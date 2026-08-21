@@ -18,6 +18,10 @@ from Workstation.workstation_core.coordinate_contract import (
     WORLD_FRAME,
 )
 from Workstation.workstation_core.rtk_geometry import ned_delta_m
+from Workstation.workstation_core.measurement_methods import (
+    PIXHAWK_RTK_LIVE,
+    normalize_measurement_method_id,
+)
 from Workstation.workstation_core.stereo import StereoCalibration
 from Workstation.workstation_core.triangulation import (
     camera_translation_right_in_left_camera,
@@ -998,6 +1002,12 @@ class MeasurementAttempt:
     relative_yaw_deg: float | None
     source_quality: str
     warnings: tuple[str, ...]
+    measurement_method_id: str = PIXHAWK_RTK_LIVE
+    measurement_method_instance_id: str = ""
+    measurement_geometry_kind: str = "legacy"
+    measurement_geometry_sha256: str = ""
+    measurement_selection_reason: str = "legacy"
+    measurement_component_sources: tuple[tuple[str, str], ...] = ()
     world_frame: str = WORLD_FRAME
     body_frame: str = BODY_FRAME
     camera_frame: str = CAMERA_FRAME
@@ -1037,6 +1047,54 @@ class MeasurementAttempt:
         ):
             object.__setattr__(self, name, str(getattr(self, name)))
         object.__setattr__(self, "warnings", tuple(str(value) for value in self.warnings))
+        object.__setattr__(
+            self,
+            "measurement_method_id",
+            normalize_measurement_method_id(self.measurement_method_id),
+        )
+        object.__setattr__(
+            self,
+            "measurement_method_instance_id",
+            str(self.measurement_method_instance_id or self.measurement_method_id),
+        )
+        object.__setattr__(
+            self,
+            "measurement_geometry_kind",
+            str(self.measurement_geometry_kind),
+        )
+        object.__setattr__(
+            self,
+            "measurement_geometry_sha256",
+            str(self.measurement_geometry_sha256),
+        )
+        object.__setattr__(
+            self,
+            "measurement_selection_reason",
+            str(self.measurement_selection_reason),
+        )
+        object.__setattr__(
+            self,
+            "measurement_component_sources",
+            tuple(
+                (str(name), str(source))
+                for name, source in self.measurement_component_sources
+            ),
+        )
+        if self.measurement_geometry_kind not in {
+            "legacy",
+            "live_pixhawk_mount",
+            "relative_pose",
+            "unresolved",
+        }:
+            raise ValueError("unsupported measurement_geometry_kind")
+        if self.measurement_geometry_kind != "legacy" and (
+            len(self.measurement_geometry_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.measurement_geometry_sha256
+            )
+        ):
+            raise ValueError("measurement_geometry_sha256 must be lowercase SHA-256 hex")
         if type(self.left_detection) is not DetectionSnapshot or type(
             self.right_detection
         ) is not DetectionSnapshot:
@@ -1102,8 +1160,10 @@ class MeasurementAttempt:
             if value is not None and value.camera != expected_camera:
                 raise ValueError(f"{field_name} must preserve {expected_camera} camera identity")
         if self.triangulation_source == "checkerboard":
-            if self.baseline is not None and not self.baseline.source.startswith("checkerboard"):
-                raise ValueError("checkerboard attempts must use checkerboard baseline provenance")
+            if self.baseline is not None and not self.baseline.source.startswith(
+                ("checkerboard", "relative-pose:")
+            ):
+                raise ValueError("relative-pose attempts must use profile baseline provenance")
         if self.triangulation_source == "pixhawk" and self.baseline is not None:
             if not self.baseline.source.startswith("gps-rtk"):
                 raise ValueError("Pixhawk attempts must use GPS/RTK baseline provenance")
@@ -1178,6 +1238,78 @@ class MeasurementAttempt:
     def canonical_payload(self) -> dict[str, Any]:
         return asdict(self)
 
+    @classmethod
+    def from_canonical_payload(cls, payload: Mapping[str, Any]) -> "MeasurementAttempt":
+        """Rebuild an attempt from persisted canonical evidence.
+
+        The reconstruction boundary is deliberately strict: nested values are
+        passed through the same immutable snapshot validators used at capture
+        time, and the rebuilt canonical bytes must match the supplied payload.
+        This makes a stored attempt independently hashable and usable as an
+        offline recalculation input instead of retaining only an opaque digest.
+        """
+
+        if cls is not MeasurementAttempt:
+            raise TypeError("MeasurementAttempt.from_canonical_payload does not support subclasses")
+        if not isinstance(payload, Mapping):
+            raise TypeError("canonical measurement attempt payload must be a mapping")
+        values = dict(payload)
+
+        def required_mapping(name: str) -> dict[str, Any]:
+            value = values.get(name)
+            if not isinstance(value, Mapping):
+                raise ValueError(f"{name} must be a mapping")
+            return dict(value)
+
+        def optional_snapshot(name: str, snapshot_type: type) -> Any:
+            value = values.get(name)
+            if value is None:
+                return None
+            if not isinstance(value, Mapping):
+                raise ValueError(f"{name} must be a mapping or null")
+            return snapshot_type(**dict(value))
+
+        values["left_detection"] = DetectionSnapshot(**required_mapping("left_detection"))
+        values["right_detection"] = DetectionSnapshot(**required_mapping("right_detection"))
+        values["left_attitude"] = optional_snapshot("left_attitude", AttitudeSnapshot)
+        values["right_attitude"] = optional_snapshot("right_attitude", AttitudeSnapshot)
+        values["left_gps"] = optional_snapshot("left_gps", GpsSnapshot)
+        values["right_gps"] = optional_snapshot("right_gps", GpsSnapshot)
+        intrinsics = values.get("intrinsics")
+        if intrinsics is None:
+            values["intrinsics"] = None
+        elif isinstance(intrinsics, Mapping):
+            intrinsics_values = dict(intrinsics)
+            intrinsics_values["left"] = CameraIntrinsicsSnapshot(
+                **dict(intrinsics_values["left"])
+            )
+            intrinsics_values["right"] = CameraIntrinsicsSnapshot(
+                **dict(intrinsics_values["right"])
+            )
+            checkerboard = intrinsics_values.get("checkerboard_extrinsics")
+            intrinsics_values["checkerboard_extrinsics"] = (
+                None
+                if checkerboard is None
+                else CheckerboardExtrinsicsSnapshot(**dict(checkerboard))
+            )
+            values["intrinsics"] = StereoIntrinsicsSnapshot(**intrinsics_values)
+        else:
+            raise ValueError("intrinsics must be a mapping or null")
+        values["baseline"] = optional_snapshot("baseline", BaselineSnapshot)
+        values["geometry_config"] = GeometryConfigSnapshot(
+            **required_mapping("geometry_config")
+        )
+        attempt = cls(**values)
+        supplied_bytes = _canonical_json_bytes(payload)
+        if _canonical_json_bytes(attempt.canonical_payload()) != supplied_bytes:
+            raise ValueError("canonical measurement attempt payload changed during reconstruction")
+        return attempt
+
+    def canonical_json(self) -> str:
+        """Return the exact canonical JSON whose bytes define ``canonical_sha256``."""
+
+        return _canonical_json_bytes(self.canonical_payload()).decode("utf-8")
+
     def canonical_sha256(self) -> str:
         return _sha256_payload(self.canonical_payload())
 
@@ -1205,6 +1337,72 @@ class MeasurementAttempt:
 
     def instance_sha256(self) -> str:
         return _sha256_payload(self.instance_canonical_payload())
+
+
+@dataclass(frozen=True)
+class BlockedMeasurementPair:
+    """Matched detections retained when no complete measurement geometry exists."""
+
+    detection_pair_key: tuple[MetadataScalar, ...]
+    created_monotonic_s: float
+    created_wall_s: float
+    timestamp_basis: str
+    left_detection: DetectionSnapshot
+    right_detection: DetectionSnapshot
+    status: str
+    reasons: tuple[str, ...]
+    readiness_sha256: str
+    readiness_payload_json: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "detection_pair_key", tuple(self.detection_pair_key))
+        object.__setattr__(
+            self,
+            "created_monotonic_s",
+            _finite_float(self.created_monotonic_s, name="created_monotonic_s"),
+        )
+        object.__setattr__(
+            self,
+            "created_wall_s",
+            _finite_float(self.created_wall_s, name="created_wall_s"),
+        )
+        object.__setattr__(self, "timestamp_basis", str(self.timestamp_basis))
+        object.__setattr__(self, "status", str(self.status))
+        object.__setattr__(self, "reasons", tuple(str(value) for value in self.reasons))
+        object.__setattr__(self, "readiness_sha256", str(self.readiness_sha256))
+        readiness_payload_json = str(self.readiness_payload_json or "")
+        if readiness_payload_json:
+            try:
+                readiness_payload = json.loads(readiness_payload_json)
+            except json.JSONDecodeError as exc:
+                raise ValueError("readiness_payload_json must contain valid JSON") from exc
+            if not isinstance(readiness_payload, Mapping):
+                raise ValueError("readiness_payload_json must contain a JSON object")
+            canonical_readiness_json = _canonical_json_bytes(readiness_payload).decode("utf-8")
+            if _sha256_payload(readiness_payload) != self.readiness_sha256:
+                raise ValueError("readiness payload does not match readiness_sha256")
+            readiness_payload_json = canonical_readiness_json
+        object.__setattr__(self, "readiness_payload_json", readiness_payload_json)
+        if not self.status or not self.reasons:
+            raise ValueError("blocked measurement pairs require status and reasons")
+        if self.left_detection.camera != "left" or self.right_detection.camera != "right":
+            raise ValueError("blocked pair detections must preserve left/right identity")
+        if len(self.readiness_sha256) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in self.readiness_sha256
+        ):
+            raise ValueError("readiness_sha256 must be SHA-256 hex")
+
+    def canonical_payload(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def canonical_json(self) -> str:
+        """Return the exact canonical JSON retained as blocked-pair evidence."""
+
+        return _canonical_json_bytes(self.canonical_payload()).decode("utf-8")
+
+    def canonical_sha256(self) -> str:
+        return _sha256_payload(self.canonical_payload())
 
 
 def detection_pair_key(
@@ -1297,6 +1495,8 @@ def build_pixhawk_baseline_snapshot(
 
 def build_checkerboard_baseline_snapshot(
     intrinsics: StereoIntrinsicsSnapshot | None,
+    *,
+    source: str = "checkerboard",
 ) -> BaselineSnapshot | None:
     extrinsics = None if intrinsics is None else intrinsics.checkerboard_extrinsics
     if extrinsics is None:
@@ -1308,7 +1508,7 @@ def build_checkerboard_baseline_snapshot(
     baseline_m = math.sqrt(sum(value * value for value in translation))
     usable = baseline_m > 0.0
     return BaselineSnapshot(
-        source="checkerboard" if usable else "checkerboard-waiting",
+        source=str(source) if usable else f"{source}-waiting",
         baseline_m=baseline_m,
         ned_right_from_left_m=None,
         translation_right_in_left_rdf_m=translation if usable else None,

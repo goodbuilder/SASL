@@ -13,11 +13,11 @@ _CONTEXT_ALIASES = {
     "devices.pixhawk.p2": "devices.pixhawk",
     "processing.detection": "devices.cameras",
     "processing.synchronization": "devices.time",
+    # Session details is a local entry point into the canonical
+    # Recording / Sessions workspace, never a hidden navigation context.
+    "tasks.session_details": "tasks.recording",
     "tasks.playback": "tasks.recording",
     "tasks.export": "tasks.recording",
-    # The former Protocol page was removed; old saved UI state returns to the
-    # overview instead of opening a hidden/dead workspace.
-    "processing.experiment": "overview",
 }
 
 
@@ -60,6 +60,7 @@ class NavigationTree(QtWidgets.QTreeView):
         root = self._item("Workstation", "root", selectable=False)
         self.model.appendRow(root)
         root.appendRow(self._item("Overview", "overview"))
+        root.appendRow(self._item("Protocol", "processing.experiment"))
 
         devices = self._item("Devices", "devices", selectable=False)
         devices.appendRow(self._item("Cameras", "devices.cameras"))
@@ -74,8 +75,9 @@ class NavigationTree(QtWidgets.QTreeView):
         root.appendRow(self._item("Calibration", "tasks.calibration"))
 
         root.appendRow(self._item("Alignment", "processing.alignment"))
+        root.appendRow(self._item("Session", "tasks.session"))
         root.appendRow(self._item("Measurement", "processing.measurement"))
-        root.appendRow(self._item("Recording / Sessions", "tasks.recording"))
+        root.appendRow(self._item("Recording / Review", "tasks.recording"))
         root.appendRow(self._item("Advanced", "tasks.advanced"))
         root.appendRow(self._item("Settings", "tasks.settings"))
 
@@ -85,6 +87,7 @@ class NavigationTree(QtWidgets.QTreeView):
         diagnostics.appendRow(self._item("Pixhawk / MAVLink", "diagnostics.pixhawk"))
         diagnostics.appendRow(self._item("GNSS / RTK", "diagnostics.gnss"))
         diagnostics.appendRow(self._item("Logs", "diagnostics.logs"))
+        diagnostics.appendRow(self._item("FTP", "diagnostics.ftp"))
         diagnostics.appendRow(self._item("Measurement", "diagnostics.measurement"))
         diagnostics.appendRow(self._item("Performance", "diagnostics.performance"))
         root.appendRow(diagnostics)

@@ -3,13 +3,14 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import math
 import os
 import shutil
 import tempfile
 import threading
 import time
 from collections import deque
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -21,12 +22,9 @@ import pyarrow.parquet as pq
 import xlsxwriter
 
 
-# Solo-team project; nothing in this repo (or downstream of it) reads the
-# .parquet session artifacts back -- CSV already covers every consumer.
-# Flip back to True to resume writing them (write_parquet/the workbook code
-# is untouched, only the write-time gating and manifest bookkeeping below
-# skip it).
-WRITE_PARQUET_ARTIFACTS = False
+# Finalized typed tables are Parquet.  JSONL remains the crash-recovery spool
+# and append-only event format; the one operator-facing view is review.xlsx.
+WRITE_PARQUET_ARTIFACTS = True
 
 PAIR_AXIS_COLUMNS = ("sample_index", "session_elapsed_s")
 DISTANCE_MEASUREMENT_COLUMNS = (
@@ -359,7 +357,59 @@ def session_id_now() -> str:
 
 
 def session_dir(root: Path, session_id: str | None = None) -> Path:
-    return root / "sessions" / (session_id or session_id_now())
+    """Return the canonical v2 session directory directly below ``root``.
+
+    Older Workstation builds inserted an extra ``sessions`` component.  New
+    writers intentionally use ``recordings/<session-id>``; read/discovery
+    paths keep explicit legacy fallback support instead of perpetuating the
+    extra directory for new evidence.
+    """
+
+    selected = str(session_id or session_id_now())
+    if (
+        selected in {"", ".", "..", "sessions"}
+        or selected.startswith(".")
+        or Path(selected).name != selected
+        or "\\" in selected
+        or "\x00" in selected
+    ):
+        raise ValueError("session_id must be one safe non-reserved path component")
+    return root / selected
+
+
+def legacy_session_dir(root: Path, session_id: str) -> Path:
+    """Return the pre-v2 ``recordings/sessions/<session-id>`` location."""
+
+    return root / "sessions" / session_id
+
+
+def resolve_session_dir(root: Path, session_id: str) -> Path:
+    """Resolve an existing v2/legacy session or the canonical new location.
+
+    A duplicate ID across the two layouts and any session-directory symlink
+    are rejected rather than selecting an ambiguous evidence owner.
+    """
+
+    root = Path(root)
+    legacy_root = root / "sessions"
+    if root.is_symlink() or legacy_root.is_symlink():
+        raise ValueError("recordings and legacy container directories must not be symlinks")
+    canonical = session_dir(root, session_id)
+    legacy = legacy_session_dir(root, session_id)
+    for candidate in (canonical, legacy):
+        if candidate.is_symlink():
+            raise ValueError(f"session directories must not be symlinks: {candidate}")
+    canonical_exists = canonical.exists()
+    legacy_exists = legacy.exists()
+    if canonical_exists and legacy_exists:
+        raise FileExistsError(
+            f"direct/legacy session ID collision: {session_id}"
+        )
+    if canonical_exists:
+        return canonical
+    if legacy_exists:
+        return legacy
+    return canonical
 
 
 def raw_video_paths(root: Path, session_id: str | None = None) -> dict[str, Path]:
@@ -378,57 +428,54 @@ def format_video_paths(paths: dict[str, Path]) -> str:
 
 @dataclass(frozen=True)
 class SavedSessionFiles:
-    session_static_json: Path
-    distance_measurements_csv: Path
-    distance_measurements_parquet: Path
-    xlsx: Path
-    camera_left_csv: Path
-    camera_left_parquet: Path
-    camera_right_csv: Path
-    camera_right_parquet: Path
-    px4_left_csv: Path
-    px4_left_parquet: Path
-    px4_right_csv: Path
-    px4_right_parquet: Path
-    px4_left_xlsx: Path
-    px4_right_xlsx: Path
-    session_rtk_xlsx: Path
-    gnss_base_csv: Path
-    gnss_base_parquet: Path
-    extrinsics_comparison_csv: Path
-    extrinsics_comparison_parquet: Path
+    context_json: Path
+    measurement_pairs_parquet: Path
+    camera_timeline_parquet: Path
+    pixhawk_timeline_parquet: Path
+    gnss_base_timeline_parquet: Path
+    geometry_comparison_parquet: Path
+    review_xlsx: Path
     manifest: Path
     finalized: bool = True
     error: str = ""
+    review_error: str = ""
+    review_pending: bool = False
 
     @property
-    def csv(self) -> Path:
-        """Compatibility alias for the primary distance-measurement CSV."""
-        return self.distance_measurements_csv
+    def session_static_json(self) -> Path:
+        """Compatibility alias for the v2 frozen measurement context."""
+
+        return self.context_json
+
+    @property
+    def distance_measurements_parquet(self) -> Path:
+        """Compatibility alias for the authoritative pair Parquet."""
+
+        return self.measurement_pairs_parquet
+
+    @property
+    def xlsx(self) -> Path:
+        """Compatibility alias for the one session-level review workbook."""
+
+        return self.review_xlsx
 
     @property
     def outputs(self) -> list[Path]:
         return [
-            self.session_static_json,
-            self.distance_measurements_csv,
-            self.distance_measurements_parquet,
-            self.xlsx,
-            self.camera_left_csv,
-            self.camera_left_parquet,
-            self.camera_right_csv,
-            self.camera_right_parquet,
-            self.px4_left_csv,
-            self.px4_left_parquet,
-            self.px4_right_csv,
-            self.px4_right_parquet,
-            self.px4_left_xlsx,
-            self.px4_right_xlsx,
-            self.session_rtk_xlsx,
-            self.gnss_base_csv,
-            self.gnss_base_parquet,
-            self.extrinsics_comparison_csv,
-            self.extrinsics_comparison_parquet,
+            self.context_json,
+            self.measurement_pairs_parquet,
+            self.camera_timeline_parquet,
+            self.pixhawk_timeline_parquet,
+            self.gnss_base_timeline_parquet,
+            self.geometry_comparison_parquet,
+            self.review_xlsx,
         ]
+
+    @property
+    def camera_left_parquet(self) -> Path:
+        """Legacy API alias; left/right are combined in one typed timeline."""
+
+        return self.camera_timeline_parquet
 
 
 @dataclass(frozen=True)
@@ -453,6 +500,8 @@ class SpoolRows(Sequence[dict[str, object]]):
         self._handle = None
         self._count = 0
         self._lock = threading.RLock()
+        self._recovery_warnings: list[str] = []
+        self._recovery_artifacts: list[Path] = []
 
     @property
     def spool_path(self) -> Path | None:
@@ -461,6 +510,14 @@ class SpoolRows(Sequence[dict[str, object]]):
     @property
     def preview_count(self) -> int:
         return len(self._preview)
+
+    @property
+    def recovery_warnings(self) -> tuple[str, ...]:
+        return tuple(self._recovery_warnings)
+
+    @property
+    def recovery_artifacts(self) -> tuple[Path, ...]:
+        return tuple(self._recovery_artifacts)
 
     def bind(self, path: Path) -> None:
         with self._lock:
@@ -471,6 +528,8 @@ class SpoolRows(Sequence[dict[str, object]]):
             self._handle = path.open("a", encoding="utf-8", buffering=1)
             self._preview.clear()
             self._count = 0
+            self._recovery_warnings.clear()
+            self._recovery_artifacts.clear()
 
     def open_existing(self, path: Path) -> None:
         with self._lock:
@@ -478,12 +537,65 @@ class SpoolRows(Sequence[dict[str, object]]):
             self._path = path
             self._preview.clear()
             self._count = 0
+            self._recovery_warnings.clear()
+            self._recovery_artifacts.clear()
             if path.exists():
+                self._repair_unterminated_tail(path)
                 for row in self._materialized_rows() if self.supports_updates else self._plain_rows():
                     self._preview.append(row)
                     self._count += 1
             path.parent.mkdir(parents=True, exist_ok=True)
             self._handle = path.open("a", encoding="utf-8", buffering=1)
+
+    @staticmethod
+    def _atomic_replace_bytes(path: Path, payload: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".repair",
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _repair_unterminated_tail(self, path: Path) -> None:
+        """Preserve a valid prefix and quarantine only a torn final write.
+
+        A malformed newline-terminated row or malformed interior row is not a
+        recoverable crash tail and remains a hard error when rows are parsed.
+        """
+
+        payload = path.read_bytes()
+        if not payload or payload.endswith(b"\n"):
+            return
+        prefix, separator, tail = payload.rpartition(b"\n")
+        try:
+            decoded = json.loads(tail)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            quarantine_root = path.parent / ".quarantine"
+            quarantine_root.mkdir(parents=True, exist_ok=True)
+            digest = hashlib.sha256(tail).hexdigest()
+            quarantine = quarantine_root / f"{path.name}.{digest[:16]}.truncated-tail"
+            if not quarantine.exists():
+                self._atomic_replace_bytes(quarantine, tail)
+            valid_prefix = prefix + separator if separator else b""
+            self._atomic_replace_bytes(path, valid_prefix)
+            self._recovery_artifacts.append(quarantine)
+            self._recovery_warnings.append(
+                f"quarantined truncated final JSONL record: {quarantine.name}"
+            )
+            return
+        if not isinstance(decoded, dict):
+            raise OSError(f"unterminated spool row is not an object: {path}")
+        self._atomic_replace_bytes(path, payload + b"\n")
+        self._recovery_warnings.append("normalized valid unterminated final JSONL record")
 
     def append(self, row: dict[str, object]) -> None:
         stored = {key: _serializable_value(value) for key, value in row.items()}
@@ -536,18 +648,31 @@ class SpoolRows(Sequence[dict[str, object]]):
             self._preview.clear()
             self._count = 0
 
-    def discard_spool(self) -> None:
-        """Remove the durable spool after every final artifact is committed."""
+    def discard_spool(self) -> bool:
+        """Best-effort removal after every final artifact is committed.
+
+        Cleanup can fail because of filesystem permissions or transient I/O,
+        but verified published data must not be downgraded into a retry that
+        has already removed some sibling spools.  A failed path remains bound
+        for later maintenance; callers never lose the full materialized rows.
+        """
         with self._lock:
-            self.close()
+            try:
+                self.close()
+            except OSError:
+                return False
             path = self._path
             if path is not None:
-                path.unlink(missing_ok=True)
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    return False
                 try:
                     path.parent.rmdir()
                 except OSError:
                     pass
             self._path = None
+            return True
 
     def __len__(self) -> int:
         return self._count
@@ -562,10 +687,19 @@ class SpoolRows(Sequence[dict[str, object]]):
             yield from self._preview
             return
         with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
+            for line_number, line in enumerate(handle, start=1):
                 if not line.strip():
                     continue
-                row = json.loads(line)
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise OSError(
+                        f"malformed spool JSONL row: path={path}, line={line_number}"
+                    ) from exc
+                if not isinstance(row, dict):
+                    raise OSError(
+                        f"spool JSONL row is not an object: path={path}, line={line_number}"
+                    )
                 if "__spool_update_index" not in row:
                     yield row
 
@@ -575,12 +709,30 @@ class SpoolRows(Sequence[dict[str, object]]):
             return list(self._preview)
         rows: list[dict[str, object]] = []
         with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
+            for line_number, line in enumerate(handle, start=1):
                 if not line.strip():
                     continue
-                record = json.loads(line)
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise OSError(
+                        f"malformed spool JSONL row: path={path}, line={line_number}"
+                    ) from exc
+                if not isinstance(record, dict):
+                    raise OSError(
+                        f"spool JSONL row is not an object: path={path}, line={line_number}"
+                    )
                 if "__spool_update_index" in record:
-                    rows[int(record["__spool_update_index"])] = record["__spool_row"]
+                    try:
+                        update_index = int(record["__spool_update_index"])
+                        update_row = record["__spool_row"]
+                        if not isinstance(update_row, dict):
+                            raise TypeError("update row is not an object")
+                        rows[update_index] = update_row
+                    except (IndexError, KeyError, TypeError, ValueError) as exc:
+                        raise OSError(
+                            f"invalid spool update record: path={path}, line={line_number}"
+                        ) from exc
                 else:
                     rows.append(record)
         return rows
@@ -652,7 +804,14 @@ def _serializable_value(value: object) -> object:
         return value
     if isinstance(value, Path):
         return str(value)
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _serializable_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_serializable_value(item) for item in value]
+    raise TypeError(f"session row contains unsupported value type: {type(value).__name__}")
 
 
 def _normalized_pair_rows(pair_rows: Iterable[dict[str, object]]) -> list[dict[str, object]]:
@@ -673,6 +832,95 @@ def _normalized_generic_rows(rows: Iterable[dict[str, object]]) -> list[dict[str
         {key: _serializable_value(value) for key, value in row.items()}
         for row in rows
     ]
+
+
+def _iter_normalized_generic_rows(
+    rows: Iterable[dict[str, object]],
+) -> Iterator[dict[str, object]]:
+    for row in rows:
+        yield {key: _serializable_value(value) for key, value in row.items()}
+
+
+def _seconds_to_ns(value: object) -> int | None:
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds):
+        return None
+    return int(round(seconds * 1_000_000_000.0))
+
+
+def _copy_first_present(
+    row: dict[str, object],
+    destination: str,
+    *sources: str,
+) -> None:
+    if row.get(destination) not in (None, ""):
+        return
+    for source in sources:
+        value = row.get(source)
+        if value not in (None, ""):
+            row[destination] = value
+            return
+
+
+def _project_pair_typed_fields(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    for row in rows:
+        _copy_first_present(row, "recording_time_ns", "session_elapsed_ns")
+        _copy_first_present(row, "estimated_utc_time_ns", "recorded_unix_ns")
+        _copy_first_present(row, "device_utc_time_ns", "pair_mid_utc_ns")
+        _copy_first_present(row, "sync_delta_ns", "rtcp_pair_delta_ns")
+    return rows
+
+
+def _project_camera_typed_fields(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    for row in rows:
+        if row.get("recording_time_ns") in (None, ""):
+            value = _seconds_to_ns(row.get("session_elapsed_s"))
+            if value is not None:
+                row["recording_time_ns"] = value
+        _copy_first_present(row, "estimated_utc_time_ns", "session_utc_ns")
+        _copy_first_present(row, "device_utc_time_ns", "source_utc_ns")
+        for destination, source in (
+            ("rtcp_sr_age_ns", "rtcp_sr_age_s"),
+            ("rtcp_sr_pc_offset_ns", "rtcp_sr_pc_offset_s"),
+            ("rtcp_receive_delay_ns", "rtcp_frame_receive_delay_s"),
+            ("rtcp_transport_delay_ns", "rtcp_frame_transport_delay_s"),
+        ):
+            if row.get(destination) in (None, ""):
+                value = _seconds_to_ns(row.get(source))
+                if value is not None:
+                    row[destination] = value
+    return rows
+
+
+def _project_px4_typed_fields(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    for row in rows:
+        if row.get("recording_time_ns") in (None, ""):
+            value = _seconds_to_ns(row.get("session_elapsed_s"))
+            if value is not None:
+                row["recording_time_ns"] = value
+        _copy_first_present(row, "session_utc_time_ns", "session_utc_ns")
+        _copy_first_present(row, "gps_utc_time_ns", "source_utc_ns")
+        _copy_first_present(row, "gps_utc_source", "source_utc_method")
+    return rows
+
+
+def _iter_project_camera_typed_fields(
+    rows: Iterable[dict[str, object]],
+) -> Iterator[dict[str, object]]:
+    for row in rows:
+        yield _project_camera_typed_fields([row])[0]
+
+
+def _iter_project_px4_typed_fields(
+    rows: Iterable[dict[str, object]],
+) -> Iterator[dict[str, object]]:
+    for row in rows:
+        yield _project_px4_typed_fields([row])[0]
 
 
 def _authoritative_jsonl_row_bytes(row: dict[str, object]) -> bytes:
@@ -1904,23 +2152,86 @@ def write_recovery_metadata(output_dir: Path, metadata: dict[str, object]) -> Pa
 
 
 def discover_retryable_sessions(recordings_root: Path) -> list[Path]:
-    sessions_root = recordings_root / "sessions"
-    if not sessions_root.is_dir():
-        return []
+    """Find retryable v2 sessions and legacy ``sessions/`` descendants."""
+
     retryable: list[Path] = []
-    for output_dir in sessions_root.iterdir():
-        if not output_dir.is_dir() or not (output_dir / ".spool").is_dir():
+    candidates: list[Path] = []
+    roots: list[Path] = []
+    direct_roots: dict[str, Path] = {}
+    if recordings_root.is_dir():
+        direct_roots = {
+            child.name: child
+            for child in recordings_root.iterdir()
+            if child.name != "sessions"
+            and not child.name.startswith(".")
+            and child.is_dir()
+            and not child.is_symlink()
+        }
+        roots.extend(direct_roots.values())
+    legacy_root = recordings_root / "sessions"
+    if legacy_root.is_dir() and not legacy_root.is_symlink():
+        legacy_roots = {
+            child.name: child
+            for child in legacy_root.iterdir()
+            if child.is_dir() and not child.is_symlink()
+        }
+
+        def has_spool(root: Path) -> bool:
+            if (root / ".spool").is_dir():
+                return True
+            measurements = root / "measurements"
+            return measurements.is_dir() and any(
+                (child / ".spool").is_dir()
+                for child in measurements.iterdir()
+                if child.is_dir() and not child.is_symlink()
+            )
+
+        conflicts = sorted(
+            name
+            for name in set(direct_roots) & set(legacy_roots)
+            if has_spool(direct_roots[name]) or has_spool(legacy_roots[name])
+        )
+        if conflicts:
+            raise FileExistsError(
+                "direct/legacy retry session ID collision: "
+                + ", ".join(conflicts)
+            )
+        roots.extend(legacy_roots.values())
+    for session_root in roots:
+        candidates.append(session_root)
+        measurements_root = session_root / "measurements"
+        if measurements_root.is_dir() and not measurements_root.is_symlink():
+            candidates.extend(
+                child
+                for child in measurements_root.iterdir()
+                if child.is_dir() and not child.is_symlink()
+            )
+    for output_dir in candidates:
+        spool_dir = output_dir / ".spool"
+        if (
+            not spool_dir.is_dir()
+            or not (spool_dir / "session_metadata.json").is_file()
+        ):
             continue
-        manifest_path = output_dir / "session_manifest.json"
         status = ""
-        if manifest_path.is_file():
+        failure_path = output_dir / ".workstation" / "save_failure.json"
+        manifest_path = output_dir / "measurement.json"
+        if failure_path.is_file():
+            status = "failed"
+        elif not manifest_path.is_file():
+            manifest_path = output_dir / "session_manifest.json"
+        if not status and manifest_path.is_file():
             try:
                 status = str(json.loads(manifest_path.read_text(encoding="utf-8")).get("status", ""))
             except (OSError, ValueError):
                 status = "failed"
         if status != "finalized":
             retryable.append(output_dir)
-    return sorted(retryable, key=lambda path: path.name, reverse=True)
+    return sorted(
+        retryable,
+        key=lambda path: (path.stat().st_mtime_ns, path.as_posix()),
+        reverse=True,
+    )
 
 
 def load_retryable_session(output_dir: Path) -> RetryableSession:
@@ -1936,6 +2247,10 @@ def load_retryable_session(output_dir: Path) -> RetryableSession:
         camera_rows[side].open_existing(spool_dir / f"camera_{side}.jsonl")
         px4_rows[side] = SpoolRows()
         px4_rows[side].open_existing(spool_dir / f"px4_{side}.jsonl")
+    drone_spool = spool_dir / "px4_drone.jsonl"
+    if drone_spool.exists():
+        px4_rows["drone"] = SpoolRows()
+        px4_rows["drone"].open_existing(drone_spool)
     gnss_base_rows = SpoolRows()
     # Sessions recorded before this field existed have no gnss_base.jsonl;
     # open_existing() tolerates a missing path (empty rows, fresh append handle).
@@ -1944,6 +2259,36 @@ def load_retryable_session(output_dir: Path) -> RetryableSession:
     # Sessions recorded before this field existed have no extrinsics_comparison.jsonl;
     # open_existing() tolerates a missing path (empty rows, fresh append handle).
     extrinsics_comparison_rows.open_existing(spool_dir / "extrinsics_comparison.jsonl")
+    recovered_spools = {
+        "pair": pair_rows,
+        "camera_left": camera_rows["left"],
+        "camera_right": camera_rows["right"],
+        "px4_left": px4_rows["left"],
+        "px4_right": px4_rows["right"],
+        "gnss_base": gnss_base_rows,
+        "extrinsics_comparison": extrinsics_comparison_rows,
+    }
+    if "drone" in px4_rows:
+        recovered_spools["px4_drone"] = px4_rows["drone"]
+    recovery_warnings = [
+        {"stream": stream, "warning": warning}
+        for stream, rows in recovered_spools.items()
+        for warning in rows.recovery_warnings
+    ]
+    recovery_artifacts = [
+        {
+            "stream": stream,
+            "path": artifact.relative_to(output_dir).as_posix(),
+        }
+        for stream, rows in recovered_spools.items()
+        for artifact in rows.recovery_artifacts
+    ]
+    if recovery_warnings or recovery_artifacts:
+        metadata["spool_recovery"] = {
+            "status": "RECOVERED_WITH_WARNINGS",
+            "warnings": recovery_warnings,
+            "artifacts": recovery_artifacts,
+        }
     return RetryableSession(
         output_dir, metadata, pair_rows, camera_rows, px4_rows, gnss_base_rows, extrinsics_comparison_rows
     )
@@ -2003,7 +2348,492 @@ def _publish_generation(output_dir: Path, generation_dir: Path, names: Iterable[
         temp_link.unlink(missing_ok=True)
 
 
-def save_session_files(
+def _v2_publish_root(output_dir: Path) -> Path:
+    return output_dir / ".workstation" / "publish"
+
+
+def _fsync_directory_path(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _ensure_v2_data_link(output_dir: Path) -> None:
+    """Expose one data link and one generation-bound measurement manifest."""
+
+    links = {
+        output_dir / "data": Path(".workstation") / "publish" / "current" / "data",
+        output_dir / "measurement.json": (
+            Path(".workstation") / "publish" / "current" / "measurement.json"
+        ),
+    }
+    changed = False
+    for link, expected in links.items():
+        if os.path.lexists(link):
+            if not link.is_symlink() or Path(os.readlink(link)) != expected:
+                raise OSError(f"measurement v2 path is not a managed link: {link}")
+            continue
+        link.symlink_to(expected)
+        changed = True
+    if changed:
+        _fsync_directory_path(output_dir)
+
+
+def _publish_v2_generation(output_dir: Path, generation_dir: Path) -> None:
+    publish_root = _v2_publish_root(output_dir)
+    _ensure_v2_data_link(output_dir)
+    current = publish_root / "current"
+    temporary = publish_root / f".current-{generation_dir.name}.tmp"
+    temporary.unlink(missing_ok=True)
+    temporary.symlink_to(Path("generations") / generation_dir.name)
+    try:
+        os.replace(temporary, current)
+        _fsync_directory_path(publish_root)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _cleanup_v2_generations(output_dir: Path) -> None:
+    publish_root = _v2_publish_root(output_dir)
+    generations = publish_root / "generations"
+    if not generations.is_dir():
+        return
+    current_name = ""
+    current = publish_root / "current"
+    if current.is_symlink():
+        current_name = Path(os.readlink(current)).name
+    for candidate in generations.iterdir():
+        if candidate.is_dir() and candidate.name != current_name:
+            shutil.rmtree(candidate, ignore_errors=True)
+
+
+def _owning_session_root(output_dir: Path) -> Path:
+    if output_dir.parent.name == "measurements":
+        return output_dir.parent.parent
+    return output_dir
+
+
+def _validate_measurement_storage_identity(
+    output_dir: Path,
+    metadata: Mapping[str, object],
+) -> tuple[str, str]:
+    raw_session_id = str(metadata.get("session_id") or output_dir.name)
+    # Reuse the public session path contract without creating the path.
+    session_id = session_dir(Path("."), raw_session_id).name
+    raw_measurement_id = str(metadata.get("measurement_id") or output_dir.name)
+    if (
+        not raw_measurement_id
+        or raw_measurement_id in {".", ".."}
+        or raw_measurement_id.startswith(".")
+        or Path(raw_measurement_id).name != raw_measurement_id
+        or "\\" in raw_measurement_id
+        or "\x00" in raw_measurement_id
+    ):
+        raise ValueError("measurement_id must be one safe non-hidden path component")
+    if output_dir.parent.name == "measurements":
+        physical_session_id = output_dir.parent.parent.name
+        if session_id != physical_session_id:
+            raise ValueError(
+                f"metadata session_id {session_id!r} does not own {output_dir}"
+            )
+        if raw_measurement_id != output_dir.name:
+            raise ValueError(
+                f"metadata measurement_id {raw_measurement_id!r} does not own {output_dir}"
+            )
+    elif session_id != output_dir.name:
+        raise ValueError(
+            f"metadata session_id {session_id!r} does not own {output_dir}"
+        )
+    return session_id, raw_measurement_id
+
+
+def _review_result_row(row: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "pair_id": row.get("pair_id") or row.get("measurement_attempt_id"),
+        "utc_time": row.get("estimated_utc_time_ns") or row.get("recorded_unix_ns"),
+        "recording_time_ns": row.get("recording_time_ns") or row.get("pair_app_mid_monotonic_ns"),
+        "object_class": row.get("class_name"),
+        "distance_m": row.get("distance_m"),
+        "forward_m": row.get("baseline_center_forward_m"),
+        "right_m": row.get("baseline_center_right_m"),
+        "down_m": row.get("baseline_center_down_m"),
+        "measurement_method_id": row.get("measurement_method_id") or row.get("distance_mode"),
+        "valid": row.get("measurement_valid"),
+        "warning_code": row.get("warning_code") or row.get("warnings"),
+    }
+
+
+def _review_quality_row(row: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "pair_id": row.get("pair_id") or row.get("measurement_attempt_id"),
+        "sync_delta_ns": row.get("sync_delta_ns") or row.get("pair_delta_ns"),
+        "left_confidence": row.get("left_confidence") or row.get("left_bbox_confidence"),
+        "right_confidence": row.get("right_confidence") or row.get("right_bbox_confidence"),
+        "vertical_disparity_px": row.get("vertical_disparity_px") or row.get("vertical_delta_px"),
+        "reprojection_error_px": row.get("checkerboard_extrinsics_reprojection_error_px"),
+        "gnss_fix_type": row.get("rtk_fix_quality") or row.get("left_gps_fix_type"),
+        "geometry_state": row.get("measurement_geometry_kind"),
+        "status": row.get("pair_status") or row.get("quality"),
+    }
+
+
+def _review_warning_rows(rows: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
+    warnings: list[dict[str, object]] = []
+    for row in rows:
+        value = str(row.get("warnings") or row.get("warning_code") or "").strip()
+        if not value:
+            continue
+        warnings.append(
+            {
+                "utc_time": row.get("estimated_utc_time_ns") or row.get("recorded_unix_ns"),
+                "pair_id": row.get("pair_id") or row.get("measurement_attempt_id"),
+                "subsystem": "measurement",
+                "severity": "WARNING",
+                "code": row.get("warning_code") or "MEASUREMENT_WARNING",
+                "description": value,
+                "impact": row.get("pair_status"),
+            }
+        )
+    return warnings
+
+
+def _review_capture_rows(metadata: Mapping[str, object]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for key, capture_type in (("pnp_hr_photo_capture", "HR"), ("oz_photo_capture", "OZ")):
+        section = metadata.get(key)
+        values = section.get("captures", ()) if isinstance(section, Mapping) else ()
+        for capture in values if isinstance(values, (list, tuple)) else ():
+            if not isinstance(capture, Mapping):
+                continue
+            cameras = capture.get("cameras")
+            if isinstance(cameras, Mapping):
+                for side, camera in cameras.items():
+                    camera_row = camera if isinstance(camera, Mapping) else {}
+                    rows.append(
+                        {
+                            "capture_id": capture.get("capture_id"),
+                            "capture_type": capture_type,
+                            "purpose": capture.get("purpose"),
+                            "side": side,
+                            "requested_at": camera_row.get("capture_requested_unix_ns") or capture.get("request_utc_ns"),
+                            "completed_at": camera_row.get("completed_unix_ns"),
+                            "relative_path": camera_row.get("ftp_local_path"),
+                            "sha256": camera_row.get("sha256"),
+                            "status": camera_row.get("state") or capture.get("state"),
+                        }
+                    )
+            else:
+                rows.append(
+                    {
+                        "capture_id": capture.get("capture_id"),
+                        "capture_type": capture_type,
+                        "purpose": capture.get("purpose"),
+                        "status": capture.get("state"),
+                    }
+                )
+    return rows
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _measurement_review_mapping(
+    measurement_root: Path,
+    *,
+    session_root: Path,
+) -> dict[str, object] | None:
+    from Workstation.workstation_core.session_parquet import (
+        read_lossless_rows,
+        verify_parquet_artifact,
+    )
+
+    data = measurement_root / "data"
+    pairs = data / "measurement_pairs.parquet"
+    context_path = data / "context.json"
+    manifest_path = measurement_root / "measurement.json"
+    if not pairs.exists() and not context_path.exists():
+        return None
+    if not pairs.is_file() or not context_path.is_file() or not manifest_path.is_file():
+        raise OSError(
+            f"incomplete finalized measurement data view: {measurement_root}"
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, Mapping) or manifest.get("status") != "finalized":
+            raise ValueError("measurement manifest is not finalized")
+        declared_details = manifest.get("artifact_details")
+        if not isinstance(declared_details, Mapping):
+            raise ValueError("measurement manifest has no artifact details")
+        rows = read_lossless_rows(pairs, "measurement_pairs")
+        context_payload = json.loads(context_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise OSError(
+            f"cannot rebuild review from measurement {measurement_root.name}: {exc}"
+        ) from exc
+    metadata = context_payload.get("metadata", {}) if isinstance(context_payload, Mapping) else {}
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    measurement_id = str(metadata.get("measurement_id") or measurement_root.name)
+    valid_count = sum(
+        str(row.get("measurement_valid", "")).lower() in {"true", "1", "yes"}
+        or row.get("measurement_valid") is True
+        for row in rows
+    )
+    artifacts: list[dict[str, object]] = []
+    nested_measurement = measurement_root.parent.name == "measurements"
+    artifact_keys = {
+        "measurement_pairs.parquet": "measurement_pairs",
+        "camera_timeline.parquet": "camera_timeline",
+        "pixhawk_timeline.parquet": "pixhawk_timeline",
+        "gnss_base_timeline.parquet": "gnss_base_timeline",
+        "geometry_comparison.parquet": "geometry_comparison",
+    }
+    for path in sorted(data.glob("*.parquet")):
+        artifact_key = artifact_keys.get(path.name)
+        if artifact_key is None:
+            continue
+        verified = verify_parquet_artifact(path, artifact_key)
+        declared = declared_details.get(artifact_key)
+        if not isinstance(declared, Mapping):
+            raise OSError(f"manifest does not declare {artifact_key}")
+        expected_values = {
+            "size": verified.size_bytes,
+            "row_count": verified.row_count,
+            "sha256": verified.sha256,
+            "schema_sha256": verified.schema_sha256,
+        }
+        mismatched = [
+            key
+            for key, actual in expected_values.items()
+            if declared.get(key) != actual
+        ]
+        if mismatched:
+            raise OSError(
+                f"{path.name} disagrees with measurement manifest: {', '.join(mismatched)}"
+            )
+        relative = path.relative_to(measurement_root).as_posix()
+        artifact_row: dict[str, object] = {
+            "role": path.stem,
+            "format": "parquet",
+            "size_bytes": verified.size_bytes,
+            "sha256": verified.sha256,
+            "required": path.name == "measurement_pairs.parquet",
+            "status": "VERIFIED",
+        }
+        artifact_row[
+            "measurement_relative_path" if nested_measurement else "relative_path"
+        ] = relative
+        artifacts.append(artifact_row)
+    context_relative = context_path.relative_to(measurement_root).as_posix()
+    declared_context = declared_details.get("context")
+    context_sha256 = _sha256_path(context_path)
+    if (
+        not isinstance(declared_context, Mapping)
+        or declared_context.get("size") != context_path.stat().st_size
+        or declared_context.get("sha256") != context_sha256
+    ):
+        raise OSError("context.json disagrees with measurement manifest")
+    context_artifact: dict[str, object] = {
+        "role": "measurement_context",
+        "format": "json",
+        "size_bytes": context_path.stat().st_size,
+        "sha256": context_sha256,
+        "required": True,
+        "status": "VERIFIED",
+    }
+    context_artifact[
+        "measurement_relative_path" if nested_measurement else "relative_path"
+    ] = context_relative
+    artifacts.append(context_artifact)
+    latest_path = measurement_root / "latest_revision.json"
+    if latest_path.is_file():
+        try:
+            latest = json.loads(latest_path.read_text(encoding="utf-8"))
+            relative_manifest = str(latest.get("manifest_path") or "")
+            package_manifest_path = (measurement_root / relative_manifest).resolve(
+                strict=True
+            )
+            package_manifest_path.relative_to(measurement_root.resolve())
+            package_manifest = json.loads(
+                package_manifest_path.read_text(encoding="utf-8")
+            )
+            package_artifacts = package_manifest.get("artifacts", ())
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise OSError(
+                f"cannot read sealed artifact inventory for {measurement_root.name}: {exc}"
+            ) from exc
+        existing_keys = {
+            (str(row.get("role") or ""), str(row.get("measurement_relative_path") or row.get("relative_path") or ""))
+            for row in artifacts
+        }
+        for descriptor in package_artifacts if isinstance(package_artifacts, list) else ():
+            if not isinstance(descriptor, Mapping) or descriptor.get("status") != "present":
+                continue
+            relative = str(descriptor.get("relative_path") or "")
+            if not relative:
+                continue
+            role = str(descriptor.get("role") or "artifact")
+            display_relative = relative
+            data_marker = "/data/"
+            if data_marker in relative and relative.endswith(
+                (".parquet", "context.json")
+            ):
+                display_relative = "data/" + relative.rsplit(data_marker, 1)[1]
+            key = (role, display_relative)
+            if key in existing_keys:
+                continue
+            file_row: dict[str, object] = {
+                "role": role,
+                "format": Path(display_relative).suffix.lstrip(".") or "file",
+                "size_bytes": descriptor.get("size_bytes"),
+                "sha256": descriptor.get("sha256"),
+                "required": descriptor.get("required"),
+                "status": "VERIFIED",
+            }
+            file_row[
+                "measurement_relative_path" if nested_measurement else "relative_path"
+            ] = display_relative
+            artifacts.append(file_row)
+            existing_keys.add(key)
+    calculation = metadata.get("calculation")
+    calculation = calculation if isinstance(calculation, Mapping) else {}
+    intrinsics = metadata.get("intrinsics")
+    intrinsics = intrinsics if isinstance(intrinsics, Mapping) else {}
+    geometry = [
+        {
+            "method_id": calculation.get("measurement_method_id"),
+            "profile_id": calculation.get("measurement_method_instance_id"),
+            "geometry_sha256": metadata.get("active_geometry_sha256")
+            or intrinsics.get("content_sha256"),
+            "zoom": intrinsics.get("active_zoom_level"),
+            "baseline_m": calculation.get("baseline_m"),
+            "rotation_source": calculation.get("mount_assumption_model"),
+            "translation_source": calculation.get("baseline_source"),
+            "status": "READY" if valid_count else "NO_VALID_RESULT",
+        }
+    ]
+    devices = [
+        {
+            "device_id": name,
+            "device_type": kind,
+            "sample_count": metadata.get(count_key),
+            "status": "RECORDED" if int(metadata.get(count_key) or 0) else "NO_DATA",
+        }
+        for name, kind, count_key in (
+            ("camera-left", "camera", "camera_left_gui_frame_count"),
+            ("camera-right", "camera", "camera_right_gui_frame_count"),
+            ("pixhawk-left", "pixhawk", "px4_left_sample_count"),
+            ("pixhawk-right", "pixhawk", "px4_right_sample_count"),
+            ("pixhawk-drone", "pixhawk", "px4_drone_sample_count"),
+            ("gnss-base", "gnss", "gnss_base_sample_count"),
+        )
+    ]
+    return {
+        "measurement_id": measurement_id,
+        "summary": {
+            "status": "VALID" if valid_count else "NO_VALID_RESULT",
+            "method": calculation.get("measurement_method_id"),
+            "valid_pair_count": valid_count,
+            "blocked_pair_count": len(rows) - valid_count,
+            "warning_count": len(_review_warning_rows(rows)),
+        },
+        "results": [_review_result_row(row) for row in rows],
+        "quality": [_review_quality_row(row) for row in rows],
+        "geometry": geometry,
+        "devices": devices,
+        "captures": _review_capture_rows(metadata),
+        "warnings": _review_warning_rows(rows),
+        "artifacts": artifacts,
+    }
+
+
+def _rebuild_session_review(session_root: Path, session_id: str) -> Path:
+    from Workstation.workstation_core.session_review import write_session_review_xlsx
+
+    measurements: list[dict[str, object]] = []
+    session_summary: dict[str, object] = {}
+    state_path = session_root / "session.json"
+    if state_path.is_file():
+        try:
+            value = json.loads(state_path.read_text(encoding="utf-8"))
+            if isinstance(value, Mapping):
+                session_summary = dict(value)
+        except (OSError, ValueError):
+            session_summary = {}
+    required_measurements = {
+        str(row.get("measurement_id") or "")
+        for row in session_summary.get("measurements", ()) or ()
+        if isinstance(row, Mapping)
+        and str(row.get("state") or "") in {"SEALED_COMPLETE", "SEALED_INCOMPLETE"}
+        and row.get("measurement_id")
+    }
+    measurement_parent = session_root / "measurements"
+    if measurement_parent.is_dir():
+        roots = sorted(
+            child for child in measurement_parent.iterdir() if child.is_dir()
+        )
+    else:
+        roots = [session_root]
+    for root in roots:
+        review = _measurement_review_mapping(root, session_root=session_root)
+        if review is not None:
+            measurements.append(review)
+    included = {str(row.get("measurement_id") or "") for row in measurements}
+    missing = sorted(required_measurements - included)
+    if missing:
+        raise OSError(
+            "finalized measurements are missing from review inputs: "
+            + ", ".join(missing)
+        )
+    return write_session_review_xlsx(
+        session_root,
+        session_id=session_id,
+        measurements=measurements,
+        session_summary=session_summary,
+    )
+
+
+def rebuild_session_review(session_root: Path, session_id: str) -> Path:
+    """Regenerate the derived session workbook and persist its status."""
+
+    session_root = Path(session_root)
+    status_path = session_root / ".workstation" / "review.json"
+    try:
+        output = _rebuild_session_review(session_root, session_id)
+    except Exception as exc:
+        _write_manifest(
+            status_path,
+            {
+                "status": "failed",
+                "path": "review.xlsx",
+                "error": str(exc),
+                "regenerable": True,
+            },
+        )
+        _fsync_directory_path(status_path.parent)
+        raise
+    _write_manifest(
+        status_path,
+        {
+            "status": "generated",
+            "path": output.relative_to(session_root).as_posix(),
+            "size_bytes": output.stat().st_size,
+            "sha256": _sha256_path(output),
+            "authoritative": False,
+            "regenerable": True,
+        },
+    )
+    _fsync_directory_path(status_path.parent)
+    return output
+
+
+def _save_session_files_legacy(
     output_dir: Path,
     *,
     metadata: dict[str, object],
@@ -2015,7 +2845,7 @@ def save_session_files(
 ) -> SavedSessionFiles:
     output_dir.mkdir(parents=True, exist_ok=True)
     session_id = Path(str(metadata.get("session_id") or output_dir.name)).name
-    rows = _normalized_pair_rows(pair_rows)
+    rows = _project_pair_typed_fields(_normalized_pair_rows(pair_rows))
     camera_rows = camera_rows or {}
     px4_rows = px4_rows or {}
     gnss_base_full_rows = _normalized_generic_rows(gnss_base_rows or [])
@@ -2024,9 +2854,10 @@ def save_session_files(
         side: _normalized_generic_rows(camera_rows.get(side, []))
         for side in ("left", "right")
     }
+    px4_sides = ("left", "right", *(("drone",) if "drone" in px4_rows else ()))
     px4_full_rows = {
         side: _normalized_generic_rows(px4_rows.get(side, []))
-        for side in ("left", "right")
+        for side in px4_sides
     }
     compact_distance_rows = compact_distance_measurement_rows(rows, metadata)
     compact_camera_rows = {
@@ -2063,6 +2894,7 @@ def save_session_files(
     raw_camera_right_output = output_dir / f"{session_id}_raw_camera_right_rows.jsonl"
     raw_px4_left_output = output_dir / f"{session_id}_raw_px4_left_rows.jsonl"
     raw_px4_right_output = output_dir / f"{session_id}_raw_px4_right_rows.jsonl"
+    raw_px4_drone_output = output_dir / f"{session_id}_raw_px4_drone_rows.jsonl"
     raw_gnss_base_output = output_dir / f"{session_id}_raw_gnss_base_rows.jsonl"
     raw_extrinsics_comparison_output = output_dir / f"{session_id}_raw_extrinsics_comparison_rows.jsonl"
     manifest_output = output_dir / "session_manifest.json"
@@ -2094,6 +2926,8 @@ def save_session_files(
         "raw_extrinsics_comparison_rows_jsonl": raw_extrinsics_comparison_output.name,
         "workbook": xlsx_output.name,
     }
+    if "drone" in px4_full_rows:
+        resource_files["raw_px4_drone_rows_jsonl"] = raw_px4_drone_output.name
     if not WRITE_PARQUET_ARTIFACTS:
         for key in (
             "distance_measurements_parquet",
@@ -2141,7 +2975,7 @@ def save_session_files(
         if WRITE_PARQUET_ARTIFACTS
         else ()
     )
-    raw_jsonl_names_and_rows = (
+    raw_jsonl_names_and_rows = [
         (
             raw_pair_output.name,
             rows,
@@ -2184,7 +3018,16 @@ def save_session_files(
             "raw_extrinsics_comparison_rows_jsonl",
             "_normalized_generic_rows",
         ),
-    )
+    ]
+    if "drone" in px4_full_rows:
+        raw_jsonl_names_and_rows.append(
+            (
+                raw_px4_drone_output.name,
+                px4_full_rows["drone"],
+                "raw_px4_drone_rows_jsonl",
+                "_normalized_generic_rows",
+            )
+        )
     manifest: dict[str, object] = {
         "session_id": session_id,
         "status": "preparing",
@@ -2223,6 +3066,8 @@ def save_session_files(
             xlsx_output.name: "integrated_review_workbook",
         },
     }
+    if "drone" in px4_full_rows:
+        manifest["artifact_roles"][raw_px4_drone_output.name] = "raw_px4_drone_rows_jsonl"  # type: ignore[index]
     if not WRITE_PARQUET_ARTIFACTS:
         artifact_roles = manifest["artifact_roles"]  # type: ignore[assignment]
         for name in (
@@ -2336,25 +3181,13 @@ def save_session_files(
     )
     _write_manifest(manifest_output, manifest)
     saved = SavedSessionFiles(
-        session_static_json=static_output,
-        distance_measurements_csv=distance_csv_output,
-        distance_measurements_parquet=distance_parquet_output,
-        xlsx=xlsx_output,
-        camera_left_csv=camera_left_output,
-        camera_left_parquet=camera_left_parquet_output,
-        camera_right_csv=camera_right_output,
-        camera_right_parquet=camera_right_parquet_output,
-        px4_left_csv=px4_left_output,
-        px4_left_parquet=px4_left_parquet_output,
-        px4_right_csv=px4_right_output,
-        px4_right_parquet=px4_right_parquet_output,
-        px4_left_xlsx=px4_left_xlsx_output,
-        px4_right_xlsx=px4_right_xlsx_output,
-        session_rtk_xlsx=session_rtk_xlsx_output,
-        gnss_base_csv=gnss_base_output,
-        gnss_base_parquet=gnss_base_parquet_output,
-        extrinsics_comparison_csv=extrinsics_comparison_output,
-        extrinsics_comparison_parquet=extrinsics_comparison_parquet_output,
+        context_json=static_output,
+        measurement_pairs_parquet=distance_parquet_output,
+        camera_timeline_parquet=camera_left_parquet_output,
+        pixhawk_timeline_parquet=px4_left_parquet_output,
+        gnss_base_timeline_parquet=gnss_base_parquet_output,
+        geometry_comparison_parquet=extrinsics_comparison_parquet_output,
+        review_xlsx=xlsx_output,
         manifest=manifest_output,
         finalized=not error,
         error=error,
@@ -2376,4 +3209,221 @@ def save_session_files(
         except OSError:
             pass
         _cleanup_finalize_orphans(output_dir)
+    return saved
+
+
+def save_session_files(
+    output_dir: Path,
+    *,
+    metadata: dict[str, object],
+    pair_rows: Iterable[dict[str, object]],
+    camera_rows: dict[str, Iterable[dict[str, object]]] | None = None,
+    px4_rows: dict[str, Iterable[dict[str, object]]] | None = None,
+    gnss_base_rows: Iterable[dict[str, object]] | None = None,
+    extrinsics_comparison_rows: Iterable[dict[str, object]] | None = None,
+) -> SavedSessionFiles:
+    """Finalize one measurement as typed Parquet plus one session review.
+
+    JSONL remains the durable live spool and append-only event format.  This
+    boundary materializes the latest spool state, writes five lossless typed
+    Parquet artifacts inside a generation staging directory, verifies them,
+    and atomically swaps a single ``data`` view.  CSV and per-device XLSX
+    files are intentionally not emitted.
+    """
+
+    from Workstation.workstation_core.session_parquet import (
+        CAMERA_TIMELINE_FILENAME,
+        GEOMETRY_COMPARISON_FILENAME,
+        GNSS_BASE_TIMELINE_FILENAME,
+        MEASUREMENT_PAIRS_FILENAME,
+        PX4_TIMELINE_FILENAME,
+        finalize_session_parquet_artifacts,
+    )
+
+    output_dir = Path(output_dir)
+    session_id, measurement_id = _validate_measurement_storage_identity(
+        output_dir, metadata
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows = _project_pair_typed_fields(_normalized_pair_rows(pair_rows))
+    camera_sources = camera_rows or {}
+    px4_sources = px4_rows or {}
+    camera_full_rows = {
+        side: _iter_project_camera_typed_fields(
+            _iter_normalized_generic_rows(camera_sources.get(side, ()))
+        )
+        for side in ("left", "right")
+    }
+    px4_full_rows = {
+        source: _iter_project_px4_typed_fields(
+            _iter_normalized_generic_rows(values)
+        )
+        for source, values in px4_sources.items()
+    }
+    for source in ("left", "right"):
+        px4_full_rows.setdefault(source, [])
+    gnss_rows = _iter_normalized_generic_rows(gnss_base_rows or ())
+    geometry_rows = _iter_normalized_generic_rows(
+        extrinsics_comparison_rows or ()
+    )
+
+    manifest_output = output_dir / "measurement.json"
+    generation_id = session_id_now()
+    publish_root = _v2_publish_root(output_dir)
+    generations_root = publish_root / "generations"
+    generations_root.mkdir(parents=True, exist_ok=True)
+    staging_dir = generations_root / f"{generation_id}.preparing"
+    staging_dir.mkdir()
+    data_dir = staging_dir / "data"
+    data_dir.mkdir()
+
+    try:
+        artifacts = finalize_session_parquet_artifacts(
+            data_dir,
+            measurement_pairs=rows,
+            camera_rows=camera_full_rows,
+            px4_rows=px4_full_rows,
+            gnss_base_rows=gnss_rows,
+            geometry_comparison_rows=geometry_rows,
+        )
+        resource_files = {
+            "measurement_pairs_parquet": f"data/{MEASUREMENT_PAIRS_FILENAME}",
+            "camera_timeline_parquet": f"data/{CAMERA_TIMELINE_FILENAME}",
+            "pixhawk_timeline_parquet": f"data/{PX4_TIMELINE_FILENAME}",
+            "gnss_base_timeline_parquet": f"data/{GNSS_BASE_TIMELINE_FILENAME}",
+            "geometry_comparison_parquet": f"data/{GEOMETRY_COMPARISON_FILENAME}",
+            "context": "data/context.json",
+        }
+        context_payload = {
+            "file_type": "workstation_measurement_context",
+            "schema_version": "workstation-measurement-context-v2",
+            "session_id": session_id,
+            "measurement_id": measurement_id,
+            "time_axis": {
+                "primary": "recording_time_ns",
+                "definition": "nanoseconds elapsed from measurement recording start",
+            },
+            "resource_files": resource_files,
+            "metadata": metadata,
+        }
+        context_path = data_dir / "context.json"
+        _write_manifest(context_path, context_payload)
+        artifact_details = artifacts.to_mapping(relative_to=staging_dir)
+        context_detail = {
+            "role": "measurement_context",
+            "path": "data/context.json",
+            "format": "json",
+            "size": context_path.stat().st_size,
+            "size_unit": "bytes",
+            "sha256": _sha256_path(context_path),
+            "authoritative": True,
+            "verified": True,
+        }
+        generation_manifest = {
+            "schema": "workstation-measurement-storage-v2",
+            "session_id": session_id,
+            "measurement_id": measurement_id,
+            "status": "prepared",
+            "generation_id": generation_id,
+            "resource_files_authoritative": True,
+            "resource_files": resource_files,
+            "artifact_details": {**artifact_details, "context": context_detail},
+            "authoritative_parquet_artifacts_verified": True,
+            "time_axis": "recording_time_ns",
+        }
+        manifest = {
+            **generation_manifest,
+            "status": "finalized",
+            "phase": "published",
+            "retryable": False,
+            "published_pointer": ".workstation/publish/current",
+            "data_view": "data",
+            "publish_contract": (
+                "data and measurement.json resolve through one atomically replaced generation pointer"
+            ),
+        }
+        _write_manifest(staging_dir / "generation_manifest.json", generation_manifest)
+        _write_manifest(staging_dir / "measurement.json", manifest)
+        _fsync_directory_path(data_dir)
+        _fsync_directory_path(staging_dir)
+        generation_dir = generations_root / generation_id
+        os.replace(staging_dir, generation_dir)
+        _fsync_directory_path(generations_root)
+        _publish_v2_generation(output_dir, generation_dir)
+    except Exception as exc:
+        failure = {
+            "schema": "workstation-measurement-storage-v2",
+            "session_id": session_id,
+            "measurement_id": measurement_id,
+            "status": "failed",
+            "phase": "prepare_or_publish_parquet",
+            "error": str(exc),
+            "retryable": True,
+            "generation_id": generation_id,
+        }
+        failure_path = output_dir / ".workstation" / "save_failure.json"
+        _write_manifest(failure_path, failure)
+        _fsync_directory_path(failure_path.parent)
+        raise
+    failure_path = output_dir / ".workstation" / "save_failure.json"
+    failure_path.unlink(missing_ok=True)
+    _fsync_directory_path(failure_path.parent)
+
+    session_root = _owning_session_root(output_dir)
+    review_path = session_root / "review.xlsx"
+    review_status_path = session_root / ".workstation" / "review.json"
+    review_error = ""
+    review_pending = output_dir.parent.name == "measurements"
+    if review_pending:
+        _write_manifest(
+            review_status_path,
+            {
+                "status": "pending_session_close",
+                "path": "review.xlsx",
+                "regenerable": True,
+            },
+        )
+        _fsync_directory_path(review_status_path.parent)
+    else:
+        try:
+            review_path = rebuild_session_review(session_root, session_id)
+        except Exception as exc:
+            # The workbook is a reproducible operator view, never the
+            # measurement source of truth. Preserve an older review and keep
+            # typed evidence finalized when regeneration fails.
+            review_error = str(exc)
+
+    data_view = output_dir / "data"
+    saved = SavedSessionFiles(
+        context_json=data_view / "context.json",
+        measurement_pairs_parquet=data_view / MEASUREMENT_PAIRS_FILENAME,
+        camera_timeline_parquet=data_view / CAMERA_TIMELINE_FILENAME,
+        pixhawk_timeline_parquet=data_view / PX4_TIMELINE_FILENAME,
+        gnss_base_timeline_parquet=data_view / GNSS_BASE_TIMELINE_FILENAME,
+        geometry_comparison_parquet=data_view / GEOMETRY_COMPARISON_FILENAME,
+        review_xlsx=review_path,
+        manifest=manifest_output,
+        finalized=True,
+        review_error=review_error,
+        review_pending=review_pending,
+    )
+    for source_rows in (
+        pair_rows,
+        *camera_sources.values(),
+        *px4_sources.values(),
+        gnss_base_rows,
+        extrinsics_comparison_rows,
+    ):
+        if isinstance(source_rows, SpoolRows):
+            source_rows.discard_spool()
+    recovery_metadata = output_dir / ".spool" / "session_metadata.json"
+    try:
+        recovery_metadata.unlink(missing_ok=True)
+    except OSError:
+        pass
+    try:
+        recovery_metadata.parent.rmdir()
+    except OSError:
+        pass
+    _cleanup_v2_generations(output_dir)
     return saved

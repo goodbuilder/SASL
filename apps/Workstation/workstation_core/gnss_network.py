@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import math
 import os
 import socket
 import ssl
@@ -147,6 +148,7 @@ def format_nmea_gga(
     fix_quality: int = 1,
     satellites: int = 12,
     hdop: float = 1.0,
+    geoid_separation_m: float | None = None,
 ) -> str:
     """Format a checksummed GGA sentence for a caster/VRS position hint."""
 
@@ -157,10 +159,17 @@ def format_nmea_gga(
     lat, lat_dir = _nmea_coordinate(float(latitude_deg), latitude=True)
     lon, lon_dir = _nmea_coordinate(float(longitude_deg), latitude=False)
     time_text = moment.strftime("%H%M%S.%f")[:9]
+    if geoid_separation_m is None:
+        geoid_text = ""
+    else:
+        geoid_value = float(geoid_separation_m)
+        if not math.isfinite(geoid_value):
+            raise ValueError("geoid_separation_m must be finite")
+        geoid_text = f"{geoid_value:.3f}"
     body = (
         f"GPGGA,{time_text}"
         f",{lat},{lat_dir},{lon},{lon_dir},{int(fix_quality)},{int(satellites):02d},"
-        f"{float(hdop):.1f},{float(altitude_m):.3f},M,0.000,M,,"
+        f"{float(hdop):.1f},{float(altitude_m):.3f},M,{geoid_text},M,,"
     )
     return f"${body}*{_nmea_checksum(body)}"
 
@@ -173,6 +182,12 @@ def gga_from_position(position: Any, *, utc_datetime: datetime | None = None) ->
     altitude = getattr(position, "altitude_m", None)
     if latitude is None or longitude is None or altitude is None:
         return None
+    ellipsoid = getattr(position, "altitude_ellipsoid_m", None)
+    geoid_separation = (
+        None
+        if ellipsoid is None
+        else float(ellipsoid) - float(altitude)
+    )
     return format_nmea_gga(
         latitude,
         longitude,
@@ -184,6 +199,7 @@ def gga_from_position(position: Any, *, utc_datetime: datetime | None = None) ->
         fix_quality=4 if getattr(position, "fix_type", None) == 6 else 1,
         satellites=getattr(position, "satellites_used", None) or 12,
         hdop=getattr(position, "eph_m", None) or 1.0,
+        geoid_separation_m=geoid_separation,
     )
 
 
@@ -191,10 +207,11 @@ def gga_from_coordinate_sample(sample: Any, *, utc_datetime: datetime | None = N
     """Format NMEA GGA from a WGS84 geodetic Base coordinate sample.
 
     ``GnssCoordinateSample`` stores the Base position as latitude/longitude
-    degrees and heights in metres.  GGA's altitude field is represented as an
-    MSL value when the receiver supplied one; ellipsoidal height is the
-    explicit fallback.  This helper never converts the coordinate into the
-    rover NED/ENU baseline frame.
+    degrees and heights in metres.  GGA's altitude field is MSL; when both MSL
+    and ellipsoid heights are present their difference is emitted as the geoid
+    separation.  Missing MSL height fails closed instead of relabeling an
+    ellipsoid height as MSL.  This helper never converts the coordinate into
+    the rover NED/ENU baseline frame.
     """
 
     latitude = getattr(sample, "latitude_deg", None)
@@ -203,11 +220,13 @@ def gga_from_coordinate_sample(sample: Any, *, utc_datetime: datetime | None = N
         return None
     altitude = getattr(sample, "msl_altitude_m", None)
     if altitude is None:
-        altitude = getattr(sample, "ellipsoid_height_m", None)
-    if altitude is None:
-        altitude = getattr(sample, "selected_height_m", None)
-    if altitude is None:
         return None
+    ellipsoid = getattr(sample, "ellipsoid_height_m", None)
+    geoid_separation = (
+        None
+        if ellipsoid is None
+        else float(ellipsoid) - float(altitude)
+    )
     return format_nmea_gga(
         latitude,
         longitude,
@@ -217,6 +236,7 @@ def gga_from_coordinate_sample(sample: Any, *, utc_datetime: datetime | None = N
         fix_quality=4 if bool(getattr(sample, "fixed", False)) else 1,
         satellites=getattr(sample, "satellites_used", None) or 12,
         hdop=1.0,
+        geoid_separation_m=geoid_separation,
     )
 
 

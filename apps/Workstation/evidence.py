@@ -10,6 +10,7 @@ coordinate conversion, save, or calibration operation.
 
 import time
 import csv
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping
@@ -27,6 +28,17 @@ from Workstation.workstation_core.coordinate_contract import (
     MEASUREMENT_FRAME,
     WORLD_FRAME,
 )
+
+
+def _sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _widget_text(widget: object | None, default: str = "") -> str:
@@ -111,6 +123,8 @@ def _matrix_value(matrix: object, row: int, column: int) -> float | None:
 def resolve_session_artifact_path(
     session_root: Path | str,
     artifact_name: str,
+    *,
+    allow_published: bool = True,
 ) -> Path | None:
     """Resolve one session-owned artifact without discarding subdirectories.
 
@@ -129,7 +143,9 @@ def resolve_session_artifact_path(
     relative = Path(raw)
     if relative.is_absolute() or "\x00" in raw:
         return None
-    candidates = (root / relative, root / "published" / relative)
+    candidates = [root / relative]
+    if allow_published:
+        candidates.append(root / "published" / relative)
     for unresolved in candidates:
         try:
             candidate = unresolved.resolve()
@@ -139,6 +155,613 @@ def resolve_session_artifact_path(
         if candidate.exists():
             return candidate
     return None
+
+
+def _safe_session_relative_path(session_root: Path, value: object) -> str | None:
+    """Return a normalized session-relative path only when it cannot escape.
+
+    Package manifests are review input, not trusted filesystem authority.  Keep
+    their nested paths intact while rejecting absolute paths, explicit parent
+    traversal, NULs, and paths whose existing symlink prefix leaves the session.
+    The target itself need not exist because missing artifacts are evidence too.
+    """
+
+    raw = str(value or "").strip()
+    if not raw or "\x00" in raw:
+        return None
+    relative = Path(raw)
+    if relative.is_absolute() or any(part == ".." for part in relative.parts):
+        return None
+    normalized = Path(*[part for part in relative.parts if part not in ("", ".")])
+    if not normalized.parts:
+        return None
+    root = session_root.expanduser().resolve()
+    try:
+        (root / normalized).resolve().relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return normalized.as_posix()
+
+
+def _recording_session_directories(recordings_root: Path) -> tuple[Path, ...]:
+    """Return v2 direct sessions followed by legacy ``sessions/`` entries."""
+
+    root = recordings_root.expanduser().resolve()
+    candidates: list[Path] = []
+    if root.is_dir():
+        candidates.extend(
+            child
+            for child in root.iterdir()
+            if child.name != "sessions"
+            and not child.name.startswith(".")
+            and child.is_dir()
+            and not child.is_symlink()
+        )
+    legacy = root / "sessions"
+    if legacy.is_dir() and not legacy.is_symlink():
+        candidates.extend(
+            child
+            for child in legacy.iterdir()
+            if child.is_dir() and not child.is_symlink()
+        )
+    grouped: dict[str, list[Path]] = {}
+    for candidate in candidates:
+        grouped.setdefault(candidate.name, []).append(candidate)
+    # Ambiguous direct/legacy IDs are deliberately absent from automatic
+    # review.  Recovery reports the collision and requires an explicit choice.
+    return tuple(values[0] for values in grouped.values() if len(values) == 1)
+
+
+def _resolve_recording_session_directory(
+    recordings_root: Path,
+    session_id: object,
+) -> Path | None:
+    """Resolve a safe session ID, preferring the v2 direct location."""
+
+    component = str(session_id or "")
+    if (
+        not component
+        or Path(component).name != component
+        or component in {".", "..", "sessions"}
+        or "\\" in component
+        or "\x00" in component
+    ):
+        return None
+    from Workstation.workstation_core.recording_session import resolve_session_dir
+
+    root = recordings_root.expanduser().resolve()
+    try:
+        resolved = resolve_session_dir(root, component).resolve(strict=True)
+        resolved.relative_to(root)
+    except (FileExistsError, FileNotFoundError, OSError, RuntimeError, ValueError):
+        return None
+    return resolved if resolved.is_dir() and not resolved.is_symlink() else None
+
+
+def _package_manifest_reference(
+    session_root: Path,
+) -> tuple[Path | None, dict[str, object], str, bool, str]:
+    """Locate the authoritative revision manifest without following unsafe pointers.
+
+    The return value is ``(path, latest_pointer, error, detected, relative_path)``.
+    An existing latest pointer is authoritative; a malformed or unsafe pointer is
+    reported rather than silently falling back to an arbitrary revision.
+    """
+
+    latest_path = session_root / "latest_revision.json"
+    if latest_path.exists() or latest_path.is_symlink():
+        safe_latest = _safe_session_relative_path(session_root, "latest_revision.json")
+        if safe_latest is None or not latest_path.is_file():
+            return None, {}, "latest_revision.json is not a safe regular file", True, ""
+        try:
+            latest_payload = json.loads(latest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError) as exc:
+            return None, {}, f"malformed latest_revision.json: {exc}", True, ""
+        if not isinstance(latest_payload, Mapping):
+            return None, {}, "malformed latest_revision.json: expected a JSON object", True, ""
+        latest = {str(key): value for key, value in latest_payload.items()}
+        manifest_value = latest.get("manifest_path")
+        if manifest_value in (None, ""):
+            revision = latest.get("revision")
+            if revision in (None, ""):
+                return None, latest, "latest_revision.json has no manifest_path or revision", True, ""
+            revision_text = str(revision)
+            if revision_text.isdigit():
+                revision_text = f"r{int(revision_text):04d}"
+            manifest_value = f"revisions/{revision_text}/package_manifest.json"
+        relative = _safe_session_relative_path(session_root, manifest_value)
+        if relative is None:
+            return None, latest, "latest_revision.json contains an unsafe manifest_path", True, ""
+        parts = Path(relative).parts
+        if len(parts) != 3 or parts[0] != "revisions" or parts[2] != "package_manifest.json":
+            return None, latest, "latest_revision.json manifest_path is not a revision package manifest", True, relative
+        manifest_path = session_root / relative
+        if not manifest_path.is_file():
+            return None, latest, f"latest package manifest is missing: {relative}", True, relative
+        return manifest_path, latest, "", True, relative
+
+    revisions_root = session_root / "revisions"
+    if not revisions_root.is_dir():
+        return None, {}, "", False, ""
+    if _safe_session_relative_path(session_root, "revisions") is None:
+        return None, {}, "package revisions directory escapes the session", True, ""
+    candidates: list[tuple[str, Path]] = []
+    unsafe_manifest_seen = False
+    try:
+        revision_dirs = tuple(revisions_root.iterdir())
+    except OSError as exc:
+        return None, {}, f"cannot scan package revisions: {exc}", True, ""
+    for revision_dir in revision_dirs:
+        candidate = revision_dir / "package_manifest.json"
+        relative = _safe_session_relative_path(session_root, candidate.relative_to(session_root))
+        if candidate.exists() and relative is None:
+            unsafe_manifest_seen = True
+        elif relative is not None and candidate.is_file():
+            candidates.append((relative, candidate))
+    if not candidates:
+        if unsafe_manifest_seen:
+            return None, {}, "revision package manifest escapes the session", True, ""
+        return None, {}, "", False, ""
+    def revision_sort_key(item: tuple[str, Path]) -> tuple[int, int, str]:
+        revision_name = Path(item[0]).parts[1]
+        if revision_name.startswith("r") and revision_name[1:].isdigit():
+            return (1, int(revision_name[1:]), item[0])
+        return (0, 0, item[0])
+
+    relative, manifest_path = max(candidates, key=revision_sort_key)
+    return manifest_path, {}, "", True, relative
+
+
+def _mapping_state(value: object, *, default: str = "") -> str:
+    if isinstance(value, Mapping):
+        for key in ("state", "status", "value"):
+            candidate = value.get(key)
+            if candidate not in (None, ""):
+                return str(candidate)
+        return default
+    return default if value in (None, "") else str(value)
+
+
+def _reason_values(value: object) -> tuple[str, ...]:
+    """Flatten list/mapping reason fields without inventing an interpretation."""
+
+    reasons: list[str] = []
+
+    def append(item: object, label: str = "") -> None:
+        if item in (None, "", False):
+            return
+        if isinstance(item, str):
+            reasons.append(f"{label}: {item}" if label else item)
+            return
+        if isinstance(item, Mapping):
+            identity = next(
+                (
+                    str(item.get(key))
+                    for key in ("artifact_id", "relative_path", "path", "role", "source_id")
+                    if item.get(key) not in (None, "")
+                ),
+                label,
+            )
+            detail = next(
+                (
+                    item.get(key)
+                    for key in ("reason", "message", "error", "detail")
+                    if item.get(key) not in (None, "")
+                ),
+                None,
+            )
+            if detail is not None:
+                append(detail, identity)
+                return
+            nested = next(
+                (item.get(key) for key in ("reasons", "missing_required", "issues") if key in item),
+                None,
+            )
+            if nested is not None:
+                append(nested, identity)
+                return
+            source = item.get("source")
+            role = item.get("role")
+            status = item.get("status")
+            if source not in (None, "") and role not in (None, "") and status not in (None, ""):
+                reasons.append(f"{source}/{role}: {status}")
+                return
+            for key, nested_value in item.items():
+                append(nested_value, str(key))
+            return
+        if isinstance(item, (list, tuple, set)):
+            for nested_item in item:
+                append(nested_item, label)
+            return
+        reasons.append(f"{label}: {item}" if label else str(item))
+
+    append(value)
+    return tuple(dict.fromkeys(reason for reason in reasons if reason))
+
+
+def _artifact_reason(detail: Mapping[str, object]) -> str:
+    metadata = detail.get("metadata")
+    for source in (detail, metadata if isinstance(metadata, Mapping) else {}):
+        for key in ("reason", "error", "message", "detail"):
+            value = source.get(key)
+            if value not in (None, ""):
+                return str(value)
+    return ""
+
+
+def _package_artifact_projection(
+    session_root: Path,
+    value: object,
+) -> tuple[tuple[dict[str, object], ...], tuple[str, ...], tuple[str, ...], int]:
+    """Normalize list- or mapping-shaped artifact inventories."""
+
+    raw_entries: list[tuple[str, object]] = []
+    if isinstance(value, Mapping):
+        raw_entries.extend((str(key), detail) for key, detail in value.items())
+    elif isinstance(value, (list, tuple)):
+        raw_entries.extend((str(index), detail) for index, detail in enumerate(value))
+    elif value not in (None, ""):
+        raw_entries.append(("0", value))
+
+    entries: list[dict[str, object]] = []
+    missing: list[str] = []
+    failed: list[str] = []
+    total_bytes = 0
+    for key, raw_detail in raw_entries:
+        if isinstance(raw_detail, Mapping):
+            detail = {str(name): item for name, item in raw_detail.items()}
+        elif isinstance(raw_detail, str):
+            detail = (
+                {"status": raw_detail}
+                if isinstance(value, Mapping)
+                else {"relative_path": raw_detail}
+            )
+        else:
+            detail = {"status": raw_detail}
+        artifact_id = str(detail.get("artifact_id") or key)
+        declared_path = detail.get("relative_path", detail.get("path"))
+        if (
+            declared_path in (None, "")
+            and isinstance(value, Mapping)
+            and detail.get("artifact_id") in (None, "")
+        ):
+            declared_path = key
+        relative_path = (
+            _safe_session_relative_path(session_root, declared_path)
+            if declared_path not in (None, "")
+            else None
+        )
+        state = _mapping_state(detail.get("status", detail.get("state")), default="present")
+        state_lower = state.lower()
+        reason = _artifact_reason(detail)
+        if declared_path not in (None, "") and relative_path is None:
+            failed.append(f"{artifact_id}: unsafe artifact path rejected")
+        elif state_lower == "present" and relative_path is None:
+            failed.append(f"{artifact_id}: present artifact has no relative_path")
+        if state_lower == "missing":
+            missing.append(f"{artifact_id}: {reason}" if reason else artifact_id)
+        elif state_lower == "failed":
+            failed.append(f"{artifact_id}: {reason}" if reason else artifact_id)
+
+        size_bytes = _integer(detail.get("size_bytes", detail.get("size")))
+        if (
+            size_bytes is not None
+            and size_bytes >= 0
+            and relative_path is not None
+            and state_lower == "present"
+        ):
+            total_bytes += size_bytes
+        else:
+            size_bytes = None
+        entries.append(
+            {
+                "artifact_id": artifact_id,
+                "role": str(detail.get("role") or ""),
+                "classification": str(detail.get("classification") or ""),
+                "relative_path": relative_path or "",
+                "producer": str(detail.get("producer") or ""),
+                "source": str(detail.get("source") or detail.get("source_id") or ""),
+                "required": bool(detail.get("required", False)),
+                "status": state,
+                "media_type": str(detail.get("media_type") or ""),
+                "schema": detail.get("schema"),
+                "size_bytes": size_bytes,
+                "sha256": str(detail.get("sha256") or ""),
+                "reason": reason,
+            }
+        )
+    return (
+        tuple(entries),
+        tuple(dict.fromkeys(missing)),
+        tuple(dict.fromkeys(failed)),
+        total_bytes,
+    )
+
+
+def _package_error_projection(
+    session_root: Path,
+    *,
+    error: str,
+    relative_path: str,
+    latest: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    latest = latest if isinstance(latest, Mapping) else {}
+    revision = str(latest.get("revision") or (Path(relative_path).parent.name if relative_path else ""))
+    revision_number = _integer(latest.get("revision_number"))
+    hash_summary = {
+        "status": "NOT_RUN",
+        "manifest_status": "UNREADABLE",
+        "expected_manifest_sha256": str(latest.get("manifest_sha256") or ""),
+        "actual_manifest_sha256": "",
+        "artifact_hashes_declared": 0,
+        "artifacts_verified": 0,
+        "artifacts_failed": 0,
+        "artifacts_not_run": 0,
+    }
+    return {
+        "session_id": session_root.name,
+        "path": str(session_root),
+        "status": "INTEGRITY_FAILED",
+        "lifecycle_state": "UNKNOWN",
+        "completeness_state": "UNKNOWN",
+        "evidence_complete": False,
+        "integrity_status": "INTEGRITY_FAILED",
+        "package_schema": "",
+        "package_schema_version": None,
+        "revision": revision,
+        "revision_number": revision_number,
+        "package_manifest_path": relative_path,
+        "missing_reasons": (),
+        "failed_reasons": (error,),
+        "total_bytes": 0,
+        "hash_verification": hash_summary,
+        "hash_verification_summary": hash_summary,
+        "source_expectations": (),
+        "artifact_details": (),
+        "artifacts": (),
+        "error": error,
+        "package_manifest_error": True,
+        "retryable": False,
+        "published_target": "",
+        "phase": "",
+        "generation_id": "",
+        "source": relative_path or "latest_revision.json",
+        "time_axis": "recording_time_ns",
+        "legacy": False,
+    }
+
+
+def _package_session_projection(
+    session_root: Path,
+    *,
+    owning_session_id: str | None = None,
+    measurement_id: str | None = None,
+) -> dict[str, object] | None:
+    expected_session_id = str(owning_session_id or session_root.name)
+    expected_measurement_id = str(measurement_id or "")
+
+    def identified(entry: dict[str, object]) -> dict[str, object]:
+        entry["session_id"] = expected_session_id
+        entry["measurement_id"] = expected_measurement_id
+        entry["catalog_key"] = (
+            f"{expected_session_id}::{expected_measurement_id}"
+            if expected_measurement_id
+            else expected_session_id
+        )
+        entry["layout"] = "nested-v2" if expected_measurement_id else "legacy-flat-v1"
+        entry["session_root"] = str(
+            session_root.parent.parent if expected_measurement_id else session_root
+        )
+        return entry
+
+    manifest_path, latest, locate_error, detected, relative_path = _package_manifest_reference(session_root)
+    if not detected:
+        return None
+    if locate_error or manifest_path is None:
+        return identified(_package_error_projection(
+            session_root,
+            error=locate_error or "package manifest is unavailable",
+            relative_path=relative_path,
+            latest=latest,
+        ))
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+        payload = json.loads(manifest_bytes.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        return identified(_package_error_projection(
+            session_root,
+            error=f"malformed package manifest: {exc}",
+            relative_path=relative_path,
+            latest=latest,
+        ))
+    if not isinstance(payload, Mapping):
+        return identified(_package_error_projection(
+            session_root,
+            error="malformed package manifest: expected a JSON object",
+            relative_path=relative_path,
+            latest=latest,
+        ))
+    manifest = {str(key): value for key, value in payload.items()}
+    artifact_details, artifact_missing, artifact_failed, total_bytes = _package_artifact_projection(
+        session_root,
+        manifest.get("artifacts", manifest.get("files", manifest.get("inventory"))),
+    )
+    artifacts = tuple(
+        sorted(
+            {
+                str(detail["relative_path"])
+                for detail in artifact_details
+                if detail.get("relative_path")
+            }
+        )
+    )
+    completeness = manifest.get("evidence_completeness", manifest.get("completeness"))
+    completeness_state = _mapping_state(completeness, default="UNKNOWN")
+    completeness_mapping = completeness if isinstance(completeness, Mapping) else {}
+    complete_value = completeness_mapping.get("complete")
+    if completeness_state == "UNKNOWN" and complete_value is not None:
+        completeness_state = "COMPLETE" if bool(complete_value) else "INCOMPLETE"
+    evidence_complete = (
+        bool(complete_value)
+        if complete_value is not None
+        else completeness_state.upper() == "COMPLETE"
+    )
+    manifest_missing = _reason_values(
+        completeness_mapping.get("missing_required", manifest.get("missing_reasons"))
+    )
+    manifest_failed = _reason_values(
+        completeness_mapping.get("failed", manifest.get("failed_reasons"))
+    )
+    missing_reasons = tuple(dict.fromkeys((*manifest_missing, *artifact_missing)))
+    failed_reasons = list(dict.fromkeys((*manifest_failed, *artifact_failed)))
+
+    actual_manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    expected_manifest_sha256 = str(latest.get("manifest_sha256") or "")
+    manifest_hash_status = "UNAVAILABLE"
+    integrity_status = "NOT_VERIFIED"
+    if expected_manifest_sha256:
+        if len(expected_manifest_sha256) != 64 or any(
+            character not in "0123456789abcdefABCDEF" for character in expected_manifest_sha256
+        ):
+            manifest_hash_status = "INVALID_EXPECTED_HASH"
+            integrity_status = "INTEGRITY_FAILED"
+            failed_reasons.append("latest_revision.json manifest_sha256 is not a SHA-256 digest")
+        elif actual_manifest_sha256.lower() == expected_manifest_sha256.lower():
+            manifest_hash_status = "VERIFIED"
+            integrity_status = "MANIFEST_VERIFIED"
+        else:
+            manifest_hash_status = "MISMATCH"
+            integrity_status = "INTEGRITY_FAILED"
+            failed_reasons.append("package manifest SHA-256 does not match latest_revision.json")
+    declared_hashes = sum(bool(detail.get("sha256")) for detail in artifact_details)
+    present_artifacts = sum(str(detail.get("status") or "").lower() == "present" for detail in artifact_details)
+    hash_summary = {
+        "status": (
+            "INTEGRITY_FAILED"
+            if integrity_status == "INTEGRITY_FAILED"
+            else "ARTIFACTS_NOT_RUN"
+        ),
+        "manifest_status": manifest_hash_status,
+        "expected_manifest_sha256": expected_manifest_sha256,
+        "actual_manifest_sha256": actual_manifest_sha256,
+        "artifact_hashes_declared": declared_hashes,
+        "artifacts_verified": 0,
+        "artifacts_failed": 0,
+        "artifacts_not_run": present_artifacts,
+    }
+
+    schema = manifest.get("schema", manifest.get("package_schema", ""))
+    schema_name = _mapping_state(schema)
+    if isinstance(schema, Mapping):
+        schema_name = str(schema.get("name") or schema.get("id") or schema_name)
+    schema_version = _integer(
+        manifest.get(
+            "schema_version",
+            schema.get("version") if isinstance(schema, Mapping) else None,
+        )
+    )
+    lifecycle_state = _mapping_state(
+        manifest.get("state", manifest.get("lifecycle", manifest.get("status"))),
+        default="UNKNOWN",
+    )
+    manifest_session_id = str(manifest.get("session_id") or session_root.name)
+    if manifest_session_id != expected_session_id:
+        failed_reasons.append(
+            f"package manifest session_id {manifest_session_id!r} does not match owning session {expected_session_id!r}"
+        )
+        integrity_status = "INTEGRITY_FAILED"
+        hash_summary["status"] = "INTEGRITY_FAILED"
+    manifest_metadata = manifest.get("metadata")
+    manifest_metadata = manifest_metadata if isinstance(manifest_metadata, Mapping) else {}
+    declared_measurement_id = str(manifest_metadata.get("measurement_id") or "")
+    if expected_measurement_id and declared_measurement_id != expected_measurement_id:
+        failed_reasons.append(
+            f"package measurement_id {declared_measurement_id!r} does not match directory {expected_measurement_id!r}"
+        )
+        integrity_status = "INTEGRITY_FAILED"
+        hash_summary["status"] = "INTEGRITY_FAILED"
+    if schema_name and schema_name != "workstation-measurement-package-v1":
+        failed_reasons.append(f"unsupported package schema: {schema_name}")
+        integrity_status = "INTEGRITY_FAILED"
+        hash_summary["status"] = "INTEGRITY_FAILED"
+    elif not schema_name:
+        failed_reasons.append("package manifest schema is missing")
+        integrity_status = "INTEGRITY_FAILED"
+        hash_summary["status"] = "INTEGRITY_FAILED"
+    if schema_version != 1:
+        failed_reasons.append(f"unsupported package schema version: {schema_version}")
+        integrity_status = "INTEGRITY_FAILED"
+        hash_summary["status"] = "INTEGRITY_FAILED"
+    source_expectations = manifest.get("source_expectations", ())
+    if isinstance(source_expectations, Mapping):
+        source_expectations = tuple(source_expectations.values())
+    elif isinstance(source_expectations, list):
+        source_expectations = tuple(source_expectations)
+    elif not isinstance(source_expectations, tuple):
+        source_expectations = ()
+    revision = str(manifest.get("revision") or latest.get("revision") or Path(relative_path).parent.name)
+    revision_number = _integer(manifest.get("revision_number", latest.get("revision_number")))
+    revision_directory = Path(relative_path).parent.name
+    if revision != revision_directory:
+        failed_reasons.append(
+            f"package manifest revision {revision!r} does not match directory {revision_directory!r}"
+        )
+        integrity_status = "INTEGRITY_FAILED"
+        hash_summary["status"] = "INTEGRITY_FAILED"
+    if latest:
+        pointer_schema = str(latest.get("schema") or "")
+        if pointer_schema and pointer_schema != "workstation-measurement-package-latest-v1":
+            failed_reasons.append(f"unsupported latest revision pointer schema: {pointer_schema}")
+            integrity_status = "INTEGRITY_FAILED"
+            hash_summary["status"] = "INTEGRITY_FAILED"
+        pointer_session = str(latest.get("session_id") or "")
+        if pointer_session and pointer_session != manifest_session_id:
+            failed_reasons.append("latest revision pointer session_id does not match package manifest")
+            integrity_status = "INTEGRITY_FAILED"
+            hash_summary["status"] = "INTEGRITY_FAILED"
+        pointer_revision = str(latest.get("revision") or "")
+        if pointer_revision and pointer_revision != revision:
+            failed_reasons.append("latest revision pointer revision does not match package manifest")
+            integrity_status = "INTEGRITY_FAILED"
+            hash_summary["status"] = "INTEGRITY_FAILED"
+        pointer_number = _integer(latest.get("revision_number"))
+        if pointer_number is not None and pointer_number != revision_number:
+            failed_reasons.append("latest revision pointer revision_number does not match package manifest")
+            integrity_status = "INTEGRITY_FAILED"
+            hash_summary["status"] = "INTEGRITY_FAILED"
+    status = "INTEGRITY_FAILED" if integrity_status == "INTEGRITY_FAILED" else lifecycle_state
+    return identified({
+        "session_id": expected_session_id,
+        "measurement_id": expected_measurement_id,
+        "path": str(session_root),
+        "status": status,
+        "lifecycle_state": lifecycle_state,
+        "completeness_state": completeness_state,
+        "evidence_complete": evidence_complete,
+        "integrity_status": integrity_status,
+        "package_schema": schema_name,
+        "package_schema_version": schema_version,
+        "revision": revision,
+        "revision_number": revision_number,
+        "package_manifest_path": relative_path,
+        "missing_reasons": missing_reasons,
+        "failed_reasons": tuple(dict.fromkeys(failed_reasons)),
+        "total_bytes": total_bytes,
+        "hash_verification": hash_summary,
+        "hash_verification_summary": hash_summary,
+        "source_expectations": source_expectations,
+        "artifact_details": artifact_details,
+        "artifacts": artifacts,
+        "error": "; ".join(dict.fromkeys(failed_reasons)),
+        "package_manifest_error": False,
+        "retryable": lifecycle_state == "RECOVERABLE",
+        "published_target": "",
+        "phase": lifecycle_state,
+        "generation_id": "",
+        "source": f"{relative_path} package source of truth",
+        "time_axis": str(manifest.get("time_axis", "recording_time_ns") or "recording_time_ns"),
+        "legacy": False,
+    })
 
 
 def _run_ledger_artifact_names(session_root: Path) -> set[str]:
@@ -173,6 +796,19 @@ def _run_ledger_artifact_names(session_root: Path) -> set[str]:
         # The catalog remains usable even when a ledger needs forensic repair.
         pass
     return names
+
+
+def _existing_artifact_byte_total(session_root: Path, artifacts: tuple[str, ...]) -> int:
+    total = 0
+    for name in artifacts:
+        candidate = resolve_session_artifact_path(session_root, name)
+        if candidate is None or not candidate.is_file():
+            continue
+        try:
+            total += candidate.stat().st_size
+        except OSError:
+            continue
+    return total
 
 
 def mavlink_link_provenance(panel: object, side: str) -> dict[str, object]:
@@ -629,6 +1265,20 @@ class EvidenceAdapter:
             "device_id": str(getattr(latest_coordinate, "device_id", "") or ""),
             "age_s": _age(getattr(latest_coordinate, "timestamp_s", None), now),
             "position_contract": "WGS84 latitude/longitude degrees; heights metres with explicit height type",
+            "fix_type": getattr(latest_coordinate, "fix_type", None),
+            "carrier_solution": getattr(latest_coordinate, "carrier_solution", None),
+            "fix_stage_label": (
+                "--" if latest_coordinate is None else str(getattr(latest_coordinate, "fix_stage_label", "UNKNOWN"))
+            ),
+        }
+        satellite_quality = getattr(self.panel, "gnss_base_satellite_quality", None)
+        satellite_quality = satellite_quality if isinstance(satellite_quality, Mapping) else {}
+        satellites = {
+            "count": getattr(self.panel, "gnss_base_satellite_count", None),
+            "count_source": str(getattr(self.panel, "gnss_base_satellite_count_source", "") or ""),
+            "used": _integer(satellite_quality.get("used")),
+            "tracked": _integer(satellite_quality.get("tracked")),
+            "avg_cno_dbhz": _number(satellite_quality.get("avg_cno_dbhz")),
         }
 
         profile = getattr(self.panel, "gnss_fixed_base_profile", None)
@@ -638,6 +1288,13 @@ class EvidenceAdapter:
         except Exception:
             profile_values = {}
         profile_values = profile_values if isinstance(profile_values, Mapping) else {}
+        live_profile = getattr(self.panel, "gnss_fixed_base_live_profile", None)
+        live_profile_method = getattr(live_profile, "to_mapping", None)
+        try:
+            live_profile_values = live_profile_method() if callable(live_profile_method) else {}
+        except Exception:
+            live_profile_values = {}
+        live_profile_values = live_profile_values if isinstance(live_profile_values, Mapping) else {}
         readiness = None
         readiness_method = getattr(manager, "readiness", None)
         if callable(readiness_method):
@@ -674,6 +1331,16 @@ class EvidenceAdapter:
             {str(key): _integer(value, 0) for key, value in ntrip_message_types.items()}
             if isinstance(ntrip_message_types, Mapping)
             else {}
+        )
+        # A fresh, high-rate RTCM stream can still be useless for RTK: 1005/1006
+        # (station coordinate) and 1070-1129 (MSM observables) are the message
+        # classes an RTK solution actually needs. Ephemeris/antenna-descriptor
+        # messages (1019/1020/1033/1042/1007/...) alone will never converge.
+        ntrip_base_position_present = any(
+            int(key) in {1005, 1006} for key in ntrip_message_types if key.lstrip("-").isdigit()
+        )
+        ntrip_msm_present = any(
+            1070 <= int(key) <= 1129 for key in ntrip_message_types if key.lstrip("-").isdigit()
         )
         rover_fixed_since = getattr(self.panel, "gnss_rover_fixed_since", {}) or {}
         rover_fixed_since = rover_fixed_since if isinstance(rover_fixed_since, Mapping) else {}
@@ -755,15 +1422,19 @@ class EvidenceAdapter:
                 "rtcm_age_s": ntrip_health.rtcm_age_s,
                 "rtcm_frames": _integer(stats.get("frames"), 0),
                 "rtcm_message_types": ntrip_message_types,
+                "rtcm_base_position_present": ntrip_base_position_present,
+                "rtcm_msm_present": ntrip_msm_present,
                 "reconnect_count": ntrip_health.reconnect_count,
                 "last_error": ntrip_health.last_error,
                 "transport_stale_after_s": _number(network_config.get("read_timeout_s"), 10.0),
                 "correction_stale_after_s": _number(readiness_config.get("maximum_correction_age_s"), 3.0),
             },
             "base_coordinate": coordinate,
+            "satellites": satellites,
             "fixed_base": {
                 "sample_count": _safe_len(coordinate_samples),
                 "profile": dict(profile_values),
+                "live_profile": dict(live_profile_values),
                 "target_acquisition_duration_s": _number(fixed_config.get("acquisition_duration_s")),
                 "target_fixed_duration_s": _number(fixed_config.get("minimum_fixed_duration_s")),
                 "target_fixed_ratio": _number(fixed_config.get("minimum_fixed_ratio")),
@@ -1027,7 +1698,9 @@ class EvidenceAdapter:
 
         def setting(name: str, default: object = None) -> object:
             value = getattr(settings, name, default)
-            return default if value is None else value
+            value = default if value is None else value
+            resolver = getattr(self.panel, "_workstation_setting", None)
+            return resolver(name, value) if callable(resolver) else value
 
         weights = _widget_text(getattr(self.panel, "weights_edit", None), str(setting("yolo_weights_path", "")))
         device = _combo_data(getattr(self.panel, "device_combo", None), setting("yolo_device", "cpu"))
@@ -1090,6 +1763,12 @@ class EvidenceAdapter:
                 900.0,
             ),
             "distance_mode": str(distance_mode or "pixhawk"),
+            "measurement_preferred_method": str(
+                setting("measurement_preferred_method", "pixhawk_rtk_live")
+            ),
+            "measurement_method_fallback_order": list(
+                setting("measurement_method_fallback_order", ()) or ()
+            ),
             "yolo_input_size_px": _integer(
                 _widget_value(getattr(self.panel, "input_size_spin", None), setting("yolo_input_size"))
             ),
@@ -1236,21 +1915,142 @@ class EvidenceAdapter:
     def session_catalog(self) -> tuple[dict[str, object], ...]:
         """List finalized/retryable session directories for review only."""
 
-        sessions_root = self._app_root() / "recordings" / "sessions"
-        if not sessions_root.is_dir():
+        recordings_root = self._app_root() / "recordings"
+        session_directories = _recording_session_directories(recordings_root)
+        if not session_directories:
             return ()
         entries: list[dict[str, object]] = []
-        for path in sorted((item for item in sessions_root.iterdir() if item.is_dir()), key=lambda item: item.name, reverse=True):
-            manifest_path = path / "session_manifest.json"
+        for path in sorted(
+            session_directories,
+            key=lambda item: item.name,
+            reverse=True,
+        ):
+            hierarchy_state_path = path / "session.json"
+            if hierarchy_state_path.is_file():
+                try:
+                    hierarchy = json.loads(hierarchy_state_path.read_text(encoding="utf-8"))
+                    if not isinstance(hierarchy, Mapping):
+                        raise ValueError("session.json must contain a JSON object")
+                except (OSError, UnicodeError, ValueError) as exc:
+                    entries.append(
+                        {
+                            "session_id": path.name,
+                            "measurement_id": "",
+                            "catalog_key": path.name,
+                            "layout": "nested-v2",
+                            "path": str(path),
+                            "session_root": str(path),
+                            "status": "INTEGRITY_FAILED",
+                            "lifecycle_state": "RECOVERABLE",
+                            "completeness_state": "UNKNOWN",
+                            "integrity_status": "INTEGRITY_FAILED",
+                            "artifacts": (),
+                            "artifact_details": (),
+                            "source_expectations": (),
+                            "error": f"malformed session.json: {exc}",
+                        }
+                    )
+                    continue
+                session_id = str(hierarchy.get("session_id") or path.name)
+                measurement_rows = {
+                    str(row.get("measurement_id") or ""): dict(row)
+                    for row in hierarchy.get("measurements", ()) or ()
+                    if isinstance(row, Mapping) and row.get("measurement_id")
+                }
+                child_entries = 0
+                measurements_root = path / "measurements"
+                if measurements_root.is_dir() and not measurements_root.is_symlink():
+                    for child in sorted(
+                        (
+                            item
+                            for item in measurements_root.iterdir()
+                            if item.is_dir() and not item.is_symlink()
+                        ),
+                        key=lambda item: item.name,
+                        reverse=True,
+                    ):
+                        projection = _package_session_projection(
+                            child,
+                            owning_session_id=session_id,
+                            measurement_id=child.name,
+                        )
+                        if projection is None:
+                            row = measurement_rows.get(child.name, {})
+                            projection = {
+                                "session_id": session_id,
+                                "measurement_id": child.name,
+                                "catalog_key": f"{session_id}::{child.name}",
+                                "layout": "nested-v2",
+                                "session_root": str(path),
+                                "path": str(child),
+                                "status": str(row.get("state") or "COLLECTING"),
+                                "lifecycle_state": str(row.get("state") or "COLLECTING"),
+                                "completeness_state": "PENDING",
+                                "evidence_complete": False,
+                                "integrity_status": "NOT_VERIFIED",
+                                "revision": str(row.get("revision") or ""),
+                                "revision_number": row.get("revision_number"),
+                                "artifacts": (),
+                                "artifact_details": (),
+                                "source_expectations": (),
+                                "error": "",
+                                "retryable": str(row.get("state") or "") == "RECOVERABLE",
+                                "legacy": False,
+                            }
+                        entries.append(projection)
+                        child_entries += 1
+                if child_entries == 0:
+                    entries.append(
+                        {
+                            "session_id": session_id,
+                            "measurement_id": "",
+                            "catalog_key": session_id,
+                            "layout": "nested-v2",
+                            "session_root": str(path),
+                            "path": str(path),
+                            "status": str(hierarchy.get("state") or "OPEN"),
+                            "lifecycle_state": str(hierarchy.get("state") or "OPEN"),
+                            "completeness_state": "PENDING",
+                            "evidence_complete": False,
+                            "integrity_status": "NOT_VERIFIED",
+                            "artifacts": (),
+                            "artifact_details": (),
+                            "source_expectations": (),
+                            "error": "",
+                            "retryable": False,
+                            "legacy": False,
+                        }
+                    )
+                continue
+            package_entry = _package_session_projection(path)
+            if package_entry is not None:
+                entries.append(package_entry)
+                continue
+            v2_manifest_path = path / "measurement.json"
+            legacy_manifest_path = path / "session_manifest.json"
+            manifest_path = (
+                v2_manifest_path
+                if v2_manifest_path.is_file()
+                else legacy_manifest_path
+            )
+            manifest_is_v2 = manifest_path == v2_manifest_path and manifest_path.is_file()
             manifest: dict[str, object] = {}
+            manifest_error = ""
             if manifest_path.is_file():
                 try:
                     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
                     if isinstance(payload, dict):
                         manifest = payload
-                except (OSError, ValueError):
+                    else:
+                        manifest_error = f"malformed {manifest_path.name}: expected a JSON object"
+                except (OSError, UnicodeError, ValueError) as exc:
                     manifest = {}
-            published = path / "published"
+                    manifest_error = f"malformed {manifest_path.name}: {exc}"
+            published = (
+                path / ".workstation" / "publish" / "current"
+                if manifest_is_v2
+                else path / "published"
+            )
             published_target = ""
             if published.is_symlink():
                 try:
@@ -1275,26 +2075,81 @@ class EvidenceAdapter:
                 if name not in (None, "")
             }
             for name, detail in artifact_details.items():
-                artifact_names.add(str(name))
                 if isinstance(detail, Mapping) and detail.get("path"):
                     artifact_names.add(str(detail["path"]))
+                else:
+                    artifact_names.add(str(name))
             artifact_names.update(_run_ledger_artifact_names(path))
             artifacts = tuple(
-                sorted(artifact_names)
+                sorted(
+                    {
+                        normalized
+                        for name in artifact_names
+                        if (normalized := _safe_session_relative_path(path, name)) is not None
+                    }
+                )
             )
             entries.append(
                 {
                     "session_id": path.name,
                     "path": str(path),
-                    "status": str(manifest.get("status", "unknown") or "unknown"),
+                    "status": (
+                        str(manifest.get("status") or "unknown")
+                        if manifest_is_v2
+                        else "LEGACY_UNVERIFIED" if manifest_path.is_file() else "unknown"
+                    ),
+                    "lifecycle_state": str(manifest.get("status", "unknown") or "unknown"),
+                    "completeness_state": (
+                        "VERIFIED" if manifest_is_v2 else "LEGACY_UNVERIFIED" if manifest_path.is_file() else "UNKNOWN"
+                    ),
+                    "evidence_complete": False,
+                    "integrity_status": (
+                        "VERIFIED" if manifest_is_v2 else "LEGACY_UNVERIFIED" if manifest_path.is_file() else "NOT_VERIFIED"
+                    ),
+                    "package_schema": "",
+                    "package_schema_version": None,
+                    "revision": "",
+                    "revision_number": None,
+                    "package_manifest_path": "",
+                    "missing_reasons": (),
+                    "failed_reasons": (manifest_error,) if manifest_error else (),
+                    "total_bytes": _existing_artifact_byte_total(path, artifacts),
+                    "hash_verification": {
+                        "status": "VERIFIED" if manifest_is_v2 else "LEGACY_UNVERIFIED" if manifest_path.is_file() else "NOT_RUN",
+                        "manifest_status": "AVAILABLE" if manifest_is_v2 else "NOT_AVAILABLE",
+                        "artifact_hashes_declared": 0,
+                        "artifacts_verified": 0,
+                        "artifacts_failed": 0,
+                        "artifacts_not_run": len(artifacts),
+                    },
+                    "hash_verification_summary": {
+                        "status": "VERIFIED" if manifest_is_v2 else "LEGACY_UNVERIFIED" if manifest_path.is_file() else "NOT_RUN",
+                        "manifest_status": "AVAILABLE" if manifest_is_v2 else "NOT_AVAILABLE",
+                        "artifact_hashes_declared": 0,
+                        "artifacts_verified": 0,
+                        "artifacts_failed": 0,
+                        "artifacts_not_run": len(artifacts),
+                    },
+                    "source_expectations": (),
+                    "artifact_details": tuple(
+                        {"relative_path": name, "status": "unverified"} for name in artifacts
+                    ),
                     "phase": str(manifest.get("phase", "") or ""),
                     "generation_id": str(manifest.get("generation_id", "") or ""),
-                    "error": str(manifest.get("error", "") or ""),
+                    "error": manifest_error or str(manifest.get("error", "") or ""),
+                    "package_manifest_error": False,
                     "retryable": bool(manifest.get("retryable", False)),
                     "published_target": published_target,
                     "artifacts": artifacts,
-                    "source": "session_manifest.json + published generation pointer",
+                    "source": (
+                        "measurement.json v2 + typed Parquet generation"
+                        if manifest_is_v2
+                        else "session_manifest.json legacy unverified + published generation pointer"
+                        if manifest_path.is_file()
+                        else "session directory without manifest"
+                    ),
                     "time_axis": str(manifest.get("time_axis", "recording_time_ns") or "recording_time_ns"),
+                    "legacy": manifest_path.is_file() and not manifest_is_v2,
                 }
             )
         return tuple(entries)
@@ -1304,23 +2159,119 @@ class EvidenceAdapter:
         session_id: str,
         artifact_name: str,
         *,
+        measurement_id: str | None = None,
         limit: int = 100,
     ) -> dict[str, object]:
-        """Read stored CSV/JSONL rows without reinterpreting timestamps or frames."""
+        """Read stored Parquet/CSV/JSONL rows without frame reinterpretation."""
 
-        sessions_root = (self._app_root() / "recordings" / "sessions").resolve()
-        output_dir = (sessions_root / Path(str(session_id))).resolve()
-        try:
-            output_dir.relative_to(sessions_root)
-        except ValueError:
-            return {"columns": (), "rows": (), "error": "session path outside recordings root"}
-        candidate = resolve_session_artifact_path(output_dir, artifact_name)
-        if candidate is None or not candidate.is_file():
+        recordings_root = (self._app_root() / "recordings").resolve()
+        resolved_session = _resolve_recording_session_directory(
+            recordings_root,
+            session_id,
+        )
+        if resolved_session is None:
+            return {"columns": (), "rows": (), "error": "unsafe or missing session ID"}
+        output_dir = resolved_session
+        if measurement_id:
+            component = Path(str(measurement_id))
+            if (
+                component.name != str(measurement_id)
+                or str(measurement_id) in {".", ".."}
+                or "\\" in str(measurement_id)
+            ):
+                return {"columns": (), "rows": (), "error": "unsafe measurement ID"}
+            output_dir = (output_dir / "measurements" / component).resolve()
+            try:
+                output_dir.relative_to(recordings_root)
+            except ValueError:
+                return {"columns": (), "rows": (), "error": "measurement path outside recordings root"}
+        package_entry = _package_session_projection(
+            output_dir,
+            owning_session_id=str(session_id) if measurement_id else None,
+            measurement_id=str(measurement_id or "") or None,
+        )
+        normalized_artifact = _safe_session_relative_path(output_dir, artifact_name)
+        if normalized_artifact is None:
             return {
                 "columns": (),
                 "rows": (),
                 "error": f"unsafe or missing session artifact: {artifact_name}",
             }
+        declared_detail: Mapping[str, object] | None = None
+        if package_entry is not None:
+            declared_artifacts = {
+                str(value) for value in package_entry.get("artifacts", ()) or ()
+            }
+            if normalized_artifact not in declared_artifacts:
+                detail = (
+                    "package manifest is unreadable"
+                    if package_entry.get("package_manifest_error")
+                    else "artifact is not declared by package manifest"
+                )
+                return {
+                    "columns": (),
+                    "rows": (),
+                    "error": f"{detail}: {normalized_artifact}",
+                }
+            declared_detail = next(
+                (
+                    detail
+                    for detail in package_entry.get("artifact_details", ()) or ()
+                    if isinstance(detail, Mapping)
+                    and str(detail.get("relative_path") or "") == normalized_artifact
+                ),
+                None,
+            )
+        candidate = resolve_session_artifact_path(
+            output_dir,
+            normalized_artifact,
+            allow_published=package_entry is None,
+        )
+        if candidate is None or not candidate.is_file():
+            return {
+                "columns": (),
+                "rows": (),
+                "error": f"unsafe or missing session artifact: {normalized_artifact}",
+            }
+        if package_entry is not None:
+            if declared_detail is None:
+                return {
+                    "columns": (),
+                    "rows": (),
+                    "error": f"package artifact descriptor is missing: {normalized_artifact}",
+                }
+            if str(declared_detail.get("status") or "").lower() != "present":
+                return {
+                    "columns": (),
+                    "rows": (),
+                    "error": f"package artifact is not present: {normalized_artifact}",
+                }
+            expected_size = declared_detail.get("size_bytes")
+            if expected_size is not None and candidate.stat().st_size != int(expected_size):
+                return {
+                    "columns": (),
+                    "rows": (),
+                    "error": f"artifact size does not match package manifest: {normalized_artifact}",
+                }
+            expected_sha256 = str(declared_detail.get("sha256") or "").lower()
+            if len(expected_sha256) != 64 or any(
+                character not in "0123456789abcdef" for character in expected_sha256
+            ):
+                return {
+                    "columns": (),
+                    "rows": (),
+                    "error": f"artifact SHA-256 is missing or invalid in package manifest: {normalized_artifact}",
+                }
+            try:
+                actual_sha256 = _sha256_file(candidate)
+            except OSError as exc:
+                return {"columns": (), "rows": (), "error": str(exc)}
+            if actual_sha256 != expected_sha256:
+                return {
+                    "columns": (),
+                    "rows": (),
+                    "error": f"artifact SHA-256 does not match package manifest: {normalized_artifact}",
+                }
         if candidate.suffix.lower() == ".jsonl":
             try:
                 rows = []
@@ -1338,13 +2289,45 @@ class EvidenceAdapter:
                 "error": "",
                 "path": str(candidate),
                 "time_axis": "recorded_unix_ns; camera response timestamps preserved",
-                "coordinate_contract": "HR Capture evidence as stored; no image payload or conversion",
+                "coordinate_contract": "Capture HR Still evidence as stored; no image payload or conversion",
+            }
+        if candidate.suffix.lower() == ".parquet":
+            from Workstation.workstation_core.session_parquet import read_lossless_rows
+
+            artifact_keys = {
+                "measurement_pairs.parquet": "measurement_pairs",
+                "camera_timeline.parquet": "camera_timeline",
+                "pixhawk_timeline.parquet": "pixhawk_timeline",
+                "gnss_base_timeline.parquet": "gnss_base_timeline",
+                "geometry_comparison.parquet": "geometry_comparison",
+            }
+            artifact_key = artifact_keys.get(candidate.name)
+            if artifact_key is None:
+                return {
+                    "columns": (),
+                    "rows": (),
+                    "error": f"unknown Workstation Parquet artifact: {candidate.name}",
+                    "path": str(candidate),
+                }
+            try:
+                all_rows = read_lossless_rows(candidate, artifact_key)
+                rows = all_rows[: max(0, int(limit))]
+                columns = tuple(dict.fromkeys(key for row in rows for key in row))
+            except (OSError, TypeError, ValueError) as exc:
+                return {"columns": (), "rows": (), "error": str(exc), "path": str(candidate)}
+            return {
+                "columns": columns,
+                "rows": tuple(rows),
+                "error": "",
+                "path": str(candidate),
+                "time_axis": "recording_time_ns; exact row_json values preserved",
+                "coordinate_contract": "typed Parquet projection plus lossless canonical row_json",
             }
         if candidate.suffix.lower() != ".csv":
             return {
                 "columns": (),
                 "rows": (),
-                "error": "only CSV artifacts are previewed; binary/video/XLSX outputs remain unchanged",
+                "error": "only Parquet/CSV/JSONL artifacts are previewed; binary/video/XLSX outputs remain unchanged",
                 "path": str(candidate),
             }
         try:
@@ -1414,6 +2397,10 @@ class EvidenceAdapter:
             "state": finalization,
             "active": active,
             "session_id": session_id,
+            "measurement_id": str(getattr(self.panel, "_measurement_id", "") or ""),
+            "recording_mode": str(
+                getattr(self.panel, "_recording_mode", "manual") or "manual"
+            ),
             "output_dir": str(output_dir) if output_dir is not None else "",
             "video_paths": video_paths,
             "artifacts": tuple(artifacts),
@@ -1602,6 +2589,17 @@ class EvidenceAdapter:
         progress_text = str(progress.get("message") or progress.get("phase") or "Idle")
         if progress:
             progress_text = f"{progress_text} ({max(0.0, min(100.0, progress_percent)):.0f}%)"
+        calibration_quality = getattr(self.panel, "calibration_quality", None)
+        if not isinstance(calibration_quality, Mapping) and result is not None:
+            calibration_quality = getattr(result, "calibration_quality", None)
+        calibration_quality = (
+            dict(calibration_quality)
+            if isinstance(calibration_quality, Mapping)
+            else {
+                "state": "UNVERIFIED",
+                "reason_codes": ["quality_snapshot_unavailable"],
+            }
+        )
         return {
             "state": (
                 "CALCULATING"
@@ -1638,6 +2636,8 @@ class EvidenceAdapter:
                 or ("manual_candidate" if extrinsics is not None else "intrinsics_only")
             ),
             "validation_gate": "disabled",
+            "quality_gate": "calibration_quality_v1",
+            "calibration_quality": calibration_quality,
             "zoom_readback": zoom_readback,
             "status_label": status_label,
             "progress": progress_text,

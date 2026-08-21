@@ -9,7 +9,11 @@ pyarrow>=14,<24
 XlsxWriter>=3.1,<4
 pyserial>=3.5,<4
 pymavlink>=2.4.41,<3
-pyqtgraph>=0.13,<1
-av>=11,<16
+# pyqtgraph 0.14 requires NumPy >=1.25, which conflicts with the SciPy/NumPy
+# reference runtime above.  Keep the compatible 0.13 line explicit.
+pyqtgraph>=0.13,<0.14
+packaging>=23,<27
+# Detection is part of the normal Measurement workflow.
+ultralytics>=8.3,<9
 # OS-secured NTRIP password storage (workstation_core/ntrip_credentials.py).
 keyring>=23,<26

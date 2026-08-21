@@ -32,23 +32,25 @@ StereoWIRIS
   - Pixhawk
   - GNSS / RTK
   - Time / Sync
-- Measurement
 - Alignment
 - Pre-run Calibration
-- Recording / Sessions
+- Session
+- Measurement
+- Recording / Review
 - Advanced
 - Settings
 - Diagnostics / Analysis
 
 Left/Right camera views and P1/P2 Pixhawk evidence are local paired views, not separate
 navigation contexts. Detection belongs to Cameras, synchronization belongs to Time / Sync,
-and Review/Files belong to Recording / Sessions.
+Session owns the daily lifecycle and current-child readiness; Review/Files belong to
+Recording / Review.
 
 ## 4. Workspace
 
 Largest area where engineering work is performed. Current Workstation workspaces are
-Overview, Protocol, Cameras, Time / Sync, Measurement, Alignment, Pre-run Calibration,
-Recording / Sessions, and Advanced. Pixhawk and GNSS are local tabs of the paired Alignment
+Overview, Protocol, Cameras, Time / Sync, Session, Measurement, Alignment, Pre-run Calibration,
+Recording / Review, and Advanced. Pixhawk and GNSS are local tabs of the paired Alignment
 workspace; Detection is a Cameras section.
 
 ## 5. Inspector

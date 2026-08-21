@@ -27,10 +27,12 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from Workstation.workstation_core.attitude_geometry import (quaternion_conjugate, quaternion_multiply, relative_attitude, relative_rotation_angle_deg)
 from Workstation.workstation_core.measurement_attempt import (
     AttitudeSnapshot,
+    BlockedMeasurementPair,
     GpsSnapshot,
     MeasurementAttempt,
     StereoIntrinsicsSnapshot,
 )
+from Workstation.workstation_core.measurement_methods import CHECKERBOARD_STEREO
 from Workstation.workstation_core.dual_geometry import evaluate_nominal_active
 from Workstation.workstation_core.coordinate_contract import (
     BODY_FRAME,
@@ -103,6 +105,8 @@ RECORDING_CONTROLLER_METHODS = [
     "_refresh_recording_table",
     "_refresh_recording_sample_detail",
     "toggle_session_recording",
+    "start_automatic_session_recording",
+    "stop_automatic_session_recording",
     "_start_session_recording",
     "_recover_retryable_recording_session",
     "_stop_session_recording",
@@ -124,6 +128,7 @@ RECORDING_CONTROLLER_METHODS = [
     "_pair_recording_base_row",
     "_upsert_pair_recording_row",
     "_record_unresolved_pair",
+    "_record_blocked_measurement_pair",
     "_append_distance_history",
     "_append_extrinsics_comparison_snapshot",
     "_distance_history_class_name",
@@ -343,12 +348,83 @@ class RecordingController:
     def toggle_session_recording(self) -> bool | None:
         if self.panel._session_recording_active():
             self.panel._stop_session_recording()
+            if not self.panel._session_recording_active():
+                self.panel._automatic_session_recording = False
             return None
         return self.panel._start_session_recording()
 
-    def _start_session_recording(self) -> bool | None:
+    def start_automatic_session_recording(self) -> bool:
+        """Start the session owned by the Measurement/Detection lifecycle.
+
+        Session IDs, spools, and video paths remain owned by the recording
+        controller.  The camera lifecycle only asks for this boundary before
+        it starts a detection stream, so the normal operator path never needs
+        a separate Record or Save action.
+        """
+
+        if self.panel._session_recording_active():
+            return True
+        if bool(getattr(self.panel, "_measurement_package_explicit_lifecycle", False)):
+            snapshotter = getattr(self.panel, "measurement_package_snapshot", None)
+            snapshot = snapshotter() if callable(snapshotter) else {}
+            if not isinstance(snapshot, Mapping) or str(snapshot.get("state") or "") != "COLLECTING":
+                self.panel.recording_status_label.setText(
+                    "세션 기록: New Measurement/COLLECTING 상태가 필요합니다"
+                )
+                return False
+        if bool(getattr(self.panel, "_session_save_retry_required", False)):
+            self.panel.recording_status_label.setText(
+                "세션 기록: 이전 자동 저장 실패를 먼저 확인해야 합니다"
+            )
+            return False
+        previous_mode = str(getattr(self.panel, "_recording_mode", "manual") or "manual")
+        self.panel._automatic_session_recording = True
+        self.panel._recording_mode = "automatic_detection"
+        try:
+            result = self._start_session_recording(start_camera_streams=False)
+        except Exception:
+            self.panel._automatic_session_recording = False
+            self.panel._recording_mode = previous_mode
+            raise
+        if result is False:
+            self.panel._automatic_session_recording = False
+            self.panel._recording_mode = previous_mode
+            return False
+        self.panel.recording_status_label.setText(
+            f"자동 세션 기록: 진행 중, session={self.panel.recording_session_id}"
+        )
+        return True
+
+    def stop_automatic_session_recording(
+        self,
+        *,
+        final_clock_sync_snapshot: dict[str, object] | None = None,
+    ) -> bool:
+        """Stop producers and start legacy session persistence after Detection.
+
+        This does not seal the measurement package.  Post evidence remains
+        appendable until the operator invokes the separate Finalize action.
+        """
+
+        if not bool(getattr(self.panel, "_automatic_session_recording", False)):
+            return True
+        if not self.panel._session_recording_active():
+            self.panel._automatic_session_recording = False
+            return True
+        stop_kwargs: dict[str, object] = {"restart_streams": False}
+        if final_clock_sync_snapshot is not None:
+            stop_kwargs["final_clock_sync_snapshot"] = final_clock_sync_snapshot
+        self._stop_session_recording(**stop_kwargs)
+        if self.panel._session_recording_active():
+            return False
+        self.panel._automatic_session_recording = False
+        return True
+
+    def _start_session_recording(self, *, start_camera_streams: bool = True) -> bool | None:
+        if not bool(getattr(self.panel, "_automatic_session_recording", False)):
+            self.panel._recording_mode = "manual"
         if self._camera_photo_capture_active():
-            self.panel.recording_status_label.setText("세션 기록: OZ/HR Capture 완료 대기 중")
+            self.panel.recording_status_label.setText("세션 기록: HR/OZ still 캡처 완료 대기 중")
             return False
         if self.panel._session_save_thread is not None:
             self.panel.recording_status_label.setText("세션 기록: 이전 세션 저장 완료 대기 중")
@@ -379,7 +455,13 @@ class RecordingController:
             try:
                 evidence_start(
                     "recording_started",
-                    {"session_id": self.panel.recording_session_id},
+                    {
+                        "session_id": self.panel.recording_session_id,
+                        "measurement_id": str(getattr(self.panel, "_measurement_id", "") or ""),
+                        "recording_mode": str(
+                            getattr(self.panel, "_recording_mode", "manual") or "manual"
+                        ),
+                    },
                     source="RecordingController",
                     coordinate_contract="not_applicable",
                 )
@@ -424,6 +506,7 @@ class RecordingController:
         self.panel.extrinsics_comparison_recording_rows.bind(spool_root / "extrinsics_comparison.jsonl")
         self.panel._recording_pair_row_index.clear()
         self.panel._recovered_session_metadata = None
+        self.panel._recovered_session_output_dir = None
         self.panel._recording_clock_sync_start_observation = None
         self.panel._recording_clock_sync_end_observation = None
         self.panel.recording_reference_attitudes = {
@@ -466,9 +549,9 @@ class RecordingController:
             "[저장] 세션 기록을 시작했습니다: "
             f"session={self.panel.recording_session_id}, {self.panel._format_video_recording_paths()}"
         )
-        if self.panel.camera_connected:
+        if start_camera_streams and self.panel.camera_connected:
             self.panel._start_camera_streams(enable_detection=self.panel.yolo_enabled, switch_to_depth=self.panel.yolo_enabled)
-        else:
+        elif start_camera_streams:
             self.panel._log("[저장] 카메라 스트림을 시작하면 좌/우 영상 녹화가 함께 시작됩니다.")
         self.panel._refresh_recording_status_label()
         self.panel._refresh_operation_header()
@@ -479,26 +562,83 @@ class RecordingController:
         if not path.is_file():
             return []
         records: list[dict[str, object]] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
+        for line_number, raw_line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(),
+            start=1,
+        ):
+            line = raw_line.strip()
             if not line:
                 continue
             try:
                 record = json.loads(line)
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
+                records.append(
+                    {
+                        "capture_id": f"corrupt-line-{line_number:06d}",
+                        "state": "corrupt",
+                        "error": f"malformed capture JSONL row at line {line_number}: {exc.msg}",
+                        "line_number": line_number,
+                        "raw_line_sha256": hashlib.sha256(
+                            raw_line.encode("utf-8")
+                        ).hexdigest(),
+                    }
+                )
                 continue
             if isinstance(record, dict):
                 records.append(record)
+            else:
+                records.append(
+                    {
+                        "capture_id": f"corrupt-line-{line_number:06d}",
+                        "state": "corrupt",
+                        "error": f"capture JSONL row at line {line_number} is not an object",
+                        "line_number": line_number,
+                        "raw_line_sha256": hashlib.sha256(
+                            raw_line.encode("utf-8")
+                        ).hexdigest(),
+                    }
+                )
         return records
 
+    @staticmethod
+    def _next_capture_id(records: Sequence[Mapping[str, object]], prefix: str) -> str:
+        normalized = re.sub(r"[^a-z0-9]+", "", str(prefix).lower()) or "capture"
+        pattern = re.compile(rf"^{re.escape(normalized)}-(\d+)$")
+        high_water = max(
+            (
+                int(match.group(1))
+                for record in records
+                for match in (pattern.fullmatch(str(record.get("capture_id") or "").lower()),)
+                if match is not None
+            ),
+            default=0,
+        )
+        return f"{normalized}-{high_water + 1:03d}"
+
     def _recover_retryable_recording_session(self) -> bool:
-        candidates = discover_retryable_sessions(self.panel.app_root / "recordings")
+        try:
+            candidates = discover_retryable_sessions(
+                self.panel.app_root / "recordings"
+            )
+        except (FileExistsError, OSError, ValueError) as exc:
+            self.panel._log(f"[저장] 복구 세션 경로 충돌: {exc}")
+            self.panel.recording_status_label.setText(
+                "세션 기록: direct/legacy 복구 경로 충돌 확인 필요"
+            )
+            return False
         if not candidates:
             return False
-        try:
-            recovered = load_retryable_session(candidates[0])
-        except Exception as exc:
-            self.panel._log(f"[저장] 미완료 세션 복구 정보를 읽지 못했습니다: {exc}")
+        recovered = None
+        for candidate in candidates:
+            try:
+                recovered = load_retryable_session(candidate)
+                break
+            except Exception as exc:
+                self.panel._log(
+                    f"[저장] 미완료 세션 복구 정보를 건너뜁니다: "
+                    f"path={candidate}, error={exc}"
+                )
+        if recovered is None:
             return False
         metadata = recovered.metadata
 
@@ -506,6 +646,25 @@ class RecordingController:
             return None if value in (None, "") else int(value)
 
         self.panel.recording_session_id = str(metadata.get("session_id") or recovered.output_dir.name)
+        recovered_measurement_id = str(metadata.get("measurement_id") or "")
+        if recovered_measurement_id and bool(
+            getattr(self.panel, "_measurement_session_hierarchy_enabled", False)
+        ):
+            self.panel._measurement_session_id = self.panel.recording_session_id
+            self.panel._measurement_id = recovered_measurement_id
+            try:
+                from Workstation.workstation_core.measurement_session import MeasurementSession
+
+                session_root = recovered.output_dir.parent.parent
+                session = MeasurementSession.open(session_root)
+                self.panel._measurement_session = session
+                self.panel._measurement_session_state = session.state
+                self.panel._measurement_package = session.measurement_package(
+                    recovered_measurement_id
+                )
+                self.panel._measurement_package_state = "RECOVERABLE"
+            except Exception as exc:
+                self.panel._log(f"[저장] 측정 세션 인덱스 복구 실패: {exc}")
         self.panel.recording_session_started_unix_ns = optional_int(
             metadata.get("session_started_unix_ns")
         )
@@ -542,8 +701,14 @@ class RecordingController:
             recovered.output_dir / "oz_captures.jsonl"
         )
         self.panel._recovered_session_metadata = metadata
+        # Pin retries to the exact discovered tree.  This prevents a legacy
+        # ``recordings/sessions/<id>`` spool from being read there and then
+        # finalized into the new direct ``recordings/<id>`` tree.
+        self.panel._recovered_session_output_dir = recovered.output_dir
         self.panel._session_save_retry_required = True
         self.panel._session_save_finalized = False
+        self.panel._automatic_session_recording = False
+        self.panel._recording_mode = str(metadata.get("recording_mode") or "manual")
         self.panel.distance_recording_enabled = False
         self.panel.video_recording_enabled = False
         self.panel.record_button.setEnabled(False)
@@ -559,15 +724,21 @@ class RecordingController:
         )
         return True
 
-    def _stop_session_recording(self) -> None:
+    def _stop_session_recording(
+        self,
+        *,
+        restart_streams: bool = True,
+        final_clock_sync_snapshot: dict[str, object] | None = None,
+    ) -> None:
         if self._camera_photo_capture_active():
-            self.panel.recording_status_label.setText("세션 기록: OZ/HR Capture 완료 대기 중")
+            self.panel.recording_status_label.setText("세션 기록: HR/OZ still 캡처 완료 대기 중")
             return
-        final_clock_sync_snapshot = (
-            self.panel._camera_time_sync_snapshot("last_observed_before_session_stop")
-            if self.panel._session_recording_active()
-            else None
-        )
+        if final_clock_sync_snapshot is None:
+            final_clock_sync_snapshot = (
+                self.panel._camera_time_sync_snapshot("last_observed_before_session_stop")
+                if self.panel._session_recording_active()
+                else None
+            )
         if final_clock_sync_snapshot is not None:
             self.panel._recording_clock_sync_end_observation = final_clock_sync_snapshot
         try:
@@ -588,9 +759,8 @@ class RecordingController:
                 }:
                     target_snapshot = target_owner.stop_target_drone_stream(timeout_s=3.0)
                 artifact = target_snapshot.get("artifact")
-                importer = getattr(self.panel, "import_workstation_session_artifact", None)
-                if isinstance(artifact, dict) and callable(importer):
-                    importer(
+                if isinstance(artifact, dict):
+                    self._register_session_owned_artifact(
                         artifact["absolute_path"],
                         role="target_drone_raw_mavlink_jsonl",
                         media_type="application/x-ndjson",
@@ -599,6 +769,8 @@ class RecordingController:
                             for key, value in artifact.items()
                             if key != "absolute_path"
                         },
+                        expected_size_bytes=artifact.get("size_bytes"),
+                        expected_sha256=artifact.get("sha256"),
                     )
             except Exception as exc:
                 self.panel.recording_status_label.setText(
@@ -614,7 +786,7 @@ class RecordingController:
             "[저장] 세션 기록을 중지했습니다: "
             f"session={self.panel.recording_session_id or 'none'}, {self.panel._format_video_recording_paths()}"
         )
-        if self.panel.camera_connected:
+        if restart_streams and self.panel.camera_connected:
             self.panel._start_camera_streams(enable_detection=self.panel.yolo_enabled, switch_to_depth=self.panel.yolo_enabled)
         self.panel.save_distance_history_csv(final_clock_sync_snapshot=final_clock_sync_snapshot)
         self.panel._refresh_recording_status_label()
@@ -633,21 +805,52 @@ class RecordingController:
                 continue
             controller.stop_automatic_ulog_and_collect(source)
         refreshed = controller.ulog_snapshot()
-        importer = getattr(self.panel, "import_workstation_session_artifact", None)
-        if not callable(importer):
-            return
         for artifact in refreshed.get("artifacts", ()) or ():
             if not isinstance(artifact, dict):
                 continue
             relative = str(artifact.get("relative_path") or "")
             if not relative:
                 continue
-            importer(
+            self._register_session_owned_artifact(
                 controller.session_root / relative,
                 role=f"ulog/{artifact.get('source_id', 'unknown')}",
                 media_type="application/vnd.px4.ulog",
                 metadata=dict(artifact),
+                expected_size_bytes=artifact.get("size_bytes"),
+                expected_sha256=artifact.get("sha256"),
             )
+
+    def _register_session_owned_artifact(
+        self,
+        path: Path | str,
+        *,
+        role: str,
+        media_type: str,
+        metadata: Mapping[str, object],
+        expected_size_bytes: object = None,
+        expected_sha256: object = None,
+    ) -> object | None:
+        """Register session-owned sealed bytes, with a legacy copy fallback."""
+
+        registrar = getattr(self.panel, "register_workstation_session_artifact", None)
+        if callable(registrar):
+            return registrar(
+                path,
+                role=role,
+                media_type=media_type,
+                metadata=dict(metadata),
+                expected_size_bytes=expected_size_bytes,
+                expected_sha256=expected_sha256,
+            )
+        importer = getattr(self.panel, "import_workstation_session_artifact", None)
+        if callable(importer):
+            return importer(
+                path,
+                role=role,
+                media_type=media_type,
+                metadata=dict(metadata),
+            )
+        return None
 
     def _camera_photo_capture_active(self) -> bool:
         return bool(
@@ -675,6 +878,10 @@ class RecordingController:
         user action that unambiguously means "this is a new measurement."
         """
 
+        if not self._measurement_package_capture_allowed():
+            raise RuntimeError(
+                "Start Session and New Measurement are required before pre/post evidence capture"
+            )
         if not self.panel.recording_session_id:
             self.panel.recording_session_id = session_id_now()
             self.panel.pnp_photo_capture_records = []
@@ -688,11 +895,29 @@ class RecordingController:
                 f"{capture_channel}_capture_requested",
                 {
                     "session_id": self.panel.recording_session_id,
+                    "measurement_id": str(getattr(self.panel, "_measurement_id", "") or ""),
                     "capture_channel": capture_channel,
                 },
                 source="RecordingController",
                 coordinate_contract="native raster u-right/v-down; OpenCV optical RDF",
             )
+
+    def _measurement_package_capture_allowed(self) -> bool:
+        """Keep legacy callers compatible while enforcing explicit UI sessions."""
+
+        if not bool(getattr(self.panel, "_measurement_package_explicit_lifecycle", False)):
+            return True
+        snapshotter = getattr(self.panel, "measurement_package_snapshot", None)
+        if not callable(snapshotter):
+            return False
+        try:
+            snapshot = snapshotter()
+        except Exception:
+            return False
+        return isinstance(snapshot, Mapping) and str(snapshot.get("state") or "") in {
+            "COLLECTING",
+            "POST_CAPTURE",
+        }
 
     def _prepare_pnp_evidence_session(self) -> None:
         self._prepare_camera_evidence_session("hr")
@@ -759,14 +984,14 @@ class RecordingController:
             expected_sha256=expected_sha256,
         )
         absolute = controller.session_root / str(artifact["relative_path"])
-        importer = getattr(self.panel, "import_workstation_session_artifact", None)
-        if callable(importer):
-            importer(
-                absolute,
-                role=f"ulog/{resolved_source.value}",
-                media_type="application/vnd.px4.ulog",
-                metadata=dict(artifact),
-            )
+        self._register_session_owned_artifact(
+            absolute,
+            role=f"ulog/{resolved_source.value}",
+            media_type="application/vnd.px4.ulog",
+            metadata=dict(artifact),
+            expected_size_bytes=artifact.get("size_bytes"),
+            expected_sha256=artifact.get("sha256"),
+        )
         append_event = getattr(self.panel, "append_workstation_run_event", None)
         if callable(append_event):
             append_event(
@@ -946,13 +1171,17 @@ class RecordingController:
         remains equivalent to ``purpose="unspecified"``.
         """
 
+        if not self._measurement_package_capture_allowed():
+            self.panel.recording_status_label.setText(
+                "Capture HR Still: 먼저 Begin Session을 실행하세요"
+            )
+            return False
         if self._camera_photo_capture_active():
-            self.panel.recording_status_label.setText("OZ/HR Capture가 이미 진행 중입니다")
+            self.panel.recording_status_label.setText("HR/OZ still 캡처가 이미 진행 중입니다")
             return False
         normalized_purpose = self._hr_capture_purpose(purpose)
         self._prepare_pnp_evidence_session()
-        capture_index = len(self.panel.pnp_photo_capture_records) + 1
-        capture_id = f"hr-{capture_index:03d}"
+        capture_id = self._next_capture_id(self.panel.pnp_photo_capture_records, "hr")
         request = self._new_hr_request_context(capture_id, normalized_purpose)
         self._pending_hr_requests[capture_id] = request
         target_infos = self._camera_photo_target_infos()
@@ -993,7 +1222,7 @@ class RecordingController:
         self.panel.pnp_photo_capture_thread.finished.connect(self.panel._clear_pnp_photo_capture_worker)
         self.panel.pnp_photo_capture_thread.start()
         self.panel.recording_status_label.setText(
-            f"HR Capture {capture_id}: 좌/우 카메라 내부 저장 중"
+            f"Capture HR Still {capture_id}: 좌/우 카메라 내부 저장 중"
         )
         return True
 
@@ -1008,13 +1237,20 @@ class RecordingController:
         the RTSP/MP4 session recording and the visible-HR capture stream.
         """
 
+        if not self._measurement_package_capture_allowed():
+            self.panel.recording_status_label.setText(
+                "Capture OZ Still: 먼저 Begin Session을 실행하세요"
+            )
+            return False
         if self._camera_photo_capture_active():
-            self.panel.recording_status_label.setText("OZ/HR Capture가 이미 진행 중입니다")
+            self.panel.recording_status_label.setText("HR/OZ still 캡처가 이미 진행 중입니다")
             return False
         normalized_purpose = self._hr_capture_purpose(purpose)
         self._prepare_oz_evidence_session()
-        capture_index = len(getattr(self.panel, "oz_photo_capture_records", ())) + 1
-        capture_id = f"oz-{capture_index:03d}"
+        capture_id = self._next_capture_id(
+            getattr(self.panel, "oz_photo_capture_records", ()),
+            "oz",
+        )
         request = self._new_oz_request_context(capture_id, normalized_purpose)
         self._pending_oz_requests[capture_id] = request
         target_infos = self._camera_photo_target_infos()
@@ -1055,7 +1291,7 @@ class RecordingController:
         self.panel.oz_photo_capture_thread.finished.connect(self.panel._clear_oz_photo_capture_worker)
         self.panel.oz_photo_capture_thread.start()
         self.panel.recording_status_label.setText(
-            f"OZ Capture {capture_id}: 좌/우 카메라 내부 저장 중"
+            f"Capture OZ Still {capture_id}: 좌/우 카메라 내부 저장 중"
         )
         return True
 
@@ -1126,6 +1362,7 @@ class RecordingController:
             json.dumps(record, ensure_ascii=False, allow_nan=False, sort_keys=True)
         )
         normalized["session_id"] = self.panel.recording_session_id
+        normalized["measurement_id"] = str(getattr(self.panel, "_measurement_id", "") or "")
         normalized["event_index"] = len(self.panel.pnp_photo_capture_records) + 1
         normalized.setdefault("recorded_utc_ns", time.time_ns())
         # Preserve the legacy spelling for downstream readers while making
@@ -1174,7 +1411,7 @@ class RecordingController:
             except Exception as exc:
                 logger = getattr(self.panel, "_log", None)
                 if callable(logger):
-                    logger(f"[HR Capture] run evidence linkage failed: {exc}")
+                    logger(f"[Capture HR Still] run evidence linkage failed: {exc}")
         return json.loads(
             json.dumps(normalized, ensure_ascii=False, allow_nan=False, sort_keys=True)
         )
@@ -1192,6 +1429,7 @@ class RecordingController:
             records = []
             self.panel.oz_photo_capture_records = records
         normalized["session_id"] = self.panel.recording_session_id
+        normalized["measurement_id"] = str(getattr(self.panel, "_measurement_id", "") or "")
         normalized["event_index"] = len(records) + 1
         normalized.setdefault("recorded_utc_ns", time.time_ns())
         normalized.setdefault("recorded_unix_ns", normalized["recorded_utc_ns"])
@@ -1242,7 +1480,7 @@ class RecordingController:
             except Exception as exc:
                 logger = getattr(self.panel, "_log", None)
                 if callable(logger):
-                    logger(f"[OZ Capture] run evidence linkage failed: {exc}")
+                    logger(f"[Capture OZ Still] run evidence linkage failed: {exc}")
         return json.loads(
             json.dumps(normalized, ensure_ascii=False, sort_keys=True)
         )
@@ -1274,10 +1512,10 @@ class RecordingController:
         )
         self.panel._append_pnp_photo_capture_record(record)
         self.panel._log(
-            f"[HR Capture] {capture_id} 카메라 내부 저장: state={record['state']}, {ftp_text}"
+            f"[Capture HR Still] {capture_id} 카메라 내부 저장: state={record['state']}, {ftp_text}"
         )
         self.panel.recording_status_label.setText(
-            f"HR Capture {capture_id}: {record['state']} · camera internal · {ftp_text}"
+            f"Capture HR Still {capture_id}: {record['state']} · camera internal · {ftp_text}"
         )
 
     def _handle_pnp_photo_capture_failed(self, capture_id: str, error: str) -> None:
@@ -1293,8 +1531,8 @@ class RecordingController:
                 request=self._pending_hr_requests.pop(str(capture_id), None),
             )
         )
-        self.panel._log(f"[HR Capture] {capture_id} 촬영 실패: {error}")
-        self.panel.recording_status_label.setText(f"HR Capture {capture_id}: failed ({error})")
+        self.panel._log(f"[Capture HR Still] {capture_id} 촬영 실패: {error}")
+        self.panel.recording_status_label.setText(f"Capture HR Still {capture_id}: failed ({error})")
 
     def _handle_oz_photo_capture_completed(self, result: object) -> None:
         record = dict(result or {}) if isinstance(result, dict) else {"state": "failed"}
@@ -1323,10 +1561,10 @@ class RecordingController:
         )
         self.panel._append_oz_photo_capture_record(record)
         self.panel._log(
-            f"[OZ Capture] {capture_id} 카메라 내부 저장: state={record['state']}, {ftp_text}"
+            f"[Capture OZ Still] {capture_id} 카메라 내부 저장: state={record['state']}, {ftp_text}"
         )
         self.panel.recording_status_label.setText(
-            f"OZ Capture {capture_id}: {record['state']} · camera internal · {ftp_text}"
+            f"Capture OZ Still {capture_id}: {record['state']} · camera internal · {ftp_text}"
         )
 
     def _handle_oz_photo_capture_failed(self, capture_id: str, error: str) -> None:
@@ -1342,16 +1580,26 @@ class RecordingController:
                 request=self._pending_oz_requests.pop(str(capture_id), None),
             )
         )
-        self.panel._log(f"[OZ Capture] {capture_id} 촬영 실패: {error}")
-        self.panel.recording_status_label.setText(f"OZ Capture {capture_id}: failed ({error})")
+        self.panel._log(f"[Capture OZ Still] {capture_id} 촬영 실패: {error}")
+        self.panel.recording_status_label.setText(f"Capture OZ Still {capture_id}: failed ({error})")
 
     def _clear_pnp_photo_capture_worker(self) -> None:
         self.panel.pnp_photo_capture_thread = None
         self.panel.pnp_photo_capture_worker = None
+        continuation = getattr(
+            self.panel, "_continue_measurement_package_finalization", None
+        )
+        if callable(continuation):
+            continuation()
 
     def _clear_oz_photo_capture_worker(self) -> None:
         self.panel.oz_photo_capture_thread = None
         self.panel.oz_photo_capture_worker = None
+        continuation = getattr(
+            self.panel, "_continue_measurement_package_finalization", None
+        )
+        if callable(continuation):
+            continuation()
 
     @staticmethod
     def _hr_capture_path_component(capture_id: str) -> str:
@@ -1583,7 +1831,14 @@ class RecordingController:
             self.panel._refresh_operation_header()
             return
         stamp = self.panel.recording_session_id or session_id_now()
-        output_dir = self.panel._recording_session_dir(stamp)
+        recovered_output = getattr(
+            self.panel, "_recovered_session_output_dir", None
+        )
+        output_dir = (
+            Path(recovered_output)
+            if recovered_output is not None
+            else self.panel._recording_session_dir(stamp)
+        )
         for rows in (
             self.panel.distance_recording_rows,
             *self.panel.camera_recording_rows.values(),
@@ -1606,6 +1861,9 @@ class RecordingController:
                     "camera_right_gui_frame_count": len(self.panel.camera_recording_rows["right"]),
                     "px4_left_sample_count": len(self.panel.px4_recording_rows["left"]),
                     "px4_right_sample_count": len(self.panel.px4_recording_rows["right"]),
+                    "px4_drone_sample_count": len(
+                        self.panel.px4_recording_rows.get("drone", ())
+                    ),
                     "gnss_base_sample_count": len(self.panel.gnss_base_recording_rows),
                     "extrinsics_comparison_sample_count": len(self.panel.extrinsics_comparison_recording_rows),
                     "finalization": {
@@ -1661,7 +1919,10 @@ class RecordingController:
             pair_rows = self.panel.distance_recording_rows
         else:
             pair_rows = [dict(row) for row in self.panel.distance_recording_rows]
-        thread = QtCore.QThread(self)
+        # RecordingController is a plain Python delegate, not a QObject.  The
+        # hidden Workstation panel is the actual Qt lifecycle owner and must
+        # parent the save thread so construction and shutdown are valid.
+        thread = QtCore.QThread(self.panel)
         worker = SessionSaveWorker(
             output_dir=output_dir,
             metadata=metadata,
@@ -1681,6 +1942,7 @@ class RecordingController:
         self.panel._session_save_thread = thread
         self.panel._session_save_worker = worker
         self.panel._session_save_retry_required = False
+        self.panel._session_save_last_error = ""
         self.panel.record_button.setEnabled(False)
         self.panel.save_history_button.setEnabled(False)
         self.panel.recording_status_label.setText(
@@ -1692,55 +1954,58 @@ class RecordingController:
 
     @QtCore.pyqtSlot(object)
     def _handle_session_saved(self, saved_files: SavedSessionFiles) -> None:
-        # Parquet writing is disabled (see WRITE_PARQUET_ARTIFACTS in
-        # workstation_core/recording_session.py); the paths still exist on
-        # SavedSessionFiles for a stable interface, but nothing is written
-        # there, so don't log them as saved.
-        parquet_written = saved_files.distance_measurements_parquet.exists()
         self.panel._log(
-            f"[저장] 거리 측정 compact CSV{'/Parquet' if parquet_written else ''}을 저장했습니다: "
-            f"csv={saved_files.distance_measurements_csv}"
-            + (f", parquet={saved_files.distance_measurements_parquet}" if parquet_written else "")
+            "[저장] typed Parquet 원본을 저장했습니다: "
+            f"pairs={saved_files.measurement_pairs_parquet}, "
+            f"camera={saved_files.camera_timeline_parquet}, "
+            f"pixhawk={saved_files.pixhawk_timeline_parquet}, "
+            f"gnss={saved_files.gnss_base_timeline_parquet}, "
+            f"geometry={saved_files.geometry_comparison_parquet}"
         )
-        self.panel._log(f"[저장] 세션 고정 JSON을 저장했습니다: {saved_files.session_static_json}")
-        self.panel._log(
-            f"[저장] GUI 전달 카메라 프레임 CSV{'/Parquet' if parquet_written else ''}을 저장했습니다: "
-            f"left={saved_files.camera_left_csv}" + (f"/{saved_files.camera_left_parquet}" if parquet_written else "")
-            + f", right={saved_files.camera_right_csv}"
-            + (f"/{saved_files.camera_right_parquet}" if parquet_written else "")
-        )
-        self.panel._log(
-            f"[저장] PX4 타임라인 CSV{'/Parquet' if parquet_written else ''}을 저장했습니다: "
-            f"left={saved_files.px4_left_csv}" + (f"/{saved_files.px4_left_parquet}" if parquet_written else "")
-            + f", right={saved_files.px4_right_csv}"
-            + (f"/{saved_files.px4_right_parquet}" if parquet_written else "")
-        )
-        self.panel._log(f"[저장] 세션 manifest를 저장했습니다: {saved_files.manifest}")
-        if saved_files.finalized:
-            self.panel._log(f"[저장] 목적별 탭 XLSX를 저장했습니다: {saved_files.xlsx}")
-            output_text = ", ".join(str(output) for output in saved_files.outputs)
-            self.panel.recording_status_label.setText(
-                "세션 기록 저장 완료: "
-                f"매칭 프레임쌍={len(self.panel.distance_recording_rows)}개 - {output_text}"
+        self.panel._log(f"[저장] 측정 context를 저장했습니다: {saved_files.context_json}")
+        self.panel._log(f"[저장] 측정 manifest를 저장했습니다: {saved_files.manifest}")
+        if saved_files.review_pending:
+            self.panel._log(
+                "[저장] review.xlsx는 모든 측정을 통합해 Close Session 시 생성됩니다."
             )
-            self.panel._session_save_retry_required = False
-            self.panel._session_save_finalized = True
+        elif saved_files.review_error:
+            self.panel._log(
+                "[저장] Parquet 원본은 확정되었지만 review.xlsx 재생성은 실패했습니다: "
+                + saved_files.review_error
+            )
         else:
-            self.panel._session_save_retry_required = True
-            self.panel._session_save_finalized = False
-            self.panel._log(f"[저장] XLSX 생성 실패; CSV는 확정되었으며 재시도할 수 있습니다: {saved_files.error}")
-            self.panel.recording_status_label.setText(
-                f"세션 CSV 저장 완료 / XLSX 실패(재시도 가능): {saved_files.error}"
-            )
+            self.panel._log(f"[저장] 세션 통합 XLSX를 저장했습니다: {saved_files.review_xlsx}")
+        output_text = ", ".join(
+            str(output) for output in saved_files.outputs if output.exists()
+        )
+        self.panel.recording_status_label.setText(
+            "세션 기록 저장 완료: "
+            f"매칭 프레임쌍={len(self.panel.distance_recording_rows)}개 - {output_text}"
+        )
+        self.panel._session_save_retry_required = False
+        self.panel._session_save_last_error = ""
+        self.panel._session_save_finalized = True
+        self.panel._recovered_session_output_dir = None
         self.panel._refresh_operation_header()
+        continuation = getattr(
+            self.panel, "_continue_measurement_package_finalization", None
+        )
+        if callable(continuation):
+            continuation()
 
     @QtCore.pyqtSlot(str)
     def _handle_session_save_failed(self, error: str) -> None:
         self.panel._session_save_retry_required = True
         self.panel._session_save_finalized = False
+        self.panel._session_save_last_error = str(error)
         self.panel._log(f"[저장] 세션 파일 확정 실패; spool을 보존했습니다: {error}")
         self.panel.recording_status_label.setText(f"세션 저장 실패(재시도 가능): {error}")
         self.panel._refresh_operation_header()
+        continuation = getattr(
+            self.panel, "_continue_measurement_package_finalization", None
+        )
+        if callable(continuation):
+            continuation()
 
     @QtCore.pyqtSlot()
     def _handle_session_save_thread_finished(self) -> None:
@@ -1754,6 +2019,11 @@ class RecordingController:
         self.panel.save_history_button.setEnabled(not self.panel._session_save_finalized)
         self.panel.record_button.setEnabled(not self.panel._session_save_retry_required)
         self.panel._refresh_operation_header()
+        continuation = getattr(
+            self.panel, "_continue_measurement_package_finalization", None
+        )
+        if callable(continuation):
+            continuation()
 
     def _wait_for_session_save(self, timeout_ms: int = 15000) -> bool:
         thread = self.panel._session_save_thread
@@ -1812,6 +2082,7 @@ class RecordingController:
                 rows.append(
                     {
                         "session_id": self.panel.recording_session_id,
+                        "measurement_id": str(getattr(self.panel, "_measurement_id", "") or ""),
                         "session_started_unix_s": self.panel._fmt_record_float(self.panel.recording_session_started_wall_s, 6),
                         "recording_elapsed_s": self.panel._fmt_record_float(self.panel._recording_elapsed_s(now_s), 6),
                         "recorded_app_timestamp_s": self.panel._fmt_record_float(now_s, 6),
@@ -2020,14 +2291,68 @@ class RecordingController:
         if not isinstance(camera_time_metrics, dict):
             camera_time_metrics = {}
         triangulation_source = self.panel._triangulation_extrinsics_source()
-        _baseline_m, baseline_source, _baseline_warnings = self.panel._active_baseline_m()
+        try:
+            measurement_methods = self.panel.workstation_measurement_methods_snapshot()
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            measurement_methods = {}
+        selected_method_row: dict[str, object] = {}
+        if isinstance(measurement_methods, dict):
+            selected_id = str(measurement_methods.get("selected_method_id") or "")
+            selected_instance = str(measurement_methods.get("selected_instance_id") or "")
+            method_rows = measurement_methods.get("all_methods", ())
+            if not isinstance(method_rows, (tuple, list)) or not method_rows:
+                method_rows = measurement_methods.get("ready_methods", ())
+            selected_method_row = next(
+                (
+                    dict(row)
+                    for row in method_rows
+                    if isinstance(row, Mapping)
+                    and str(row.get("method_id") or "") == selected_id
+                    and (
+                        not selected_instance
+                        or str(row.get("instance_id") or "") == selected_instance
+                    )
+                ),
+                {},
+            )
+        selected_method_id = str(selected_method_row.get("method_id") or "")
+        selected_uses_pixhawk = bool(selected_method_row.get("requires_live_pixhawk"))
+        selected_uses_gnss = bool(selected_method_row.get("requires_live_gnss"))
+        selected_relative_pose = bool(selected_method_id and selected_method_id != "pixhawk_rtk_live")
+        if selected_method_id:
+            baseline_source = (
+                "live_gnss"
+                if selected_uses_gnss
+                else "checkerboard"
+                if selected_method_id == CHECKERBOARD_STEREO
+                else "resolved_relative_pose"
+            )
+        else:
+            _baseline_m, baseline_source, _baseline_warnings = self.panel._active_baseline_m()
+        session_owner = getattr(self.panel, "_measurement_session", None)
+        session_snapshotter = getattr(session_owner, "snapshot", None)
+        try:
+            session_snapshot = session_snapshotter() if callable(session_snapshotter) else {}
+        except Exception:
+            session_snapshot = {}
+        session_snapshot = session_snapshot if isinstance(session_snapshot, Mapping) else {}
         return {
             "session_id": self.panel.recording_session_id,
+            "session_created_utc_ns": session_snapshot.get("created_utc_ns"),
+            "measurement_id": str(getattr(self.panel, "_measurement_id", "") or ""),
+            "recording_mode": str(
+                getattr(self.panel, "_recording_mode", "manual") or "manual"
+            ),
             "session_dir": str(self.panel._recording_session_dir(stamp)),
+            "measurement_dir": str(self.panel._recording_session_dir(stamp)),
             "session_started_unix_s": self.panel.recording_session_started_wall_s,
             "session_started_unix_ns": self.panel.recording_session_started_unix_ns,
             "session_started_monotonic_ns": self.panel.recording_session_started_monotonic_ns,
             "session_time_anchor_uncertainty_ns": self.panel.recording_session_anchor_uncertainty_ns,
+            "measurement_started_unix_s": self.panel.recording_session_started_wall_s,
+            "measurement_started_unix_ns": self.panel.recording_session_started_unix_ns,
+            "measurement_started_monotonic_ns": self.panel.recording_session_started_monotonic_ns,
+            "measurement_time_anchor_uncertainty_ns": self.panel.recording_session_anchor_uncertainty_ns,
             "schema_version": "stereowiris-paired-frame-v2",
             "row_contract": "one row per accepted left/right matched detection frame pair",
             "left_video_path": str(self.panel.video_recording_paths.get("left", "")),
@@ -2037,6 +2362,7 @@ class RecordingController:
             "camera_right_gui_frame_count": len(self.panel.camera_recording_rows["right"]),
             "px4_left_sample_count": len(self.panel.px4_recording_rows["left"]),
             "px4_right_sample_count": len(self.panel.px4_recording_rows["right"]),
+            "px4_drone_sample_count": len(self.panel.px4_recording_rows.get("drone", ())),
             "gnss_base_sample_count": len(self.panel.gnss_base_recording_rows),
             "extrinsics_comparison_sample_count": len(self.panel.extrinsics_comparison_recording_rows),
             "device_timeline_contract": {
@@ -2092,6 +2418,31 @@ class RecordingController:
             "right_rtcp_frame_transit_ms": camera_time_metrics["right_frame_transit_delay_ms"],
             "calculation": {
                 "triangulation_extrinsics_source": triangulation_source,
+                "measurement_method_id": str(
+                    measurement_methods.get("selected_method_id", "")
+                    if isinstance(measurement_methods, dict)
+                    else ""
+                ),
+                "measurement_method_instance_id": str(
+                    measurement_methods.get("selected_instance_id", "")
+                    if isinstance(measurement_methods, dict)
+                    else ""
+                ),
+                "measurement_method_selection_reason": str(
+                    measurement_methods.get("selection_reason", "")
+                    if isinstance(measurement_methods, dict)
+                    else ""
+                ),
+                "measurement_method_fallback_order": (
+                    list(measurement_methods.get("fallback_order", ()))
+                    if isinstance(measurement_methods, dict)
+                    else []
+                ),
+                "measurement_method_fill_policy": (
+                    dict(measurement_methods.get("fill_policy", {}))
+                    if isinstance(measurement_methods, dict)
+                    else {}
+                ),
                 "distance_mode": self.panel._distance_mode_label(),
                 "baseline_source": baseline_source,
                 "measurement_path": self.panel._measurement_path_label(),
@@ -2105,8 +2456,8 @@ class RecordingController:
                     "midpoint_of_left_optical_origin_and_selected_right_origin_proxy"
                 ),
                 "baseline_frame_origin_model": (
-                    "checkerboard_stereo_rt_optical_centers"
-                    if triangulation_source == "checkerboard"
+                    "resolved_relative_pose_optical_centers"
+                    if selected_relative_pose
                     else "gps_rtk_antenna_baseline_proxy_no_lever_arm"
                 ),
                 "baseline_frame_axis_contract": (
@@ -2114,14 +2465,18 @@ class RecordingController:
                     "down=forward_cross_right"
                 ),
                 "attitude_timing_policy": ATTITUDE_TIMING_POLICY,
-                "attitude_timing_blocks_measurement": False,
+                "attitude_timing_blocks_measurement": selected_uses_pixhawk,
                 "attitude_stale_age_threshold_s": ATTITUDE_STALE_AGE_S,
                 "attitude_very_stale_age_threshold_s": ATTITUDE_VERY_STALE_AGE_S,
                 "attitude_stale_pair_delta_threshold_s": ATTITUDE_STALE_PAIR_DELTA_S,
                 "attitude_very_stale_pair_delta_threshold_s": ATTITUDE_VERY_STALE_PAIR_DELTA_S,
                 "mount_assumption_model": (
                     "checkerboard-stereo-extrinsics-v1"
-                    if triangulation_source == "checkerboard"
+                    if selected_method_id == CHECKERBOARD_STEREO
+                    else "hybrid-candidate-live-components-v1"
+                    if selected_relative_pose and (selected_uses_pixhawk or selected_uses_gnss)
+                    else "optical-pose-relative-r-t-v1"
+                    if selected_relative_pose
                     else "gps-rtk-baseline-only-v1"
                 ),
             },
@@ -2187,34 +2542,34 @@ class RecordingController:
                 continue
             filtered_history.append(candidate)
         if not removed_history:
-            self.panel._log("[Depth] 거리 그래프 삭제 요청이 현재 기록과 일치하지 않았습니다.")
+            self.panel._log("[Depth] 거리 그래프 숨김 요청이 현재 뷰와 일치하지 않았습니다.")
             return
 
         self.panel.distance_history = filtered_history
-        removed_row = False
-        if point_key in self.panel.distance_recording_keys:
-            cached_index = self.panel.distance_recording_keys.index(point_key)
-            row_index = len(self.panel.distance_recording_rows) - len(self.panel.distance_recording_keys) + cached_index
-            self.panel.distance_recording_keys.pop(cached_index)
-            if row_index < len(self.panel.distance_recording_rows):
-                self.panel.distance_recording_rows.pop(row_index)
-                removed_row = True
-                base_index = len(self.panel.distance_recording_rows) - len(self.panel.distance_recording_keys)
-                self.panel._recording_pair_row_index = {
-                    tuple(key): base_index + index
-                    for index, key in enumerate(self.panel.distance_recording_keys)
-                }
-                self.panel._refresh_recording_table()
-        self.panel._last_distance_history_key = None
+        append_event = getattr(self.panel, "append_workstation_run_event", None)
+        if callable(append_event):
+            try:
+                append_event(
+                    "measurement_point_hidden",
+                    {
+                        "sample_key": list(point_key),
+                        "timestamp_s": point.timestamp_s,
+                        "distance_m": point.distance_m,
+                        "quality": point.quality,
+                        "method": point.method,
+                        "view_only": True,
+                    },
+                    source="RecordingController",
+                    coordinate_contract="baseline_center_frd view annotation; canonical pair remains append-only",
+                )
+            except Exception as exc:
+                self.panel._log(f"[Depth] 그래프 숨김 감사 이벤트 기록 실패: {exc}")
         self.panel._refresh_recording_status_label()
         self.panel._refresh_operation_header()
-        message = (
-            f"[Depth] 거리 그래프 점을 삭제했습니다: {point.distance_m:.2f} m "
-            f"({point.method}, quality={point.quality})"
+        self.panel._log(
+            f"[Depth] 거리 그래프 점을 뷰에서만 숨겼습니다: {point.distance_m:.2f} m "
+            f"({point.method}, quality={point.quality}); canonical 원본 pair/spool은 보존됩니다."
         )
-        if not removed_row:
-            message += " [기록 샘플은 찾지 못함]"
-        self.panel._log(message)
 
 
 
@@ -2229,9 +2584,11 @@ class RecordingController:
         )
         row: dict[str, object] = {
             "session_id": self.panel.recording_session_id,
+            "measurement_id": str(getattr(self.panel, "_measurement_id", "") or ""),
             "measurement_attempt_id": str(measurement_attempt.attempt_id),
             "measurement_attempt_session_id": measurement_attempt.attempt_session_id,
             "measurement_attempt_sha256": measurement_attempt.canonical_sha256(),
+            "measurement_attempt_canonical_json": measurement_attempt.canonical_json(),
             "measurement_detection_pair_key": json.dumps(
                 measurement_attempt.detection_pair_key, separators=(",", ":")
             ),
@@ -2250,11 +2607,11 @@ class RecordingController:
             "baseline_frame_origin_contract": (
                 "midpoint_of_left_optical_origin_and_selected_right_origin_proxy"
             ),
-            "baseline_frame_origin_model": (
-                "checkerboard_stereo_rt_optical_centers"
-                if measurement_attempt.triangulation_source == "checkerboard"
-                else "gps_rtk_antenna_baseline_proxy_no_lever_arm"
-            ),
+                "baseline_frame_origin_model": (
+                    "resolved_relative_pose_optical_centers"
+                    if measurement_attempt.measurement_geometry_kind == "relative_pose"
+                    else "gps_rtk_antenna_baseline_proxy_no_lever_arm"
+                ),
             "baseline_frame_axis_construction": (
                 "right=left_to_right_center;forward=projected_average_optical_forward;"
                 "down=forward_cross_right"
@@ -2333,12 +2690,12 @@ class RecordingController:
         if (
             not isinstance(nominal, StereoIntrinsicsSnapshot)
             or not isinstance(active, StereoIntrinsicsSnapshot)
-            or measurement_attempt.triangulation_source != "checkerboard"
+            or measurement_attempt.measurement_geometry_kind != "relative_pose"
         ):
             return {
                 "dual_geometry_state": (
-                    "not_applicable_pixhawk_path"
-                    if measurement_attempt.triangulation_source != "checkerboard"
+                    "not_applicable_live_pixhawk_path"
+                    if measurement_attempt.measurement_geometry_kind != "relative_pose"
                     else "nominal_or_active_profile_unavailable"
                 ),
                 "nominal_profile_sha256": "" if not isinstance(nominal, StereoIntrinsicsSnapshot) else nominal.content_sha256,
@@ -2372,11 +2729,15 @@ class RecordingController:
                 "active_profile_sha256": active.content_sha256,
             }
 
-    def _persist_native_measurement_pair(
+    def _persist_native_detection_pair(
         self,
-        measurement_attempt: MeasurementAttempt,
+        *,
+        left_detection: object,
+        right_detection: object,
+        pair_id: str,
+        purpose: str,
     ) -> dict[str, object]:
-        """Persist accepted-pair source pixels without resizing or overlays.
+        """Persist evaluated-pair source pixels without resizing or overlays.
 
         The producer's OpenCV/native image coordinates are retained.  Missing
         cached frames do not block raw attempt recording; the explicit status
@@ -2385,19 +2746,26 @@ class RecordingController:
 
         if not self.panel.recording_session_id:
             return {"native_pair_status": "session_id_missing"}
-        pair_id = f"pair-{measurement_attempt.attempt_id}"
-        store = NativeFrameStore(
-            self.panel._recording_session_dir(self.panel.recording_session_id)
-        )
+        resolver = getattr(self.panel, "_recording_session_dir", None)
+        if not callable(resolver):
+            return {"native_pair_status": "session_directory_owner_missing"}
+        store = NativeFrameStore(resolver(self.panel.recording_session_id))
         output: dict[str, object] = {"native_pair_status": "complete"}
         missing: list[str] = []
         for side, detection in (
-            ("left", measurement_attempt.left_detection),
-            ("right", measurement_attempt.right_detection),
+            ("left", left_detection),
+            ("right", right_detection),
         ):
             pane = getattr(self.panel, f"{side}_pane", None)
             getter = getattr(pane, "native_measurement_frame", None)
-            cached = getter(detection.pairing_timestamp_s) if callable(getter) else None
+            # CameraPane's native cache is keyed by the producer's
+            # app-receive monotonic timestamp.  pairing_timestamp_s may instead
+            # be RTCP/NTP Unix time and is only valid for stereo pairing.
+            cached = (
+                getter(detection.app_receive_monotonic_s)
+                if callable(getter)
+                else None
+            )
             if cached is None:
                 missing.append(side)
                 continue
@@ -2405,7 +2773,7 @@ class RecordingController:
             try:
                 artifact = store.persist(
                     side=side,
-                    purpose="accepted-measurement",
+                    purpose=purpose,
                     frame_id=pair_id,
                     image=image,
                     metadata=metadata,
@@ -2428,6 +2796,58 @@ class RecordingController:
         if missing:
             output["native_pair_status"] = "missing:" + ",".join(missing)
         return output
+
+    def _persist_native_measurement_pair(
+        self,
+        measurement_attempt: MeasurementAttempt,
+    ) -> dict[str, object]:
+        return self._persist_native_detection_pair(
+            left_detection=measurement_attempt.left_detection,
+            right_detection=measurement_attempt.right_detection,
+            pair_id=f"pair-{measurement_attempt.attempt_id}",
+            purpose="accepted-measurement",
+        )
+
+    @staticmethod
+    def _measurement_result_evidence(
+        *,
+        attempt_sha256: str,
+        status: str,
+        valid: bool,
+        method: str,
+        quality: str,
+        warnings: tuple[str, ...] | list[str] | str,
+        vector_frd_range_m: tuple[float | None, float | None, float | None, float | None],
+    ) -> dict[str, str]:
+        warning_values = (
+            [str(value) for value in warnings]
+            if isinstance(warnings, (tuple, list))
+            else [str(warnings)] if warnings else []
+        )
+        payload = {
+            "schema": "workstation-measurement-result-v1",
+            "measurement_attempt_sha256": str(attempt_sha256),
+            "status": str(status),
+            "valid": bool(valid),
+            "method": str(method),
+            "quality": str(quality),
+            "warnings": warning_values,
+            "measurement_frame": MEASUREMENT_FRAME,
+            "measurement_axis_contract": MEASUREMENT_AXIS_CONTRACT,
+            "unit": "m",
+            "vector_frd_range_m": list(vector_frd_range_m),
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return {
+            "measurement_result_canonical_json": encoded,
+            "measurement_result_sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+        }
 
     def _upsert_pair_recording_row(
         self,
@@ -2493,7 +2913,109 @@ class RecordingController:
                 "warnings": "; ".join(warnings or measurement_attempt.warnings),
             }
         )
+        row.update(
+            self._measurement_result_evidence(
+                attempt_sha256=measurement_attempt.canonical_sha256(),
+                status=status,
+                valid=False,
+                method=measurement_attempt.measurement_method_id,
+                quality=measurement_attempt.source_quality,
+                warnings=warnings or measurement_attempt.warnings,
+                vector_frd_range_m=(None, None, None, None),
+            )
+        )
         self.panel._upsert_pair_recording_row(measurement_attempt, row)
+
+    def _record_blocked_measurement_pair(self, blocked: BlockedMeasurementPair) -> None:
+        if not self.panel.distance_recording_enabled:
+            return
+        key = tuple(blocked.detection_pair_key)
+        row: dict[str, object] = {
+            "session_id": self.panel.recording_session_id,
+            "measurement_id": str(getattr(self.panel, "_measurement_id", "") or ""),
+            "schema_version": "stereowiris-paired-frame-v2",
+            "measurement_valid": "false",
+            "pair_status": blocked.status,
+            "measurement_geometry_kind": "unresolved",
+            "measurement_method_id": "",
+            "measurement_method_instance_id": "",
+            "measurement_attempt_sha256": "",
+            "blocked_pair_sha256": blocked.canonical_sha256(),
+            "blocked_pair_canonical_json": blocked.canonical_json(),
+            "measurement_readiness_sha256": blocked.readiness_sha256,
+            "measurement_readiness_canonical_json": blocked.readiness_payload_json,
+            "measurement_attempt_timestamp_basis": blocked.timestamp_basis,
+            "measurement_detection_pair_key": json.dumps(key, separators=(",", ":")),
+            "warnings": "; ".join(blocked.reasons),
+            "recorded_unix_ns": int(round(blocked.created_wall_s * 1_000_000_000.0)),
+            "pair_app_mid_monotonic_ns": int(
+                round(
+                    (
+                        blocked.left_detection.timestamp_s
+                        + blocked.right_detection.timestamp_s
+                    )
+                    * 0.5
+                    * 1_000_000_000.0
+                )
+            ),
+            "selected_left_pairing_timestamp_s": blocked.left_detection.pairing_timestamp_s,
+            "selected_right_pairing_timestamp_s": blocked.right_detection.pairing_timestamp_s,
+            "left_bbox_xyxy_px": json.dumps(blocked.left_detection.bbox_xyxy_px),
+            "right_bbox_xyxy_px": json.dumps(blocked.right_detection.bbox_xyxy_px),
+            "left_class_id": blocked.left_detection.class_id,
+            "right_class_id": blocked.right_detection.class_id,
+        }
+        row.update(
+            self._persist_native_detection_pair(
+                left_detection=blocked.left_detection,
+                right_detection=blocked.right_detection,
+                pair_id=f"blocked-{blocked.canonical_sha256()[:20]}",
+                purpose="blocked-measurement",
+            )
+        )
+        row.update(
+            self._measurement_result_evidence(
+                attempt_sha256=blocked.canonical_sha256(),
+                status=blocked.status,
+                valid=False,
+                method="",
+                quality="BLOCKED",
+                warnings=blocked.reasons,
+                vector_frd_range_m=(None, None, None, None),
+            )
+        )
+        row_index = self.panel._recording_pair_row_index.get(key)
+        if row_index is None:
+            row_index = len(self.panel.distance_recording_rows)
+            row["sample_index"] = row_index
+            row["pair_sequence"] = row_index
+            self.panel._recording_pair_row_index[key] = row_index
+            self.panel.distance_recording_rows.append(row)
+            self.panel.distance_recording_keys.append(key)
+            if len(self.panel.distance_recording_keys) > RECORDING_KEY_CACHE_LIMIT:
+                self.panel.distance_recording_keys.pop(0)
+            minimum_cached_index = max(
+                0,
+                len(self.panel.distance_recording_rows) - RECORDING_KEY_CACHE_LIMIT,
+            )
+            self.panel._recording_pair_row_index = {
+                cached_key: cached_index
+                for cached_key, cached_index in self.panel._recording_pair_row_index.items()
+                if cached_index >= minimum_cached_index
+            }
+            self.panel._append_recording_table_row(row)
+        else:
+            current = self.panel.distance_recording_rows[row_index]
+            sample_index = current.get("sample_index", row_index)
+            pair_sequence = current.get("pair_sequence", row_index)
+            current.update(row)
+            current["sample_index"] = sample_index
+            current["pair_sequence"] = pair_sequence
+            if isinstance(self.panel.distance_recording_rows, SpoolRows):
+                self.panel.distance_recording_rows.replace(row_index, current)
+            self.panel._refresh_recording_table()
+        self.panel._refresh_recording_status_label()
+        self.panel._refresh_operation_header()
 
     def _append_distance_history(
         self,
@@ -2554,6 +3076,7 @@ class RecordingController:
         row = self.panel._pair_recording_base_row(measurement_attempt)
         row.update({
             "session_id": self.panel.recording_session_id,
+            "measurement_id": str(getattr(self.panel, "_measurement_id", "") or ""),
             "measurement_attempt_id": str(measurement_attempt.attempt_id),
             "measurement_attempt_session_id": measurement_attempt.attempt_session_id,
             "measurement_attempt_sha256": measurement_attempt.canonical_sha256(),
@@ -2594,8 +3117,8 @@ class RecordingController:
                 "midpoint_of_left_optical_origin_and_selected_right_origin_proxy"
             ),
             "baseline_frame_origin_model": (
-                "checkerboard_stereo_rt_optical_centers"
-                if measurement_attempt.triangulation_source == "checkerboard"
+                "resolved_relative_pose_optical_centers"
+                if measurement_attempt.measurement_geometry_kind == "relative_pose"
                 else "gps_rtk_antenna_baseline_proxy_no_lever_arm"
             ),
             "measurement_method": "two_ray_closest_midpoint",
@@ -2634,6 +3157,22 @@ class RecordingController:
         row.update(self.panel._record_frame_timestamp_parameters(measurement_attempt))
         row.update(self.panel._record_live_telemetry_snapshot_parameters(measurement_attempt))
         row.update(self.panel._record_external_parameters(estimate=estimate, measurement_attempt=measurement_attempt))
+        row.update(
+            self._measurement_result_evidence(
+                attempt_sha256=measurement_attempt.canonical_sha256(),
+                status="measured",
+                valid=True,
+                method=method,
+                quality=estimate.sync_quality,
+                warnings=tuple(estimate.warnings),
+                vector_frd_range_m=(
+                    point.forward_m,
+                    point.right_m,
+                    point.down_m,
+                    distance_m,
+                ),
+            )
+        )
         row.pop("measurement_attempt_content_sha256", None)
         row.pop("measurement_attempt_instance_sha256", None)
         row["measurement_attempt_content_sha256"] = measurement_attempt_content_sha256
@@ -2712,6 +3251,8 @@ class RecordingController:
             return "left"
         if normalized.startswith("right"):
             return "right"
+        if normalized.startswith("drone"):
+            return "drone"
         return None
 
     def _raw_timeline_row(
@@ -2740,6 +3281,7 @@ class RecordingController:
         return {
             "sequence": sequence,
             "session_id": self.panel.recording_session_id,
+            "measurement_id": str(getattr(self.panel, "_measurement_id", "") or ""),
             "side": side,
             "sample_type": sample_type,
             "row_contract": row_contract,
@@ -2901,6 +3443,14 @@ class RecordingController:
         side = self.panel._recording_side(camera)
         if side is None:
             return
+        if side not in self.panel.px4_recording_rows:
+            rows = SpoolRows()
+            rows.bind(
+                self.panel._recording_session_dir(self.panel.recording_session_id)
+                / ".spool"
+                / f"px4_{side}.jsonl"
+            )
+            self.panel.px4_recording_rows[side] = rows
         host_receive_monotonic_ns = time.monotonic_ns()
         host_receive_utc_ns = time.time_ns()
         raw_sample_monotonic_s = values.get("sample_app_timestamp_s")
@@ -3568,9 +4118,13 @@ class RecordingController:
         self, *, estimate=None, measurement_attempt: MeasurementAttempt
     ) -> dict[str, str]:
         triangulation_source = measurement_attempt.triangulation_source
-        checkerboard_mode = triangulation_source == "checkerboard"
+        checkerboard_mode = measurement_attempt.measurement_method_id == CHECKERBOARD_STEREO
+        relative_pose_mode = measurement_attempt.measurement_geometry_kind == "relative_pose"
+        component_sources = dict(measurement_attempt.measurement_component_sources)
+        uses_live_gnss = "live_gnss" in component_sources.values()
+        uses_live_pixhawk = "live_pixhawk" in component_sources.values()
         attitude_timing_status = classify_attitude_timing(
-            uses_pixhawk_attitude=not checkerboard_mode,
+            uses_pixhawk_attitude=uses_live_pixhawk,
             left_age_s=(
                 measurement_attempt.left_attitude_age_s
                 if estimate is None
@@ -3590,17 +4144,23 @@ class RecordingController:
         checkerboard = self.panel._record_checkerboard_extrinsics_parameters(measurement_attempt)
         row: dict[str, str] = {
             "triangulation_extrinsics_source": triangulation_source,
-            "use_rtk_baseline": self.panel._fmt_record_bool(not checkerboard_mode),
-            "rtk_baseline_applied": self.panel._fmt_record_bool(not checkerboard_mode),
+            "measurement_method_id": measurement_attempt.measurement_method_id,
+            "measurement_method_instance_id": measurement_attempt.measurement_method_instance_id,
+            "measurement_geometry_kind": measurement_attempt.measurement_geometry_kind,
+            "measurement_geometry_sha256": measurement_attempt.measurement_geometry_sha256,
+            "measurement_selection_reason": measurement_attempt.measurement_selection_reason,
+            "measurement_component_sources": json.dumps(
+                component_sources, sort_keys=True, separators=(",", ":")
+            ),
+            "use_rtk_baseline": self.panel._fmt_record_bool(uses_live_gnss),
+            "rtk_baseline_applied": self.panel._fmt_record_bool(uses_live_gnss),
             "require_rtk_fixed": self.panel._fmt_record_bool(
-                False if checkerboard_mode else measurement_attempt.geometry_config.require_rtk_fixed_setting
+                measurement_attempt.geometry_config.require_rtk_fixed_setting
+                if uses_live_gnss
+                else False
             ),
             "use_triangulation": self.panel._fmt_record_bool(True),
-            "distance_mode": (
-                "체커보드 Stereo 외부 파라미터"
-                if checkerboard_mode
-                else "Pixhawk 자세 + GPS/RTK baseline"
-            ),
+            "distance_mode": measurement_attempt.measurement_method_id,
             "world_frame": WORLD_FRAME,
             "body_frame": BODY_FRAME,
             "camera_frame": CAMERA_FRAME,
@@ -3608,27 +4168,41 @@ class RecordingController:
             "mount_assumption_model": (
                 "checkerboard-stereo-extrinsics-v1"
                 if checkerboard_mode
+                else "hybrid-candidate-live-components-v1"
+                if relative_pose_mode and (uses_live_pixhawk or uses_live_gnss)
+                else "optical-pose-relative-r-t-v1"
+                if relative_pose_mode
                 else "gps-rtk-baseline-only-v1"
             ),
             "mount_assumption_status": (
-                "checkerboard stereo extrinsics" if checkerboard_mode else "GPS/RTK baseline only"
+                "checkerboard stereo extrinsics"
+                if checkerboard_mode
+                else "resolved candidate/live component geometry"
+                if relative_pose_mode
+                else "GPS/RTK baseline only"
             ),
             "mount_assumption_detail": (
                 "applied_checkerboard_stereo_extrinsics_used_as_fixed_optical_transform"
                 if checkerboard_mode
+                else "resolved_relative_pose_with_per_dof_sources"
+                if relative_pose_mode
                 else "live_gps_rtk_baseline_used_as_stereo_translation"
             ),
-            "checkerboard_extrinsics_active": self.panel._fmt_record_bool(bool(checkerboard["active"])),
-            "checkerboard_extrinsics_pair_count": str(checkerboard.get("pair_count", "")),
+            "checkerboard_extrinsics_active": self.panel._fmt_record_bool(
+                checkerboard_mode and bool(checkerboard["active"])
+            ),
+            "checkerboard_extrinsics_pair_count": (
+                str(checkerboard.get("pair_count", "")) if checkerboard_mode else ""
+            ),
             "checkerboard_extrinsics_reprojection_error_px": self.panel._fmt_record_float(
-                checkerboard.get("reprojection_error_px"), 6
+                checkerboard.get("reprojection_error_px") if checkerboard_mode else None, 6
             ),
             "checkerboard_extrinsics_frame_contract": str(checkerboard["frame_contract"]),
-            "require_attitude": self.panel._fmt_record_bool(False),
-            "attitude_used_for_triangulation": self.panel._fmt_record_bool(not checkerboard_mode),
+            "require_attitude": self.panel._fmt_record_bool(uses_live_pixhawk),
+            "attitude_used_for_triangulation": self.panel._fmt_record_bool(uses_live_pixhawk),
             "attitude_timing_policy": ATTITUDE_TIMING_POLICY,
             "attitude_timing_status": attitude_timing_status,
-            "attitude_timing_blocks_measurement": self.panel._fmt_record_bool(False),
+            "attitude_timing_blocks_measurement": self.panel._fmt_record_bool(uses_live_pixhawk),
             "attitude_stale_age_threshold_s": self.panel._fmt_record_float(ATTITUDE_STALE_AGE_S, 3),
             "attitude_very_stale_age_threshold_s": self.panel._fmt_record_float(
                 ATTITUDE_VERY_STALE_AGE_S, 3
@@ -3910,5 +4484,3 @@ class RecordingController:
                 "" if state.mavlink_message_id is None else state.mavlink_message_id
             ),
         }
-
-

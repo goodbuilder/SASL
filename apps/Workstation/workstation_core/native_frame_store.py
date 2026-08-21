@@ -110,7 +110,9 @@ class NativeFrameStore:
             source_timestamp_s=(
                 None if metadata.get("source_timestamp_s") is None else float(metadata["source_timestamp_s"])
             ),
-            timestamp_reference=str(metadata.get("timestamp_reference") or "app-receive"),
+            # Missing provenance is unknown.  It must never be promoted to the
+            # host monotonic clock merely because a caller omitted the field.
+            timestamp_reference=str(metadata.get("timestamp_reference") or "unknown"),
             source_native_frame_id=str(metadata.get("source_native_frame_id") or ""),
         )
         with self.events_path.open("a", encoding="utf-8") as handle:

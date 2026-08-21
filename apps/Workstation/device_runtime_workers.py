@@ -10,6 +10,7 @@ from collections import deque
 from collections.abc import Sequence
 from ipaddress import IPv4Address
 import threading
+import time
 
 from PyQt5 import QtCore
 
@@ -462,65 +463,200 @@ class PixhawkPersistentConfigWorker(QtCore.QObject):
 class PixhawkRtcmInjectionWorker(QtCore.QObject):
     """Queue RTCM packets so GNSS correction delivery never runs in the UI."""
 
+    MAX_INJECTION_AGE_S = 2.0
+
     request = QtCore.pyqtSignal(object, object)
+    request_envelope = QtCore.pyqtSignal(object)
     injected = QtCore.pyqtSignal(object)
     finished = QtCore.pyqtSignal()
 
-    def __init__(self, subscriber: DualPixhawkMavlinkSubscriber, *, max_queue: int = 96) -> None:
+    def __init__(
+        self,
+        subscriber: DualPixhawkMavlinkSubscriber,
+        *,
+        max_queue: int = 96,
+        max_injection_age_s: float = MAX_INJECTION_AGE_S,
+    ) -> None:
         super().__init__()
         self.subscriber = subscriber
         self.max_queue = max(1, int(max_queue))
-        self._queue: deque[tuple[tuple[str, ...], bytes]] = deque()
+        self.max_injection_age_s = max(0.0, float(max_injection_age_s))
+        self._queue: deque[tuple[tuple[str, ...], bytes, dict[str, object]]] = deque()
         self._queue_lock = threading.Lock()
         self._draining = False
 
     @QtCore.pyqtSlot(object, object)
     def enqueue(self, sides: object, payload: object) -> None:
+        self._enqueue(sides, payload, {}, drain_immediately=True)
+
+    @QtCore.pyqtSlot(object)
+    def enqueue_envelope(self, request: object) -> None:
+        self._enqueue_envelope(request, drain_immediately=True)
+
+    @QtCore.pyqtSlot(object)
+    def submit_envelope(self, request: object) -> None:
+        """Thread-safe bounded handoff used directly by the RTCM pipeline."""
+
+        self._enqueue_envelope(request, drain_immediately=False)
+
+    def _enqueue_envelope(self, request: object, *, drain_immediately: bool) -> None:
+        values = dict(request) if isinstance(request, dict) else {}
+        metadata = {
+            key: values[key]
+            for key in (
+                "pipeline_sequence",
+                "source",
+                "targets",
+                "payload_sha256",
+                "receive_monotonic_ns",
+                "message_type",
+                "evidence_context_token",
+                "evidence_session_id",
+                "evidence_session_root",
+            )
+            if key in values
+        }
+        self._enqueue(
+            values.get("targets"),
+            values.get("payload"),
+            metadata,
+            drain_immediately=drain_immediately,
+        )
+
+    def _enqueue(
+        self,
+        sides: object,
+        payload: object,
+        metadata: dict[str, object],
+        *,
+        drain_immediately: bool,
+    ) -> None:
         target_sides = tuple(str(side) for side in (sides or ()))
         frame = bytes(payload or b"")
         if not target_sides or not frame:
             return
         with self._queue_lock:
             dropped = 0
+            dropped_metadata: list[dict[str, object]] = []
             while len(self._queue) >= self.max_queue:
-                self._queue.popleft()
+                _old_sides, _old_payload, old_metadata = self._queue.popleft()
+                if old_metadata:
+                    dropped_metadata.append(dict(old_metadata))
                 dropped += 1
-            self._queue.append((target_sides, frame))
-            if self._draining:
-                return
-            self._draining = True
+            self._queue.append((target_sides, frame, dict(metadata)))
+            should_start = not self._draining
+            if should_start:
+                self._draining = True
         if dropped:
-            self.injected.emit({"dropped": dropped, "payload_bytes": 0, "sent": (), "failed": ()})
-        self._drain_one()
+            result: dict[str, object] = {
+                "dropped": dropped,
+                "payload_bytes": 0,
+                "sent": (),
+                "failed": (),
+            }
+            if dropped_metadata:
+                result["dropped_envelopes"] = tuple(dropped_metadata)
+            self.injected.emit(result)
+        if should_start:
+            if drain_immediately:
+                self._drain_one()
+            else:
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_drain_one",
+                    QtCore.Qt.QueuedConnection,
+                )
 
+    @QtCore.pyqtSlot()
     def _drain_one(self) -> None:
         with self._queue_lock:
             if not self._queue:
                 self._draining = False
                 return
-            sides, payload = self._queue.popleft()
+            sides, payload, metadata = self._queue.popleft()
         sent: list[tuple[str, int]] = []
         failed: list[tuple[str, str]] = []
-        for side in sides:
+        stale_targets: list[str] = []
+        delivery_monotonic_s_by_target: dict[str, float] = {}
+        receive_monotonic_ns = int(metadata.get("receive_monotonic_ns") or 0)
+        last_age_s = 0.0
+        for index, side in enumerate(sides):
             try:
                 with self.subscriber.exclusive_command(side):
+                    # exclusive_command may itself wait behind another device
+                    # operation. Re-evaluate only after acquiring it so this
+                    # check is immediately adjacent to the physical send.
+                    if receive_monotonic_ns > 0:
+                        last_age_s = max(
+                            0.0,
+                            (time.monotonic_ns() - receive_monotonic_ns)
+                            / 1_000_000_000.0,
+                        )
+                    if (
+                        receive_monotonic_ns > 0
+                        and self.max_injection_age_s > 0.0
+                        and last_age_s > self.max_injection_age_s
+                    ):
+                        stale_targets.extend(str(value) for value in sides[index:])
+                        break
                     packet_count = int(self.subscriber.send_rtcm_data(side, payload) or 0)
                 sent.append((side, packet_count))
+                delivery_monotonic_s_by_target[side] = time.monotonic()
             except Exception as exc:
                 failed.append((side, str(exc)))
-        self.injected.emit(
-            {
-                "payload_bytes": len(payload),
-                "sent": tuple(sent),
-                "failed": tuple(failed),
-                "dropped": 0,
-            }
-        )
+        result: dict[str, object] = {
+            "payload_bytes": len(payload),
+            "sent": tuple(sent),
+            "failed": tuple(failed),
+            "dropped": 1 if stale_targets else 0,
+        }
+        result.update(metadata)
+        if delivery_monotonic_s_by_target and int(metadata.get("pipeline_sequence") or 0) > 0:
+            result["delivery_monotonic_s_by_target"] = dict(
+                delivery_monotonic_s_by_target
+            )
+            result["last_delivery_s"] = max(
+                delivery_monotonic_s_by_target.values()
+            )
+        if stale_targets:
+            result.update(
+                {
+                    "drop_reason": "stale-before-send",
+                    "age_s": last_age_s,
+                    "dropped_targets": tuple(stale_targets),
+                    "terminal_outcome": "stale" if not sent else "partial-stale",
+                }
+            )
+        self.injected.emit(result)
         QtCore.QTimer.singleShot(0, self._drain_one)
 
-    def clear_pending(self) -> None:
+    def clear_pending(
+        self,
+        *,
+        reason: str = "worker-retired",
+    ) -> tuple[dict[str, object], ...]:
         with self._queue_lock:
+            pending = tuple(self._queue)
             self._queue.clear()
+        outcomes: list[dict[str, object]] = []
+        for sides, payload, metadata in pending:
+            outcome: dict[str, object] = {
+                "payload_bytes": len(payload),
+                "sent": (),
+                "failed": (),
+                "dropped": 1,
+            }
+            outcome.update(metadata)
+            outcome.update(
+                {
+                    "drop_reason": str(reason),
+                    "dropped_targets": tuple(sides),
+                    "terminal_outcome": "cancelled",
+                }
+            )
+            outcomes.append(outcome)
+            self.injected.emit(outcome)
+        return tuple(outcomes)
 
 
 class PixhawkShellCommandWorker(QtCore.QObject):

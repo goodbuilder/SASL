@@ -1,13 +1,24 @@
 from __future__ import annotations
 
+import copy
+import math
+import threading
 import time
+import weakref
 from collections import deque
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from Workstation.workstation_core.stereo import DetectionObservation
 from Workstation.workstation_core.theme import ACCENT
-from Workstation.workstation_core.yolo_stream import YoloStreamWorker
+from Workstation.workstation_core.yolo_stream import (
+    DEFAULT_PREVIEW_DISPLAY_RATE_HZ,
+    YoloStreamWorker,
+)
+
+
+DEFAULT_NATIVE_CALIBRATION_FRAME_MAX_AGE_S = 2.0
+MAX_GUI_PREVIEW_RATE_HZ = DEFAULT_PREVIEW_DISPLAY_RATE_HZ
 
 
 def infer_camera_timestamp_reference(metadata: dict) -> str:
@@ -78,9 +89,47 @@ class _AspectRatioPreviewContainer(QtWidgets.QWidget):
         self._child.setGeometry(x, y, target_w, target_h)
 
 
+class _CameraStreamSignalAdapter(QtCore.QObject):
+    """Give non-preview worker signals an explicit GUI-thread receiver."""
+
+    def __init__(self, pane: "CameraPane", generation: int) -> None:
+        super().__init__(pane)
+        self._pane_ref = weakref.ref(pane)
+        self._generation = int(generation)
+
+    @QtCore.pyqtSlot(object, QtGui.QImage)
+    def native_frame(self, metadata: object, image: QtGui.QImage) -> None:
+        pane = self._pane_ref()
+        if pane is not None:
+            pane._emit_native_measurement_frame_if_current(
+                self._generation,
+                metadata,
+                image,
+            )
+
+    @QtCore.pyqtSlot(dict)
+    def detection(self, payload: dict) -> None:
+        pane = self._pane_ref()
+        if pane is not None:
+            pane._handle_detection_payload_if_current(self._generation, payload)
+
+    @QtCore.pyqtSlot(dict)
+    def stats(self, payload: dict) -> None:
+        pane = self._pane_ref()
+        if pane is not None:
+            pane._handle_stats_payload_if_current(self._generation, payload)
+
+    @QtCore.pyqtSlot(str)
+    def status(self, value: str) -> None:
+        pane = self._pane_ref()
+        if pane is not None:
+            pane._set_status_if_current(self._generation, value)
+
+
 class CameraPane(QtWidgets.QGroupBox):
     detection_changed = QtCore.pyqtSignal(str, object)
     frame_changed = QtCore.pyqtSignal(str, QtGui.QImage, object)
+    measurement_frame_changed = QtCore.pyqtSignal(str, QtGui.QImage, object)
     native_measurement_frame_changed = QtCore.pyqtSignal(str, object, QtGui.QImage)
     stats_changed = QtCore.pyqtSignal(str, object)
     state_changed = QtCore.pyqtSignal(str, str)
@@ -107,6 +156,17 @@ class CameraPane(QtWidgets.QGroupBox):
         self.current_status = "중지됨"
         self._stop_requested_monotonic_s: float | None = None
         self._stop_escalation_level = 0
+        self._preview_lock = threading.Lock()
+        self._pending_preview: tuple[int, QtGui.QImage, dict[str, object]] | None = None
+        self._preview_submitted = 0
+        self._preview_rendered = 0
+        self._preview_replaced = 0
+        self._preview_frame_callback = None
+        self._stream_signal_adapter: _CameraStreamSignalAdapter | None = None
+        self._preview_timer = QtCore.QTimer(self)
+        self._preview_timer.setTimerType(QtCore.Qt.PreciseTimer)
+        self._preview_timer.setInterval(round(1000.0 / MAX_GUI_PREVIEW_RATE_HZ))
+        self._preview_timer.timeout.connect(self._drain_preview_frame)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(10, 12, 10, 10)
@@ -135,12 +195,15 @@ class CameraPane(QtWidgets.QGroupBox):
         self.measurement_frame_images.clear()
         self.measurement_frame_metadata.clear()
         self.measurement_frame_order.clear()
+        self._clear_pending_preview()
         self.measurement_pair_display_active = False
         self.selected_measurement_frame_timestamp_s = None
         self.selected_measurement_frame_lookup_delta_s = None
         self.detection_stream_active = bool(enable_detection)
         self._stop_requested_monotonic_s = None
         self._stop_escalation_level = 0
+        self._configure_preview_timer(kwargs.get("display_rate_hz"))
+        self._preview_timer.start()
         self.image_label.setPixmap(QtGui.QPixmap())
         self.image_label.setText("YOLO 시작 중..." if enable_detection else "카메라 연결 중...")
         self._set_detection_label(None)
@@ -148,31 +211,39 @@ class CameraPane(QtWidgets.QGroupBox):
         self.worker = YoloStreamWorker(url=url, enable_detection=enable_detection, **kwargs)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
+        pane_ref = weakref.ref(self)
+
+        def submit_preview(
+            image: QtGui.QImage,
+            metadata: object,
+            *,
+            generation: int = stream_generation,
+        ) -> None:
+            pane = pane_ref()
+            if pane is not None:
+                pane._submit_preview_frame_for_generation(generation, image, metadata)
+
+        self._preview_frame_callback = submit_preview
         self.worker.frame_ready.connect(
-            lambda image, metadata, generation=stream_generation: self._show_frame_if_current(
-                generation, image, metadata
-            )
+            submit_preview,
+            QtCore.Qt.DirectConnection,
         )
-        self.worker.measurement_frame_ready.connect(
-            lambda timestamp_s, image, generation=stream_generation: self._store_measurement_frame_if_current(
-                generation, timestamp_s, image
-            )
-        )
+        adapter = _CameraStreamSignalAdapter(self, stream_generation)
+        self._stream_signal_adapter = adapter
+        # The metadata-rich native signal below supersedes the compatibility
+        # measurement_frame_ready signal.  Connecting both stored every
+        # multi-megabyte raster twice on the GUI thread during detection.
         self.worker.native_measurement_frame_ready.connect(
-            lambda metadata, image, generation=stream_generation: self._emit_native_measurement_frame_if_current(
-                generation, metadata, image
-            )
+            adapter.native_frame,
         )
         self.worker.detection_ready.connect(
-            lambda payload, generation=stream_generation: self._handle_detection_payload_if_current(
-                generation, payload
-            )
+            adapter.detection,
         )
         self.worker.stats_ready.connect(
-            lambda payload, generation=stream_generation: self._handle_stats_payload_if_current(generation, payload)
+            adapter.stats,
         )
         self.worker.status_changed.connect(
-            lambda status, generation=stream_generation: self._set_status_if_current(generation, status)
+            adapter.status,
         )
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
@@ -191,7 +262,18 @@ class CameraPane(QtWidgets.QGroupBox):
         self.stream_generation += 1
         worker = self.worker
         thread = self.thread
+        adapter = self._stream_signal_adapter
+        self._stream_signal_adapter = None
+        if adapter is not None:
+            adapter.deleteLater()
         if worker is not None:
+            callback = self._preview_frame_callback
+            if callback is not None:
+                try:
+                    worker.frame_ready.disconnect(callback)
+                except (TypeError, RuntimeError):
+                    pass
+            self._preview_frame_callback = None
             worker.request_stop()
             if self._stop_requested_monotonic_s is None:
                 self._stop_requested_monotonic_s = time.monotonic()
@@ -232,10 +314,12 @@ class CameraPane(QtWidgets.QGroupBox):
         self.measurement_frame_images.clear()
         self.measurement_frame_metadata.clear()
         self.measurement_frame_order.clear()
+        self._clear_pending_preview()
         self.measurement_pair_display_active = False
         self.selected_measurement_frame_timestamp_s = None
         self.selected_measurement_frame_lookup_delta_s = None
         self.detection_stream_active = False
+        self._preview_timer.stop()
         self.image_label.setText("중지됨")
         self.image_label.setPixmap(QtGui.QPixmap())
         self._preview_container.set_aspect_ratio(None)
@@ -278,6 +362,63 @@ class CameraPane(QtWidgets.QGroupBox):
             return
         self._show_frame(image, metadata)
 
+    def _configure_preview_timer(self, requested_rate_hz: object) -> None:
+        try:
+            requested = float(requested_rate_hz)
+        except (TypeError, ValueError):
+            requested = MAX_GUI_PREVIEW_RATE_HZ
+        if not math.isfinite(requested) or requested <= 0.0:
+            requested = MAX_GUI_PREVIEW_RATE_HZ
+        effective = min(MAX_GUI_PREVIEW_RATE_HZ, requested)
+        self._preview_timer.setInterval(max(1, round(1000.0 / effective)))
+
+    def _submit_preview_frame_for_generation(
+        self,
+        generation: int,
+        image: QtGui.QImage,
+        metadata: object,
+    ) -> None:
+        # May run in a camera worker thread. Only replace one detached QImage
+        # reference under a lock; QWidget access remains in the timer slot.
+        if generation != self.stream_generation:
+            return
+        frame_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        with self._preview_lock:
+            self._preview_submitted += 1
+            if self._pending_preview is not None:
+                self._preview_replaced += 1
+            self._pending_preview = (generation, image, frame_metadata)
+
+    @QtCore.pyqtSlot()
+    def _drain_preview_frame(self) -> None:
+        with self._preview_lock:
+            pending = self._pending_preview
+            self._pending_preview = None
+        if pending is None:
+            return
+        generation, image, metadata = pending
+        if generation != self.stream_generation:
+            return
+        self._preview_rendered += 1
+        self._show_frame(image, metadata)
+
+    def _clear_pending_preview(self) -> None:
+        with self._preview_lock:
+            self._pending_preview = None
+
+    def preview_delivery_snapshot(self) -> dict[str, int | bool]:
+        with self._preview_lock:
+            queued = self._pending_preview is not None
+            submitted = self._preview_submitted
+            replaced = self._preview_replaced
+        return {
+            "submitted": submitted,
+            "rendered": self._preview_rendered,
+            "replaced": replaced,
+            "queued_latest": queued,
+            "timer_interval_ms": self._preview_timer.interval(),
+        }
+
     def _store_measurement_frame(
         self,
         timestamp_s: float,
@@ -293,7 +434,7 @@ class CameraPane(QtWidgets.QGroupBox):
             self.measurement_frame_order.append(key)
         self.measurement_frame_images[key] = image.copy()
         if metadata is not None:
-            self.measurement_frame_metadata[key] = dict(metadata)
+            self.measurement_frame_metadata[key] = copy.deepcopy(metadata)
 
     def _store_measurement_frame_if_current(self, generation: int, timestamp_s: float, image: QtGui.QImage) -> None:
         if generation != self.stream_generation:
@@ -357,6 +498,132 @@ class CameraPane(QtWidgets.QGroupBox):
             maximum_delta_s=0.0,
         )
 
+    def calibration_native_frame_near(
+        self,
+        timestamp_s: float,
+        *,
+        maximum_delta_s: float = 0.001,
+        maximum_age_s: float = DEFAULT_NATIVE_CALIBRATION_FRAME_MAX_AGE_S,
+        now_monotonic_s: float | None = None,
+    ) -> tuple[str, QtGui.QImage, dict[str, object]] | None:
+        """Return the closest fresh native raster suitable for calibration.
+
+        ``timestamp_s`` is the producer's app-receive monotonic timestamp.  A
+        calibration caller can therefore resolve the native raster belonging
+        to a preview/checkerboard observation without ever saving the resized
+        preview.  The returned image and metadata are defensive copies.
+
+        Frames fail closed when their producer provenance cannot prove that
+        they are lossless, native-sized and unannotated.  This keeps a preview
+        resize or UI overlay from silently changing the calibration pixel
+        coordinate system.
+        """
+
+        requested = self._finite_nonnegative_limit(timestamp_s, "timestamp_s", allow_zero=True)
+        delta_limit = self._finite_nonnegative_limit(
+            maximum_delta_s,
+            "maximum_delta_s",
+            allow_zero=True,
+        )
+        if not self.measurement_frame_images:
+            return None
+        key = min(self.measurement_frame_images, key=lambda candidate: abs(candidate - requested))
+        if abs(key - requested) > delta_limit:
+            return None
+        return self._native_calibration_frame_for_key(
+            key,
+            maximum_age_s=maximum_age_s,
+            now_monotonic_s=now_monotonic_s,
+        )
+
+    def latest_native_calibration_frame(
+        self,
+        *,
+        maximum_age_s: float = DEFAULT_NATIVE_CALIBRATION_FRAME_MAX_AGE_S,
+        now_monotonic_s: float | None = None,
+    ) -> tuple[str, QtGui.QImage, dict[str, object]] | None:
+        """Return ``(frame_id, native_image, metadata)`` for calibration.
+
+        Unlike :meth:`current_image`, this method never reads the resized UI
+        preview.  Missing, stale, annotated, resized, or provenance-incomplete
+        native frames are rejected with ``None``.
+        """
+
+        if not self.measurement_frame_order:
+            return None
+        return self._native_calibration_frame_for_key(
+            self.measurement_frame_order[-1],
+            maximum_age_s=maximum_age_s,
+            now_monotonic_s=now_monotonic_s,
+        )
+
+    @staticmethod
+    def _finite_nonnegative_limit(
+        value: float,
+        name: str,
+        *,
+        allow_zero: bool,
+    ) -> float:
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a finite non-negative number") from exc
+        if not math.isfinite(normalized) or normalized < 0.0 or (not allow_zero and normalized == 0.0):
+            raise ValueError(f"{name} must be a finite non-negative number")
+        return normalized
+
+    def _native_calibration_frame_for_key(
+        self,
+        key: float,
+        *,
+        maximum_age_s: float,
+        now_monotonic_s: float | None,
+    ) -> tuple[str, QtGui.QImage, dict[str, object]] | None:
+        age_limit = self._finite_nonnegative_limit(
+            maximum_age_s,
+            "maximum_age_s",
+            allow_zero=True,
+        )
+        now_s = time.monotonic() if now_monotonic_s is None else float(now_monotonic_s)
+        if not math.isfinite(now_s):
+            raise ValueError("now_monotonic_s must be finite")
+        age_s = now_s - float(key)
+        if age_s < 0.0 or age_s > age_limit:
+            return None
+
+        image = self.measurement_frame_images.get(key)
+        if image is None or image.isNull():
+            return None
+        metadata = copy.deepcopy(self.measurement_frame_metadata.get(key, {}))
+        try:
+            metadata_timestamp_s = float(metadata["timestamp_s"])
+            native_width = int(metadata["native_width"])
+            native_height = int(metadata["native_height"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(metadata_timestamp_s) or abs(metadata_timestamp_s - float(key)) > 1e-9:
+            return None
+        if (native_width, native_height) != (image.width(), image.height()):
+            return None
+        if metadata.get("native_lossless_source") is not True:
+            return None
+        if metadata.get("overlay_applied") is not False:
+            return None
+        frame_id = str(
+            metadata.get("source_native_frame_id")
+            or metadata.get("frame_id")
+            or ""
+        ).strip()
+        if not frame_id:
+            return None
+
+        metadata["frame_id"] = frame_id
+        metadata.setdefault(
+            "pixel_contract",
+            "decoded native RGB raster; no resize, crop, or overlay",
+        )
+        return frame_id, image.copy(), metadata
+
     def show_measurement_frame_for_detection(self, detection: DetectionObservation) -> bool:
         detection_timestamp_s = float(detection.timestamp_s)
         image = self.measurement_frame_images.get(detection_timestamp_s)
@@ -374,15 +641,32 @@ class CameraPane(QtWidgets.QGroupBox):
         self.selected_measurement_frame_lookup_delta_s = (
             None if selected_timestamp_s is None else selected_timestamp_s - detection_timestamp_s
         )
-        self.show_selected_measurement_frame(image)
+        metadata = (
+            dict(self.measurement_frame_metadata.get(float(selected_timestamp_s), {}))
+            if selected_timestamp_s is not None
+            else {}
+        )
+        metadata.setdefault("timestamp_s", selected_timestamp_s)
+        self.show_selected_measurement_frame(image, metadata)
         return True
 
-    def show_selected_measurement_frame(self, image: QtGui.QImage) -> None:
+    def show_selected_measurement_frame(
+        self,
+        image: QtGui.QImage,
+        metadata: object | None = None,
+    ) -> None:
         self.measurement_pair_display_active = True
         self.latest_image = image.copy()
         if image.height() > 0:
             self._preview_container.set_aspect_ratio(image.width() / image.height())
         self._refresh_pixmap()
+        frame_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        frame_metadata.setdefault("timestamp_s", self.selected_measurement_frame_timestamp_s)
+        frame_metadata.setdefault("display_mode", "detection")
+        # MeasurementWorkspace has a separate preview widget from the legacy
+        # CameraPane label.  Publish the frozen pair explicitly so the live
+        # frame signal cannot replace it while detection mode is active.
+        self.measurement_frame_changed.emit(self.camera_label, self.latest_image, frame_metadata)
 
     def clear_measurement_pair_display(self) -> None:
         self.measurement_pair_display_active = False
@@ -522,5 +806,7 @@ class CameraPane(QtWidgets.QGroupBox):
             return
         self.thread = None
         self.worker = None
+        self._preview_frame_callback = None
+        self._stream_signal_adapter = None
         self._stop_requested_monotonic_s = None
         self._stop_escalation_level = 0

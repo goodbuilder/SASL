@@ -21,7 +21,18 @@ BACKEND_FACADE_METHODS = (
     "save_session",
     "apply_run_setup",
     "run_setup_snapshot",
+    "begin_measurement_session",
+    "measurement_session_snapshot",
+    "measurement_package_snapshot",
+    "begin_measurement",
+    "finalize_measurement_package",
+    "close_measurement_session",
+    "begin_measurement_revision",
+    "verify_measurement_package",
+    "verify_measurement_session",
     "optical_pose_snapshot",
+    "optical_pose_prepare_auto_select",
+    "optical_pose_commit_auto_select",
     "optical_pose_capture_burst",
     "optical_pose_import_burst",
     "optical_pose_capture_burst_wiris_ftp",
@@ -178,6 +189,7 @@ def evaluate_recording_protocol(
     minimum_fix_type: int | None = None,
     physical_alignment: Mapping[str, object] | None = None,
     final_sync_verified: bool | None = None,
+    measurement_method: Mapping[str, object] | None = None,
 ) -> ProtocolReadiness:
     """Classify the minimum evidence expected before an experiment run.
 
@@ -234,8 +246,28 @@ def evaluate_recording_protocol(
         )
     )
 
-    mode = str(distance_mode or "pixhawk").lower()
-    if mode == "checkerboard":
+    method = measurement_method if isinstance(measurement_method, Mapping) else None
+    if method is not None:
+        method_ready = bool(method.get("ready"))
+        checks.append(
+            ProtocolCheck(
+                "geometry",
+                str(method.get("label") or method.get("method_id") or "Measurement geometry"),
+                method_ready,
+                (
+                    f"method={method.get('method_id', '--')} · instance={method.get('instance_id', '--')}"
+                    if method_ready
+                    else "; ".join(str(value) for value in method.get("reasons", ()) or ())
+                ),
+            )
+        )
+        needs_pixhawk = bool(method.get("requires_live_pixhawk"))
+        needs_gnss = bool(method.get("requires_live_gnss"))
+    else:
+        mode = str(distance_mode or "pixhawk").lower()
+        needs_pixhawk = mode != "checkerboard"
+        needs_gnss = mode != "checkerboard"
+    if method is None and not needs_pixhawk and not needs_gnss:
         extrinsics = calibration.get("extrinsics")
         checkerboard_ready = isinstance(extrinsics, Mapping) and str(extrinsics.get("state", "NO DATA")).upper() == "AVAILABLE"
         checks.append(
@@ -246,7 +278,7 @@ def evaluate_recording_protocol(
                 "left-camera optical RDF → right-camera optical RDF",
             )
         )
-    else:
+    if needs_pixhawk:
         pixhawk_states = (_status_state(snapshot, "pixhawk.left"), _status_state(snapshot, "pixhawk.right"))
         checks.append(
             ProtocolCheck(
@@ -256,6 +288,7 @@ def evaluate_recording_protocol(
                 f"P1={pixhawk_states[0]}, P2={pixhawk_states[1]} · body FRD → world NED",
             )
         )
+    if needs_gnss:
         baseline_state = str(baseline.get("state", "NO DATA") or "NO DATA").upper()
         baseline_available = _has_numeric(baseline.get("length_m")) and baseline_state not in {"NO DATA", "UNKNOWN"}
         baseline_good = baseline_state == "GOOD"

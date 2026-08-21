@@ -59,3 +59,18 @@ def test_dimension_mismatch_and_overlay_are_rejected(tmp_path: Path) -> None:
             metadata={"native_width": 960, "native_height": 540, "overlay_applied": True},
         )
 
+
+def test_missing_timestamp_reference_remains_unknown(tmp_path: Path) -> None:
+    artifact = NativeFrameStore(tmp_path / "session").persist(
+        side="left",
+        purpose="imported-reference",
+        image=_image(32, 24),
+        metadata={
+            "timestamp_s": 1_787_000_000.0,
+            "native_width": 32,
+            "native_height": 24,
+            "overlay_applied": False,
+        },
+    )
+
+    assert artifact.timestamp_reference == "unknown"

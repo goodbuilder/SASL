@@ -11,6 +11,7 @@ import os
 import time
 from dataclasses import dataclass
 from math import isfinite
+from pathlib import Path
 
 from PyQt5 import QtCore, QtWidgets
 
@@ -18,6 +19,7 @@ from Workstation.gnss_runtime_workers import (
     GnssBaseSerialDetectWorker,
     GnssBaseSerialWorker,
     NtripNetworkWorker,
+    RtcmDataPlaneWorker,
 )
 from Workstation.workstation_core import ntrip_credentials
 from Workstation.drone_telemetry_controller import (
@@ -60,6 +62,14 @@ from Workstation.workstation_core.gnss_protocol import (
     ubx_cfg_tmode3_poll_frame,
     ubx_cfg_tmode3_survey_in_frame,
     ubx_nav_svin_poll_frame,
+)
+from Workstation.workstation_core.rtcm_pipeline import (
+    RTCM_PIPELINE_SNAPSHOT_SCHEMA,
+    RtcmEvidenceContext,
+    RtcmEvidenceRecord,
+    RtcmRouteConfig,
+    append_rtcm_evidence,
+    load_rtcm_evidence_high_water,
 )
 
 class NtripCredentialError(RuntimeError):
@@ -132,6 +142,14 @@ GNSS_RUNTIME_CONTROLLER_METHODS = [
     "_format_rtcm_message_types",
     "_refresh_gnss_base_rtcm_stats",
     "_handle_gnss_base_satellite_quality",
+    "_ensure_rtcm_pipeline",
+    "_sync_rtcm_pipeline_config",
+    "_sync_rtcm_evidence_context",
+    "_close_rtcm_evidence_context_and_drain",
+    "_apply_rtcm_pipeline_snapshot",
+    "_handle_rtcm_pipeline_evidence_started",
+    "_handle_rtcm_pipeline_integrity_failed",
+    "_stop_rtcm_pipeline",
     "_gnss_base_rtcm_target_sides",
     "_record_gnss_base_rtcm_frame",
     "_record_gnss_base_rtcm_injection",
@@ -148,8 +166,446 @@ GNSS_RUNTIME_CONTROLLER_METHODS = [
 
 
 class GnssRuntimeController:
+    RTCM_UI_UPDATE_INTERVAL_S = 0.5
+
     def __init__(self, panel):
         self.panel = panel
+        self._last_rtcm_ui_update_s = float("-inf")
+        self._last_rtcm_result_ui_update_s = float("-inf")
+        self._last_ntrip_ui_update_s = float("-inf")
+        self._last_pipeline_drop_count = 0
+        package_signal = getattr(panel, "measurement_package_changed", None)
+        if (
+            hasattr(package_signal, "connect")
+            and not bool(getattr(panel, "_rtcm_package_signal_connected", False))
+        ):
+            package_signal.connect(self._handle_measurement_package_changed)
+            panel._rtcm_package_signal_connected = True
+
+    def _handle_measurement_package_changed(self, _snapshot: object) -> None:
+        self._sync_rtcm_evidence_context()
+
+    def _rtcm_route_config(self) -> RtcmRouteConfig:
+        config = getattr(self.panel, "gnss_active_operation_config", None)
+        if config is None:
+            builder = getattr(self.panel, "_build_gnss_operation_config", None)
+            if callable(builder):
+                try:
+                    config = builder()
+                except (AttributeError, TypeError, ValueError):
+                    config = None
+        mode = getattr(config, "operation_mode", None)
+        assisted = mode == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE
+        ntrip_targets = self._gnss_base_rtcm_target_sides(
+            source=DRONE_RTCM_SOURCE_NTRIP,
+            include_rover_targets=not assisted,
+        )
+        base_targets = self._gnss_base_rtcm_target_sides(
+            source=DRONE_RTCM_SOURCE_BASE,
+            include_rover_targets=True,
+        )
+        return RtcmRouteConfig(
+            ntrip_targets=ntrip_targets,
+            base_targets=base_targets,
+            forward_ntrip_to_base=assisted,
+            base_serial_available=bool(
+                getattr(self.panel, "gnss_base_serial_connected", False)
+                and getattr(self.panel, "gnss_base_serial_worker", None) is not None
+            ),
+        )
+
+    def _rtcm_evidence_context(self) -> RtcmEvidenceContext:
+        state = str(getattr(self.panel, "_measurement_package_state", "IDLE") or "IDLE")
+        session_id = str(getattr(self.panel, "recording_session_id", "") or "")
+        measurement_id = str(getattr(self.panel, "_measurement_id", "") or "")
+        revision_number = max(
+            0,
+            int(getattr(self.panel, "_measurement_package_revision", 0) or 0),
+        )
+        resolver = getattr(self.panel, "_recording_session_dir", None)
+        root = None
+        if session_id and callable(resolver):
+            try:
+                root = Path(resolver(session_id))
+            except (OSError, TypeError, ValueError):
+                root = None
+        context_token = (
+            f"{session_id}:{measurement_id or 'session'}:r{revision_number:04d}"
+            if session_id and root is not None
+            else ""
+        )
+        if context_token and str(
+            getattr(
+                self.panel,
+                "_measurement_package_rtcm_drain_requested_token",
+                "",
+            )
+            or ""
+        ) == context_token:
+            # A VERIFYING/RECOVERABLE package snapshot published after the
+            # barrier ACK must not reactivate the same evidence owner.
+            state = "IDLE"
+        return RtcmEvidenceContext(
+            state=state,
+            session_id=session_id,
+            session_root=root,
+            context_token=context_token,
+        )
+
+    def _ensure_rtcm_pipeline(self) -> RtcmDataPlaneWorker:
+        existing = getattr(self.panel, "rtcm_pipeline_worker", None)
+        thread = getattr(self.panel, "rtcm_pipeline_thread", None)
+        if existing is not None and thread is not None and thread.isRunning():
+            return existing
+        if thread is not None and thread.isRunning():
+            raise RuntimeError("RTCM pipeline thread exists without its worker")
+
+        thread = QtCore.QThread(self.panel)
+        worker = RtcmDataPlaneWorker(snapshot_interval_s=self.RTCM_UI_UPDATE_INTERVAL_S)
+        worker.moveToThread(thread)
+        worker.snapshot_ready.connect(self.panel._apply_rtcm_pipeline_snapshot)
+        worker.evidence_started.connect(self.panel._handle_rtcm_pipeline_evidence_started)
+        drain_handler = getattr(
+            self.panel,
+            "_handle_measurement_rtcm_evidence_drained",
+            None,
+        )
+        if callable(drain_handler):
+            worker.evidence_drained.connect(drain_handler)
+        worker.integrity_failed.connect(self.panel._handle_rtcm_pipeline_integrity_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(
+            lambda thread=thread, worker=worker: self._clear_rtcm_pipeline(thread, worker)
+        )
+        thread.finished.connect(thread.deleteLater)
+        self.panel.rtcm_pipeline_thread = thread
+        self.panel.rtcm_pipeline_worker = worker
+        self.panel._rtcm_pipeline_base_worker = None
+        self.panel._rtcm_pipeline_injection_worker = None
+        thread.start()
+        worker.configure_requested.emit(self._rtcm_route_config().as_dict())
+        worker.evidence_context_requested.emit(self._rtcm_evidence_context().as_dict())
+        self._wire_rtcm_pipeline_base_worker(
+            getattr(self.panel, "gnss_base_serial_worker", None)
+        )
+        self._wire_rtcm_pipeline_injection_worker(
+            getattr(self.panel, "pixhawk_rtcm_worker", None)
+        )
+        return worker
+
+    def _wire_rtcm_pipeline_base_worker(self, base_worker: object | None) -> None:
+        pipeline = getattr(self.panel, "rtcm_pipeline_worker", None)
+        if pipeline is None:
+            return
+        current = getattr(self.panel, "_rtcm_pipeline_base_worker", None)
+        if current is base_worker:
+            return
+        try:
+            pipeline.base_write_requested.disconnect()
+        except (TypeError, RuntimeError):
+            pass
+        self.panel._rtcm_pipeline_base_worker = base_worker
+        if base_worker is not None:
+            # GnssBaseSerialWorker.run() owns a blocking serial loop, so its
+            # QThread event loop cannot service a queued slot. send_bytes()
+            # only performs a thread-safe Queue.put and is therefore the one
+            # deliberate direct cross-thread adapter on this boundary.
+            pipeline.base_write_requested.connect(
+                base_worker.send_bytes,
+                QtCore.Qt.DirectConnection,
+            )
+
+    def _wire_rtcm_pipeline_injection_worker(self, injection_worker: object | None) -> None:
+        pipeline = getattr(self.panel, "rtcm_pipeline_worker", None)
+        if pipeline is None:
+            return
+        current = getattr(self.panel, "_rtcm_pipeline_injection_worker", None)
+        if current is injection_worker:
+            return
+        try:
+            pipeline.injection_requested.disconnect()
+        except (TypeError, RuntimeError):
+            pass
+        if current is not None:
+            try:
+                current.injected.disconnect(pipeline.injection_result_received)
+            except (TypeError, RuntimeError):
+                pass
+        self.panel._rtcm_pipeline_injection_worker = injection_worker
+        if injection_worker is not None:
+            # submit_envelope only touches the worker's locked bounded queue;
+            # device I/O remains in _drain_one on the injection QThread.
+            pipeline.injection_requested.connect(
+                injection_worker.submit_envelope,
+                QtCore.Qt.DirectConnection,
+            )
+            injection_worker.injected.connect(pipeline.injection_result_received)
+
+    def _wire_rtcm_ntrip_source(
+        self,
+        source: NtripNetworkWorker,
+        pipeline: RtcmDataPlaneWorker,
+    ) -> None:
+        source.stats_snapshot_changed.connect(pipeline.ntrip_stats_received)
+        source.chunk_envelope_received.connect(
+            pipeline.submit_ntrip_envelope,
+            QtCore.Qt.DirectConnection,
+        )
+
+    def _wire_rtcm_base_source(
+        self,
+        source: GnssBaseSerialWorker,
+        pipeline: RtcmDataPlaneWorker,
+    ) -> None:
+        source.rtcm_frame_envelope_received.connect(
+            pipeline.submit_base_envelope,
+            QtCore.Qt.DirectConnection,
+        )
+
+    def _sync_rtcm_pipeline_config(self, *, reset: bool = False) -> None:
+        pipeline = getattr(self.panel, "rtcm_pipeline_worker", None)
+        if pipeline is None:
+            return
+        self._wire_rtcm_pipeline_base_worker(
+            getattr(self.panel, "gnss_base_serial_worker", None)
+        )
+        self._wire_rtcm_pipeline_injection_worker(
+            getattr(self.panel, "pixhawk_rtcm_worker", None)
+        )
+        payload = self._rtcm_route_config().as_dict()
+        if reset:
+            self._last_pipeline_drop_count = 0
+            pipeline.reset_requested.emit(payload)
+        else:
+            pipeline.configure_requested.emit(payload)
+
+    def _sync_rtcm_evidence_context(self) -> None:
+        pipeline = getattr(self.panel, "rtcm_pipeline_worker", None)
+        if pipeline is not None:
+            pipeline.evidence_context_requested.emit(
+                self._rtcm_evidence_context().as_dict()
+            )
+
+    def _close_rtcm_evidence_context_and_drain(
+        self,
+        context_token: str,
+    ) -> bool:
+        pipeline = getattr(self.panel, "rtcm_pipeline_worker", None)
+        if pipeline is None:
+            return False
+        current = self._rtcm_evidence_context()
+        return bool(
+            pipeline.close_evidence_context_and_drain(
+                {
+                    "context_token": str(context_token),
+                    "session_id": current.session_id,
+                    "session_root": (
+                        None
+                        if current.session_root is None
+                        else str(current.session_root)
+                    ),
+                }
+            )
+        )
+
+    def _apply_rtcm_pipeline_snapshot(self, snapshot: object) -> None:
+        if not isinstance(snapshot, dict) or snapshot.get("schema") != RTCM_PIPELINE_SNAPSHOT_SCHEMA:
+            return
+        injection = snapshot.get("injection")
+        message_types = snapshot.get("message_types")
+        self.panel.gnss_base_rtcm_stats = {
+            "start_s": float(snapshot.get("start_s") or time.monotonic()),
+            "last_frame_s": snapshot.get("last_frame_s"),
+            "frames": int(snapshot.get("frames") or 0),
+            "bytes": int(snapshot.get("bytes") or 0),
+            "max_frame_bytes": int(snapshot.get("max_frame_bytes") or 0),
+            "message_types": dict(message_types) if isinstance(message_types, dict) else {},
+            "injection": (
+                {side: dict(values) for side, values in injection.items() if isinstance(values, dict)}
+                if isinstance(injection, dict)
+                else {}
+            ),
+            "transport": dict(snapshot.get("transport") or {}),
+            "integrity": dict(snapshot.get("integrity") or {}),
+            "ingress": dict(snapshot.get("ingress") or {}),
+        }
+        ntrip_stats = snapshot.get("ntrip_stats")
+        if ntrip_stats is not None:
+            self.panel.gnss_network_stats = ntrip_stats
+            if (
+                self.panel.gnss_network_connected
+                and getattr(ntrip_stats, "last_chunk_monotonic_s", None) is not None
+            ):
+                self.panel.gnss_network_phase = "STREAMING"
+        if bool(snapshot.get("base_reference_seen")) and (
+            self.panel.gnss_operation_manager.state == GnssOperationState.BASE_RECONFIGURING
+        ):
+            self.panel.gnss_fixed_base_reconfigure_rtcm = True
+            self.panel._maybe_activate_gnss_fixed_base()
+
+        integrity = self.panel.gnss_base_rtcm_stats["integrity"]
+        dropped = int(integrity.get("injection_dropped_stale") or 0)
+        if dropped > self._last_pipeline_drop_count:
+            delta = dropped - self._last_pipeline_drop_count
+            self._last_pipeline_drop_count = dropped
+            self.panel._log(
+                f"[GNSS] RTCM 오래된 주입 대기 프레임 {delta}개 폐기 "
+                f"(누계={dropped}, evidence 원본은 유지)"
+            )
+
+        latest_result = snapshot.get("latest_injection_result")
+        if isinstance(latest_result, dict):
+            sent = tuple(latest_result.get("sent") or ())
+            failed = tuple(latest_result.get("failed") or ())
+            if failed:
+                text = "RTCM 주입 실패: " + ", ".join(
+                    f"{self.panel._px4_mag_camera_label(str(side))}:{error}"
+                    for side, error in failed
+                )
+                level = "warn" if sent else "bad"
+            elif sent:
+                text = (
+                    f"RTCM {int(latest_result.get('payload_bytes') or 0)} bytes -> "
+                    + ", ".join(
+                        self.panel._px4_mag_camera_label(str(side))
+                        for side, _packets in sent
+                    )
+                )
+                level = "good"
+            else:
+                text = ""
+                level = "idle"
+            if text and hasattr(self.panel, "gnss_base_status_labels"):
+                self.panel._set_health_label(
+                    self.panel.gnss_base_status_labels["rtcm_injection"],
+                    text,
+                    level,
+                )
+
+        transport = self.panel.gnss_base_rtcm_stats["transport"]
+        if (
+            self.panel.gnss_network_connected
+            and hasattr(self.panel, "gnss_base_status_labels")
+            and int(transport.get("chunks") or 0) > 0
+        ):
+            unavailable = int(transport.get("base_forward_unavailable") or 0)
+            if unavailable:
+                text, level = (
+                    f"NTRIP 수신 중이나 Base serial 전달 불가 {unavailable}회",
+                    "bad",
+                )
+            else:
+                text, level = (
+                    f"NTRIP RTCM streaming | chunks={int(transport.get('chunks') or 0)}",
+                    "good",
+                )
+            self.panel._set_health_label(
+                self.panel.gnss_base_status_labels["network"],
+                text,
+                level,
+            )
+        self.panel._refresh_gnss_base_rtcm_stats()
+        self.panel._refresh_gnss_operation_readiness()
+
+    def _handle_rtcm_pipeline_evidence_started(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        current_context = self._rtcm_evidence_context()
+        if (
+            str(payload.get("session_id") or "") != current_context.session_id
+            or str(payload.get("context_token") or "") != current_context.context_token
+            or str(payload.get("session_root") or "") != str(current_context.session_root)
+        ):
+            return
+        activator = getattr(self.panel, "activate_measurement_package_source", None)
+        if callable(activator):
+            activator(
+                "gnss.rtcm",
+                required_roles=("corrections/rtcm/raw",),
+                metadata={
+                    "activated_utc_ns": int(payload.get("first_receive_utc_ns") or time.time_ns()),
+                    "first_pipeline_sequence": int(payload.get("first_sequence") or 0),
+                    "source": "rtcm_data_plane_worker",
+                },
+            )
+
+    def _handle_rtcm_pipeline_integrity_failed(self, payload: object) -> None:
+        values = dict(payload) if isinstance(payload, dict) else {"error": str(payload)}
+        error = (
+            "RTCM integrity failure: "
+            f"sequence={int(values.get('sequence') or 0)}, {values.get('error') or 'unknown error'}"
+        )
+        package_state = str(
+            getattr(self.panel, "_measurement_package_state", "IDLE") or "IDLE"
+        ).upper()
+        current_context = self._rtcm_evidence_context()
+        failure_session_id = str(values.get("session_id") or "")
+        failure_context_token = str(values.get("context_token") or "")
+        belongs_to_current_context = (
+            failure_session_id == current_context.session_id
+            and (
+                not failure_context_token
+                or failure_context_token == current_context.context_token
+            )
+        )
+        if (
+            belongs_to_current_context
+            and package_state in {"COLLECTING", "POST_CAPTURE", "VERIFYING", "RECOVERABLE"}
+        ):
+            errors = getattr(self.panel, "_measurement_package_inventory_errors", None)
+            if isinstance(errors, list) and error not in errors:
+                errors.append(error)
+            self.panel._measurement_package_error = error
+            self.panel._session_save_retry_required = True
+        if hasattr(self.panel, "gnss_base_status_labels"):
+            self.panel._set_health_label(
+                self.panel.gnss_base_status_labels["rtcm_injection"],
+                error,
+                "bad",
+            )
+        self.panel._log(f"[GNSS] {error}")
+
+    def _stop_rtcm_pipeline(self) -> bool:
+        thread = getattr(self.panel, "rtcm_pipeline_thread", None)
+        worker = getattr(self.panel, "rtcm_pipeline_worker", None)
+        if thread is None or not thread.isRunning():
+            return True
+        if worker is not None:
+            worker.stop_requested.emit()
+        return False
+
+    def _clear_rtcm_pipeline(
+        self,
+        thread: QtCore.QThread,
+        worker: RtcmDataPlaneWorker,
+    ) -> None:
+        if getattr(self.panel, "rtcm_pipeline_thread", None) is thread:
+            self.panel.rtcm_pipeline_thread = None
+            self.panel.rtcm_pipeline_worker = None
+            self.panel._rtcm_pipeline_base_worker = None
+            self.panel._rtcm_pipeline_injection_worker = None
+
+    def _rtcm_ui_update_due(self, now_s: float | None = None) -> bool:
+        now_s = time.monotonic() if now_s is None else float(now_s)
+        if now_s - self._last_rtcm_ui_update_s < self.RTCM_UI_UPDATE_INTERVAL_S:
+            return False
+        self._last_rtcm_ui_update_s = now_s
+        return True
+
+    def _rtcm_result_ui_update_due(self, now_s: float | None = None) -> bool:
+        now_s = time.monotonic() if now_s is None else float(now_s)
+        if now_s - self._last_rtcm_result_ui_update_s < self.RTCM_UI_UPDATE_INTERVAL_S:
+            return False
+        self._last_rtcm_result_ui_update_s = now_s
+        return True
+
+    def _ntrip_ui_update_due(self, now_s: float | None = None) -> bool:
+        now_s = time.monotonic() if now_s is None else float(now_s)
+        if now_s - self._last_ntrip_ui_update_s < self.RTCM_UI_UPDATE_INTERVAL_S:
+            return False
+        self._last_ntrip_ui_update_s = now_s
+        return True
 
     def _refresh_gnss_base_tab(self) -> None:
         if not hasattr(self.panel, "gnss_base_status_labels"):
@@ -469,7 +925,8 @@ class GnssRuntimeController:
         frequent enough to see live, never a per-recv()-loop spam risk.
         """
 
-        policy = self.panel._gnss_active_operation_config().network.gga_policy
+        active_config = self.panel._gnss_active_operation_config()
+        policy = active_config.network.gga_policy
         if policy == GgaPolicy.BASE_GNSS:
             sample = getattr(self.panel, "latest_gnss_base_position", None)
             if sample is None:
@@ -483,34 +940,103 @@ class GnssRuntimeController:
                 )
                 return None
             return gga_from_coordinate_sample(sample)
-        left = self.panel.latest_gps.get("left")
-        right = self.panel.latest_gps.get("right")
-        positions = [position for position in (left, right) if position is not None and position.has_position]
         if policy == GgaPolicy.MANUAL:
             self.panel._log("[GNSS][NTRIP] GGA skipped: GGA policy is MANUAL; GGA is intentionally never sent")
             return None
-        if not positions:
-            def _describe(position: object) -> str:
+        left = self.panel.latest_gps.get("left")
+        right = self.panel.latest_gps.get("right")
+        now_s = time.monotonic()
+        maximum_age_s = float(active_config.readiness.maximum_gps_sample_age_s)
+
+        def fresh(position: object, side: str) -> object | None:
+            if position is None:
+                self.panel._log(
+                    f"[GNSS][NTRIP] GGA skipped: {side} GNSS has no message "
+                    f"(policy={policy.value})"
+                )
+                return None
+            if not bool(getattr(position, "has_position", False)):
+                self.panel._log(
+                    f"[GNSS][NTRIP] GGA skipped: {side} GNSS position is incomplete "
+                    f"(policy={policy.value})"
+                )
+                return None
+            try:
+                timestamp_s = float(getattr(position, "timestamp_s"))
+                age_s = now_s - timestamp_s
+            except (AttributeError, TypeError, ValueError):
+                age_s = float("nan")
+            if not isfinite(age_s) or age_s < 0.0:
+                self.panel._log(
+                    f"[GNSS][NTRIP] GGA skipped: {side} GNSS timestamp is invalid "
+                    f"(policy={policy.value})"
+                )
+                return None
+            if age_s > maximum_age_s:
+                self.panel._log(
+                    f"[GNSS][NTRIP] GGA skipped: {side} GNSS sample is stale "
+                    f"(age={age_s:.3f}s > {maximum_age_s:.3f}s, policy={policy.value})"
+                )
+                return None
+            return position
+
+        if policy == GgaPolicy.LEFT_GNSS:
+            selected = fresh(left, "left")
+            return None if selected is None else gga_from_position(selected)
+        if policy == GgaPolicy.PER_ROVER_SESSION:
+            selected = fresh(left, "left")
+            return None if selected is None else gga_from_position(selected)
+        # SYSTEM_CENTER: average WGS84 geodetic values for the two antenna hints.
+        fresh_left = fresh(left, "left")
+        fresh_right = fresh(right, "right")
+        if fresh_left is None or fresh_right is None:
+            def describe(position: object) -> str:
                 if position is None:
                     return "no message received"
-                if not getattr(position, "has_position", False):
+                if not bool(getattr(position, "has_position", False)):
                     return "message received but lat/lon/alt incomplete"
-                return "ok"
+                return "stale or invalid timestamp"
 
             self.panel._log(
                 "[GNSS][NTRIP] GGA skipped: no left/right GNSS position available "
-                f"(policy={policy.value}, left={_describe(left)}, right={_describe(right)})"
+                f"(policy={policy.value}, left={describe(left)}, right={describe(right)})"
             )
             return None
-        if policy == GgaPolicy.LEFT_GNSS or len(positions) == 1:
-            return gga_from_position(positions[0])
-        if policy == GgaPolicy.PER_ROVER_SESSION:
-            return gga_from_position(left or positions[0])
-        # SYSTEM_CENTER: average WGS84 geodetic values for the two antenna hints.
+        timestamp_delta_ms = abs(
+            float(getattr(fresh_right, "timestamp_s"))
+            - float(getattr(fresh_left, "timestamp_s"))
+        ) * 1000.0
+        maximum_delta_ms = float(
+            active_config.readiness.maximum_left_right_timestamp_delta_ms
+        )
+        if timestamp_delta_ms > maximum_delta_ms:
+            self.panel._log(
+                "[GNSS][NTRIP] GGA skipped: left/right GNSS timestamp delta "
+                f"{timestamp_delta_ms:.3f}ms > {maximum_delta_ms:.3f}ms"
+            )
+            return None
+        positions = (fresh_left, fresh_right)
         lat = sum(float(position.latitude_deg) for position in positions) / len(positions)
         lon = sum(float(position.longitude_deg) for position in positions) / len(positions)
         alt = sum(float(position.altitude_m) for position in positions) / len(positions)
-        return format_nmea_gga(lat, lon, alt, fix_quality=1, satellites=12, hdop=1.0)
+        satellites_values = [
+            int(value)
+            for value in (getattr(position, "satellites_used", None) for position in positions)
+            if value is not None
+        ]
+        accuracy_values = [
+            float(value)
+            for value in (getattr(position, "eph_m", None) for position in positions)
+            if value is not None and isfinite(float(value))
+        ]
+        return format_nmea_gga(
+            lat,
+            lon,
+            alt,
+            fix_quality=1,
+            satellites=min(satellites_values) if satellites_values else 12,
+            hdop=max(accuracy_values) if accuracy_values else 1.0,
+        )
 
     def _resolve_ntrip_credentials(self, network) -> "NtripCredentialResolution":
         """Resolve the username/password to authenticate with, in priority order.
@@ -648,6 +1174,7 @@ class GnssRuntimeController:
         if hasattr(self.panel, "gnss_base_fixed_scatter_plot"):
             self.panel.gnss_base_fixed_scatter_plot.points.clear()
         self.panel.gnss_fixed_base_profile = None
+        self.panel.gnss_fixed_base_live_profile = None
         self.panel.gnss_fixed_base_pending_profile = None
         self.panel.gnss_fixed_base_command_sent = False
         self.panel.gnss_fixed_base_reconfigure_expected = None
@@ -662,6 +1189,14 @@ class GnssRuntimeController:
         self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], "NTRIP 연결 중", "warn")
         self._maybe_persist_ntrip_credential(config.network, credential)
         self.panel._refresh_ntrip_credential_status()
+        pipeline = self._ensure_rtcm_pipeline()
+        route = self._rtcm_route_config()
+        if route.ntrip_targets:
+            if self._ensure_pixhawk_rtcm_worker() is None:
+                self._reject_ntrip_start("RTCM 주입 worker를 시작할 수 없습니다", "bad")
+                return
+        self._sync_rtcm_pipeline_config(reset=True)
+        self._sync_rtcm_evidence_context()
         thread = QtCore.QThread(self.panel)
         worker = NtripNetworkWorker(
             config=config.network,
@@ -672,8 +1207,7 @@ class GnssRuntimeController:
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.connected.connect(self.panel._handle_gnss_network_connected)
-        worker.stats_changed.connect(self.panel._handle_gnss_network_stats)
-        worker.chunk_received.connect(self.panel._handle_gnss_network_chunk)
+        self._wire_rtcm_ntrip_source(worker, pipeline)
         worker.reconnecting.connect(self.panel._handle_gnss_network_reconnecting)
         worker.failed.connect(self.panel._handle_gnss_network_failed)
         worker.diagnostic.connect(self.panel._handle_gnss_network_diagnostic)
@@ -702,6 +1236,7 @@ class GnssRuntimeController:
             )
         if thread is None or not thread.isRunning():
             self.panel.gnss_active_operation_config = None
+            self._sync_rtcm_pipeline_config()
             self.panel._set_gnss_operation_controls_locked(False)
             self.panel._handle_gnss_operation_mode_changed()
             return True
@@ -788,23 +1323,27 @@ class GnssRuntimeController:
         if not isinstance(chunk, (bytes, bytearray)):
             return
         payload = bytes(chunk)
+        self._append_rtcm_package_evidence(payload, source="ntrip", record_kind="transport_chunk")
         mode = self.panel._gnss_active_operation_config().operation_mode
         frames = self.panel.gnss_network_rtcm_parser.feed(payload)
+        ntrip_ui_due = self._ntrip_ui_update_due()
         if mode == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE:
             worker = self.panel.gnss_base_serial_worker
             if worker is None or not self.panel.gnss_base_serial_connected:
-                self.panel._set_health_label(
-                    self.panel.gnss_base_status_labels["network"],
-                    "NTRIP 수신 중이나 Base serial이 끊겼습니다",
-                    "bad",
-                )
+                if ntrip_ui_due:
+                    self.panel._set_health_label(
+                        self.panel.gnss_base_status_labels["network"],
+                        "NTRIP 수신 중이나 Base serial이 끊겼습니다",
+                        "bad",
+                    )
             else:
                 worker.send_bytes("NTRIP RTCM -> fixed base", payload)
-                self.panel._set_health_label(
-                    self.panel.gnss_base_status_labels["network"],
-                    f"NTRIP {len(payload)} bytes -> fixed base",
-                    "good",
-                )
+                if ntrip_ui_due:
+                    self.panel._set_health_label(
+                        self.panel.gnss_base_status_labels["network"],
+                        f"NTRIP {len(payload)} bytes -> fixed base",
+                        "good",
+                    )
             # Assisted Fixed Base still forwards the raw NTRIP stream to the
             # Base receiver. If Drone is configured to use Network NTRIP, its
             # complete RTCM frames are also delivered independently, without
@@ -818,11 +1357,21 @@ class GnssRuntimeController:
                     )
             return
         if not frames:
-            self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], f"NTRIP raw {len(payload)} bytes | RTCM frame 대기", "warn")
+            if ntrip_ui_due:
+                self.panel._set_health_label(
+                    self.panel.gnss_base_status_labels["network"],
+                    f"NTRIP raw {len(payload)} bytes | RTCM frame 대기",
+                    "warn",
+                )
             return
         for frame in frames:
             self.panel._handle_gnss_base_rtcm_frame(frame, source=DRONE_RTCM_SOURCE_NTRIP)
-        self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], f"NTRIP RTCM {len(frames)} frame 수신", "good")
+        if ntrip_ui_due:
+            self.panel._set_health_label(
+                self.panel.gnss_base_status_labels["network"],
+                f"NTRIP RTCM {len(frames)} frame 수신",
+                "good",
+            )
 
     def _handle_gnss_network_diagnostic(self, message: str) -> None:
         """Surface NtripClient's per-event evidence (connect/GGA TX outcome).
@@ -939,9 +1488,12 @@ class GnssRuntimeController:
                 "good" if sample.fixed else "warn",
             )
         config = self.panel._gnss_active_operation_config()
+        # Base NAV-PVT is raw measurement evidence in every GNSS mode.  The
+        # assisted-fixed mode below adds state-machine behavior, but it is not
+        # the owner of persistence.
+        self.panel._record_gnss_base_position_row(sample)
         if config.operation_mode != GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE:
             return
-        self.panel._record_gnss_base_position_row(sample)
         if hasattr(self.panel, "gnss_base_fixed_state_plot"):
             self.panel.gnss_base_fixed_state_plot.add_point(
                 TelemetryHistoryPoint(sample.timestamp_s, "fix", 1.0 if sample.fixed else 0.0)
@@ -980,6 +1532,11 @@ class GnssRuntimeController:
             source_mountpoint=config.network.mountpoint,
         )
         profile = validation.profile
+        # Keep a live copy of the in-progress (not-yet-validated) profile so
+        # the UI can show real scatter/duration numbers while collecting,
+        # distinct from panel.gnss_fixed_base_profile which is only set once
+        # the coordinate is fully validated AND applied to the receiver.
+        self.panel.gnss_fixed_base_live_profile = profile
         if profile is None:
             self.panel._set_health_label(self.panel.gnss_base_status_labels["base_fixed"], "고정 좌표 프로파일 수집 중", "warn")
             return
@@ -1057,10 +1614,36 @@ class GnssRuntimeController:
 
         if not isinstance(payload, (bytes, bytearray)):
             return
-        if self.panel.gnss_operation_manager.state != GnssOperationState.BASE_RECONFIGURING:
-            return
         raw_payload = bytes(payload)
         ack = parse_ubx_ack(int(message_class), int(message_id), raw_payload)
+        if self.panel.gnss_operation_manager.state == GnssOperationState.BASE_SURVEYING:
+            if ack is None:
+                return
+            accepted, target_class, target_id = ack
+            if (target_class, target_id) != (0x06, 0x71):
+                return
+            generation = int(getattr(self.panel, "_gnss_survey_generation", 0) or 0)
+            sent_generation = int(
+                getattr(self.panel, "_gnss_survey_command_sent_generation", 0) or 0
+            )
+            if generation <= 0 or sent_generation != generation:
+                return
+            if not accepted:
+                self.panel._gnss_transition(
+                    GnssOperationState.FAULT,
+                    "survey-in CFG-TMODE3 ACK-NAK",
+                )
+                return
+            self.panel._gnss_survey_ack_generation = generation
+            worker = getattr(self.panel, "gnss_base_serial_worker", None)
+            if worker is not None:
+                worker.send_bytes(
+                    "NAV-SVIN poll after survey-in ACK",
+                    ubx_nav_svin_poll_frame(),
+                )
+            return
+        if self.panel.gnss_operation_manager.state != GnssOperationState.BASE_RECONFIGURING:
+            return
         if ack is not None:
             accepted, target_class, target_id = ack
             if (target_class, target_id) != (0x06, 0x71):
@@ -1284,7 +1867,6 @@ class GnssRuntimeController:
         worker.satellite_quality_changed.connect(self.panel._handle_gnss_base_satellite_quality)
         worker.position_changed.connect(self.panel._handle_gnss_base_position)
         worker.ubx_message_received.connect(self.panel._handle_gnss_base_ubx_message)
-        worker.rtcm_frame_received.connect(self.panel._handle_gnss_base_rtcm_frame)
         worker.command_sent.connect(self.panel._handle_gnss_base_command_sent)
         worker.failed.connect(self.panel._handle_gnss_base_serial_failed)
         worker.disconnected.connect(self.panel._handle_gnss_base_serial_disconnected)
@@ -1293,6 +1875,13 @@ class GnssRuntimeController:
         thread.finished.connect(lambda: self.panel._clear_gnss_base_serial_worker(thread))
         self.panel.gnss_base_serial_thread = thread
         self.panel.gnss_base_serial_worker = worker
+        pipeline = self._ensure_rtcm_pipeline()
+        self._wire_rtcm_base_source(worker, pipeline)
+        self._wire_rtcm_pipeline_base_worker(worker)
+        if self._rtcm_route_config().base_targets:
+            self._ensure_pixhawk_rtcm_worker()
+        self._sync_rtcm_pipeline_config(reset=True)
+        self._sync_rtcm_evidence_context()
         thread.start()
 
     def disconnect_gnss_base_serial(self) -> None:
@@ -1333,6 +1922,17 @@ class GnssRuntimeController:
         self.panel.gnss_active_operation_config = config
         self.panel.gnss_operation_gate_active = True
         self.panel._set_gnss_operation_controls_locked(True)
+        generation = int(getattr(self.panel, "_gnss_survey_generation", 0) or 0) + 1
+        self.panel._gnss_survey_generation = generation
+        self.panel._gnss_survey_command_sent_generation = 0
+        self.panel._gnss_survey_ack_generation = 0
+        self.panel._gnss_survey_active_seen_generation = 0
+        self.panel._gnss_survey_requested_duration_s = int(
+            self.panel.gnss_base_survey_duration_spin.value()
+        )
+        self.panel._gnss_survey_requested_accuracy_m = float(
+            self.panel.gnss_base_survey_accuracy_spin.value()
+        )
         self.panel._gnss_transition(GnssOperationState.INITIALIZING, "현장 Base Survey-in 초기화")
         self.panel._gnss_transition(GnssOperationState.BASE_SURVEYING, "현장 Base Survey-in 진행")
         frame = ubx_cfg_tmode3_survey_in_frame(
@@ -1352,6 +1952,9 @@ class GnssRuntimeController:
         worker.send_bytes("CFG-TMODE3 disabled", ubx_cfg_tmode3_disabled_frame())
         worker.send_bytes("NAV-SVIN poll after survey-in stop", ubx_nav_svin_poll_frame())
         self.panel.gnss_operation_gate_active = False
+        self.panel._gnss_survey_command_sent_generation = 0
+        self.panel._gnss_survey_ack_generation = 0
+        self.panel._gnss_survey_active_seen_generation = 0
         self.panel.gnss_operation_manager.stop()
         self.panel.gnss_active_operation_config = None
         self.panel._set_gnss_operation_controls_locked(False)
@@ -1449,6 +2052,7 @@ class GnssRuntimeController:
 
     def _handle_gnss_base_serial_connected(self, port: str, baud: int) -> None:
         self.panel.gnss_base_serial_connected = True
+        self._sync_rtcm_pipeline_config()
         self.panel.latest_gnss_base_position = None
         self.panel._set_health_label(self.panel.gnss_base_status_labels["connection"], f"connected {port} @ {baud}", "good")
         self.panel._set_health_label(self.panel.gnss_base_status_labels["survey_in"], "UBX NAV-SVIN 대기 중", "idle")
@@ -1468,34 +2072,49 @@ class GnssRuntimeController:
 
     def _handle_gnss_base_serial_failed(self, message: str) -> None:
         self.panel.gnss_base_serial_connected = False
-        self.panel.latest_gnss_base_position = None
+        self._sync_rtcm_pipeline_config()
+        self._reset_gnss_base_acquisition_state()
         self.panel._set_health_label(self.panel.gnss_base_status_labels["connection"], f"failed: {message}", "bad")
         self.panel._set_health_label(self.panel.gnss_base_status_labels["survey_in"], "미연결", "idle")
         self.panel._set_health_label(self.panel.gnss_base_status_labels["base_satellites"], "대기 중", "idle")
         self.panel._set_health_label(self.panel.gnss_base_status_labels["rtcm_rx"], "없음", "idle")
         self.panel._set_gnss_base_quality_waiting("미연결")
         self.panel._set_health_label(self.panel.gnss_base_status_labels["base_position"], "Base WGS84 위치 없음", "idle")
-        self.panel._reset_gnss_base_rtcm_stats()
         self.panel.gnss_base_survey_start_button.setEnabled(False)
         self.panel.gnss_base_survey_stop_button.setEnabled(False)
         if self.panel.gnss_operation_gate_active:
             self.panel._gnss_transition(GnssOperationState.DEGRADED, f"Base serial failure: {message}")
+        else:
+            # No live measurement gate depends on this session, so fully
+            # rewind the state machine (stop() forces STOPPED from any
+            # state; STOPPED -> DISCONNECTED is an allowed transition) so
+            # the acquisition-progress UI reflects a clean, initial state.
+            self.panel.gnss_operation_manager.stop()
+            self.panel._gnss_transition(GnssOperationState.DISCONNECTED, f"Base serial failure: {message}")
 
     def _handle_gnss_base_serial_disconnected(self, message: str) -> None:
         self.panel.gnss_base_serial_connected = False
-        self.panel.latest_gnss_base_position = None
+        self._sync_rtcm_pipeline_config()
+        self._reset_gnss_base_acquisition_state()
         self.panel._set_health_label(self.panel.gnss_base_status_labels["connection"], message, "idle")
         self.panel._set_health_label(self.panel.gnss_base_status_labels["survey_in"], "미연결", "idle")
         self.panel._set_health_label(self.panel.gnss_base_status_labels["base_satellites"], "대기 중", "idle")
         self.panel._set_gnss_base_quality_waiting("미연결")
         self.panel._set_health_label(self.panel.gnss_base_status_labels["base_position"], "Base WGS84 위치 없음", "idle")
-        self.panel._reset_gnss_base_rtcm_stats()
         self.panel.gnss_base_survey_start_button.setEnabled(False)
         self.panel.gnss_base_survey_stop_button.setEnabled(False)
         if self.panel.gnss_operation_gate_active:
             self.panel._gnss_transition(GnssOperationState.DEGRADED, f"Base serial disconnected: {message}")
+        else:
+            # See _handle_gnss_base_serial_failed: no live gate to preserve,
+            # so rewind to a clean DISCONNECTED state via the same stop()
+            # escape hatch used elsewhere (e.g. _gnss_configure_manager).
+            self.panel.gnss_operation_manager.stop()
+            self.panel._gnss_transition(GnssOperationState.DISCONNECTED, f"Base serial disconnected: {message}")
 
     def _handle_gnss_base_satellite_count(self, count: int, source: str) -> None:
+        self.panel.gnss_base_satellite_count = int(count)
+        self.panel.gnss_base_satellite_count_source = str(source)
         level = "good" if count >= 12 else "warn" if count >= 6 else "bad"
         self.panel._set_health_label(
             self.panel.gnss_base_status_labels["base_satellites"],
@@ -1517,7 +2136,40 @@ class GnssRuntimeController:
 
     def _reset_gnss_base_rtcm_stats(self) -> None:
         self.panel.gnss_base_rtcm_stats = self.panel._new_gnss_base_rtcm_stats()
+        pipeline = getattr(self.panel, "rtcm_pipeline_worker", None)
+        if pipeline is not None:
+            self._last_pipeline_drop_count = 0
+            pipeline.reset_requested.emit(self._rtcm_route_config().as_dict())
         self.panel._refresh_gnss_base_rtcm_stats()
+
+    def _reset_gnss_base_acquisition_state(self) -> None:
+        """Clear all Base fixed-coordinate acquisition progress.
+
+        A dropped Base serial link means the receiver's own survey-in/TMODE3
+        state can no longer be trusted, so a subsequent connect must start
+        the acquisition sequence from zero instead of resuming stale samples
+        or a stale (possibly no-longer-valid) fixed-coordinate profile.
+        """
+        self.panel.gnss_coordinate_samples.clear()
+        self.panel.latest_gnss_base_position = None
+        self.panel.gnss_fixed_base_profile = None
+        self.panel.gnss_fixed_base_live_profile = None
+        self.panel.gnss_fixed_base_pending_profile = None
+        self.panel.gnss_fixed_base_command_sent = False
+        self.panel.gnss_fixed_base_reconfigure_expected = None
+        self.panel.gnss_fixed_base_reconfigure_ack = False
+        self.panel.gnss_fixed_base_reconfigure_readback = False
+        self.panel.gnss_fixed_base_reconfigure_rtcm = False
+        self.panel.gnss_fixed_base_reconfigure_deadline_s = None
+        self.panel.latest_gnss_base_survey_in = None
+        self.panel.gnss_base_survey_samples.clear()
+        self.panel._gnss_survey_command_sent_generation = 0
+        self.panel._gnss_survey_ack_generation = 0
+        self.panel._gnss_survey_active_seen_generation = 0
+        self.panel.gnss_base_satellite_count = None
+        self.panel.gnss_base_satellite_count_source = ""
+        self.panel.gnss_base_satellite_quality = None
+        self._reset_gnss_base_rtcm_stats()
 
     def _format_rtcm_message_types(self, message_types: dict[int, int]) -> str:
         if not message_types:
@@ -1585,19 +2237,44 @@ class GnssRuntimeController:
             injection_text = " | ".join(injection_parts)
             injection_level = "good" if frames and total_fail == 0 else "warn" if frames else "idle"
         avg_frame = (total_bytes / frames) if frames else 0.0
+        integrity = stats.get("integrity") if isinstance(stats.get("integrity"), dict) else {}
+        ingress = stats.get("ingress") if isinstance(stats.get("ingress"), dict) else {}
+        received_sequence = int(integrity.get("last_received_sequence") or 0)
+        persisted_sequence = int(integrity.get("last_persisted_sequence") or 0)
+        injected_sequence = int(integrity.get("last_injected_sequence") or 0)
+        evidence_failed = int(integrity.get("evidence_failed") or 0)
+        dropped_stale = int(integrity.get("injection_dropped_stale") or 0)
+        queue_depth = int(ingress.get("queued") or 0)
+        backpressure_waits = int(ingress.get("backpressure_waits") or 0)
+        integrity_text = (
+            f"seq rx/persist/inject={received_sequence}/{persisted_sequence}/{injected_sequence}"
+            f" | stale_drop={dropped_stale} | q={queue_depth} | bp={backpressure_waits}"
+        )
         bandwidth_text = (
             "packet 대기 중"
             if frames <= 0
             else f"MAVLink packets={total_packets} | avg frame={avg_frame:.0f}B | max frame={int(stats.get('max_frame_bytes') or 0)}B"
         )
-        bandwidth_level = "good" if frames and total_fail == 0 else "warn" if frames else "idle"
+        bandwidth_text = f"{bandwidth_text} | {integrity_text}"
+        bandwidth_level = (
+            "bad"
+            if evidence_failed
+            else "warn"
+            if total_fail or dropped_stale or backpressure_waits
+            else "good"
+            if frames
+            else "idle"
+        )
         self.panel._set_health_label(labels["rtcm_receive"], receive_text, receive_level)
         self.panel._set_health_label(labels["rtcm_messages"], self.panel._format_rtcm_message_types(message_type_counts), message_level)
         self.panel._set_health_label(labels["rtcm_injection_stats"], injection_text, injection_level)
         self.panel._set_health_label(labels["rtcm_bandwidth"], bandwidth_text, bandwidth_level)
 
     def _handle_gnss_base_satellite_quality(self, quality: object) -> None:
-        if not isinstance(quality, dict) or not hasattr(self.panel, "gnss_base_quality_labels"):
+        if not isinstance(quality, dict):
+            return
+        self.panel.gnss_base_satellite_quality = dict(quality)
+        if not hasattr(self.panel, "gnss_base_quality_labels"):
             return
         try:
             tracked = int(quality.get("tracked") or 0)
@@ -1728,6 +2405,45 @@ class GnssRuntimeController:
                 stats["message_types"] = message_types
             message_types[message_type] = int(message_types.get(message_type, 0)) + 1
 
+    def _append_rtcm_package_evidence(
+        self,
+        payload: bytes,
+        *,
+        source: str,
+        record_kind: str,
+    ) -> None:
+        """Append exact RTCM bytes and an offset/hash index to the open session."""
+
+        if not payload:
+            return
+        context = self._rtcm_evidence_context()
+        if not context.active:
+            return
+        last_sequence, source_sequences = load_rtcm_evidence_high_water(context)
+        source_key = (str(source), str(record_kind))
+        evidence_record = RtcmEvidenceRecord(
+            sequence=last_sequence + 1,
+            source_sequence=int(source_sequences.get(source_key, 0)) + 1,
+            source=str(source),
+            record_kind=str(record_kind),
+            payload=payload,
+            receive_utc_ns=time.time_ns(),
+            receive_monotonic_ns=time.monotonic_ns(),
+            message_type=(
+                parse_rtcm3_message_type(payload) if record_kind == "rtcm_frame" else None
+            ),
+        )
+        record = append_rtcm_evidence(context, evidence_record)
+        if record is None:
+            return
+        activator = getattr(self.panel, "activate_measurement_package_source", None)
+        if callable(activator):
+            activator(
+                "gnss.rtcm",
+                required_roles=("corrections/rtcm/raw",),
+                metadata={"activated_utc_ns": record["receive_utc_ns"], "source": str(source)},
+            )
+
     def _record_gnss_base_rtcm_injection(
         self,
         side: str,
@@ -1760,6 +2476,8 @@ class GnssRuntimeController:
         if not isinstance(frame, (bytes, bytearray)):
             return
         payload = bytes(frame)
+        self._append_rtcm_package_evidence(payload, source=source, record_kind="rtcm_frame")
+        ui_due = self._rtcm_ui_update_due()
         self.panel._record_gnss_base_rtcm_frame(payload)
         if (
             self.panel.gnss_operation_manager.state == GnssOperationState.BASE_RECONFIGURING
@@ -1771,58 +2489,107 @@ class GnssRuntimeController:
             include_rover_targets=include_rover_targets,
         )
         if not target_sides:
-            self.panel._set_health_label(self.panel.gnss_base_status_labels["rtcm_injection"], "비활성", "idle")
-            self.panel._refresh_gnss_base_rtcm_stats()
-            self.panel._refresh_gnss_operation_readiness()
+            if ui_due:
+                self.panel._set_health_label(self.panel.gnss_base_status_labels["rtcm_injection"], "비활성", "idle")
+                self.panel._refresh_gnss_base_rtcm_stats()
+                self.panel._refresh_gnss_operation_readiness()
             return
         if self.panel.mavlink_pixhawk is None:
             for side in target_sides:
                 self.panel._record_gnss_base_rtcm_injection(side, payload_bytes=len(payload), failed=True)
-            self.panel._set_health_label(
-                self.panel.gnss_base_status_labels["rtcm_injection"],
-                f"RTCM {len(payload)} bytes 수신 | MAVLink rover 미연결",
-                "warn",
-            )
-            self.panel._refresh_gnss_base_rtcm_stats()
-            self.panel._refresh_gnss_operation_readiness()
+            if ui_due:
+                self.panel._set_health_label(
+                    self.panel.gnss_base_status_labels["rtcm_injection"],
+                    f"RTCM {len(payload)} bytes 수신 | MAVLink rover 미연결",
+                    "warn",
+                )
+                self.panel._refresh_gnss_base_rtcm_stats()
+                self.panel._refresh_gnss_operation_readiness()
             return
         worker = self.panel._ensure_pixhawk_rtcm_worker()
         if worker is None:
             for side in target_sides:
                 self.panel._record_gnss_base_rtcm_injection(side, payload_bytes=len(payload), failed=True)
-            self.panel._set_health_label(
-                self.panel.gnss_base_status_labels["rtcm_injection"],
-                f"RTCM 주입 대기 실패: MAVLink worker 없음 ({len(payload)} bytes)",
-                "bad",
-            )
-            self.panel._refresh_gnss_base_rtcm_stats()
-            self.panel._refresh_gnss_operation_readiness()
+            if ui_due:
+                self.panel._set_health_label(
+                    self.panel.gnss_base_status_labels["rtcm_injection"],
+                    f"RTCM 주입 대기 실패: MAVLink worker 없음 ({len(payload)} bytes)",
+                    "bad",
+                )
+                self.panel._refresh_gnss_base_rtcm_stats()
+                self.panel._refresh_gnss_operation_readiness()
             return
         worker.request.emit(tuple(target_sides), payload)
-        self.panel._set_health_label(
-            self.panel.gnss_base_status_labels["rtcm_injection"],
-            f"RTCM {len(payload)} bytes 대기 중 -> "
-            f"{', '.join(self.panel._px4_mag_camera_label(side) for side in target_sides)}",
-            "warn",
-        )
+        if ui_due:
+            self.panel._set_health_label(
+                self.panel.gnss_base_status_labels["rtcm_injection"],
+                f"RTCM {len(payload)} bytes 대기 중 -> "
+                f"{', '.join(self.panel._px4_mag_camera_label(side) for side in target_sides)}",
+                "warn",
+            )
 
     def _ensure_pixhawk_rtcm_worker(self) -> PixhawkRtcmInjectionWorker | None:
         subscriber = self.panel.mavlink_pixhawk
         if subscriber is None:
             return None
-        if self.panel.pixhawk_rtcm_thread is not None and self.panel.pixhawk_rtcm_worker is not None:
-            return self.panel.pixhawk_rtcm_worker
+        existing_thread = self.panel.pixhawk_rtcm_thread
+        existing_worker = self.panel.pixhawk_rtcm_worker
+        if (
+            existing_thread is not None
+            and existing_worker is not None
+            and existing_thread.isRunning()
+            and existing_worker.subscriber is subscriber
+        ):
+            self._wire_rtcm_pipeline_injection_worker(existing_worker)
+            return existing_worker
+        if existing_thread is not None or existing_worker is not None:
+            if not self._retire_pixhawk_rtcm_worker(wait=True):
+                return None
+        self._ensure_rtcm_pipeline()
         thread = QtCore.QThread(self.panel)
         worker = PixhawkRtcmInjectionWorker(subscriber)
         worker.moveToThread(thread)
         worker.request.connect(worker.enqueue, QtCore.Qt.QueuedConnection)
-        worker.injected.connect(self.panel._apply_pixhawk_rtcm_result)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self.panel._clear_pixhawk_rtcm_worker)
+        thread.finished.connect(
+            lambda thread=thread, worker=worker: self._clear_pixhawk_rtcm_worker(
+                thread,
+                worker,
+            )
+        )
         self.panel.pixhawk_rtcm_thread = thread
         self.panel.pixhawk_rtcm_worker = worker
+        self._wire_rtcm_pipeline_injection_worker(worker)
         thread.start()
         return worker
+
+    def _retire_pixhawk_rtcm_worker(
+        self,
+        *,
+        expected_subscriber: object | None = None,
+        wait: bool,
+    ) -> bool:
+        thread = getattr(self.panel, "pixhawk_rtcm_thread", None)
+        worker = getattr(self.panel, "pixhawk_rtcm_worker", None)
+        if worker is not None and (
+            expected_subscriber is None or worker.subscriber is expected_subscriber
+        ):
+            try:
+                worker.clear_pending()
+            except Exception:
+                pass
+        elif expected_subscriber is not None:
+            return True
+        if getattr(self.panel, "_rtcm_pipeline_injection_worker", None) is worker:
+            self._wire_rtcm_pipeline_injection_worker(None)
+        if thread is not None and thread.isRunning():
+            thread.quit()
+            if wait and not thread.wait(1000):
+                return False
+        if thread is None or not thread.isRunning():
+            self._clear_pixhawk_rtcm_worker(thread, worker)
+            return True
+        return False
 
     def _apply_pixhawk_rtcm_result(self, result: object) -> None:
         data = dict(result or {})
@@ -1846,6 +2613,13 @@ class GnssRuntimeController:
             failed_labels.append(f"{self.panel._px4_mag_camera_label(side)}:{error}")
         if dropped:
             self.panel._log(f"[GNSS] RTCM 오래된 대기 프레임 {dropped}개를 폐기했습니다.")
+        # Receive/pending updates and completed injection updates use separate
+        # clocks.  Otherwise every high-rate receive event consumes the one
+        # slot that should publish delivery stats and advance readiness.
+        if not failed_labels and not self._rtcm_result_ui_update_due():
+            return
+        if failed_labels:
+            self._last_rtcm_result_ui_update_s = time.monotonic()
         if sent_labels and not failed_labels:
             level = "good"
             text = f"RTCM {payload_bytes} bytes -> {', '.join(sent_labels)}"
@@ -1861,12 +2635,30 @@ class GnssRuntimeController:
         self.panel._refresh_gnss_base_rtcm_stats()
         self.panel._refresh_gnss_operation_readiness()
 
-    def _clear_pixhawk_rtcm_worker(self) -> None:
+    def _clear_pixhawk_rtcm_worker(
+        self,
+        thread: QtCore.QThread | None = None,
+        worker: PixhawkRtcmInjectionWorker | None = None,
+    ) -> None:
+        current_thread = getattr(self.panel, "pixhawk_rtcm_thread", None)
+        current_worker = getattr(self.panel, "pixhawk_rtcm_worker", None)
+        if thread is not None and current_thread is not thread:
+            return
+        if worker is not None and current_worker is not worker:
+            return
+        if getattr(self.panel, "_rtcm_pipeline_injection_worker", None) is current_worker:
+            self._wire_rtcm_pipeline_injection_worker(None)
         self.panel.pixhawk_rtcm_thread = None
         self.panel.pixhawk_rtcm_worker = None
-        self.panel._refresh_gnss_base_rtcm_stats()
-        self.panel._maybe_activate_gnss_fixed_base()
-        self.panel._refresh_gnss_operation_readiness()
+        self._sync_rtcm_pipeline_config()
+        for callback_name in (
+            "_refresh_gnss_base_rtcm_stats",
+            "_maybe_activate_gnss_fixed_base",
+            "_refresh_gnss_operation_readiness",
+        ):
+            callback = getattr(self.panel, callback_name, None)
+            if callable(callback):
+                callback()
 
     def _handle_gnss_base_command_sent(self, label: str, byte_count: int) -> None:
         self.panel._set_health_label(
@@ -1875,6 +2667,9 @@ class GnssRuntimeController:
             "good",
         )
         if label == "CFG-TMODE3 survey-in start":
+            self.panel._gnss_survey_command_sent_generation = int(
+                getattr(self.panel, "_gnss_survey_generation", 0) or 0
+            )
             self.panel._set_health_label(
                 self.panel.gnss_base_status_labels["survey_in"],
                 "survey-in 시작 명령 전송 완료 | NAV-SVIN 상태 수신 대기",
@@ -1916,10 +2711,49 @@ class GnssRuntimeController:
             accuracy_m=accuracy_m,
             observations=observations,
         )
-        if valid and self.panel._gnss_active_operation_config().operation_mode == GnssOperationMode.LOCAL_SURVEY_IN:
+        generation = int(getattr(self.panel, "_gnss_survey_generation", 0) or 0)
+        generation_ready = bool(
+            generation > 0
+            and int(
+                getattr(self.panel, "_gnss_survey_command_sent_generation", 0) or 0
+            )
+            == generation
+            and int(getattr(self.panel, "_gnss_survey_ack_generation", 0) or 0)
+            == generation
+        )
+        if active and not valid and generation_ready:
+            self.panel._gnss_survey_active_seen_generation = generation
+        requested_duration_s = int(
+            getattr(self.panel, "_gnss_survey_requested_duration_s", 0) or 0
+        )
+        requested_accuracy_m = float(
+            getattr(self.panel, "_gnss_survey_requested_accuracy_m", 0.0) or 0.0
+        )
+        completion_correlated = bool(
+            generation_ready
+            and int(
+                getattr(self.panel, "_gnss_survey_active_seen_generation", 0) or 0
+            )
+            == generation
+            and duration_s >= requested_duration_s
+            and requested_accuracy_m > 0.0
+            and accuracy_m <= requested_accuracy_m
+        )
+        if (
+            valid
+            and completion_correlated
+            and self.panel._gnss_active_operation_config().operation_mode
+            == GnssOperationMode.LOCAL_SURVEY_IN
+        ):
             if self.panel.gnss_operation_manager.state == GnssOperationState.BASE_SURVEYING:
                 self.panel._gnss_transition(GnssOperationState.LOCAL_RTCM_ACTIVE, "현장 Survey-in valid; RTCM rover 라우팅")
             self.panel._refresh_gnss_operation_readiness()
+        elif valid and self.panel.gnss_operation_manager.state == GnssOperationState.BASE_SURVEYING:
+            self.panel._set_health_label(
+                self.panel.gnss_base_status_labels["survey_in"],
+                "valid NAV-SVIN ignored until current CFG ACK, active observation, and requested limits are confirmed",
+                "warn",
+            )
 
     def _update_gnss_base_survey_visualization(
         self,

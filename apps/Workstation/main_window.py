@@ -16,6 +16,7 @@ from .command_registry import CommandRegistry, CommandSpec
 from .components import StatusIndicator
 from .inspector import InspectorWidget
 from .navigation import NavigationTree, canonical_context_id
+from .optical_pose_workers import OpticalPoseAutoSelectWorker
 from .settings_workspace import SettingsWorkspace
 from .status_model import BackendStatusAdapter, RuntimeStatus
 from Workstation.workstation_core.px4_calibration_groups import PX4_CALIBRATION_GROUPS
@@ -26,10 +27,12 @@ from .workspaces import (
     CameraWorkspace,
     CalibrationWorkspace,
     DiagnosticsContent,
+    ExperimentWorkspace,
     MeasurementWorkspace,
     OverviewWorkspace,
     PixhawkWorkspace,
     RecordingWorkspace,
+    SessionWorkspace,
     TelemetryWorkspace,
     TimeWorkspace,
 )
@@ -64,6 +67,10 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self.commands = CommandRegistry(self)
         self._current_context = "overview"
         self._closing = False
+        self._optical_pose_auto_thread: QtCore.QThread | None = None
+        self._optical_pose_auto_worker: OpticalPoseAutoSelectWorker | None = None
+        self._optical_pose_auto_command_id: str | None = None
+        self._close_after_optical_pose_auto = False
         self._build_commands()
         self._build_shell()
         self._build_workspaces()
@@ -101,21 +108,19 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self.commands.register(
             CommandSpec(
                 "recording.toggle",
-                "Record",
-                "Start/stop the existing session spool and asynchronous finalization.",
+                "Manual record",
+                "Advanced/manual fallback; normal Measurement runs record automatically.",
                 "recording",
                 self._toggle_recording,
-                shortcut="Ctrl+R",
             )
         )
         self.commands.register(
             CommandSpec(
                 "session.save",
-                "Save session",
-                "Finalize the existing session files without changing the measurement schema.",
+                "Retry session save",
+                "Retry or manually finalize an advanced/recovered session without changing the measurement schema.",
                 "data",
                 self._save_session,
-                shortcut="Ctrl+S",
             )
         )
         for command_id, text, tooltip, category, handler in (
@@ -415,21 +420,21 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         for command_id, text, tooltip, handler in (
             (
                 "calibration.capture_images",
-                "Capture",
-                "Capture calibration images through the existing checkerboard owner.",
+                "Capture Live Pair",
+                "Capture the newest decoded native pair from the live RTSP streams through the existing checkerboard owner.",
                 self._calibration_capture_images,
             ),
             (
                 "calibration.capture_images_wiris_ftp",
-                "Capture FTP HR",
+                "Capture HR Still (FTP)",
                 "Trigger a WIRIS HR still on both cameras and download it via FTP "
                 "into this calibration run, instead of the live RTSP feed.",
                 self._calibration_capture_images_wiris_ftp,
             ),
             (
                 "calibration.capture_images_wiris_ftp_oz",
-                "Capture FTP OZ",
-                "Same as Capture FTP HR, using the lower-resolution operating-zoom "
+                "Capture OZ Still (FTP)",
+                "Same as Capture HR Still (FTP), using the lower-resolution operating-zoom "
                 "still (SIVI) instead of the HR still -- faster, no camera reboot risk.",
                 self._calibration_capture_images_wiris_ftp_oz,
             ),
@@ -557,12 +562,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 "Swap P1/P2",
                 "Swap P1/P2 mapping through the existing owner; coordinate labels remain explicit.",
                 self._alignment_swap_pixhawks,
-            ),
-            (
-                "alignment.query_lrf",
-                "Refresh LRF",
-                "Run one on-demand WIRIS GLRD read on both cameras instead of a continuous poll.",
-                self._alignment_query_lrf,
             ),
         ):
             category = (
@@ -693,8 +692,8 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             ),
             (
                 "advanced.media.preview",
-                "Preview selected CSV",
-                "Preview stored CSV fields without coordinate or timestamp conversion.",
+                "Preview selected table",
+                "Preview stored Parquet, CSV, or JSONL rows without coordinate or timestamp conversion.",
                 self._advanced_media_preview,
             ),
             (
@@ -832,9 +831,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         toolbar.addAction(self.commands.action("camera.toggle"))
         toolbar.addAction(self.commands.action("detection.toggle"))
         toolbar.addSeparator()
-        toolbar.addAction(self.commands.action("recording.toggle"))
-        toolbar.addAction(self.commands.action("session.save"))
-        toolbar.addSeparator()
         toolbar.addAction(self.navigation_dock.toggleViewAction())
         toolbar.addAction(self.inspector_dock.toggleViewAction())
         toolbar.addAction(self.diagnostics_dock.toggleViewAction())
@@ -861,8 +857,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
 
     def _build_menus(self) -> None:
         file_menu = self.menuBar().addMenu("File")
-        file_menu.addAction(self.commands.action("session.save"))
-        file_menu.addSeparator()
         file_menu.addAction("Quit", self.close, "Ctrl+Q")
         view_menu = self.menuBar().addMenu("View")
         view_menu.addAction(self.navigation_dock.toggleViewAction())
@@ -880,7 +874,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         device_menu.addAction(self.commands.action("pixhawk.discover_mavlink_candidates"))
         measurement_menu = self.menuBar().addMenu("Run")
         measurement_menu.addAction(self.commands.action("detection.toggle"))
-        measurement_menu.addAction(self.commands.action("recording.toggle"))
         tools_menu = self.menuBar().addMenu("Tools")
         tools_menu.addAction(self.commands.action("advanced.open"))
         tools_menu.addAction(self.commands.action("settings.apply"))
@@ -890,12 +883,32 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
 
     def _build_workspaces(self) -> None:
         self.overview = OverviewWorkspace(self.backend, self.status_adapter.model)
+        self.experiment = ExperimentWorkspace(self.backend)
         self.camera = CameraWorkspace(self.backend, self.status_adapter.model, self.commands.invoke)
         self.time_workspace = TimeWorkspace(self.backend, self.commands.invoke)
         self.measurement = MeasurementWorkspace(
             self.backend,
             self.status_adapter.model,
             self.commands.invoke,
+            lambda: self._select_context("tasks.recording"),
+            begin_session_action=self._begin_measurement_session_with_run_setup,
+        )
+        # Session lifecycle is a top-level daily-work process.  Keep the
+        # Measurement widget's legacy controls available to direct embedders,
+        # but remove them from the main application surface.
+        for button in (
+            self.measurement.start_session_button,
+            self.measurement.new_measurement_button,
+            self.measurement.finalize_session_button,
+            self.measurement.close_session_button,
+        ):
+            button.hide()
+        self.session = SessionWorkspace(
+            self.backend,
+            self.status_adapter.model,
+            lambda: self._select_context("processing.measurement"),
+            lambda: self._select_context("tasks.recording"),
+            begin_session_action=self._begin_measurement_session_with_run_setup,
         )
         self.pixhawk = PixhawkWorkspace(
             self.backend,
@@ -934,6 +947,9 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self.measurement.inspection_requested.connect(
             lambda selection: self._inspect_selection("processing.measurement", selection)
         )
+        self.session.inspection_requested.connect(
+            lambda selection: self._inspect_selection("tasks.session", selection)
+        )
         self.calibration = CalibrationWorkspace(
             self.backend,
             self._open_advanced_zoom,
@@ -966,9 +982,11 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self.workspace_scrolls: dict[str, QtWidgets.QScrollArea] = {}
         for context_id, widget in (
             ("overview", self.overview),
+            ("experiment", self.experiment),
             ("camera", self.camera),
             ("time", self.time_workspace),
             ("measurement", self.measurement),
+            ("session", self.session),
             ("pixhawk", self.pixhawk),
             ("telemetry", self.telemetry),
             ("base_gnss", self.base_gnss),
@@ -982,6 +1000,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             self.workspace_scrolls[context_id] = scroll
             self._workspace_indexes[context_id] = self.workspace_host.addWidget(scroll)
         self.overview.open_context.connect(self._select_context)
+        self.experiment.open_context.connect(self._select_context)
         self._select_context("overview")
 
     def _handle_hr_command(self, command_id: str, payload: object) -> None:
@@ -1070,10 +1089,130 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self.recording.apply_ulog_snapshot(result)
         self.statusBar().showMessage("ULog imported and hash-verified", 3500)
 
+    def _start_optical_pose_auto_selection(
+        self,
+        command_id: str,
+        payload: dict[str, object],
+    ) -> None:
+        if self._optical_pose_auto_thread is not None and self._optical_pose_auto_thread.isRunning():
+            self.statusBar().showMessage("An optical-pose auto-selection is already running", 3000)
+            return
+        mode = "horizon" if command_id.endswith("horizon") else "mountain"
+        prepare = getattr(self.backend, "optical_pose_prepare_auto_select", None)
+        if not callable(prepare):
+            self._handle_optical_pose_auto_failed(
+                command_id,
+                "background auto-selection owner is not available",
+            )
+            return
+        try:
+            job = prepare(mode, dict(payload))
+        except Exception as exc:
+            self._handle_optical_pose_auto_failed(command_id, str(exc))
+            return
+
+        self.alignment.optical_pose_pane.set_auto_suggestion_busy(True, mode)
+        thread = QtCore.QThread(self)
+        worker = OpticalPoseAutoSelectWorker(job)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(
+            lambda result, command_id=command_id: self._handle_optical_pose_auto_completed(
+                command_id,
+                result,
+            )
+        )
+        worker.failed.connect(
+            lambda message, command_id=command_id: self._handle_optical_pose_auto_failed(
+                command_id,
+                message,
+            )
+        )
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(
+            lambda thread=thread: self._clear_optical_pose_auto_selection(thread)
+        )
+        self._optical_pose_auto_thread = thread
+        self._optical_pose_auto_worker = worker
+        self._optical_pose_auto_command_id = command_id
+        thread.start()
+
+    def _handle_optical_pose_auto_completed(self, command_id: str, result: object) -> None:
+        try:
+            if not isinstance(result, dict):
+                raise RuntimeError("background auto-selection returned an invalid result")
+            commit = getattr(self.backend, "optical_pose_commit_auto_select", None)
+            if not callable(commit):
+                raise RuntimeError("background auto-selection commit owner is not available")
+            snapshot = commit(dict(result))
+            if not isinstance(snapshot, dict):
+                snapshot = self.backend.optical_pose_snapshot()
+            if isinstance(snapshot, dict):
+                self.alignment.optical_pose_pane.apply_snapshot(snapshot)
+            self.inspector.refresh(self._current_context, self.status_adapter.model)
+        except Exception as exc:
+            self._handle_optical_pose_auto_failed(command_id, str(exc))
+            return
+
+        message = f"{command_id}: accepted"
+        duration_ms = 3000
+        suggestions = snapshot.get("auto_suggestions") if isinstance(snapshot, dict) else None
+        latest = suggestions[-1] if isinstance(suggestions, list) and suggestions else None
+        if isinstance(latest, dict):
+            pose_state = str(latest.get("state") or "UNKNOWN")
+            confidence = latest.get("confidence")
+            confidence_text = f"{float(confidence):.2f}" if isinstance(confidence, (int, float)) else "--"
+            if latest.get("eligible", False):
+                message = f"{command_id}: {pose_state} (confidence={confidence_text})"
+            else:
+                reason = str(latest.get("failure_reason") or "no eligible detection")
+                message = f"{command_id}: {pose_state} — {reason}"
+                duration_ms = 8000
+        self.statusBar().showMessage(message, duration_ms)
+
+    def _handle_optical_pose_auto_failed(self, command_id: str, message: str) -> None:
+        self.statusBar().showMessage(f"{command_id}: failed — {message}", 10000)
+        self.alignment.optical_pose_pane.set_auto_suggestion_error(command_id, message)
+
+    def _clear_optical_pose_auto_selection(self, thread: QtCore.QThread) -> None:
+        if self._optical_pose_auto_thread is not thread:
+            return
+        self._optical_pose_auto_thread = None
+        self._optical_pose_auto_worker = None
+        self._optical_pose_auto_command_id = None
+        self.alignment.optical_pose_pane.set_auto_suggestion_busy(False)
+        if self._close_after_optical_pose_auto:
+            self._close_after_optical_pose_auto = False
+            QtCore.QTimer.singleShot(0, self.close)
+
     def _handle_optical_pose_command(self, command_id: str, payload: object) -> None:
         """Route typed OpticalPosePane requests through backend owner facades."""
 
         values = dict(payload) if isinstance(payload, dict) else {}
+        auto_selection_running = (
+            self._optical_pose_auto_thread is not None
+            and self._optical_pose_auto_thread.isRunning()
+        )
+        if auto_selection_running and (
+            command_id.startswith("alignment.pose.")
+            or command_id in {
+                "alignment.mountain_ridge_margin.set",
+                "alignment.mountain_max_points.set",
+            }
+        ) and command_id not in {
+            "alignment.pose.auto_select_horizon",
+            "alignment.pose.auto_select_mountain",
+        }:
+            self.statusBar().showMessage("Wait for the optical-pose auto-selection to finish", 3000)
+            return
+        if command_id in {
+            "alignment.pose.auto_select_horizon",
+            "alignment.pose.auto_select_mountain",
+        }:
+            self._start_optical_pose_auto_selection(command_id, values)
+            return
         try:
             if command_id == "alignment.pose.apply_candidate":
                 result = self.backend.optical_pose_apply_candidate(values)
@@ -1103,16 +1242,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 method = getattr(self.backend, "optical_pose_capture_burst_wiris_ftp_oz", None)
                 if not callable(method):
                     raise RuntimeError("WIRIS FTP (OZ) frozen-burst capture owner is not available")
-                result = method(values)
-            elif command_id == "alignment.pose.auto_select_horizon":
-                method = getattr(self.backend, "optical_pose_auto_select_horizon", None)
-                if not callable(method):
-                    raise RuntimeError("automatic Horizon selector owner is not available")
-                result = method(values)
-            elif command_id == "alignment.pose.auto_select_mountain":
-                method = getattr(self.backend, "optical_pose_auto_select_mountain", None)
-                if not callable(method):
-                    raise RuntimeError("automatic Mountain selector owner is not available")
                 result = method(values)
             elif command_id == "alignment.pose.use_suggestion":
                 method = getattr(self.backend, "optical_pose_accept_suggestion", None)
@@ -1177,7 +1306,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                     "alignment.pose.solve_terrain": "optical_pose_solve_terrain",
                     "alignment.pose.solve_gnss_mountain": "optical_pose_solve_gnss_mountain",
                     "alignment.pose.solve_drone_yaw": "optical_pose_solve_drone_yaw",
-                    "alignment.pose.initialize_telemetry": "optical_pose_initialize_telemetry",
                     "alignment.pose.solve_drone_rtk_multiview": "optical_pose_solve_drone_rtk_multiview",
                     "alignment.pose.solve_combined": "optical_pose_solve_combined",
                 }.get(command_id)
@@ -1347,16 +1475,28 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
 
     def _select_context(self, context_id: str) -> None:
         context_id = canonical_context_id(context_id)
+        if context_id.startswith("diagnostics"):
+            # Diagnostics is a dock-local view, not a replacement logical
+            # workspace.  Preserve _current_context and the Inspector's
+            # current row selection so workspace inspection remains usable.
+            self.diagnostics_dock.show()
+            self.diagnostics.select_tab_for_context(context_id)
+            self.diagnostics.refresh(self.status_adapter.model.snapshot())
+            return
         self._current_context = context_id
         if context_id == "overview":
             page = "overview"
+        elif context_id == "processing.experiment":
+            page = "experiment"
         elif context_id.startswith("devices.cameras") or context_id in {"processing.detection"}:
             page = "camera"
         elif context_id == "devices.time":
             page = "time"
         elif context_id in {"processing.measurement"}:
             page = "measurement"
-        elif context_id in {"tasks.recording"}:
+        elif context_id == "tasks.session":
+            page = "session"
+        elif context_id == "tasks.recording":
             page = "recording"
         elif context_id in {"devices.pixhawk", "devices.pixhawk.p1", "devices.pixhawk.p2"}:
             page = "pixhawk"
@@ -1368,10 +1508,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             page = "alignment"
         elif context_id in {"tasks.calibration"}:
             page = "calibration"
-        elif context_id.startswith("diagnostics"):
-            self.diagnostics_dock.show()
-            self.diagnostics.select_tab_for_context(context_id)
-            page = self.workspace_host.currentWidget()
         elif context_id in {"tasks.advanced", "tasks.playback", "tasks.export"}:
             page = "advanced"
         elif context_id in {"tasks.settings"}:
@@ -1381,12 +1517,12 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             page = "overview"
         if isinstance(page, str):
             self.workspace_host.setCurrentIndex(self._workspace_indexes[page])
+        if page == "measurement":
+            QtCore.QTimer.singleShot(0, self.measurement.refresh_preview_layout)
         if page == "alignment":
             self.alignment.select_tab_for_context(context_id)
         self._refresh_visible_surfaces(self.status_adapter.model.snapshot())
         self.inspector.refresh(context_id, self.status_adapter.model)
-        if context_id.startswith("diagnostics"):
-            self.diagnostics.select_tab_for_context(context_id)
         if context_id not in {"overview"} and self.navigation.currentIndex().data(QtCore.Qt.UserRole) != context_id:
             self.navigation.select_context(context_id)
 
@@ -1416,6 +1552,22 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
 
     def _save_session(self) -> object:
         return self.backend.save_session()
+
+    def _begin_measurement_session_with_run_setup(self) -> object:
+        """Start the session, then replace its unlocked fallback with the visible draft."""
+
+        draft = self.recording.validated_run_setup_payload(allow_auto_default=True)
+        result = self.backend.begin_measurement_session()
+        if result is False:
+            return False
+        if draft is None:
+            self.recording.refresh_run_setup_from_owner()
+            return result
+        applied = self.backend.apply_run_setup(draft)
+        if applied is False:
+            raise RuntimeError("run setup apply was rejected after Start Session")
+        self.recording.accept_run_setup_result(applied)
+        return result
 
     def _camera_discover_host_ip(self) -> object:
         return self.backend.camera_discover_host_ip()
@@ -1457,6 +1609,11 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         return self.backend.apply_measurement_settings(self.time_workspace.settings_payload())
 
     def _time_save_settings(self) -> object:
+        applied = self.backend.apply_measurement_settings(
+            self.time_workspace.settings_payload()
+        )
+        if applied is False:
+            raise RuntimeError("time/synchronization settings apply was rejected")
         return self.backend.save_measurement_settings()
 
     def _pixhawk_toggle_mavlink(self) -> object:
@@ -1552,18 +1709,38 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         return self.backend.calibration_toggle_auto_capture()
 
     def _calibration_run_intrinsic(self) -> object:
-        self.backend.calibration_apply_setup(self.calibration.setup_payload())
+        if not self.calibration.apply_selected_calibration_session():
+            return False
+        if not getattr(self.calibration, "_last_calibration_session_apply_performed", False):
+            self.backend.calibration_apply_setup(self.calibration.setup_payload())
         return self.backend.calibration_run_intrinsic()
 
     def _calibration_run_extrinsics(self) -> object:
-        self.backend.calibration_apply_setup(self.calibration.setup_payload())
+        if not self.calibration.apply_selected_calibration_session():
+            return False
+        if not getattr(self.calibration, "_last_calibration_session_apply_performed", False):
+            self.backend.calibration_apply_setup(self.calibration.setup_payload())
         return self.backend.calibration_run_extrinsics()
 
     def _calibration_save_intrinsics(self) -> object:
-        return self.backend.calibration_save_intrinsics()
+        confirmed = bool(
+            getattr(self.calibration, "_calibration_quality_warning_confirmed", False)
+        )
+        return (
+            self.backend.calibration_save_intrinsics(quality_warning_confirmed=True)
+            if confirmed
+            else self.backend.calibration_save_intrinsics()
+        )
 
     def _calibration_save_extrinsics(self) -> object:
-        return self.backend.calibration_save_extrinsics()
+        confirmed = bool(
+            getattr(self.calibration, "_calibration_quality_warning_confirmed", False)
+        )
+        return (
+            self.backend.calibration_save_extrinsics(quality_warning_confirmed=True)
+            if confirmed
+            else self.backend.calibration_save_extrinsics()
+        )
 
     def _calibration_load_intrinsics(self) -> object:
         return self.backend.calibration_load_intrinsics()
@@ -1572,12 +1749,24 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         return self.backend.calibration_load_extrinsics()
 
     def _calibration_apply_bundle(self) -> object:
-        return self.backend.calibration_apply_bundle()
+        confirmed = bool(
+            getattr(self.calibration, "_calibration_quality_warning_confirmed", False)
+        )
+        return (
+            self.backend.calibration_apply_bundle(quality_warning_confirmed=True)
+            if confirmed
+            else self.backend.calibration_apply_bundle()
+        )
 
     def _measurement_apply_settings(self) -> object:
         return self.backend.apply_measurement_settings(self.measurement.settings_payload())
 
     def _measurement_save_settings(self) -> object:
+        applied = self.backend.apply_measurement_settings(
+            self.measurement.settings_payload()
+        )
+        if applied is False:
+            raise RuntimeError("measurement settings apply was rejected")
         return self.backend.save_measurement_settings()
 
     def _settings_apply(self) -> object:
@@ -1585,10 +1774,17 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         # in settings_payload()'s JSON-safe dict (see NetworkConfig /
         # ntrip_credentials.py). It needs its own explicit handoff here,
         # where both this workspace and the backend are in scope.
-        self.backend.set_gnss_ntrip_session_password(self.settings_workspace.gnss_network_password_edit.text())
+        password_applied = self.backend.set_gnss_ntrip_session_password(
+            self.settings_workspace.gnss_network_password_edit.text()
+        )
+        if password_applied is False:
+            raise RuntimeError("NTRIP session password apply was rejected")
         return self.backend.apply_workstation_system_settings(self.settings_workspace.settings_payload())
 
     def _settings_save(self) -> object:
+        applied = self._settings_apply()
+        if applied is False:
+            raise RuntimeError("system settings apply was rejected")
         return self.backend.save_workstation_system_settings()
 
     def _calibration_apply_setup(self) -> object:
@@ -1615,9 +1811,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
 
     def _alignment_swap_pixhawks(self) -> object:
         return self.backend.alignment_swap_pixhawks()
-
-    def _alignment_query_lrf(self) -> object:
-        return self.backend.query_lrf_once()
 
     def _advanced_wiris_send(self) -> object:
         return self.backend.advanced_send_wiris_command(
@@ -1716,6 +1909,9 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             for status in (snapshot.get("camera.left"), snapshot.get("camera.right"))
         )
         clock_change_active = getattr(panel, "wiris_time_sync_thread", None) is not None
+        automatic_recording = bool(
+            getattr(panel, "_automatic_session_recording", False)
+        )
         # These controls are safety gates shared by several hidden pages, so
         # keep their enabled state current without rebuilding those pages.
         self.measurement.refresh_run_controls(snapshot, panel)
@@ -1741,8 +1937,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         if swap_button is not None:
             swap_button.setEnabled(not recording_locked)
         reset_level_button = self.alignment.operation_buttons.get("pixhawk.reset_level_calibration")
-        if reset_level_button is not None:
-            reset_level_button.setEnabled(not recording_locked)
         self.commands.set_enabled("camera.toggle", not recording_locked)
         self.commands.set_enabled("camera.auto_connect", not recording_locked)
         self.commands.set_enabled("camera.swap", not recording_locked)
@@ -1751,23 +1945,42 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self.commands.set_enabled("camera.reactivate_right", not recording_locked and not rtsp_operation_active)
         self.commands.set_enabled("alignment.swap_pixhawks", not recording_locked)
         self.commands.set_enabled("pixhawk.toggle_mavlink", not recording_locked)
-        pixhawk_states = {
-            str(snapshot.get(key).state).upper()
-            for key in ("pixhawk.left", "pixhawk.right")
-            if snapshot.get(key) is not None
+        pixhawk_state_by_side = {
+            side: str(snapshot.get(f"pixhawk.{side}").state).upper()
+            for side in ("left", "right")
+            if snapshot.get(f"pixhawk.{side}") is not None
         }
-        pixhawk_connected = bool(pixhawk_states & {"LIVE", "CONNECTED", "STARTING"})
+        open_sides_reader = getattr(panel, "_mavlink_open_sides", None)
+        open_sides = (
+            set(open_sides_reader())
+            if callable(open_sides_reader)
+            else {
+                side
+                for side, state in pixhawk_state_by_side.items()
+                if state in {"LIVE", "CONNECTED", "STARTING"}
+            }
+        )
+        pixhawk_connected = bool(open_sides)
         pixhawk_connecting = getattr(panel, "pixhawk_connection_thread", None) is not None
         pixhawk_active = pixhawk_connected or pixhawk_connecting
         self.commands.set_enabled("pixhawk.connect_mavlink", not recording_locked and not pixhawk_active)
         self.commands.set_enabled("pixhawk.disconnect_mavlink", not recording_locked and pixhawk_active)
-        self.commands.set_enabled("pixhawk.reset_level_calibration", not recording_locked)
-        for side_code in ("p1", "p2"):
+        managers = getattr(panel, "px4_mag_managers", {}) or {}
+        disarmed_open_sides = {
+            side
+            for side in open_sides
+            if not bool(getattr(managers.get(side), "armed", False))
+        }
+        level_reset_enabled = bool(open_sides) and disarmed_open_sides == open_sides and not recording_locked
+        self.commands.set_enabled("pixhawk.reset_level_calibration", level_reset_enabled)
+        if reset_level_button is not None:
+            reset_level_button.setEnabled(level_reset_enabled)
+        for side_code, side in (("p1", "left"), ("p2", "right")):
             for calibration in PX4_CALIBRATION_GROUPS:
                 if calibration.resettable:
                     self.commands.set_enabled(
                         f"pixhawk.reset_calibration.{side_code}.{calibration.key}",
-                        not recording_locked,
+                        side in disarmed_open_sides and not recording_locked,
                     )
         bootstrap_active = getattr(panel, "pixhawk_usb_bootstrap_thread", None) is not None
         for command_id in (
@@ -1779,10 +1992,19 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         # Recording may be armed before cameras are live; samples begin when
         # the source streams become available. Once a stream is running, a
         # mode switch would reopen the active session's video paths.
-        self.commands.set_enabled("detection.toggle", not (recording_locked and camera_running))
+        self.commands.set_enabled(
+            "detection.toggle",
+            self.measurement.control_buttons["detection.toggle"].isEnabled()
+            and not (
+                recording_locked
+                and camera_running
+                and not bool(getattr(panel, "_automatic_session_recording", False))
+            ),
+        )
         self.commands.set_enabled(
             "recording.toggle",
-            recording_state not in {"FINALIZING", "RECOVERABLE"}
+            not automatic_recording
+            and recording_state not in {"FINALIZING", "RECOVERABLE"}
             and (recording_locked or not clock_change_active),
         )
         has_session_data = bool(getattr(panel, "recording_session_id", "")) or bool(getattr(panel, "distance_history", []))
@@ -1794,7 +2016,12 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self.commands.set_text("camera.toggle", "Stop preview" if camera_state and camera_state.state in {"LIVE", "STARTING"} else "Preview")
         detection = snapshot.get("detection")
         self.commands.set_text("detection.toggle", "Stop detection" if detection and detection.state in {"RUNNING", "STARTING"} else "Detection")
-        self.commands.set_text("recording.toggle", "Stop recording" if recording and recording.state in {"ACTIVE", "FINALIZING"} else "Record")
+        self.commands.set_text(
+            "recording.toggle",
+            "Stop manual recording"
+            if recording and recording.state == "ACTIVE" and not automatic_recording
+            else "Manual record",
+        )
         self.commands.set_text(
             "pixhawk.toggle_mavlink",
             "Disconnect Pixhawk MAVLink" if pixhawk_connected else "Connect Pixhawk MAVLink",
@@ -1830,8 +2057,29 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         label = self.commands.action(command_id).text() if command_id in self.commands._actions else command_id
         self.statusBar().showMessage(f"{label}: started", 3000)
 
+    def showEvent(self, event: QtGui.QShowEvent) -> None:  # noqa: N802
+        super().showEvent(event)
+        # QSettings can restore Measurement as the current page before the
+        # scroll area has a real viewport size. Refit after the top-level
+        # window is shown so the preview does not retain an unconstrained
+        # height from that zero-size pass.
+        if self._current_context == "processing.measurement":
+            QtCore.QTimer.singleShot(0, self.measurement.refresh_preview_layout)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if self._current_context == "processing.measurement":
+            QtCore.QTimer.singleShot(0, self.measurement.refresh_preview_layout)
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         if self._closing:
+            event.ignore()
+            return
+        if self._optical_pose_auto_thread is not None and self._optical_pose_auto_thread.isRunning():
+            self._close_after_optical_pose_auto = True
+            if self._optical_pose_auto_worker is not None:
+                self._optical_pose_auto_worker.cancel()
+            self.statusBar().showMessage("Waiting for optical-pose analysis to finish", 3000)
             event.ignore()
             return
         self._closing = True

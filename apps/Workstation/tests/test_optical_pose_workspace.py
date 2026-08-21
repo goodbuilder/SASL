@@ -53,9 +53,11 @@ def test_horizon_disables_yaw_and_manual_mountain_restores_it() -> None:
     # The automatic actions remain available for both manual annotation modes.
     assert pane.solver_buttons["alignment.pose.solve_horizon"].text() == "Solve Horizon Roll/Pitch"
     assert pane.solver_buttons["alignment.pose.solve_gnss_mountain"].text() == "Solve GNSS + Mountain R,t"
-    assert pane.capture_frozen_burst_button.text() == "Capture"
+    assert pane.capture_frozen_burst_button.text() == "Capture Live Pair"
     assert pane.annotation_clear_button.text() == "Clear"
-    assert pane.import_frozen_burst_button.text() == "Import"
+    assert pane.import_frozen_burst_button.text() == "Import Pair"
+    assert pane.capture_frozen_burst_wiris_ftp_button.text() == "Capture HR Still (FTP)"
+    assert pane.capture_frozen_burst_wiris_ftp_oz_button.text() == "Capture OZ Still (FTP)"
     assert "Roll/Pitch" in pane.annotation_mode_combo.toolTip()
     pane.annotation_mode_combo.setCurrentIndex(pane.annotation_mode_combo.findData("ridge"))
     assert "at least four paired points" in pane.annotation_mode_combo.toolTip()
@@ -69,26 +71,33 @@ def test_horizon_disables_yaw_and_manual_mountain_restores_it() -> None:
     assert pane.solver_buttons["alignment.pose.import_terrain"].text() == "Import GeoTIFF"
     assert pane.solver_buttons["alignment.pose.solve_terrain"].text() == "Solve Terrain PnP"
     candidates_group = pane.findChild(QtWidgets.QGroupBox, "opticalPoseCandidatesGroup")
-    method_tabs = pane.findChild(QtWidgets.QTabWidget, "opticalPoseMethodTabs")
+    method_tabs = pane.findChild(QtWidgets.QTabWidget, "alignmentOperationTabs")
     assert candidates_group is not None
     assert method_tabs is not None
     assert [method_tabs.tabText(index) for index in range(method_tabs.count())] == [
-        "Horizon R/P",
+        "Horizon",
         "Mountain + GNSS",
         "Terrain PnP",
-        "Drone RTK Yaw",
-        "Existing calibration",
-        "Combine candidates",
+        "Drone Rotation",
+        "Drone Multi-view",
+        "References",
+        "Combine",
     ]
-    workflow_group = pane.findChild(QtWidgets.QGroupBox, "opticalPoseWorkflowGroup")
-    assert workflow_group is not None
-    assert pane.solver_buttons["alignment.pose.initialize_telemetry"].text() == (
-        "Initialize from Telemetry"
-    )
+    assert "alignment.pose.initialize_telemetry" not in pane.solver_buttons
     assert pane.solver_buttons["alignment.pose.solve_drone_rtk_multiview"].text() == (
         "Refine Drone RTK Multi-view R,t"
     )
-    assert pane.layout().indexOf(candidates_group) > pane.layout().indexOf(method_tabs.parentWidget())
+    assert set(pane.method_information_labels) == {
+        "Horizon",
+        "Mountain + GNSS",
+        "Terrain PnP",
+        "Drone Rotation",
+        "Drone Multi-view",
+        "References",
+        "Combine",
+    }
+    assert candidates_group.parentWidget() is pane.candidate_review_widget
+    assert method_tabs.parentWidget() is pane.method_column
 
     pane.set_candidates(
         [
@@ -123,19 +132,23 @@ def test_existing_calibration_is_reference_and_combine_requires_explicit_sources
     app = _app()
     pane = OpticalPosePane()
 
-    existing_text = pane.method_tabs.widget(4).findChildren(QtWidgets.QLabel)[0].text()
-    assert "Reference only" in existing_text
-    assert "Calibration" in existing_text
+    existing_text = pane.method_tabs.widget(5).findChildren(QtWidgets.QLabel)[0].text()
+    assert "Register Checkerboard" in existing_text
 
     # The tab's own text promises "use this reference as the base pose for
     # optical-pose candidates" -- there must actually be a button that does
     # that, not just descriptive text.
     reference_buttons = {
         button.text(): button
-        for button in pane.method_tabs.widget(4).findChildren(QtWidgets.QPushButton)
+        for button in pane.method_tabs.widget(5).findChildren(QtWidgets.QPushButton)
     }
     assert "Register Checkerboard as candidate" in reference_buttons
     assert "Register Pixhawk + RTK (live) as candidate" in reference_buttons
+    combine_buttons = {
+        button.text(): button
+        for button in pane.method_tabs.widget(6).findChildren(QtWidgets.QPushButton)
+    }
+    assert "Build combined candidate" in combine_buttons
     captured: list[tuple[str, object]] = []
     pane.command_requested.connect(lambda command_id, payload: captured.append((command_id, payload)))
     reference_buttons["Register Checkerboard as candidate"].click()
@@ -372,18 +385,21 @@ def test_alignment_isolates_optical_pose_page_and_preserves_physical_index() -> 
     assert [
         workspace.operation_tabs.tabText(index)
         for index in range(workspace.operation_tabs.count())
-    ] == ["R,t methods"]
-    assert workspace.operation_tabs.widget(0) is workspace.optical_pose_scroll
-    assert workspace.optical_pose_scroll.widget() is workspace.optical_pose_pane
-    assert (
-        workspace.optical_pose_scroll.verticalScrollBarPolicy()
-        == QtCore.Qt.ScrollBarAsNeeded
-    )
-    assert workspace.lrf_group.parentWidget() is workspace.optical_pose_pane
-    assert workspace.layout().indexOf(workspace.lrf_group) == -1
-    assert workspace.lrf_group.objectName() == "alignmentLrfGroup"
+    ] == [
+        "Horizon",
+        "Mountain + GNSS",
+        "Terrain PnP",
+        "Drone Rotation",
+        "Drone Multi-view",
+        "References",
+        "Combine",
+    ]
+    assert workspace.operation_tabs is workspace.optical_pose_pane.method_tabs
+    assert workspace.optical_pose_scroll is None
+    assert not hasattr(workspace, "lrf_group")
+    assert not hasattr(workspace, "lrf_indicators")
     assert workspace.findChild(QtWidgets.QGroupBox, "alignmentDevicePrerequisites") is None
-    assert workspace.optical_pose_pane.method_tabs.count() == 6
+    assert workspace.optical_pose_pane.method_tabs.count() == 7
     workspace.select_tab_for_context("processing.alignment")
     assert workspace.operation_tabs.currentIndex() == 0
 
@@ -468,6 +484,53 @@ def test_frozen_native_annotations_follow_capture_and_solver_commands() -> None:
     app.processEvents()
 
 
+def test_promoted_method_tabs_switch_annotation_mode_without_losing_points() -> None:
+    app = _app()
+    pane = OpticalPosePane()
+    image = QtGui.QImage(640, 480, QtGui.QImage.Format_RGB888)
+    image.fill(QtGui.QColor(QtCore.Qt.darkGray))
+    pane.apply_snapshot(
+        {
+            "frozen_frames": {
+                side: {
+                    "image": image,
+                    "frame_id": f"burst-{side}",
+                    "sha256": ("a" if side == "left" else "b") * 64,
+                    "width": 640,
+                    "height": 480,
+                }
+                for side in ("left", "right")
+            }
+        }
+    )
+    pane.annotation_views["left"].add_source_point((20.0, 100.0), mode="horizon")
+    pane.annotation_views["left"].add_source_point((600.0, 100.0), mode="horizon")
+    commands: list[str] = []
+    pane.command_requested.connect(lambda command, _payload: commands.append(command))
+
+    pane.method_tabs.setCurrentIndex(pane.method_tabs.indexOf(pane.method_tabs.widget(1)))
+    assert pane.method_tabs.currentIndex() == 1
+    assert pane.annotation_mode_combo.currentData() == "ridge"
+    assert len(pane.annotation_payloads()["left"].horizon_line) == 2
+
+    pane.method_tabs.setCurrentIndex(3)
+    assert pane.annotation_mode_combo.currentData() == "target"
+    assert len(pane.annotation_payloads()["left"].horizon_line) == 2
+
+    pane.method_tabs.setCurrentIndex(4)
+    assert not pane.annotation_mode_combo.isEnabled()
+    assert not pane.annotation_views["left"].isEnabled()
+    pane.method_tabs.setCurrentIndex(0)
+    assert pane.annotation_mode_combo.currentData() == "horizon"
+    assert pane.annotation_views["left"].isEnabled()
+    assert len(pane.annotation_payloads()["left"].horizon_line) == 2
+    assert "L/R=2/0" in pane.method_information_labels["Horizon"].text()
+    assert commands == []
+
+    pane.deleteLater()
+    app.processEvents()
+
+
 def test_multiview_capture_keeps_target_marks_until_clear_current_annotation() -> None:
     app = _app()
     pane = OpticalPosePane()
@@ -537,9 +600,16 @@ def test_optical_pose_frozen_reference_columns_are_real_16_9_viewports() -> None
         assert view.width() / view.height() == pytest.approx(16.0 / 9.0, abs=0.02)
         assert view.height() == view.heightForWidth(view.width())
 
+    assert pane.frozen_preview_layout.direction() == QtWidgets.QBoxLayout.LeftToRight
+    assert pane.method_review_splitter.orientation() == QtCore.Qt.Horizontal
+    assert pane.annotation_views["left"].width() < pane.width() / 2
+    assert pane.annotation_views["right"].width() < pane.width() / 2
+
+    pane.resize(900, 800)
+    pane._update_optical_pose_layout_mode()
+    app.processEvents()
     assert pane.frozen_preview_layout.direction() == QtWidgets.QBoxLayout.TopToBottom
-    assert pane.annotation_views["left"].width() > pane.width() / 2
-    assert pane.annotation_views["right"].width() > pane.width() / 2
+    assert pane.method_review_splitter.orientation() == QtCore.Qt.Vertical
 
     pane.close()
     pane.deleteLater()

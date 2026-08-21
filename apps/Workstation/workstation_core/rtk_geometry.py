@@ -165,6 +165,102 @@ class RtkBaselineEstimate:
     right_age_s: float
     fix_quality: str
     warnings: tuple[str, ...] = ()
+    gps_pair_delta_s: float | None = None
+
+
+@dataclass(frozen=True)
+class GpsPairReadiness:
+    """Fail-closed readiness for one raw P1/P2 GPS pair.
+
+    The samples remain WGS84 geodetic evidence and their derived baseline
+    remains world NED.  This decision only controls whether the pair may feed
+    measurement geometry; it never discards or rewrites the raw samples.
+    Timestamps are application receive-monotonic seconds.
+    """
+
+    usable: bool
+    reasons: tuple[str, ...]
+    left_age_s: float | None
+    right_age_s: float | None
+    pair_delta_s: float | None
+
+
+def validate_gps_pair_for_baseline(
+    left: GpsPositionState | None,
+    right: GpsPositionState | None,
+    *,
+    now_s: float,
+    maximum_age_s: float,
+    maximum_pair_delta_s: float,
+    minimum_fix_type: int = 3,
+) -> GpsPairReadiness:
+    """Validate freshness/skew before a P1→P2 NED pair feeds geometry."""
+
+    now = float(now_s)
+    maximum_age = float(maximum_age_s)
+    maximum_pair_delta = float(maximum_pair_delta_s)
+    minimum_fix = int(minimum_fix_type)
+    if not isfinite(now):
+        raise ValueError("now_s must be finite")
+    if not isfinite(maximum_age) or maximum_age < 0.0:
+        raise ValueError("maximum_age_s must be finite and non-negative")
+    if not isfinite(maximum_pair_delta) or maximum_pair_delta < 0.0:
+        raise ValueError("maximum_pair_delta_s must be finite and non-negative")
+    if minimum_fix < 0:
+        raise ValueError("minimum_fix_type must be non-negative")
+
+    reasons: list[str] = []
+    ages: dict[str, float | None] = {"left": None, "right": None}
+    timestamps: dict[str, float] = {}
+    for side, state in (("left", left), ("right", right)):
+        if state is None:
+            reasons.append(f"{side} GPS sample missing")
+            continue
+        position = (state.latitude_deg, state.longitude_deg, state.altitude_m)
+        try:
+            position_valid = state.has_position and all(
+                isfinite(float(value)) for value in position
+            )
+        except (TypeError, ValueError):
+            position_valid = False
+        if not position_valid:
+            reasons.append(f"{side} GPS position missing or invalid")
+        if state.fix_type is None or int(state.fix_type) < minimum_fix:
+            reasons.append(f"{side} GPS fix < {minimum_fix}")
+        try:
+            timestamp = float(state.timestamp_s)
+        except (TypeError, ValueError):
+            timestamp = float("nan")
+        if not isfinite(timestamp):
+            reasons.append(f"{side} GPS timestamp invalid")
+            continue
+        timestamps[side] = timestamp
+        age = now - timestamp
+        ages[side] = age
+        if age < 0.0:
+            reasons.append(f"{side} GPS sample timestamp is in the future")
+        elif age > maximum_age:
+            reasons.append(
+                f"{side} GPS sample stale ({age:.3f}s > {maximum_age:.3f}s)"
+            )
+
+    pair_delta = None
+    if set(timestamps) == {"left", "right"}:
+        pair_delta = abs(timestamps["left"] - timestamps["right"])
+        if pair_delta > maximum_pair_delta:
+            reasons.append(
+                "GPS pair timestamp skew "
+                f"({pair_delta:.3f}s > {maximum_pair_delta:.3f}s)"
+            )
+
+    stable_reasons = tuple(dict.fromkeys(reasons))
+    return GpsPairReadiness(
+        usable=not stable_reasons,
+        reasons=stable_reasons,
+        left_age_s=ages["left"],
+        right_age_s=ages["right"],
+        pair_delta_s=pair_delta,
+    )
 
 
 @dataclass(frozen=True)
@@ -275,4 +371,5 @@ def estimate_rtk_baseline(
         right_age_s=right_age,
         fix_quality=quality,
         warnings=tuple(warnings),
+        gps_pair_delta_s=abs(float(left.timestamp_s) - float(right.timestamp_s)),
     )

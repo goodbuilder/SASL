@@ -31,6 +31,8 @@ from wiris_stereo_distance.yolo_stream import (
     _process_frame_for_output,
     _release_record_video_writer,
     _run_opencv_stream,
+    _activate_cpu_fallback_rate_limiter,
+    _should_emit_preview_frame,
     _write_record_video_frame,
     build_ffmpeg_recording_command,
     build_gst_pipeline_text,
@@ -126,7 +128,7 @@ class _FastFakeCapture:
         self.released = True
 
 
-def test_process_output_queue_drops_preview_frames_without_dropping_detection_events() -> None:
+def test_process_output_queue_keeps_latest_preview_without_dropping_detection_events() -> None:
     event_queue: queue.Queue = queue.Queue(maxsize=1)
     frame_queue: queue.Queue = queue.Queue(maxsize=1)
     output_queue = _BoundedProcessOutputQueue(event_queue, frame_queue)
@@ -136,10 +138,19 @@ def test_process_output_queue_drops_preview_frames_without_dropping_detection_ev
     output_queue.put(("detection", 1.0, 1, 1, {"confidence": 0.9}, [], {}))
 
     assert frame_queue.qsize() == 1
-    assert frame_queue.get_nowait()[4] == b"a"
+    assert frame_queue.get_nowait()[4] == b"b"
     event = event_queue.get_nowait()
     assert event[0] == "detection"
     assert event[4]["confidence"] == 0.9
+
+
+def test_preview_output_rate_limiter_does_not_change_capture_timestamps() -> None:
+    config = {"display_rate_hz": 10.0}
+
+    assert _should_emit_preview_frame(config, 1.0)
+    assert not _should_emit_preview_frame(config, 1.05)
+    assert _should_emit_preview_frame(config, 1.1)
+    assert _should_emit_preview_frame({"display_rate_hz": "invalid"}, 1.0)
 
 
 def _predict_config() -> dict:
@@ -834,6 +845,28 @@ def test_yolo_processing_falls_back_to_cpu_when_cuda_predict_fails() -> None:
     assert output_queue.messages[-1][0] == "detection"
 
 
+def test_cuda_fallback_activates_cpu_adaptive_rate_limit() -> None:
+    worker = YoloStreamWorker(
+        url="rtsp://10.0.0.232:8554/visible",
+        weights_path="weights.pt",
+        device="cuda:0",
+        input_size=640,
+        conf_threshold=0.5,
+        iou_threshold=0.45,
+        max_rate_hz=0.0,
+        enable_detection=True,
+    )
+    limiter = AdaptiveYoloRateLimiter.from_config(worker.config, enable_detection=True)
+
+    worker.config["_yolo_cpu_fallback_active"] = True
+    _activate_cpu_fallback_rate_limiter(limiter, worker.config)
+
+    assert limiter.enabled is True
+    assert limiter.target_rate_hz == DEFAULT_CPU_YOLO_INITIAL_RATE_HZ
+    assert limiter.max_rate_hz == DEFAULT_CPU_YOLO_ADAPTIVE_MAX_RATE_HZ
+    assert worker.config["device"] == "cpu"
+
+
 def test_yolo_processing_emits_measurement_frame_before_detection_when_enabled() -> None:
     import numpy as np
 
@@ -1086,7 +1119,7 @@ def test_yolo_worker_emits_actual_device_and_cpu_fallback_in_stats(monkeypatch) 
     _ = app
 
 
-def test_opencv_receive_and_display_hz_are_not_yolo_or_preview_limited() -> None:
+def test_opencv_preview_hz_is_limited_without_limiting_capture_or_detection() -> None:
     stop_event = threading.Event()
     capture = _FastFakeCapture()
     stats_messages = []
@@ -1113,7 +1146,7 @@ def test_opencv_receive_and_display_hz_are_not_yolo_or_preview_limited() -> None
             "url": "rtsp://example/stream",
             "rtsp_transport": "tcp",
             "stream_backend": "opencv",
-            "display_rate_hz": 1.0,
+            "display_rate_hz": 10.0,
             "max_rate_hz": 5.0,
             "adaptive_rate": False,
             "input_size": 640,
@@ -1146,8 +1179,8 @@ def test_opencv_receive_and_display_hz_are_not_yolo_or_preview_limited() -> None
     assert width == 32
     assert height == 24
     assert decoded_hz > inferred_hz * 2.0
-    assert displayed_hz > 1.0
-    assert abs(displayed_hz - decoded_hz) < 0.001
+    assert displayed_hz <= 12.0
+    assert decoded_hz > displayed_hz * 2.0
     assert requested_device == "cpu"
     assert actual_device == "cpu"
     assert cpu_fallback is False

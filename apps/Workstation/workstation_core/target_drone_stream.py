@@ -963,11 +963,15 @@ class TargetDroneWorker:
         receiver: TargetDroneReceiver,
         *,
         idle_wait_s: float = 0.010,
+        drain_max_duration_s: float = 1.0,
     ) -> None:
         self.receiver = receiver
         self.idle_wait_s = float(idle_wait_s)
         if not math.isfinite(self.idle_wait_s) or self.idle_wait_s <= 0.0:
             raise ValueError("idle_wait_s must be finite and positive")
+        self.drain_max_duration_s = float(drain_max_duration_s)
+        if not math.isfinite(self.drain_max_duration_s) or self.drain_max_duration_s <= 0.0:
+            raise ValueError("drain_max_duration_s must be finite and positive")
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._worker_error: BaseException | None = None
@@ -1006,7 +1010,10 @@ class TargetDroneWorker:
             self._worker_error = exc
         finally:
             try:
-                self.receiver.stop(drain=True)
+                self.receiver.stop(
+                    drain=True,
+                    drain_max_duration_s=self.drain_max_duration_s,
+                )
             except BaseException as exc:
                 if self._worker_error is None:
                     self._worker_error = exc
@@ -1018,7 +1025,10 @@ class TargetDroneWorker:
         self.request_stop()
         thread = self._thread
         if thread is None:
-            return self.receiver.stop(drain=True)
+            return self.receiver.stop(
+                drain=True,
+                drain_max_duration_s=self.drain_max_duration_s,
+            )
         timeout = (
             self.receiver.heartbeat_timeout_s + 1.0
             if timeout_s is None

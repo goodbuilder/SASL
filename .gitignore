@@ -92,6 +92,10 @@ StereoDistance/calibration_captures/left/
 StereoDistance/calibration_captures/right/
 apps/StereoWIRIS/calibration_captures/left/
 apps/StereoWIRIS/calibration_captures/right/
+# Workstation legacy/source-tree capture root. New writes use
+# .local/workstation_data/calibration, but existing field data must never be
+# swept into source commits during migration.
+apps/Workstation/calibration/
 *.mp4
 *.mkv
 *.avi

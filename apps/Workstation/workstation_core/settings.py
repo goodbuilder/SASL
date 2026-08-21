@@ -7,15 +7,68 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from Workstation.runtime_paths import (
+    REPO_ROOT,
+    WORKSTATION_CALIBRATION_ROOT,
+    WORKSTATION_DATA_ROOT,
+    WORKSTATION_MODELS_ROOT,
+    WORKSTATION_SETTINGS_PATH,
+)
 from Workstation.workstation_core.gnss_operation import GnssOperationConfig
+from Workstation.workstation_core.measurement_methods import (
+    DEFAULT_MEASUREMENT_METHOD_FALLBACK_ORDER,
+    PIXHAWK_RTK_LIVE,
+    normalize_measurement_method_fallback_order,
+    normalize_measurement_method_id,
+)
 
 
 APP_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SETTINGS_PATH = APP_ROOT / "stereo_distance_settings.json"
-DEFAULT_INTRINSICS_PATH = "calibration_captures/intrinsics.json"
-DEFAULT_CALIBRATION_ROOT = "calibration_captures"
+LEGACY_DEFAULT_SETTINGS_PATH = APP_ROOT / "stereo_distance_settings.json"
+LEGACY_REPOSITORY_DATA_ROOT = REPO_ROOT / ".local" / "workstation_data"
+LEGACY_CALIBRATION_CAPTURES_ROOT = WORKSTATION_DATA_ROOT / "calibration_captures"
+LEGACY_MODELS_ROOT = REPO_ROOT / ".local" / "models"
+DEFAULT_SETTINGS_PATH = WORKSTATION_SETTINGS_PATH
+DEFAULT_CALIBRATION_ROOT = str(WORKSTATION_CALIBRATION_ROOT)
+DEFAULT_INTRINSICS_PATH = str(Path(DEFAULT_CALIBRATION_ROOT) / "intrinsics.json")
+DEFAULT_YOLO_WEIGHTS_PATH = str(WORKSTATION_MODELS_ROOT / "yolov8m.pt")
 PIXHAWK_ETHERNET_MODES = ("mavlink",)
 DEFAULT_PIXHAWK_ETHERNET_MODE = "mavlink"
+
+
+def _default_path_with_legacy_read(
+    value: object,
+    *,
+    canonical: str | Path,
+    legacy_markers: set[str],
+    legacy_candidates: tuple[Path, ...],
+) -> str:
+    """Resolve only historical default spellings, never explicit custom paths.
+
+    New/default writes target the canonical Workstation data root.  A settings
+    file that still contains a historical default continues to read an
+    existing legacy asset in place; the asset is not copied, renamed, or
+    deleted.  Any non-default value is returned byte-for-byte.
+    """
+
+    text = str(value or "")
+    marker = text.strip()
+    if not marker:
+        return str(canonical)
+    if marker not in legacy_markers:
+        return text
+    for candidate in legacy_candidates:
+        if candidate.exists():
+            return str(candidate)
+    return str(canonical)
+
+
+def _settings_read_path(settings_path: Path) -> Path:
+    if settings_path.exists():
+        return settings_path
+    if settings_path == WORKSTATION_SETTINGS_PATH and LEGACY_DEFAULT_SETTINGS_PATH.exists():
+        return LEGACY_DEFAULT_SETTINGS_PATH
+    return settings_path
 
 
 def _load_gnss_operation(value: object) -> GnssOperationConfig:
@@ -40,7 +93,7 @@ def _load_gnss_operation(value: object) -> GnssOperationConfig:
 @dataclass(frozen=True)
 class AppSettings:
     intrinsics_path: str = DEFAULT_INTRINSICS_PATH
-    yolo_weights_path: str = ".local/models/yolov8m.pt"
+    yolo_weights_path: str = DEFAULT_YOLO_WEIGHTS_PATH
     interface_name: str = "enx588694fce07e"
     camera_host_address: str = "10.0.0.10/24"
     left_rtsp_url: str = "rtsp://10.0.0.231:8554/visible"
@@ -62,12 +115,12 @@ class AppSettings:
     # Each camera has its own local FTP account (the login is set per-unit on
     # the camera itself), so port/user/password/remote dir/timeout are kept
     # separate per side; only the download toggle is shared.
-    wiris_ftp_enabled: bool = False
+    wiris_ftp_enabled: bool = True
     wiris_ftp_port: int = 21
     wiris_ftp_user: str = "anonymous"
     wiris_ftp_password: str = ""
     wiris_ftp_remote_dir: str = "/"
-    wiris_ftp_timeout_s: float = 10.0
+    wiris_ftp_timeout_s: float = 30.0
     left_ftp_port: int = 21
     right_ftp_port: int = 21
     left_ftp_user: str = "wiris-enterprise"
@@ -76,8 +129,8 @@ class AppSettings:
     right_ftp_password: str = "ABCD"
     left_ftp_remote_dir: str = "/"
     right_ftp_remote_dir: str = "/"
-    left_ftp_timeout_s: float = 10.0
-    right_ftp_timeout_s: float = 10.0
+    left_ftp_timeout_s: float = 30.0
+    right_ftp_timeout_s: float = 30.0
     yolo_device: str = "cpu"
     yolo_input_size: int = 416
     yolo_conf_threshold: float = 0.5
@@ -116,7 +169,9 @@ class AppSettings:
     yolo_frame_queue_size: int = 2
     rtsp_decoder: str = "auto"
     stream_backend: str = "gstreamer"
-    rtsp_transport: str = "udp"
+    # Interleaved TCP avoids the unrecoverable H.264 gaps seen when UDP loses
+    # SPS/PPS or keyframe packets. Operators can still opt into UDP explicitly.
+    rtsp_transport: str = "tcp"
     camera_sync_history_window_s: float = 1.0
     camera_sync_receive_pair_max_delta_s: float = 0.350
     camera_sync_rtcp_pair_max_delta_s: float = 0.050
@@ -150,6 +205,10 @@ class AppSettings:
     manual_focal_override: bool = False
     use_triangulation: bool = True
     triangulation_extrinsics_source: str = "pixhawk"
+    measurement_preferred_method: str = PIXHAWK_RTK_LIVE
+    measurement_method_fallback_order: tuple[str, ...] = (
+        DEFAULT_MEASUREMENT_METHOD_FALLBACK_ORDER
+    )
     measurement_display_mode: str = "detection"
     use_rtk_baseline: bool = True
     require_rtk_fixed: bool = False
@@ -163,13 +222,19 @@ class AppSettings:
     gnss_operation: GnssOperationConfig = field(default_factory=GnssOperationConfig)
 
 
-def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
+def load_settings(
+    path: str | Path = DEFAULT_SETTINGS_PATH,
+    *,
+    create_if_missing: bool = True,
+) -> AppSettings:
     settings_path = Path(path)
-    if not settings_path.exists():
+    read_path = _settings_read_path(settings_path)
+    if not read_path.exists():
         settings = AppSettings(gnss_operation=GnssOperationConfig.ngii_rts2_base_assisted())
-        save_settings(settings, settings_path)
+        if create_if_missing:
+            save_settings(settings, settings_path)
         return settings
-    payload = json.loads(settings_path.read_text())
+    payload = json.loads(read_path.read_text())
     pixhawk_ethernet_mode = str(
         payload.get("pixhawk_ethernet_mode", DEFAULT_PIXHAWK_ETHERNET_MODE)
     )
@@ -182,6 +247,15 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
         triangulation_extrinsics_source = "checkerboard"
     if triangulation_extrinsics_source not in {"pixhawk", "checkerboard"}:
         triangulation_extrinsics_source = "pixhawk"
+    measurement_preferred_method = normalize_measurement_method_id(
+        payload.get("measurement_preferred_method", triangulation_extrinsics_source)
+    )
+    measurement_method_fallback_order = normalize_measurement_method_fallback_order(
+        payload.get(
+            "measurement_method_fallback_order",
+            DEFAULT_MEASUREMENT_METHOD_FALLBACK_ORDER,
+        )
+    )
     calibration_validation_mode = str(
         payload.get("calibration_validation_mode", AppSettings.calibration_validation_mode)
     )
@@ -193,9 +267,67 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
     if drone_telemetry_rtcm_source not in {"base", "ntrip"}:
         drone_telemetry_rtcm_source = AppSettings.drone_telemetry_rtcm_source
     gnss_operation = _load_gnss_operation(payload.get("gnss_operation"))
+    intrinsics_path = _default_path_with_legacy_read(
+        payload.get("intrinsics_path", AppSettings.intrinsics_path),
+        canonical=DEFAULT_INTRINSICS_PATH,
+        legacy_markers={"calibration_captures/intrinsics.json"},
+        legacy_candidates=(
+            LEGACY_CALIBRATION_CAPTURES_ROOT / "intrinsics.json",
+            LEGACY_REPOSITORY_DATA_ROOT / "calibration_captures" / "intrinsics.json",
+            APP_ROOT / "calibration_captures" / "intrinsics.json",
+        ),
+    )
+    raw_yolo_weights_path = payload.get(
+        "yolo_weights_path", AppSettings.yolo_weights_path
+    )
+    if (
+        str(raw_yolo_weights_path or "").strip() == "yolov8n.pt"
+        and (APP_ROOT / "yolov8n.pt").is_file()
+    ):
+        yolo_weights_path = str(APP_ROOT / "yolov8n.pt")
+    else:
+        yolo_weights_path = _default_path_with_legacy_read(
+            raw_yolo_weights_path,
+            canonical=DEFAULT_YOLO_WEIGHTS_PATH,
+            legacy_markers={".local/models/yolov8m.pt"},
+            legacy_candidates=(
+                LEGACY_MODELS_ROOT / "yolov8m.pt",
+                WORKSTATION_DATA_ROOT / ".local" / "models" / "yolov8m.pt",
+            ),
+        )
+    calibration_root = _default_path_with_legacy_read(
+        payload.get("calibration_root", AppSettings.calibration_root),
+        canonical=DEFAULT_CALIBRATION_ROOT,
+        legacy_markers={"calibration_captures"},
+        legacy_candidates=(
+            LEGACY_CALIBRATION_CAPTURES_ROOT,
+            LEGACY_REPOSITORY_DATA_ROOT / "calibration_captures",
+            APP_ROOT / "calibration_captures",
+        ),
+    )
+    calibration_validation_root = _default_path_with_legacy_read(
+        payload.get("calibration_validation_root", AppSettings.calibration_validation_root),
+        canonical=DEFAULT_CALIBRATION_ROOT,
+        legacy_markers={"calibration_captures"},
+        legacy_candidates=(
+            LEGACY_CALIBRATION_CAPTURES_ROOT,
+            LEGACY_REPOSITORY_DATA_ROOT / "calibration_captures",
+            APP_ROOT / "calibration_captures",
+        ),
+    )
+    calibration_validation_json = _default_path_with_legacy_read(
+        payload.get("calibration_validation_json", AppSettings.calibration_validation_json),
+        canonical=DEFAULT_INTRINSICS_PATH,
+        legacy_markers={"calibration_captures/intrinsics.json"},
+        legacy_candidates=(
+            LEGACY_CALIBRATION_CAPTURES_ROOT / "intrinsics.json",
+            LEGACY_REPOSITORY_DATA_ROOT / "calibration_captures" / "intrinsics.json",
+            APP_ROOT / "calibration_captures" / "intrinsics.json",
+        ),
+    )
     return AppSettings(
-        intrinsics_path=str(payload.get("intrinsics_path", AppSettings.intrinsics_path)),
-        yolo_weights_path=str(payload.get("yolo_weights_path", AppSettings.yolo_weights_path)),
+        intrinsics_path=intrinsics_path,
+        yolo_weights_path=yolo_weights_path,
         interface_name=str(payload.get("interface_name", AppSettings.interface_name)),
         camera_host_address=str(payload.get("camera_host_address", AppSettings.camera_host_address)),
         left_rtsp_url=str(payload.get("left_rtsp_url", AppSettings.left_rtsp_url)),
@@ -311,14 +443,10 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
             1,
             min(200, int(payload.get("calibration_auto_target_pairs", AppSettings.calibration_auto_target_pairs))),
         ),
-        calibration_root=str(payload.get("calibration_root", AppSettings.calibration_root)),
+        calibration_root=calibration_root,
         calibration_validation_mode=calibration_validation_mode,
-        calibration_validation_root=str(
-            payload.get("calibration_validation_root", AppSettings.calibration_validation_root)
-        ),
-        calibration_validation_json=str(
-            payload.get("calibration_validation_json", AppSettings.calibration_validation_json)
-        ),
+        calibration_validation_root=calibration_validation_root,
+        calibration_validation_json=calibration_validation_json,
         calibration_validation_runs=max(
             1,
             min(20, int(payload.get("calibration_validation_runs", AppSettings.calibration_validation_runs))),
@@ -427,6 +555,8 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
         manual_focal_override=bool(payload.get("manual_focal_override", False)),
         use_triangulation=bool(payload.get("use_triangulation", True)),
         triangulation_extrinsics_source=triangulation_extrinsics_source,
+        measurement_preferred_method=measurement_preferred_method,
+        measurement_method_fallback_order=measurement_method_fallback_order,
         measurement_display_mode=str(payload.get("measurement_display_mode", AppSettings.measurement_display_mode)),
         use_rtk_baseline=bool(payload.get("use_rtk_baseline", True)),
         require_rtk_fixed=bool(payload.get("require_rtk_fixed", False)),

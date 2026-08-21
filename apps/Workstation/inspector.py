@@ -18,10 +18,12 @@ _CONTEXT_LABELS = {
     "devices.time": "Time / Sync",
     "devices.pixhawk": "Pixhawk",
     "devices.gnss": "Base GNSS",
+    "processing.experiment": "Protocol",
     "processing.measurement": "Measurement",
     "processing.alignment": "Alignment",
+    "tasks.session": "Session",
     "tasks.calibration": "Calibration",
-    "tasks.recording": "Recording / Sessions",
+    "tasks.recording": "Recording / Review",
     "tasks.advanced": "Advanced",
     "tasks.settings": "Settings",
     "diagnostics.system": "Diagnostics · System",
@@ -29,6 +31,7 @@ _CONTEXT_LABELS = {
     "diagnostics.pixhawk": "Diagnostics · Pixhawk / MAVLink",
     "diagnostics.gnss": "Diagnostics · GNSS / RTK",
     "diagnostics.logs": "Diagnostics · Logs",
+    "diagnostics.ftp": "Diagnostics · FTP",
     "diagnostics.measurement": "Diagnostics · Measurement",
     "diagnostics.performance": "Diagnostics · Performance",
 }
@@ -53,6 +56,10 @@ _CONTEXT_LAYOUTS = {
         "Time synchronization",
         ("State", "Evidence", "Clock basis", "Time contract", "Next check"),
     ),
+    "processing.experiment": (
+        "Protocol",
+        ("Readiness", "Current step", "Freshness", "Evidence contract", "Next action"),
+    ),
     "processing.alignment": (
         "Physical alignment",
         ("Sampling", "Offsets", "Quality", "Frame contract", "Instruction"),
@@ -61,12 +68,16 @@ _CONTEXT_LAYOUTS = {
         "Measurement",
         ("State", "Result / reason", "Timestamp", "Output contract", "Verdict"),
     ),
+    "tasks.session": (
+        "Daily session",
+        ("Lifecycle", "Current measurement", "Readiness", "Method inputs", "Next action"),
+    ),
     "tasks.calibration": (
         "Calibration",
         ("Profile", "Result", "Image grid", "Frame contract", "Next check"),
     ),
     "tasks.recording": (
-        "Recording session",
+        "Recording review",
         ("Session", "Samples", "Finalization", "Output", "Verdict"),
     ),
     "tasks.advanced": (
@@ -96,6 +107,10 @@ _CONTEXT_LAYOUTS = {
     "diagnostics.logs": (
         "Log evidence",
         ("Entries", "Latest", "Ordering", "Parsing", "Verdict"),
+    ),
+    "diagnostics.ftp": (
+        "FTP evidence",
+        ("Entries", "Latest", "Ordering", "Scope", "Verdict"),
     ),
     "diagnostics.measurement": (
         "Measurement diagnostics",
@@ -272,6 +287,7 @@ class InspectorWidget(QtWidgets.QWidget):
             "devices.pixhawk": ("pixhawk.left", "pixhawk.right"),
             "devices.gnss": ("gnss.base", "gnss.ntrip"),
             "devices.time": ("synchronization",),
+            "processing.experiment": ("gnss", "synchronization", "measurement", "recording"),
             "processing.measurement": ("measurement",),
             "tasks.recording": ("recording",),
             "diagnostics.camera": ("camera.left", "camera.right"),
@@ -737,6 +753,21 @@ class InspectorWidget(QtWidgets.QWidget):
                 verdict="AVAILABLE" if lines else "EMPTY",
             )
             source = "backend diagnostic_text"
+        elif context_id == "diagnostics.ftp":
+            diagnostic_method = getattr(self.backend, "ftp_diagnostic_text", None)
+            try:
+                log_text = str(diagnostic_method() if callable(diagnostic_method) else "")
+            except Exception:
+                log_text = ""
+            lines = [line for line in log_text.splitlines() if line.strip()]
+            values.update(
+                primary=f"{len(lines)} retained FTP log lines",
+                secondary=(lines[-1] if lines else "No FTP activity yet"),
+                timing="Bounded append order; newest entries remain at the end",
+                contract="FTP capture/download/save status and local paths are text evidence only",
+                verdict="AVAILABLE" if lines and log_text != "No FTP activity yet." else "EMPTY",
+            )
+            source = "backend ftp_diagnostic_text"
         elif context_id == "diagnostics.performance":
             performance = self._status_for_context(context_id)
             values.update(

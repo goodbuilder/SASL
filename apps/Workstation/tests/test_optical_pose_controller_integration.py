@@ -8,7 +8,9 @@ from types import SimpleNamespace
 import pytest
 from PyQt5 import QtGui
 
+import Workstation.optical_pose_controller as optical_pose_module
 from Workstation.optical_pose_controller import OpticalPoseController
+from Workstation.measurement_view_controller import MeasurementViewController
 from Workstation.workstation_core.calibration import (
     CameraIntrinsics,
     CheckerboardConfig,
@@ -24,6 +26,9 @@ from Workstation.workstation_core.optical_pose import (
 )
 from Workstation.workstation_core.rtk_geometry import GpsPositionState, ned_delta_m
 from Workstation.workstation_core.terrain import TerrainMetadata
+from Workstation.workstation_core.measurement_methods import HORIZON_HYBRID
+from Workstation.workstation_core.measurement_attempt import AttitudeSnapshot, GpsSnapshot
+from Workstation.workstation_core.optical_pose_auto_select import AutoSelectionResult
 
 
 def _image() -> QtGui.QImage:
@@ -218,6 +223,83 @@ def _annotations(snapshot: dict[str, object], *, horizon: bool = True):
     return result
 
 
+def test_horizon_candidate_becomes_measurement_ready_with_live_pixhawk_and_gnss_fill(
+    tmp_path: Path,
+) -> None:
+    panel = _panel(tmp_path)
+    pose = OpticalPoseController(panel)
+    frozen = pose.capture_workstation_optical_pose_burst({})
+    pose.solve_workstation_optical_pose_horizon({"annotations": _annotations(frozen)})
+    now = time.monotonic()
+    panel.latest_extrinsics = {
+        side: SimpleNamespace(
+            camera=side,
+            roll_deg=1.0,
+            pitch_deg=2.0,
+            yaw_deg=3.0,
+            timestamp_s=now,
+            q=(1.0, 0.0, 0.0, 0.0),
+            namespace=f"{side}-pixhawk",
+            topic="mavlink/ATTITUDE_QUATERNION",
+            px4_timestamp_s=None,
+        )
+        for side in ("left", "right")
+    }
+    panel.latest_rtk_baseline = SimpleNamespace(
+        north_m=0.0,
+        east_m=2.0,
+        down_m=0.1,
+    )
+    panel._gps_baseline_usable_for_translation = lambda _baseline: (True, "")
+    panel.settings = SimpleNamespace(
+        measurement_preferred_method=HORIZON_HYBRID,
+        measurement_method_fallback_order=(HORIZON_HYBRID,),
+    )
+    panel._workstation_setting_overrides = {}
+    panel._workstation_setting = lambda _name, default=None: default
+    panel._optical_pose_controller = lambda: pose
+    panel.checkerboard_extrinsics_profile = panel.selected_extrinsics_profile
+    panel.optical_pose_extrinsics_profile = None
+
+    measurement = MeasurementViewController(panel)
+    status = next(
+        row for row in measurement._measurement_method_statuses()
+        if row.method_id == HORIZON_HYBRID
+    )
+
+    assert status.ready is True
+    sources = dict(status.component_sources)
+    assert sources["left.roll_deg"].startswith("candidate:horizon-")
+    assert sources["left.yaw_deg"] == "live_pixhawk"
+    assert sources["right.north_m"] == "live_gnss"
+    left_gps = GpsSnapshot.from_state(_gps_state("left", timestamp_s=now))
+    right_gps = GpsSnapshot.from_state(
+        _gps_state("right", timestamp_s=now, longitude_deg=127.987676321)
+    )
+    frozen_left_attitude = AttitudeSnapshot.from_state(panel.latest_extrinsics["left"])
+    frozen_right_attitude = AttitudeSnapshot.from_state(panel.latest_extrinsics["right"])
+    result = measurement._measurement_intrinsics_result_for_method(
+        status,
+        left_attitude=frozen_left_attitude,
+        right_attitude=frozen_right_attitude,
+        left_gps=left_gps,
+        right_gps=right_gps,
+    )
+    assert result is not None and result.extrinsics is not None
+    assert result.extrinsics.pair_count >= 1
+    panel.latest_extrinsics["left"].yaw_deg = 90.0
+    panel.latest_rtk_baseline.east_m = 99.0
+    repeated = measurement._measurement_intrinsics_result_for_method(
+        status,
+        left_attitude=frozen_left_attitude,
+        right_attitude=frozen_right_attitude,
+        left_gps=left_gps,
+        right_gps=right_gps,
+    )
+    assert repeated is not None
+    assert repeated.extrinsics == result.extrinsics
+
+
 def test_capture_horizon_and_apply_create_next_pair_immutable_profile(tmp_path: Path) -> None:
     panel = _panel(tmp_path)
     controller = OpticalPoseController(panel)
@@ -263,6 +345,71 @@ def test_capture_horizon_and_apply_create_next_pair_immutable_profile(tmp_path: 
     controller.revert_workstation_optical_pose({})
     assert panel.selected_extrinsics_profile is base_profile
     assert panel.active_intrinsics is base_active_intrinsics
+
+
+def test_auto_select_job_keeps_owner_state_until_ui_commit_and_rejects_stale_result(
+    tmp_path: Path,
+) -> None:
+    panel = _panel(tmp_path)
+    controller = OpticalPoseController(panel)
+    controller.capture_workstation_optical_pose_burst({})
+
+    job = controller.prepare_workstation_optical_pose_auto_selection("horizon", {})
+    suggestion = job.run()
+    assert controller.workstation_optical_pose_snapshot()["auto_suggestions"] == []
+
+    committed = controller.commit_workstation_optical_pose_auto_selection(suggestion)
+    assert len(committed["auto_suggestions"]) == 1
+
+    stale_job = controller.prepare_workstation_optical_pose_auto_selection("horizon", {})
+    controller.capture_workstation_optical_pose_burst({})
+    stale_suggestion = stale_job.run()
+    with pytest.raises(RuntimeError, match="stale"):
+        controller.commit_workstation_optical_pose_auto_selection(stale_suggestion)
+
+
+def test_horizon_auto_suggestion_requires_both_sides_to_be_eligible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    panel = _panel(tmp_path)
+    controller = OpticalPoseController(panel)
+    controller.capture_workstation_optical_pose_burst({})
+    results = iter(
+        (
+            AutoSelectionResult(
+                mode="horizon",
+                state="GOOD",
+                detection_method="fixture",
+                points=((10.0, 20.0), (620.0, 22.0)),
+                inlier_count=20,
+                confidence=0.95,
+                eligible=True,
+            ),
+            AutoSelectionResult(
+                mode="horizon",
+                state="LOW_CONFIDENCE",
+                detection_method="fixture",
+                points=((12.0, 30.0), (618.0, 33.0)),
+                inlier_count=2,
+                confidence=0.20,
+                eligible=False,
+                failure_reason="right horizon support is insufficient",
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        optical_pose_module,
+        "auto_select_horizon",
+        lambda *_args, **_kwargs: next(results),
+    )
+
+    suggestion = controller._compute_auto_select_horizon({})
+
+    assert suggestion["state"] == "LOW_CONFIDENCE"
+    assert suggestion["eligible"] is False
+    assert suggestion["sides"]["left"]["eligible"] is True
+    assert suggestion["sides"]["right"]["eligible"] is False
 
 
 def test_combined_pose_requires_explicit_candidate_ids(tmp_path: Path) -> None:
@@ -328,6 +475,13 @@ def test_drone_yaw_requires_explicit_los_and_preserves_other_dof(tmp_path: Path)
     assert candidate["method"] == "drone-rtk-target-yaw"
     assert candidate["left_delta_rpy_deg"] == pytest.approx([0.0, 0.0, 90.0])
     assert candidate["right_delta_rpy_deg"] == pytest.approx([0.0, 0.0, 0.0])
+    assert candidate["observable_dof"]["yaw_deg"] is False
+    assert candidate["observable_dof_by_side"]["left"]["yaw_deg"] is True
+    assert candidate["observable_dof_by_side"]["right"]["yaw_deg"] is False
+    retained = controller._candidate_drone_rotation_context[candidate["candidate_id"]]["left"]
+    assert retained["mode"] == "yaw_only"
+    assert retained["observed_ray_camera_rdf"] == pytest.approx((0.0, 0.0, 1.0))
+    assert retained["expected_los_ned"] == pytest.approx((0.0, 1.0, 0.0))
 
 
 def test_gnss_mountain_uses_mountain_rotation_and_gnss_metric_baseline(tmp_path: Path) -> None:
@@ -552,6 +706,50 @@ def test_drone_rtk_sync_is_unverified_when_clock_domain_is_not_confirmed(tmp_pat
     assert sync["reason"]
 
 
+@pytest.mark.parametrize(
+    ("left_timestamp_s", "right_timestamp_s", "drone_timestamp_s", "reason_text"),
+    (
+        (100.0, 101.0, 100.1, "left/right frame delta"),
+        (100.0, 100.004, 101.0, "frame/Drone GNSS delta"),
+        (float("nan"), 100.004, 100.008, "not finite"),
+    ),
+)
+def test_drone_rtk_sync_rejects_nonfinite_or_out_of_window_samples(
+    tmp_path: Path,
+    left_timestamp_s: float,
+    right_timestamp_s: float,
+    drone_timestamp_s: float,
+    reason_text: str,
+) -> None:
+    panel = _panel(tmp_path)
+    panel.left_pane = _TimedCameraPane(
+        "left",
+        timestamp_s=left_timestamp_s,
+        timestamp_reference="app-receive",
+    )
+    panel.right_pane = _TimedCameraPane(
+        "right",
+        timestamp_s=right_timestamp_s,
+        timestamp_reference="app-receive",
+    )
+    panel.latest_gps = {
+        "left": _gps_state("left", timestamp_s=100.0),
+        "right": _gps_state("right", timestamp_s=100.004),
+        "drone": _gps_state("drone", timestamp_s=drone_timestamp_s),
+    }
+    controller = OpticalPoseController(panel)
+
+    snapshot = controller.capture_workstation_optical_pose_burst({})
+
+    observation = snapshot["drone_rtk_capture_observations"][0]
+    sync = observation["synchronization"]
+    assert sync["state"] == "SYNC_UNVERIFIED"
+    assert sync["left_frame_to_drone_gnss_s"] is None
+    assert sync["right_frame_to_drone_gnss_s"] is None
+    assert reason_text in sync["reason"]
+    assert observation["state"] == "WARNING"
+
+
 def test_import_burst_does_not_attach_current_gnss_as_capture_time_gnss(tmp_path: Path) -> None:
     left_path = tmp_path / "left.png"
     right_path = tmp_path / "right.png"
@@ -571,6 +769,58 @@ def test_import_burst_does_not_attach_current_gnss_as_capture_time_gnss(tmp_path
 
     assert snapshot["frozen_frame_artifacts"]["left"]["frame_id"]
     assert snapshot["drone_rtk_capture_observations"] == []
+
+
+def test_ftp_import_with_unknown_capture_time_never_claims_app_receive_sync(
+    tmp_path: Path,
+) -> None:
+    left_path = tmp_path / "ftp-left.png"
+    right_path = tmp_path / "ftp-right.png"
+    _image().save(str(left_path), "PNG")
+    _image().save(str(right_path), "PNG")
+    panel = _panel(tmp_path)
+    # These live RTSP values are deliberately plausible but unrelated to the
+    # downloaded stills. They must not leak into imported evidence.
+    for side in ("left", "right"):
+        panel.camera_frame_metadata[side].update(
+            {
+                "timestamp_s": 1_787_000_000.0,
+                "timestamp_reference": "app-receive",
+                "source_timestamp_s": 42.0,
+            }
+        )
+    panel.latest_gps = {
+        "left": _gps_state("left", timestamp_s=100.0),
+        "right": _gps_state("right", timestamp_s=100.004),
+        "drone": _gps_state("drone", timestamp_s=100.008),
+    }
+    controller = OpticalPoseController(panel)
+    before_import_s = time.monotonic()
+
+    snapshot = controller.import_workstation_optical_pose_burst(
+        {
+            "sources": {
+                "left": {"path": str(left_path)},
+                "right": {"path": str(right_path)},
+            },
+            "_ftp_request_gnss_snapshot": panel.latest_gps,
+        }
+    )
+    after_import_s = time.monotonic()
+
+    for side in ("left", "right"):
+        artifact = snapshot["frozen_frame_artifacts"][side]
+        metadata = snapshot["frozen_native_frames"][side]["metadata"]
+        assert artifact["timestamp_reference"] == "import-receive"
+        assert before_import_s <= artifact["timestamp_s"] <= after_import_s
+        assert metadata["capture_timestamp_known"] is False
+        assert metadata["capture_zoom_index"] is None
+        assert metadata["capture_zoom_known"] is False
+        assert "source_timestamp_s" not in metadata
+    sync = snapshot["drone_rtk_capture_observations"][0]["synchronization"]
+    assert sync["state"] == "SYNC_UNVERIFIED"
+    assert sync["left_frame_to_drone_gnss_s"] is None
+    assert sync["right_frame_to_drone_gnss_s"] is None
 
 
 def test_drone_rtk_observation_capture_has_no_solver_side_effects(tmp_path: Path) -> None:

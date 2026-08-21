@@ -19,11 +19,16 @@ from typing import Any, Callable
 
 from PyQt5 import QtCore, QtGui
 
+from Workstation.runtime_paths import WORKSTATION_MODELS_ROOT
+
 
 SASL_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_YOLO_PYTHON = os.environ.get("PYTHON_BIN") or sys.executable
-DEFAULT_YOLO_WEIGHTS = os.environ.get("YOLO_MODEL_PATH") or str(SASL_ROOT / ".local" / "models" / "yolov8m.pt")
+DEFAULT_YOLO_WEIGHTS = os.environ.get("YOLO_MODEL_PATH") or str(
+    WORKSTATION_MODELS_ROOT / "yolov8m.pt"
+)
 DEFAULT_RTSP_LATENCY_MS = 50
+DEFAULT_PREVIEW_DISPLAY_RATE_HZ = 15.0
 DEFAULT_CPU_YOLO_MAX_RATE_HZ = 20.0
 DEFAULT_CPU_YOLO_INITIAL_RATE_HZ = 15.0
 DEFAULT_CPU_YOLO_ADAPTIVE_MAX_RATE_HZ = 20.0
@@ -38,6 +43,7 @@ DEFAULT_CPU_WORKER_THREADS = 4
 DEFAULT_CUDA_WORKER_THREADS = 1
 DEFAULT_EVENT_QUEUE_SIZE = 128
 DEFAULT_FRAME_QUEUE_SIZE = 2
+DEFAULT_RTSP_FRAME_TIMEOUT_S = 5.0
 YOLO_INPUT_SIZE_STRIDE = 32
 DECODER_AUTO = "auto"
 DECODER_NVIDIA = "nvidia"
@@ -115,6 +121,42 @@ def highest_confidence_detection(detections: list[DetectionBox]) -> DetectionBox
     if not detections:
         return None
     return max(detections, key=lambda detection: detection.confidence)
+
+
+def filter_detections_by_class_gate(
+    detections: list[DetectionBox],
+    *,
+    enabled: bool,
+    target: object = "",
+) -> list[DetectionBox]:
+    """Keep only the operator-selected target class before choosing ``best``.
+
+    The gate is a target-class filter, not the stereo correspondence rule.
+    Left/right observations still have to carry the same class downstream;
+    this function only prevents a higher-confidence distractor from winning
+    before the target-class setting can be applied.
+    """
+
+    if not enabled:
+        return list(detections)
+    text = str(target or "").strip()
+    if not text:
+        return []
+    normalized = text.casefold()
+    target_id: int | None = None
+    candidate = normalized[1:] if normalized.startswith("#") else normalized
+    try:
+        target_id = int(candidate)
+    except ValueError:
+        pass
+    if target_id is not None:
+        return [detection for detection in detections if detection.class_id == target_id]
+    return [
+        detection
+        for detection in detections
+        if detection.class_name is not None
+        and detection.class_name.strip().casefold() == normalized
+    ]
 
 
 def detections_from_ultralytics_result(result, *, names: object | None = None) -> list[DetectionBox]:
@@ -353,7 +395,11 @@ def normalize_decoder_mode(decoder: str | None) -> str:
 def decoder_candidates(decoder: str | None) -> tuple[str, ...]:
     mode = normalize_decoder_mode(decoder)
     if mode == DECODER_NVIDIA:
-        return (NVIDIA_H264_DECODER,)
+        # Keep the explicit NVIDIA preference, but retain a software escape
+        # hatch when the optional NVIDIA GStreamer plugin is absent. Without
+        # this fallback a stale/legacy "nvidia" setting retries a parse error
+        # forever even though avdec_h264 is installed.
+        return (NVIDIA_H264_DECODER, SOFTWARE_H264_DECODER)
     if mode == DECODER_SOFTWARE:
         return (SOFTWARE_H264_DECODER,)
     return (NVIDIA_H264_DECODER, SOFTWARE_H264_DECODER)
@@ -393,6 +439,28 @@ def effective_yolo_max_rate_hz(max_rate_hz: float | int | str | None, *, device:
     if enable_detection and rate_hz <= 0.0 and _device_uses_cpu(device):
         return DEFAULT_CPU_YOLO_MAX_RATE_HZ
     return max(0.0, rate_hz)
+
+
+def _should_emit_preview_frame(config: dict[str, Any], timestamp_s: float) -> bool:
+    """Rate-limit UI preview frames while keeping capture/detection independent."""
+
+    try:
+        display_rate_hz = float(config.get("display_rate_hz", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        display_rate_hz = 0.0
+    if display_rate_hz <= 0.0:
+        return True
+
+    current_s = float(timestamp_s)
+    last_s = config.get("_last_preview_emit_s")
+    try:
+        elapsed_s = current_s - float(last_s) if last_s is not None else float("inf")
+    except (TypeError, ValueError):
+        elapsed_s = float("inf")
+    if elapsed_s >= 0.0 and elapsed_s < 1.0 / display_rate_hz:
+        return False
+    config["_last_preview_emit_s"] = current_s
+    return True
 
 
 @dataclass
@@ -442,6 +510,33 @@ class AdaptiveYoloRateLimiter:
         elif decoded_hz >= CPU_DECODE_HZ_RECOVERY:
             self.target_rate_hz = min(self.max_rate_hz, self.target_rate_hz + 0.15)
         return abs(self.target_rate_hz - previous_rate_hz) >= 0.05
+
+
+def _activate_cpu_fallback_rate_limiter(
+    rate_limiter: AdaptiveYoloRateLimiter,
+    config: dict[str, Any],
+) -> None:
+    """Enable the CPU limiter when a requested CUDA device falls back at runtime."""
+
+    if rate_limiter.enabled:
+        return
+    try:
+        configured_max_rate_hz = float(config.get("max_rate_hz", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        configured_max_rate_hz = 0.0
+    max_rate_hz = min(
+        configured_max_rate_hz if configured_max_rate_hz > 0.0 else DEFAULT_CPU_YOLO_MAX_RATE_HZ,
+        DEFAULT_CPU_YOLO_ADAPTIVE_MAX_RATE_HZ,
+    )
+    min_rate_hz = min(DEFAULT_CPU_YOLO_MIN_RATE_HZ, max_rate_hz)
+    rate_limiter.enabled = True
+    rate_limiter.max_rate_hz = max_rate_hz
+    rate_limiter.min_rate_hz = min_rate_hz
+    rate_limiter.target_rate_hz = min(max(DEFAULT_CPU_YOLO_INITIAL_RATE_HZ, min_rate_hz), max_rate_hz)
+    config["device"] = "cpu"
+    config["adaptive_rate"] = True
+    config["adaptive_max_rate_hz"] = max_rate_hz
+    config["max_rate_hz"] = max_rate_hz
 
 
 def _worker_cpu_threads(config: dict[str, Any]) -> int:
@@ -1365,7 +1460,10 @@ def _launch_gst_pipeline(
             last_error = f"{decoder}: {exc}"
             if pipeline is not None:
                 pipeline.set_state(Gst.State.NULL)
-            if normalize_decoder_mode(decoder_mode) == DECODER_AUTO and decoder == NVIDIA_H264_DECODER:
+            if (
+                normalize_decoder_mode(decoder_mode) in {DECODER_AUTO, DECODER_NVIDIA}
+                and decoder == NVIDIA_H264_DECODER
+            ):
                 _emit_status(output_queue, f"NVIDIA 디코더 사용 불가, software로 재시도: {exc}")
                 continue
             break
@@ -1480,7 +1578,11 @@ def _process_frame_for_output(
                 )
                 return frame, None, False
         try:
-            detections = detections_from_ultralytics_result(result, names=class_names)
+            detections = filter_detections_by_class_gate(
+                detections_from_ultralytics_result(result, names=class_names),
+                enabled=bool(config.get("class_gate_enabled", False)),
+                target=config.get("class_gate", ""),
+            )
             best_detection = highest_confidence_detection(detections)
             if draw_preview_overlay and best_detection is not None:
                 annotated = _draw_detections(cv2, frame, [best_detection], best_detection)
@@ -1524,7 +1626,7 @@ def _emit_preview_frame(
     source_timestamp_s: float | None = None,
     timestamp_source: str = "app-receive",
     extra_metadata: dict[str, Any] | None = None,
-) -> None:
+) -> bool:
     native_height, native_width = frame.shape[:2]
     # Pose initialization must also work while detection is disabled.  Emit a
     # low-rate native reference sample in addition to the resized UI preview;
@@ -1567,6 +1669,8 @@ def _emit_preview_frame(
             timestamp_metadata=reference_metadata,
         )
         config["_last_native_reference_s"] = float(timestamp_s)
+    if not _should_emit_preview_frame(config, timestamp_s):
+        return False
     display_frame = frame
     max_preview_width = int(config["preview_max_width"])
     if max_preview_width > 0 and display_frame.shape[1] > max_preview_width:
@@ -1599,6 +1703,7 @@ def _emit_preview_frame(
         else "app-receive",
     )
     output_queue.put(("frame", metadata, rgb.shape[1], rgb.shape[0], rgb.tobytes()))
+    return True
 
 
 def _emit_measurement_frame(
@@ -1722,9 +1827,22 @@ def _run_gstreamer_stream_once(
     decoded_frames = 0
     latest_width = 0
     latest_height = 0
+    stream_started_s = time.monotonic()
+    last_frame_received_s: float | None = None
+    try:
+        frame_timeout_s = float(
+            config.get("rtsp_frame_timeout_s", DEFAULT_RTSP_FRAME_TIMEOUT_S)
+        )
+    except (TypeError, ValueError):
+        frame_timeout_s = DEFAULT_RTSP_FRAME_TIMEOUT_S
+    if not math.isfinite(frame_timeout_s) or frame_timeout_s <= 0.0:
+        frame_timeout_s = DEFAULT_RTSP_FRAME_TIMEOUT_S
+    config["_gst_last_run_received_frame"] = False
     reader_stop = threading.Event()
+
     def reader_loop() -> None:
-        nonlocal decoded_frames, displayed_frames, latest_frame, latest_height, latest_sequence, latest_width
+        nonlocal decoded_frames, displayed_frames, last_frame_received_s
+        nonlocal latest_frame, latest_height, latest_sequence, latest_width
         while not stop_event.is_set() and not reader_stop.is_set():
             sample = sink.emit("try-pull-sample", 200_000_000)
             if sample is None:
@@ -1748,7 +1866,7 @@ def _run_gstreamer_stream_once(
                 frame = np.frombuffer(map_info.data, dtype=np.uint8).reshape((height, width, 3)).copy()
             finally:
                 buffer.unmap(map_info)
-            _emit_preview_frame(
+            preview_emitted = _emit_preview_frame(
                 cv2,
                 frame,
                 config,
@@ -1761,9 +1879,11 @@ def _run_gstreamer_stream_once(
             with latest_lock:
                 latest_sequence += 1
                 decoded_frames += 1
-                displayed_frames += 1
+                displayed_frames += int(preview_emitted)
                 latest_width = width
                 latest_height = height
+                last_frame_received_s = receive_s
+                config["_gst_last_run_received_frame"] = True
                 latest_frame = {
                     "sequence": latest_sequence,
                     "frame": frame,
@@ -1796,6 +1916,20 @@ def _run_gstreamer_stream_once(
                 break
 
             now_s = time.monotonic()
+            with latest_lock:
+                last_receive_s = last_frame_received_s
+            frame_age_s = now_s - (
+                stream_started_s if last_receive_s is None else last_receive_s
+            )
+            if frame_age_s >= frame_timeout_s:
+                stream_failed = True
+                phase = "첫 디코드 프레임" if last_receive_s is None else "새 디코드 프레임"
+                _emit_status(
+                    output_queue,
+                    f"RTSP 프레임 타임아웃: {phase}이 {frame_age_s:.1f}s 동안 없습니다; "
+                    "파이프라인을 재연결합니다.",
+                )
+                break
             if now_s - last_stats_s >= 1.0:
                 elapsed_s = now_s - last_stats_s
                 with latest_lock:
@@ -1875,6 +2009,8 @@ def _run_gstreamer_stream_once(
             if annotated is None:
                 time.sleep(0.2)
                 continue
+            if config.get("_yolo_cpu_fallback_active"):
+                _activate_cpu_fallback_rate_limiter(rate_limiter, config)
             if inferred:
                 inferred_frames += 1
             last_status_s = _emit_stream_status(output_queue, enable_detection, best_detection, now_s, last_status_s)
@@ -1890,21 +2026,24 @@ def _run_gstreamer_stream_once(
 
 
 def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2, model, enable_detection: bool) -> None:
-    """Run GStreamer and recover transient RTSP server/SDP failures locally."""
+    """Run GStreamer and keep recovering transient RTSP failures locally."""
 
-    delays = tuple(float(delay) for delay in GST_RTSP_RECONNECT_DELAYS_S)
-    for attempt in range(len(delays) + 1):
-        if stop_event.is_set():
-            return
+    delays = tuple(max(0.0, float(delay)) for delay in GST_RTSP_RECONNECT_DELAYS_S) or (1.0,)
+    consecutive_failures = 0
+    reconnect_attempt = 0
+    while not stop_event.is_set():
         if _run_gstreamer_stream_once(config, output_queue, stop_event, cv2, model, enable_detection):
             return
-        if stop_event.is_set() or attempt >= len(delays):
-            _emit_status(output_queue, "GStreamer RTSP 재연결 포기: 카메라 서버가 응답하지 않습니다.")
+        if stop_event.is_set():
             return
-        delay_s = delays[attempt]
+        if bool(config.pop("_gst_last_run_received_frame", False)):
+            consecutive_failures = 0
+        delay_s = delays[min(consecutive_failures, len(delays) - 1)]
+        consecutive_failures += 1
+        reconnect_attempt += 1
         _emit_status(
             output_queue,
-            f"GStreamer RTSP 재연결 대기 {attempt + 1}/{len(delays)}: "
+            f"GStreamer RTSP 재연결 대기 (시도 {reconnect_attempt}): "
             f"{delay_s:.1f}s 후 같은 endpoint 재시도",
         )
         if stop_event.wait(delay_s):
@@ -1955,7 +2094,7 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
                 if record_writer_state is None:
                     record_writer_state = _open_record_video_writer(cv2, config, output_queue, frame_width, frame_height)
                 _write_record_video_frame(cv2, record_writer_state, frame)
-            _emit_preview_frame(
+            preview_emitted = _emit_preview_frame(
                 cv2,
                 frame,
                 config,
@@ -1966,7 +2105,7 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
             with latest_lock:
                 latest_sequence += 1
                 decoded_frames += 1
-                displayed_frames += 1
+                displayed_frames += int(preview_emitted)
                 width = frame_width
                 height = frame_height
                 latest_frame = {
@@ -2051,6 +2190,8 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
             if annotated is None:
                 time.sleep(0.2)
                 continue
+            if config.get("_yolo_cpu_fallback_active"):
+                _activate_cpu_fallback_rate_limiter(rate_limiter, config)
             if inferred:
                 inferred_frames += 1
             last_status_s = _emit_stream_status(output_queue, enable_detection, best_detection, now_s, last_status_s)
@@ -2134,7 +2275,7 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
                         source_timestamp_s = float(av_frame.pts * av_frame.time_base)
                         timestamp_source = "pyav-pts"
                         timestamp_reference = "source"
-                    _emit_preview_frame(
+                    preview_emitted = _emit_preview_frame(
                         cv2,
                         frame,
                         config,
@@ -2146,7 +2287,7 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
                     with latest_lock:
                         latest_sequence += 1
                         decoded_frames += 1
-                        displayed_frames += 1
+                        displayed_frames += int(preview_emitted)
                         width = frame_width
                         height = frame_height
                         latest_frame = {
@@ -2237,6 +2378,8 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
             if annotated is None:
                 time.sleep(0.2)
                 continue
+            if config.get("_yolo_cpu_fallback_active"):
+                _activate_cpu_fallback_rate_limiter(rate_limiter, config)
             if inferred:
                 inferred_frames += 1
             last_status_s = _emit_stream_status(output_queue, enable_detection, best_detection, now_s, last_status_s)
@@ -2298,7 +2441,16 @@ class _BoundedProcessOutputQueue:
             try:
                 self.frame_queue.put_nowait(message)
             except queue.Full:
-                return
+                # A preview is a latest-state signal.  Drop the stale queued
+                # frame so a slow GUI does not render old video indefinitely.
+                try:
+                    self.frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self.frame_queue.put_nowait(message)
+                except queue.Full:
+                    pass
             return
         self.event_queue.put(message)
 
@@ -2343,13 +2495,15 @@ class YoloStreamWorker(QtCore.QObject):
         conf_threshold: float,
         iou_threshold: float,
         max_rate_hz: float,
-        display_rate_hz: float = 0.0,
+        display_rate_hz: float = DEFAULT_PREVIEW_DISPLAY_RATE_HZ,
         preview_max_width: int = 960,
         rtsp_latency_ms: int = DEFAULT_RTSP_LATENCY_MS,
-        decoder: str = DECODER_NVIDIA,
+        decoder: str = DECODER_AUTO,
         stream_backend: str = STREAM_BACKEND_GSTREAMER,
         rtsp_transport: str = RTSP_TRANSPORT_UDP,
         enable_detection: bool = True,
+        class_gate_enabled: bool = False,
+        class_gate: str = "",
         record_video_path: str = "",
         record_video_fps: float = 30.0,
         event_queue_size: int = DEFAULT_EVENT_QUEUE_SIZE,
@@ -2378,6 +2532,8 @@ class YoloStreamWorker(QtCore.QObject):
             "stream_backend": normalize_stream_backend(stream_backend),
             "rtsp_transport": normalize_rtsp_transport(rtsp_transport),
             "enable_detection": enable_detection,
+            "class_gate_enabled": bool(class_gate_enabled),
+            "class_gate": str(class_gate or "").strip(),
             "emit_measurement_frames": enable_detection,
             "emit_native_reference_frames": True,
             "native_reference_period_s": 1.0,

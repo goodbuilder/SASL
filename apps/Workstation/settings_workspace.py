@@ -3,11 +3,15 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from PyQt5 import QtWidgets
+from PyQt5 import QtCore, QtWidgets
 
 from Workstation.wiris_ftp_browser import WirisFtpBrowserDialog
 from Workstation.workstation_core import ntrip_credentials
 from Workstation.workstation_core.settings import AppSettings
+from Workstation.workstation_core.measurement_methods import (
+    MEASUREMENT_METHOD_LABELS,
+    normalize_measurement_method_fallback_order,
+)
 
 from .components import WorkspaceHeader
 
@@ -356,12 +360,17 @@ class SettingsWorkspace(QtWidgets.QWidget):
 
     def _build_yolo_tab(self) -> None:
         layout = self._tab("YOLO / RTSP")
+        yolo_input_size = self._integer("yolo_input_size", 160, 1920, " px")
+        yolo_input_size.setToolTip(
+            "Applied to the hidden YOLO runtime owner now and used from the next Detection start."
+        )
         layout.addWidget(
             self._group(
                 "YOLO runtime",
                 [
                     ("Weights path", self._text("yolo_weights_path")),
                     ("Inference device", self._combo("yolo_device", (("CPU", "cpu"), ("CUDA", "cuda:0")))),
+                    ("YOLO input size", yolo_input_size),
                     ("Preview width", self._integer("preview_width", 320, 3840, " px")),
                     ("RTSP latency", self._integer("rtsp_latency_ms", 0, 5000, " ms")),
                     ("YOLO event queue", self._integer("yolo_event_queue_size", 1, 10000)),
@@ -458,7 +467,50 @@ class SettingsWorkspace(QtWidgets.QWidget):
                 ],
             )
         )
+        fallback_group = QtWidgets.QGroupBox("Measurement fallback order")
+        fallback_layout = QtWidgets.QVBoxLayout(fallback_group)
+        fallback_note = QtWidgets.QLabel(
+            "Measurement의 preferred 방식이 준비 상태를 잃으면 이 순서에서 준비된 첫 방식을 사용합니다. "
+            "행을 드래그해 순위를 변경합니다."
+        )
+        fallback_note.setObjectName("statusStrip")
+        fallback_note.setWordWrap(True)
+        fallback_layout.addWidget(fallback_note)
+        self.measurement_fallback_list = QtWidgets.QListWidget()
+        self.measurement_fallback_list.setObjectName("measurementFallbackOrderList")
+        self.measurement_fallback_list.setDragDropMode(QtWidgets.QAbstractItemView.InternalMove)
+        self.measurement_fallback_list.setDefaultDropAction(QtCore.Qt.MoveAction)
+        self.measurement_fallback_list.setMinimumHeight(170)
+        fallback_layout.addWidget(self.measurement_fallback_list)
+        self.measurement_fallback_list.model().rowsMoved.connect(
+            lambda *_args: self._refresh_measurement_fallback_labels()
+        )
+        self._set_measurement_fallback_order(
+            self._value("measurement_method_fallback_order", ())
+        )
+        layout.addWidget(fallback_group)
         layout.addStretch(1)
+
+    def _measurement_fallback_order(self) -> tuple[str, ...]:
+        return tuple(
+            str(self.measurement_fallback_list.item(index).data(QtCore.Qt.UserRole))
+            for index in range(self.measurement_fallback_list.count())
+        )
+
+    def _refresh_measurement_fallback_labels(self) -> None:
+        for index in range(self.measurement_fallback_list.count()):
+            item = self.measurement_fallback_list.item(index)
+            method_id = str(item.data(QtCore.Qt.UserRole) or "")
+            item.setText(f"{index + 1:02d} · {MEASUREMENT_METHOD_LABELS.get(method_id, method_id)}")
+
+    def _set_measurement_fallback_order(self, value: object) -> None:
+        order = normalize_measurement_method_fallback_order(value)
+        self.measurement_fallback_list.clear()
+        for method_id in order:
+            item = QtWidgets.QListWidgetItem()
+            item.setData(QtCore.Qt.UserRole, method_id)
+            self.measurement_fallback_list.addItem(item)
+        self._refresh_measurement_fallback_labels()
 
     def _refresh_gnss_mode_controls(self) -> None:
         operation_mode = self.settings_widgets.get("gnss_operation_mode")
@@ -711,6 +763,9 @@ class SettingsWorkspace(QtWidgets.QWidget):
 
     def settings_payload(self) -> dict[str, object]:
         payload = {key: self._widget_value(widget) for key, widget in self.settings_widgets.items()}
+        payload["measurement_method_fallback_order"] = list(
+            self._measurement_fallback_order()
+        )
         gnss = _mapping(self._snapshot.get("gnss_operation"))
         readiness = _mapping(gnss.get("readiness"))
         local_base = _mapping(gnss.get("local_base"))
@@ -826,3 +881,6 @@ class SettingsWorkspace(QtWidgets.QWidget):
         self._snapshot = self._read_snapshot()
         for key in self.settings_widgets:
             self._set_widget_value(key, self._field_value(key))
+        self._set_measurement_fallback_order(
+            self._value("measurement_method_fallback_order", ())
+        )

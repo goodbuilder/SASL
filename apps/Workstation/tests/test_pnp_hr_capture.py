@@ -4,11 +4,115 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+from PyQt5 import QtWidgets
+
 from Workstation.recording_controller import RecordingController
 from Workstation.wiris_runtime_workers import (
     WirisOZPhotoCaptureWorker,
     WirisPnPPhotoCaptureWorker,
 )
+
+
+class _FakeFtpListing:
+    def __init__(self) -> None:
+        self.current = "/"
+        self.entries = {
+            "/ssd": ["old-session", "new-session", "latest-visible-session"],
+            "/ssd/old-session/img": ["10-00-00-visible.jpg"],
+            "/ssd/new-session/img": [
+                "10-01-00-visible.jpg",
+                "10-01-00-highRes.jpg",
+            ],
+            "/ssd/latest-visible-session/img": ["10-02-00-visible.jpg"],
+            "/sdcard": [],
+            "/flashd": [],
+        }
+        self.mtimes = {
+            "10-00-00-visible.jpg": "20260820090000",
+            "10-01-00-visible.jpg": "20260820100000",
+            "10-01-00-highRes.jpg": "20260820100001",
+            "10-02-00-visible.jpg": "20260820110000",
+        }
+
+    def cwd(self, path: str) -> None:
+        self.current = path.rstrip("/") or "/"
+
+    def nlst(self) -> list[str]:
+        return list(self.entries.get(self.current, ()))
+
+    def voidcmd(self, command: str) -> str:
+        name = command.split(maxsplit=1)[1]
+        return f"213 {self.mtimes[name]}"
+
+    def retrbinary(self, _command: str, callback) -> None:
+        callback(b"fake-image")
+
+    def quit(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+def test_pnp_worker_discovers_wiris_session_img_directory_from_root() -> None:
+    worker = WirisPnPPhotoCaptureWorker(
+        (),
+        capture_id="hr-remote-dir",
+        image_enable_command="SIHR TRUE",
+    )
+
+    remote_dir, name = worker._latest_ftp_file_location(_FakeFtpListing(), "/")
+
+    assert remote_dir == "/ssd/new-session/img"
+    assert name == "10-01-00-highRes.jpg"
+
+
+def test_pnp_worker_refuses_to_reuse_pre_capture_ftp_file() -> None:
+    worker = WirisPnPPhotoCaptureWorker(
+        (),
+        capture_id="hr-stale-guard",
+        image_enable_command="SIHR TRUE",
+    )
+    fake_ftp = _FakeFtpListing()
+    baseline = {
+        worker._ftp_candidate_token(candidate)
+        for candidate in worker._ftp_image_candidates(fake_ftp, "/")
+    }
+
+    with pytest.raises(FileNotFoundError, match="stale"):
+        worker._latest_ftp_file_location(fake_ftp, "/", baseline_tokens=baseline)
+
+    fake_ftp.entries["/ssd"].append("fresh-session")
+    fake_ftp.entries["/ssd/fresh-session/img"] = ["10-02-00-highRes.jpg"]
+    fake_ftp.mtimes["10-02-00-highRes.jpg"] = "20260820120000"
+
+    remote_dir, name = worker._latest_ftp_file_location(
+        fake_ftp,
+        "/",
+        baseline_tokens=baseline,
+    )
+    assert remote_dir == "/ssd/fresh-session/img"
+    assert name == "10-02-00-highRes.jpg"
+
+
+def test_pnp_worker_separates_downloads_by_camera_side(tmp_path: Path, monkeypatch) -> None:
+    worker = WirisPnPPhotoCaptureWorker(
+        (),
+        capture_id="calib-remote-layout",
+        capture_channel="calib",
+        image_enable_command="SIHR TRUE",
+        ftp_output_dir=tmp_path,
+        ftp_settings_by_label={"left": {"remote_dir": "/"}},
+    )
+    fake_ftp = _FakeFtpListing()
+    monkeypatch.setattr(worker, "_connect_ftp", lambda *_args: fake_ftp)
+
+    local_path, remote_path = worker._download_latest_ftp_file("10.0.0.1", "left")
+
+    assert local_path.parent == tmp_path / "calib_capture" / "HR" / "left"
+    assert local_path.name == "calib-remote-layout_10-01-00-highRes.jpg"
+    assert remote_path == "/ssd/new-session/img/10-01-00-highRes.jpg"
 
 
 def test_pnp_worker_enables_hr_and_captures_both_cameras(monkeypatch) -> None:
@@ -28,9 +132,13 @@ def test_pnp_worker_enables_hr_and_captures_both_cameras(monkeypatch) -> None:
         completion_timeout_s=0.1,
     )
     completed: list[dict[str, object]] = []
+    progress: list[dict[str, object]] = []
     worker.completed.connect(completed.append)
+    worker.progress.connect(progress.append)
 
     worker.run()
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    app.processEvents()
 
     assert len(completed) == 1
     assert completed[0]["capture_id"] == "hr-001"
@@ -42,6 +150,43 @@ def test_pnp_worker_enables_hr_and_captures_both_cameras(monkeypatch) -> None:
         assert (host, "SIHR TRUE") in calls
         assert (host, "CPTR") in calls
         assert (host, "ICPT") in calls
+    assert {(row["side"], row["command"]) for row in progress if row["phase"] == "response"} >= {
+        ("left", "SIHR TRUE"),
+        ("left", "CPTR"),
+        ("left", "ICPT"),
+        ("right", "SIHR TRUE"),
+        ("right", "CPTR"),
+        ("right", "ICPT"),
+    }
+
+
+@pytest.mark.parametrize(
+    "icpt_response",
+    ("", "ERR", "ERROR 0", "OK", "garbage", "ICPT 0 trailing"),
+)
+def test_pnp_worker_rejects_non_explicit_icpt_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    icpt_response: str,
+) -> None:
+    def fake_send(_host: str, _port: int, _timeout_s: float, command: str) -> str:
+        return icpt_response if command == "ICPT" else "OK"
+
+    monkeypatch.setattr(WirisPnPPhotoCaptureWorker, "_send", staticmethod(fake_send))
+    worker = WirisPnPPhotoCaptureWorker(
+        (("left", "10.0.0.1", 2240, 0.5),),
+        capture_id="hr-invalid-icpt",
+        completion_timeout_s=0.0,
+    )
+    completed: list[dict[str, object]] = []
+    worker.completed.connect(completed.append)
+
+    worker.run()
+
+    camera = completed[0]["cameras"]["left"]
+    assert camera["state"] == "failed"
+    assert camera["capture_complete"] is False
+    assert camera["stored_on_camera"] is False
+    assert "invalid ICPT response" in camera["error"]
 
 
 def test_oz_worker_enables_visible_still_and_captures_both_cameras(monkeypatch) -> None:

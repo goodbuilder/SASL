@@ -53,6 +53,7 @@ SENSOR_PRESENTATION_METHODS = [
 class SensorPresentationController:
     def __init__(self, panel):
         self.panel = panel
+        self._last_camera_parameters_refresh_s = 0.0
 
     def _update_extrinsic(self, camera: str, extrinsic: CameraExtrinsicState) -> None:
         # Drone Telemetry shares the receive subscriber but is a position/
@@ -131,7 +132,7 @@ class SensorPresentationController:
         self.panel._refresh_alignment_overview()
         self.panel._refresh_gnss_base_tab()
         self.panel._refresh_alignment_validation()
-        self.panel._refresh_camera_parameters_tab()
+        self._refresh_camera_parameters_if_needed()
         self.panel._refresh_distance()
 
     def _update_gps(self, camera: str, gps: GpsPositionState) -> None:
@@ -227,8 +228,39 @@ class SensorPresentationController:
         self.panel._refresh_gnss_base_tab()
         self.panel._refresh_gnss_operation_readiness()
         self.panel._append_baseline_sample_if_active()
-        self.panel._refresh_camera_parameters_tab()
+        self._refresh_camera_parameters_if_needed()
         self.panel._refresh_distance()
+
+    def _refresh_camera_parameters_if_needed(self) -> None:
+        """Avoid rebuilding hidden parameter text on every telemetry packet.
+
+        Workstation keeps the legacy owner panel hidden and renders its own
+        source-backed surfaces.  Rebuilding several QPlainTextEdit documents
+        for every GPS/ATTITUDE packet monopolizes the GUI thread, especially
+        while both Pixhawks stream at high rates.  A visible legacy panel only
+        needs this display while its parameter tab is active, and even then a
+        bounded refresh rate is sufficient.
+        """
+
+        refresh = getattr(self.panel, "_refresh_camera_parameters_tab", None)
+        if not callable(refresh):
+            return
+        is_visible = getattr(self.panel, "isVisible", None)
+        if callable(is_visible) and not bool(is_visible()):
+            return
+        tabs = getattr(self.panel, "tabs", None)
+        parameter_index = getattr(self.panel, "parameter_tab_index", None)
+        if tabs is not None and parameter_index is not None:
+            try:
+                if int(tabs.currentIndex()) != int(parameter_index):
+                    return
+            except (AttributeError, TypeError, ValueError):
+                pass
+        now_s = time.monotonic()
+        if now_s - self._last_camera_parameters_refresh_s < 0.5:
+            return
+        self._last_camera_parameters_refresh_s = now_s
+        refresh()
 
     def _update_mag_sensor(self, camera: str, state) -> None:
         topic = str(getattr(state, "topic", ""))

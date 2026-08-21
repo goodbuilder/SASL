@@ -19,8 +19,9 @@ StereoWIRIS
   - Base GNSS
   - Time / Sync
 - Alignment
+- Session
 - Measurement
-- Recording / Sessions
+- Recording / Review
 - Advanced
 - Settings
 - Diagnostics
@@ -37,7 +38,9 @@ measurement, calibration, recording, review, or export state; each selection onl
 the workspace/Inspector context. Cameras and Pixhawk are paired contexts; their Left/Right
 or P1/P2 detail is shown inside the workspace and Inspector rather than as navigation
 children. Detection is part of Cameras, synchronization is part of Time / Sync, and
-Review/Files are part of Recording / Sessions.
+Session owns the daily-work lifecycle, current Measurement readiness, method-input evidence,
+and the ordered child summary. Measurement owns live detection and result inspection.
+Review/Files are part of Recording / Review.
 
 ## 3. Selection Semantics
 
@@ -84,13 +87,13 @@ Use native QTreeView keyboard behavior. Recommended row height 22–26 px. Targe
 ## 12. Phase 1 Minimum
 
 Overview; Protocol; Pre-run Calibration; Devices/Cameras/Pixhawk/GNSS/Time;
-Alignment; Measurement; Recording/Sessions; Diagnostics.
+Alignment; Session; Measurement; Recording/Review; Diagnostics.
 
 ## 13. Compatibility IDs
 
 Old saved or external context IDs remain accepted as aliases: camera Left/Right/Stereo
 resolve to Cameras, Pixhawk P1/P2 resolve to Pixhawk, Detection resolves to Cameras,
-Synchronization resolves to Time / Sync, and Review/Files resolve to Recording / Sessions.
+Synchronization resolves to Time / Sync, and Review/Files resolve to Recording / Review.
 They are not rendered as separate navigation nodes.
 
 ## 14. Anti-Patterns

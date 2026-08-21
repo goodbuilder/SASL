@@ -97,12 +97,19 @@ RTCP/NTP sync limits, and check stream evidence. Workstation timing evidence inc
 RTC/STUS-GDTI, live RTCP/NTP frame metadata, and the editable sync-limit contract; still-image
 capture, FTP, and EXIF comparison remain Legacy-only.
 
-## 15. Measurement Workspace
+## 15. Session and Measurement Workspaces
 
-Correlate run control, image/target, preflight evidence, current measurement quality,
-public result, timing, and history without application-level page switching. Preview,
-Detection, Record, and Save session remain together; active/finalizing recording gates
-prevent preview interruption and premature saving.
+Session is the top-level daily-work surface. It owns `Open Session`, `New Measurement`,
+`Seal Measurement`, and `Close Session`, shows the stable parent and ordered `mNNNNNN` children,
+and keeps lifecycle separate from the derived Evidence collection/Valid measurement readiness.
+The readiness table shows blockers only. Its compact method table always lists all eight categories;
+the selected-method detail shows actual rotation/translation inputs and preserves their PX4, GNSS
+NED, candidate virtual-FRD/NED, or OpenCV RDF contracts. The current next action is the only
+visually promoted lifecycle control.
+
+Measurement correlates live image/target, Detection, current quality, public result, timing, and
+history. Active/finalizing recording gates prevent preview interruption, overlapping children,
+and premature sealing.
 
 ## 16. Calibration Workspace
 
@@ -121,17 +128,21 @@ values are shown with their PX4 semantic label and raw number. These values reta
 sensor-axis/board-parameter contract and are not converted to NED, ENU, or camera frames.
 Base GNSS presents the Base receiver, Survey-in/NTRIP, discovered receiver candidates, and
 RTCM delivery; Alignment presents physical sampling and iteration evidence. Detection remains
-with Cameras, and Recording/Review/Files is exposed once as Recording / Sessions.
-The Alignment page places its Pixhawk, GNSS / RTK, Alignment, and Optical pose operation tabs directly
-below the page header so field controls remain reachable before the evidence tables.
-Optical pose contains frozen native left/right annotation views, horizon Roll/Pitch,
-terrain/GeoTIFF PnP, Drone RTK Yaw, candidate residuals/observability, explicit six-DOF
-selection, and immutable Apply/Revert actions. It is not a second calibration owner.
+with Cameras, and saved Recording/Review/Files is exposed once as Recording / Review.
+The Alignment page places compact readiness and shared frozen native left/right annotation views
+below the page header. The previews are side by side when each can retain at least 560 px width and
+stack vertically otherwise. Below them, promoted `Horizon`, `Mountain + GNSS`, `Terrain PnP`,
+`Drone Rotation`, `Drone Multi-view`, `References`, and `Combine` tabs replace the former nested
+`R,t methods` structure. Candidate residuals/side-specific observability and immutable Apply/Revert
+remain in one common review area: right of the tabs at widths of at least 1200 px and below them on
+narrower screens. Measurement has a ready-only method selector; Settings owns the drag-reordered
+fallback priority. Alignment is not a second calibration owner.
 The Alignment evidence keeps raw RTK NED `[N,E,D]` and the separate P1 body-FRD
 `[F,R,D]` projection in adjacent groups so the operator can use the intuitive P1
 orientation without confusing it with camera optical RDF or public measurement output.
 Recording keeps Run setup (including Drone/UAM mode and camera identity), HR purpose/import
-events, and a PX4 ULog evidence table. UAM target telemetry is shown as deferred rather
+events, and a PX4 ULog evidence table. Saved review uses a composite session/measurement key so
+siblings remain independently selectable. UAM target telemetry is shown as deferred rather
 than erroneous; target Drone data is a separate receive-only source and never replaces P1/P2
 attitude, GNSS baseline, or nominal stereo geometry.
 

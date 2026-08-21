@@ -1007,6 +1007,11 @@ def solve_rotation_only_hr_to_oz_bridge(
     rotation = u @ correction @ vt
     rotated = rotation @ hr
     dots = np.clip(np.sum(rotated * oz, axis=0), -1.0, 1.0)
+    # Exact synthetic/duplicate directions can land a few machine epsilons
+    # below 1.0 after SVD depending on the supported NumPy build.  Treat only
+    # that floating-point neighbourhood as the mathematically exact endpoint;
+    # real angular residuals remain unchanged.
+    dots = np.where(dots >= 1.0 - 8.0 * np.finfo(np.float64).eps, 1.0, dots)
     angular_errors_deg = np.degrees(np.arccos(dots))
     angular_rms_deg = float(np.sqrt(np.mean(np.square(angular_errors_deg))))
     resolved_side = _side(side)

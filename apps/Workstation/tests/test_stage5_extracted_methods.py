@@ -83,6 +83,29 @@ def test_recover_retryable_recording_session_returns_false_without_candidates(tm
     assert result is False
 
 
+def test_capture_jsonl_corruption_is_preserved_and_next_id_uses_high_water(
+    tmp_path,
+) -> None:
+    path = tmp_path / "hr_captures.jsonl"
+    path.write_text(
+        '{"capture_id":"hr-001"}\n'
+        '{malformed\n'
+        '{"capture_id":"hr-003"}\n',
+        encoding="utf-8",
+    )
+
+    records = RecordingController._load_jsonl_records(path)
+
+    assert [row["capture_id"] for row in records] == [
+        "hr-001",
+        "corrupt-line-000002",
+        "hr-003",
+    ]
+    assert records[1]["state"] == "corrupt"
+    assert records[1]["raw_line_sha256"]
+    assert RecordingController._next_capture_id(records, "hr") == "hr-004"
+
+
 def test_recover_retryable_recording_session_restores_hr_oz_capture_records(tmp_path) -> None:
     # event_index/capture_id for the *next* HR/OZ capture are derived from
     # len(panel.pnp_photo_capture_records)/len(panel.oz_photo_capture_records);

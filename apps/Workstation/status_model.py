@@ -490,36 +490,74 @@ class BackendStatusAdapter(QtCore.QObject):
         manager = getattr(panel, "gnss_operation_manager", None)
         state_value = getattr(getattr(manager, "state", None), "value", None)
         state_value = str(state_value or "").upper()
+        readiness_config = getattr(getattr(manager, "config", None), "readiness", None)
+        try:
+            configured_maximum_age = getattr(
+                readiness_config, "maximum_gps_sample_age_s", 1.0
+            )
+            maximum_gps_age_s = float(
+                1.0 if configured_maximum_age is None else configured_maximum_age
+            )
+        except (TypeError, ValueError):
+            maximum_gps_age_s = 1.0
+        if not math.isfinite(maximum_gps_age_s) or maximum_gps_age_s < 0.0:
+            maximum_gps_age_s = 1.0
         gps_states = getattr(panel, "latest_gps", {}) or {}
         baseline = getattr(panel, "latest_rtk_baseline", None)
         receiver_details = []
-        receiver_ages = []
+        receiver_ages: dict[str, float] = {}
         receiver_labels: list[str] = []
         for side, label in (("left", "P1"), ("right", "P2")):
             gps = gps_states.get(side) if isinstance(gps_states, dict) else None
             if gps is None:
                 receiver_details.append(f"{label}=NO DATA")
                 continue
-            age_s = max(0.0, now_s - float(getattr(gps, "timestamp_s", now_s)))
-            receiver_ages.append(age_s)
+            try:
+                timestamp_s = float(getattr(gps, "timestamp_s"))
+                if not math.isfinite(timestamp_s):
+                    raise ValueError
+                age_s = now_s - timestamp_s
+                if age_s < 0.0:
+                    raise ValueError
+            except (AttributeError, TypeError, ValueError):
+                age_s = None
+            if age_s is not None:
+                receiver_ages[side] = age_s
             fix = str(getattr(gps, "rtk_label", "UNKNOWN") or "UNKNOWN")
             receiver_labels.append(fix)
             fix_type = getattr(gps, "fix_type", None)
             sats = getattr(gps, "satellites_used", None)
             eph = getattr(gps, "eph_m", None)
             epv = getattr(gps, "epv_m", None)
+            freshness = (
+                "NO TIMESTAMP"
+                if age_s is None
+                else "STALE"
+                if age_s > maximum_gps_age_s
+                else "FRESH"
+            )
+            age_text = "--" if age_s is None else f"{age_s:.2f}s"
             receiver_details.append(
-                f"{label}={fix}(fix={fix_type if fix_type is not None else '--'}, "
+                f"{label}={fix}/{freshness}(fix={fix_type if fix_type is not None else '--'}, "
                 f"sats={sats if sats is not None else '--'}, "
                 f"eph={eph if eph is not None else '--'}m, "
-                f"epv={epv if epv is not None else '--'}m, age={age_s:.2f}s)"
+                f"epv={epv if epv is not None else '--'}m, age={age_text})"
             )
         baseline_age = None
         baseline_detail = "baseline NED=NO DATA"
         if baseline is not None:
             left_age = float(getattr(baseline, "left_age_s", 0.0))
             right_age = float(getattr(baseline, "right_age_s", 0.0))
-            baseline_age = max(0.0, left_age, right_age)
+            complete_pair = set(receiver_ages) == {"left", "right"}
+            baseline_age = max(receiver_ages.values()) if complete_pair else None
+            baseline_freshness = (
+                "UNKNOWN"
+                if baseline_age is None
+                else "STALE"
+                if baseline_age > maximum_gps_age_s
+                else "FRESH"
+            )
+            baseline_age_text = "--" if baseline_age is None else f"{baseline_age:.2f}s"
             baseline_detail = (
                 "baseline NED="
                 f"{float(getattr(baseline, 'north_m', 0.0)):+.3f}/"
@@ -527,7 +565,8 @@ class BackendStatusAdapter(QtCore.QObject):
                 f"{float(getattr(baseline, 'down_m', 0.0)):+.3f} m, "
                 f"length={float(getattr(baseline, 'baseline_m', 0.0)):.3f} m, "
                 f"quality={getattr(baseline, 'fix_quality', 'UNKNOWN')}, "
-                f"age P1/P2={left_age:.2f}/{right_age:.2f}s"
+                f"freshness={baseline_freshness}, age={baseline_age_text} "
+                f"(created P1/P2={left_age:.2f}/{right_age:.2f}s)"
             )
             projection = getattr(panel, "latest_p1_body_frd_baseline", None)
             if projection is None:
@@ -544,11 +583,23 @@ class BackendStatusAdapter(QtCore.QObject):
         readiness_text = ""
         if readiness_ready is not None:
             readiness_text = f"; readiness={'READY' if bool(readiness_ready) else 'BLOCKED'}"
-        has_receiver = bool(receiver_ages)
+        has_receiver = bool(receiver_labels)
+        has_complete_timestamped_pair = set(receiver_ages) == {"left", "right"}
+        receiver_stale = any(age > maximum_gps_age_s for age in receiver_ages.values())
+        baseline_stale = baseline_age is not None and baseline_age > maximum_gps_age_s
         fix_quality = str(getattr(baseline, "fix_quality", "") or "").upper() if baseline is not None else ""
+        current_pair_fixed = len(receiver_labels) == 2 and all(
+            label.upper() == "RTK_FIXED" for label in receiver_labels
+        )
         if state_value in {"FAILED", "ERROR", "FAULT", "INVALIDATED"}:
             state, severity = "ERROR", StatusSeverity.BAD
-        elif baseline is not None and fix_quality == "GOOD":
+        elif receiver_stale or baseline_stale:
+            state, severity = "STALE", StatusSeverity.WARN
+        elif not has_receiver or not has_complete_timestamped_pair:
+            # A manager lifecycle state is not rover-position evidence.  In
+            # particular READY with no P1/P2 samples must remain NO DATA.
+            state, severity = "NO DATA", StatusSeverity.UNKNOWN
+        elif baseline is not None and fix_quality == "GOOD" and current_pair_fixed:
             state, severity = "FIX", StatusSeverity.OK
         elif baseline is not None and "RTK_FLOAT" in receiver_labels:
             state, severity = "FLOAT", StatusSeverity.WARN
@@ -556,10 +607,6 @@ class BackendStatusAdapter(QtCore.QObject):
             state, severity = "NO FIX", StatusSeverity.WARN
         elif has_receiver:
             state, severity = "NO FIX", StatusSeverity.WARN
-        elif state_value in {"READY", "RUNNING", "CONNECTED", "ACTIVE"}:
-            state, severity = "READY", StatusSeverity.OK
-        elif state_value in {"DEGRADED", "CONNECTING", "WAITING", "STARTING"}:
-            state, severity = "DEGRADED", StatusSeverity.WARN
         else:
             state, severity = "NO DATA", StatusSeverity.UNKNOWN
         detail = "; ".join(
@@ -572,7 +619,11 @@ class BackendStatusAdapter(QtCore.QObject):
             severity,
             detail=detail,
             source="GnssOperationManager + GpsPositionState + RtkBaselineEstimate",
-            age_s=baseline_age if baseline_age is not None else (max(receiver_ages) if receiver_ages else None),
+            age_s=(
+                baseline_age
+                if baseline_age is not None
+                else (max(receiver_ages.values()) if receiver_ages else None)
+            ),
             clock="GPS app_receive_monotonic; baseline NED",
             observed_monotonic_s=now_s,
         )

@@ -34,6 +34,8 @@ from Workstation.workstation_core.theme import (
     SUCCESS_TEXT,
 )
 from Workstation.workstation_core.stereo import DetectionObservation
+from Workstation.workstation_core.settings import DEFAULT_CALIBRATION_ROOT
+from Workstation.calibration_sessions import discover_calibration_sessions
 
 from .components import EngineeringValue, StatusIndicator, WorkspaceHeader
 from .evidence import EvidenceAdapter
@@ -42,6 +44,8 @@ from .status_model import RuntimeStatus, StatusModel, StatusSeverity
 
 
 SESSION_CATALOG_REFRESH_INTERVAL_S = 5.0
+PIXHAWK_CONNECTION_INDICATOR_WIDTH_PX = 420
+CALIBRATION_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
 
 def _status(model: StatusModel, key: str) -> RuntimeStatus | None:
@@ -267,7 +271,7 @@ class OverviewWorkspace(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
-        layout.addWidget(WorkspaceHeader("Overview", "Connect → verify → measure → record"))
+        layout.addWidget(WorkspaceHeader("Overview", "Connect → verify → measure → auto-save"))
 
         status_group = QtWidgets.QGroupBox("Status")
         status_layout = QtWidgets.QGridLayout(status_group)
@@ -324,12 +328,22 @@ class OverviewWorkspace(QtWidgets.QWidget):
         session = str(getattr(panel, "recording_session_id", "") or "") or "--"
         self.session_value.set_value(session, source="recording session metadata")
         measurement_status = snapshot.get("measurement")
+        measurement_is_current_valid = bool(
+            measurement_status and measurement_status.state == "VALID"
+        )
         self.measurement_value.set_value(
             str(getattr(panel, "last_distance_status", "Waiting for measurement") or ""),
             source="MeasurementAttempt/controller result",
             frame=MEASUREMENT_FRAME,
             age_s=measurement_status.age_s if measurement_status else None,
-            valid=str(getattr(panel, "last_distance_quality", "WARNING")).upper() in {"GOOD", "VALID"},
+            valid=(
+                True
+                if measurement_is_current_valid
+                else False
+                if measurement_status
+                and measurement_status.state in {"ERROR", "REJECTED"}
+                else None
+            ),
         )
         self.contract_value.set_value(
             f"{MEASUREMENT_AXIS_CONTRACT} · metres",
@@ -487,7 +501,11 @@ class ExperimentWorkspace(QtWidgets.QWidget):
         )
 
         connected = all(state in {"LIVE", "CONNECTED", "STARTING"} for state in (*camera_states, *pixhawk_states))
-        gps_present = all(data.get("fix_type") is not None for data in gps.values())
+        gnss_state = self._state(snapshot.get("gnss"))
+        gps_present = (
+            gnss_state in {"FIX", "FLOAT", "NO FIX"}
+            and all(data.get("fix_type") is not None for data in gps.values())
+        )
         mode = str(gnss.get("mode", "UNKNOWN") or "UNKNOWN")
         base_serial = gnss.get("base_serial") if isinstance(gnss.get("base_serial"), dict) else {}
         ntrip = gnss.get("ntrip") if isinstance(gnss.get("ntrip"), dict) else {}
@@ -601,19 +619,32 @@ class ExperimentWorkspace(QtWidgets.QWidget):
             save_state, save_detail = "SAVING", "session save worker running"
         elif recording_state == "RECOVERABLE":
             save_state, save_detail = "RETRY", "retryable spool preserved; save again"
+        elif recording_state == "ACTIVE" and bool(
+            getattr(panel, "_automatic_session_recording", False)
+        ):
+            save_state, save_detail = "AUTO", "session is recording with Detection"
         elif has_data:
-            save_state, save_detail = "SAVE", "unsaved session data available"
+            save_state, save_detail = "READY", "session details are handled automatically"
         else:
-            save_state, save_detail = "WAIT", "save becomes available after a measurement"
+            save_state, save_detail = "WAIT", "session starts with Detection"
         self._set_step(11, save_state, save_detail)
 
 
 class CameraPreview(QtWidgets.QFrame):
     IMAGE_ASPECT_RATIO = 16.0 / 9.0
 
-    def __init__(self, side: str, parent: QtWidgets.QWidget | None = None) -> None:
+    def __init__(
+        self,
+        side: str,
+        parent: QtWidgets.QWidget | None = None,
+        *,
+        crop_to_fill: bool = True,
+        lock_chrome_height: bool = False,
+    ) -> None:
         super().__init__(parent)
         self.side = side
+        self.crop_to_fill = bool(crop_to_fill)
+        self.lock_chrome_height = bool(lock_chrome_height)
         self.setObjectName("cameraPreview")
         self.setMinimumSize(0, 0)
         self.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Expanding)
@@ -629,9 +660,20 @@ class CameraPreview(QtWidgets.QFrame):
         self.image.setObjectName("cameraPreviewImage")
         self.meta = QtWidgets.QLabel("WAITING")
         self.meta.setObjectName("cameraPreviewMeta")
-        self.meta.setWordWrap(True)
+        self.meta.setWordWrap(not self.lock_chrome_height)
         self.meta.setMinimumWidth(0)
-        self.meta.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        if self.lock_chrome_height:
+            # Measurement receives live metadata and detection labels while
+            # the image surface is being painted.  A wrapping metadata label
+            # changes its sizeHint when a class name or status changes, which
+            # lets the parent splitter resize the camera surface on every
+            # update.  Keep one reserved line and expose the full text in the
+            # tooltip so content changes cannot move the image.
+            self.meta.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
+            self._locked_meta_height = max(1, self.meta.fontMetrics().lineSpacing())
+            self.meta.setFixedHeight(self._locked_meta_height)
+        else:
+            self.meta.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
         layout.addWidget(title)
         layout.addWidget(self.image, 1)
         layout.addWidget(self.meta)
@@ -645,15 +687,19 @@ class CameraPreview(QtWidgets.QFrame):
     def heightForWidth(self, width: int) -> int:  # noqa: N802 - Qt override.
         content_width = max(0, int(width) - self.layout().contentsMargins().left() - self.layout().contentsMargins().right())
         image_height = int(round(content_width / self.IMAGE_ASPECT_RATIO))
-        chrome_height = sum(
-            widget.sizeHint().height()
-            for widget in (self.findChild(QtWidgets.QLabel, "cameraPreviewTitle"), self.meta)
+        title = self.findChild(QtWidgets.QLabel, "cameraPreviewTitle")
+        chrome_height = title.sizeHint().height() if title is not None else 0
+        chrome_height += (
+            self._locked_meta_height
+            if self.lock_chrome_height
+            else self.meta.sizeHint().height()
         )
         return image_height + chrome_height + self.layout().spacing() * 2 + self.layout().contentsMargins().top() + self.layout().contentsMargins().bottom()
 
     def set_frame(self, image: QtGui.QImage, metadata: object) -> None:
         self._image = image
-        self._render()
+        if self.isVisible():
+            self._render()
         self._set_metadata(metadata, live=True)
 
     def clear(self) -> None:
@@ -662,7 +708,8 @@ class CameraPreview(QtWidgets.QFrame):
         self._image = None
         self._detection = None
         self._metadata = {}
-        self._render()
+        if self.isVisible():
+            self._render()
         self._set_metadata({}, live=False)
 
     def set_detection(self, detection: DetectionObservation | None) -> None:
@@ -674,7 +721,8 @@ class CameraPreview(QtWidgets.QFrame):
         """
 
         self._detection = detection
-        self._render()
+        if self.isVisible():
+            self._render()
         self._set_metadata(
             self._metadata,
             live=self._image is not None and not self._image.isNull(),
@@ -706,12 +754,27 @@ class CameraPreview(QtWidgets.QFrame):
             return
         target_size = self.image.size()
         source_pixmap = QtGui.QPixmap.fromImage(self._image)
-        scaled = source_pixmap.scaled(
-            target_size, QtCore.Qt.KeepAspectRatioByExpanding, QtCore.Qt.SmoothTransformation
-        )
-        crop_x = max(0, (scaled.width() - target_size.width()) // 2)
-        crop_y = max(0, (scaled.height() - target_size.height()) // 2)
-        pixmap = scaled.copy(crop_x, crop_y, target_size.width(), target_size.height())
+        if self.crop_to_fill:
+            scaled = source_pixmap.scaled(
+                target_size, QtCore.Qt.KeepAspectRatioByExpanding, QtCore.Qt.SmoothTransformation
+            )
+            crop_x = max(0, (scaled.width() - target_size.width()) // 2)
+            crop_y = max(0, (scaled.height() - target_size.height()) // 2)
+            pixmap = scaled.copy(crop_x, crop_y, target_size.width(), target_size.height())
+        else:
+            scaled = source_pixmap.scaled(
+                target_size, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
+            )
+            offset_x = max(0, (target_size.width() - scaled.width()) // 2)
+            offset_y = max(0, (target_size.height() - scaled.height()) // 2)
+            pixmap = QtGui.QPixmap(target_size)
+            pixmap.fill(QtCore.Qt.black)
+            painter = QtGui.QPainter(pixmap)
+            painter.drawPixmap(offset_x, offset_y, scaled)
+            painter.end()
+            # _draw_detection_overlay uses display = source * scale - crop.
+            crop_x = -offset_x
+            crop_y = -offset_y
         if self._detection is not None:
             pixmap = self._draw_detection_overlay(
                 pixmap,
@@ -772,8 +835,13 @@ class CameraPreview(QtWidgets.QFrame):
         return pixmap
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802
-        self._render()
+        if self.isVisible():
+            self._render()
         super().resizeEvent(event)
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._render()
 
 
 class CameraPreviewPair(QtWidgets.QSplitter):
@@ -1206,6 +1274,13 @@ class CameraWorkspace(QtWidgets.QWidget):
         self._update_preview_pair_orientation()
         QtCore.QTimer.singleShot(0, self._fit_preview_layout)
 
+    def showEvent(self, event: QtGui.QShowEvent) -> None:  # noqa: N802
+        super().showEvent(event)
+        # Navigation swaps the page without necessarily resizing the widget;
+        # size the preview once it becomes visible so the first paint cannot
+        # inherit an unconstrained splitter height from the scroll area.
+        QtCore.QTimer.singleShot(0, self._fit_preview_layout)
+
     def _connect_panes(self) -> None:
         panel = getattr(self.backend, "panel", self.backend)
         clear_signal = getattr(panel, "camera_preview_cleared", None)
@@ -1597,6 +1672,640 @@ class TimeWorkspace(QtWidgets.QWidget):
         return payload
 
 
+class SessionWorkspace(QtWidgets.QWidget):
+    """Top-level daily work session lifecycle and Measurement readiness view."""
+
+    inspection_requested = QtCore.pyqtSignal(object)
+
+    def __init__(
+        self,
+        backend: object,
+        status_model: StatusModel,
+        open_measurement: Callable[[], None] | None = None,
+        open_review: Callable[[], None] | None = None,
+        parent: QtWidgets.QWidget | None = None,
+        *,
+        begin_session_action: Callable[[], object] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.backend = backend
+        self.status_model = status_model
+        self.begin_session_action = begin_session_action
+        self._can_open_measurement = open_measurement is not None
+        self._can_open_review = open_review is not None
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        layout.addWidget(
+            WorkspaceHeader(
+                "Session",
+                "Daily work, current Measurement readiness, and evidence ownership",
+            )
+        )
+
+        lifecycle_group = QtWidgets.QGroupBox("Current work")
+        lifecycle_layout = QtWidgets.QGridLayout(lifecycle_group)
+        lifecycle_layout.setContentsMargins(6, 6, 6, 6)
+        lifecycle_layout.setHorizontalSpacing(6)
+        lifecycle_layout.setVerticalSpacing(4)
+        self.start_session_button = QtWidgets.QPushButton("Open Session")
+        self.start_session_button.setObjectName("sessionWorkspaceOpen")
+        self.start_session_button.clicked.connect(self._begin_measurement_session)
+        self.new_measurement_button = QtWidgets.QPushButton("New Measurement")
+        self.new_measurement_button.setObjectName("sessionWorkspaceNewMeasurement")
+        self.new_measurement_button.clicked.connect(self._begin_next_measurement)
+        self.seal_measurement_button = QtWidgets.QPushButton("Seal Measurement")
+        self.seal_measurement_button.setObjectName("sessionWorkspaceSealMeasurement")
+        self.seal_measurement_button.clicked.connect(self._seal_measurement)
+        self.close_session_button = QtWidgets.QPushButton("Close Session")
+        self.close_session_button.setObjectName("sessionWorkspaceClose")
+        self.close_session_button.clicked.connect(self._close_measurement_session)
+        for column, button in enumerate(
+            (
+                self.start_session_button,
+                self.new_measurement_button,
+                self.seal_measurement_button,
+                self.close_session_button,
+            )
+        ):
+            lifecycle_layout.addWidget(button, 0, column)
+        self.session_status_label = QtWidgets.QLabel("Session: IDLE")
+        self.session_status_label.setObjectName("sessionWorkspaceLifecycle")
+        self.session_status_label.setWordWrap(True)
+        self.measurement_status_label = QtWidgets.QLabel("Measurement: NONE")
+        self.measurement_status_label.setObjectName("sessionWorkspaceMeasurement")
+        self.measurement_status_label.setWordWrap(True)
+        self.next_action_label = QtWidgets.QLabel("Next: Open Session")
+        self.next_action_label.setObjectName("sessionWorkspaceNextAction")
+        self.next_action_label.setWordWrap(True)
+        # Compatibility alias for callers that inspected the old workflow strip.
+        self.workflow_status_label = self.next_action_label
+        lifecycle_layout.addWidget(self.session_status_label, 1, 0, 1, 4)
+        lifecycle_layout.addWidget(self.measurement_status_label, 2, 0, 1, 4)
+        lifecycle_layout.addWidget(self.next_action_label, 3, 0, 1, 4)
+        lifecycle_layout.setColumnStretch(4, 1)
+        layout.addWidget(lifecycle_group)
+
+        readiness_group = QtWidgets.QGroupBox("Readiness")
+        readiness_layout = QtWidgets.QVBoxLayout(readiness_group)
+        readiness_layout.setContentsMargins(6, 6, 6, 6)
+        readiness_layout.setSpacing(4)
+        self.readiness_summary_label = QtWidgets.QLabel(
+            "Evidence collection: BLOCKED · Valid measurement: BLOCKED"
+        )
+        self.readiness_summary_label.setObjectName("sessionWorkspaceReadinessSummary")
+        self.readiness_summary_label.setWordWrap(True)
+        readiness_layout.addWidget(self.readiness_summary_label)
+        self.readiness_model = _table_model(self, ("Scope", "Blocker"))
+        self.readiness_table = QtWidgets.QTableView()
+        self.readiness_table.setObjectName("sessionWorkspaceReadinessTable")
+        self.readiness_table.setModel(self.readiness_model)
+        self.readiness_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.readiness_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.readiness_table.verticalHeader().setVisible(False)
+        self.readiness_table.horizontalHeader().setStretchLastSection(True)
+        self.readiness_table.setMaximumHeight(140)
+        readiness_layout.addWidget(self.readiness_table)
+        self.readiness_note_label = QtWidgets.QLabel(
+            "Raw and Pre evidence remain available when only valid measurement is blocked."
+        )
+        self.readiness_note_label.setObjectName("compactContract")
+        self.readiness_note_label.setWordWrap(True)
+        readiness_layout.addWidget(self.readiness_note_label)
+        layout.addWidget(readiness_group)
+
+        methods_group = QtWidgets.QGroupBox("Measurement method inputs")
+        methods_layout = QtWidgets.QVBoxLayout(methods_group)
+        methods_layout.setContentsMargins(6, 6, 6, 6)
+        methods_layout.setSpacing(4)
+        self.method_selection_label = QtWidgets.QLabel("Preferred -- · Effective --")
+        self.method_selection_label.setObjectName("statusStrip")
+        self.method_selection_label.setWordWrap(True)
+        methods_layout.addWidget(self.method_selection_label)
+        self.method_inputs_model = _table_model(
+            self,
+            ("Method", "State", "Input or blocker"),
+        )
+        self.method_inputs_table = QtWidgets.QTableView()
+        self.method_inputs_table.setObjectName("sessionWorkspaceMethodInputs")
+        self.method_inputs_table.setModel(self.method_inputs_model)
+        self.method_inputs_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.method_inputs_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.method_inputs_table.verticalHeader().setVisible(False)
+        self.method_inputs_table.horizontalHeader().setStretchLastSection(True)
+        self.method_inputs_table.setMinimumHeight(100)
+        self.method_inputs_table.setMaximumHeight(300)
+        self.method_inputs_table.clicked.connect(self._inspect_method_row)
+        self.method_inputs_table.selectionModel().currentRowChanged.connect(
+            self._method_row_changed
+        )
+        methods_layout.addWidget(self.method_inputs_table)
+
+        self.method_detail_title = QtWidgets.QLabel("Select a method")
+        self.method_detail_title.setObjectName("sessionWorkspaceMethodDetailTitle")
+        self.method_detail_title.setWordWrap(True)
+        self.method_detail_values = QtWidgets.QLabel("Input: --")
+        self.method_detail_values.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.method_detail_values.setWordWrap(True)
+        self.method_detail_meta = QtWidgets.QLabel("Source: --")
+        self.method_detail_meta.setObjectName("statusStrip")
+        self.method_detail_meta.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.method_detail_meta.setWordWrap(True)
+        self.method_detail_contract = QtWidgets.QLabel("Coordinate contract: --")
+        self.method_detail_contract.setObjectName("compactContract")
+        self.method_detail_contract.setWordWrap(True)
+        methods_layout.addWidget(self.method_detail_title)
+        methods_layout.addWidget(self.method_detail_values)
+        methods_layout.addWidget(self.method_detail_meta)
+        methods_layout.addWidget(self.method_detail_contract)
+
+        layout.addWidget(methods_group, 1)
+
+        history_group = QtWidgets.QGroupBox("Measurements in this Session")
+        history_layout = QtWidgets.QVBoxLayout(history_group)
+        self.measurements_model = _table_model(
+            self,
+            ("Sequence", "Measurement", "State", "Evidence", "Revision"),
+        )
+        self.measurements_table = QtWidgets.QTableView()
+        self.measurements_table.setModel(self.measurements_model)
+        self.measurements_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.measurements_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.measurements_table.verticalHeader().setVisible(False)
+        self.measurements_table.horizontalHeader().setStretchLastSection(True)
+        self.measurements_table.setMaximumHeight(125)
+        history_layout.addWidget(self.measurements_table)
+        navigation_row = QtWidgets.QHBoxLayout()
+        self.open_measurement_button = QtWidgets.QPushButton("Open Measurement")
+        self.open_measurement_button.setEnabled(self._can_open_measurement)
+        if open_measurement is not None:
+            self.open_measurement_button.clicked.connect(open_measurement)
+        self.open_review_button = QtWidgets.QPushButton("Open Session Review")
+        self.open_review_button.setEnabled(self._can_open_review)
+        if open_review is not None:
+            self.open_review_button.clicked.connect(open_review)
+        navigation_row.addWidget(self.open_measurement_button)
+        navigation_row.addWidget(self.open_review_button)
+        navigation_row.addStretch(1)
+        history_layout.addLayout(navigation_row)
+        layout.addWidget(history_group)
+
+        self._last_method_rows: list[dict[str, object]] = []
+        self.refresh({})
+
+    def _owner_method(self, *names: str) -> Callable[..., object] | None:
+        panel = getattr(self.backend, "panel", self.backend)
+        for owner in (self.backend, panel):
+            for name in names:
+                method = getattr(owner, name, None)
+                if callable(method):
+                    return method
+        return None
+
+    def _snapshot(self, *names: str) -> dict[str, object]:
+        reader = self._owner_method(*names)
+        if reader is None:
+            return {}
+        try:
+            value = reader()
+        except Exception as exc:
+            return {"state": "ERROR", "error": str(exc)}
+        return dict(value) if isinstance(value, Mapping) else {}
+
+    def _run_action(
+        self,
+        names: tuple[str, ...],
+        *,
+        action: Callable[[], object] | None = None,
+    ) -> None:
+        method = action or self._owner_method(*names)
+        if method is None:
+            self.session_status_label.setText("Session: ERROR · control unavailable")
+            return
+        try:
+            method()
+        except Exception as exc:
+            self.session_status_label.setText(f"Session: ERROR · {exc}")
+            return
+        self.refresh(self.status_model.snapshot())
+
+    def _begin_measurement_session(self) -> None:
+        self._run_action(
+            ("begin_measurement_session", "begin_session"),
+            action=self.begin_session_action,
+        )
+
+    def _begin_next_measurement(self) -> None:
+        self._run_action(("begin_measurement", "begin_next_measurement"))
+
+    def _seal_measurement(self) -> None:
+        self._run_action(
+            ("finalize_measurement_package", "seal_session", "finalize_session")
+        )
+
+    def _close_measurement_session(self) -> None:
+        self._run_action(("close_measurement_session", "close_session"))
+
+    @staticmethod
+    def _format_attitude_rows(values: Mapping[str, object]) -> str:
+        rows = values.get("live_attitude_rpy_deg")
+        rows = rows if isinstance(rows, Mapping) else {}
+        parts = []
+        for side, label in (("left", "L"), ("right", "R")):
+            row = rows.get(side)
+            if not isinstance(row, Mapping):
+                continue
+            parts.append(
+                f"{label} R/P/Y={_display_number(row.get('roll_deg'), digits=2)}/"
+                f"{_display_number(row.get('pitch_deg'), digits=2)}/"
+                f"{_display_number(row.get('yaw_deg'), digits=2)}° "
+                f"age={_display_number(row.get('age_s'), digits=2, suffix='s')}"
+            )
+        return "; ".join(parts)
+
+    @staticmethod
+    def _format_candidate_rows(values: Mapping[str, object], *, rotation: bool) -> str:
+        rows = values.get("candidate_pose_virtual_frd_to_world_ned")
+        rows = rows if isinstance(rows, Mapping) else {}
+        names = ("roll_deg", "pitch_deg", "yaw_deg") if rotation else ("north_m", "east_m", "down_m")
+        unit = "°" if rotation else "m"
+        prefix = "R/P/Y" if rotation else "N/E/D"
+        parts = []
+        for side, label in (("left", "L"), ("right", "R")):
+            row = rows.get(side)
+            if not isinstance(row, Mapping):
+                continue
+            if not any(row.get(name) is not None for name in names):
+                continue
+            parts.append(
+                f"{label} {prefix}="
+                + "/".join(_display_number(row.get(name), digits=3) for name in names)
+                + unit
+            )
+        return "; ".join(parts)
+
+    @staticmethod
+    def _format_method_inputs(row: Mapping[str, object]) -> tuple[str, str]:
+        values = row.get("input_values")
+        values = values if isinstance(values, Mapping) else {}
+        rotation_parts: list[str] = []
+        translation_parts: list[str] = []
+        candidate_rotation = SessionWorkspace._format_candidate_rows(values, rotation=True)
+        candidate_translation = SessionWorkspace._format_candidate_rows(values, rotation=False)
+        if candidate_rotation:
+            rotation_parts.append("candidate " + candidate_rotation)
+        if bool(values.get("uses_live_pixhawk")):
+            live_attitude = SessionWorkspace._format_attitude_rows(values)
+            rotation_parts.append("PX4 " + (live_attitude or "--"))
+        if candidate_translation:
+            translation_parts.append("candidate " + candidate_translation)
+        if bool(values.get("uses_live_gnss")):
+            baseline = values.get("live_baseline_ned_m")
+            if isinstance(baseline, Mapping):
+                translation_parts.append(
+                    "GNSS P1→P2 N/E/D="
+                    + "/".join(
+                        _display_number(baseline.get(name), digits=3)
+                        for name in ("north_m", "east_m", "down_m")
+                    )
+                    + "m"
+                )
+            else:
+                translation_parts.append("GNSS P1→P2 --")
+        stereo = values.get("stereo_extrinsics_opencv_rdf")
+        if isinstance(stereo, Mapping):
+            rotation = stereo.get("rotation_left_to_right")
+            if isinstance(rotation, (list, tuple)):
+                flat = [number for matrix_row in rotation if isinstance(matrix_row, (list, tuple)) for number in matrix_row]
+                rotation_parts.append("R=[" + ", ".join(_display_number(number, digits=3) for number in flat) + "]")
+            translation = stereo.get("translation_left_to_right_m")
+            if isinstance(translation, (list, tuple)):
+                translation_parts.append(
+                    "t RDF=[" + ", ".join(_display_number(number, digits=4) for number in translation) + "]m"
+                )
+        return "; ".join(rotation_parts) or "--", "; ".join(translation_parts) or "--"
+
+    def _render_methods(self, snapshot: Mapping[str, object]) -> bool:
+        raw_rows = snapshot.get("method_catalog")
+        if not isinstance(raw_rows, list):
+            raw_rows = snapshot.get("method_capabilities")
+        rows = [dict(row) for row in raw_rows if isinstance(row, Mapping)] if isinstance(raw_rows, list) else []
+        self._last_method_rows = rows
+        selected = str(snapshot.get("selected_method_id") or "")
+        preferred = str(snapshot.get("preferred_method_id") or "")
+        reason = str(snapshot.get("selection_reason") or "--")
+        labels = {
+            str(row.get("method_id") or ""): str(row.get("label") or row.get("method_id") or "--")
+            for row in rows
+        }
+        self.method_selection_label.setText(
+            f"Preferred {labels.get(preferred, preferred) or '--'} · "
+            f"Effective {labels.get(selected, selected) or '--'}"
+            + (f" · {reason}" if reason not in {"", "--", "preferred", "manual"} else "")
+        )
+        self.method_inputs_model.removeRows(0, self.method_inputs_model.rowCount())
+        any_ready = False
+        detail_index = 0
+        for row in rows:
+            ready = bool(row.get("ready", False))
+            any_ready = any_ready or ready
+            rotation, translation = self._format_method_inputs(row)
+            reasons = row.get("reasons")
+            reason_text = "; ".join(str(value) for value in reasons) if isinstance(reasons, list) else ""
+            method_id = str(row.get("method_id") or "")
+            state = "EFFECTIVE" if method_id == selected else "READY" if ready else "BLOCKED"
+            if method_id == selected:
+                detail_index = self.method_inputs_model.rowCount()
+            elif not selected and method_id == preferred:
+                detail_index = self.method_inputs_model.rowCount()
+            if ready:
+                input_text = " · ".join(
+                    value
+                    for value in (
+                        "R " + rotation if rotation != "--" else "",
+                        "T " + translation if translation != "--" else "",
+                    )
+                    if value
+                ) or "Inputs resolved by the active method instance"
+            else:
+                input_text = reason_text or "Required inputs are unavailable"
+            _append_table_row(
+                self.method_inputs_model,
+                (
+                    str(row.get("label") or row.get("method_id") or "--"),
+                    state,
+                    _compact_text(input_text, limit=150),
+                ),
+            )
+        self.method_inputs_table.resizeColumnToContents(0)
+        self.method_inputs_table.resizeColumnToContents(1)
+        table_height = (
+            self.method_inputs_table.horizontalHeader().sizeHint().height()
+            + self.method_inputs_table.verticalHeader().defaultSectionSize() * max(1, len(rows))
+            + 6
+        )
+        table_height = max(100, min(300, table_height))
+        self.method_inputs_table.setMinimumHeight(table_height)
+        self.method_inputs_table.setMaximumHeight(table_height)
+        if rows:
+            self.method_inputs_table.selectRow(detail_index)
+            self._render_method_detail(detail_index)
+        else:
+            self.method_detail_title.setText("No measurement methods")
+            self.method_detail_values.setText("Input: --")
+            self.method_detail_meta.setText("Source: --")
+            self.method_detail_contract.setText("Coordinate contract: --")
+        return any_ready
+
+    @staticmethod
+    def _method_coordinate_contract(method_id: str) -> str:
+        if method_id == "pixhawk_rtk_live":
+            return "PX4 body FRD → world NED attitude; P1→P2 GNSS NED metres"
+        if method_id == "checkerboard_stereo":
+            return "OpenCV optical RDF: X_right = R_left_to_right X_left + t_left_to_right"
+        return "candidate virtual-camera FRD → world NED; resolved stereo geometry remains optical RDF"
+
+    def _render_method_detail(self, row_index: int) -> None:
+        if row_index < 0 or row_index >= len(self._last_method_rows):
+            return
+        row = self._last_method_rows[row_index]
+        method_id = str(row.get("method_id") or "")
+        label = str(row.get("label") or method_id or "Measurement method")
+        ready = bool(row.get("ready", False))
+        rotation, translation = self._format_method_inputs(row)
+        reasons = row.get("reasons")
+        reason_text = "; ".join(str(value) for value in reasons) if isinstance(reasons, list) else ""
+        required = row.get("required_inputs")
+        required_text = ", ".join(str(value) for value in required) if isinstance(required, list) else ""
+        self.method_detail_title.setText(f"{label} · {'READY' if ready else 'BLOCKED'}")
+        actual_parts = []
+        if rotation != "--":
+            actual_parts.append("Rotation: " + rotation)
+        if translation != "--":
+            actual_parts.append("Translation: " + translation)
+        if not actual_parts:
+            actual_parts.append("No factual input values available")
+        if required_text and not ready:
+            actual_parts.append("Required: " + required_text)
+        self.method_detail_values.setText("\n".join(actual_parts))
+        instance = str(row.get("instance_id") or "no instance")
+        geometry_hash = str(row.get("geometry_sha256") or "")
+        meta_parts = [f"Source: {instance}"]
+        if geometry_hash:
+            meta_parts.append(f"geometry={geometry_hash[:16]}…")
+        if reason_text:
+            meta_parts.append("blocker=" + reason_text)
+        self.method_detail_meta.setText(" · ".join(meta_parts))
+        self.method_detail_contract.setText(
+            "Coordinate contract: " + self._method_coordinate_contract(method_id)
+        )
+
+    def _method_row_changed(
+        self,
+        current: QtCore.QModelIndex,
+        _previous: QtCore.QModelIndex,
+    ) -> None:
+        self._render_method_detail(current.row())
+
+    def _render_readiness(
+        self,
+        runtime: Mapping[str, RuntimeStatus],
+        session: Mapping[str, object],
+        package: Mapping[str, object],
+        *,
+        any_method_ready: bool,
+    ) -> None:
+        session_state = str(session.get("state") or package.get("session_state") or "IDLE").upper()
+        package_state = str(package.get("state") or "IDLE").upper()
+        measurement_id = str(package.get("measurement_id") or "")
+        gates: list[tuple[str, bool, str]] = [
+            ("Session", session_state == "OPEN", session_state),
+            (
+                "Measurement",
+                bool(measurement_id) and package_state == "COLLECTING",
+                f"{measurement_id or 'NONE'} · {package_state}",
+            ),
+        ]
+        for key, label in (("camera.left", "Left camera"), ("camera.right", "Right camera"), ("synchronization", "Time sync")):
+            status = runtime.get(key)
+            ok = bool(status and status.severity == StatusSeverity.OK)
+            detail = "NO DATA" if status is None else f"{status.state} · {status.detail}"
+            gates.append((label, ok, detail))
+        gates.append(("Measurement method", any_method_ready, "ready method available" if any_method_ready else "no ready method"))
+        self.readiness_model.removeRows(0, self.readiness_model.rowCount())
+        collection_ready = all(ok for _label, ok, _detail in gates[:-1])
+        valid_ready = collection_ready and gates[-1][1]
+        self.readiness_summary_label.setText(
+            f"Evidence collection: {'READY' if collection_ready else 'BLOCKED'} · "
+            f"Valid measurement: {'READY' if valid_ready else 'BLOCKED'}"
+        )
+        blockers = [
+            (
+                "VALIDITY" if label == "Measurement method" else "COLLECTION",
+                f"{label}: {_compact_text(detail, limit=170)}",
+            )
+            for label, ok, detail in gates
+            if not ok
+        ]
+        for scope, detail in blockers:
+            _append_table_row(self.readiness_model, (scope, detail))
+        self.readiness_table.resizeColumnToContents(0)
+        self.readiness_table.setVisible(bool(blockers))
+        if not blockers:
+            self.readiness_note_label.setText("No blockers.")
+        elif collection_ready:
+            self.readiness_note_label.setText(
+                "Raw and Pre evidence are available; valid output waits for a ready method."
+            )
+        else:
+            self.readiness_note_label.setText(
+                "Resolve the listed collection blockers before starting Detection."
+            )
+
+    def _render_history(self, session: Mapping[str, object]) -> None:
+        self.measurements_model.removeRows(0, self.measurements_model.rowCount())
+        rows = session.get("measurements")
+        if not isinstance(rows, (list, tuple)):
+            return
+        for raw in rows:
+            if not isinstance(raw, Mapping):
+                continue
+            complete = raw.get("evidence_complete")
+            evidence = "COMPLETE" if complete is True else "INCOMPLETE" if complete is False else "PENDING"
+            _append_table_row(
+                self.measurements_model,
+                (
+                    raw.get("sequence", "--"),
+                    raw.get("measurement_id", "--"),
+                    raw.get("state", "--"),
+                    evidence,
+                    raw.get("revision", "--"),
+                ),
+            )
+        for column in range(4):
+            self.measurements_table.resizeColumnToContents(column)
+
+    def _inspect_method_row(self, index: QtCore.QModelIndex) -> None:
+        row_index = index.row()
+        if row_index < 0 or row_index >= len(self._last_method_rows):
+            return
+        self._render_method_detail(row_index)
+        row = self._last_method_rows[row_index]
+        rotation, translation = self._format_method_inputs(row)
+        self.inspection_requested.emit(
+            {
+                "selection": str(row.get("label") or row.get("method_id") or "Measurement method"),
+                "value": f"rotation={rotation} · translation={translation}",
+                "freshness": "live values are refreshed from the owner snapshot",
+                "contract": "PX4 FRD/NED, GNSS NED, candidate virtual-FRD/NED, OpenCV RDF remain separate",
+                "verdict": "READY" if bool(row.get("ready", False)) else "; ".join(str(value) for value in row.get("reasons", [])),
+                "source": str(row.get("instance_id") or "measurement-method-snapshot-v1"),
+            }
+        )
+
+    def _set_primary_action(self, selected: QtWidgets.QPushButton | None) -> None:
+        buttons = (
+            self.start_session_button,
+            self.new_measurement_button,
+            self.seal_measurement_button,
+            self.close_session_button,
+            self.open_measurement_button,
+            self.open_review_button,
+        )
+        for button in buttons:
+            button.setDefault(False)
+            button.setStyleSheet("")
+        if selected is None or not selected.isEnabled():
+            return
+        selected.setDefault(True)
+        selected.setStyleSheet(
+            f"font-weight: 600; border: 2px solid {ACCENT}; padding: 3px 8px;"
+        )
+
+    def refresh(self, runtime: dict[str, RuntimeStatus]) -> None:
+        session = self._snapshot("measurement_session_snapshot")
+        package = self._snapshot("measurement_package_snapshot")
+        methods = self._snapshot("measurement_methods_snapshot", "workstation_measurement_methods_snapshot")
+        session_state = str(session.get("state") or package.get("session_state") or "IDLE").upper()
+        session_id = str(session.get("session_id") or package.get("session_id") or "")
+        rows = session.get("measurements")
+        count = len(rows) if isinstance(rows, (list, tuple)) else 0
+        self.session_status_label.setText(
+            f"Session: {session_state}" + (f" · {session_id}" if session_id else "") + f" · measurements={count}"
+        )
+        package_state = str(package.get("state") or "IDLE").upper()
+        measurement_id = str(package.get("measurement_id") or "")
+        revision = str(package.get("revision") or "")
+        self.measurement_status_label.setText(
+            f"Measurement: {package_state}"
+            + (f" · {measurement_id}" if measurement_id else "")
+            + (f" · {revision}" if revision else "")
+        )
+        detection_started = bool(package.get("detection_started", False))
+        detection_completed = bool(package.get("detection_completed", False))
+        primary_action: QtWidgets.QPushButton | None = None
+        if session_state == "IDLE":
+            next_action = "Open Session"
+            primary_action = self.start_session_button
+        elif session_state == "SEALED":
+            next_action = "Open a new Session for additional work"
+            primary_action = self.start_session_button
+        elif not measurement_id:
+            next_action = "Create New Measurement"
+            primary_action = self.new_measurement_button
+        elif package_state == "COLLECTING" and not detection_started:
+            next_action = "Review blockers, then open Measurement"
+            primary_action = self.open_measurement_button
+        elif package_state == "COLLECTING" and not detection_completed:
+            next_action = "Monitor Detection in Measurement"
+            primary_action = self.open_measurement_button
+        elif package_state == "POST_CAPTURE":
+            next_action = "Collect Post evidence, then Seal Measurement"
+            primary_action = self.seal_measurement_button
+        elif package_state in {"SEALED_COMPLETE", "SEALED_INCOMPLETE"}:
+            next_action = "Create another Measurement or Close Session"
+            primary_action = self.new_measurement_button
+        elif package_state == "RECOVERABLE":
+            next_action = "Retry Seal Measurement"
+            primary_action = self.seal_measurement_button
+        else:
+            next_action = package_state
+        self.next_action_label.setText("Next: " + next_action)
+        any_method_ready = self._render_methods(methods)
+        self._render_readiness(runtime, session, package, any_method_ready=any_method_ready)
+        self._render_history(session)
+
+        begin = self._owner_method("begin_measurement_session", "begin_session")
+        new = self._owner_method("begin_measurement", "begin_next_measurement")
+        seal = self._owner_method("finalize_measurement_package", "seal_session", "finalize_session")
+        close = self._owner_method("close_measurement_session", "close_session")
+        self.start_session_button.setEnabled(
+            begin is not None and session_state in {"IDLE", "SEALED"}
+        )
+        self.new_measurement_button.setEnabled(
+            new is not None
+            and session_state == "OPEN"
+            and package_state in {"IDLE", "SEALED_COMPLETE", "SEALED_INCOMPLETE"}
+        )
+        self.seal_measurement_button.setEnabled(
+            seal is not None and package_state in {"POST_CAPTURE", "RECOVERABLE"}
+        )
+        self.close_session_button.setEnabled(
+            close is not None
+            and session_state in {"OPEN", "CLOSING", "RECOVERABLE"}
+            and package_state in {"IDLE", "SEALED_COMPLETE", "SEALED_INCOMPLETE"}
+        )
+        self.open_measurement_button.setEnabled(
+            self._can_open_measurement
+            and bool(measurement_id)
+            and package_state in {"COLLECTING", "POST_CAPTURE", "RECOVERABLE"}
+        )
+        self.open_review_button.setEnabled(
+            self._can_open_review and bool(session_id)
+        )
+        self._set_primary_action(primary_action)
+
+
 class MeasurementWorkspace(QtWidgets.QWidget):
     inspection_requested = QtCore.pyqtSignal(object)
     CAMERA_ASPECT_RATIO = 16.0 / 9.0
@@ -1606,12 +2315,16 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         backend: object,
         status_model: StatusModel,
         invoke_command: Callable[[str], bool] | None = None,
+        open_session_details: Callable[[], None] | None = None,
         parent: QtWidgets.QWidget | None = None,
+        *,
+        begin_session_action: Callable[[], object] | None = None,
     ) -> None:
         super().__init__(parent)
         self.backend = backend
         self.status_model = status_model
         self.invoke_command = invoke_command
+        self.begin_session_action = begin_session_action
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
@@ -1622,15 +2335,68 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         run_layout.setContentsMargins(6, 6, 6, 6)
         run_layout.setSpacing(6)
         self.control_buttons: dict[str, QtWidgets.QPushButton] = {}
-        for command_id, label in (
-            ("camera.toggle", "Preview"),
-            ("detection.toggle", "Detection"),
-            ("recording.toggle", "Record"),
-            ("session.save", "Save"),
-        ):
-            button = _command_button(label, command_id, invoke_command)
-            self.control_buttons[command_id] = button
-            run_layout.addWidget(button)
+        preview_button = _command_button("Preview", "camera.toggle", invoke_command)
+        self.control_buttons["camera.toggle"] = preview_button
+        run_layout.addWidget(preview_button)
+        self.start_session_button = QtWidgets.QPushButton("Start Session")
+        self.start_session_button.setObjectName("measurementPackageStart")
+        self.start_session_button.setProperty("commandId", "session.begin")
+        self.start_session_button.setToolTip(
+            "Create the measurement folder and collect pre-measurement evidence."
+        )
+        self.start_session_button.clicked.connect(self._begin_measurement_session)
+        run_layout.addWidget(self.start_session_button)
+        self.new_measurement_button = QtWidgets.QPushButton("New Measurement")
+        self.new_measurement_button.setObjectName("measurementPackageNewMeasurement")
+        self.new_measurement_button.setProperty("commandId", "measurement.begin")
+        self.new_measurement_button.setToolTip(
+            "Create the next isolated measurement folder inside the open session."
+        )
+        self.new_measurement_button.clicked.connect(self._begin_next_measurement)
+        run_layout.addWidget(self.new_measurement_button)
+        detection_button = _command_button("Detection", "detection.toggle", invoke_command)
+        self.control_buttons["detection.toggle"] = detection_button
+        run_layout.addWidget(detection_button)
+        self.finalize_session_button = QtWidgets.QPushButton("Seal Measurement")
+        self.finalize_session_button.setObjectName("measurementPackageFinalize")
+        self.finalize_session_button.setProperty("commandId", "session.finalize")
+        self.finalize_session_button.setToolTip(
+            "Drain evidence producers, verify the inventory, and seal this revision."
+        )
+        self.finalize_session_button.clicked.connect(self._finalize_measurement_package)
+        run_layout.addWidget(self.finalize_session_button)
+        self.close_session_button = QtWidgets.QPushButton("Close Session")
+        self.close_session_button.setObjectName("measurementSessionClose")
+        self.close_session_button.setProperty("commandId", "session.close")
+        self.close_session_button.setToolTip(
+            "Seal the session index after every child measurement is sealed."
+        )
+        self.close_session_button.clicked.connect(self._close_measurement_session)
+        run_layout.addWidget(self.close_session_button)
+        package_status_layout = QtWidgets.QVBoxLayout()
+        package_status_layout.setContentsMargins(0, 0, 0, 0)
+        package_status_layout.setSpacing(2)
+        self.session_status_label = QtWidgets.QLabel(
+            "Session: IDLE · Start Session to prepare a complete evidence folder"
+        )
+        self.session_status_label.setObjectName("measurementPackageLifecycle")
+        self.session_status_label.setWordWrap(True)
+        package_status_layout.addWidget(self.session_status_label)
+        self.measurement_status_label = QtWidgets.QLabel("Measurement: NONE")
+        self.measurement_status_label.setObjectName("measurementPackageCurrent")
+        self.measurement_status_label.setWordWrap(True)
+        package_status_layout.addWidget(self.measurement_status_label)
+        self.session_step_label = QtWidgets.QLabel(
+            "Workflow: Start Session → Detection → Post capture → Finalize"
+        )
+        self.session_step_label.setObjectName("measurementPackageStep")
+        self.session_step_label.setWordWrap(True)
+        package_status_layout.addWidget(self.session_step_label)
+        self.evidence_summary_label = QtWidgets.QLabel("Evidence: PENDING")
+        self.evidence_summary_label.setObjectName("measurementPackageEvidence")
+        self.evidence_summary_label.setWordWrap(True)
+        package_status_layout.addWidget(self.evidence_summary_label)
+        run_layout.addLayout(package_status_layout, 1)
         run_layout.addStretch(1)
         layout.addWidget(run_group)
 
@@ -1642,12 +2408,17 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         self.preview_splitter.setChildrenCollapsible(False)
         self.preview_row = self.preview_splitter
         preview_row = self.preview_splitter
-        self.previews = {side: CameraPreview(side) for side in ("left", "right")}
+        self.previews = {
+            side: CameraPreview(side, crop_to_fill=False, lock_chrome_height=True)
+            for side in ("left", "right")
+        }
         for side in ("left", "right"):
             preview = self.previews[side]
             preview.setMinimumHeight(280)
+            preview.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
             preview_row.addWidget(preview)
         preview_row.setMinimumHeight(280)
+        preview_row.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         preview_row.setStretchFactor(0, 1)
         preview_row.setStretchFactor(1, 1)
         upstream_layout.addWidget(preview_row)
@@ -1681,6 +2452,81 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         # content.  Keeping it as the first child of the details page lets the
         # outer Measurement workspace scroll move the whole page together.
         details_layout.addWidget(upstream_group)
+
+        method_group = QtWidgets.QGroupBox("Measurement method")
+        method_layout = QtWidgets.QGridLayout(method_group)
+        method_layout.setContentsMargins(6, 6, 6, 6)
+        method_layout.setHorizontalSpacing(8)
+        self.measurement_method_combo = QtWidgets.QComboBox()
+        self.measurement_method_combo.setObjectName("measurementMethodCombo")
+        self.measurement_method_combo.setToolTip(
+            "현재 exact K,D와 필요한 live/candidate 입력이 모두 준비된 방식만 표시합니다. "
+            "선택 방식이 준비 상태를 잃으면 이 Measurement가 생성될 때 고정된 fallback "
+            "순서로 자동 전환합니다."
+        )
+        self.measurement_method_combo.currentIndexChanged.connect(
+            self._measurement_method_selected
+        )
+        self.measurement_method_status = QtWidgets.QLabel("준비된 측정 방식 확인 중")
+        self.measurement_method_status.setObjectName("statusStrip")
+        self.measurement_method_status.setWordWrap(True)
+        method_layout.addWidget(QtWidgets.QLabel("Ready method"), 0, 0)
+        method_layout.addWidget(self.measurement_method_combo, 0, 1)
+        method_layout.addWidget(self.measurement_method_status, 1, 0, 1, 2)
+        self.measurement_fill_method_combo = QtWidgets.QComboBox()
+        self.measurement_fill_method_combo.setObjectName("measurementFillMethodCombo")
+        self.measurement_fill_method_combo.setToolTip(
+            "방식이 직접 제공하는 축은 OWN으로 잠깁니다. 미관측 회전축은 PX4, "
+            "미관측 이동축은 GNSS 토글로 이 Measurement에서만 채웁니다."
+        )
+        self.measurement_fill_method_combo.currentIndexChanged.connect(
+            self._measurement_fill_method_changed
+        )
+        method_layout.addWidget(QtWidgets.QLabel("DOF fill for"), 2, 0)
+        method_layout.addWidget(self.measurement_fill_method_combo, 2, 1)
+        fill_widget = QtWidgets.QWidget()
+        fill_layout = QtWidgets.QGridLayout(fill_widget)
+        fill_layout.setContentsMargins(0, 0, 0, 0)
+        fill_layout.setHorizontalSpacing(6)
+        fill_layout.setVerticalSpacing(3)
+        dof_columns = (
+            ("roll_deg", "Roll"),
+            ("pitch_deg", "Pitch"),
+            ("yaw_deg", "Yaw"),
+            ("north_m", "North"),
+            ("east_m", "East"),
+            ("down_m", "Down"),
+        )
+        for column, (_dof, label) in enumerate(dof_columns, start=1):
+            fill_layout.addWidget(QtWidgets.QLabel(label), 0, column)
+        self.measurement_fill_buttons: dict[str, QtWidgets.QPushButton] = {}
+        for row, side in enumerate(("left", "right"), start=1):
+            fill_layout.addWidget(QtWidgets.QLabel(side.title()), row, 0)
+            for column, (dof, _label) in enumerate(dof_columns, start=1):
+                component = f"{side}.{dof}"
+                button = QtWidgets.QPushButton("--")
+                button.setCheckable(True)
+                button.setObjectName(
+                    "measurementFill" + side.title() + "".join(part.title() for part in dof.split("_"))
+                )
+                button.setProperty("component", component)
+                button.toggled.connect(
+                    lambda checked, component=component: self._measurement_fill_toggled(
+                        component,
+                        checked,
+                    )
+                )
+                self.measurement_fill_buttons[component] = button
+                fill_layout.addWidget(button, row, column)
+        self.measurement_fill_status = QtWidgets.QLabel(
+            "New Measurement 생성 후 Detection 전에 fill source를 선택할 수 있습니다."
+        )
+        self.measurement_fill_status.setObjectName("statusStrip")
+        self.measurement_fill_status.setWordWrap(True)
+        method_layout.addWidget(fill_widget, 3, 0, 1, 2)
+        method_layout.addWidget(self.measurement_fill_status, 4, 0, 1, 2)
+        method_layout.setColumnStretch(1, 1)
+        details_layout.addWidget(method_group)
 
         quality_group = QtWidgets.QGroupBox("Quality")
         quality_layout = QtWidgets.QGridLayout(quality_group)
@@ -1790,20 +2636,6 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             self.settings_widgets[key] = widget
             return widget
 
-        def int_spin(
-            key: str,
-            minimum: int,
-            maximum: int,
-            suffix: str = "",
-        ) -> QtWidgets.QSpinBox:
-            widget = QtWidgets.QSpinBox()
-            widget.setRange(minimum, maximum)
-            value = settings.get(key)
-            widget.setValue(int(value if value is not None else minimum))
-            widget.setSuffix(suffix)
-            self.settings_widgets[key] = widget
-            return widget
-
         def toggle(key: str, label: str) -> QtWidgets.QPushButton:
             widget = QtWidgets.QPushButton(label)
             widget.setCheckable(True)
@@ -1825,25 +2657,6 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         geometry_form.setColumnStretch(1, 1)
         geometry_form.setColumnStretch(3, 1)
         geometry_fields = (
-            (
-                "Intrinsics",
-                combo("intrinsics_source", (("Checkerboard", "checkerboard"), ("Manual fallback", "manual"))),
-            ),
-            (
-                "Focal length",
-                double_spin("focal_px", 1.0, 100000.0, 3, " px"),
-            ),
-            (
-                "Baseline",
-                combo(
-                    "distance_mode",
-                    (("Pixhawk attitude + GPS/RTK NED", "pixhawk"), ("Checkerboard stereo R/T", "checkerboard")),
-                ),
-            ),
-            (
-                "YOLO input",
-                int_spin("yolo_input_size_px", 160, 1920, " px"),
-            ),
             (
                 "Confidence",
                 double_spin("yolo_confidence", 0.01, 1.0, 3, ""),
@@ -1915,8 +2728,29 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         self.history.horizontalHeader().setStretchLastSection(True)
         self.history.clicked.connect(self._inspect_history_row)
         details_layout.addWidget(self.history, 1)
+
+        self.session_details_group = QtWidgets.QGroupBox("Session Details")
+        session_details_layout = QtWidgets.QHBoxLayout(self.session_details_group)
+        session_details_layout.setContentsMargins(6, 6, 6, 6)
+        session_details_label = QtWidgets.QLabel(
+            "Review measurement packages, captures, ULogs, media, and saved-file evidence."
+        )
+        session_details_label.setObjectName("compactContract")
+        session_details_label.setWordWrap(True)
+        session_details_layout.addWidget(session_details_label, 1)
+        self.session_details_button = QtWidgets.QPushButton("Open Session Details")
+        self.session_details_button.setObjectName("measurementSessionDetails")
+        self.session_details_button.setToolTip(
+            "Open optional evidence, capture, ULog, and saved-file review tools."
+        )
+        self.session_details_button.setEnabled(open_session_details is not None)
+        if open_session_details is not None:
+            self.session_details_button.clicked.connect(open_session_details)
+        session_details_layout.addWidget(self.session_details_button)
+        details_layout.addWidget(self.session_details_group)
         layout.addWidget(details, 1)
         self._connect_panes()
+        self._refresh_package_controls({}, getattr(self.backend, "panel", self.backend))
 
     @classmethod
     def preview_pair_orientation(cls, width: int, height: int) -> QtCore.Qt.Orientation:
@@ -1965,21 +2799,35 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         if required_height <= 0:
             return
         target_height = max(280, required_height)
-        if self.preview_splitter.minimumHeight() == target_height:
+        if (
+            self.preview_splitter.minimumHeight() == target_height
+            and self.preview_splitter.maximumHeight() == target_height
+        ):
             return
-        # setFixedHeight() pins both the minimum and maximum height, so any
-        # heightForWidth() fluctuation forces an immediate hard resize.  That
-        # resize can toggle the ancestor QScrollArea's AsNeeded vertical
-        # scrollbar, which changes this widget's width, which changes
-        # heightForWidth() again -- an infinite grow/shrink loop.  A
-        # minimum-only constraint (mirroring CameraWorkspace) lets the layout
-        # settle instead of re-forcing the exact pixel height every pass.
-        self.preview_splitter.setMaximumHeight(16777215)
+        # Measurement is a fixed-aspect inspection surface.  Leaving the
+        # maximum height unconstrained lets the outer QScrollArea stretch the
+        # splitter, after which KeepAspectRatioByExpanding crops the live image
+        # and makes it look zoomed.  Recompute the natural height on resize,
+        # then clamp both bounds to that value.
         self.preview_splitter.setMinimumHeight(target_height)
+        self.preview_splitter.setMaximumHeight(target_height)
+
+    def refresh_preview_layout(self) -> None:
+        """Clamp the Measurement preview after navigation changes its viewport."""
+
+        self._fit_preview_layout()
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802 - Qt override.
         super().resizeEvent(event)
         self._update_preview_pair_orientation()
+        QtCore.QTimer.singleShot(0, self._fit_preview_layout)
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:  # noqa: N802 - Qt override.
+        super().showEvent(event)
+        # The first show can establish the final central-widget geometry
+        # without delivering a resize event to this page.  Fit once after the
+        # layout has settled so the first camera frame cannot trigger a large
+        # orientation/height correction.
         QtCore.QTimer.singleShot(0, self._fit_preview_layout)
 
     def _inspect_upstream(self, key: str) -> None:
@@ -2048,6 +2896,188 @@ class MeasurementWorkspace(QtWidgets.QWidget):
                 payload[key] = widget.value()
         return payload
 
+    def _measurement_fill_method_changed(self, _index: int) -> None:
+        if bool(self.measurement_fill_method_combo.property("refreshing")):
+            return
+        self._render_measurement_fill_controls()
+
+    def _render_measurement_fill_controls(self) -> None:
+        row = self.measurement_fill_method_combo.currentData(QtCore.Qt.UserRole + 1)
+        capability = dict(row) if isinstance(row, Mapping) else {}
+        components = capability.get("components")
+        component_rows = dict(components) if isinstance(components, Mapping) else {}
+        locked_count = 0
+        fill_count = 0
+        unavailable_count = 0
+        for component, button in self.measurement_fill_buttons.items():
+            values = component_rows.get(component)
+            state = dict(values) if isinstance(values, Mapping) else {}
+            button.setProperty("refreshing", True)
+            try:
+                provided = bool(state.get("provided", False))
+                editable = bool(state.get("editable", False))
+                locked = bool(state.get("locked", True))
+                source = str(state.get("source") or "none")
+                compatible = str(state.get("compatible_fill_source") or "")
+                if provided:
+                    button.setText("OWN")
+                    button.setChecked(True)
+                    button.setEnabled(False)
+                    locked_count += 1
+                elif editable:
+                    button.setText("PX4" if compatible == "live_pixhawk" else "GNSS")
+                    button.setChecked(bool(state.get("fill_enabled", False)))
+                    button.setEnabled(not locked)
+                    fill_count += int(button.isChecked())
+                else:
+                    button.setText("N/A")
+                    button.setChecked(False)
+                    button.setEnabled(False)
+                    unavailable_count += 1
+                readiness = "ready" if bool(state.get("source_ready", False)) else "not ready"
+                button.setToolTip(
+                    f"{component} · source={source} · {state.get('reason', '')} · {readiness}"
+                )
+            finally:
+                button.setProperty("refreshing", False)
+        method_id = str(capability.get("method_id") or "")
+        if not method_id:
+            self.measurement_fill_status.setText("구성할 Measurement method가 없습니다.")
+            return
+        policy_state = "LOCKED" if any(
+            bool(dict(value).get("locked", True))
+            for value in component_rows.values()
+            if isinstance(value, Mapping) and bool(dict(value).get("editable", False))
+        ) else "EDITABLE"
+        self.measurement_fill_status.setText(
+            f"{policy_state} · method={method_id} · own={locked_count} · "
+            f"fill enabled={fill_count} · unavailable={unavailable_count}"
+        )
+
+    def _measurement_fill_toggled(self, component: str, checked: bool) -> None:
+        button = self.measurement_fill_buttons[component]
+        if bool(button.property("refreshing")):
+            return
+        method_id = self.measurement_fill_method_combo.currentData()
+        configurator = getattr(self.backend, "configure_measurement_method_fill", None)
+        if not method_id or not callable(configurator):
+            return
+        try:
+            snapshot = configurator(
+                {
+                    "method_id": str(method_id),
+                    "component": component,
+                    "enabled": bool(checked),
+                }
+            )
+        except Exception as exc:
+            self.measurement_fill_status.setText(f"DOF fill 변경 실패: {exc}")
+            button.setProperty("refreshing", True)
+            try:
+                button.setChecked(not checked)
+            finally:
+                button.setProperty("refreshing", False)
+            return
+        if isinstance(snapshot, Mapping):
+            self._refresh_measurement_methods(snapshot)
+
+    def _measurement_method_selected(self, _index: int) -> None:
+        method_id = self.measurement_method_combo.currentData()
+        if not method_id or bool(self.measurement_method_combo.property("refreshing")):
+            return
+        selector = getattr(self.backend, "select_measurement_method", None)
+        if not callable(selector):
+            self.measurement_method_status.setText("Measurement method selector unavailable")
+            return
+        try:
+            snapshot = selector({"method_id": str(method_id)})
+        except Exception as exc:
+            self.measurement_method_status.setText(f"방식 선택 실패: {exc}")
+            return
+        if isinstance(snapshot, Mapping):
+            self._refresh_measurement_methods(snapshot)
+
+    def _measurement_methods_snapshot(self) -> dict[str, object]:
+        reader = getattr(self.backend, "measurement_methods_snapshot", None)
+        if not callable(reader):
+            return {}
+        try:
+            value = reader()
+        except Exception:
+            return {}
+        return dict(value) if isinstance(value, Mapping) else {}
+
+    def _refresh_measurement_methods(self, snapshot: Mapping[str, object] | None = None) -> None:
+        values = dict(snapshot or self._measurement_methods_snapshot())
+        ready = values.get("ready_methods")
+        rows = [dict(row) for row in ready if isinstance(row, Mapping)] if isinstance(ready, list) else []
+        raw_capabilities = values.get("method_capabilities")
+        capabilities = (
+            [dict(row) for row in raw_capabilities if isinstance(row, Mapping)]
+            if isinstance(raw_capabilities, list)
+            else []
+        )
+        selected_method = str(values.get("selected_method_id") or "")
+        selected_instance = str(values.get("selected_instance_id") or "")
+        selection_reason = str(values.get("selection_reason") or "")
+        previous_fill_method = str(self.measurement_fill_method_combo.currentData() or "")
+        self.measurement_fill_method_combo.setProperty("refreshing", True)
+        try:
+            self.measurement_fill_method_combo.clear()
+            fill_index = 0
+            preferred_fill_method = previous_fill_method or selected_method
+            for index, capability in enumerate(capabilities):
+                method_id = str(capability.get("method_id") or "")
+                label = str(capability.get("label") or method_id)
+                state = "READY" if bool(capability.get("ready", False)) else "BLOCKED"
+                self.measurement_fill_method_combo.addItem(f"{label} · {state}", method_id)
+                self.measurement_fill_method_combo.setItemData(
+                    index,
+                    capability,
+                    QtCore.Qt.UserRole + 1,
+                )
+                if method_id == preferred_fill_method:
+                    fill_index = index
+            self.measurement_fill_method_combo.setEnabled(bool(capabilities))
+            if capabilities:
+                self.measurement_fill_method_combo.setCurrentIndex(fill_index)
+        finally:
+            self.measurement_fill_method_combo.setProperty("refreshing", False)
+        self._render_measurement_fill_controls()
+        self.measurement_method_combo.setProperty("refreshing", True)
+        try:
+            self.measurement_method_combo.clear()
+            if not rows:
+                self.measurement_method_combo.addItem("준비된 측정 방식 없음", None)
+                self.measurement_method_combo.setEnabled(False)
+                self.measurement_method_status.setText(
+                    "측정 차단 · Calibration/Alignment에서 한 방식의 K,D와 R,t 입력을 준비하세요."
+                )
+                return
+            selected_index = 0
+            for index, row in enumerate(rows):
+                method_id = str(row.get("method_id") or "")
+                label = str(row.get("label") or method_id)
+                rank = row.get("fallback_rank")
+                rank_text = "--" if rank is None else str(rank)
+                self.measurement_method_combo.addItem(f"#{rank_text} · {label}", method_id)
+                self.measurement_method_combo.setItemData(index, row, QtCore.Qt.UserRole + 1)
+                if method_id == selected_method:
+                    selected_index = index
+            self.measurement_method_combo.setEnabled(True)
+            self.measurement_method_combo.setCurrentIndex(selected_index)
+            current = rows[selected_index]
+            components = current.get("component_sources")
+            component_text = ", ".join(
+                f"{key}={value}" for key, value in dict(components or {}).items()
+            )
+            self.measurement_method_status.setText(
+                f"{selection_reason or 'selected'} · instance={selected_instance or current.get('instance_id', '--')}"
+                + (f" · {component_text}" if component_text else "")
+            )
+        finally:
+            self.measurement_method_combo.setProperty("refreshing", False)
+
     def _connect_panes(self) -> None:
         panel = getattr(self.backend, "panel", self.backend)
         clear_signal = getattr(panel, "camera_preview_cleared", None)
@@ -2058,7 +3088,18 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             pane = getattr(panel, f"{side}_pane", None)
             signal = getattr(pane, "frame_changed", None)
             if signal is not None:
-                signal.connect(lambda _label, image, metadata, side=side: self.previews[side].set_frame(image, metadata))
+                signal.connect(
+                    lambda _label, image, metadata, side=side: self._on_live_camera_frame(
+                        side, image, metadata
+                    )
+                )
+            measurement_signal = getattr(pane, "measurement_frame_changed", None)
+            if measurement_signal is not None:
+                measurement_signal.connect(
+                    lambda _label, image, metadata, side=side: self.previews[side].set_frame(
+                        image, metadata
+                    )
+                )
             detection_signal = getattr(pane, "detection_changed", None)
             if detection_signal is not None:
                 detection_signal.connect(
@@ -2067,6 +3108,13 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             stats_signal = getattr(pane, "stats_changed", None)
             if stats_signal is not None:
                 stats_signal.connect(lambda _label, stats, side=side: self.previews[side].set_metadata(stats))
+
+    def _on_live_camera_frame(self, side: str, image: QtGui.QImage, metadata: object) -> None:
+        panel = getattr(self.backend, "panel", self.backend)
+        pane = getattr(panel, f"{side}_pane", None)
+        if bool(getattr(pane, "measurement_pair_display_active", False)):
+            return
+        self.previews[side].set_frame(image, metadata)
 
     def _clear_camera_previews(self) -> None:
         for preview in self.previews.values():
@@ -2081,7 +3129,11 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             if isinstance(current, dict):
                 preview.set_metadata(current)
 
-    def _refresh_quality(self, panel: object) -> None:
+    def _refresh_quality(
+        self,
+        panel: object,
+        measurement_status: RuntimeStatus | None = None,
+    ) -> None:
         quality_sources = {
             "status": ("triangulation_quality_status_label", "3D ray triangulation 대기 중"),
             "gap": ("triangulation_quality_gap_label", "gap: --"),
@@ -2094,6 +3146,270 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             widget = getattr(panel, attribute, None)
             text = getattr(widget, "text", None)
             self.quality_labels[key].setText(str(text()) if callable(text) else default)
+        if measurement_status is not None and measurement_status.state != "VALID":
+            state = str(measurement_status.state or "NO DATA")
+            detail = str(measurement_status.detail or "measurement evidence is not current")
+            self.quality_labels["status"].setText(f"{state} · {detail}")
+
+    def _package_method(self, *names: str) -> Callable[..., object] | None:
+        panel = getattr(self.backend, "panel", self.backend)
+        for owner in (self.backend, panel):
+            for name in names:
+                method = getattr(owner, name, None)
+                if callable(method):
+                    return method
+        return None
+
+    def _measurement_package_snapshot(self) -> dict[str, object] | None:
+        reader = self._package_method("measurement_package_snapshot")
+        if reader is None:
+            return None
+        try:
+            value = reader()
+        except Exception as exc:
+            self.evidence_summary_label.setText(f"Evidence: status unavailable · {exc}")
+            return {}
+        return dict(value) if isinstance(value, Mapping) else {}
+
+    def _measurement_session_snapshot(self) -> dict[str, object] | None:
+        reader = self._package_method("measurement_session_snapshot")
+        if reader is None:
+            return None
+        try:
+            value = reader()
+        except Exception as exc:
+            self.evidence_summary_label.setText(f"Session evidence: status unavailable · {exc}")
+            return {}
+        return dict(value) if isinstance(value, Mapping) else {}
+
+    def _refresh_package_controls(
+        self,
+        runtime: Mapping[str, RuntimeStatus],
+        _panel: object | None = None,
+    ) -> None:
+        package = self._measurement_package_snapshot()
+        session = self._measurement_session_snapshot()
+        if package is None:
+            self.start_session_button.setEnabled(
+                self._package_method("begin_measurement_session", "begin_session") is not None
+            )
+            self.finalize_session_button.setEnabled(False)
+            self.new_measurement_button.setEnabled(False)
+            self.close_session_button.setEnabled(False)
+            return
+        self._apply_measurement_package_snapshot(package, runtime, session=session)
+
+    @staticmethod
+    def _package_artifact_counts(snapshot: Mapping[str, object]) -> dict[str, int]:
+        counts = {"present": 0, "missing": 0, "failed": 0, "not_applicable": 0}
+        artifacts = snapshot.get("artifacts")
+        rows = artifacts if isinstance(artifacts, (tuple, list)) else ()
+        for raw in rows:
+            if not isinstance(raw, Mapping):
+                continue
+            state = str(raw.get("state", raw.get("status", "")) or "").lower()
+            if state in counts:
+                counts[state] += 1
+        return counts
+
+    def _apply_measurement_package_snapshot(
+        self,
+        package: Mapping[str, object],
+        runtime: Mapping[str, RuntimeStatus],
+        *,
+        session: Mapping[str, object] | None = None,
+    ) -> None:
+        state = str(package.get("state", "IDLE") or "IDLE").upper()
+        session_id = str(package.get("session_id", "") or "")
+        measurement_id = str(package.get("measurement_id", "") or "")
+        revision = str(package.get("revision", "") or "")
+        detail = str(package.get("detail", package.get("error", "")) or "")
+        identity = " · ".join(value for value in (session_id, revision) if value)
+        session_state = str(
+            (session or {}).get("state", package.get("session_state", "")) or ""
+        ).upper()
+        if session is not None:
+            rows = (session or {}).get("measurements")
+            measurement_count = len(rows) if isinstance(rows, (tuple, list)) else 0
+            self.session_status_label.setText(
+                f"Session: {session_state or 'IDLE'}"
+                + (f" · {session_id}" if session_id else "")
+                + f" · measurements={measurement_count}"
+            )
+            visible_measurement_state = "NONE" if not measurement_id and state == "IDLE" else state
+            measurement_text = f"Measurement: {visible_measurement_state}"
+            if measurement_id:
+                measurement_text += f" · {measurement_id} · {revision}"
+            if detail:
+                measurement_text += f" · {_compact_text(detail, limit=96)}"
+            self.measurement_status_label.setText(measurement_text)
+        else:
+            status_text = f"Session: {state}"
+            if identity:
+                status_text += f" · {identity}"
+            if detail:
+                status_text += f" · {_compact_text(detail, limit=96)}"
+            self.session_status_label.setText(status_text)
+            self.measurement_status_label.setText(
+                f"Measurement: {state}" + (f" · {revision}" if revision else "")
+            )
+
+        detection_started = bool(package.get("detection_started", False))
+        detection_completed = bool(package.get("detection_completed", False))
+        step_text = {
+            "IDLE": "Workflow: ready for Start Session",
+            "POST_CAPTURE": "Workflow: Post evidence · ready to Finalize",
+            "VERIFYING": "Workflow: draining producers and verifying inventory",
+            "SEALED_COMPLETE": "Workflow: sealed with complete evidence",
+            "SEALED_INCOMPLETE": "Workflow: sealed with documented missing evidence",
+            "RECOVERABLE": "Workflow: recoverable spool · retry Finalize",
+            "INTEGRITY_FAILED": "Workflow: sealed data failed integrity verification",
+        }.get(state)
+        if session is not None and state == "IDLE" and session_state == "OPEN":
+            step_text = "Workflow: session open · create New Measurement"
+        elif session is not None and session_state == "SEALED":
+            step_text = "Workflow: session sealed · start a new session when ready"
+        if state == "COLLECTING":
+            step_text = (
+                "Workflow: Detection running"
+                if detection_started and not detection_completed
+                else "Workflow: Pre evidence · run Detection once"
+            )
+        self.session_step_label.setText(step_text or f"Workflow: {state}")
+
+        completeness = package.get("evidence_completeness")
+        completeness = completeness if isinstance(completeness, Mapping) else {}
+        evidence_state = str(
+            completeness.get(
+                "status",
+                package.get("completeness", package.get("completeness_state", "")),
+            )
+            or ""
+        ).upper()
+        if not evidence_state:
+            if state == "SEALED_COMPLETE":
+                evidence_state = "COMPLETE"
+            elif state in {"SEALED_INCOMPLETE", "INTEGRITY_FAILED"}:
+                evidence_state = "INCOMPLETE"
+            else:
+                evidence_state = "PENDING"
+        counts = self._package_artifact_counts(package)
+        missing_required = completeness.get("missing_required")
+        if isinstance(missing_required, (tuple, list)):
+            counts["missing"] = max(counts["missing"], len(missing_required))
+        count_text = ", ".join(
+            f"{key}={value}"
+            for key, value in counts.items()
+            if value
+        )
+        self.evidence_summary_label.setText(
+            f"Evidence: {evidence_state}" + (f" · {count_text}" if count_text else "")
+        )
+
+        begin_method = self._package_method("begin_measurement_session", "begin_session")
+        next_method = self._package_method("begin_measurement", "begin_next_measurement")
+        close_method = self._package_method("close_measurement_session", "close_session")
+        finalize_method = self._package_method(
+            "finalize_measurement_package", "seal_session", "finalize_session"
+        )
+        if session is not None:
+            self.start_session_button.setEnabled(
+                begin_method is not None and session_state in {"IDLE", "SEALED"}
+            )
+            self.new_measurement_button.setEnabled(
+                next_method is not None
+                and session_state == "OPEN"
+                and state in {"IDLE", "SEALED_COMPLETE", "SEALED_INCOMPLETE"}
+            )
+            self.close_session_button.setEnabled(
+                close_method is not None
+                and session_state in {"OPEN", "CLOSING", "RECOVERABLE"}
+                and state in {"IDLE", "SEALED_COMPLETE", "SEALED_INCOMPLETE"}
+            )
+        else:
+            self.start_session_button.setEnabled(
+                begin_method is not None
+                and state
+                in {
+                    "IDLE",
+                    "SEALED_COMPLETE",
+                    "SEALED_INCOMPLETE",
+                    "INTEGRITY_FAILED",
+                }
+            )
+            self.new_measurement_button.setEnabled(False)
+            self.close_session_button.setEnabled(False)
+        self.finalize_session_button.setEnabled(
+            finalize_method is not None and state in {"POST_CAPTURE", "RECOVERABLE"}
+        )
+        detection_status = runtime.get("detection")
+        detection_active = bool(
+            detection_status
+            and detection_status.state in {"RUNNING", "STARTING"}
+        )
+        self.control_buttons["detection.toggle"].setEnabled(
+            self.invoke_command is not None
+            and (
+                detection_active
+                or (state == "COLLECTING" and not detection_completed)
+            )
+        )
+
+    def _run_package_action(
+        self,
+        names: tuple[str, ...],
+        *,
+        unavailable_text: str,
+        pending_text: str,
+        action: Callable[[], object] | None = None,
+    ) -> None:
+        method = action or self._package_method(*names)
+        if method is None:
+            self.session_status_label.setText(unavailable_text)
+            return
+        try:
+            result = method()
+        except Exception as exc:
+            self.session_status_label.setText(f"Session: ERROR · {exc}")
+            return
+        package = dict(result) if isinstance(result, Mapping) else self._measurement_package_snapshot()
+        if package:
+            self._apply_measurement_package_snapshot(
+                package,
+                {},
+                session=self._measurement_session_snapshot(),
+            )
+        else:
+            self.session_status_label.setText(pending_text)
+
+    def _begin_measurement_session(self) -> None:
+        self._run_package_action(
+            ("begin_measurement_session", "begin_session"),
+            unavailable_text="Session: Start Session control unavailable",
+            pending_text="Session: start requested",
+            action=self.begin_session_action,
+        )
+
+    def _finalize_measurement_package(self) -> None:
+        self._run_package_action(
+            ("finalize_measurement_package", "seal_session", "finalize_session"),
+            unavailable_text="Session: Finalize control unavailable",
+            pending_text="Session: Finalize requested · waiting for producer drain",
+        )
+
+    def _begin_next_measurement(self) -> None:
+        self._run_package_action(
+            ("begin_measurement", "begin_next_measurement"),
+            unavailable_text="Measurement: New Measurement control unavailable",
+            pending_text="Measurement: start requested",
+        )
+
+    def _close_measurement_session(self) -> None:
+        self._run_package_action(
+            ("close_measurement_session", "close_session"),
+            unavailable_text="Session: Close Session control unavailable",
+            pending_text="Session: close requested",
+        )
 
     def refresh_run_controls(self, snapshot: dict[str, RuntimeStatus], panel: object) -> None:
         camera = snapshot.get("camera.left")
@@ -2107,35 +3423,50 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             "LIVE",
             "STARTING",
         }
-        clock_change_active = getattr(panel, "wiris_time_sync_thread", None) is not None
         self.control_buttons["camera.toggle"].setText(
             "Stop preview" if camera_state in {"LIVE", "STARTING"} else "Preview"
         )
         self.control_buttons["detection.toggle"].setText(
             "Stop detection" if detection_state in {"RUNNING", "STARTING"} else "Detection"
         )
-        self.control_buttons["recording.toggle"].setText(
-            "Stop recording" if recording_state in {"ACTIVE", "FINALIZING"} else "Record"
-        )
         self.control_buttons["camera.toggle"].setEnabled(not recording_locked)
         self.control_buttons["detection.toggle"].setEnabled(
-            not (recording_locked and camera_running)
+            not (recording_locked and camera_running and not bool(getattr(panel, "_automatic_session_recording", False)))
         )
-        self.control_buttons["recording.toggle"].setEnabled(
-            recording_state not in {"FINALIZING", "RECOVERABLE"}
-            and (recording_locked or not clock_change_active)
-        )
-        has_session_data = bool(getattr(panel, "recording_session_id", "")) or bool(
-            getattr(panel, "distance_history", [])
-        )
-        self.control_buttons["session.save"].setEnabled(
-            not recording_locked and (has_session_data or recording_state == "RECOVERABLE")
-        )
+        session_id = str(getattr(panel, "recording_session_id", "") or "")
+        automatic = bool(getattr(panel, "_automatic_session_recording", False))
+        if recording_state == "ACTIVE" and automatic:
+            self.session_status_label.setText(
+                f"Session: recording automatically · {session_id or 'preparing'}"
+            )
+        elif recording_state == "FINALIZING":
+            self.session_status_label.setText(
+                f"Session: saving · {session_id or 'current run'}"
+            )
+        elif recording_state == "RECOVERABLE":
+            self.session_status_label.setText(
+                f"Session: save needs a retry · {session_id or 'recovered run'}"
+            )
+        elif recording_state == "SAVED":
+            self.session_status_label.setText(
+                f"Session: saved · {session_id or 'latest run'}"
+            )
+        elif recording_state == "ACTIVE":
+            self.session_status_label.setText(
+                f"Session: manual evidence recording · {session_id or 'current run'}"
+            )
+        else:
+            self.session_status_label.setText(
+                "Session: automatic · starts with Detection and saves when it stops"
+            )
+        self._refresh_package_controls(snapshot, panel)
 
     def refresh(self, snapshot: dict[str, RuntimeStatus]) -> None:
         panel = getattr(self.backend, "panel", self.backend)
         self._refresh_preview_metadata(panel)
-        self._refresh_quality(panel)
+        measurement_status = snapshot.get("measurement")
+        self._refresh_quality(panel, measurement_status)
+        self._refresh_measurement_methods()
         self.refresh_run_controls(snapshot, panel)
         for key, value in self.upstream_values.items():
             status = snapshot.get(key)
@@ -2162,10 +3493,17 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         except (TypeError, IndexError):
             point = None
         if point is not None:
-            self.values["range"].set_value(getattr(point, "distance_m", None), unit="m", frame=MEASUREMENT_FRAME, source="DistanceHistoryPoint")
-            self.values["forward"].set_value(getattr(point, "forward_m", None), unit="m", frame=MEASUREMENT_FRAME, source="DistanceHistoryPoint")
-            self.values["right"].set_value(getattr(point, "right_m", None), unit="m", frame=MEASUREMENT_FRAME, source="DistanceHistoryPoint")
-            self.values["down"].set_value(getattr(point, "down_m", None), unit="m", frame=MEASUREMENT_FRAME, source="DistanceHistoryPoint")
+            current_valid = bool(measurement_status and measurement_status.state == "VALID")
+            rejected = bool(
+                measurement_status
+                and measurement_status.state in {"ERROR", "REJECTED"}
+            )
+            result_valid = True if current_valid else False if rejected else None
+            result_age_s = measurement_status.age_s if measurement_status else None
+            self.values["range"].set_value(getattr(point, "distance_m", None), unit="m", frame=MEASUREMENT_FRAME, source="DistanceHistoryPoint", age_s=result_age_s, valid=result_valid)
+            self.values["forward"].set_value(getattr(point, "forward_m", None), unit="m", frame=MEASUREMENT_FRAME, source="DistanceHistoryPoint", age_s=result_age_s, valid=result_valid)
+            self.values["right"].set_value(getattr(point, "right_m", None), unit="m", frame=MEASUREMENT_FRAME, source="DistanceHistoryPoint", age_s=result_age_s, valid=result_valid)
+            self.values["down"].set_value(getattr(point, "down_m", None), unit="m", frame=MEASUREMENT_FRAME, source="DistanceHistoryPoint", age_s=result_age_s, valid=result_valid)
         else:
             for value in self.values.values():
                 value.set_value(None, unit="m", frame=MEASUREMENT_FRAME, source="no accepted measurement")
@@ -2251,8 +3589,13 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         self.indicators: dict[str, StatusIndicator] = {}
         for key, label in (("pixhawk.left", "P1"), ("pixhawk.right", "P2")):
             indicator = StatusIndicator(label)
+            # The detail line contains a live PX4 timestamp. Keep the card
+            # width independent of that changing string so the Connection
+            # row does not reflow on every attitude sample.
+            indicator.setFixedWidth(PIXHAWK_CONNECTION_INDICATOR_WIDTH_PX)
             self.indicators[key] = indicator
             status_layout.addWidget(indicator)
+        status_layout.addStretch(1)
         layout.addWidget(status_group)
 
         recovery_group = QtWidgets.QGroupBox("ETH MAV")
@@ -2628,10 +3971,13 @@ class PixhawkWorkspace(QtWidgets.QWidget):
                 )
                 _sync_table_rows(self.px4_parameter_group_models[side][calibration.key], rows)
                 reset_button = self.px4_parameter_reset_buttons[side][calibration.key]
+                manager = (getattr(panel, "px4_mag_managers", {}) or {}).get(side)
+                disarmed = not bool(getattr(manager, "armed", False))
                 reset_button.setEnabled(
                     calibration.resettable
                     and self._invoke_command_available
                     and connected
+                    and disarmed
                     and not active
                     and not self._recording_locked
                 )
@@ -3373,6 +4719,52 @@ class BaseGnssWorkspace(QtWidgets.QWidget):
         "NETWORK_RTK_DIRECT": "Network RTK Direct",
     }
 
+    # Ordered acquisition chain for NETWORK_ASSISTED_FIXED_BASE / NETWORK_RTK_DIRECT:
+    # position in this tuple is the stage number shown to the user. States outside
+    # this chain (fault/terminal/other-mode states) are labelled but not numbered.
+    ACQUISITION_STAGES: tuple[tuple[str, str], ...] = (
+        # DISCONNECTED/CONFIGURED describe the operation-state-machine
+        # session, not the Base serial link -- the serial link is shown
+        # separately in the "Base receiver" panel's Connection field, and
+        # can already be CONNECTED while this still reads stage 1: Start
+        # NTRIP is what actually advances the state machine past here.
+        ("DISCONNECTED", "GNSS 세션 미시작 (NTRIP Start 대기)"),
+        ("CONFIGURED", "운용 설정 적용됨 · NTRIP Start 대기"),
+        ("NTRIP_CONNECTING", "NTRIP 접속 중"),
+        ("NTRIP_ACTIVE", "NTRIP 보정 수신 중"),
+        # These two stage names ("float"/"fixed") name what the app is
+        # WAITING for, not the receiver's current carrier-solution state --
+        # BASE_AS_ROVER_FLOAT starts unconditionally right after NTRIP_ACTIVE,
+        # before the receiver has any RTK solution at all. Check the
+        # "GNSS Fixed 단계 (수신기 raw)" field for the receiver's actual
+        # live fix quality (NO FIX/3D FIX/RTK FLOAT/RTK FIXED).
+        ("BASE_AS_ROVER_FLOAT", "수신기 RTK Fix 수렴 대기 중"),
+        ("BASE_AS_ROVER_FIXED", "수신기 RTK Fixed 획득 · 좌표 수집 시작"),
+        ("FIXED_COORDINATE_COLLECTING", "좌표 안정성 검증 중"),
+        ("FIXED_COORDINATE_VALIDATED", "좌표 검증 완료"),
+        ("BASE_RECONFIGURING", "Base를 고정 기준점으로 재설정 중"),
+        ("LOCAL_RTCM_ACTIVE", "Base 활성화 완료 · 자체 RTCM 송출 중"),
+    )
+    _ACQUISITION_STAGE_INDEX: dict[str, int] = {
+        name: index for index, (name, _label) in enumerate(ACQUISITION_STAGES, start=1)
+    }
+    _ACQUISITION_STAGE_LABEL: dict[str, str] = dict(ACQUISITION_STAGES)
+    _ACQUISITION_STAGE_TOTAL = len(ACQUISITION_STAGES)
+
+    OTHER_STATE_LABELS: dict[str, str] = {
+        "INITIALIZING": "초기화 중",
+        "BASE_SURVEYING": "자체 Survey-in 진행 중",
+        "ROVERS_CONVERGING": "로버 수렴 대기 중",
+        "ALIGNMENT_COLLECTING": "정렬 데이터 수집 중",
+        "ALIGNMENT_VALID": "정렬 완료",
+        "READY": "측정 준비 완료",
+        "MEASURING": "측정 중",
+        "DEGRADED": "성능 저하",
+        "FAULT": "오류 발생",
+        "INVALIDATED": "무효화됨",
+        "STOPPED": "중지됨",
+    }
+
     def __init__(
         self,
         backend: object,
@@ -3392,11 +4784,39 @@ class BaseGnssWorkspace(QtWidgets.QWidget):
         layout.setSpacing(6)
         layout.addWidget(WorkspaceHeader("Base GNSS"))
 
+        # Fixed 3-column x 2-row action grid. Survey-in and NTRIP start/stop
+        # share a cell with their counterpart because refresh() never makes
+        # both visible at once (local_mode vs network_mode are exclusive),
+        # so the visible grid always stays a clean, fully-packed 3x2 layout
+        # regardless of which operation mode is active.
+        actions = QtWidgets.QGridLayout()
+        self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
+        for command_id, label, row, col in (
+            ("gnss.base_discover", "Find Base", 0, 0),
+            ("gnss.base_connect", "Connect", 0, 1),
+            ("gnss.base_disconnect", "Disconnect", 0, 2),
+            ("gnss.survey_start", "Start Survey-in", 1, 0),
+            ("gnss.ntrip_start", "Start NTRIP", 1, 0),
+            ("gnss.survey_stop", "Stop Survey-in", 1, 1),
+            ("gnss.ntrip_stop", "Stop NTRIP", 1, 1),
+            ("gnss.ntrip_forget_password", "Forget NTRIP password", 1, 2),
+        ):
+            button = _command_button(label, command_id, invoke_command)
+            self.operation_buttons[command_id] = button
+            actions.addWidget(button, row, col)
+        layout.addLayout(actions)
+
         summary_group = QtWidgets.QGroupBox("Current state")
         summary_layout = QtWidgets.QGridLayout(summary_group)
         self.summary_values: dict[str, EngineeringValue] = {}
         for index, (key, label) in enumerate(
-            (("mode", "Mode"), ("state", "Operation"), ("source", "Correction source"), ("rtcm", "RTCM stream"))
+            (
+                ("progress", "진행 단계"),
+                ("mode", "Mode"),
+                ("state", "Operation (raw)"),
+                ("source", "Correction source"),
+                ("rtcm", "RTCM stream"),
+            )
         ):
             value = EngineeringValue(label)
             self.summary_values[key] = value
@@ -3406,10 +4826,12 @@ class BaseGnssWorkspace(QtWidgets.QWidget):
         self.serial_group = QtWidgets.QGroupBox("Base receiver")
         serial_layout = QtWidgets.QGridLayout(self.serial_group)
         self.serial_values: dict[str, EngineeringValue] = {}
-        for index, (key, label) in enumerate((("connection", "Connection"), ("device", "Device"), ("baud", "Baud"))):
+        for index, (key, label) in enumerate(
+            (("connection", "Connection"), ("device", "Device"), ("baud", "Baud"), ("satellites", "Satellites"))
+        ):
             value = EngineeringValue(label)
             self.serial_values[key] = value
-            serial_layout.addWidget(value, 0, index)
+            serial_layout.addWidget(value, index // 4, index % 4)
         layout.addWidget(self.serial_group)
 
         self.candidate_group = QtWidgets.QGroupBox("Discovered Base receivers")
@@ -3442,7 +4864,7 @@ class BaseGnssWorkspace(QtWidgets.QWidget):
         layout.addWidget(self.candidate_group)
         self._candidate_signature: tuple[tuple[object, ...], ...] = ()
 
-        self.survey_group = QtWidgets.QGroupBox("Survey-in")
+        self.survey_group = QtWidgets.QGroupBox("Survey-in (수신기 자체 관측치)")
         survey_layout = QtWidgets.QGridLayout(self.survey_group)
         self.survey_values: dict[str, EngineeringValue] = {}
         for index, (key, label) in enumerate(
@@ -3472,6 +4894,7 @@ class BaseGnssWorkspace(QtWidgets.QWidget):
                 ("status", "Caster response"),
                 ("transport", "Transport"),
                 ("rtcm", "RTCM"),
+                ("coverage", "RTCM 완전성 (관측치 포함?)"),
                 ("reconnects", "Reconnects"),
                 ("error", "Last error"),
             )
@@ -3488,7 +4911,8 @@ class BaseGnssWorkspace(QtWidgets.QWidget):
             (
                 ("position", "WGS84 position"),
                 ("height", "Height"),
-                ("fix", "Base fix"),
+                ("gnss_fix_stage", "GNSS Fixed 단계 (수신기 raw)"),
+                ("fix", "Base fix (임시 · 좌표 확보 단계)"),
                 ("samples", "Samples"),
                 ("scatter", "Scatter H/V"),
                 ("reconfigure", "Apply verification"),
@@ -3510,6 +4934,7 @@ class BaseGnssWorkspace(QtWidgets.QWidget):
                 ("left_fixed", "3. Left Rover RTK Fixed"),
                 ("right_fixed", "4. Right Rover RTK Fixed"),
                 ("stabilized", "5. L/R Fixed stabilized"),
+                ("rtcm_complete", "6. RTCM 관측치(MSM) 포함"),
             )
         ):
             value = EngineeringValue(label)
@@ -3548,24 +4973,6 @@ class BaseGnssWorkspace(QtWidgets.QWidget):
                     lambda group_name=group_name, key=key: self._inspect_value(group_name, key)
                 )
 
-        actions = QtWidgets.QGridLayout()
-        self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
-        for index, (command_id, label) in enumerate(
-            (
-                ("gnss.base_discover", "Find Base"),
-                ("gnss.base_connect", "Connect"),
-                ("gnss.base_disconnect", "Disconnect"),
-                ("gnss.survey_start", "Start Survey-in"),
-                ("gnss.survey_stop", "Stop Survey-in"),
-                ("gnss.ntrip_start", "Start NTRIP"),
-                ("gnss.ntrip_stop", "Stop NTRIP"),
-                ("gnss.ntrip_forget_password", "Forget NTRIP password"),
-            )
-        ):
-            button = _command_button(label, command_id, invoke_command)
-            self.operation_buttons[command_id] = button
-            actions.addWidget(button, index // 4, index % 4)
-        layout.addLayout(actions)
         layout.addStretch(1)
 
     @staticmethod
@@ -3633,10 +5040,19 @@ class BaseGnssWorkspace(QtWidgets.QWidget):
             f"{data.get('base_frames', 0)} frames · {_display_number(data.get('average_frame_rate_hz'), digits=2)} Hz"
             f" · age {_display_number(frame_age, digits=2, suffix='s')}"
         )
+        stage_index = self._ACQUISITION_STAGE_INDEX.get(state)
+        if stage_index is not None:
+            stage_label = self._ACQUISITION_STAGE_LABEL[state]
+            progress_text = f"{stage_index}/{self._ACQUISITION_STAGE_TOTAL} · {stage_label}"
+            progress_valid = True if state == "LOCAL_RTCM_ACTIVE" else None
+        else:
+            progress_text = self.OTHER_STATE_LABELS.get(state, state)
+            progress_valid = False if state in {"FAULT", "INVALIDATED"} else None
+        self.summary_values["progress"].set_value(progress_text, valid=progress_valid)
         self.summary_values["mode"].set_value(self.MODE_LABELS.get(mode, mode))
         self.summary_values["state"].set_value(state, valid=False if state in {"FAULT", "INVALIDATED"} else None)
         self.summary_values["source"].set_value(source_text)
-        self.summary_values["rtcm"].set_value(frame_text, age_s=float(frame_age) if frame_age not in (None, "") else None)
+        self.summary_values["rtcm"].set_value(frame_text)
 
         serial_connected = bool(serial.get("connected", False))
         self.serial_values["connection"].set_value(
@@ -3645,6 +5061,20 @@ class BaseGnssWorkspace(QtWidgets.QWidget):
         )
         self.serial_values["device"].set_value(serial.get("device") or "--")
         self.serial_values["baud"].set_value(serial.get("baud") or "--")
+        satellites = self._dict(data.get("satellites"))
+        sat_used = satellites.get("used")
+        sat_tracked = satellites.get("tracked")
+        sat_count = satellites.get("count")
+        if sat_used is not None or sat_tracked is not None:
+            sat_text = f"used={_display_number(sat_used, digits=0)} / tracked={_display_number(sat_tracked, digits=0)}"
+        elif sat_count is not None:
+            sat_text = f"{sat_count} ({satellites.get('count_source') or '--'})"
+        else:
+            sat_text = "--"
+        self.serial_values["satellites"].set_value(
+            sat_text,
+            valid=True if (sat_used or sat_count or 0) >= 12 else False if serial_connected else None,
+        )
 
         survey_active = bool(survey.get("active", False))
         survey_valid = bool(survey.get("valid", False))
@@ -3686,23 +5116,43 @@ class BaseGnssWorkspace(QtWidgets.QWidget):
             f"chunks={ntrip.get('chunks_received', 0)} · bytes={ntrip.get('bytes_received', 0)} · "
             f"rate={_display_number(ntrip.get('byte_rate_bps'), digits=1)} B/s · "
             f"last={_display_number(transport_age, digits=2, suffix='s')}",
-            age_s=float(transport_age) if transport_age not in (None, "") else None,
             source="NtripStreamStats",
         )
         rtcm_age = ntrip.get("rtcm_age_s")
         message_types = ntrip.get("rtcm_message_types")
         type_text = "--"
         if isinstance(message_types, dict) and message_types:
+            # No truncation: a stream can look fine at a glance (fresh, high
+            # frame rate) while still lacking the MSM observables an RTK
+            # solution actually needs -- that gap only shows up by seeing
+            # every message type present, not just the lowest-numbered ones.
             type_text = ", ".join(
                 f"{key}:{value}"
-                for key, value in sorted(message_types.items(), key=lambda item: str(item[0]))[:6]
+                for key, value in sorted(message_types.items(), key=lambda item: int(item[0]) if str(item[0]).lstrip("-").isdigit() else 0)
             )
         self.ntrip_values["rtcm"].set_value(
             f"frames={ntrip.get('rtcm_frames', data.get('base_frames', 0))} · "
             f"age={_display_number(rtcm_age, digits=2, suffix='s')} · types={type_text}",
-            age_s=float(rtcm_age) if rtcm_age not in (None, "") else None,
             source="Base RTCM parser",
         )
+        # A fresh, high-rate RTCM stream can still be unusable for RTK: an
+        # RTK solution needs a station-coordinate message (1005/1006) AND at
+        # least one MSM observation message (1070-1129). Ephemeris/antenna
+        # messages (1019/1020/1033/1042/1007/...) alone will never converge
+        # -- this is the gap that silently stalls acquisition at "3D FIX".
+        base_position_present = bool(ntrip.get("rtcm_base_position_present"))
+        msm_present = bool(ntrip.get("rtcm_msm_present"))
+        if not ntrip.get("connected") or not message_types:
+            coverage_text, coverage_valid = "--", None
+        elif base_position_present and msm_present:
+            coverage_text, coverage_valid = "OK (station + MSM 관측치 포함)", True
+        elif base_position_present and not msm_present:
+            coverage_text, coverage_valid = "부족 — MSM 관측치 없음, RTK 불가", False
+        elif msm_present and not base_position_present:
+            coverage_text, coverage_valid = "부족 — station 좌표(1005/1006) 없음, RTK 불가", False
+        else:
+            coverage_text, coverage_valid = "부족 — station·MSM 모두 없음, RTK 불가", False
+        self.ntrip_values["coverage"].set_value(coverage_text, valid=coverage_valid)
         self.ntrip_values["reconnects"].set_value(ntrip.get("reconnect_count", 0))
         self.ntrip_values["error"].set_value(
             ntrip.get("last_error") or "--",
@@ -3718,12 +5168,24 @@ class BaseGnssWorkspace(QtWidgets.QWidget):
             unit="m",
             frame=str(coordinate.get("height_type", fixed.get("height_type", "UNKNOWN"))),
         )
+        fix_stage_label = str(coordinate.get("fix_stage_label") or "--")
+        self.fixed_values["gnss_fix_stage"].set_value(
+            fix_stage_label,
+            valid=True if fix_stage_label == "RTK FIXED" else None,
+        )
         base_fix = coordinate.get("fixed")
         self.fixed_values["fix"].set_value("--" if base_fix is None else "FIXED" if base_fix else "NOT FIXED", valid=base_fix)
         self.fixed_values["samples"].set_value(fixed.get("sample_count", 0))
+        # profile is only populated once the coordinate is fully validated
+        # AND applied to the receiver (LOCAL_RTCM_ACTIVE); live_profile
+        # carries the same shape while still collecting/validating, so use
+        # it as the in-progress preview instead of leaving this blank.
+        live_profile = self._dict(fixed.get("live_profile"))
+        scatter_source = profile if profile else live_profile
         self.fixed_values["scatter"].set_value(
-            f"{_display_number(profile.get('horizontal_scatter_m'))} / {_display_number(profile.get('vertical_scatter_m'))}",
+            f"{_display_number(scatter_source.get('horizontal_scatter_m'))} / {_display_number(scatter_source.get('vertical_scatter_m'))}",
             unit="m",
+            source="live (collecting)" if not profile and live_profile else "",
         )
         verification = "/".join(
             "OK" if fixed.get(key) else "WAIT"
@@ -3841,6 +5303,10 @@ class BaseGnssWorkspace(QtWidgets.QWidget):
                 else fixed_stabilized,
                 f"both fixed for ≥{fixed_duration_target:.0f}s",
             ),
+            "rtcm_complete": (
+                None if not ntrip.get("connected") or not message_types else (base_position_present and msm_present),
+                "station 1005/1006 + MSM 1070-1129 present",
+            ),
         }
         for key, (satisfied, source_text) in checklist_statuses.items():
             self.checklist_values[key].set_value(
@@ -3854,6 +5320,13 @@ class BaseGnssWorkspace(QtWidgets.QWidget):
         network_mode = assisted_mode or mode == "NETWORK_RTK_DIRECT"
         self.serial_group.setVisible(local_mode or assisted_mode)
         self.candidate_group.setVisible(local_mode or assisted_mode)
+        # Survey-in (NAV-SVIN) is a receiver-native TMODE3 feature that is
+        # only ever commanded in LOCAL_SURVEY_IN mode (start_gnss_base_survey_in
+        # sends CFG-TMODE3 survey-in start). NETWORK_ASSISTED_FIXED_BASE never
+        # enables it -- that mode tracks convergence via its own NAV-PVT
+        # sample count/scatter instead (see fixed_values["scatter"]/["samples"]
+        # below) -- so showing this panel there would just display a
+        # permanently-idle/frozen NAV-SVIN poll and look broken.
         self.survey_group.setVisible(local_mode)
         self.ntrip_group.setVisible(network_mode)
         self.fixed_group.setVisible(assisted_mode)
@@ -4164,12 +5637,14 @@ class OpticalPosePane(QtWidgets.QWidget):
         # keeps the reason on screen instead of it being wiped within a
         # second by the next poll.
         self._auto_suggestion_error_active = False
+        self._optical_pose_layout_width_hint = 0
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
         readiness_group = QtWidgets.QGroupBox("Readiness")
+        self.readiness_group = readiness_group
         readiness_layout = QtWidgets.QGridLayout(readiness_group)
         readiness_layout.setContentsMargins(6, 6, 6, 6)
         self.readiness_values: dict[str, EngineeringValue] = {}
@@ -4205,6 +5680,7 @@ class OpticalPosePane(QtWidgets.QWidget):
             return button
 
         preview_group = _FrozenPreviewGroup("Frozen native reference burst + annotations")
+        self.preview_group = preview_group
         preview_group_layout = QtWidgets.QVBoxLayout(preview_group)
         preview_group_layout.setContentsMargins(6, 6, 6, 6)
         preview_group_layout.setSpacing(5)
@@ -4243,36 +5719,37 @@ class OpticalPosePane(QtWidgets.QWidget):
         annotation_actions.addWidget(self.annotation_clear_button)
         self.capture_frozen_burst_button = make_solver_button(
             "alignment.pose.capture_burst",
-            "Capture",
+            "Capture Live Pair",
         )
         self.capture_frozen_burst_button.setToolTip(
-            "Capture once, then use the same immutable native left/right frames across all R,t methods."
+            "Capture the newest decoded native left/right frames from the live RTSP streams, "
+            "then use the same immutable pair across all R,t methods. Raw RTP packets are not captured."
         )
         annotation_actions.addWidget(self.capture_frozen_burst_button)
         self.capture_frozen_burst_wiris_ftp_button = make_solver_button(
             "alignment.pose.capture_burst_wiris_ftp",
-            "Capture FTP HR",
+            "Capture HR Still (FTP)",
         )
         self.capture_frozen_burst_wiris_ftp_button.setToolTip(
             "Trigger a WIRIS HR still on both cameras and download it via FTP instead of the "
-            "live RTSP feed, then freeze it the same way as Capture."
+            "live RTSP feed, then store it under the same immutable-pair contract."
         )
         annotation_actions.addWidget(self.capture_frozen_burst_wiris_ftp_button)
         self.capture_frozen_burst_wiris_ftp_oz_button = make_solver_button(
             "alignment.pose.capture_burst_wiris_ftp_oz",
-            "Capture FTP OZ",
+            "Capture OZ Still (FTP)",
         )
         self.capture_frozen_burst_wiris_ftp_oz_button.setToolTip(
-            "Same as Capture FTP HR, using the lower-resolution "
+            "Same as Capture HR Still (FTP), using the lower-resolution "
             "operating-zoom still (SIVI) instead of the HR still."
         )
         annotation_actions.addWidget(self.capture_frozen_burst_wiris_ftp_oz_button)
-        self.import_frozen_burst_button = QtWidgets.QPushButton("Import")
+        self.import_frozen_burst_button = QtWidgets.QPushButton("Import Pair")
         self.import_frozen_burst_button.setObjectName("opticalPoseImportBurst")
         self.import_frozen_burst_button.setToolTip(
             "Load left/right images from disk instead of a live capture -- reuse an "
             "FTP-downloaded HR/OZ still, or feed local test imagery for offline accuracy evaluation. "
-            "The same immutable-frame contract as Capture applies."
+            "The same immutable-frame contract as Capture Live Pair applies."
         )
         self.import_frozen_burst_button.clicked.connect(self._import_frozen_burst)
         annotation_actions.addWidget(self.import_frozen_burst_button)
@@ -4285,14 +5762,16 @@ class OpticalPosePane(QtWidgets.QWidget):
         # Stack them vertically so each camera receives the full content width;
         # the optical-pose page is already scrollable, so the extra height is
         # intentional and each 16:9 viewport can remain uncropped by layout.
-        preview_layout = QtWidgets.QVBoxLayout()
+        preview_layout = QtWidgets.QBoxLayout(QtWidgets.QBoxLayout.TopToBottom)
         preview_layout.setContentsMargins(0, 0, 0, 0)
         preview_layout.setSpacing(6)
         self.frozen_preview_layout = preview_layout
         self.frozen_preview_labels: dict[str, QtWidgets.QLabel] = {}
         self.annotation_views: dict[str, AnnotationImageView] = {}
+        self.frozen_preview_panels: list[QtWidgets.QWidget] = []
         for side, label in (("left", "Left"), ("right", "Right")):
             side_panel = _FrozenPreviewColumn()
+            self.frozen_preview_panels.append(side_panel)
             side_layout = QtWidgets.QVBoxLayout(side_panel)
             side_layout.setContentsMargins(0, 0, 0, 0)
             side_layout.setSpacing(3)
@@ -4329,6 +5808,7 @@ class OpticalPosePane(QtWidgets.QWidget):
         layout.addWidget(preview_group)
 
         observations_group = QtWidgets.QGroupBox("Drone RTK Capture Observations")
+        self.observations_group = observations_group
         observations_group.setObjectName("opticalPoseDroneRtkObservationsGroup")
         observations_layout = QtWidgets.QVBoxLayout(observations_group)
         observations_layout.setContentsMargins(6, 6, 6, 6)
@@ -4433,9 +5913,9 @@ class OpticalPosePane(QtWidgets.QWidget):
 
         self._drone_rtk_observation_rows: dict[str, dict[str, object]] = {}
         self._drone_rtk_observation_order: list[str] = []
-        layout.addWidget(observations_group)
 
         auto_group = QtWidgets.QGroupBox("Automatic point suggestion · review required")
+        self.auto_group = auto_group
         auto_group.setObjectName("opticalPoseAutoSuggestionGroup")
         auto_layout = QtWidgets.QGridLayout(auto_group)
         auto_layout.setContentsMargins(6, 6, 6, 6)
@@ -4474,21 +5954,7 @@ class OpticalPosePane(QtWidgets.QWidget):
         self.auto_suggestion_metrics_label.setObjectName("compactContract")
         self.auto_suggestion_metrics_label.setWordWrap(True)
         auto_layout.addWidget(self.auto_suggestion_metrics_label, 2, 0, 1, 3)
-        layout.addWidget(auto_group)
 
-        workflow_group = QtWidgets.QGroupBox("Pose workflow")
-        workflow_group.setObjectName("opticalPoseWorkflowGroup")
-        workflow_layout = QtWidgets.QGridLayout(workflow_group)
-        workflow_layout.setContentsMargins(6, 6, 6, 6)
-        workflow_layout.setSpacing(5)
-        initialize_button = make_solver_button(
-            "alignment.pose.initialize_telemetry",
-            "Initialize from Telemetry",
-        )
-        initialize_button.setToolTip(
-            "Build a reviewed initial pose candidate from fresh P1/P2/Drone GNSS and, when available, "
-            "fresh Pixhawk R/P/Y. GNSS positions are converted to local world NED; this does not auto-apply."
-        )
         multiview_button = make_solver_button(
             "alignment.pose.solve_drone_rtk_multiview",
             "Refine Drone RTK Multi-view R,t",
@@ -4497,21 +5963,35 @@ class OpticalPosePane(QtWidgets.QWidget):
             "Import a multi-view JSON containing per-side camera rays/pixels and synchronized Drone RTK "
             "target positions, then solve full 6-DOF R,t for both cameras."
         )
-        workflow_layout.addWidget(initialize_button, 0, 0)
-        workflow_layout.addWidget(multiview_button, 0, 1)
         workflow_note = QtWidgets.QLabel(
-            "Two explicit stages: initialize with live Telemetry, then refine with several synchronized "
-            "Drone RTK target observations. Both results become candidates and share the same review/apply path."
+            "Each solver below creates an independent candidate and shares the same review/apply path."
         )
         workflow_note.setObjectName("compactContract")
         workflow_note.setWordWrap(True)
-        workflow_layout.addWidget(workflow_note, 1, 0, 1, 2)
-        layout.addWidget(workflow_group)
+        readiness_layout.addWidget(workflow_note, 4, 0, 1, 2)
 
-        method_group = QtWidgets.QGroupBox("R,t measurement methods")
-        method_layout = QtWidgets.QVBoxLayout(method_group)
         self.method_tabs = _CurrentPageTabWidget()
-        self.method_tabs.setObjectName("opticalPoseMethodTabs")
+        self.method_tabs.setObjectName("alignmentOperationTabs")
+        self.method_information_labels: dict[str, QtWidgets.QLabel] = {}
+        self.method_detail_labels: dict[str, QtWidgets.QLabel] = {}
+        method_contracts = {
+            "Horizon": "Observed: Roll/Pitch · Measurement fill: Yaw=pair-frozen Pixhawk, t=pair-frozen GNSS",
+            "Mountain + GNSS": "Observed: relative R from paired u,v · t: frozen GNSS baseline · no terrain height",
+            "Terrain PnP": "Observed: full 6-DOF · requires GeoTIFF vertical datum and matched 2D/3D points",
+            "Drone Rotation": "1 target: Yaw · 2+ targets: Roll/Pitch/Yaw · Measurement t: pair-frozen GNSS",
+            "Drone Multi-view": "Observed: full 6-DOF R,t · requires at least four synchronized observations per side",
+            "References": "Register existing Checkerboard R,t or live Pixhawk+RTK Translation as reusable reference evidence",
+            "Combine": "Compose only non-overlapping axes observable on both camera sides with shared prior/K,D",
+        }
+        method_details = {
+            "Horizon": "Evidence: horizon point count, model fit, Roll/Pitch sensitivity, prior Yaw/Translation source",
+            "Mountain + GNSS": "Evidence: paired point count, inliers/outliers, Sampson residual, GNSS baseline, lever-arm status",
+            "Terrain PnP": "Evidence: GeoTIFF/vertical datum, 2D↔3D counts, reprojection error, depth ratio, rank/condition",
+            "Drone Rotation": "Evidence: target count, Yaw/full-R mode, Drone/P1/P2 RTK state, sync delta, angular residual",
+            "Drone Multi-view": "Evidence: JSON hash, per-side observation count, timestamp verification, 3D spread, full-rank status",
+            "References": "Evidence: active K,D compatibility, profile hash, source zoom, baseline and reference state",
+            "Combine": "Evidence: selected candidates, per-side observability, DOF ownership, overlap and shared-prior checks",
+        }
 
         def add_method_tab(
             tab_label: str,
@@ -4526,6 +6006,20 @@ class OpticalPosePane(QtWidgets.QWidget):
             note.setObjectName("compactContract")
             note.setWordWrap(True)
             page_layout.addWidget(note)
+            contract_label = QtWidgets.QLabel(method_contracts.get(tab_label, ""))
+            contract_label.setObjectName("compactContract")
+            contract_label.setWordWrap(True)
+            page_layout.addWidget(contract_label)
+            information_label = QtWidgets.QLabel("Solve readiness: waiting for owner snapshot")
+            information_label.setObjectName("statusStrip")
+            information_label.setWordWrap(True)
+            self.method_information_labels[tab_label] = information_label
+            page_layout.addWidget(information_label)
+            detail_label = QtWidgets.QLabel(method_details.get(tab_label, ""))
+            detail_label.setObjectName("compactContract")
+            detail_label.setWordWrap(True)
+            self.method_detail_labels[tab_label] = detail_label
+            page_layout.addWidget(detail_label)
             if content is not None:
                 content(page_layout)
             action_layout = QtWidgets.QHBoxLayout()
@@ -4534,10 +6028,11 @@ class OpticalPosePane(QtWidgets.QWidget):
             action_layout.addStretch(1)
             page_layout.addLayout(action_layout)
             page_layout.addStretch(1)
-            self.method_tabs.addTab(page, tab_label)
+            index = self.method_tabs.addTab(page, tab_label)
+            self.method_tabs.setTabToolTip(index, description)
 
         add_method_tab(
-            "Horizon R/P",
+            "Horizon",
             "Two horizon points constrain Roll/Pitch only. Yaw and camera position remain at the prior pose.",
             (
                 make_solver_button("alignment.pose.solve_horizon", "Solve Horizon Roll/Pitch"),
@@ -4572,12 +6067,18 @@ class OpticalPosePane(QtWidgets.QWidget):
             content=build_terrain_content,
         )
         add_method_tab(
-            "Drone RTK Yaw",
-            "Advanced single-target fallback: a frozen target pixel plus explicit Drone RTK line-of-sight "
-            "evidence constrains Yaw. Use Pose workflow above for Telemetry initialization and full multi-view R,t.",
+            "Drone Rotation",
+            "One synchronized target constrains Yaw; two or more non-degenerate target/ray observations "
+            "constrain Roll/Pitch/Yaw. Missing Translation is supplied by live GNSS in Measurement.",
             (
-                make_solver_button("alignment.pose.solve_drone_yaw", "Solve Drone RTK Yaw"),
+                make_solver_button("alignment.pose.solve_drone_yaw", "Solve Drone RTK Rotation"),
             ),
+        )
+        add_method_tab(
+            "Drone Multi-view",
+            "Import at least four synchronized target observations per side and solve full six-DOF "
+            "camera pose. Translation is solved from the observations instead of inherited from live GNSS.",
+            (multiview_button,),
         )
         def register_reference_candidate(source: str) -> None:
             self.command_requested.emit(
@@ -4606,16 +6107,6 @@ class OpticalPosePane(QtWidgets.QWidget):
         register_pixhawk_button.clicked.connect(
             lambda _checked=False: register_reference_candidate("pixhawk_rtk")
         )
-        add_method_tab(
-            "Existing calibration",
-            "Reference only. Calibration creates the checkerboard stereo R,t profile; "
-            "Alignment does not recalculate or overwrite it here. Apply the selected K,D + R,t "
-            "bundle in Calibration first, then use this reference as the base pose for "
-            "optical-pose candidates. The active profile and baseline are shown below in the "
-            "common comparison card.",
-            (register_checkerboard_button, register_pixhawk_button),
-        )
-
         combine_button = make_solver_button(
             "alignment.pose.solve_combined",
             "Build combined candidate",
@@ -4684,16 +6175,16 @@ class OpticalPosePane(QtWidgets.QWidget):
             page_layout.addWidget(self.combine_candidate_status)
 
         add_method_tab(
-            "Combine candidates",
-            "Compose independent evidence into a new immutable candidate. This is not averaging and "
-            "does not silently choose the latest Horizon/Drone result; the source candidates must be "
-            "checked explicitly below.",
+            "References",
+            "Register Checkerboard or live Pixhawk+RTK reference evidence for later method composition.",
+            (register_checkerboard_button, register_pixhawk_button),
+        )
+        add_method_tab(
+            "Combine",
+            "Compose explicitly selected non-overlapping candidate axes into one immutable candidate.",
             (combine_button,),
             content=build_combine_content,
         )
-        method_layout.addWidget(self.method_tabs)
-        layout.addWidget(method_group)
-
         self.solver_buttons["alignment.pose.solve_horizon"].setToolTip(
             "Automatically fit Roll/Pitch from the manually marked horizon line. "
             "The horizon cannot observe Yaw."
@@ -4706,6 +6197,7 @@ class OpticalPosePane(QtWidgets.QWidget):
         )
 
         dof_group = QtWidgets.QGroupBox("Candidate degrees of freedom")
+        self.dof_group = dof_group
         dof_layout = QtWidgets.QGridLayout(dof_group)
         self.dof_checkboxes: dict[str, QtWidgets.QCheckBox] = {}
         for index, key in enumerate(self.DOF_KEYS):
@@ -4730,9 +6222,9 @@ class OpticalPosePane(QtWidgets.QWidget):
         dof_contract.setObjectName("compactContract")
         dof_contract.setWordWrap(True)
         dof_layout.addWidget(dof_contract, 1, 0, 1, len(self.DOF_KEYS))
-        layout.addWidget(dof_group)
 
         candidate_group = QtWidgets.QGroupBox("R,t candidates · compare")
+        self.candidate_group = candidate_group
         candidate_group.setObjectName("opticalPoseCandidatesGroup")
         candidate_layout = QtWidgets.QVBoxLayout(candidate_group)
         self.candidate_table = QtWidgets.QTableWidget(0, len(self.CANDIDATE_HEADERS))
@@ -4775,7 +6267,6 @@ class OpticalPosePane(QtWidgets.QWidget):
         candidate_actions.addWidget(self.revert_button)
         candidate_actions.addWidget(self.candidate_status_label, 1)
         candidate_layout.addLayout(candidate_actions)
-        layout.addWidget(candidate_group)
 
         contract = QtWidgets.QLabel(
             "Frames: image pixels/OpenCV optical RDF · pose PX4 virtual FRD→world NED · "
@@ -4783,7 +6274,248 @@ class OpticalPosePane(QtWidgets.QWidget):
         )
         contract.setObjectName("compactContract")
         contract.setWordWrap(True)
-        layout.addWidget(contract)
+        self.contract_label = contract
+
+        method_column = QtWidgets.QWidget()
+        method_column.setObjectName("alignmentMethodColumn")
+        method_column_layout = QtWidgets.QVBoxLayout(method_column)
+        method_column_layout.setContentsMargins(0, 0, 0, 0)
+        method_column_layout.setSpacing(6)
+        method_column_layout.addWidget(self.method_tabs)
+        method_column_layout.addWidget(self.auto_group)
+        method_column_layout.addStretch(1)
+        self.method_column = method_column
+
+        candidate_review = QtWidgets.QWidget()
+        candidate_review.setObjectName("alignmentCandidateReview")
+        candidate_review_layout = QtWidgets.QVBoxLayout(candidate_review)
+        candidate_review_layout.setContentsMargins(0, 0, 0, 0)
+        candidate_review_layout.setSpacing(6)
+        candidate_review_layout.addWidget(self.dof_group)
+        candidate_review_layout.addWidget(self.candidate_group)
+        candidate_review_layout.addWidget(self.observations_group)
+        candidate_review_layout.addWidget(self.contract_label)
+        candidate_review_layout.addStretch(1)
+        self.candidate_review_widget = candidate_review
+
+        lower_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        lower_splitter.setObjectName("alignmentMethodReviewSplitter")
+        lower_splitter.setChildrenCollapsible(False)
+        lower_splitter.setHandleWidth(8)
+        lower_splitter.addWidget(method_column)
+        lower_splitter.addWidget(candidate_review)
+        lower_splitter.setStretchFactor(0, 3)
+        lower_splitter.setStretchFactor(1, 2)
+        lower_splitter.setSizes([720, 480])
+        self.method_review_splitter = lower_splitter
+        layout.addWidget(lower_splitter)
+
+        self.method_tabs.currentChanged.connect(self._handle_method_tab_changed)
+        self._handle_method_tab_changed(self.method_tabs.currentIndex())
+
+    def _handle_method_tab_changed(self, index: int) -> None:
+        label = self.method_tabs.tabText(index) if index >= 0 else ""
+        annotation_modes = {
+            "Horizon": AnnotationMode.HORIZON.value,
+            "Mountain + GNSS": AnnotationMode.RIDGE.value,
+            "Terrain PnP": AnnotationMode.RIDGE.value,
+            "Drone Rotation": AnnotationMode.TARGET.value,
+        }
+        mode = annotation_modes.get(label)
+        editable = mode is not None
+        self.annotation_mode_combo.setEnabled(editable)
+        self.annotation_clear_button.setEnabled(editable)
+        for view in self.annotation_views.values():
+            view.setEnabled(editable)
+        if mode is not None:
+            mode_index = self.annotation_mode_combo.findData(mode)
+            if mode_index >= 0:
+                self.annotation_mode_combo.setCurrentIndex(mode_index)
+            self._set_annotation_mode(self.annotation_mode_combo.currentIndex())
+
+        show_horizon_auto = label == "Horizon"
+        show_mountain_auto = label == "Mountain + GNSS"
+        self.auto_group.setVisible(show_horizon_auto or show_mountain_auto)
+        horizon_button = self.auto_select_buttons.get("alignment.pose.auto_select_horizon")
+        mountain_button = self.auto_select_buttons.get("alignment.pose.auto_select_mountain")
+        if horizon_button is not None:
+            horizon_button.setVisible(show_horizon_auto)
+        if mountain_button is not None:
+            mountain_button.setVisible(show_mountain_auto)
+        self.observations_group.setVisible(
+            label in {"Drone Rotation", "Drone Multi-view"}
+        )
+        self._refresh_method_information()
+
+    def _update_optical_pose_layout_mode(self) -> None:
+        width_hint = self._optical_pose_layout_width_hint or self.width()
+        preview_width = min(
+            self.preview_group.contentsRect().width(),
+            max(0, width_hint - 12),
+        )
+        margins = self.frozen_preview_layout.contentsMargins()
+        usable_width = max(0, preview_width - margins.left() - margins.right())
+        horizontal_previews = (usable_width - self.frozen_preview_layout.spacing()) // 2 >= 560
+        preview_direction = (
+            QtWidgets.QBoxLayout.LeftToRight
+            if horizontal_previews
+            else QtWidgets.QBoxLayout.TopToBottom
+        )
+        if self.frozen_preview_layout.direction() != preview_direction:
+            self.frozen_preview_layout.setDirection(preview_direction)
+            self.preview_group.updateGeometry()
+
+        splitter_orientation = (
+            QtCore.Qt.Horizontal if width_hint >= 1200 else QtCore.Qt.Vertical
+        )
+        if self.method_review_splitter.orientation() != splitter_orientation:
+            self.method_review_splitter.setOrientation(splitter_orientation)
+            self.method_review_splitter.setSizes(
+                [720, 480] if splitter_orientation == QtCore.Qt.Horizontal else [420, 360]
+            )
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802 - Qt override.
+        self._optical_pose_layout_width_hint = event.size().width()
+        super().resizeEvent(event)
+        self._update_optical_pose_layout_mode()
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:  # noqa: N802 - Qt override.
+        super().showEvent(event)
+        QtCore.QTimer.singleShot(0, self._update_optical_pose_layout_mode)
+
+    def _refresh_method_information(self) -> None:
+        annotation_counts: dict[str, dict[str, int]] = {
+            "left": {"horizon": 0, "ridge": 0, "target": 0},
+            "right": {"horizon": 0, "ridge": 0, "target": 0},
+        }
+        for side, view in self.annotation_views.items():
+            payload = view.export_annotations()
+            if payload is None:
+                continue
+            annotation_counts[side] = {
+                "horizon": len(payload.horizon_line),
+                "ridge": len(payload.ridge_polyline),
+                "target": len(payload.target_point),
+            }
+
+        candidate_state_by_method: dict[str, str] = {}
+        candidate_by_method: dict[str, Mapping[str, object]] = {}
+        method_categories = {
+            "flat-horizon-roll-pitch": "Horizon",
+            "spherical-horizon-roll-pitch": "Horizon",
+            "gnss-constrained-mountain-uv": "Mountain + GNSS",
+            "terrain-pnp-ensemble": "Terrain PnP",
+            "drone-rtk-target-yaw": "Drone Rotation",
+            "drone-rtk-multiview-r-t": "Drone Multi-view",
+            "combined-independent-axis-evidence": "Combine",
+        }
+        for candidate in self._candidate_rows.values():
+            method = str(candidate.get("method", "") or "")
+            category = method_categories.get(method)
+            if category is not None:
+                candidate_by_method[category] = candidate
+                candidate_state_by_method[category] = str(
+                    candidate.get("state", candidate.get("quality", "CANDIDATE"))
+                    or "CANDIDATE"
+                )
+
+        left = annotation_counts["left"]
+        right = annotation_counts["right"]
+        terrain_state = self.readiness_values["terrain"].value.text()
+        base_state = self.readiness_values["base_extrinsics"].value.text()
+        observation_count = len(self._drone_rtk_observation_order)
+        candidate_count = len(self._candidate_rows)
+        information = {
+            "Horizon": (
+                f"Solve readiness · horizon points L/R={left['horizon']}/{right['horizon']} "
+                f"(2 required each) · candidate={candidate_state_by_method.get('Horizon', '--')} · "
+                "Measurement also requires fresh Pixhawk Yaw and usable GNSS t"
+            ),
+            "Mountain + GNSS": (
+                f"Solve readiness · paired ridge points L/R={left['ridge']}/{right['ridge']} "
+                f"(≥4, equal order) · candidate={candidate_state_by_method.get('Mountain + GNSS', '--')} · "
+                "frozen GNSS baseline and lever-arm provenance required"
+            ),
+            "Terrain PnP": (
+                f"Solve readiness · ridge points L/R={left['ridge']}/{right['ridge']} · "
+                f"terrain={terrain_state or '--'} · candidate={candidate_state_by_method.get('Terrain PnP', '--')}"
+            ),
+            "Drone Rotation": (
+                f"Solve readiness · target points L/R={left['target']}/{right['target']} · "
+                f"captured observations={observation_count} · candidate={candidate_state_by_method.get('Drone Rotation', '--')}"
+            ),
+            "Drone Multi-view": (
+                f"Solve readiness · imported observations require ≥4 per side · captured evidence={observation_count} · "
+                f"candidate={candidate_state_by_method.get('Drone Multi-view', '--')}"
+            ),
+            "References": (
+                f"Reference readiness · base R,t={base_state or '--'} · candidates={candidate_count} · "
+                "register a reusable source candidate"
+            ),
+            "Combine": (
+                f"Combine readiness · candidates={candidate_count} · "
+                f"combined={candidate_state_by_method.get('Combine', '--')}"
+            ),
+        }
+        def candidate_metric(category: str, key: str, default: object = "--") -> object:
+            row = candidate_by_method.get(category, {})
+            metrics = row.get("quality_metrics")
+            metrics = metrics if isinstance(metrics, Mapping) else {}
+            return metrics.get(key, default)
+
+        def candidate_input(category: str, key: str, default: object = "--") -> object:
+            row = candidate_by_method.get(category, {})
+            hashes = row.get("input_hashes")
+            hashes = hashes if isinstance(hashes, Mapping) else {}
+            return hashes.get(key, default)
+
+        details = {
+            "Horizon": (
+                f"model={candidate_input('Horizon', 'horizon_model')} · "
+                f"L/R RMS px={candidate_metric('Horizon', 'left_rms_px_equivalent')}/"
+                f"{candidate_metric('Horizon', 'right_rms_px_equivalent')} · "
+                f"sensitivity R/P={candidate_metric('Horizon', 'left_roll_sensitivity_1px_deg')}/"
+                f"{candidate_metric('Horizon', 'left_pitch_sensitivity_1px_deg')} deg"
+            ),
+            "Mountain + GNSS": (
+                f"pairs={candidate_metric('Mountain + GNSS', 'mountain_uv_pair_count')} · "
+                f"inlier ratio={candidate_metric('Mountain + GNSS', 'inlier_ratio')} · "
+                f"Sampson RMS px={candidate_metric('Mountain + GNSS', 'sampson_rms_px_equivalent')} · "
+                f"baseline={candidate_metric('Mountain + GNSS', 'gnss_baseline_m')} m · "
+                f"lever-arm={candidate_input('Mountain + GNSS', 'lever_arm_status')}"
+            ),
+            "Terrain PnP": (
+                f"L/R reprojection RMSE={candidate_metric('Terrain PnP', 'left_reprojection_rmse_px')}/"
+                f"{candidate_metric('Terrain PnP', 'right_reprojection_rmse_px')} px · "
+                f"positive depth={candidate_metric('Terrain PnP', 'left_positive_depth_ratio')}/"
+                f"{candidate_metric('Terrain PnP', 'right_positive_depth_ratio')}"
+            ),
+            "Drone Rotation": (
+                f"observations L/R={candidate_metric('Drone Rotation', 'left_observation_count')}/"
+                f"{candidate_metric('Drone Rotation', 'right_observation_count')} · "
+                f"angular RMS={candidate_metric('Drone Rotation', 'left_rotation_rms_chord_residual')} · "
+                "Translation=pair-frozen GNSS"
+            ),
+            "Drone Multi-view": (
+                f"observations L/R={candidate_metric('Drone Multi-view', 'left_observation_count')}/"
+                f"{candidate_metric('Drone Multi-view', 'right_observation_count')} · "
+                f"angular RMS={candidate_metric('Drone Multi-view', 'left_angular_rms_chord')} / "
+                f"{candidate_metric('Drone Multi-view', 'right_angular_rms_chord')} · "
+                f"JSON={candidate_input('Drone Multi-view', 'drone_rtk_multiview_json_sha256')}"
+            ),
+            "References": (
+                f"checkerboard profile={base_state or '--'} · "
+                f"reference candidates={candidate_count} · source zoom/status are shown in Candidate review"
+            ),
+            "Combine": (
+                f"sources={len(candidate_by_method.get('Combine', {}).get('source_observation_ids', ())) or '--'} · "
+                "axes must be non-overlapping and observable on both sides"
+            ),
+        }
+        for label, widget in self.method_information_labels.items():
+            widget.setText(information.get(label, "Solve readiness: --"))
+        for label, widget in self.method_detail_labels.items():
+            widget.setText(details.get(label, "Evidence: --"))
 
     @staticmethod
     def _candidate_text(value: object, *, digits: int = 3) -> str:
@@ -4804,6 +6536,15 @@ class OpticalPosePane(QtWidgets.QWidget):
 
     @staticmethod
     def _candidate_observability(candidate: Mapping[str, object]) -> str:
+        by_side = candidate.get("observable_dof_by_side")
+        if isinstance(by_side, Mapping):
+            parts = []
+            for side, label in (("left", "L"), ("right", "R")):
+                values = by_side.get(side)
+                values = values if isinstance(values, Mapping) else {}
+                enabled = [str(key) for key, value in values.items() if bool(value)]
+                parts.append(f"{label}[{','.join(enabled) or 'none'}]")
+            return " ".join(parts)
         raw = candidate.get("observable_dof", candidate.get("observability"))
         if isinstance(raw, Mapping):
             enabled = [str(key) for key, value in raw.items() if bool(value)]
@@ -5063,6 +6804,24 @@ class OpticalPosePane(QtWidgets.QWidget):
         for view in self.annotation_views.values():
             view.clear_suggestion_points()
 
+    def set_auto_suggestion_busy(self, busy: bool, mode: str = "") -> None:
+        """Show an in-flight selector and prevent duplicate CPU-heavy runs."""
+
+        busy = bool(busy)
+        for button in self.auto_select_buttons.values():
+            button.setEnabled(not busy)
+        if not busy:
+            return
+        mode_label = "Horizon" if str(mode).lower() == "horizon" else "Mountain"
+        self._auto_suggestion_error_active = False
+        self.auto_suggestion_status_label.setStyleSheet("")
+        self.auto_suggestion_status_label.setText(
+            f"{mode_label} · RUNNING · analyzing frozen frames in background"
+        )
+        self.auto_suggestion_metrics_label.setText(
+            "Confidence / inliers / residual / detector: calculating…"
+        )
+
     def _reset_auto_acceptance(self) -> None:
         """Invalidate accepted-point provenance when the frozen frame changes."""
 
@@ -5260,6 +7019,7 @@ class OpticalPosePane(QtWidgets.QWidget):
                 ),
             },
         )
+        self._refresh_method_information()
 
     def _set_annotation_mode(self, _index: int = -1) -> None:
         mode = str(
@@ -5327,6 +7087,7 @@ class OpticalPosePane(QtWidgets.QWidget):
                 frame = ""
                 valid = None
             widget.set_value(display, source=source, frame=frame, valid=valid)
+        self._refresh_method_information()
 
     def set_active_profile(self, profile_id: object) -> None:
         self._active_profile_id = str(profile_id or "")
@@ -5351,6 +7112,7 @@ class OpticalPosePane(QtWidgets.QWidget):
             frame=str(extrinsics.get("frame_contract", "OpenCV optical RDF") or ""),
             valid=True if state in {"READY", "VALID", "LOADED", "ACTIVE"} else None,
         )
+        self._refresh_method_information()
 
     @staticmethod
     def _candidate_rt_sources(candidate: Mapping[str, object]) -> tuple[str, str, str]:
@@ -5416,6 +7178,7 @@ class OpticalPosePane(QtWidgets.QWidget):
         self._sync_combine_candidate_list(rows, selected_combine_ids)
         self._apply_candidate_dof_defaults()
         self._refresh_candidate_actions()
+        self._refresh_method_information()
 
     def _selected_drone_rtk_observation_id(self) -> str:
         row = self.observation_history_table.currentRow()
@@ -5487,6 +7250,7 @@ class OpticalPosePane(QtWidgets.QWidget):
         finally:
             table.blockSignals(False)
         self._refresh_drone_rtk_observation_detail()
+        self._refresh_method_information()
 
     def _refresh_drone_rtk_observation_detail(self) -> None:
         latest_id = self._drone_rtk_observation_order[-1] if self._drone_rtk_observation_order else ""
@@ -5672,6 +7436,14 @@ class OpticalPosePane(QtWidgets.QWidget):
             if key in quality:
                 lines.append(f"{key}: {quality[key]:.6g}")
         warnings = candidate.get("warnings")
+        by_side = candidate.get("observable_dof_by_side")
+        if isinstance(by_side, Mapping):
+            lines.append("observable_dof_by_side:")
+            for side in ("left", "right"):
+                values = by_side.get(side)
+                values = values if isinstance(values, Mapping) else {}
+                enabled = [str(key) for key, value in values.items() if bool(value)]
+                lines.append(f"  {side}: {','.join(enabled) or 'none'}")
         if isinstance(warnings, (tuple, list)) and warnings:
             lines.append("warnings:")
             lines.extend(f"  - {text}" for text in warnings)
@@ -5960,16 +7732,14 @@ class AlignmentWorkspace(QtWidgets.QWidget):
         # their command surfaces stay in Devices; this page compares geometry
         # candidates below.
         self.operation_tabs = self._build_operation_tabs(invoke_command)
-        # The Alignment page itself lives in an outer scroll area.  Give the
-        # R,t surface the remaining viewport height so hiding the bottom
-        # Diagnostics dock expands the camera/annotation scroll surface all
-        # the way to the window bottom. The LRF card is part of that same
-        # scroll content, so it does not remain pinned as a separate footer.
-        self.operation_tabs.setSizePolicy(
+        # The Alignment page itself lives in the workspace host's outer scroll
+        # area.  Common readiness/frozen evidence stays above the promoted
+        # method tabs owned by OpticalPosePane.
+        self.optical_pose_pane.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding,
             QtWidgets.QSizePolicy.Expanding,
         )
-        layout.addWidget(self.operation_tabs, 1)
+        layout.addWidget(self.optical_pose_pane, 1)
         self.indicators: dict[str, StatusIndicator] = {}
 
         attitude_group = QtWidgets.QGroupBox("Attitude")
@@ -6100,13 +7870,11 @@ class AlignmentWorkspace(QtWidgets.QWidget):
         self,
         invoke_command: Callable[[str], bool] | None,
     ) -> QtWidgets.QTabWidget:
-        operation_tabs = _ContentSizedOperationTabs()
-        operation_tabs.setObjectName("alignmentOperationTabs")
         self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
-        # Keep one scrollable R,t work surface. Its inner method tabs split
-        # Horizon, Mountain + GNSS, Drone RTK, existing calibration, and
-        # candidate composition without duplicating Devices commands here.
+        # OpticalPosePane owns the common preview and the promoted method tabs;
+        # Alignment exposes that tab widget directly as operation_tabs.
         self.optical_pose_pane = OpticalPosePane()
+        operation_tabs = self.optical_pose_pane.method_tabs
         self.optical_pose_pane.command_requested.connect(
             self.optical_pose_command_requested.emit
         )
@@ -6114,36 +7882,7 @@ class AlignmentWorkspace(QtWidgets.QWidget):
         self.operation_buttons["alignment.pose.apply_candidate"] = self.optical_pose_pane.apply_button
         self.operation_buttons["alignment.pose.revert"] = self.optical_pose_pane.revert_button
 
-        # Keep LRF status in the same scrollable content as the R,t controls.
-        # It is an on-demand read: each refresh opens/closes its own control
-        # port instead of starting a continuous background poll.
-        lrf_group = QtWidgets.QGroupBox("LRF (Laser Range Finder)")
-        lrf_group.setObjectName("alignmentLrfGroup")
-        lrf_layout = QtWidgets.QGridLayout(lrf_group)
-        self.lrf_group = lrf_group
-        self.lrf_indicators: dict[str, StatusIndicator] = {}
-        for index, (key, label) in enumerate(
-            (("lrf.left", "CAM L"), ("lrf.right", "CAM R"))
-        ):
-            indicator = StatusIndicator(label)
-            self.lrf_indicators[key] = indicator
-            lrf_layout.addWidget(indicator, 0, index)
-        lrf_refresh_button = _command_button("Refresh LRF", "alignment.query_lrf", invoke_command)
-        self.operation_buttons["alignment.query_lrf"] = lrf_refresh_button
-        lrf_layout.addWidget(lrf_refresh_button, 0, 2)
-        self.optical_pose_pane.layout().addWidget(lrf_group)
-
-        optical_pose_scroll = QtWidgets.QScrollArea()
-        optical_pose_scroll.setObjectName("alignmentOpticalPoseScroll")
-        optical_pose_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        optical_pose_scroll.setWidgetResizable(True)
-        optical_pose_scroll.setMinimumSize(0, 0)
-        optical_pose_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        optical_pose_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-        optical_pose_scroll.setSizeAdjustPolicy(QtWidgets.QAbstractScrollArea.AdjustIgnored)
-        optical_pose_scroll.setWidget(self.optical_pose_pane)
-        self.optical_pose_scroll = optical_pose_scroll
-        operation_tabs.addTab(optical_pose_scroll, "R,t methods")
+        self.optical_pose_scroll = None
         return operation_tabs
 
     def select_tab_for_context(self, context_id: str) -> None:
@@ -6156,8 +7895,6 @@ class AlignmentWorkspace(QtWidgets.QWidget):
         self.optical_pose_pane.set_reference_profile(evidence.calibration())
 
         for key, indicator in self.indicators.items():
-            indicator.set_status(snapshot.get(key))
-        for key, indicator in self.lrf_indicators.items():
             indicator.set_status(snapshot.get(key))
         attitude_rows: list[tuple[object, ...]] = []
         for side in ("left", "right"):
@@ -6434,8 +8171,182 @@ class AlignmentWorkspace(QtWidgets.QWidget):
         }
 
 
+class CalibrationErrorPlot(QtWidgets.QWidget):
+    """Small dependency-free residual plot with a point context menu."""
+
+    exclude_requested = QtCore.pyqtSignal(object)
+    restore_requested = QtCore.pyqtSignal(object)
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setMinimumHeight(220)
+        self.setMouseTracking(True)
+        self.setToolTip(
+            "사진별 점을 우클릭하면 해당 이미지 또는 stereo pair를 계산에서 제외할 수 있습니다."
+        )
+        self._rows: list[dict[str, object]] = []
+        self._point_positions: list[tuple[QtCore.QPointF, dict[str, object]]] = []
+        self._excluded_paths: set[str] = set()
+        self._excluded_pair_keys: set[str] = set()
+        self._threshold_px: float | None = None
+
+    @staticmethod
+    def _finite_error(row: Mapping[str, object]) -> float | None:
+        try:
+            value = float(row.get("reprojection_error_px"))
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    @staticmethod
+    def _median(values: list[float]) -> float:
+        ordered = sorted(values)
+        if not ordered:
+            return 0.0
+        middle = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[middle]
+        return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+    def set_diagnostics(
+        self,
+        rows: Sequence[Mapping[str, object]],
+        *,
+        excluded_paths: set[str] | None = None,
+        excluded_pair_keys: set[str] | None = None,
+    ) -> None:
+        self._rows = [dict(row) for row in rows]
+        self._excluded_paths = {str(path) for path in excluded_paths or ()}
+        self._excluded_pair_keys = {str(key) for key in excluded_pair_keys or ()}
+        errors = [error for row in self._rows if (error := self._finite_error(row)) is not None]
+        if errors:
+            median = self._median(errors)
+            deviations = [abs(value - median) for value in errors]
+            mad = self._median(deviations)
+            self._threshold_px = median + 3.0 * mad if mad > 1.0e-9 else median * 2.0
+        else:
+            self._threshold_px = None
+        self.update()
+
+    def _is_excluded(self, row: Mapping[str, object]) -> bool:
+        return (
+            str(row.get("path") or "") in self._excluded_paths
+            or str(row.get("capture_key") or "") in self._excluded_pair_keys
+        )
+
+    def _point_at(self, position: QtCore.QPoint) -> dict[str, object] | None:
+        nearest: tuple[float, dict[str, object]] | None = None
+        for point, row in self._point_positions:
+            distance = math.hypot(point.x() - position.x(), point.y() - position.y())
+            if distance > 12.0:
+                continue
+            if nearest is None or distance < nearest[0]:
+                nearest = (distance, row)
+        return None if nearest is None else nearest[1]
+
+    def contextMenuEvent(self, event: QtGui.QContextMenuEvent) -> None:  # noqa: N802
+        row = self._point_at(event.pos())
+        if row is None:
+            return
+        menu = QtWidgets.QMenu(self)
+        side = str(row.get("side") or "").upper()
+        path = str(row.get("path") or "")
+        capture_key = str(row.get("capture_key") or "")
+        title = menu.addAction(f"{side}: {Path(path).name or capture_key}")
+        title.setEnabled(False)
+        menu.addSeparator()
+        if self._is_excluded(row):
+            restore_image = menu.addAction(f"{side} 사진을 Intrinsic에 복원")
+            restore_image.setData({"action": "restore", "scope": "image", **row})
+            restore_pair = menu.addAction("Stereo pair 복원")
+            restore_pair.setData({"action": "restore", "scope": "pair", **row})
+        else:
+            exclude_image = menu.addAction(f"{side} 사진을 Intrinsic에서 제외")
+            exclude_image.setData({"action": "exclude", "scope": "image", **row})
+            exclude_pair = menu.addAction("Stereo pair를 R,t에서 제외")
+            exclude_pair.setData({"action": "exclude", "scope": "pair", **row})
+        selected = menu.exec_(self.mapToGlobal(event.pos()))
+        if selected is None:
+            return
+        payload = selected.data()
+        if not isinstance(payload, dict):
+            return
+        if str(payload.get("action") or "exclude") == "restore":
+            self.restore_requested.emit(payload)
+        else:
+            self.exclude_requested.emit(payload)
+
+    def paintEvent(self, _event: QtGui.QPaintEvent) -> None:  # noqa: N802
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        painter.fillRect(self.rect(), self.palette().base())
+        plot = self.rect().adjusted(52, 24, -20, -36)
+        painter.setPen(QtGui.QPen(self.palette().mid().color(), 1))
+        painter.drawRect(plot)
+        self._point_positions = []
+        valid_rows = [row for row in self._rows if self._finite_error(row) is not None]
+        if not valid_rows:
+            painter.setPen(self.palette().text().color())
+            painter.drawText(plot, QtCore.Qt.AlignCenter, "계산 후 사진별 reprojection error가 표시됩니다.")
+            return
+        errors = [self._finite_error(row) or 0.0 for row in valid_rows]
+        max_error = max(max(errors), self._threshold_px or 0.0, 1.0)
+        y_max = max_error * 1.15
+        for index in range(5):
+            ratio = index / 4.0
+            y = plot.bottom() - round(ratio * plot.height())
+            painter.setPen(QtGui.QPen(self.palette().mid().color(), 1, QtCore.Qt.DotLine))
+            painter.drawLine(plot.left(), y, plot.right(), y)
+            painter.setPen(self.palette().text().color())
+            painter.drawText(2, y - 7, 46, 15, QtCore.Qt.AlignRight, f"{y_max * ratio:.2f}")
+        if self._threshold_px is not None:
+            threshold_y = plot.bottom() - round(
+                min(1.0, self._threshold_px / y_max) * plot.height()
+            )
+            painter.setPen(QtGui.QPen(QtGui.QColor("#c0392b"), 1, QtCore.Qt.DashLine))
+            painter.drawLine(plot.left(), threshold_y, plot.right(), threshold_y)
+            painter.drawText(plot.left() + 5, threshold_y - 4, f"candidate {self._threshold_px:.2f}px")
+        colors = {"left": QtGui.QColor("#555555"), "right": QtGui.QColor("#999999")}
+        for index, row in enumerate(valid_rows):
+            error = self._finite_error(row) or 0.0
+            x_ratio = 0.5 if len(valid_rows) <= 1 else index / (len(valid_rows) - 1)
+            x = plot.left() + round(x_ratio * plot.width())
+            y = plot.bottom() - round(min(1.0, error / y_max) * plot.height())
+            point = QtCore.QPointF(x, y)
+            self._point_positions.append((point, row))
+            excluded = self._is_excluded(row)
+            color = QtGui.QColor("#8a8a8a") if excluded else colors.get(
+                str(row.get("side") or "").lower(), QtGui.QColor("#555555")
+            )
+            painter.setPen(QtGui.QPen(color.darker(130) if excluded else color, 1))
+            painter.setBrush(QtGui.QBrush(color))
+            painter.drawEllipse(point, 5, 5)
+            if excluded:
+                painter.drawLine(x - 5, y - 5, x + 5, y + 5)
+                painter.drawLine(x - 5, y + 5, x + 5, y - 5)
+        painter.setPen(self.palette().text().color())
+        painter.drawText(
+            4,
+            self.height() - 22,
+            self.width() - 8,
+            18,
+            QtCore.Qt.AlignCenter,
+            "파랑=Left · 주황=Right · 점 우클릭=제외/복원",
+        )
+
+
 class CalibrationWorkspace(QtWidgets.QWidget):
     """Calibration evidence with owner-backed capture/run/save/apply commands."""
+
+    _CALIBRATION_QUALITY_GATED_COMMANDS = frozenset(
+        {
+            "calibration.save_intrinsics",
+            "calibration.save_extrinsics",
+            "calibration.apply_bundle",
+            "calibration.validation.save",
+            "calibration.validation.apply",
+        }
+    )
 
     def __init__(
         self,
@@ -6449,6 +8360,26 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         self.invoke_command = invoke_command
         self._camera_preview_metadata: dict[str, object] = {"left": {}, "right": {}}
         self._checkerboard_overlay_active = {"left": False, "right": False}
+        # The calibration page is refreshed with the global 4 Hz evidence
+        # poll.  Pair thumbnails are expensive GUI-thread work, so rebuild
+        # the picker only when its directories or persisted selection change.
+        self._calibration_pair_picker_signature: tuple[object, ...] | None = None
+        self._calibration_pair_picker_thumbnail_generation = 0
+        self._calibration_pair_picker_thumbnail_paths: list[tuple[str, Path]] = []
+        self._calibration_pair_picker_thumbnail_index = 0
+        self._calibration_pair_picker_items: dict[str, QtWidgets.QListWidgetItem] = {}
+        self._calibration_pair_picker_visible_keys: set[str] = set()
+        self._calibration_pair_picker_session_started_unix_ns = time.time_ns()
+        self._calibration_session_catalog_signature: tuple[object, ...] | None = None
+        self._calibration_diagnostics_signature: tuple[object, ...] | None = None
+        self._calibration_quality_signature: tuple[object, ...] | None = None
+        self._calibration_quality_state = "UNVERIFIED"
+        self._calibration_quality_snapshot_cache: dict[str, object] = {}
+        self._calibration_quality_warning_confirmed = False
+        self._calibration_capture_log_lines: dict[str, list[str]] = {
+            "left": [],
+            "right": [],
+        }
         self._checkerboard_preview_supported = callable(
             getattr(self.backend, "advanced_refresh_calibration_preview", None)
         )
@@ -6512,7 +8443,10 @@ class CalibrationWorkspace(QtWidgets.QWidget):
 
         self.operation_tabs = self._build_operation_tabs()
         camera_layout.addWidget(self.operation_tabs)
+        self.refresh_calibration_quality()
         layout.addWidget(camera_group)
+        self._connect_calibration_capture_event_signal()
+        self._connect_calibration_diagnostics_signal()
         self._connect_camera_panes()
         self._connect_calibration_preview_signal()
 
@@ -6647,7 +8581,7 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         path_form.setColumnStretch(1, 1)
         path_form.setColumnStretch(3, 1)
         path_form.addWidget(QtWidgets.QLabel("Calibration root"), 0, 0)
-        path_form.addWidget(setup_text("calibration_root", "calibration_captures"), 0, 1, 1, 3)
+        path_form.addWidget(setup_text("calibration_root", DEFAULT_CALIBRATION_ROOT), 0, 1, 1, 3)
         path_form.addWidget(QtWidgets.QLabel("Calculation mode"), 1, 0)
         path_form.addWidget(setup_combo("validation_mode"), 1, 1)
         setup_layout.addLayout(path_form)
@@ -6669,6 +8603,20 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         setup_actions.addStretch(1)
         setup_layout.addLayout(setup_actions)
         layout.addWidget(setup_group)
+
+        validation_group = QtWidgets.QGroupBox("Advanced validation (optional)")
+        self.checkerboard_validation_outer_group = validation_group
+        validation_group.setCheckable(True)
+        validation_group.setChecked(False)
+        validation_layout = QtWidgets.QVBoxLayout(validation_group)
+        validation_content = self._build_checkerboard_validation_group()
+        validation_layout.addWidget(validation_content)
+        validation_content.setVisible(False)
+        validation_group.toggled.connect(validation_content.setVisible)
+        validation_group.toggled.connect(
+            lambda _checked: self._apply_calibration_quality_gate()
+        )
+        layout.addWidget(validation_group)
 
         handoff_button = QtWidgets.QPushButton("Advanced Zoom")
         handoff_button.setToolTip(
@@ -6697,25 +8645,30 @@ class CalibrationWorkspace(QtWidgets.QWidget):
     def _build_operation_tabs(self) -> QtWidgets.QTabWidget:
         operation_tabs = QtWidgets.QTabWidget()
         self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
-        # Two tabs by workflow, not by K,D vs R,t: a fresh checkerboard run
-        # always produces both together (R,t needs K,D already computed), so
-        # "Capture & Compute" covers both, then saves each as its own file.
+        # Separate capture from post-capture computation. A fresh checkerboard
+        # run still produces the same evidence contract, but the operator must
+        # review/select a saved session before calculating or loading it.
         # "Load & Apply" is the separate path for reusing a previously saved
         # profile without recapturing anything. The Setup group's own
         # Apply/Save setup buttons live next to that form, not in a tab here.
         operation_sections = (
             (
-                "Capture & Compute",
+                "Capture",
                 (
-                    ("calibration.capture_images", "Capture"),
-                    ("calibration.capture_images_wiris_ftp", "Capture FTP HR"),
-                    ("calibration.capture_images_wiris_ftp_oz", "Capture FTP OZ"),
+                    ("calibration.capture_images", "Capture Live Pair"),
+                    ("calibration.capture_images_wiris_ftp", "Capture HR Still (FTP)"),
+                    ("calibration.capture_images_wiris_ftp_oz", "Capture OZ Still (FTP)"),
                     ("calibration.capture_images_wiris_oz_capture_only", "OZ 캡처"),
-                    ("calibration.sync_images_wiris_oz_ftp", "FTP 접근"),
+                ),
+            ),
+            (
+                "Compute",
+                (
                     ("calibration.run_intrinsic", "Run calibration (K,D)"),
                     ("calibration.run_extrinsics", "Calculate R,t"),
                     ("calibration.save_intrinsics", "Save Intrinsics"),
                     ("calibration.save_extrinsics", "Save R,t"),
+                    ("calibration.sync_images_wiris_oz_ftp", "FTP 접근"),
                 ),
             ),
             (
@@ -6726,19 +8679,22 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                     ("calibration.apply_bundle", "Apply (K,D + R,t)"),
                 ),
             ),
-            ("Validation", ()),
         )
         for tab_label, actions in operation_sections:
             page = QtWidgets.QWidget()
             page_layout = QtWidgets.QVBoxLayout(page)
             page_layout.setContentsMargins(6, 6, 6, 6)
             actions_layout = QtWidgets.QGridLayout()
+            columns = 4 if tab_label == "Capture" else 3
             for index, (command_id, label) in enumerate(actions):
                 button = _command_button(label, command_id, self.invoke_command)
+                if tab_label == "Capture":
+                    button.setMinimumWidth(0)
+                    button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
                 self.operation_buttons[command_id] = button
-                actions_layout.addWidget(button, index // 3, index % 3)
+                actions_layout.addWidget(button, index // columns, index % columns)
             page_layout.addLayout(actions_layout)
-            if tab_label == "Capture & Compute":
+            if tab_label == "Capture":
                 auto_group = QtWidgets.QGroupBox("Automatic capture")
                 auto_layout = QtWidgets.QGridLayout(auto_group)
                 auto_layout.setHorizontalSpacing(8)
@@ -6777,12 +8733,1515 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                 auto_layout.addWidget(auto_target, 0, 3)
                 auto_layout.addWidget(auto_button, 1, 0, 1, 4)
                 page_layout.addWidget(auto_group)
-                page_layout.addWidget(self._build_calibration_pair_picker_group())
-            elif tab_label == "Validation":
-                page_layout.addWidget(self._build_checkerboard_validation_group())
+                page_layout.addWidget(self._build_calibration_capture_response_group())
+            elif tab_label == "Compute":
+                page_layout.addWidget(self._build_calibration_session_group())
+                page_layout.addWidget(self._build_calibration_file_selection_group())
+                page_layout.addWidget(self._build_calibration_quality_group())
+                page_layout.addWidget(self._build_calibration_outlier_group())
             page_layout.addStretch(1)
             operation_tabs.addTab(page, tab_label)
         return operation_tabs
+
+    def _build_calibration_capture_response_group(self) -> QtWidgets.QGroupBox:
+        """Show the raw capture lifecycle separately for the two cameras."""
+
+        group = QtWidgets.QGroupBox("Capture command / response")
+        layout = QtWidgets.QVBoxLayout(group)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(5)
+        split = QtWidgets.QHBoxLayout()
+        split.setSpacing(6)
+        self.calibration_capture_response_edits: dict[str, QtWidgets.QPlainTextEdit] = {}
+        self.calibration_capture_response_status: dict[str, QtWidgets.QLabel] = {}
+        for side, title in (("left", "Left camera"), ("right", "Right camera")):
+            side_group = QtWidgets.QGroupBox(title)
+            side_layout = QtWidgets.QVBoxLayout(side_group)
+            side_layout.setContentsMargins(5, 5, 5, 5)
+            status = QtWidgets.QLabel("대기")
+            status.setObjectName("statusStrip")
+            status.setWordWrap(True)
+            log = QtWidgets.QPlainTextEdit()
+            log.setReadOnly(True)
+            log.setMaximumBlockCount(160)
+            log.setMinimumHeight(92)
+            log.setPlaceholderText("이 카메라의 capture 명령과 응답이 표시됩니다.")
+            self.calibration_capture_response_status[side] = status
+            self.calibration_capture_response_edits[side] = log
+            side_layout.addWidget(status)
+            side_layout.addWidget(log)
+            split.addWidget(side_group, 1)
+        layout.addLayout(split)
+        actions = QtWidgets.QHBoxLayout()
+        actions.addStretch(1)
+        clear_button = QtWidgets.QPushButton("Clear capture responses")
+        clear_button.clicked.connect(self._clear_calibration_capture_response_logs)
+        actions.addWidget(clear_button)
+        layout.addLayout(actions)
+        return group
+
+    def _connect_calibration_capture_event_signal(self) -> None:
+        panel = getattr(self.backend, "panel", None)
+        signal = getattr(panel, "calibration_capture_event", None)
+        connect = getattr(signal, "connect", None)
+        if callable(connect):
+            connect(self._append_calibration_capture_event)
+
+    def _connect_calibration_diagnostics_signal(self) -> None:
+        panel = getattr(self.backend, "panel", None)
+        signal = getattr(panel, "calibration_diagnostics_changed", None)
+        connect = getattr(signal, "connect", None)
+        if callable(connect):
+            connect(self._on_calibration_diagnostics_changed)
+
+    def _on_calibration_diagnostics_changed(self, _payload: object = None) -> None:
+        self._calibration_diagnostics_signature = None
+        self._sync_calibration_outlier_view()
+
+    def _clear_calibration_capture_response_logs(self) -> None:
+        for side in ("left", "right"):
+            self._calibration_capture_log_lines[side] = []
+            status = self.calibration_capture_response_status.get(side)
+            if status is not None:
+                status.setText("대기")
+            editor = self.calibration_capture_response_edits.get(side)
+            if editor is not None:
+                editor.clear()
+
+    def _append_calibration_capture_event(self, payload: object) -> None:
+        if not isinstance(payload, Mapping):
+            return
+        side = str(payload.get("side") or "").strip().lower()
+        if side not in {"left", "right"}:
+            return
+        operation = str(payload.get("operation") or "Capture Live Pair")
+        phase = str(payload.get("phase") or "event")
+        state = str(payload.get("state") or "")
+        command = str(payload.get("command") or "").strip()
+        response = str(payload.get("response") or "").strip()
+        capture_id = str(payload.get("capture_id") or "").strip()
+        timestamp = QtCore.QDateTime.currentDateTime().toString("HH:mm:ss.zzz")
+        prefix = f"[{timestamp}] {operation}"
+        if capture_id:
+            prefix += f" {capture_id}"
+        lines: list[str]
+        if phase == "command":
+            lines = [f"{prefix} · {side}", f"> {command or '<command>'}"]
+        elif phase == "response":
+            lines = [f"{prefix} · {side}", f"< {command or '<command>'}: {response or '<empty>'}"]
+        else:
+            detail = response or str(payload.get("path") or "") or state or phase
+            lines = [f"{prefix} · {phase} · {state or 'unknown'}: {detail}"]
+            remote_path = str(payload.get("remote_path") or "").strip()
+            if remote_path:
+                lines.append(f"remote: {remote_path}")
+        buffer = self._calibration_capture_log_lines.setdefault(side, [])
+        buffer.extend(lines)
+        del buffer[:-160]
+        editor = self.calibration_capture_response_edits.get(side)
+        if editor is not None:
+            editor.setPlainText("\n".join(buffer))
+            cursor = editor.textCursor()
+            cursor.movePosition(QtGui.QTextCursor.End)
+            editor.setTextCursor(cursor)
+        status = self.calibration_capture_response_status.get(side)
+        if status is not None:
+            status.setText(f"{operation}: {state or phase}")
+
+    def _build_calibration_session_group(self) -> QtWidgets.QGroupBox:
+        group = QtWidgets.QGroupBox("Calibration session")
+        layout = QtWidgets.QGridLayout(group)
+        layout.setHorizontalSpacing(8)
+        self.calibration_session_combo = QtWidgets.QComboBox()
+        self.calibration_session_combo.setObjectName("calibrationSessionSelector")
+        self.calibration_session_combo.currentIndexChanged.connect(
+            self._on_calibration_session_selected
+        )
+        self.calibration_session_refresh_button = QtWidgets.QPushButton("Refresh sessions")
+        self.calibration_session_refresh_button.clicked.connect(
+            lambda _checked=False: self._refresh_calibration_session_selector(force=True)
+        )
+        self.calibration_session_path_label = QtWidgets.QLabel("No saved session selected")
+        self.calibration_session_path_label.setObjectName("statusStrip")
+        self.calibration_session_path_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.calibration_session_result_label = QtWidgets.QLabel(
+            "Results: beside the selected left/right photo set"
+        )
+        self.calibration_session_result_label.setObjectName("compactContract")
+        self.calibration_session_result_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        layout.addWidget(QtWidgets.QLabel("Photo set"), 0, 0)
+        layout.addWidget(self.calibration_session_combo, 0, 1)
+        layout.addWidget(self.calibration_session_refresh_button, 0, 2)
+        layout.addWidget(self.calibration_session_path_label, 1, 0, 1, 3)
+        layout.addWidget(self.calibration_session_result_label, 2, 0, 1, 3)
+        self._refresh_calibration_session_selector(force=True)
+        return group
+
+    def _refresh_calibration_session_selector(self, *, force: bool = False) -> None:
+        combo = getattr(self, "calibration_session_combo", None)
+        if combo is None:
+            return
+        configured = str(
+            _evidence(self.backend).calibration_setup().get("calibration_root_resolved") or ""
+        )
+        default_base = Path(DEFAULT_CALIBRATION_ROOT)
+        catalog_roots = [default_base]
+        configured_base = Path(configured) if configured else None
+        if (
+            configured_base is not None
+            and configured_base.is_dir()
+            and configured_base.resolve() != default_base.resolve()
+        ):
+            catalog_roots.append(configured_base)
+        sessions_by_root = {}
+        for catalog_root in catalog_roots:
+            for session in discover_calibration_sessions(catalog_root):
+                sessions_by_root[str(session.root)] = session
+        sessions = tuple(
+            sorted(
+                sessions_by_root.values(),
+                key=lambda session: (session.updated_ns, str(session.root)),
+                reverse=True,
+            )
+        )
+        signature = (
+            tuple(str(root) for root in catalog_roots),
+            tuple((str(session.root), session.pair_count, session.updated_ns) for session in sessions),
+        )
+        if not force and signature == self._calibration_session_catalog_signature:
+            return
+        self._calibration_session_catalog_signature = signature
+        current = configured
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            for session in sessions:
+                combo.addItem(session.display_name, str(session.root))
+            selected_index = combo.findData(current)
+            if selected_index < 0 and sessions:
+                selected_index = 0
+            if selected_index >= 0:
+                combo.setCurrentIndex(selected_index)
+                self.calibration_session_path_label.setText(
+                    str(combo.currentData() or "No saved session selected")
+                )
+                self.calibration_session_result_label.setText(
+                    f"Results: {combo.currentData()}/intrinsics_zoom_##.json and intrinsics.json"
+                )
+            else:
+                self.calibration_session_path_label.setText("No saved session selected")
+                self.calibration_session_result_label.setText(
+                    "Results: beside the selected left/right photo set"
+                )
+        finally:
+            combo.blockSignals(False)
+
+    def _on_calibration_session_selected(self, index: int) -> None:
+        combo = getattr(self, "calibration_session_combo", None)
+        if combo is None or index < 0:
+            return
+        root = str(combo.itemData(index) or "").strip()
+        if not root:
+            return
+        root_widget = self.setup_widgets.get("calibration_root")
+        if isinstance(root_widget, QtWidgets.QLineEdit):
+            root_widget.setText(root)
+        apply_setup = getattr(self.backend, "calibration_apply_setup", None)
+        if callable(apply_setup):
+            try:
+                apply_setup(self.setup_payload())
+            except Exception as exc:
+                self.calibration_session_path_label.setText(f"Session apply failed: {exc}")
+                return
+        self.calibration_session_path_label.setText(root)
+        self.calibration_session_result_label.setText(
+            f"Results: {root}/intrinsics_zoom_##.json and intrinsics.json"
+        )
+        self._calibration_pair_picker_signature = None
+        self._calibration_file_picker_signature = None
+        self._sync_calibration_file_selection()
+        self._calibration_diagnostics_signature = None
+        self._sync_calibration_outlier_view()
+
+    def apply_selected_calibration_session(self) -> bool:
+        """Apply the visible session choice immediately before a compute action."""
+
+        self._last_calibration_session_apply_performed = False
+        combo = getattr(self, "calibration_session_combo", None)
+        if combo is None:
+            return True
+        root = str(combo.currentData() or "").strip()
+        if not root:
+            return True
+        root_widget = self.setup_widgets.get("calibration_root")
+        configured_root = str(
+            _evidence(self.backend).calibration_setup().get("calibration_root_resolved") or ""
+        )
+        needs_apply = configured_root != root
+        if isinstance(root_widget, QtWidgets.QLineEdit) and root_widget.text().strip() != root:
+            root_widget.setText(root)
+            needs_apply = True
+        self._normalize_legacy_calibration_selection(Path(root))
+        if not needs_apply:
+            return True
+        apply_setup = getattr(self.backend, "calibration_apply_setup", None)
+        if not callable(apply_setup):
+            return True
+        try:
+            apply_setup(self.setup_payload())
+        except Exception as exc:
+            self.calibration_session_path_label.setText(f"Session apply failed: {exc}")
+            return False
+        self._last_calibration_session_apply_performed = True
+        self.calibration_session_path_label.setText(root)
+        self.calibration_session_result_label.setText(
+            f"Results: {root}/intrinsics_zoom_##.json and intrinsics.json"
+        )
+        self._calibration_file_picker_signature = None
+        self._calibration_diagnostics_signature = None
+        self._sync_calibration_file_selection()
+        self._sync_calibration_outlier_view()
+        return True
+
+    @staticmethod
+    def _normalize_legacy_calibration_selection(root: Path) -> None:
+        """Do not let the removed legacy pair picker limit a new session."""
+
+        path = root / "calibration_pair_selection.json"
+        if not path.is_file():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return
+        if not isinstance(data, dict):
+            return
+        if data.get("schema") == "workstation-calibration-file-selection-v1":
+            return
+        if data.get("left_paths") or data.get("right_paths"):
+            return
+        data.update(
+            {
+                "schema": "workstation-calibration-file-selection-v1",
+                "manual_mode": False,
+                "included_keys": [],
+                "left_paths": [],
+                "right_paths": [],
+                "excluded_left_paths": [],
+                "excluded_right_paths": [],
+                "excluded_pair_keys": [],
+            }
+        )
+        try:
+            path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            return
+
+    # -- Explicit calculation-file selection ---------------------------
+
+    def _build_calibration_file_selection_group(self) -> QtWidgets.QGroupBox:
+        group = QtWidgets.QGroupBox("계산에 사용할 사진")
+        layout = QtWidgets.QVBoxLayout(group)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(5)
+
+        controls = QtWidgets.QGridLayout()
+        controls.setHorizontalSpacing(8)
+        controls.setVerticalSpacing(5)
+        self.calibration_left_files_button = QtWidgets.QPushButton("Left 사진 선택…")
+        self.calibration_right_files_button = QtWidgets.QPushButton("Right 사진 선택…")
+        self.calibration_clear_files_button = QtWidgets.QPushButton("선택 초기화")
+        self.calibration_left_files_button.clicked.connect(
+            lambda _checked=False: self._choose_calibration_files("left")
+        )
+        self.calibration_right_files_button.clicked.connect(
+            lambda _checked=False: self._choose_calibration_files("right")
+        )
+        self.calibration_clear_files_button.clicked.connect(
+            self._clear_calibration_file_selection
+        )
+        self.calibration_file_selection_summary = QtWidgets.QLabel(
+            "파일창에서 좌/우 사진을 각각 선택하세요."
+        )
+        self.calibration_file_selection_summary.setObjectName("statusStrip")
+        self.calibration_file_selection_summary.setWordWrap(True)
+        controls.addWidget(self.calibration_left_files_button, 0, 0)
+        controls.addWidget(self.calibration_right_files_button, 0, 1)
+        controls.addWidget(self.calibration_clear_files_button, 0, 2)
+        controls.addWidget(self.calibration_file_selection_summary, 1, 0, 1, 3)
+        layout.addLayout(controls)
+
+        self.calibration_selected_files_table = QtWidgets.QTableWidget(0, 6)
+        self.calibration_selected_files_table.setObjectName("calibrationSelectedFilesTable")
+        self.calibration_selected_files_table.setHorizontalHeaderLabels(
+            ("#", "Left", "Right", "Left 정보", "Right 정보", "Pair")
+        )
+        self.calibration_selected_files_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.calibration_selected_files_table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.calibration_selected_files_table.verticalHeader().setVisible(False)
+        self.calibration_selected_files_table.setMinimumHeight(100)
+        self.calibration_selected_files_table.setMaximumHeight(230)
+        header = self.calibration_selected_files_table.horizontalHeader()
+        header.setStretchLastSection(True)
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
+        layout.addWidget(self.calibration_selected_files_table)
+
+        hint = QtWidgets.QLabel(
+            "intrinsic은 좌/우 목록을 각각 사용하고, Checkerboard R,t는 같은 행의 좌/우 파일을 pair로 사용합니다. "
+            "사진 정보의 시각은 exact RTCP/NTP frame → app capture record/request → legacy file mtime "
+            "순으로 표시하며 출처를 함께 적습니다. 선택 목록은 세션 폴더의 "
+            "calibration_pair_selection.json에 저장됩니다."
+        )
+        hint.setObjectName("compactContract")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self._calibration_file_picker_signature = None
+        return group
+
+    def _build_calibration_outlier_group(self) -> QtWidgets.QGroupBox:
+        group = QtWidgets.QGroupBox("Outlier analysis")
+        layout = QtWidgets.QVBoxLayout(group)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(5)
+        self.calibration_outlier_summary = QtWidgets.QLabel(
+            "Run calibration (K,D) 후 사진별 reprojection error가 표시됩니다."
+        )
+        self.calibration_outlier_summary.setObjectName("statusStrip")
+        self.calibration_outlier_summary.setWordWrap(True)
+        layout.addWidget(self.calibration_outlier_summary)
+        self.calibration_outlier_plot = CalibrationErrorPlot()
+        self.calibration_outlier_plot.exclude_requested.connect(
+            lambda payload: self._handle_calibration_outlier_action(payload, restore=False)
+        )
+        self.calibration_outlier_plot.restore_requested.connect(
+            lambda payload: self._handle_calibration_outlier_action(payload, restore=True)
+        )
+        layout.addWidget(self.calibration_outlier_plot)
+        self.calibration_outlier_table = QtWidgets.QTableWidget(0, 6)
+        self.calibration_outlier_table.setObjectName("calibrationOutlierTable")
+        self.calibration_outlier_table.setHorizontalHeaderLabels(
+            ("Side", "File", "Error px", "Coverage", "Board", "State")
+        )
+        self.calibration_outlier_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.calibration_outlier_table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.calibration_outlier_table.verticalHeader().setVisible(False)
+        self.calibration_outlier_table.setMinimumHeight(72)
+        self.calibration_outlier_table.setMaximumHeight(190)
+        header = self.calibration_outlier_table.horizontalHeader()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
+        header.setStretchLastSection(True)
+        layout.addWidget(self.calibration_outlier_table)
+        return group
+
+    def _build_calibration_quality_group(self) -> QtWidgets.QGroupBox:
+        """Build a presentation-only view of the owner's quality snapshot."""
+
+        group = QtWidgets.QGroupBox("Calibration quality gate")
+        group.setObjectName("calibrationQualityGroup")
+        self.calibration_quality_group = group
+        layout = QtWidgets.QVBoxLayout(group)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(5)
+
+        values_layout = QtWidgets.QGridLayout()
+        values_layout.setHorizontalSpacing(8)
+        values_layout.setVerticalSpacing(4)
+        self.calibration_quality_values: dict[str, EngineeringValue] = {}
+        for index, (key, label) in enumerate(
+            (
+                ("state", "Quality state"),
+                ("effective_pose_count", "Effective poses"),
+                ("coverage", "Center coverage"),
+                ("principal_offsets", "Principal offsets"),
+                ("subset_stability", "Subset cx/cy/focal stability"),
+                ("uncertainty", "Solver uncertainty / max view error"),
+                ("reasons", "Reasons"),
+                ("source", "Source"),
+            )
+        ):
+            value = EngineeringValue(label)
+            value.setObjectName(f"calibrationQuality_{key}")
+            self.calibration_quality_values[key] = value
+            values_layout.addWidget(value, index // 2, index % 2)
+        self.calibration_quality_state_label = self.calibration_quality_values["state"].value
+        self.calibration_quality_reasons_label = self.calibration_quality_values["reasons"].value
+        layout.addLayout(values_layout)
+
+        coverage_label = QtWidgets.QLabel(
+            "Board-center occupancy (source-provided 3×3 grid; no UI geometry recomputation)"
+        )
+        coverage_label.setObjectName("compactContract")
+        coverage_label.setWordWrap(True)
+        layout.addWidget(coverage_label)
+        self.calibration_center_coverage_table = QtWidgets.QTableWidget(3, 3)
+        self.calibration_center_coverage_table.setObjectName("calibrationCenterCoverage3x3")
+        self.calibration_center_coverage_table.setHorizontalHeaderLabels(
+            ("Left", "Center", "Right")
+        )
+        self.calibration_center_coverage_table.setVerticalHeaderLabels(
+            ("Top", "Middle", "Bottom")
+        )
+        self.calibration_center_coverage_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.NoEditTriggers
+        )
+        self.calibration_center_coverage_table.setSelectionMode(
+            QtWidgets.QAbstractItemView.NoSelection
+        )
+        self.calibration_center_coverage_table.setMaximumHeight(126)
+        self.calibration_center_coverage_table.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.Stretch
+        )
+        self.calibration_center_coverage_table.verticalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.Stretch
+        )
+        layout.addWidget(self.calibration_center_coverage_table)
+
+        self.calibration_quality_warning_checkbox = QtWidgets.QCheckBox(
+            "I reviewed this WARNING and explicitly allow Save / Apply for this result"
+        )
+        self.calibration_quality_warning_checkbox.setObjectName(
+            "calibrationQualityWarningConfirmation"
+        )
+        self.calibration_quality_warning_checkbox.setToolTip(
+            "Confirmation applies only to the currently displayed source-backed quality snapshot."
+        )
+        self.calibration_quality_warning_checkbox.toggled.connect(
+            self.confirm_calibration_quality_warning
+        )
+        self.calibration_quality_warning_checkbox.setVisible(False)
+        layout.addWidget(self.calibration_quality_warning_checkbox)
+
+        self.calibration_quality_gate_label = QtWidgets.QLabel(
+            "UNVERIFIED · legacy result has no quality snapshot; existing Save / Apply behavior is preserved."
+        )
+        self.calibration_quality_gate_label.setObjectName("statusStrip")
+        self.calibration_quality_gate_label.setWordWrap(True)
+        layout.addWidget(self.calibration_quality_gate_label)
+
+        for row in range(3):
+            for column in range(3):
+                item = QtWidgets.QTableWidgetItem("--")
+                item.setTextAlignment(QtCore.Qt.AlignCenter)
+                self.calibration_center_coverage_table.setItem(row, column, item)
+        return group
+
+    @staticmethod
+    def _calibration_quality_state_text(value: object) -> str:
+        state = str(getattr(value, "value", value) or "").strip().upper()
+        aliases = {
+            "GOOD": "PASS",
+            "VALID": "PASS",
+            "PASSED": "PASS",
+            "OK": "PASS",
+            "WARN": "WARNING",
+            "INVALID": "FAIL",
+            "FAILED": "FAIL",
+            "ERROR": "FAIL",
+            "UNKNOWN": "UNVERIFIED",
+            "NOT_VERIFIED": "UNVERIFIED",
+            "LEGACY_UNVERIFIED": "UNVERIFIED",
+        }
+        normalized = aliases.get(state, state)
+        return normalized if normalized in {"PASS", "WARNING", "FAIL"} else "UNVERIFIED"
+
+    @staticmethod
+    def _calibration_quality_reasons(value: object) -> tuple[str, ...]:
+        reasons: list[str] = []
+        rows = value if isinstance(value, (list, tuple, set)) else (value,)
+        for row in rows:
+            if row in (None, ""):
+                continue
+            if isinstance(row, Mapping):
+                code = str(row.get("code") or row.get("id") or "").strip()
+                detail = str(
+                    row.get("message")
+                    or row.get("reason")
+                    or row.get("detail")
+                    or row.get("status")
+                    or ""
+                ).strip()
+                text = f"{code}: {detail}" if code and detail else code or detail
+            else:
+                text = str(row).strip()
+            if text and text not in reasons:
+                reasons.append(text)
+        return tuple(reasons)
+
+    @staticmethod
+    def _calibration_quality_display(value: object) -> str:
+        if value in (None, "", (), [], {}):
+            return "--"
+        if isinstance(value, bool):
+            return "yes" if value else "no"
+        if isinstance(value, float):
+            return _display_number(value, digits=4)
+        if isinstance(value, Mapping):
+            parts = []
+            for key, child in value.items():
+                if key in {"grid", "grid_3x3", "cells", "coverage_grid_3x3"}:
+                    continue
+                parts.append(
+                    f"{key}={CalibrationWorkspace._calibration_quality_display(child)}"
+                )
+            return " · ".join(parts) or "--"
+        if isinstance(value, (list, tuple)):
+            return ", ".join(
+                CalibrationWorkspace._calibration_quality_display(child) for child in value
+            )
+        return str(value)
+
+    @staticmethod
+    def _calibration_quality_mapping(value: object) -> dict[str, object]:
+        if not isinstance(value, Mapping):
+            return {}
+        snapshot = dict(value)
+        for key in ("calibration_quality", "quality_snapshot", "quality"):
+            nested = snapshot.get(key)
+            if isinstance(nested, Mapping) and any(
+                field in nested
+                for field in (
+                    "state",
+                    "status",
+                    "verdict",
+                    "quality_state",
+                    "effective_pose_count",
+                    "coverage_grid_3x3",
+                )
+            ):
+                merged = dict(snapshot)
+                merged.update(dict(nested))
+                return merged
+        return snapshot
+
+    def calibration_quality_snapshot(self) -> dict[str, object]:
+        """Read one owner-produced quality snapshot without deriving metrics."""
+
+        panel = getattr(self.backend, "panel", self.backend)
+        for owner in (self.backend, panel):
+            for name in (
+                "calibration_quality_snapshot",
+                "workstation_calibration_quality_snapshot",
+                "checkerboard_calibration_quality_snapshot",
+            ):
+                reader = getattr(owner, name, None)
+                if not callable(reader):
+                    continue
+                try:
+                    snapshot = reader()
+                except Exception as exc:
+                    return {
+                        "state": "UNVERIFIED",
+                        "reasons": (f"quality snapshot unavailable: {exc}",),
+                        "source": f"{type(owner).__name__}.{name}",
+                    }
+                if isinstance(snapshot, Mapping):
+                    return self._calibration_quality_mapping(snapshot)
+        for owner in (panel, self.backend):
+            for name in ("calibration_quality", "last_calibration_quality"):
+                snapshot = getattr(owner, name, None)
+                if isinstance(snapshot, Mapping):
+                    return self._calibration_quality_mapping(snapshot)
+        result = getattr(panel, "last_calibration_result", None)
+        snapshot = getattr(result, "quality_snapshot", None) if result is not None else None
+        if isinstance(snapshot, Mapping):
+            return self._calibration_quality_mapping(snapshot)
+        return {}
+
+    @staticmethod
+    def _calibration_quality_field(
+        snapshot: Mapping[str, object],
+        *names: str,
+    ) -> object:
+        for container in (
+            snapshot,
+            snapshot.get("metrics") if isinstance(snapshot.get("metrics"), Mapping) else {},
+        ):
+            if not isinstance(container, Mapping):
+                continue
+            for name in names:
+                if name in container and container[name] not in (None, ""):
+                    return container[name]
+        return None
+
+    @staticmethod
+    def _calibration_coverage_grid(snapshot: Mapping[str, object]) -> object:
+        coverage = snapshot.get("coverage")
+        for value in (
+            snapshot.get("coverage_grid_3x3"),
+            snapshot.get("center_coverage_grid"),
+            coverage.get("grid_3x3") if isinstance(coverage, Mapping) else None,
+            coverage.get("grid") if isinstance(coverage, Mapping) else None,
+            coverage.get("cells") if isinstance(coverage, Mapping) else None,
+        ):
+            if value not in (None, ""):
+                return value
+        return None
+
+    @staticmethod
+    def _calibration_grid_cell(grid: object, row: int, column: int) -> object:
+        if isinstance(grid, (list, tuple)):
+            if len(grid) == 9:
+                return grid[row * 3 + column]
+            if len(grid) > row and isinstance(grid[row], (list, tuple)) and len(grid[row]) > column:
+                return grid[row][column]
+        if isinstance(grid, Mapping):
+            names = (
+                ("top_left", "top_center", "top_right"),
+                ("middle_left", "center", "middle_right"),
+                ("bottom_left", "bottom_center", "bottom_right"),
+            )
+            for key in (
+                names[row][column],
+                f"{row},{column}",
+                f"r{row}c{column}",
+                str(row * 3 + column),
+            ):
+                if key in grid:
+                    return grid[key]
+        return None
+
+    @staticmethod
+    def _calibration_grid_cell_text(value: object) -> tuple[str, bool | None]:
+        if value is None:
+            return "--", None
+        if isinstance(value, Mapping):
+            covered = value.get("covered")
+            display = next(
+                (
+                    value[key]
+                    for key in ("label", "count", "pose_count", "fraction", "value")
+                    if key in value
+                ),
+                "covered" if covered is True else "empty" if covered is False else "--",
+            )
+            return CalibrationWorkspace._calibration_quality_display(display), (
+                bool(covered) if covered is not None else None
+            )
+        if isinstance(value, bool):
+            return ("covered", True) if value else ("empty", False)
+        return CalibrationWorkspace._calibration_quality_display(value), None
+
+    def apply_calibration_quality_snapshot(self, value: object) -> dict[str, object]:
+        """Present and gate one source snapshot; never calculate quality here."""
+
+        snapshot = self._calibration_quality_mapping(value)
+        raw_state = self._calibration_quality_field(
+            snapshot, "state", "quality_state", "verdict", "status"
+        )
+        state = self._calibration_quality_state_text(raw_state)
+        reasons = self._calibration_quality_reasons(
+            self._calibration_quality_field(
+                snapshot,
+                "reasons",
+                "quality_reasons",
+                "failure_reasons",
+                "warning_reasons",
+            )
+        )
+        if not snapshot:
+            reasons = ("No source-backed calibration quality snapshot (legacy result)",)
+        elif state == "UNVERIFIED" and raw_state not in (None, "") and not reasons:
+            reasons = (f"Unsupported source quality state: {raw_state}",)
+        source = str(
+            snapshot.get("source")
+            or snapshot.get("producer")
+            or snapshot.get("source_id")
+            or "legacy/no quality source"
+        )
+        effective_pose_count = self._calibration_quality_field(
+            snapshot,
+            "effective_pose_count",
+            "effective_poses",
+            "usable_pose_count",
+            "inlier_pose_count",
+        )
+        coverage = self._calibration_quality_field(
+            snapshot,
+            "coverage",
+            "center_coverage",
+            "board_center_coverage",
+            "coverage_fraction",
+        )
+        principal_offsets = self._calibration_quality_field(
+            snapshot,
+            "principal_point_offsets_px",
+            "principal_offsets_px",
+            "principal_offsets",
+        )
+        if principal_offsets is None:
+            principal_parts = {
+                key: self._calibration_quality_field(snapshot, *aliases)
+                for key, aliases in (
+                    ("left", ("left_principal_offset_px", "left_principal_point_offset_px")),
+                    ("right", ("right_principal_offset_px", "right_principal_point_offset_px")),
+                    ("cx", ("principal_offset_cx_px", "principal_cx_offset_px")),
+                    ("cy", ("principal_offset_cy_px", "principal_cy_offset_px")),
+                )
+            }
+            principal_offsets = {
+                key: child for key, child in principal_parts.items() if child is not None
+            } or None
+        subset_stability = self._calibration_quality_field(
+            snapshot,
+            "subset_stability_px",
+            "subset_stability",
+            "random_subset_stability",
+        )
+        if subset_stability is None:
+            subset_parts = {
+                key: self._calibration_quality_field(snapshot, *aliases)
+                for key, aliases in (
+                    ("cx", ("subset_cx_stability_px", "subset_cx_std_px")),
+                    ("cy", ("subset_cy_stability_px", "subset_cy_std_px")),
+                    (
+                        "focal",
+                        ("subset_focal_stability_px", "subset_focal_std_px", "subset_fx_std_px"),
+                    ),
+                )
+            }
+            subset_stability = {
+                key: child for key, child in subset_parts.items() if child is not None
+            } or None
+        uncertainty = self._calibration_quality_field(
+            snapshot,
+            "uncertainty",
+            "solver_uncertainty",
+            "intrinsic_uncertainty",
+        )
+        signature_values = {
+            "state": state,
+            "reasons": reasons,
+            "effective_pose_count": effective_pose_count,
+            "coverage": coverage,
+            "principal_offsets": principal_offsets,
+            "subset_stability": subset_stability,
+            "uncertainty": uncertainty,
+            "grid": self._calibration_coverage_grid(snapshot),
+            "source": source,
+            "quality_id": snapshot.get(
+                "quality_id", snapshot.get("result_id", snapshot.get("profile_sha256"))
+            ),
+        }
+        signature = (
+            json.dumps(signature_values, sort_keys=True, ensure_ascii=False, default=str),
+        )
+        if signature != self._calibration_quality_signature:
+            self._calibration_quality_signature = signature
+            self._calibration_quality_warning_confirmed = False
+            checkbox = getattr(self, "calibration_quality_warning_checkbox", None)
+            if checkbox is not None:
+                checkbox.blockSignals(True)
+                checkbox.setChecked(False)
+                checkbox.blockSignals(False)
+
+        self._calibration_quality_state = state
+        normalized = dict(snapshot)
+        normalized.update(state=state, reasons=reasons, source=source)
+        self._calibration_quality_snapshot_cache = normalized
+        valid = True if state == "PASS" else False if state == "FAIL" else None
+        self.calibration_quality_values["state"].set_value(
+            state, source=source, valid=valid
+        )
+        self.calibration_quality_values["effective_pose_count"].set_value(
+            effective_pose_count, source=source
+        )
+        self.calibration_quality_values["coverage"].set_value(
+            self._calibration_quality_display(coverage), source=source
+        )
+        self.calibration_quality_values["principal_offsets"].set_value(
+            self._calibration_quality_display(principal_offsets), unit="px", source=source
+        )
+        self.calibration_quality_values["subset_stability"].set_value(
+            self._calibration_quality_display(subset_stability), unit="px", source=source
+        )
+        self.calibration_quality_values["uncertainty"].set_value(
+            self._calibration_quality_display(uncertainty), source=source
+        )
+        self.calibration_quality_values["reasons"].set_value(
+            " · ".join(reasons) if reasons else "none", source=source
+        )
+        self.calibration_quality_values["source"].set_value(source, source=source)
+
+        grid = self._calibration_coverage_grid(snapshot)
+        for row in range(3):
+            for column in range(3):
+                text, covered = self._calibration_grid_cell_text(
+                    self._calibration_grid_cell(grid, row, column)
+                )
+                item = self.calibration_center_coverage_table.item(row, column)
+                if item is None:
+                    item = QtWidgets.QTableWidgetItem()
+                    self.calibration_center_coverage_table.setItem(row, column, item)
+                item.setText(text)
+                item.setTextAlignment(QtCore.Qt.AlignCenter)
+                item.setToolTip(f"Source: {source}\nValue: {text}")
+                item.setForeground(
+                    QtGui.QBrush(
+                        QtGui.QColor(SUCCESS_TEXT if covered is True else ERROR_TEXT)
+                    )
+                    if covered is not None
+                    else QtGui.QBrush()
+                )
+
+        self.calibration_quality_warning_checkbox.setVisible(state == "WARNING")
+        self._apply_calibration_quality_gate()
+        return dict(normalized)
+
+    def refresh_calibration_quality(self) -> dict[str, object]:
+        return self.apply_calibration_quality_snapshot(self.calibration_quality_snapshot())
+
+    def confirm_calibration_quality_warning(self, confirmed: bool = True) -> bool:
+        if self._calibration_quality_state != "WARNING":
+            return False
+        self._calibration_quality_warning_confirmed = bool(confirmed)
+        checkbox = getattr(self, "calibration_quality_warning_checkbox", None)
+        if checkbox is not None and checkbox.isChecked() != bool(confirmed):
+            checkbox.blockSignals(True)
+            checkbox.setChecked(bool(confirmed))
+            checkbox.blockSignals(False)
+        self._apply_calibration_quality_gate()
+        return self._calibration_quality_warning_confirmed
+
+    def calibration_quality_action_allowed(self, command_id: str) -> bool:
+        if command_id not in self._CALIBRATION_QUALITY_GATED_COMMANDS:
+            return True
+        if self._calibration_quality_state == "FAIL":
+            return False
+        if self._calibration_quality_state == "WARNING":
+            return bool(self._calibration_quality_warning_confirmed)
+        return True
+
+    def _apply_calibration_quality_gate(self) -> None:
+        owned = getattr(self, "_calibration_quality_gate_owned", set())
+        original_tooltips = getattr(self, "_calibration_quality_original_tooltips", {})
+        reasons = tuple(self._calibration_quality_snapshot_cache.get("reasons") or ())
+        reason_text = " · ".join(str(reason) for reason in reasons) or "no reason supplied"
+        state = self._calibration_quality_state
+        for command_id in self._CALIBRATION_QUALITY_GATED_COMMANDS:
+            button = self.operation_buttons.get(command_id)
+            if button is None:
+                continue
+            original_tooltips.setdefault(command_id, button.toolTip())
+            allowed = self.calibration_quality_action_allowed(command_id)
+            if not allowed:
+                if button.isEnabled():
+                    owned.add(command_id)
+                button.setEnabled(False)
+                if state == "FAIL":
+                    button.setToolTip(f"Blocked by calibration quality FAIL: {reason_text}")
+                else:
+                    button.setToolTip(
+                        "Calibration quality WARNING requires the explicit confirmation checkbox. "
+                        + reason_text
+                    )
+            elif command_id in owned:
+                button.setEnabled(True)
+                owned.discard(command_id)
+                button.setToolTip(original_tooltips.get(command_id, ""))
+        self._calibration_quality_gate_owned = owned
+        self._calibration_quality_original_tooltips = original_tooltips
+
+        if state == "PASS":
+            text = "PASS · source quality gate allows Save / Apply."
+        elif state == "WARNING":
+            text = (
+                "WARNING acknowledged · Save / Apply explicitly enabled for this snapshot."
+                if self._calibration_quality_warning_confirmed
+                else "WARNING · review reasons and check the confirmation before Save / Apply."
+            )
+        elif state == "FAIL":
+            text = f"FAIL · Save / Apply blocked. {reason_text}"
+        else:
+            text = (
+                "UNVERIFIED · legacy/no-quality result; it is not presented as PASS and "
+                "existing Save / Apply behavior is preserved."
+            )
+        self.calibration_quality_gate_label.setText(text)
+
+    def _calibration_diagnostic_rows(self) -> tuple[dict[str, object], ...]:
+        panel = getattr(self.backend, "panel", self.backend)
+        rows = getattr(panel, "calibration_image_diagnostics", ())
+        if not rows:
+            result = getattr(panel, "last_calibration_result", None)
+            rows = getattr(result, "image_diagnostics", ()) if result is not None else ()
+        return tuple(dict(row) for row in rows if isinstance(row, Mapping))
+
+    def _calibration_exclusion_sets(self) -> tuple[set[str], set[str]]:
+        selection = self._load_calibration_pair_selection()
+        root_text = str(_evidence(self.backend).calibration_setup().get("calibration_root_resolved") or "")
+        root = Path(root_text) if root_text else Path(DEFAULT_CALIBRATION_ROOT)
+        left = {
+            str(path)
+            for path in self._resolve_calibration_selection_paths(
+                selection.get("excluded_left_paths"), root
+            )
+        }
+        right = {
+            str(path)
+            for path in self._resolve_calibration_selection_paths(
+                selection.get("excluded_right_paths"), root
+            )
+        }
+        return left, right
+
+    def _sync_calibration_outlier_view(self) -> None:
+        plot = getattr(self, "calibration_outlier_plot", None)
+        table = getattr(self, "calibration_outlier_table", None)
+        if plot is None or table is None:
+            return
+        rows = self._calibration_diagnostic_rows()
+        excluded_left, excluded_right = self._calibration_exclusion_sets()
+        selection = self._load_calibration_pair_selection()
+        excluded_pairs = {str(key) for key in selection.get("excluded_pair_keys") or ()}
+        signature = (
+            tuple(tuple(sorted(row.items())) for row in rows),
+            tuple(sorted(excluded_left)),
+            tuple(sorted(excluded_right)),
+            tuple(sorted(excluded_pairs)),
+        )
+        if signature == self._calibration_diagnostics_signature:
+            return
+        self._calibration_diagnostics_signature = signature
+        excluded_paths = excluded_left | excluded_right
+        plot.set_diagnostics(
+            rows,
+            excluded_paths=excluded_paths,
+            excluded_pair_keys=excluded_pairs,
+        )
+        table.setRowCount(len(rows))
+        threshold = plot._threshold_px
+        for index, row in enumerate(rows):
+            error = plot._finite_error(row)
+            path = Path(str(row.get("path") or ""))
+            excluded = str(path) in excluded_paths or str(row.get("capture_key") or "") in excluded_pairs
+            state = "EXCLUDED" if excluded else "candidate" if threshold is not None and error is not None and error >= threshold else "included"
+            coverage = row.get("board_coverage_fraction")
+            coverage_text = "--" if coverage is None else f"{float(coverage) * 100.0:.1f}%"
+            values = (
+                str(row.get("side") or "").upper(),
+                path.name or str(row.get("path") or "--"),
+                "--" if error is None else f"{error:.3f}",
+                coverage_text,
+                str(row.get("capture_key") or "--"),
+                state,
+            )
+            for column, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setToolTip(str(row.get("path") or value))
+                if state == "EXCLUDED":
+                    item.setForeground(QtGui.QBrush(QtGui.QColor("#888888")))
+                elif state == "candidate":
+                    item.setForeground(QtGui.QBrush(QtGui.QColor("#c0392b")))
+                table.setItem(index, column, item)
+        if not rows:
+            self.calibration_outlier_summary.setText(
+                "계산 결과가 없습니다. Run calibration (K,D)를 먼저 실행하세요."
+            )
+        else:
+            valid = sum(1 for row in rows if plot._finite_error(row) is not None)
+            excluded = len(excluded_paths)
+            candidate_count = sum(
+                1
+                for row in rows
+                if plot._finite_error(row) is not None
+                and plot._finite_error(row) >= (threshold or float("inf"))
+            )
+            self.calibration_outlier_summary.setText(
+                f"진단 {len(rows)}장 · 유효 잔차 {valid}장 · 자동 후보 {candidate_count}장 · "
+                f"제외 {excluded}장 | 점 우클릭으로 제외/복원 후 다시 계산하세요."
+            )
+
+    def _handle_calibration_outlier_action(self, payload: object, *, restore: bool) -> None:
+        if not isinstance(payload, Mapping):
+            return
+        path_text = str(payload.get("path") or "").strip()
+        side = str(payload.get("side") or "").strip().lower()
+        if side not in {"left", "right"} or not path_text:
+            return
+        root_text = str(_evidence(self.backend).calibration_setup().get("calibration_root_resolved") or "")
+        root = Path(root_text) if root_text else Path(DEFAULT_CALIBRATION_ROOT)
+        path = Path(path_text).expanduser().resolve()
+        selection = self._load_calibration_pair_selection()
+        excluded_left = set(str(item) for item in selection.get("excluded_left_paths") or ())
+        excluded_right = set(str(item) for item in selection.get("excluded_right_paths") or ())
+        excluded_pairs = set(str(item) for item in selection.get("excluded_pair_keys") or ())
+        capture_key = str(payload.get("capture_key") or "").strip()
+        pair_left_paths = {str(path)} if side == "left" else set()
+        pair_right_paths = {str(path)} if side == "right" else set()
+        if capture_key:
+            for row in self._calibration_diagnostic_rows():
+                if (
+                    str(row.get("capture_key") or "") == capture_key
+                    and str(row.get("path") or "")
+                    and str(row.get("path")) != str(path)
+                ):
+                    counterpart = str(Path(str(row["path"])).expanduser().resolve())
+                    if str(row.get("side") or "").lower() == "left":
+                        pair_left_paths.add(counterpart)
+                    elif str(row.get("side") or "").lower() == "right":
+                        pair_right_paths.add(counterpart)
+        scope = str(payload.get("scope") or "image")
+        if restore:
+            if scope == "pair":
+                excluded_pairs.discard(capture_key)
+                excluded_left.difference_update(pair_left_paths)
+                excluded_right.difference_update(pair_right_paths)
+            elif side == "left":
+                excluded_left.discard(str(path))
+            else:
+                excluded_right.discard(str(path))
+            action_text = "복원"
+        else:
+            if scope == "pair":
+                excluded_pairs.add(capture_key)
+                excluded_left.update(pair_left_paths)
+                excluded_right.update(pair_right_paths)
+                action_text = "stereo pair 제외"
+            elif side == "left":
+                excluded_left.add(str(path))
+                action_text = "Left 사진 제외"
+            else:
+                excluded_right.add(str(path))
+                action_text = "Right 사진 제외"
+        data = {
+            "schema": "workstation-calibration-file-selection-v1",
+            "root": str(root),
+            "manual_mode": bool(selection.get("manual_mode")),
+            "left_paths": list(selection.get("left_paths") or ()),
+            "right_paths": list(selection.get("right_paths") or ()),
+            "included_keys": list(selection.get("included_keys") or ()),
+            "excluded_left_paths": sorted(excluded_left),
+            "excluded_right_paths": sorted(excluded_right),
+            "excluded_pair_keys": sorted(key for key in excluded_pairs if key),
+        }
+        try:
+            sidecar = root / "calibration_pair_selection.json"
+            sidecar.parent.mkdir(parents=True, exist_ok=True)
+            sidecar.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        except OSError as exc:
+            self.calibration_outlier_summary.setText(f"제외 상태 저장 실패: {exc}")
+            return
+        self._calibration_diagnostics_signature = None
+        self._calibration_file_picker_signature = None
+        self._sync_calibration_file_selection()
+        self._sync_calibration_outlier_view()
+        self.calibration_outlier_summary.setText(
+            f"{action_text}: {Path(path_text).name} | 원본 파일은 삭제하지 않았습니다. 다시 계산하면 반영됩니다."
+        )
+
+    @staticmethod
+    def _calibration_file_root(path: Path) -> Path:
+        resolved = path.expanduser().resolve()
+        if resolved.parent.name.lower() in {"left", "right"}:
+            return resolved.parent.parent
+        return resolved.parent
+
+    @staticmethod
+    def _calibration_file_key(path: Path, side: str) -> str:
+        prefix = f"{side}_"
+        return path.stem.removeprefix(prefix) if path.stem.startswith(prefix) else path.stem
+
+    def _resolve_calibration_selection_paths(
+        self,
+        raw_paths: object,
+        root: Path,
+    ) -> list[Path]:
+        paths: list[Path] = []
+        if not isinstance(raw_paths, (list, tuple)):
+            return paths
+        for raw in raw_paths:
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            path = Path(text).expanduser()
+            if not path.is_absolute():
+                path = root / path
+            try:
+                path = path.resolve()
+            except OSError:
+                continue
+            if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}:
+                paths.append(path)
+        return paths
+
+    def _calibration_file_selection_for_root(self, root: Path) -> tuple[list[Path], list[Path], bool]:
+        selection_path = root / "calibration_pair_selection.json"
+        data: dict[str, object] = {}
+        try:
+            loaded = json.loads(selection_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, ValueError, TypeError):
+            pass
+        manual = bool(data.get("manual_mode"))
+        left = self._resolve_calibration_selection_paths(data.get("left_paths"), root)
+        right = self._resolve_calibration_selection_paths(data.get("right_paths"), root)
+        return left, right, manual and bool(left or right)
+
+    def _choose_calibration_files(self, side: str) -> None:
+        if side not in {"left", "right"}:
+            return
+        root_text = str(_evidence(self.backend).calibration_setup().get("calibration_root_resolved") or "")
+        root = Path(root_text) if root_text else Path(DEFAULT_CALIBRATION_ROOT)
+        current_left, current_right, manual = self._calibration_file_selection_for_root(root)
+        current = current_left if side == "left" and manual else current_right if side == "right" and manual else []
+        start = str(current[0].parent if current else root / side)
+        files, _selected_filter = QtWidgets.QFileDialog.getOpenFileNames(
+            self,
+            f"{side.title()} calibration images 선택",
+            start,
+            "Calibration images (*.png *.jpg *.jpeg *.tif *.tiff *.bmp);;All files (*)",
+        )
+        if not files:
+            return
+        selected = [Path(path).expanduser().resolve() for path in files if Path(path).is_file()]
+        if not selected:
+            return
+        other = current_right if side == "left" and manual else current_left if side == "right" and manual else []
+        candidate_paths = [*selected, *other]
+        roots = {self._calibration_file_root(path) for path in candidate_paths}
+        if len(roots) > 1:
+            self.calibration_file_selection_summary.setText(
+                "좌/우 사진은 같은 calibration session 폴더에서 선택해야 합니다."
+            )
+            return
+        selected_root = next(iter(roots), root).resolve()
+        left = selected if side == "left" else other
+        right = selected if side == "right" else other
+        root_widget = self.setup_widgets.get("calibration_root")
+        if isinstance(root_widget, QtWidgets.QLineEdit):
+            root_widget.setText(str(selected_root))
+        apply_setup = getattr(self.backend, "calibration_apply_setup", None)
+        if callable(apply_setup):
+            try:
+                apply_setup(self.setup_payload())
+            except Exception as exc:
+                self.calibration_file_selection_summary.setText(f"사진 root 적용 실패: {exc}")
+                return
+        self._save_calibration_file_selection(selected_root, left, right)
+        self._calibration_file_picker_signature = None
+        self._sync_calibration_file_selection()
+
+    def _save_calibration_file_selection(
+        self,
+        root: Path,
+        left: Sequence[Path],
+        right: Sequence[Path],
+    ) -> None:
+        left_paths = [str(Path(path).expanduser().resolve()) for path in left]
+        right_paths = [str(Path(path).expanduser().resolve()) for path in right]
+        common_keys = [
+            self._calibration_file_key(left_path, "left")
+            for left_path in map(Path, left_paths)
+            if any(
+                self._calibration_file_key(right_path, "right")
+                == self._calibration_file_key(left_path, "left")
+                for right_path in map(Path, right_paths)
+            )
+        ]
+        previous = self._load_calibration_pair_selection()
+        selected_left = set(left_paths)
+        selected_right = set(right_paths)
+        payload = {
+            "schema": "workstation-calibration-file-selection-v1",
+            "root": str(root),
+            "manual_mode": bool(left_paths or right_paths),
+            "left_paths": left_paths,
+            "right_paths": right_paths,
+            "included_keys": sorted(set(common_keys)),
+            "excluded_left_paths": sorted(
+                path for path in previous.get("excluded_left_paths") or () if path in selected_left
+            ),
+            "excluded_right_paths": sorted(
+                path for path in previous.get("excluded_right_paths") or () if path in selected_right
+            ),
+            "excluded_pair_keys": list(previous.get("excluded_pair_keys") or ()),
+        }
+        path = root / "calibration_pair_selection.json"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        except OSError as exc:
+            self.calibration_file_selection_summary.setText(f"선택 목록 저장 실패: {exc}")
+
+    def _clear_calibration_file_selection(self) -> None:
+        root_text = str(_evidence(self.backend).calibration_setup().get("calibration_root_resolved") or "")
+        root = Path(root_text) if root_text else Path(DEFAULT_CALIBRATION_ROOT)
+        try:
+            path = root / "calibration_pair_selection.json"
+            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            if not isinstance(data, dict):
+                data = {}
+            data.update(
+                {
+                    "manual_mode": False,
+                    "left_paths": [],
+                    "right_paths": [],
+                    "included_keys": [],
+                    "excluded_left_paths": [],
+                    "excluded_right_paths": [],
+                    "excluded_pair_keys": [],
+                }
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        except (OSError, ValueError, TypeError) as exc:
+            self.calibration_file_selection_summary.setText(f"선택 초기화 실패: {exc}")
+            return
+        self._calibration_file_picker_signature = None
+        self._sync_calibration_file_selection()
+
+    @classmethod
+    def _calibration_capture_metadata_path(cls, path: Path) -> Path:
+        side = path.parent.name.lower()
+        key = cls._calibration_file_key(path, side)
+        return cls._calibration_file_root(path) / "capture_metadata" / f"capture_{key}.json"
+
+    @classmethod
+    def _calibration_file_capture_time(
+        cls,
+        path: Path,
+    ) -> tuple[int | None, str, str]:
+        """Resolve one photo's wall-clock time and its independent provenance.
+
+        Camera RTCP/NTP frame time is the strongest source because it belongs
+        to the exact left or right image. Pair-level application record/request
+        time is retained as a fallback; legacy external files use mtime and are
+        labelled as such instead of being presented as a camera timestamp.
+        """
+
+        metadata_path = cls._calibration_capture_metadata_path(path)
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            payload = {}
+        if isinstance(payload, Mapping):
+            side = path.parent.name.lower()
+            capture_origin = str(payload.get("capture_origin") or "").strip().lower()
+            nested = payload.get("frame_grid_by_side")
+            side_payload = (
+                nested.get(side, {})
+                if isinstance(nested, Mapping) and isinstance(nested.get(side), Mapping)
+                else {}
+            )
+            # FTP/OZ metadata historically copied the contemporaneous live
+            # preview RTCP time, not the downloaded still's exposure time.
+            # Never label that value as the selected FTP photo's timestamp.
+            rtcp_is_bound_to_saved_frame = capture_origin in {"manual", "auto"} or (
+                not capture_origin and bool(side_payload.get("native_lossless_source"))
+            )
+            if rtcp_is_bound_to_saved_frame:
+                for container, field in (
+                    (side_payload, "rtcp_frame_ntp_unix_s"),
+                    (payload, f"{side}_rtcp_frame_ntp_unix_s"),
+                ):
+                    try:
+                        seconds = float(container.get(field))
+                    except (AttributeError, TypeError, ValueError):
+                        continue
+                    if math.isfinite(seconds) and seconds > 0.0:
+                        whole_seconds = int(seconds)
+                        fractional_ns = int(
+                            round((seconds - whole_seconds) * 1_000_000_000)
+                        )
+                        if fractional_ns >= 1_000_000_000:
+                            whole_seconds += 1
+                            fractional_ns -= 1_000_000_000
+                        return (
+                            whole_seconds * 1_000_000_000 + fractional_ns,
+                            "RTCP/NTP frame",
+                            str(metadata_path),
+                        )
+            for field, source in (
+                ("capture_recorded_unix_ns", "app capture record"),
+                ("capture_requested_unix_ns", "capture request"),
+            ):
+                try:
+                    unix_ns = int(payload.get(field))
+                except (TypeError, ValueError):
+                    continue
+                if unix_ns > 0:
+                    return unix_ns, source, str(metadata_path)
+        try:
+            return int(path.stat().st_mtime_ns), "file mtime", str(path)
+        except OSError:
+            return None, "unavailable", str(path)
+
+    @staticmethod
+    def _format_calibration_file_capture_time(unix_ns: int | None, source: str) -> str:
+        if unix_ns is None or unix_ns <= 0:
+            return "시각 없음 · unavailable"
+        seconds, nanoseconds = divmod(int(unix_ns), 1_000_000_000)
+        try:
+            local_time = time.localtime(seconds)
+        except (OverflowError, OSError, ValueError):
+            return f"시각 해석 불가 ({unix_ns} ns) · {source}"
+        timezone_name = time.strftime("%Z", local_time).strip()
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
+        timestamp += f".{nanoseconds // 1_000_000:03d}"
+        if timezone_name:
+            timestamp += f" {timezone_name}"
+        return f"{timestamp} · {source}"
+
+    @classmethod
+    def _calibration_file_info(cls, path: Path) -> str:
+        try:
+            size_kib = path.stat().st_size / 1024.0
+        except OSError:
+            size_kib = 0.0
+        size = QtGui.QImageReader(str(path)).size()
+        dimensions = f"{size.width()}×{size.height()}" if size.isValid() else "?×?"
+        unix_ns, source, _evidence_path = cls._calibration_file_capture_time(path)
+        captured_at = cls._format_calibration_file_capture_time(unix_ns, source)
+        return f"{dimensions} · {size_kib:.1f} KiB\n{captured_at}"
+
+    @classmethod
+    def _calibration_file_tooltip(cls, path: Path) -> str:
+        unix_ns, source, evidence_path = cls._calibration_file_capture_time(path)
+        captured_at = cls._format_calibration_file_capture_time(unix_ns, source)
+        return (
+            f"{path}\n"
+            f"사진 시각: {captured_at}\n"
+            f"시각 근거: {evidence_path}"
+        )
+
+    @classmethod
+    def _calibration_file_signature(cls, path: Path) -> tuple[object, ...]:
+        try:
+            image_stat = path.stat()
+            image_stamp = (int(image_stat.st_mtime_ns), int(image_stat.st_size))
+        except OSError:
+            image_stamp = (0, 0)
+        metadata_path = cls._calibration_capture_metadata_path(path)
+        try:
+            metadata_stat = metadata_path.stat()
+            metadata_stamp = (int(metadata_stat.st_mtime_ns), int(metadata_stat.st_size))
+        except OSError:
+            metadata_stamp = (0, 0)
+        return str(path), *image_stamp, str(metadata_path), *metadata_stamp
+
+    def _sync_calibration_file_selection(self) -> None:
+        table = getattr(self, "calibration_selected_files_table", None)
+        if table is None:
+            return
+        root_text = str(_evidence(self.backend).calibration_setup().get("calibration_root_resolved") or "")
+        root = Path(root_text) if root_text else Path(DEFAULT_CALIBRATION_ROOT)
+        left, right, manual = self._calibration_file_selection_for_root(root)
+        selection = self._load_calibration_pair_selection()
+        excluded_left = {
+            str(path)
+            for path in self._resolve_calibration_selection_paths(
+                selection.get("excluded_left_paths"), root
+            )
+        }
+        excluded_right = {
+            str(path)
+            for path in self._resolve_calibration_selection_paths(
+                selection.get("excluded_right_paths"), root
+            )
+        }
+        excluded_pair_keys = {str(key) for key in selection.get("excluded_pair_keys") or ()}
+        if not manual:
+            # Before the operator opens a file dialog, show the available
+            # matching session pairs as a review-only preview. The controller
+            # retains its legacy even-spread selection contract until explicit
+            # files are saved here.
+            left_candidates = sorted(
+                path
+                for path in (root / "left").iterdir()
+                if path.is_file() and path.suffix.lower() in CALIBRATION_IMAGE_SUFFIXES
+            ) if (root / "left").is_dir() else []
+            right_candidates = sorted(
+                path
+                for path in (root / "right").iterdir()
+                if path.is_file() and path.suffix.lower() in CALIBRATION_IMAGE_SUFFIXES
+            ) if (root / "right").is_dir() else []
+            left_by_key = {
+                self._calibration_file_key(path, "left"): path
+                for path in left_candidates
+            }
+            right_by_key = {
+                self._calibration_file_key(path, "right"): path
+                for path in right_candidates
+            }
+            keys = sorted(left_by_key.keys() & right_by_key.keys())
+            if keys:
+                left = [left_by_key[key] for key in keys]
+                right = [right_by_key[key] for key in keys]
+            else:
+                left = left_candidates
+                right = right_candidates
+        signature = (
+            str(root),
+            manual,
+            tuple(self._calibration_file_signature(path) for path in left),
+            tuple(self._calibration_file_signature(path) for path in right),
+        )
+        if signature == getattr(self, "_calibration_file_picker_signature", None):
+            return
+        self._calibration_file_picker_signature = signature
+        table.setRowCount(0)
+        row_count = max(len(left), len(right))
+        table.setRowCount(row_count)
+        for index in range(row_count):
+            left_path = left[index] if index < len(left) else None
+            right_path = right[index] if index < len(right) else None
+            left_key = self._calibration_file_key(left_path, "left") if left_path is not None else ""
+            right_key = self._calibration_file_key(right_path, "right") if right_path is not None else ""
+            is_excluded = (
+                (left_path is not None and str(left_path) in excluded_left)
+                or (right_path is not None and str(right_path) in excluded_right)
+                or (left_key and left_key == right_key and left_key in excluded_pair_keys)
+            )
+            values = (
+                str(index + 1),
+                left_path.name if left_path is not None else "--",
+                right_path.name if right_path is not None else "--",
+                self._calibration_file_info(left_path) if left_path is not None else "--",
+                self._calibration_file_info(right_path) if right_path is not None else "--",
+                "EXCLUDED"
+                if is_excluded
+                else "matched"
+                if left_path is not None
+                and right_path is not None
+                and left_key == right_key
+                else "same row"
+                if left_path is not None and right_path is not None
+                else "incomplete",
+            )
+            for column, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                tooltip_path = (
+                    left_path
+                    if column in {1, 3}
+                    else right_path
+                    if column in {2, 4}
+                    else None
+                )
+                item.setToolTip(
+                    self._calibration_file_tooltip(tooltip_path)
+                    if tooltip_path is not None
+                    else value
+                )
+                table.setItem(index, column, item)
+        table.resizeRowsToContents()
+        if manual:
+            pair_count = min(len(left), len(right))
+            self.calibration_file_selection_summary.setText(
+                f"지정 파일: left={len(left)}, right={len(right)}, 계산 행 pair={pair_count}"
+            )
+        else:
+            self.calibration_file_selection_summary.setText(
+                f"자동 후보 미리보기: left={len(left)}, right={len(right)} · 파일창에서 고정 선택 가능"
+            )
 
     # -- Manual calculation-pair picker --------------------------------
     #
@@ -6807,6 +10266,20 @@ class CalibrationWorkspace(QtWidgets.QWidget):
             self._on_calibration_pair_selection_changed
         )
         layout.addWidget(self.calibration_manual_selection_checkbox)
+        filter_row = QtWidgets.QHBoxLayout()
+        self.calibration_show_all_pairs_checkbox = QtWidgets.QCheckBox("전체 사진 보기")
+        self.calibration_show_all_pairs_checkbox.setToolTip(
+            "기본값은 Workstation 실행 이후 저장된 pair만 표시합니다. "
+            "켜면 calibration root의 기존 pair까지 모두 표시합니다."
+        )
+        self.calibration_show_all_pairs_checkbox.toggled.connect(
+            self._handle_calibration_pair_picker_filter_changed
+        )
+        filter_row.addWidget(self.calibration_show_all_pairs_checkbox)
+        self.calibration_pair_picker_summary = QtWidgets.QLabel("앱 실행 후 캡처 대기")
+        self.calibration_pair_picker_summary.setObjectName("statusStrip")
+        filter_row.addWidget(self.calibration_pair_picker_summary, 1)
+        layout.addLayout(filter_row)
         self.calibration_pair_picker_list = QtWidgets.QListWidget()
         self.calibration_pair_picker_list.setObjectName("calibrationPairPickerList")
         self.calibration_pair_picker_list.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
@@ -6830,7 +10303,15 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         return Path(root_text) / "calibration_pair_selection.json"
 
     def _load_calibration_pair_selection(self) -> dict[str, object]:
-        empty: dict[str, object] = {"manual_mode": False, "included_keys": []}
+        empty: dict[str, object] = {
+            "manual_mode": False,
+            "included_keys": [],
+            "left_paths": [],
+            "right_paths": [],
+            "excluded_left_paths": [],
+            "excluded_right_paths": [],
+            "excluded_pair_keys": [],
+        }
         path = self._calibration_pair_selection_path()
         if path is None or not path.exists():
             return empty
@@ -6840,29 +10321,68 @@ class CalibrationWorkspace(QtWidgets.QWidget):
             return empty
         if not isinstance(data, dict):
             return empty
+        raw_left_paths = data.get("left_paths", [])
+        raw_right_paths = data.get("right_paths", [])
+        if not isinstance(raw_left_paths, (list, tuple)):
+            raw_left_paths = []
+        if not isinstance(raw_right_paths, (list, tuple)):
+            raw_right_paths = []
+        raw_keys = data.get("included_keys", [])
+        if not isinstance(raw_keys, (list, tuple)):
+            raw_keys = []
+        raw_excluded_left = data.get("excluded_left_paths", [])
+        raw_excluded_right = data.get("excluded_right_paths", [])
+        raw_excluded_pairs = data.get("excluded_pair_keys", [])
+        if not isinstance(raw_excluded_left, (list, tuple)):
+            raw_excluded_left = []
+        if not isinstance(raw_excluded_right, (list, tuple)):
+            raw_excluded_right = []
+        if not isinstance(raw_excluded_pairs, (list, tuple)):
+            raw_excluded_pairs = []
         return {
             "manual_mode": bool(data.get("manual_mode", False)),
-            "included_keys": [str(key) for key in data.get("included_keys", []) or []],
+            "included_keys": [str(key) for key in raw_keys],
+            "left_paths": [str(path) for path in raw_left_paths],
+            "right_paths": [str(path) for path in raw_right_paths],
+            "excluded_left_paths": [str(path) for path in raw_excluded_left],
+            "excluded_right_paths": [str(path) for path in raw_excluded_right],
+            "excluded_pair_keys": [str(key) for key in raw_excluded_pairs],
         }
 
     def _on_calibration_pair_selection_changed(self, *_args: object) -> None:
         path = self._calibration_pair_selection_path()
         if path is None:
             return
-        included_keys = [
-            str(self.calibration_pair_picker_list.item(index).data(QtCore.Qt.UserRole))
-            for index in range(self.calibration_pair_picker_list.count())
-            if self.calibration_pair_picker_list.item(index).checkState() == QtCore.Qt.Checked
-        ]
+        selection = self._load_calibration_pair_selection()
+        included = {str(key) for key in selection.get("included_keys") or ()}
+        visible_keys = set(getattr(self, "_calibration_pair_picker_visible_keys", set()))
+        for index in range(self.calibration_pair_picker_list.count()):
+            item = self.calibration_pair_picker_list.item(index)
+            key = str(item.data(QtCore.Qt.UserRole))
+            if key not in visible_keys:
+                continue
+            if item.checkState() == QtCore.Qt.Checked:
+                included.add(key)
+            else:
+                included.discard(key)
         payload = {
             "manual_mode": bool(self.calibration_manual_selection_checkbox.isChecked()),
-            "included_keys": included_keys,
+            "included_keys": sorted(included),
+            "left_paths": list(selection.get("left_paths") or ()),
+            "right_paths": list(selection.get("right_paths") or ()),
+            "excluded_left_paths": list(selection.get("excluded_left_paths") or ()),
+            "excluded_right_paths": list(selection.get("excluded_right_paths") or ()),
+            "excluded_pair_keys": list(selection.get("excluded_pair_keys") or ()),
         }
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except OSError:
             pass
+
+    def _handle_calibration_pair_picker_filter_changed(self, _checked: bool) -> None:
+        self._calibration_pair_picker_signature = None
+        self._sync_calibration_pair_picker()
 
     def _sync_calibration_pair_picker(self) -> None:
         picker = getattr(self, "calibration_pair_picker_list", None)
@@ -6873,9 +10393,97 @@ class CalibrationWorkspace(QtWidgets.QWidget):
             return
         root = Path(root_text)
         left_dir, right_dir = root / "left", root / "right"
+
+        def path_stamp(path: Path) -> tuple[int, int] | None:
+            try:
+                stat = path.stat()
+            except OSError:
+                return None
+            return int(stat.st_mtime_ns), int(stat.st_size)
+
+        def directory_stamp(path: Path, prefix: str) -> tuple[object, ...] | None:
+            try:
+                stat = path.stat()
+                names = tuple(
+                    sorted(
+                        entry.name
+                        for entry in path.iterdir()
+                        if entry.is_file() and entry.name.startswith(prefix) and entry.suffix.lower() == ".png"
+                    )
+                )
+            except OSError:
+                return None
+            # Directory mtime catches rewrites; names catch filesystems whose
+            # directory mtime granularity is too coarse for rapid captures.
+            return int(stat.st_mtime_ns), int(stat.st_size), names
+
+        def metadata_directory_stamp(path: Path) -> tuple[object, ...] | None:
+            try:
+                stat = path.stat()
+                entries = tuple(
+                    sorted(
+                        (entry.name, int(entry.stat().st_mtime_ns), int(entry.stat().st_size))
+                        for entry in path.iterdir()
+                        if entry.is_file()
+                        and entry.name.startswith("capture_")
+                        and entry.suffix.lower() == ".json"
+                    )
+                )
+            except OSError:
+                return None
+            return int(stat.st_mtime_ns), int(stat.st_size), entries
+
+        selection_path = root / "calibration_pair_selection.json"
+        show_all_widget = getattr(self, "calibration_show_all_pairs_checkbox", None)
+        show_all = bool(show_all_widget.isChecked()) if show_all_widget is not None else True
+        session_started_ns = int(
+            getattr(self, "_calibration_pair_picker_session_started_unix_ns", 0) or 0
+        )
+        signature = (
+            str(root),
+            directory_stamp(left_dir, "left_"),
+            directory_stamp(right_dir, "right_"),
+            metadata_directory_stamp(root / "capture_metadata"),
+            path_stamp(selection_path),
+            show_all,
+            session_started_ns,
+        )
+        if signature == self._calibration_pair_picker_signature:
+            return
+
         left_keys = {path.stem.removeprefix("left_") for path in left_dir.glob("left_*.png")} if left_dir.is_dir() else set()
         right_keys = {path.stem.removeprefix("right_") for path in right_dir.glob("right_*.png")} if right_dir.is_dir() else set()
-        keys = sorted(left_keys & right_keys)
+        all_keys = sorted(left_keys & right_keys)
+        metadata_dir = root / "capture_metadata"
+
+        def pair_capture_time_ns(key: str) -> int:
+            metadata_path = metadata_dir / f"capture_{key}.json"
+            try:
+                payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                payload = {}
+            if isinstance(payload, dict):
+                for field in ("capture_recorded_unix_ns", "capture_requested_unix_ns"):
+                    try:
+                        value = int(payload.get(field))
+                    except (TypeError, ValueError):
+                        continue
+                    if value > 0:
+                        return value
+            try:
+                return int((left_dir / f"left_{key}.png").stat().st_mtime_ns)
+            except OSError:
+                return 0
+
+        if show_all or session_started_ns <= 0:
+            keys = all_keys
+        else:
+            keys = [key for key in all_keys if pair_capture_time_ns(key) >= session_started_ns]
+        self._calibration_pair_picker_visible_keys = set(keys)
+        summary_label = getattr(self, "calibration_pair_picker_summary", None)
+        if summary_label is not None:
+            scope = "전체" if show_all else "앱 실행 후"
+            summary_label.setText(f"{scope} 표시: {len(keys)} / 전체 {len(all_keys)} pair")
         selection = self._load_calibration_pair_selection()
         included = set(selection.get("included_keys") or ())
         picker.blockSignals(True)
@@ -6883,43 +10491,87 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         try:
             self.calibration_manual_selection_checkbox.setChecked(bool(selection.get("manual_mode")))
             picker.clear()
-            metadata_dir = root / "capture_metadata"
+            self._calibration_pair_picker_items = {}
+            thumbnail_paths: list[tuple[str, Path]] = []
             for key in keys:
                 origin = "manual"
                 metadata_path = metadata_dir / f"capture_{key}.json"
                 if metadata_path.exists():
                     try:
-                        origin = str(
-                            json.loads(metadata_path.read_text(encoding="utf-8")).get("capture_origin", "manual")
+                        metadata_payload = json.loads(
+                            metadata_path.read_text(encoding="utf-8")
                         )
-                    except (OSError, ValueError):
+                        if isinstance(metadata_payload, Mapping):
+                            origin = str(metadata_payload.get("capture_origin", "manual"))
+                    except (OSError, ValueError, TypeError):
                         pass
                 left_path = left_dir / f"left_{key}.png"
-                captured_at = ""
-                try:
-                    captured_at = time.strftime(
-                        "%H:%M:%S", time.localtime(left_path.stat().st_mtime)
-                    )
-                except OSError:
-                    pass
-                item = QtWidgets.QListWidgetItem(f"{key} · {origin} · {captured_at}")
+                right_path = right_dir / f"right_{key}.png"
+                left_ns, left_source, _left_evidence = self._calibration_file_capture_time(
+                    left_path
+                )
+                right_ns, right_source, _right_evidence = self._calibration_file_capture_time(
+                    right_path
+                )
+                left_time = self._format_calibration_file_capture_time(left_ns, left_source)
+                right_time = self._format_calibration_file_capture_time(right_ns, right_source)
+                item = QtWidgets.QListWidgetItem(
+                    f"{key} · {origin} · L {left_time} · R {right_time}"
+                )
+                item.setToolTip(
+                    "Left\n"
+                    + self._calibration_file_tooltip(left_path)
+                    + "\n\nRight\n"
+                    + self._calibration_file_tooltip(right_path)
+                )
                 item.setData(QtCore.Qt.UserRole, key)
                 item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
                 item.setCheckState(
                     QtCore.Qt.Checked if not included or key in included else QtCore.Qt.Unchecked
                 )
-                thumbnail = QtGui.QPixmap(str(left_path))
-                if not thumbnail.isNull():
-                    item.setIcon(QtGui.QIcon(thumbnail.scaledToHeight(36, QtCore.Qt.SmoothTransformation)))
                 picker.addItem(item)
+                self._calibration_pair_picker_items[key] = item
+                thumbnail_paths.append((key, left_path))
         finally:
             picker.blockSignals(False)
             self.calibration_manual_selection_checkbox.blockSignals(False)
+        self._calibration_pair_picker_signature = signature
+        self._calibration_pair_picker_thumbnail_generation += 1
+        self._calibration_pair_picker_thumbnail_paths = thumbnail_paths
+        self._calibration_pair_picker_thumbnail_index = 0
+        generation = self._calibration_pair_picker_thumbnail_generation
+        QtCore.QTimer.singleShot(0, lambda generation=generation: self._load_next_calibration_pair_thumbnail(generation))
+
+    def _load_next_calibration_pair_thumbnail(self, generation: int) -> None:
+        """Load one picker thumbnail between normal UI event-loop turns."""
+
+        if generation != self._calibration_pair_picker_thumbnail_generation:
+            return
+        index = self._calibration_pair_picker_thumbnail_index
+        paths = self._calibration_pair_picker_thumbnail_paths
+        if index >= len(paths):
+            return
+        key, left_path = paths[index]
+        self._calibration_pair_picker_thumbnail_index = index + 1
+        item = self._calibration_pair_picker_items.get(key)
+        if item is not None:
+            try:
+                thumbnail = QtGui.QPixmap(str(left_path))
+                if not thumbnail.isNull():
+                    item.setIcon(QtGui.QIcon(thumbnail.scaledToHeight(36, QtCore.Qt.SmoothTransformation)))
+            except RuntimeError:
+                # A refresh may have replaced the QListWidget while a
+                # previously queued thumbnail callback was still pending.
+                return
+        QtCore.QTimer.singleShot(
+            0,
+            lambda generation=generation: self._load_next_calibration_pair_thumbnail(generation),
+        )
 
     def _build_checkerboard_validation_group(self) -> QtWidgets.QGroupBox:
         """Recompute K,D (and R,t) from random subsets of the scanned pairs
         and report how much the result varies, as a check on calibration
-        stability -- distinct from the main Capture & Compute/Load & Apply
+        stability -- distinct from the main Capture/Compute/Load & Apply
         flow, which only ever produces or loads one "official" result.
 
         This talks to the owner only through the payload-in/result-out
@@ -6963,7 +10615,7 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         self.checkerboard_validation_json_edit = QtWidgets.QLineEdit()
         self.checkerboard_validation_json_edit.setToolTip(
             "Existing intrinsics/extrinsics JSON to use as the validation reference, instead of "
-            "capturing and computing a fresh result in Capture & Compute first."
+            "capturing and computing a fresh result in Compute first."
         )
         browse_json_button = QtWidgets.QPushButton("Browse…")
         browse_json_button.clicked.connect(self._choose_checkerboard_validation_json)
@@ -6999,8 +10651,8 @@ class CalibrationWorkspace(QtWidgets.QWidget):
 
         self.checkerboard_validation_random_button = QtWidgets.QPushButton("Run random validation")
         self.checkerboard_validation_random_button.setToolTip(
-            "Requires a reference result first: load one above, or run a normal capture/compute in "
-            "Capture & Compute. Recomputes K,D (and R,t in Checkerboard mode) from several random "
+            "Requires a reference result first: load one above, or run a normal compute in "
+            "Compute. Recomputes K,D (and R,t in Checkerboard mode) from several random "
             "subsets of the scanned stereo pairs and reports how much the result varies."
         )
         self.checkerboard_validation_random_button.clicked.connect(self._run_checkerboard_validation)
@@ -7018,12 +10670,28 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         grid.addWidget(self.checkerboard_validation_results_text, row, 0, 1, 3)
         row += 1
 
-        save_result_button = QtWidgets.QPushButton("Save result")
-        save_result_button.clicked.connect(self._save_checkerboard_validation_result)
-        apply_result_button = QtWidgets.QPushButton("Apply result")
-        apply_result_button.clicked.connect(self._apply_checkerboard_validation_result)
-        grid.addWidget(save_result_button, row, 0)
-        grid.addWidget(apply_result_button, row, 1)
+        self.checkerboard_validation_save_button = QtWidgets.QPushButton("Save result")
+        self.checkerboard_validation_save_button.setProperty(
+            "commandId", "calibration.validation.save"
+        )
+        self.checkerboard_validation_save_button.clicked.connect(
+            self._save_checkerboard_validation_result
+        )
+        self.checkerboard_validation_apply_button = QtWidgets.QPushButton("Apply result")
+        self.checkerboard_validation_apply_button.setProperty(
+            "commandId", "calibration.validation.apply"
+        )
+        self.checkerboard_validation_apply_button.clicked.connect(
+            self._apply_checkerboard_validation_result
+        )
+        self.operation_buttons["calibration.validation.save"] = (
+            self.checkerboard_validation_save_button
+        )
+        self.operation_buttons["calibration.validation.apply"] = (
+            self.checkerboard_validation_apply_button
+        )
+        grid.addWidget(self.checkerboard_validation_save_button, row, 0)
+        grid.addWidget(self.checkerboard_validation_apply_button, row, 1)
 
         self._checkerboard_validation_poll_timer = QtCore.QTimer(self)
         self._checkerboard_validation_poll_timer.setInterval(700)
@@ -7072,6 +10740,9 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         if isinstance(run_results, (list, tuple)):
             lines.extend(str(row) for row in run_results if isinstance(row, Mapping))
         self.checkerboard_validation_results_text.setPlainText("\n".join(lines))
+        quality = snapshot.get("calibration_quality")
+        if isinstance(quality, Mapping):
+            self.apply_calibration_quality_snapshot(quality)
         running = bool(snapshot.get("running"))
         self.checkerboard_validation_random_button.setEnabled(not running)
         if running:
@@ -7113,13 +10784,25 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         method = getattr(self.backend, "save_workstation_checkerboard_validation_result", None)
         if not callable(method):
             return
-        self._apply_checkerboard_validation_snapshot(method())
+        self._apply_checkerboard_validation_snapshot(
+            method(
+                quality_warning_confirmed=bool(
+                    self._calibration_quality_warning_confirmed
+                )
+            )
+        )
 
     def _apply_checkerboard_validation_result(self) -> None:
         method = getattr(self.backend, "apply_workstation_checkerboard_validation_result", None)
         if not callable(method):
             return
-        self._apply_checkerboard_validation_snapshot(method())
+        self._apply_checkerboard_validation_snapshot(
+            method(
+                quality_warning_confirmed=bool(
+                    self._calibration_quality_warning_confirmed
+                )
+            )
+        )
 
     def _connect_camera_panes(self) -> None:
         panel = getattr(self.backend, "panel", self.backend)
@@ -7238,7 +10921,15 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         recording = snapshot.get("recording")
         recording_locked = bool(recording and recording.state in {"ACTIVE", "FINALIZING"})
         self.camera_buttons["camera.toggle"].setEnabled(not recording_locked)
-        self._sync_calibration_pair_picker()
+        self._refresh_calibration_session_selector()
+        self._sync_calibration_file_selection()
+        self._sync_calibration_outlier_view()
+        self.refresh_calibration_quality()
+        # Keep the old in-memory pair picker path available for compatibility
+        # with legacy embedded callers and tests; the visible Workstation UI
+        # now uses explicit left/right file lists above.
+        if hasattr(self, "calibration_pair_picker_list"):
+            self._sync_calibration_pair_picker()
         data = _evidence(self.backend).calibration()
         self.zoom_readback_label.setText(
             f"capture zoom={data.get('zoom', '--')} | "
@@ -7720,7 +11411,7 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         self.media_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.media_table, 1)
         actions = QtWidgets.QHBoxLayout()
-        actions.addWidget(self._button("Save", "session.save"))
+        actions.addWidget(self._button("Save / retry", "session.save"))
         actions.addStretch(1)
         layout.addLayout(actions)
         self.media_session_combo.currentIndexChanged.connect(lambda _index: self._refresh_media_artifacts())
@@ -7760,8 +11451,8 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         self.baseline_status_label.setText(str(payload.get("axis_contract") or "Baseline fields updated."))
 
     def _selected_media_record(self) -> dict[str, object] | None:
-        session_id = str(self.media_session_combo.currentData() or "")
-        return self._media_records.get(session_id)
+        catalog_key = str(self.media_session_combo.currentData() or "")
+        return self._media_records.get(catalog_key)
 
     def _selected_media_artifact_path(self) -> Path | None:
         record = self._selected_media_record()
@@ -7771,11 +11462,19 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         artifact = str(self.media_artifact_combo.currentData() or "")
         if not artifact:
             return output_dir if output_dir.exists() else None
-        candidate = output_dir / Path(artifact).name
-        if candidate.exists():
-            return candidate
-        published = output_dir / "published" / Path(artifact).name
-        return published if published.exists() else candidate
+        relative = Path(artifact)
+        if relative.is_absolute() or ".." in relative.parts:
+            return None
+        root = output_dir.resolve()
+        candidates = (output_dir / relative, output_dir / "published" / relative)
+        for candidate in candidates:
+            try:
+                candidate.resolve().relative_to(root)
+            except (OSError, ValueError):
+                continue
+            if candidate.exists():
+                return candidate
+        return candidates[0]
 
     def _selected_media_video_path(self) -> Path | None:
         value = str(self.media_video_combo.currentData() or "")
@@ -7805,6 +11504,7 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         signature = tuple(
             (
                 record.get("session_id"),
+                record.get("measurement_id"),
                 record.get("status"),
                 record.get("error"),
                 tuple(record.get("artifacts", ()) or ()),
@@ -7815,7 +11515,7 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         if changed:
             current = str(self.media_session_combo.currentData() or "")
             self._media_records = {
-                str(record.get("session_id")): dict(record)
+                str(record.get("catalog_key") or record.get("session_id")): dict(record)
                 for record in records
                 if record.get("session_id")
             }
@@ -7825,8 +11525,13 @@ class AdvancedWorkspace(QtWidgets.QWidget):
                 self.media_session_combo.clear()
                 for record in records:
                     session_id = str(record.get("session_id") or "")
+                    measurement_id = str(record.get("measurement_id") or "")
+                    catalog_key = str(record.get("catalog_key") or session_id)
+                    identity = (
+                        f"{session_id} / {measurement_id}" if measurement_id else session_id
+                    )
                     self.media_session_combo.addItem(
-                        f"{session_id} [{record.get('status', 'unknown')}]", session_id
+                        f"{identity} [{record.get('status', 'unknown')}]", catalog_key
                     )
                 if current:
                     index = self.media_session_combo.findData(current)
@@ -7885,7 +11590,17 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         if record is None or not artifact:
             self.media_model.clear()
             return
-        data = _evidence(self.backend).session_artifact_rows(str(record.get("session_id")), artifact)
+        measurement_id = str(record.get("measurement_id") or "")
+        if measurement_id:
+            data = _evidence(self.backend).session_artifact_rows(
+                str(record.get("session_id")),
+                artifact,
+                measurement_id=measurement_id,
+            )
+        else:
+            data = _evidence(self.backend).session_artifact_rows(
+                str(record.get("session_id")), artifact
+            )
         error = str(data.get("error") or "")
         if error:
             self.media_model.clear()
@@ -7947,14 +11662,105 @@ class RecordingWorkspace(QtWidgets.QWidget):
         self.session_records: dict[str, dict[str, object]] = {}
         self._session_catalog_signature: tuple[object, ...] = ()
         self._last_session_scan_monotonic_s = float("-inf")
+        self._run_setup_draft_dirty = False
+        self._run_setup_syncing = False
+        self._run_setup_locked = False
+        self._run_setup_auto_default = False
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
         layout.addWidget(
             WorkspaceHeader(
-                "Recording",
+                "Recording / Sessions",
+                "Evidence completeness, capture, and saved-file review",
             )
         )
+
+        package_group = QtWidgets.QGroupBox("Evidence package")
+        package_group.setObjectName("measurementPackageDetails")
+        package_layout = QtWidgets.QVBoxLayout(package_group)
+        package_layout.setContentsMargins(6, 6, 6, 6)
+        package_layout.setSpacing(5)
+        package_summary_layout = QtWidgets.QGridLayout()
+        package_summary_layout.setContentsMargins(0, 0, 0, 0)
+        self.package_state_label = QtWidgets.QLabel("State: IDLE")
+        self.package_state_label.setObjectName("measurementPackageDetailsState")
+        self.package_completeness_label = QtWidgets.QLabel("Evidence: PENDING")
+        self.package_completeness_label.setObjectName("measurementPackageDetailsCompleteness")
+        self.package_verification_label = QtWidgets.QLabel("Verification: NOT RUN")
+        self.package_verification_label.setObjectName("measurementPackageDetailsVerification")
+        self.package_revision_label = QtWidgets.QLabel("Revision: --")
+        self.package_revision_label.setObjectName("measurementPackageDetailsRevision")
+        for index, label in enumerate(
+            (
+                self.package_state_label,
+                self.package_completeness_label,
+                self.package_verification_label,
+                self.package_revision_label,
+            )
+        ):
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            package_summary_layout.addWidget(label, index // 2, index % 2)
+        package_layout.addLayout(package_summary_layout)
+
+        self.package_source_model = _table_model(
+            self,
+            ("Source", "Expected", "State / active range", "Detail"),
+        )
+        self.package_source_table = QtWidgets.QTableView()
+        self.package_source_table.setObjectName("measurementPackageSourceExpectations")
+        self.package_source_table.setModel(self.package_source_model)
+        self.package_source_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.package_source_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.package_source_table.verticalHeader().setVisible(False)
+        self.package_source_table.horizontalHeader().setStretchLastSection(True)
+        self.package_source_table.setMaximumHeight(125)
+        package_layout.addWidget(self.package_source_table)
+
+        self.package_artifact_model = _table_model(
+            self,
+            (
+                "Artifact",
+                "Role",
+                "Required",
+                "State",
+                "Bytes",
+                "SHA-256",
+                "Revision",
+                "Missing / failed reason",
+            ),
+        )
+        self.package_artifact_table = QtWidgets.QTableView()
+        self.package_artifact_table.setObjectName("measurementPackageRequiredArtifacts")
+        self.package_artifact_table.setModel(self.package_artifact_model)
+        self.package_artifact_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.package_artifact_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.package_artifact_table.verticalHeader().setVisible(False)
+        self.package_artifact_table.horizontalHeader().setStretchLastSection(True)
+        self.package_artifact_table.setMaximumHeight(170)
+        package_layout.addWidget(self.package_artifact_table)
+
+        package_actions = QtWidgets.QHBoxLayout()
+        self.verify_package_button = QtWidgets.QPushButton("Verify package")
+        self.verify_package_button.setObjectName("measurementPackageVerify")
+        self.verify_package_button.setProperty("commandId", "session.verify_package")
+        self.verify_package_button.clicked.connect(self._verify_measurement_package)
+        package_actions.addWidget(self.verify_package_button)
+        self.create_revision_button = QtWidgets.QPushButton("Create Revision")
+        self.create_revision_button.setObjectName("measurementPackageCreateRevision")
+        self.create_revision_button.setProperty("commandId", "session.create_revision")
+        self.create_revision_button.setToolTip(
+            "Create a new append-only revision; the sealed revision remains unchanged."
+        )
+        self.create_revision_button.clicked.connect(self._begin_measurement_revision)
+        package_actions.addWidget(self.create_revision_button)
+        self.package_action_status_label = QtWidgets.QLabel("Package actions: ready")
+        self.package_action_status_label.setObjectName("measurementPackageActionStatus")
+        self.package_action_status_label.setWordWrap(True)
+        package_actions.addWidget(self.package_action_status_label, 1)
+        package_layout.addLayout(package_actions)
+        layout.addWidget(package_group)
 
         run_group = QtWidgets.QGroupBox("Run setup")
         run_layout = QtWidgets.QGridLayout(run_group)
@@ -8052,6 +11858,17 @@ class RecordingWorkspace(QtWidgets.QWidget):
         self.target_stream_state_label.setObjectName("compactContract")
         self.target_stream_state_label.setWordWrap(True)
         run_layout.addWidget(self.target_stream_state_label, 6, 0, 1, 4)
+        for key in ("experiment_id", "run_id", "condition_id"):
+            editor = self.run_setup_widgets[key]
+            if isinstance(editor, QtWidgets.QLineEdit):
+                editor.textChanged.connect(self._mark_run_setup_draft_dirty)
+        for editor in self.run_camera_serial_edits.values():
+            editor.textChanged.connect(self._mark_run_setup_draft_dirty)
+        self.run_platform_combo.currentIndexChanged.connect(
+            self._mark_run_setup_draft_dirty
+        )
+        for combo in self.run_camera_stabilization_combos.values():
+            combo.currentIndexChanged.connect(self._mark_run_setup_draft_dirty)
         layout.addWidget(run_group)
         self._refresh_run_reference_label()
         self._set_run_setup_locked(False)
@@ -8107,7 +11924,7 @@ class RecordingWorkspace(QtWidgets.QWidget):
         self.pnp_capture_purpose_combo.addItem("Checkpoint", "checkpoint")
         self.pnp_capture_purpose_combo.addItem("Unspecified", "unspecified")
         hr_capture_controls.addWidget(self.pnp_capture_purpose_combo)
-        self.pnp_capture_button = QtWidgets.QPushButton("HR Capture")
+        self.pnp_capture_button = QtWidgets.QPushButton("Capture HR Still")
         self.pnp_capture_button.setProperty("commandId", "recording.hr.capture")
         self.pnp_capture_button.setToolTip(
             "Sends SIHR TRUE, CPTR, and ICPT to both cameras. Photos remain in camera "
@@ -8116,7 +11933,7 @@ class RecordingWorkspace(QtWidgets.QWidget):
         )
         self.pnp_capture_button.clicked.connect(self._capture_pnp_hr_pair)
         hr_capture_controls.addWidget(self.pnp_capture_button)
-        self.oz_capture_button = QtWidgets.QPushButton("OZ Capture")
+        self.oz_capture_button = QtWidgets.QPushButton("Capture OZ Still")
         self.oz_capture_button.setProperty("commandId", "recording.oz.capture")
         self.oz_capture_button.setToolTip(
             "Sends SIVI TRUE, CPTR, and ICPT to both cameras for a separate visible/OZ "
@@ -8127,13 +11944,13 @@ class RecordingWorkspace(QtWidgets.QWidget):
         hr_capture_controls.addStretch(1)
         session_layout.addLayout(hr_capture_controls, 3, 0, 1, 2)
         self.pnp_capture_status_label = QtWidgets.QLabel(
-            "HR Capture: camera-internal storage · select event, then import exact left/right files"
+            "Capture HR Still: camera-internal storage · select event, then import exact left/right files"
         )
         self.pnp_capture_status_label.setObjectName("compactContract")
         self.pnp_capture_status_label.setWordWrap(True)
         session_layout.addWidget(self.pnp_capture_status_label, 4, 0, 1, 2)
         self.oz_capture_status_label = QtWidgets.QLabel(
-            "OZ Capture: camera-internal FHD still · separate from RTSP session video"
+            "Capture OZ Still: camera-internal FHD still · separate from RTSP session video"
         )
         self.oz_capture_status_label.setObjectName("compactContract")
         self.oz_capture_status_label.setWordWrap(True)
@@ -8286,7 +12103,17 @@ class RecordingWorkspace(QtWidgets.QWidget):
         review_actions = QtWidgets.QHBoxLayout()
         self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
         if invoke_command is not None:
-            save_button = _command_button("Save", "session.save", invoke_command)
+            record_button = _command_button(
+                "Manual record",
+                "recording.toggle",
+                invoke_command,
+            )
+            record_button.setToolTip(
+                "Advanced fallback for recording outside the automatic Measurement lifecycle."
+            )
+            self.operation_buttons["recording.toggle"] = record_button
+            review_actions.addWidget(record_button)
+            save_button = _command_button("Save / retry", "session.save", invoke_command)
             self.operation_buttons["session.save"] = save_button
             review_actions.addWidget(save_button)
         review_actions.addStretch(1)
@@ -8314,6 +12141,23 @@ class RecordingWorkspace(QtWidgets.QWidget):
             recording_status
             and recording_status.state in {"ACTIVE", "FINALIZING"}
         )
+        manual_record_button = self.operation_buttons.get("recording.toggle")
+        if manual_record_button is not None:
+            panel = getattr(self.backend, "panel", self.backend)
+            automatic = bool(getattr(panel, "_automatic_session_recording", False))
+            manual_active = bool(
+                recording_status
+                and recording_status.state == "ACTIVE"
+                and not automatic
+            )
+            manual_record_button.setText(
+                "Stop manual recording" if manual_active else "Manual record"
+            )
+            manual_record_button.setEnabled(
+                manual_active
+                or not recording_status
+                or recording_status.state in {"IDLE", "SAVED"}
+            )
         self._refresh_run_setup_snapshot(recording_locked=recording_locked)
         self._refresh_protocol(snapshot)
         data = _evidence(self.backend).recording()
@@ -8326,31 +12170,31 @@ class RecordingWorkspace(QtWidgets.QWidget):
         records = list(getattr(panel, "pnp_photo_capture_records", ()) or ())
         self._sync_hr_capture_records(records)
         if pnp_capture_active:
-            self.pnp_capture_status_label.setText("HR Capture: in progress")
+            self.pnp_capture_status_label.setText("Capture HR Still: in progress")
         elif records:
             latest = records[-1]
             ftp_text = "FTP=ok" if latest.get("ftp_downloaded") else "FTP=disabled/failed"
             self.pnp_capture_status_label.setText(
-                f"HR Capture: {latest.get('capture_id', 'unknown')} · "
+                f"Capture HR Still: {latest.get('capture_id', 'unknown')} · "
                 f"{latest.get('state', 'unknown')} · camera-internal · {ftp_text}"
             )
         else:
             self.pnp_capture_status_label.setText(
-                "HR Capture: camera-internal storage · select event, then import exact left/right files"
+                "Capture HR Still: camera-internal storage · select event, then import exact left/right files"
             )
         oz_records = list(getattr(panel, "oz_photo_capture_records", ()) or ())
         if oz_capture_active:
-            self.oz_capture_status_label.setText("OZ Capture: in progress")
+            self.oz_capture_status_label.setText("Capture OZ Still: in progress")
         elif oz_records:
             latest_oz = oz_records[-1]
             oz_ftp_text = "FTP=ok" if latest_oz.get("ftp_downloaded") else "FTP=disabled/failed"
             self.oz_capture_status_label.setText(
-                f"OZ Capture: {latest_oz.get('capture_id', 'unknown')} · "
+                f"Capture OZ Still: {latest_oz.get('capture_id', 'unknown')} · "
                 f"{latest_oz.get('state', 'unknown')} · camera-internal · RTSP separate · {oz_ftp_text}"
             )
         else:
             self.oz_capture_status_label.setText(
-                "OZ Capture: camera-internal FHD still · separate from RTSP session video"
+                "Capture OZ Still: camera-internal FHD still · separate from RTSP session video"
             )
         for key, value in self.session_values.items():
             raw = data.get(key)
@@ -8386,6 +12230,364 @@ class RecordingWorkspace(QtWidgets.QWidget):
             except Exception as exc:
                 self.target_stream_state_label.setText(f"Target Drone: status unavailable · {exc}")
         self.refresh_sessions(force=False)
+        self._refresh_package_details()
+
+    def _package_method(self, *names: str) -> Callable[..., object] | None:
+        panel = getattr(self.backend, "panel", self.backend)
+        for owner in (self.backend, panel):
+            for name in names:
+                method = getattr(owner, name, None)
+                if callable(method):
+                    return method
+        return None
+
+    @staticmethod
+    def _record_package_snapshot(record: Mapping[str, object] | None) -> dict[str, object]:
+        if not isinstance(record, Mapping):
+            return {}
+        values = dict(record)
+        for key in ("measurement_package", "package_manifest", "package"):
+            nested = record.get(key)
+            if isinstance(nested, Mapping):
+                values.update(nested)
+        if not values.get("state"):
+            values["state"] = values.get("lifecycle_state", values.get("status", "IDLE"))
+        if not values.get("evidence_completeness") and values.get("completeness_state"):
+            values["evidence_completeness"] = {
+                "status": values.get("completeness_state"),
+                "complete": values.get("evidence_complete"),
+                "missing_required": values.get("missing_reasons", ()),
+            }
+        return values
+
+    def _selected_package_snapshot(self) -> dict[str, object]:
+        record = self._selected_record() if hasattr(self, "session_selector") else None
+        selected = self._record_package_snapshot(record)
+        reader = self._package_method("measurement_package_snapshot")
+        if reader is None:
+            return selected
+        try:
+            live = reader()
+        except Exception as exc:
+            self.package_action_status_label.setText(f"Package status unavailable: {exc}")
+            return selected
+        if not isinstance(live, Mapping):
+            return selected
+        live_values = dict(live)
+        selected_id = str(selected.get("session_id", "") or "")
+        selected_measurement_id = str(selected.get("measurement_id", "") or "")
+        live_id = str(live_values.get("session_id", "") or "")
+        live_measurement_id = str(live_values.get("measurement_id", "") or "")
+        live_state = str(live_values.get("state", "IDLE") or "IDLE").upper()
+        if selected_id and live_id and (
+            selected_id != live_id
+            or selected_measurement_id != live_measurement_id
+        ):
+            selected["_actions_available"] = False
+            return selected
+        if live_state in {"COLLECTING", "POST_CAPTURE", "VERIFYING", "RECOVERABLE"}:
+            live_values["_actions_available"] = True
+            return live_values
+        if selected_id and not live_id:
+            selected["_actions_available"] = False
+            return selected
+        selected.update(live_values)
+        if isinstance(live_values.get("artifacts"), (tuple, list, Mapping)):
+            selected["artifact_details"] = live_values["artifacts"]
+        selected["_actions_available"] = True
+        return selected
+
+    @staticmethod
+    def _package_mapping_rows(value: object, *, identity_key: str) -> list[dict[str, object]]:
+        if isinstance(value, Mapping):
+            rows: list[dict[str, object]] = []
+            for identity, raw in value.items():
+                if isinstance(raw, Mapping):
+                    row = dict(raw)
+                else:
+                    row = {"state": raw}
+                row.setdefault(identity_key, str(identity))
+                rows.append(row)
+            return rows
+        if isinstance(value, (tuple, list)):
+            return [dict(raw) for raw in value if isinstance(raw, Mapping)]
+        return []
+
+    @staticmethod
+    def _source_expectation_row(source: Mapping[str, object]) -> tuple[object, ...]:
+        source_id = source.get(
+            "source_id",
+            source.get("producer_id", source.get("name", source.get("id", "--"))),
+        )
+        required_roles = source.get("required_roles")
+        if isinstance(required_roles, (tuple, list)):
+            expected = ", ".join(str(role) for role in required_roles) or "none"
+        else:
+            required = source.get("required", source.get("expected", True))
+            expected = (
+                "required"
+                if required is True
+                else "optional"
+                if required is False
+                else str(required or "--")
+            )
+        state = str(source.get("state", source.get("status", "")) or "")
+        if not state and "active" in source:
+            state = "ACTIVE" if bool(source.get("active")) else "INACTIVE"
+        metadata = source.get("metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        start = source.get(
+            "active_from",
+            source.get(
+                "activated_utc_ns",
+                source.get(
+                    "active_from_pair_sequence",
+                    metadata.get("active_from", metadata.get("activated_utc_ns")),
+                ),
+            ),
+        )
+        end = source.get(
+            "active_until",
+            source.get(
+                "deactivated_utc_ns",
+                source.get(
+                    "active_to_pair_sequence",
+                    metadata.get("active_until", metadata.get("deactivated_utc_ns")),
+                ),
+            ),
+        )
+        active_range = " → ".join(
+            ("--" if value in (None, "") else str(value)) for value in (start, end)
+        )
+        state_range = state or "--"
+        if start not in (None, "") or end not in (None, ""):
+            state_range += f" · {active_range}"
+        detail = source.get(
+            "detail",
+            source.get(
+                "reason",
+                source.get(
+                    "expectation",
+                    metadata.get("detail", metadata.get("reason", source.get("role", ""))),
+                ),
+            ),
+        )
+        return (source_id, expected, state_range, detail or "--")
+
+    @staticmethod
+    def _artifact_inventory_row(
+        artifact: Mapping[str, object],
+        *,
+        package_revision: object,
+    ) -> tuple[object, ...]:
+        path = artifact.get(
+            "relative_path",
+            artifact.get("path", artifact.get("name", artifact.get("artifact", "--"))),
+        )
+        role = artifact.get("role", artifact.get("artifact_role", artifact.get("kind", "--")))
+        required = artifact.get("required")
+        required_text = "yes" if required is True else "no" if required is False else "--"
+        state = artifact.get("state", artifact.get("status", "--"))
+        size_bytes = artifact.get("size_bytes", artifact.get("bytes", "--"))
+        sha256 = artifact.get("sha256", artifact.get("hash", "--"))
+        revision = artifact.get("revision", package_revision or "--")
+        metadata = artifact.get("metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        reason = artifact.get(
+            "failure_reason",
+            artifact.get(
+                "missing_reason",
+                artifact.get(
+                    "reason",
+                    artifact.get(
+                        "error",
+                        artifact.get(
+                            "detail",
+                            metadata.get(
+                                "failure_reason",
+                                metadata.get("missing_reason", metadata.get("reason", "")),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        return (
+            path,
+            role,
+            required_text,
+            state,
+            size_bytes if size_bytes not in (None, "") else "--",
+            sha256 or "--",
+            revision,
+            reason or "--",
+        )
+
+    @staticmethod
+    def _reason_count(value: object) -> int:
+        if isinstance(value, Mapping):
+            return len(value)
+        if isinstance(value, (tuple, list, set)):
+            return len(value)
+        return 1 if value not in (None, "") else 0
+
+    def _apply_package_details(self, package: Mapping[str, object]) -> None:
+        state = str(package.get("state", package.get("lifecycle_state", "IDLE")) or "IDLE").upper()
+        session_id = str(package.get("session_id", "") or "")
+        self.package_state_label.setText(
+            f"State: {state}" + (f" · {session_id}" if session_id else "")
+        )
+        revision = package.get("revision", package.get("revision_number", "--"))
+        self.package_revision_label.setText(f"Revision: {revision or '--'}")
+
+        completeness = package.get("evidence_completeness")
+        completeness = completeness if isinstance(completeness, Mapping) else {}
+        completeness_state = str(
+            completeness.get(
+                "status",
+                package.get("completeness_state", package.get("completeness", "")),
+            )
+            or ""
+        ).upper()
+        if not completeness_state:
+            completeness_state = (
+                "COMPLETE"
+                if state == "SEALED_COMPLETE"
+                else "INCOMPLETE"
+                if state in {"SEALED_INCOMPLETE", "INTEGRITY_FAILED"}
+                else "PENDING"
+            )
+        missing_count = max(
+            self._reason_count(completeness.get("missing_required")),
+            self._reason_count(package.get("missing_reasons")),
+        )
+        failed_count = self._reason_count(package.get("failed_reasons"))
+        reason_summary = ", ".join(
+            text
+            for count, text in (
+                (missing_count, f"missing={missing_count}"),
+                (failed_count, f"failed={failed_count}"),
+            )
+            if count
+        )
+        self.package_completeness_label.setText(
+            f"Evidence: {completeness_state}"
+            + (f" · {reason_summary}" if reason_summary else "")
+        )
+
+        verification = package.get("hash_verification", package.get("verification"))
+        verification = verification if isinstance(verification, Mapping) else {}
+        verification_state = str(
+            package.get(
+                "integrity_status",
+                package.get(
+                    "verification_state",
+                    verification.get("status", verification.get("state", "NOT RUN")),
+                ),
+            )
+            or "NOT RUN"
+        ).upper()
+        verification_parts = []
+        manifest_status = verification.get("manifest_status")
+        if manifest_status not in (None, ""):
+            verification_parts.append(f"manifest={manifest_status}")
+        declared = verification.get(
+            "artifact_declared_count", verification.get("artifact_hashes_declared")
+        )
+        not_run = verification.get(
+            "artifact_not_run_count", verification.get("artifacts_not_run")
+        )
+        if declared not in (None, ""):
+            verification_parts.append(f"artifacts={declared}")
+        if not_run not in (None, "", 0):
+            verification_parts.append(f"not-run={not_run}")
+        self.package_verification_label.setText(
+            f"Verification: {verification_state}"
+            + (f" · {', '.join(verification_parts)}" if verification_parts else "")
+        )
+
+        sources = self._package_mapping_rows(
+            package.get("source_expectations"), identity_key="source_id"
+        )
+        source_rows = tuple(self._source_expectation_row(source) for source in sources)
+        _sync_table_rows(self.package_source_model, source_rows)
+
+        artifact_values = package.get("artifact_details", package.get("artifacts"))
+        artifacts = self._package_mapping_rows(artifact_values, identity_key="relative_path")
+        artifact_rows = tuple(
+            self._artifact_inventory_row(artifact, package_revision=revision)
+            for artifact in artifacts
+        )
+        _sync_table_rows(self.package_artifact_model, artifact_rows)
+
+        sealed = state in {"SEALED_COMPLETE", "SEALED_INCOMPLETE"}
+        actions_available = bool(package.get("_actions_available", True))
+        self.verify_package_button.setEnabled(
+            actions_available
+            and state in {"SEALED_COMPLETE", "SEALED_INCOMPLETE", "INTEGRITY_FAILED"}
+            and self._package_method("verify_measurement_package", "verify_package") is not None
+        )
+        self.create_revision_button.setEnabled(
+            actions_available
+            and sealed
+            and self._package_method("begin_measurement_revision", "create_revision") is not None
+        )
+
+    def _refresh_package_details(self) -> None:
+        package = self._selected_package_snapshot()
+        if not package:
+            self._apply_package_details({"state": "IDLE"})
+            return
+        self._apply_package_details(package)
+
+    def _verify_measurement_package(self) -> None:
+        method = self._package_method("verify_measurement_package", "verify_package")
+        if method is None:
+            self.package_action_status_label.setText("Verify package: control unavailable")
+            return
+        try:
+            result = method()
+        except Exception as exc:
+            self.package_action_status_label.setText(f"Verify package: ERROR · {exc}")
+            return
+        self._refresh_package_details()
+        result_mapping = result if isinstance(result, Mapping) else None
+        if result_mapping is None:
+            mapper = getattr(result, "to_mapping", None)
+            try:
+                mapped = mapper() if callable(mapper) else None
+            except Exception:
+                mapped = None
+            result_mapping = mapped if isinstance(mapped, Mapping) else None
+        if result_mapping is not None:
+            state = str(
+                result_mapping.get("status", result_mapping.get("state", "completed"))
+                or "completed"
+            )
+            errors = result_mapping.get("errors", result_mapping.get("issues", ()))
+            error_count = self._reason_count(errors)
+            self.package_verification_label.setText(
+                f"Verification: {state.upper()}"
+                + (f" · issues={error_count}" if error_count else "")
+            )
+        self.package_action_status_label.setText("Verify package: completed")
+
+    def _begin_measurement_revision(self) -> None:
+        method = self._package_method("begin_measurement_revision", "create_revision")
+        if method is None:
+            self.package_action_status_label.setText("Create Revision: control unavailable")
+            return
+        try:
+            result = method()
+        except Exception as exc:
+            self.package_action_status_label.setText(f"Create Revision: ERROR · {exc}")
+            return
+        self._refresh_package_details()
+        self.package_action_status_label.setText(
+            "Create Revision: started"
+            if result is not False
+            else "Create Revision: request rejected"
+        )
 
     def run_setup_payload(self) -> dict[str, object]:
         return {
@@ -8405,6 +12607,56 @@ class RecordingWorkspace(QtWidgets.QWidget):
                 "camera_identity_source": "operator_verified_run_setup",
             },
         }
+
+    def validated_run_setup_payload(
+        self,
+        *,
+        allow_auto_default: bool,
+    ) -> dict[str, object] | None:
+        """Return the operator draft, or ``None`` for an intentional default run.
+
+        Empty default controls mean that Start Session may retain the owner's
+        explicit fallback identity.  Any operator metadata makes this an
+        explicit draft and therefore requires all three join identifiers.
+        """
+
+        payload = self.run_setup_payload()
+        if self._run_setup_auto_default and not self._run_setup_draft_dirty:
+            if allow_auto_default:
+                return None
+            raise ValueError("edit the AUTO_DEFAULT identity before applying it as operator metadata")
+        identifiers = tuple(
+            str(payload.get(key) or "").strip()
+            for key in ("experiment_id", "run_id", "condition_id")
+        )
+        condition = payload.get("condition")
+        condition = condition if isinstance(condition, Mapping) else {}
+        operator_metadata_present = bool(
+            any(identifiers)
+            or str(payload.get("target_platform") or "drone") != "drone"
+            or any(
+                str(condition.get(key) or "").strip()
+                for key in (
+                    "left_serial",
+                    "right_serial",
+                    "left_stabilization_state",
+                    "right_stabilization_state",
+                )
+            )
+        )
+        if not operator_metadata_present and allow_auto_default:
+            return None
+        missing = [
+            label
+            for label, value in zip(
+                ("Experiment ID", "Run ID", "Condition ID"),
+                identifiers,
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError(f"run setup requires {', '.join(missing)}")
+        return payload
 
     def target_drone_payload(self) -> dict[str, object]:
         system_id = int(self.target_system_id_spin.value())
@@ -8462,6 +12714,15 @@ class RecordingWorkspace(QtWidgets.QWidget):
                 return method
         return None
 
+    def _mark_run_setup_draft_dirty(self, *_args: object) -> None:
+        if self._run_setup_syncing or self._run_setup_locked:
+            return
+        self._run_setup_draft_dirty = True
+        self._run_setup_auto_default = False
+        self.run_setup_state_label.setText(
+            "DRAFT · editable operator identity; Apply or Start Session to commit"
+        )
+
     def _apply_run_setup(self) -> None:
         apply_method = self._run_setup_apply_method()
         if apply_method is None:
@@ -8470,7 +12731,9 @@ class RecordingWorkspace(QtWidgets.QWidget):
             )
             return
         try:
-            result = apply_method(self.run_setup_payload())
+            payload = self.validated_run_setup_payload(allow_auto_default=False)
+            assert payload is not None
+            result = apply_method(payload)
         except Exception as exc:
             self.run_setup_state_label.setText(f"ERROR · {exc}")
             return
@@ -8479,8 +12742,7 @@ class RecordingWorkspace(QtWidgets.QWidget):
             if not isinstance(result, Mapping)
             else str(result.get("state", "REQUESTED"))
         )
-        if isinstance(result, Mapping):
-            self._apply_run_setup_snapshot(result, recording_locked=False)
+        self.accept_run_setup_result(result)
 
     def _refresh_run_reference_label(self) -> None:
         is_uam = str(self.run_platform_combo.currentData() or "drone") == "uam"
@@ -8495,10 +12757,16 @@ class RecordingWorkspace(QtWidgets.QWidget):
         self.target_connect_button.setText("Set UAM deferred" if is_uam else "Connect target")
 
     def _set_run_setup_locked(self, locked: bool) -> None:
+        identity_locked = bool(locked)
+        self._run_setup_locked = identity_locked
         for widget in self.run_setup_widgets.values():
-            widget.setEnabled(not locked)
+            widget.setEnabled(not identity_locked)
+        for widget in self.run_camera_serial_edits.values():
+            widget.setEnabled(not identity_locked)
+        for widget in self.run_camera_stabilization_combos.values():
+            widget.setEnabled(not identity_locked)
         self.run_setup_apply_button.setEnabled(
-            not locked and self._run_setup_apply_method() is not None
+            not identity_locked and self._run_setup_apply_method() is not None
         )
         # The target link is independent of immutable experiment identity.
         # It may be stopped during a run, but mode/endpoint remain frozen once
@@ -8521,7 +12789,12 @@ class RecordingWorkspace(QtWidgets.QWidget):
             except Exception:
                 break
             if isinstance(result, Mapping):
-                self._apply_run_setup_snapshot(result, recording_locked=recording_locked)
+                locked = recording_locked or bool(result.get("locked", False))
+                self._apply_run_setup_snapshot(
+                    result,
+                    recording_locked=recording_locked,
+                    preserve_draft=self._run_setup_draft_dirty and not locked,
+                )
                 return
             break
         self._set_run_setup_locked(recording_locked)
@@ -8531,35 +12804,73 @@ class RecordingWorkspace(QtWidgets.QWidget):
         snapshot: Mapping[str, object],
         *,
         recording_locked: bool,
+        preserve_draft: bool = False,
     ) -> None:
-        for key in ("experiment_id", "run_id", "condition_id"):
-            value = snapshot.get(key)
-            widget = self.run_setup_widgets[key]
-            if value is not None and isinstance(widget, QtWidgets.QLineEdit):
-                widget.setText(str(value))
         condition = snapshot.get("condition")
-        if isinstance(condition, Mapping):
-            for side in ("left", "right"):
-                serial = condition.get(f"{side}_serial")
-                if serial is not None:
-                    self.run_camera_serial_edits[side].setText(str(serial))
-                stabilization = str(
-                    condition.get(f"{side}_stabilization_state", "") or ""
-                )
-                index = self.run_camera_stabilization_combos[side].findData(stabilization)
-                if index >= 0:
-                    self.run_camera_stabilization_combos[side].setCurrentIndex(index)
-        platform = str(snapshot.get("target_platform", "") or "").lower()
-        if platform:
-            index = self.run_platform_combo.findData(platform)
-            if index >= 0:
-                self.run_platform_combo.setCurrentIndex(index)
+        condition = condition if isinstance(condition, Mapping) else {}
+        if not preserve_draft:
+            self._run_setup_syncing = True
+            try:
+                for key in ("experiment_id", "run_id", "condition_id"):
+                    value = snapshot.get(key)
+                    widget = self.run_setup_widgets[key]
+                    if value is not None and isinstance(widget, QtWidgets.QLineEdit):
+                        widget.setText(str(value))
+                for side in ("left", "right"):
+                    serial = condition.get(f"{side}_serial")
+                    if serial is not None:
+                        self.run_camera_serial_edits[side].setText(str(serial))
+                    stabilization = str(
+                        condition.get(f"{side}_stabilization_state", "") or ""
+                    )
+                    index = self.run_camera_stabilization_combos[side].findData(stabilization)
+                    if index >= 0:
+                        self.run_camera_stabilization_combos[side].setCurrentIndex(index)
+                platform = str(snapshot.get("target_platform", snapshot.get("mode", "")) or "").lower()
+                if platform:
+                    index = self.run_platform_combo.findData(platform)
+                    if index >= 0:
+                        self.run_platform_combo.setCurrentIndex(index)
+            finally:
+                self._run_setup_syncing = False
+            self._run_setup_draft_dirty = False
         locked = recording_locked or bool(snapshot.get("locked", False))
         state = str(snapshot.get("state", "LOCKED" if locked else "PENDING") or "PENDING")
         source = str(snapshot.get("source", "run setup owner snapshot") or "")
-        self.run_setup_state_label.setText(f"{state} · {source}")
+        automatic_source = str(condition.get("identity_source", "") or "") == "automatic_session_identity"
+        fallback_identifiers = (
+            str(snapshot.get("experiment_id", "") or "") == "unassigned"
+            and str(snapshot.get("condition_id", "") or "") == "unspecified"
+        )
+        auto_default = state.upper() == "AUTO_DEFAULT" or automatic_source or fallback_identifiers
+        self._run_setup_auto_default = auto_default and not self._run_setup_draft_dirty
+        if preserve_draft:
+            self.run_setup_state_label.setText(
+                f"DRAFT · editable operator identity; owner={state}"
+            )
+        elif auto_default:
+            lock_text = "LOCKED" if locked else "EDITABLE"
+            self.run_setup_state_label.setText(
+                f"AUTO_DEFAULT · {lock_text} · operator identity was not captured; "
+                "fallback IDs preserve raw evidence"
+            )
+        else:
+            self.run_setup_state_label.setText(f"{state} · {source}")
         self._set_run_setup_locked(locked)
         self._refresh_run_reference_label()
+
+    def accept_run_setup_result(self, result: object) -> None:
+        """Adopt one backend apply readback without inventing identity evidence."""
+
+        if isinstance(result, Mapping):
+            self._run_setup_draft_dirty = False
+            self._apply_run_setup_snapshot(result, recording_locked=False)
+            return
+        self._run_setup_draft_dirty = False
+        self.refresh_run_setup_from_owner()
+
+    def refresh_run_setup_from_owner(self) -> None:
+        self._refresh_run_setup_snapshot(recording_locked=False)
 
     def _capture_pnp_hr_pair(self) -> None:
         payload = {
@@ -8659,6 +12970,9 @@ class RecordingWorkspace(QtWidgets.QWidget):
         )
 
     def _import_ulog(self) -> None:
+        # Qt delivers same-thread slots synchronously.  Publish the pending
+        # state first so a completed owner readback is the last writer.
+        self.ulog_status_label.setText("ULog import requested: awaiting owner file selection")
         self.ulog_command_requested.emit(
             "recording.ulog.import",
             {
@@ -8667,7 +12981,6 @@ class RecordingWorkspace(QtWidgets.QWidget):
                 "file_selection": "owner_dialog_required",
             },
         )
-        self.ulog_status_label.setText("ULog import requested: awaiting owner file selection")
 
     def apply_ulog_snapshot(self, snapshot: object) -> None:
         if not isinstance(snapshot, Mapping):
@@ -8706,7 +13019,6 @@ class RecordingWorkspace(QtWidgets.QWidget):
         """
 
         if self.receivers(self.hr_command_requested) > 0:
-            self.hr_command_requested.emit(command_id, dict(payload))
             action = "Capture requested" if command_id.endswith("capture") else "Import requested"
             status_label = (
                 self.pnp_capture_status_label
@@ -8715,6 +13027,9 @@ class RecordingWorkspace(QtWidgets.QWidget):
             )
             channel = "HR" if command_id.startswith("recording.hr") else "OZ"
             status_label.setText(f"{channel} {action}: awaiting owner")
+            # Direct Qt connections run before emit() returns.  Set pending
+            # first so the owner's synchronous success/failure text wins.
+            self.hr_command_requested.emit(command_id, dict(payload))
             return
         if command_id == "recording.hr.capture":
             method = getattr(self.backend, "capture_pnp_hr_photos", None)
@@ -8775,6 +13090,35 @@ class RecordingWorkspace(QtWidgets.QWidget):
             for item in checkpoints or ()
         )
         measurement = evidence.measurement_settings()
+        method_snapshot_reader = getattr(self.backend, "measurement_methods_snapshot", None)
+        try:
+            method_snapshot = method_snapshot_reader() if callable(method_snapshot_reader) else {}
+        except Exception:
+            method_snapshot = {}
+        selected_method: dict[str, object] | None = None
+        if isinstance(method_snapshot, Mapping):
+            selected_id = str(method_snapshot.get("selected_method_id") or "")
+            rows = method_snapshot.get("ready_methods")
+            if isinstance(rows, list):
+                selected_method = next(
+                    (
+                        dict(row)
+                        for row in rows
+                        if isinstance(row, Mapping)
+                        and str(row.get("method_id") or "") == selected_id
+                    ),
+                    None,
+                )
+            if selected_method is None and str(method_snapshot.get("schema") or ""):
+                selected_method = {
+                    "method_id": "",
+                    "instance_id": "",
+                    "label": "Ready measurement method",
+                    "ready": False,
+                    "reasons": ["no ready measurement method"],
+                    "requires_live_pixhawk": False,
+                    "requires_live_gnss": False,
+                }
         readiness = evaluate_recording_protocol(
             snapshot,
             distance_mode=str(measurement.get("distance_mode", "pixhawk") or "pixhawk"),
@@ -8789,6 +13133,7 @@ class RecordingWorkspace(QtWidgets.QWidget):
             minimum_fix_type=minimum_fix_type,
             physical_alignment=physical_alignment,
             final_sync_verified=final_sync_verified,
+            measurement_method=selected_method,
         )
         self.protocol_state_label.setText(f"{readiness.state} · {len(readiness.blocking)} checks")
         state_style = (
@@ -8824,10 +13169,18 @@ class RecordingWorkspace(QtWidgets.QWidget):
         signature = tuple(
             (
                 record.get("session_id"),
+                record.get("measurement_id"),
                 record.get("status"),
+                record.get("lifecycle_state"),
+                record.get("completeness_state"),
+                record.get("revision"),
+                record.get("integrity_status"),
                 record.get("error"),
                 record.get("retryable"),
                 tuple(record.get("artifacts", ()) or ()),
+                json.dumps(record.get("source_expectations", ()), sort_keys=True, default=str),
+                json.dumps(record.get("artifact_details", ()), sort_keys=True, default=str),
+                json.dumps(record.get("hash_verification", {}), sort_keys=True, default=str),
             )
             for record in records
         )
@@ -8835,9 +13188,16 @@ class RecordingWorkspace(QtWidgets.QWidget):
             return
         current = str(self.session_selector.currentData() or "")
         panel = getattr(self.backend, "panel", self.backend)
-        current = current or str(getattr(panel, "recording_session_id", "") or "")
+        if not current:
+            panel_session_id = str(getattr(panel, "recording_session_id", "") or "")
+            panel_measurement_id = str(getattr(panel, "_measurement_id", "") or "")
+            current = (
+                f"{panel_session_id}::{panel_measurement_id}"
+                if panel_session_id and panel_measurement_id
+                else panel_session_id
+            )
         self.session_records = {
-            str(record.get("session_id")): dict(record)
+            str(record.get("catalog_key") or record.get("session_id")): dict(record)
             for record in records
             if record.get("session_id")
         }
@@ -8847,8 +13207,11 @@ class RecordingWorkspace(QtWidgets.QWidget):
             self.session_selector.clear()
             for record in records:
                 session_id = str(record.get("session_id") or "")
+                measurement_id = str(record.get("measurement_id") or "")
+                catalog_key = str(record.get("catalog_key") or session_id)
                 status = str(record.get("status") or "unknown")
-                self.session_selector.addItem(f"{session_id} [{status}]", session_id)
+                identity = f"{session_id} / {measurement_id}" if measurement_id else session_id
+                self.session_selector.addItem(f"{identity} [{status}]", catalog_key)
             if current:
                 index = self.session_selector.findData(current)
                 if index >= 0:
@@ -8858,8 +13221,8 @@ class RecordingWorkspace(QtWidgets.QWidget):
         self._refresh_review_artifacts()
 
     def _selected_record(self) -> dict[str, object] | None:
-        session_id = str(self.session_selector.currentData() or "")
-        return self.session_records.get(session_id)
+        catalog_key = str(self.session_selector.currentData() or "")
+        return self.session_records.get(catalog_key)
 
     def _refresh_review_artifacts(self) -> None:
         record = self._selected_record()
@@ -8879,6 +13242,7 @@ class RecordingWorkspace(QtWidgets.QWidget):
         finally:
             self.artifact_selector.blockSignals(False)
         self._preview_selected_artifact()
+        self._refresh_package_details()
 
     def _selected_artifact_name(self) -> str:
         return str(self.artifact_selector.currentData() or "")
@@ -8891,11 +13255,19 @@ class RecordingWorkspace(QtWidgets.QWidget):
         artifact = self._selected_artifact_name()
         if not artifact:
             return output_dir if output_dir.exists() else None
-        candidate = output_dir / Path(artifact).name
-        if candidate.exists():
-            return candidate
-        published = output_dir / "published" / Path(artifact).name
-        return published if published.exists() else candidate
+        relative = Path(artifact)
+        if relative.is_absolute() or ".." in relative.parts:
+            return None
+        root = output_dir.resolve()
+        candidates = (output_dir / relative, output_dir / "published" / relative)
+        for candidate in candidates:
+            try:
+                candidate.resolve().relative_to(root)
+            except (OSError, ValueError):
+                continue
+            if candidate.exists():
+                return candidate
+        return candidates[0]
 
     def _open_selected_session(self) -> None:
         record = self._selected_record()
@@ -8925,7 +13297,17 @@ class RecordingWorkspace(QtWidgets.QWidget):
             self.review_model.clear()
             self.review_status_label.setText("Select a session and file")
             return
-        data = _evidence(self.backend).session_artifact_rows(str(record.get("session_id")), artifact)
+        measurement_id = str(record.get("measurement_id") or "")
+        if measurement_id:
+            data = _evidence(self.backend).session_artifact_rows(
+                str(record.get("session_id")),
+                artifact,
+                measurement_id=measurement_id,
+            )
+        else:
+            data = _evidence(self.backend).session_artifact_rows(
+                str(record.get("session_id")), artifact
+            )
         error = str(data.get("error") or "")
         if error:
             self.review_model.clear()
@@ -8997,11 +13379,13 @@ class DiagnosticsContent(QtWidgets.QWidget):
         self.pixhawk_view = self._diagnostic_text_view()
         self.gnss_view = self._diagnostic_text_view()
         self.performance_view = self._diagnostic_text_view()
+        self.ftp_view = self._diagnostic_text_view()
         self.tabs.addTab(self.system_table, "System")
         self.tabs.addTab(self.camera_view, "Camera")
         self.tabs.addTab(self.pixhawk_view, "Pixhawk")
         self.tabs.addTab(self.gnss_view, "GNSS")
         self.tabs.addTab(log_page, "Log")
+        self.tabs.addTab(self.ftp_view, "FTP")
         self.tabs.addTab(self.measurement_view, "Measurement")
         self.tabs.addTab(self.performance_view, "Performance")
         layout.addWidget(self.tabs)
@@ -9019,8 +13403,9 @@ class DiagnosticsContent(QtWidgets.QWidget):
             "diagnostics.pixhawk": 2,
             "diagnostics.gnss": 3,
             "diagnostics.logs": 4,
-            "diagnostics.measurement": 5,
-            "diagnostics.performance": 6,
+            "diagnostics.ftp": 5,
+            "diagnostics.measurement": 6,
+            "diagnostics.performance": 7,
         }
         self.tabs.setCurrentIndex(tab_indexes.get(context_id, 0))
 
@@ -9031,6 +13416,7 @@ class DiagnosticsContent(QtWidgets.QWidget):
             self._refresh_pixhawk,
             self._refresh_gnss,
             self._refresh_log,
+            self._refresh_ftp,
             self._refresh_measurement,
             self._refresh_performance,
         )
@@ -9056,6 +13442,13 @@ class DiagnosticsContent(QtWidgets.QWidget):
         backend = getattr(self.backend, "diagnostic_text", None)
         if callable(backend):
             self._set_log_text(str(backend()))
+
+    def _refresh_ftp(self, _snapshot: dict[str, RuntimeStatus]) -> None:
+        backend = getattr(self.backend, "ftp_diagnostic_text", None)
+        if callable(backend):
+            self._set_diagnostic_text(self.ftp_view, str(backend()), move_to_end=True)
+        else:
+            self._set_diagnostic_text(self.ftp_view, "FTP diagnostic log is unavailable.")
 
     def _follow_latest_log(self) -> None:
         scrollbar = self.log_view.verticalScrollBar()

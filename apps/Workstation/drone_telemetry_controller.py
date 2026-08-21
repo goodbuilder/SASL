@@ -105,6 +105,14 @@ class DroneTelemetryController:
     def __init__(self, panel) -> None:
         self.panel = panel
 
+    def _sync_rtcm_pipeline_route(self, *, ensure_injection: bool = False) -> None:
+        owner = getattr(self.panel, "_gnss_runtime_controller_owner", None)
+        if owner is None:
+            return
+        if ensure_injection:
+            owner._ensure_pixhawk_rtcm_worker()
+        owner._sync_rtcm_pipeline_config()
+
     def configure_drone_telemetry(self, payload: Mapping[str, object] | None = None) -> dict[str, object]:
         values = dict(payload or {})
         endpoint = str(
@@ -139,6 +147,7 @@ class DroneTelemetryController:
         self.panel.drone_telemetry_baud = baud
         self.panel.drone_telemetry_rtcm_forward = forward_rtcm
         self.panel.drone_telemetry_rtcm_source = rtcm_source
+        self._sync_rtcm_pipeline_route()
         if subscriber is not None:
             subscriber.urls["drone"] = endpoint
             subscriber.baudrates["drone"] = baud
@@ -201,6 +210,7 @@ class DroneTelemetryController:
             return
         self.panel.drone_telemetry_connection_state = "CONNECTED"
         self.panel.drone_telemetry_last_error = ""
+        self._sync_rtcm_pipeline_route(ensure_injection=True)
         self.panel._log("[픽스호크] Drone Telemetry 링크가 열렸습니다. Heartbeat/GPS 수신 대기 중입니다.")
         self.panel._refresh_operation_header()
 
@@ -213,6 +223,7 @@ class DroneTelemetryController:
                 pass
         self.panel.drone_telemetry_connection_state = "ERROR"
         self.panel.drone_telemetry_last_error = str(error)
+        self._sync_rtcm_pipeline_route()
         self.panel._log(f"[픽스호크] Drone Telemetry MAVLink 연결 실패: {error}")
         self.panel._refresh_operation_header()
 
@@ -231,6 +242,7 @@ class DroneTelemetryController:
         if thread is not None and thread.isRunning():
             thread.quit()
         self.panel.drone_telemetry_connection_state = "DISCONNECTED"
+        self._sync_rtcm_pipeline_route()
         self.panel._log("[픽스호크] Drone Telemetry MAVLink 연결을 해제했습니다.")
         self.panel._refresh_operation_header()
         return self.drone_telemetry_snapshot()

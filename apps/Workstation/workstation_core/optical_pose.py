@@ -971,6 +971,9 @@ class OpticalPoseCandidate:
     uncertainty_metrics: tuple[tuple[str, float], ...] = ()
     warnings: tuple[str, ...] = ()
     created_utc_ns: int | None = None
+    observability_by_side: tuple[
+        tuple[str, tuple[tuple[str, bool], ...]], ...
+    ] = ()
 
     def __post_init__(self) -> None:
         candidate_id = str(self.candidate_id).strip()
@@ -1011,6 +1014,23 @@ class OpticalPoseCandidate:
         )
         object.__setattr__(self, "warnings", tuple(str(value) for value in self.warnings))
         object.__setattr__(self, "created_utc_ns", created)
+        side_rows: list[tuple[str, tuple[tuple[str, bool], ...]]] = []
+        if self.observability_by_side:
+            seen: set[str] = set()
+            for side, values in self.observability_by_side:
+                side_name = str(side)
+                if side_name not in {"left", "right"} or side_name in seen:
+                    raise ValueError("observability_by_side must contain unique left/right rows")
+                seen.add(side_name)
+                side_rows.append((side_name, _immutable_observability(values)))
+            if seen != {"left", "right"}:
+                raise ValueError("observability_by_side must contain both left and right")
+        else:
+            side_rows = [
+                ("left", self.observability),
+                ("right", self.observability),
+            ]
+        object.__setattr__(self, "observability_by_side", tuple(side_rows))
 
     @property
     def stereo_pose_rdf(self) -> StereoPoseRdf:
@@ -1021,6 +1041,17 @@ class OpticalPoseCandidate:
         return boresight_relative_yaw_right_minus_left_deg(
             self.left_pose_ned,
             self.right_pose_ned,
+        )
+
+    def observable_dofs_for_side(self, side: str) -> tuple[str, ...]:
+        rows = dict(self.observability_by_side)
+        if side not in rows:
+            raise ValueError(f"unknown camera side: {side}")
+        observable = dict(rows[side])
+        return tuple(
+            name
+            for name in self.optimized_dofs.selected_names
+            if observable.get(name, False)
         )
 
 

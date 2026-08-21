@@ -43,6 +43,34 @@ def _finite(value: Any, name: str) -> float:
     return result
 
 
+GNSS_FIX_TYPE_LABELS: dict[int, str] = {
+    0: "NO FIX",
+    1: "DEAD RECKONING",
+    2: "2D FIX",
+    3: "3D FIX",
+    4: "GNSS+DR",
+    5: "TIME ONLY",
+}
+
+
+def gnss_fix_stage_label(fix_type: int | None, carrier_solution: int | None) -> str:
+    """Human label for a raw UBX NAV-PVT fixType/carrSoln pair.
+
+    This is the receiver's own GNSS fix ladder (NO FIX .. RTK FIXED) and is
+    deliberately distinct from the app-level GnssOperationState acquisition
+    stage: a receiver can report RTK FIXED here while the app is still
+    validating/re-configuring the coordinate as a Fixed Base.
+    """
+
+    if fix_type is None:
+        return "UNKNOWN"
+    if carrier_solution == 2:
+        return "RTK FIXED"
+    if carrier_solution == 1:
+        return "RTK FLOAT"
+    return GNSS_FIX_TYPE_LABELS.get(int(fix_type), f"UNKNOWN({fix_type})")
+
+
 @dataclass(frozen=True)
 class GnssCoordinateSample:
     latitude_deg: float
@@ -53,6 +81,8 @@ class GnssCoordinateSample:
     timestamp_s: float = 0.0
     fixed: bool = False
     device_id: str = ""
+    fix_type: int | None = None
+    carrier_solution: int | None = None
 
     def __post_init__(self) -> None:
         lat = _finite(self.latitude_deg, "latitude_deg")
@@ -70,6 +100,14 @@ class GnssCoordinateSample:
         object.__setattr__(self, "height_type", HeightType(self.height_type))
         object.__setattr__(self, "fixed", bool(self.fixed))
         object.__setattr__(self, "device_id", str(self.device_id))
+        object.__setattr__(self, "fix_type", None if self.fix_type is None else int(self.fix_type))
+        object.__setattr__(
+            self, "carrier_solution", None if self.carrier_solution is None else int(self.carrier_solution)
+        )
+
+    @property
+    def fix_stage_label(self) -> str:
+        return gnss_fix_stage_label(self.fix_type, self.carrier_solution)
 
     @property
     def selected_height_m(self) -> float | None:
@@ -186,7 +224,14 @@ def build_coordinate_profile(
     horizontal_scatter = max((math.hypot(east, north) for east, north in xy), default=0.0)
     vertical_scatter = pstdev(heights) if len(heights) > 1 else 0.0
     timestamp_values = [row.timestamp_s for row in rows]
-    fixed_timestamps = [row.timestamp_s for row in fixed_rows]
+    ordered_rows = tuple(sorted(rows, key=lambda row: row.timestamp_s))
+    current_fixed_rows: list[GnssCoordinateSample] = []
+    for row in reversed(ordered_rows):
+        if not row.fixed:
+            break
+        current_fixed_rows.append(row)
+    current_fixed_rows.reverse()
+    current_fixed_timestamps = [row.timestamp_s for row in current_fixed_rows]
     return GnssCoordinateProfile(
         latitude_deg=lat,
         longitude_deg=lon,
@@ -197,7 +242,11 @@ def build_coordinate_profile(
         sample_count=len(rows),
         fixed_sample_count=len(fixed_rows),
         fixed_ratio=len(fixed_rows) / len(rows),
-        fixed_duration_s=(max(fixed_timestamps) - min(fixed_timestamps)) if len(fixed_timestamps) > 1 else 0.0,
+        fixed_duration_s=(
+            max(current_fixed_timestamps) - min(current_fixed_timestamps)
+            if len(current_fixed_timestamps) > 1
+            else 0.0
+        ),
         collection_duration_s=(max(timestamp_values) - min(timestamp_values)) if len(timestamp_values) > 1 else 0.0,
         horizontal_scatter_m=float(horizontal_scatter),
         vertical_scatter_m=float(vertical_scatter),

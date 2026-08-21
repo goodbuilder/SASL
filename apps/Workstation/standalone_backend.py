@@ -57,10 +57,57 @@ class StandalonePanelBackend(QtCore.QObject):
     def run_setup_snapshot(self) -> Any:
         return self._call("workstation_run_setup_snapshot")
 
+    def begin_measurement_session(self) -> Any:
+        return self._call("begin_measurement_session")
+
+    def measurement_session_snapshot(self) -> Any:
+        return self._call("measurement_session_snapshot")
+
+    def measurement_package_snapshot(self) -> Any:
+        return self._call("measurement_package_snapshot")
+
+    def finalize_measurement_package(self) -> Any:
+        return self._call("finalize_measurement_package")
+
+    def begin_next_measurement(self) -> Any:
+        return self._call("begin_next_measurement")
+
+    def begin_measurement(self) -> Any:
+        return self._call("begin_measurement")
+
+    def close_measurement_session(self) -> Any:
+        return self._call("close_measurement_session")
+
+    def begin_measurement_revision(self) -> Any:
+        return self._call("begin_measurement_revision")
+
+    def verify_measurement_package(self) -> Any:
+        return self._call("verify_measurement_package")
+
+    def verify_measurement_session(self) -> Any:
+        return self._call("verify_session")
+
     def optical_pose_snapshot(self, *, include_frames: bool = True) -> Any:
         return self._call(
             "workstation_optical_pose_snapshot",
             include_frames=bool(include_frames),
+        )
+
+    def optical_pose_prepare_auto_select(
+        self,
+        mode: str,
+        payload: dict[str, object] | None = None,
+    ) -> Any:
+        return self._call(
+            "prepare_workstation_optical_pose_auto_selection",
+            str(mode),
+            dict(payload or {}),
+        )
+
+    def optical_pose_commit_auto_select(self, suggestion: dict[str, object]) -> Any:
+        return self._call(
+            "commit_workstation_optical_pose_auto_selection",
+            dict(suggestion),
         )
 
     def optical_pose_capture_burst(self, payload: dict[str, object] | None = None) -> Any:
@@ -98,9 +145,6 @@ class StandalonePanelBackend(QtCore.QObject):
 
     def optical_pose_solve_drone_yaw(self, payload: dict[str, object]) -> Any:
         return self._call("solve_workstation_optical_pose_drone_yaw", dict(payload))
-
-    def optical_pose_initialize_telemetry(self, payload: dict[str, object]) -> Any:
-        return self._call("initialize_workstation_optical_pose_telemetry", dict(payload))
 
     def optical_pose_solve_drone_rtk_multiview(self, payload: dict[str, object]) -> Any:
         return self._call(
@@ -355,11 +399,19 @@ class StandalonePanelBackend(QtCore.QObject):
     def calibration_run_extrinsics(self) -> Any:
         return self._call("run_stereo_extrinsics_calibration")
 
-    def calibration_save_intrinsics(self) -> Any:
-        return self._call("save_intrinsics")
+    def calibration_save_intrinsics(self, *, quality_warning_confirmed: bool = False) -> Any:
+        return (
+            self._call("save_intrinsics", quality_warning_confirmed=True)
+            if quality_warning_confirmed
+            else self._call("save_intrinsics")
+        )
 
-    def calibration_save_extrinsics(self) -> Any:
-        return self._call("save_stereo_extrinsics_profile")
+    def calibration_save_extrinsics(self, *, quality_warning_confirmed: bool = False) -> Any:
+        return (
+            self._call("save_stereo_extrinsics_profile", quality_warning_confirmed=True)
+            if quality_warning_confirmed
+            else self._call("save_stereo_extrinsics_profile")
+        )
 
     def calibration_load_intrinsics(self) -> Any:
         return self._call("load_intrinsics")
@@ -373,8 +425,12 @@ class StandalonePanelBackend(QtCore.QObject):
     def calibration_apply_intrinsics(self) -> Any:
         return self._call("apply_intrinsics_to_distance")
 
-    def calibration_apply_bundle(self) -> Any:
-        return self._call("apply_calibration_bundle")
+    def calibration_apply_bundle(self, *, quality_warning_confirmed: bool = False) -> Any:
+        return (
+            self._call("apply_calibration_bundle", quality_warning_confirmed=True)
+            if quality_warning_confirmed
+            else self._call("apply_calibration_bundle")
+        )
 
     def calibration_load_validation(self) -> Any:
         return self._call("load_checkerboard_validation_json")
@@ -382,14 +438,31 @@ class StandalonePanelBackend(QtCore.QObject):
     def calibration_run_validation(self) -> Any:
         return self._call("run_checkerboard_random_validation")
 
-    def calibration_save_validation(self) -> Any:
-        return self._call("save_checkerboard_validation_result")
+    def calibration_save_validation(self, *, quality_warning_confirmed: bool = False) -> Any:
+        return (
+            self._call(
+                "save_checkerboard_validation_result",
+                quality_warning_confirmed=True,
+            )
+            if quality_warning_confirmed
+            else self._call("save_checkerboard_validation_result")
+        )
 
-    def calibration_apply_validation(self) -> Any:
-        return self._call("apply_checkerboard_validation_result")
+    def calibration_apply_validation(self, *, quality_warning_confirmed: bool = False) -> Any:
+        return (
+            self._call(
+                "apply_checkerboard_validation_result",
+                quality_warning_confirmed=True,
+            )
+            if quality_warning_confirmed
+            else self._call("apply_checkerboard_validation_result")
+        )
 
     def workstation_checkerboard_validation_snapshot(self) -> Any:
         return self._call("workstation_checkerboard_validation_snapshot")
+
+    def workstation_calibration_quality_snapshot(self) -> Any:
+        return self._call("workstation_calibration_quality_snapshot")
 
     def configure_workstation_checkerboard_validation(self, payload: dict[str, object]) -> Any:
         return self._call("configure_workstation_checkerboard_validation", dict(payload))
@@ -400,16 +473,46 @@ class StandalonePanelBackend(QtCore.QObject):
     def run_workstation_checkerboard_validation(self, payload: dict[str, object]) -> Any:
         return self._call("run_workstation_checkerboard_validation", dict(payload))
 
-    def save_workstation_checkerboard_validation_result(self) -> Any:
-        return self._call("save_workstation_checkerboard_validation_result")
+    def save_workstation_checkerboard_validation_result(
+        self, *, quality_warning_confirmed: bool = False
+    ) -> Any:
+        return (
+            self._call(
+                "save_workstation_checkerboard_validation_result",
+                quality_warning_confirmed=True,
+            )
+            if quality_warning_confirmed
+            else self._call("save_workstation_checkerboard_validation_result")
+        )
 
-    def apply_workstation_checkerboard_validation_result(self) -> Any:
-        return self._call("apply_workstation_checkerboard_validation_result")
+    def apply_workstation_checkerboard_validation_result(
+        self, *, quality_warning_confirmed: bool = False
+    ) -> Any:
+        return (
+            self._call(
+                "apply_workstation_checkerboard_validation_result",
+                quality_warning_confirmed=True,
+            )
+            if quality_warning_confirmed
+            else self._call("apply_workstation_checkerboard_validation_result")
+        )
 
     def apply_measurement_settings(self, settings: dict[str, object]) -> Any:
         """Apply Workstation-owned controls through the existing panel owner."""
 
         return self._call("apply_workstation_measurement_settings", dict(settings))
+
+    def measurement_methods_snapshot(self) -> Any:
+        return self._call("workstation_measurement_methods_snapshot")
+
+    def select_measurement_method(self, payload: dict[str, object]) -> Any:
+        return self._call("select_workstation_measurement_method", dict(payload))
+
+    def configure_measurement_method_fill(self, payload: dict[str, object]) -> Any:
+        return self._call(
+            "configure_workstation_measurement_method_fill",
+            dict(payload),
+        )
 
     def save_measurement_settings(self) -> Any:
         return self._call("save_current_settings_from_ui")
@@ -457,7 +560,10 @@ class StandalonePanelBackend(QtCore.QObject):
         return self._call("workstation_wiris_command_catalog")
 
     def query_lrf_once(self) -> Any:
-        """Run one on-demand WIRIS GLRD read, triggered by the Alignment LRF button."""
+        """Run one low-level WIRIS GLRD read for compatibility/advanced tools.
+
+        Alignment no longer exposes an LRF widget or refresh command.
+        """
 
         return self._call("query_wiris_lrf_once")
 
@@ -516,6 +622,29 @@ class StandalonePanelBackend(QtCore.QObject):
             if text:
                 sources.append(f"[{attr}]\n{text}")
         return "\n\n".join(sources)
+
+    def ftp_diagnostic_text(self) -> str:
+        """Return the dedicated WIRIS FTP lifecycle log for Diagnostics."""
+
+        panel = self.panel
+        lines = [str(line) for line in (getattr(panel, "ftp_log_lines", ()) or ()) if str(line).strip()]
+        if not lines:
+            # Keep the view useful for panels created before the dedicated
+            # buffer was introduced, and for lightweight test doubles.
+            widget = getattr(panel, "wiris_log", None)
+            if widget is not None and hasattr(widget, "toPlainText"):
+                lines = [
+                    line
+                    for line in widget.toPlainText().splitlines()
+                    if "FTP" in line.upper()
+                ]
+        status_widget = getattr(panel, "calibration_status_label", None)
+        status = str(status_widget.text()).strip() if status_widget is not None else ""
+        if status and "FTP" in status.upper() and not any(
+            status == line or line.endswith(status) for line in lines
+        ):
+            lines.append(f"[status] {status}")
+        return "\n".join(lines) or "No FTP activity yet."
 
     def shutdown_for_close(self) -> bool:
         method = getattr(self.panel, "shutdown_for_close", None)

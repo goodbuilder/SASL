@@ -60,6 +60,41 @@ def test_gga_from_coordinate_sample_reports_rtk_fixed_as_nmea_quality_4() -> Non
     assert gga_from_coordinate_sample(not_fixed).split(",")[6] == "1"
 
 
+def test_gga_preserves_msl_altitude_and_geoid_separation_contract() -> None:
+    coordinate = SimpleNamespace(
+        latitude_deg=37.0,
+        longitude_deg=127.0,
+        msl_altitude_m=48.0,
+        ellipsoid_height_m=52.0,
+        fixed=True,
+        satellites_used=17,
+    )
+    rover = SimpleNamespace(
+        latitude_deg=37.0,
+        longitude_deg=127.0,
+        altitude_m=48.0,
+        altitude_ellipsoid_m=52.0,
+        fix_type=6,
+        satellites_used=17,
+        eph_m=0.02,
+    )
+
+    for sentence in (gga_from_coordinate_sample(coordinate), gga_from_position(rover)):
+        assert sentence is not None
+        fields = sentence.split(",")
+        assert fields[9:13] == ["48.000", "M", "4.000", "M"]
+
+    unknown = SimpleNamespace(
+        latitude_deg=37.0,
+        longitude_deg=127.0,
+        altitude_m=48.0,
+        fix_type=3,
+        satellites_used=8,
+        eph_m=1.0,
+    )
+    assert gga_from_position(unknown).split(",")[11] == ""
+
+
 def test_ngii_rts2_base_assisted_profile_uses_non_gating_field_defaults() -> None:
     config = GnssOperationConfig.ngii_rts2_base_assisted()
 
@@ -83,6 +118,33 @@ def test_new_settings_file_selects_ngii_rts2_profile(tmp_path) -> None:
     settings = load_settings(tmp_path / "settings.json")
 
     assert settings.gnss_operation == GnssOperationConfig.ngii_rts2_base_assisted()
+
+
+def test_rtcm_receive_throttle_does_not_suppress_injection_success_refresh() -> None:
+    calls: list[tuple[object, ...]] = []
+    panel = SimpleNamespace(
+        gnss_base_status_labels={"rtcm_injection": object()},
+        _record_gnss_base_rtcm_injection=lambda *args, **kwargs: calls.append(
+            ("record", args, kwargs)
+        ),
+        _px4_mag_camera_label=lambda side: str(side),
+        _set_health_label=lambda _label, text, level: calls.append(
+            ("label", text, level)
+        ),
+        _refresh_gnss_base_rtcm_stats=lambda: calls.append(("stats",)),
+        _refresh_gnss_operation_readiness=lambda: calls.append(("readiness",)),
+        _log=lambda _message: None,
+    )
+    controller = GnssRuntimeController(panel)
+
+    assert controller._rtcm_ui_update_due() is True
+    controller._apply_pixhawk_rtcm_result(
+        {"payload_bytes": 16, "sent": (("left", 1),), "failed": (), "dropped": 0}
+    )
+
+    assert ("label", "RTCM 16 bytes -> left", "good") in calls
+    assert ("stats",) in calls
+    assert ("readiness",) in calls
 
 
 def test_retired_caster_settings_are_migrated_to_ngii_rts2(tmp_path) -> None:
@@ -588,10 +650,14 @@ def test_ntrip_worker_emits_updated_stream_stats_after_each_chunk(monkeypatch) -
     worker = runtime_workers.NtripNetworkWorker(config=NetworkConfig())
     connected: list[object] = []
     stats: list[object] = []
+    stats_snapshots: list[object] = []
     chunks: list[object] = []
+    envelopes: list[dict[str, object]] = []
     worker.connected.connect(lambda _status, value: connected.append(value))
     worker.stats_changed.connect(stats.append)
+    worker.stats_snapshot_changed.connect(stats_snapshots.append)
     worker.chunk_received.connect(chunks.append)
+    worker.chunk_envelope_received.connect(envelopes.append)
 
     worker.run()
 
@@ -599,7 +665,12 @@ def test_ntrip_worker_emits_updated_stream_stats_after_each_chunk(monkeypatch) -
     assert len(stats) == 1
     assert stats[0].chunks_received == 1
     assert stats[0].bytes_received == 128
+    assert stats_snapshots == stats
     assert chunks == [b"rtcm-chunk"]
+    assert len(envelopes) == 1
+    assert envelopes[0]["payload"] == b"rtcm-chunk"
+    assert int(envelopes[0]["receive_monotonic_ns"]) > 0
+    assert int(envelopes[0]["receive_utc_ns"]) > 0
 
 
 # --- Direct username/password UI: credential plumbing, storage, and UI ----
@@ -996,6 +1067,36 @@ def test_network_connect_from_ntrip_connecting_still_transitions_to_active() -> 
     assert transition_calls == [(GnssOperationState.NTRIP_ACTIVE, "NTRIP active: ICY 200 OK")]
 
 
+def test_ntrip_chunk_ui_status_is_coalesced_without_dropping_forwarding() -> None:
+    class Worker:
+        def __init__(self) -> None:
+            self.sent: list[tuple[str, bytes]] = []
+
+        def send_bytes(self, label: str, payload: bytes) -> None:
+            self.sent.append((label, payload))
+
+    health_calls: list[tuple[object, str, str]] = []
+    worker = Worker()
+    config = SimpleNamespace(operation_mode=GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE)
+    panel = SimpleNamespace(
+        gnss_network_rtcm_parser=SimpleNamespace(feed=lambda _payload: []),
+        _gnss_active_operation_config=lambda: config,
+        gnss_base_serial_worker=worker,
+        gnss_base_serial_connected=True,
+        gnss_base_status_labels={"network": object()},
+        _set_health_label=lambda label, text, tone: health_calls.append((label, text, tone)),
+        drone_telemetry_rtcm_source="base",
+        drone_telemetry_rtcm_forward=False,
+    )
+    controller = GnssRuntimeController(panel)
+
+    controller._handle_gnss_network_chunk(b"first")
+    controller._handle_gnss_network_chunk(b"second")
+
+    assert len(worker.sent) == 2
+    assert len(health_calls) == 1
+
+
 def test_handle_gnss_network_diagnostic_forwards_to_the_visible_log() -> None:
     """NtripClient's connect/GGA-TX events have no status of their own and no
     other signal to ride on -- without this handler they never reach the log.
@@ -1067,8 +1168,21 @@ def test_gga_provider_logs_stale_base_sample_age_for_base_gnss_policy() -> None:
 
 def test_gga_provider_system_center_success_does_not_log_anything() -> None:
     logged: list[str] = []
-    left = SimpleNamespace(latitude_deg=37.0, longitude_deg=127.0, altitude_m=50.0, has_position=True)
-    right = SimpleNamespace(latitude_deg=37.0001, longitude_deg=127.0001, altitude_m=51.0, has_position=True)
+    now_s = time.monotonic()
+    left = SimpleNamespace(
+        latitude_deg=37.0,
+        longitude_deg=127.0,
+        altitude_m=50.0,
+        has_position=True,
+        timestamp_s=now_s - 0.02,
+    )
+    right = SimpleNamespace(
+        latitude_deg=37.0001,
+        longitude_deg=127.0001,
+        altitude_m=51.0,
+        has_position=True,
+        timestamp_s=now_s - 0.01,
+    )
     panel = _gga_panel(
         gga_policy=GgaPolicy.SYSTEM_CENTER, log_sink=logged, latest_gps={"left": left, "right": right}
     )
@@ -1079,3 +1193,107 @@ def test_gga_provider_system_center_success_does_not_log_anything() -> None:
     assert result is not None
     assert result.startswith("$GPGGA,")
     assert logged == []
+
+
+def test_gga_provider_rejects_stale_or_skewed_rover_positions() -> None:
+    now_s = time.monotonic()
+    base = {
+        "latitude_deg": 37.0,
+        "longitude_deg": 127.0,
+        "altitude_m": 50.0,
+        "has_position": True,
+    }
+    for left_timestamp, right_timestamp, reason in (
+        (now_s - 10.0, now_s - 0.01, "stale"),
+        (now_s - 0.20, now_s - 0.01, "timestamp delta"),
+    ):
+        logged: list[str] = []
+        panel = _gga_panel(
+            gga_policy=GgaPolicy.SYSTEM_CENTER,
+            log_sink=logged,
+            latest_gps={
+                "left": SimpleNamespace(**base, timestamp_s=left_timestamp),
+                "right": SimpleNamespace(**base, timestamp_s=right_timestamp),
+            },
+        )
+
+        assert GnssRuntimeController(panel)._gnss_gga_provider() is None
+        assert any(reason in message.lower() for message in logged)
+
+
+def test_left_gga_policy_never_substitutes_the_right_rover() -> None:
+    logged: list[str] = []
+    right = SimpleNamespace(
+        latitude_deg=37.0,
+        longitude_deg=127.0,
+        altitude_m=50.0,
+        has_position=True,
+        timestamp_s=time.monotonic(),
+    )
+    panel = _gga_panel(
+        gga_policy=GgaPolicy.LEFT_GNSS,
+        log_sink=logged,
+        latest_gps={"right": right},
+    )
+
+    assert GnssRuntimeController(panel)._gnss_gga_provider() is None
+    assert any("left" in message.lower() for message in logged)
+
+
+def test_survey_in_valid_requires_current_command_ack_and_active_observation() -> None:
+    manager = SimpleNamespace(state=GnssOperationState.BASE_SURVEYING)
+    transitions: list[GnssOperationState] = []
+    sent: list[tuple[str, bytes]] = []
+
+    def transition(state: GnssOperationState, _reason: str) -> bool:
+        transitions.append(state)
+        manager.state = state
+        return True
+
+    panel = SimpleNamespace(
+        gnss_operation_manager=manager,
+        gnss_base_serial_worker=SimpleNamespace(
+            send_bytes=lambda label, payload: sent.append((label, bytes(payload)))
+        ),
+        gnss_base_status_labels={"connection": object(), "survey_in": object()},
+        _set_health_label=lambda *_args: None,
+        _update_gnss_base_survey_visualization=lambda **_kwargs: None,
+        _refresh_gnss_operation_readiness=lambda: None,
+        _gnss_active_operation_config=lambda: SimpleNamespace(
+            operation_mode=GnssOperationMode.LOCAL_SURVEY_IN
+        ),
+        _gnss_transition=transition,
+        _gnss_survey_generation=3,
+        _gnss_survey_command_sent_generation=0,
+        _gnss_survey_ack_generation=0,
+        _gnss_survey_active_seen_generation=0,
+        _gnss_survey_requested_duration_s=60,
+        _gnss_survey_requested_accuracy_m=0.1,
+    )
+    controller = GnssRuntimeController(panel)
+    stale_valid = {
+        "active": False,
+        "valid": True,
+        "duration_s": 120,
+        "mean_accuracy_m": 0.01,
+        "observations": 100,
+    }
+
+    controller._handle_gnss_base_survey_in(stale_valid)
+    assert transitions == []
+    controller._handle_gnss_base_command_sent("CFG-TMODE3 survey-in start", 40)
+    controller._handle_gnss_base_ubx_message(0x05, 0x01, bytes((0x06, 0x71)))
+    assert panel._gnss_survey_ack_generation == 3
+    assert sent and sent[-1][0] == "NAV-SVIN poll after survey-in ACK"
+    controller._handle_gnss_base_survey_in(
+        {
+            "active": True,
+            "valid": False,
+            "duration_s": 10,
+            "mean_accuracy_m": 0.5,
+            "observations": 10,
+        }
+    )
+    controller._handle_gnss_base_survey_in(stale_valid)
+
+    assert transitions == [GnssOperationState.LOCAL_RTCM_ACTIVE]

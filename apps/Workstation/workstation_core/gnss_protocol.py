@@ -244,6 +244,8 @@ def parse_ubx_nav_pvt_coordinate_sample(
         # gnssFixOK plus carrSoln=2, while fixType remains a 3D/GNSS+DR value.
         fixed=fix_type in {3, 4} and gnss_fix_ok and carrier_solution == 2,
         device_id="field-base",
+        fix_type=fix_type,
+        carrier_solution=carrier_solution,
     )
 
 

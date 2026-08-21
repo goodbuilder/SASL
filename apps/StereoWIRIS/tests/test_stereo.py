@@ -4094,7 +4094,7 @@ def test_yolo_device_dropdown_updates_worker_device(monkeypatch) -> None:
     assert widget.device_edit.text() == gui.YOLO_CPU_DEVICE
     assert widget.yolo_kwargs()["device"] == gui.YOLO_CPU_DEVICE
     assert widget.yolo_kwargs()["input_size"] == expected_input_size
-    assert widget.yolo_kwargs()["display_rate_hz"] == 0.0
+    assert widget.yolo_kwargs()["display_rate_hz"] == gui.DEFAULT_PREVIEW_DISPLAY_RATE_HZ
     assert widget.yolo_kwargs()["preview_max_width"] == expected_preview_width
     assert widget.yolo_kwargs()["event_queue_size"] == widget.yolo_event_queue_size_spin.value()
     assert widget.yolo_kwargs()["frame_queue_size"] == widget.yolo_frame_queue_size_spin.value()

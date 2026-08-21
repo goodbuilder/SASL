@@ -72,6 +72,43 @@ def test_calibration_wiris_ftp_capture_refuses_without_both_camera_hosts() -> No
     assert controller.capture_calibration_images_wiris_ftp() is False
 
 
+def test_default_calibration_capture_uses_one_timestamped_session_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import Workstation.calibration_controller as calibration_module
+
+    default_root = tmp_path / "Workstation" / "calibration"
+    monkeypatch.setattr(calibration_module, "DEFAULT_CALIBRATION_ROOT", str(default_root))
+    logs: list[str] = []
+    panel = SimpleNamespace(
+        app_root=tmp_path / "runtime-data",
+        calib_dir_edit=QtWidgets.QLineEdit(str(default_root)),
+        _calibration_session_root=None,
+        _log=logs.append,
+    )
+    controller = CalibrationWorkflowController(panel)
+
+    first = controller._ensure_calibration_session_root()
+    second = controller._ensure_calibration_session_root()
+
+    assert first is not None
+    assert first == second
+    assert first.parent == default_root
+    assert first.is_dir()
+    assert len(first.name) == len("YYYY-MM-DD_HH-MM-SS")
+    assert logs and str(first) in logs[-1]
+
+    auto = controller._ensure_calibration_session_root("auto")
+    assert auto is not None
+    assert auto.name == "AutoCapture"
+    assert auto.parent.name == "calib_capture"
+    assert auto.parent.parent.name.startswith(first.name)
+    assert auto.parent.parent.parent == default_root
+    assert auto != first
+    assert controller._ensure_calibration_session_root("auto") == auto
+
+
 def test_calibration_wiris_ftp_completion_saves_via_existing_capture_path(tmp_path: Path) -> None:
     calls: list[dict[str, object]] = []
     panel = _calibration_panel(
@@ -89,6 +126,56 @@ def test_calibration_wiris_ftp_completion_saves_via_existing_capture_path(tmp_pa
     assert set(frames) == {"left", "right"}
     assert not frames["left"].isNull()
     assert not frames["right"].isNull()
+    metadata = calls[0]["metadata_by_camera"]
+    assert metadata["left"]["timestamp_reference"] == "unknown"
+    assert metadata["right"]["timestamp_reference"] == "unknown"
+    assert metadata["left"]["capture_timestamp_known"] is False
+    assert "timestamp_s" not in metadata["left"]
+
+
+def test_missing_capture_zoom_metadata_never_falls_back_to_current_spinner(
+    tmp_path: Path,
+) -> None:
+    def fail_if_read() -> int:
+        raise AssertionError("current UI zoom is not capture evidence")
+
+    panel = _calibration_panel(
+        zoom_level_spin=SimpleNamespace(value=fail_if_read),
+    )
+    controller = CalibrationWorkflowController(panel)
+
+    zoom, detail = controller._capture_zoom_level_for_paths(
+        tmp_path,
+        (tmp_path / "left_001.png", tmp_path / "right_001.png"),
+    )
+
+    assert zoom is None
+    assert "capture-time zoom readback is missing" in detail
+
+
+def test_apply_calibration_without_capture_zoom_fails_before_reading_spinner() -> None:
+    health: list[tuple[str, str]] = []
+
+    def fail_if_read() -> int:
+        raise AssertionError("current UI zoom is not capture evidence")
+
+    panel = _calibration_panel(
+        checkerboard_validation_result=SimpleNamespace(extrinsics=None),
+        checkerboard_validation_result_mode="pixhawk",
+        checkerboard_validation_status_label=QtWidgets.QLabel(),
+        last_calibration_zoom_level=None,
+        zoom_level_spin=SimpleNamespace(value=fail_if_read),
+        _set_health_label=lambda _label, text, level: health.append(
+            (str(text), str(level))
+        ),
+    )
+    controller = CalibrationWorkflowController(panel)
+    controller._calibration_quality_allows_action = lambda *_args, **_kwargs: True  # type: ignore[method-assign]
+
+    controller.apply_checkerboard_validation_result()
+
+    assert health[-1][1] == "bad"
+    assert "readback" in health[-1][0]
 
 
 def test_calibration_wiris_ftp_completion_with_one_camera_failed_does_not_save(tmp_path: Path) -> None:
@@ -106,6 +193,37 @@ def test_calibration_wiris_ftp_completion_with_one_camera_failed_does_not_save(t
     assert "failed" in panel.calibration_status_label.text().lower()
     assert panel.capture_calibration_button.isEnabled()
     assert panel.run_calibration_button.isEnabled()
+
+
+def test_calibration_wiris_ftp_failure_surfaces_ftp_error_detail(tmp_path: Path) -> None:
+    panel = _calibration_panel(
+        capture_calibration_images=lambda **kwargs: True,
+    )
+    controller = CalibrationWorkflowController(panel)
+    left_path = tmp_path / "left.png"
+    _save_test_image(left_path)
+
+    controller._handle_calibration_wiris_ftp_capture_completed(
+        {
+            "capture_id": "calib-ftp-error",
+            "cameras": {
+                "left": {
+                    "state": "completed",
+                    "stored_on_camera": True,
+                    "ftp_downloaded": True,
+                    "ftp_local_path": str(left_path),
+                },
+                "right": {
+                    "state": "completed",
+                    "stored_on_camera": True,
+                    "ftp_downloaded": False,
+                    "ftp_error": "timed out",
+                },
+            },
+        }
+    )
+
+    assert "timed out" in panel.calibration_status_label.text()
 
 
 def test_calibration_wiris_ftp_worker_cleared_on_finish() -> None:
@@ -151,6 +269,9 @@ def test_calibration_wiris_ftp_oz_completion_saves_via_existing_capture_path(tmp
 
     assert len(calls) == 1
     assert calls[0]["capture_origin"] == "ftp_oz"
+    metadata = calls[0]["metadata_by_camera"]
+    assert metadata["left"]["timestamp_reference"] == "unknown"
+    assert metadata["right"]["timestamp_reference"] == "unknown"
 
 
 def test_calibration_wiris_ftp_oz_worker_cleared_on_finish() -> None:
@@ -164,6 +285,37 @@ def test_calibration_wiris_ftp_oz_worker_cleared_on_finish() -> None:
 
     assert panel.calibration_wiris_ftp_oz_thread is None
     assert panel.calibration_wiris_ftp_oz_worker is None
+
+
+def test_calibration_ftp_oz_sync_pair_keeps_capture_clock_unknown() -> None:
+    calls: list[dict[str, object]] = []
+    frames = {
+        "left": QtGui.QImage(4, 3, QtGui.QImage.Format_RGB888),
+        "right": QtGui.QImage(4, 3, QtGui.QImage.Format_RGB888),
+    }
+    metadata = {
+        side: {
+            "timestamp_reference": "unknown",
+            "capture_timestamp_known": False,
+            "ftp_capture_id": "oz-sync-001",
+        }
+        for side in ("left", "right")
+    }
+    panel = _calibration_panel(
+        checkerboard_calibration_thread=SimpleNamespace(
+            finished=SimpleNamespace(connect=lambda _callback: None)
+        ),
+        capture_calibration_images=lambda **kwargs: calls.append(kwargs) or True,
+        _process_next_ftp_oz_sync_pair=lambda: None,
+    )
+    controller = CalibrationWorkflowController(panel)
+    controller._pending_ftp_oz_sync_frames = [("oz-sync-001", frames, metadata)]
+
+    controller._process_next_ftp_oz_sync_pair()
+
+    assert calls[0]["capture_origin"] == "ftp_oz_sync"
+    assert calls[0]["metadata_by_camera"] is metadata
+    assert calls[0]["metadata_by_camera"]["left"]["timestamp_reference"] == "unknown"
 
 
 # --- Alignment (Optical Pose) -------------------------------------------
@@ -224,7 +376,14 @@ def test_optical_pose_wiris_ftp_completion_imports_burst_with_no_file_dialog(
     controller.import_workstation_optical_pose_burst = lambda payload=None: (
         imported.append(dict(payload or {})) or {"candidates": []}
     )
-    controller._pending_wiris_ftp_payload = {"dof": {"roll": True}}
+    controller._pending_wiris_ftp_payload = {
+        "dof": {"roll": True},
+        "_ftp_request_gnss_snapshot": {
+            "left": {"latitude_deg": 37.0, "longitude_deg": 127.0, "altitude_m": 100.0},
+            "right": {"latitude_deg": 37.00001, "longitude_deg": 127.00002, "altitude_m": 100.4},
+            "drone": None,
+        },
+    }
 
     controller._handle_optical_pose_wiris_ftp_capture_completed(
         {"capture_id": "align-001", "cameras": _camera_records(tmp_path)}
@@ -232,10 +391,14 @@ def test_optical_pose_wiris_ftp_completion_imports_burst_with_no_file_dialog(
 
     assert len(imported) == 1
     assert imported[0]["dof"] == {"roll": True}
+    assert imported[0]["_ftp_request_gnss_snapshot"]["left"]["latitude_deg"] == 37.0
     sources = imported[0]["sources"]
     assert set(sources) == {"left", "right"}
     assert Path(sources["left"]["path"]).is_file()
     assert Path(sources["right"]["path"]).is_file()
+    assert sources["left"]["metadata"]["timestamp_reference"] == "unknown"
+    assert sources["left"]["metadata"]["capture_timestamp_known"] is False
+    assert "zoom_index" not in sources["left"]
 
 
 def test_optical_pose_wiris_ftp_completion_with_one_camera_failed_does_not_import(
@@ -310,6 +473,7 @@ def test_optical_pose_wiris_ftp_oz_completion_imports_burst(tmp_path: Path) -> N
     sources = imported[0]["sources"]
     assert Path(sources["left"]["path"]).is_file()
     assert Path(sources["right"]["path"]).is_file()
+    assert sources["right"]["metadata"]["timestamp_reference"] == "unknown"
 
 
 def test_optical_pose_wiris_ftp_oz_worker_cleared_on_finish() -> None:

@@ -137,9 +137,9 @@ values remain separate. A mismatch remains visible as evidence and makes exact o
 `K,D` inapplicable to derived geometry; it does not prohibit preserving raw camera,
 telemetry, or session evidence.
 
-### HR Capture, import, and HR→OZ bridge
+### Capture HR Still, import, and HR→OZ bridge
 
-The Recording workspace exposes one repeatable `HR Capture` action with an explicit
+The Recording workspace exposes one repeatable `Capture HR Still` action with an explicit
 `Pre`, `Post`, `Checkpoint`, or `Unspecified` purpose. Every press sends `SIHR TRUE`,
 triggers `CPTR` on the left and right cameras, and polls `ICPT` until each camera reports
 completion. The request/result timestamps, left-minus-right request timing, zoom readback,
@@ -160,11 +160,14 @@ rotation and translation; a rotation-only bridge records translation as unobserv
 must not transfer a stereo baseline. Bridge inputs, solver metrics, hashes, and pre/post
 comparison remain analysis evidence rather than a hidden calibration truth.
 
-### Optical pose initialization
+### Alignment R,t method workflow
 
-The fourth local tab of Alignment is `Optical pose`. Its workflow is:
+Select `Alignment` in Navigation. Common readiness and frozen-reference controls appear above six
+promoted method tabs; there is no separate `Optical pose` Navigation item or outer `R,t methods`
+wrapper. The workflow is:
 
-1. Capture a synchronized frozen native left/right reference burst. The exact operating
+1. Select `Capture Live Pair` to capture the newest decoded native left/right frames from the
+   live RTSP streams. This is not raw RTP packet capture. The exact operating
    per-camera `K,D` applicability decision and the input image IDs/hashes are frozen with it.
 2. Annotate the actual horizon, a mountain-ridge polyline, or a Drone target point in native
    OpenCV pixels (`u` right, `v` down). The frozen reference viewport is fixed at 16:9 with
@@ -182,6 +185,9 @@ The fourth local tab of Alignment is `Optical pose`. Its workflow is:
    RTK with explicit camera/target line of sight for Yaw. Terrain PnP also requires a
    declared vertical datum; a skyline alone is not promoted to a 3-D correspondence or
    truth source.
+   The solver tabs are `Horizon`, `Mountain + GNSS`, `Terrain PnP`,
+   `Drone Rotation`, `Drone Multi-view`, `References`, and `Combine`. Tab changes automatically
+   select Horizon/Ridge/Target annotation mode without deleting points from other modes.
 4. Inspect immutable candidates, residual/uncertainty evidence, warnings, and observable
    degrees of freedom. Independent non-overlapping candidates may be combined.
 5. Apply only selected DOF that the candidate actually optimized and observed, or revert to
@@ -222,6 +228,29 @@ the right side may be supplied in the same object. A precomputed normalized ray 
 LOS may be supplied instead. These files are hashed into the candidate and are not promoted
 to live truth.
 
+### Measurement method readiness and fallback
+
+Measurement shows only method categories that can resolve a complete stereo R,t with the exact
+operating K,D. A solved candidate is usable without first pressing Apply only when its method
+contract resolves a complete pose. Horizon combines observed Roll/Pitch with pair-frozen Pixhawk
+Yaw and GNSS Translation. Single-target Drone Rotation re-solves Yaw with pair-frozen Pixhawk
+Roll/Pitch; full Drone Rotation adds pair-frozen GNSS Translation. Mountain, Multi-view, Terrain,
+and Combined must already be full 6-DOF. Readiness is per method, so an unavailable GNSS-dependent
+method does not block an independent Checkerboard or full Multi-view/Terrain profile.
+
+The operator's Measurement selection is the preferred method. If it becomes unavailable, the
+runtime selects the first ready category in `Settings > Runtime / Calibration > Measurement
+fallback order`. While operating on a fallback, a recovered preferred or higher-ranked method
+must remain ready for one second before it is restored. Every switch takes effect only before a
+new matched pair is frozen; no existing MeasurementAttempt is rewritten. With no ready category,
+valid distance output is blocked while unresolved recording evidence remains append-only.
+The pair's attitude/GPS snapshots are selected before hybrid geometry is resolved, and the final
+R,t plus those exact snapshot values are covered by `measurement_geometry_sha256`.
+When no method is ready, the matched detections are stored as a blocked pair with a readiness
+snapshot hash rather than being discarded or represented by a fabricated MeasurementAttempt.
+Candidate details show left/right observability independently; Apply/Combine enables a common
+axis only when both sides observed it.
+
 `Random stereo-pair validation` repeats the same calculation on seeded subsets in the same
 background calculation slot. It assumes a completed full result and at least three matching
 pairs. PASS records each successful subset and reports intrinsic, baseline, and rotation
@@ -255,7 +284,25 @@ Changing camera parameters should not unnecessarily hide live image.
 
 ## 7. Measurement Operation
 
+The Workstation separates the parent field session from each measurement. The operator runs
+`Session > Open Session → New Measurement → Measurement > Detection → Post capture → Session >
+Seal Measurement`; a sealed child
+leaves the parent open for another `New Measurement`. `Close Session` is separate and is available
+only when no child or producer is mutable. The parent ID remains fixed while child IDs advance as
+`m000001`, `m000002`, and so on. A revision adds evidence to one child and does not create another
+Detection interval.
+
+The top-level Session workspace keeps lifecycle and readiness separate. `OPEN` describes the daily
+container; `Evidence collection` and `Valid measurement` are derived operator states for the current
+child. The readiness table contains blockers only. The compact method table always lists all eight
+method categories; missing candidates/profiles remain `BLOCKED` with their required inputs. Selecting
+one method reveals its fallback reason, live PX4 body-FRD to world-NED R/P/Y, P1→P2 GNSS NED
+baseline, candidate virtual-FRD/world-NED values, or OpenCV left-to-right RDF `R,t` without merging
+those coordinate contracts.
+
 Required visibility:
+- parent session ID/state and child count
+- current measurement ID/state/revision
 - relevant live imagery
 - measurement result and unit
 - validity/quality
@@ -270,7 +317,7 @@ Distinguish raw/corrected/configured/derived/invalid values.
 
 Required visibility:
 - recording state
-- session/output path
+- parent session and current measurement output path
 - elapsed time when useful
 - write/save errors
 - relevant system state
@@ -355,7 +402,9 @@ Prefer factual messages such as `RTSP port unreachable` over vague `camera unhea
 
 ## 15. Saved Session Review
 
-Open session → inspect metadata/samples/plots → compare sources → export/analyze.
+Open session/measurement → inspect metadata/samples/plots → compare sources → export/analyze.
+Saved-review identity is `(session_id, measurement_id)` so equal artifact names in sibling
+measurements cannot overwrite one another.
 
 ## 16. Workflow Priority
 

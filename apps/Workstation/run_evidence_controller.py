@@ -15,6 +15,7 @@ RUN_EVIDENCE_CONTROLLER_METHODS = (
     "ensure_workstation_run_evidence",
     "append_workstation_run_event",
     "import_workstation_session_artifact",
+    "register_workstation_session_artifact",
 )
 
 
@@ -39,6 +40,26 @@ class RunEvidenceController:
             raise RuntimeError("recording session directory owner is unavailable")
         return Path(resolver(session_id))
 
+    def _ensure_session_ledger(self) -> RunEvidenceLedger | None:
+        """Bind to the current session and hydrate its durable identity."""
+
+        if not str(getattr(self.panel, "recording_session_id", "") or ""):
+            return None
+        root = self._session_root().resolve()
+        ledger = self._ledger
+        if ledger is None or ledger.root != root:
+            ledger = RunEvidenceLedger(root)
+            self._ledger = ledger
+        if ledger.setup is not None:
+            self._setup = ledger.setup
+            if ledger.locked:
+                self._state = "LOCKED"
+                self._detail = "rehydrated from locked session run evidence"
+            else:
+                self._state = "APPLIED"
+                self._detail = "rehydrated from session run setup"
+        return ledger
+
     @staticmethod
     def _zoom_index(value: object) -> int | None:
         try:
@@ -53,8 +74,6 @@ class RunEvidenceController:
         return self._zoom_index(row.get("index") if isinstance(row, Mapping) else None)
 
     def apply_workstation_run_setup(self, values: Mapping[str, Any]) -> dict[str, Any]:
-        if self._ledger is not None and self._ledger.locked:
-            raise RuntimeError("run setup is locked after the first evidence event")
         mode = values.get("mode", values.get("target_platform", "drone"))
         condition = values.get("condition")
         condition_mapping = dict(condition) if isinstance(condition, Mapping) else {}
@@ -71,17 +90,28 @@ class RunEvidenceController:
                 values.get("requested_zoom_right", self._observed_zoom("right"))
             ),
         )
+        ledger = self._ensure_session_ledger()
+        if ledger is not None and ledger.setup is not None:
+            if ledger.setup == setup:
+                self._setup = ledger.setup
+                self._state = "LOCKED" if ledger.locked else "APPLIED"
+                self._detail = (
+                    "existing locked run setup confirmed"
+                    if ledger.locked
+                    else "existing run setup confirmed"
+                )
+                return self.workstation_run_setup_snapshot()
+            if ledger.locked:
+                raise RuntimeError("run setup is locked after the first evidence event")
         self._setup = setup
         self._state = "APPLIED"
         self._detail = "identity will lock on first HR/pose/recording evidence"
-        if getattr(self.panel, "recording_session_id", ""):
-            self._ledger = RunEvidenceLedger(self._session_root())
-            if self._ledger.locked:
-                raise RuntimeError("existing session evidence already locks its run setup")
-            self._ledger.apply_setup(setup)
+        if ledger is not None:
+            ledger.apply_setup(setup)
         return self.workstation_run_setup_snapshot()
 
     def workstation_run_setup_snapshot(self) -> dict[str, Any]:
+        self._ensure_session_ledger()
         setup = self._setup
         locked = bool(self._ledger and self._ledger.locked)
         payload: dict[str, Any] = {
@@ -103,6 +133,7 @@ class RunEvidenceController:
         source: str = "Workstation",
         coordinate_contract: str = "not_applicable",
     ) -> dict[str, Any]:
+        ledger = self._ensure_session_ledger()
         if self._setup is None:
             # Raw evidence must never be lost merely because an operator did
             # not finish the join labels.  Use explicit, searchable fallback
@@ -119,10 +150,8 @@ class RunEvidenceController:
             )
             self._state = "AUTO_DEFAULT"
             self._detail = "operator run setup missing; explicit fallback IDs locked to preserve raw evidence"
-        root = self._session_root()
-        ledger = self._ledger
-        if ledger is None or ledger.root != root.resolve():
-            ledger = RunEvidenceLedger(root)
+        if ledger is None:
+            ledger = RunEvidenceLedger(self._session_root())
             self._ledger = ledger
         if ledger.setup is None:
             ledger.apply_setup(self._setup)
@@ -182,6 +211,34 @@ class RunEvidenceController:
             role=role,
             media_type=media_type,
             metadata=metadata,
+        ).to_mapping()
+
+    def register_workstation_session_artifact(
+        self,
+        session_path: str | Path,
+        *,
+        role: str,
+        media_type: str = "application/octet-stream",
+        metadata: Mapping[str, Any] | None = None,
+        expected_size_bytes: int | None = None,
+        expected_sha256: str | None = None,
+    ) -> dict[str, Any]:
+        """Inventory an already sealed file below the active session root."""
+
+        if self._ledger is None or not self._ledger.locked:
+            self.ensure_workstation_run_evidence(
+                "session_prepared",
+                {},
+                source="RunEvidenceController",
+            )
+        assert self._ledger is not None
+        return self._ledger.register_session_artifact(
+            session_path,
+            role=role,
+            media_type=media_type,
+            metadata=metadata,
+            expected_size_bytes=expected_size_bytes,
+            expected_sha256=expected_sha256,
         ).to_mapping()
 
 

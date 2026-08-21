@@ -51,7 +51,7 @@
             "state": {
               "type": "search",
               "state": {
-                "query": "README",
+                "query": "",
                 "matchingCase": false,
                 "explainSearch": false,
                 "collapseAll": false,
@@ -75,8 +75,7 @@
               "title": "북마크"
             }
           }
-        ],
-        "currentTab": 1
+        ]
       }
     ],
     "direction": "horizontal",
@@ -187,6 +186,12 @@
   },
   "active": "eb6797c961e82976",
   "lastOpenFiles": [
+    "apps/StereoWIRIS/docs/DESIGN.md",
+    "apps/Workstation/docs/ui/11_DESIGN_AUDIT_RESULT.md",
+    "apps/Simulation/Recordings/waypoint_20260812_103935_full/left_overlay.mp4",
+    "apps/Simulation/install/stereo_ground_sim/lib/stereo_ground_sim/stereo_distance_node.md",
+    "docs/PROJECT_INDEX.md",
+    "apps/Simulation/reports/experiments/EXP-20260622-331-b15x5-runtime-guard-threshold-sensitivity/README.md",
     "StereoWIRIS/tests/__pycache__/test_workstation.cpython-310-pytest-6.2.5.pyc.1649729",
     "StereoWIRIS/tests/__pycache__/test_workstation.cpython-310-pytest-6.2.5.pyc.1649546",
     "StereoWIRIS/tests/__pycache__/test_workstation.cpython-310-pytest-6.2.5.pyc.1625475",

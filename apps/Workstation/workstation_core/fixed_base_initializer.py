@@ -40,6 +40,9 @@ class FixedBaseInitializer:
         reasons: list[str] = []
         if not rows:
             return FixedBaseValidation(False, ("no coordinate samples",), None)
+        latest = max(rows, key=lambda row: row.timestamp_s)
+        if not latest.fixed:
+            reasons.append("latest coordinate sample is not RTK Fixed")
         try:
             profile = build_coordinate_profile(
                 rows,

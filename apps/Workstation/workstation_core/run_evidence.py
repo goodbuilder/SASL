@@ -310,10 +310,147 @@ class RunEvidenceLedger:
             imported_utc_ns=time.time_ns(),
             metadata=tuple(sorted((str(key), _json_safe(value)) for key, value in (metadata or {}).items())),
         )
+        self._record_artifact(
+            record,
+            "artifact_imported",
+            source="RunEvidenceLedger.import_artifact",
+        )
+        return record
+
+    def register_session_artifact(
+        self,
+        session_path: Path | str,
+        *,
+        role: str,
+        media_type: str = "application/octet-stream",
+        metadata: Mapping[str, Any] | None = None,
+        expected_size_bytes: int | None = None,
+        expected_sha256: str | None = None,
+    ) -> ArtifactRecord:
+        """Register already session-owned immutable bytes without copying them.
+
+        ``import_artifact`` remains the boundary for external files: it copies
+        those bytes into ``assets/`` before recording them.  This method is for
+        producers such as the ULog and target-drone recorders that have already
+        atomically sealed their output below this ledger's session root.
+        """
+
+        self._require_setup()
+        raw_path = Path(session_path).expanduser()
+        candidate = raw_path if raw_path.is_absolute() else self.root / raw_path
+        source = candidate.resolve(strict=True)
+        try:
+            relative = source.relative_to(self.root).as_posix()
+        except ValueError as exc:
+            raise ValueError("session artifact must be inside the session root") from exc
+        if not source.is_file():
+            raise ValueError("session artifact must be a regular file")
+
+        role_text = str(role or "").strip()
+        if not role_text or "\x00" in role_text:
+            raise ValueError("role is required")
+        size = source.stat().st_size
+        if expected_size_bytes is not None:
+            if isinstance(expected_size_bytes, bool) or int(expected_size_bytes) < 0:
+                raise ValueError("expected_size_bytes must be a non-negative integer")
+            if size != int(expected_size_bytes):
+                raise ValueError("session artifact size does not match the producer record")
+        sha256 = sha256_file(source)
+        if expected_sha256 is not None:
+            expected_digest = str(expected_sha256).strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+                raise ValueError("expected_sha256 must be a 64-character hexadecimal digest")
+            if sha256 != expected_digest:
+                raise ValueError("session artifact SHA-256 does not match the producer record")
+
+        normalized_metadata = {
+            str(key): _json_safe(value) for key, value in (metadata or {}).items()
+        }
+        normalized_metadata.update(
+            {
+                "registration": "session_reference",
+                "storage_class": "sealed_immutable",
+                "snapshot_policy": "reference_by_hash",
+            }
+        )
+        existing = self._existing_registered_artifact(
+            role=role_text,
+            relative_path=relative,
+            sha256=sha256,
+        )
+        if existing is not None:
+            return existing
+        record = ArtifactRecord(
+            artifact_id=str(uuid.uuid4()),
+            role=role_text,
+            relative_path=relative,
+            size_bytes=size,
+            sha256=sha256,
+            source_name=source.name,
+            media_type=str(media_type),
+            imported_utc_ns=time.time_ns(),
+            metadata=tuple(sorted(normalized_metadata.items())),
+        )
+        self._record_artifact(
+            record,
+            "artifact_registered",
+            source="RunEvidenceLedger.register_session_artifact",
+        )
+        return record
+
+    def _existing_registered_artifact(
+        self,
+        *,
+        role: str,
+        relative_path: str,
+        sha256: str,
+    ) -> ArtifactRecord | None:
+        if not self._artifacts_path.is_file():
+            return None
+        with self._artifacts_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(value, Mapping):
+                    continue
+                if (
+                    str(value.get("role") or "") != role
+                    or str(value.get("relative_path") or "") != relative_path
+                    or str(value.get("sha256") or "") != sha256
+                ):
+                    continue
+                metadata = value.get("metadata")
+                metadata = metadata if isinstance(metadata, Mapping) else {}
+                return ArtifactRecord(
+                    artifact_id=str(value.get("artifact_id") or ""),
+                    role=role,
+                    relative_path=relative_path,
+                    size_bytes=int(value.get("size_bytes") or 0),
+                    sha256=sha256,
+                    source_name=str(value.get("source_name") or Path(relative_path).name),
+                    media_type=str(value.get("media_type") or "application/octet-stream"),
+                    imported_utc_ns=int(value.get("imported_utc_ns") or 0),
+                    metadata=tuple(
+                        sorted((str(key), _json_safe(item)) for key, item in metadata.items())
+                    ),
+                )
+        return None
+
+    def _record_artifact(
+        self,
+        record: ArtifactRecord,
+        event_type: str,
+        *,
+        source: str,
+    ) -> None:
         self._append_json_line(self._artifacts_path, record.to_mapping())
         self._locked = True
         self.append_event(
-            "artifact_imported",
+            event_type,
             {
                 "artifact_id": record.artifact_id,
                 "role": record.role,
@@ -322,9 +459,8 @@ class RunEvidenceLedger:
                 "sha256": record.sha256,
                 "source_name": record.source_name,
             },
-            source="RunEvidenceLedger.import_artifact",
+            source=source,
         )
-        return record
 
     def resolve_artifact(self, relative_path: str) -> Path:
         candidate = (self.root / str(relative_path)).resolve()

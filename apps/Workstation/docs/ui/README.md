@@ -16,6 +16,7 @@ StereoWIRIS를 산업용/엔지니어링 Workstation UI로 재설계하기 위�
 - 10_DESIGN_AUDIT.md
 - AUDIT_PROMPT.md
 - 11_DESIGN_AUDIT_RESULT.md
+- 12_UI_REFINEMENT_PLAN.md
 
 권장 순서:
 1. 문서를 저장소의 `apps/Workstation/docs/ui/`에 배치합니다.
@@ -44,5 +45,32 @@ Inspector와 Diagnostics도 같은 `EvidenceAdapter` source를
 validation 실행도 동일한 owner-backed facade로 제공합니다. Calibration setup fields,
 measurement tuning, playback/export와 실제 RTSP/Pixhawk/GNSS 장비·장시간 writer 종료는
 별도 조건입니다.
+
+Measurement 실행은 상위 세션과 개별 측정을 분리합니다. 최상위 `Session` 화면의
+`Open Session`은 날짜·시간 기반 당일 작업 폴더를 열고, `New Measurement`는 그 아래
+`measurements/mNNNNNN`을 생성합니다. Session 화면은 현재 child의 증거 수집/유효 측정
+준비 상태를 차단 원인 중심으로 표시합니다. 모든 측정 방식은 항상 보이며, 선택한 방식의
+실제 입력값·출처·좌표계만 상세 영역에 표시합니다. Detection,
+spool, 영상, 캡처, 결과, revision은 현재 child에만 기록되며 `Seal Measurement` 뒤 같은
+세션에서 다음 child를 만들 수 있습니다. `Close Session`은 모든 child manifest SHA-256과
+세션 공통 증거를 상위 manifest에 봉인합니다. 저장 리뷰도 `(session_id, measurement_id)`를
+키로 사용합니다.
+
+Optical Pose는 현재 Horizon, Mountain + GNSS, Terrain PnP, Drone RTK Rotation,
+Drone RTK Multi-view R,t, References, Combine 방식별 탭으로 분리됩니다. Measurement는
+backend readiness snapshot에서 준비된 방식만 표시하며, 부분 후보의 누락 회전은 live
+Pixhawk, 누락 Translation은 live GNSS로 보완합니다. 이 보완은 Horizon과 Drone RTK
+Rotation의 명시적 계약에만 적용되며 full 6-DOF solver는 부분 결과를 미준비로 처리합니다. 자동 대체 순서는
+`Settings > Runtime / Calibration`에서 재정렬하고, 모든 전환은 detection-pair 경계와
+기록 provenance를 보존합니다. 상세 운용 규칙은 `01_USER_WORKFLOW.md`, 배치는
+`03_WORKSPACE_LAYOUT.md`를 참조합니다.
+
+Alignment Navigation에 들어오면 공통 Readiness와 frozen 좌·우 preview가 먼저 표시되고,
+그 아래 `Horizon`, `Mountain + GNSS`, `Terrain PnP`, `Drone Rotation`,
+`Drone Multi-view`, `References`, `Combine`이 Alignment의 상단 방식 탭으로 직접 노출됩니다.
+각 탭은 공통 Candidate DOF와 별도로 해당 방식의 입력 개수, 관측 축, 품질 metric, profile/hash,
+실패 사유를 표시하며, `References`는 source 등록만, `Combine`은 후보 조합만 담당합니다.
+별도의 `Optical Pose` 또는 바깥 `R,t methods` 탭은 없습니다. 넓은 화면은 preview 좌우 배치와
+방식/Candidate 60:40 배치를 사용하고, 좁은 화면은 preview와 Candidate review를 세로로 전환합니다.
 Workstation은 ROS2/uXRCE Pixhawk 연결·탐색과 still-image/FTP/EXIF TimeSync를 제공하지
 않으며, 해당 Legacy workflow는 `apps/StereoWIRIS/` 런타임에 유지됩니다.

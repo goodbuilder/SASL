@@ -826,6 +826,12 @@ class DeviceRuntimeController:
         except Exception as exc:
             self.panel._pixhawk_connection_failed(camera, tuple(target_sides), str(exc))
             return
+        ensure_rtcm_worker = getattr(self.panel, "_ensure_pixhawk_rtcm_worker", None)
+        if callable(ensure_rtcm_worker) and (
+            getattr(self.panel, "rtcm_pipeline_worker", None) is not None
+            or getattr(self.panel, "pixhawk_rtcm_worker", None) is not None
+        ):
+            ensure_rtcm_worker()
         if force_setup:
             self.panel._apply_mavlink_pixhawk_setup(subscriber, tuple(target_sides))
         elif self.panel.mavlink_configure_streams_checkbox.isChecked():
@@ -984,8 +990,19 @@ class DeviceRuntimeController:
         *,
         error: str | None = None,
     ) -> None:
+        disconnected_subscriber = self.panel.mavlink_pixhawk
         if not getattr(self.panel.mavlink_pixhawk, "connections", {}):
             self.panel.mavlink_pixhawk = None
+        if self.panel.mavlink_pixhawk is None and disconnected_subscriber is not None:
+            controller_factory = getattr(self.panel, "_gnss_runtime_controller", None)
+            if callable(controller_factory):
+                controller = controller_factory()
+                retire = getattr(controller, "_retire_pixhawk_rtcm_worker", None)
+                if callable(retire):
+                    retire(
+                        expected_subscriber=disconnected_subscriber,
+                        wait=False,
+                    )
         connection_thread = getattr(self.panel, "pixhawk_connection_thread", None)
         if connection_thread is not None and connection_thread.isRunning():
             connection_thread.quit()

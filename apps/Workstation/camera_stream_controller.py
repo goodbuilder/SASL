@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from PyQt5 import QtCore, QtGui
 
 from Workstation.camera_time_sync_controller import (
@@ -38,15 +40,19 @@ class CameraStreamLifecycleController:
             self.panel.connect_cameras()
 
     def toggle_yolo_detection(self) -> bool | None:
-        if self.panel._session_recording_active() and (
-            self.panel.camera_connected or self.panel._pending_camera_start is not None
+        if (
+            self.panel._session_recording_active()
+            and not bool(getattr(self.panel, "_automatic_session_recording", False))
+            and (
+                self.panel.camera_connected or self.panel._pending_camera_start is not None
+            )
         ):
             self.panel._log("[YOLO] 세션 기록 중에는 실행 중인 카메라의 Detection 모드를 바꿀 수 없습니다.")
             return False
         if self.panel.yolo_enabled or self.panel._pending_camera_start is not None:
             self.panel.stop_yolo_detection()
         else:
-            self.panel.start_yolo()
+            return self.panel.start_yolo()
         return None
 
     def connect_cameras(self) -> None:
@@ -54,11 +60,99 @@ class CameraStreamLifecycleController:
             self.panel._cancel_auto_wiris_connect_retry()
         self.panel._start_camera_streams(enable_detection=False, switch_to_depth=False)
 
-    def start_yolo(self) -> None:
-        self.panel._start_camera_streams(enable_detection=True, switch_to_depth=True)
+    def _measurement_package_state(self) -> str:
+        reader = getattr(self.panel, "measurement_package_snapshot", None)
+        if not callable(reader):
+            return "IDLE"
+        try:
+            snapshot = reader()
+        except Exception:
+            return "IDLE"
+        if not isinstance(snapshot, Mapping):
+            return "IDLE"
+        return str(snapshot.get("state") or "IDLE").upper()
+
+    def _uses_explicit_package_lifecycle(self) -> bool:
+        return bool(getattr(self.panel, "_measurement_package_explicit_lifecycle", False))
+
+    def _reserve_package_detection(self) -> bool:
+        state = self._measurement_package_state()
+        package_active = state != "IDLE"
+        if (
+            not package_active
+            and self.panel._session_recording_active()
+            and not bool(getattr(self.panel, "_automatic_session_recording", False))
+        ):
+            # Advanced/manual recording remains a supported legacy path; the
+            # new Measurement workflow itself never enters through this gate.
+            return True
+        if not self._uses_explicit_package_lifecycle() and not package_active:
+            # Compatibility for bare controller callers and older automation.
+            return True
+        starter = getattr(self.panel, "begin_measurement_detection", None)
+        if not callable(starter):
+            self.panel._log("[YOLO] Start Session/New Measurement가 필요합니다: package controller unavailable")
+            return False
+        return bool(starter())
+
+    def _complete_package_detection(self) -> bool:
+        state = self._measurement_package_state()
+        if state not in {"COLLECTING", "POST_CAPTURE"}:
+            return True
+        completer = getattr(self.panel, "complete_measurement_detection", None)
+        return True if not callable(completer) else bool(completer())
+
+    def _detection_inputs_valid(self) -> bool:
+        if not hasattr(self.panel, "left_url_edit") or not hasattr(
+            self.panel, "right_url_edit"
+        ):
+            return True
+        left_url = self.panel.left_url_edit.text().strip()
+        right_url = self.panel.right_url_edit.text().strip()
+        if not left_url or not right_url:
+            self.panel._log("[카메라] Left/Right RTSP URL을 입력해야 합니다.")
+            return False
+        if self.panel._rtsp_urls_are_same_stream():
+            message = "카메라: 좌/우 RTSP URL이 같은 스트림입니다. 좌우 카메라 IP를 분리하세요."
+            self.panel.camera_connection_label.setText(message)
+            self.panel._set_distance_text("거리: 좌/우 RTSP URL이 동일해 측정 차단", quality="ERROR")
+            self.panel._log(f"[카메라] {message}")
+            return False
+        return True
+
+    def start_yolo(self) -> bool | None:
+        if not self._detection_inputs_valid():
+            return False
+        if not self._reserve_package_detection():
+            self.panel._log("[YOLO] Detection 시작이 차단되었습니다. Start Session 후 New Measurement를 실행하세요.")
+            return False
+        if not self.panel._session_recording_active():
+            try:
+                started = self.panel.start_automatic_session_recording()
+            except Exception as exc:
+                self.panel._log(f"[저장] 자동 세션 준비 실패: {exc}")
+                cancel = getattr(self.panel, "cancel_measurement_detection_start", None)
+                if callable(cancel):
+                    cancel(str(exc))
+                return False
+            if started is False:
+                cancel = getattr(self.panel, "cancel_measurement_detection_start", None)
+                if callable(cancel):
+                    cancel("recording session could not start")
+                return False
+        stream_result = self.panel._start_camera_streams(
+            enable_detection=True, switch_to_depth=True
+        )
+        return False if stream_result is False else None
 
     def stop_yolo_detection(self) -> None:
         if self.panel._pending_camera_start is not None:
+            cancel = getattr(self.panel, "cancel_measurement_detection_start", None)
+            cancelled = bool(cancel("Detection camera start was cancelled")) if callable(cancel) else False
+            if not cancelled:
+                # Recording or another producer already started, so retain the
+                # attempted interval as explicit incomplete evidence.
+                self._complete_package_detection()
             self.panel.stop_yolo_streams()
             return
         if not self.panel.camera_connected:
@@ -68,21 +162,31 @@ class CameraStreamLifecycleController:
             self.panel._log("[YOLO] 이미 중지 상태입니다. 카메라 프리뷰는 유지 중입니다.")
             return
         self.panel._log("[YOLO] 검출을 중지하고 카메라 프리뷰만 유지합니다.")
+        self._complete_package_detection()
+        if bool(getattr(self.panel, "_automatic_session_recording", False)):
+            # Detection stop closes writers and starts the existing session
+            # persistence flow, but package sealing remains a separate,
+            # explicit Finalize action after post evidence is collected.
+            self.panel.stop_yolo_streams()
+            if self.panel._session_recording_active():
+                return
+            self.panel.connect_cameras()
+            return
         self.panel._start_camera_streams(enable_detection=False, switch_to_depth=False)
 
-    def _start_camera_streams(self, *, enable_detection: bool, switch_to_depth: bool) -> None:
+    def _start_camera_streams(self, *, enable_detection: bool, switch_to_depth: bool) -> bool:
         kwargs = self.panel.yolo_kwargs()
         left_url = self.panel.left_url_edit.text().strip()
         right_url = self.panel.right_url_edit.text().strip()
         if not left_url or not right_url:
             self.panel._log("[카메라] Left/Right RTSP URL을 입력해야 합니다.")
-            return
+            return False
         if self.panel._rtsp_urls_are_same_stream():
             message = "카메라: 좌/우 RTSP URL이 같은 스트림입니다. 좌우 카메라 IP를 분리하세요."
             self.panel.camera_connection_label.setText(message)
             self.panel._set_distance_text("거리: 좌/우 RTSP URL이 동일해 측정 차단", quality="ERROR")
             self.panel._log(f"[카메라] {message}")
-            return
+            return False
         self.panel._log("[연결] 카메라 프리뷰/YOLO는 설정된 인터페이스와 RTSP URL을 사용합니다.")
         self.panel.start_button.setEnabled(False)
         self.panel.camera_connect_button.setEnabled(False)
@@ -120,9 +224,9 @@ class CameraStreamLifecycleController:
             self.panel.camera_connected = False
             self.panel.yolo_enabled = False
             self.panel._schedule_camera_start_retry(enable_detection, switch_to_depth)
-            return
+            return True
 
-        def start_both() -> None:
+        def start_both() -> bool:
             left_started = self.panel.left_pane.start_stream(
                 left_url,
                 enable_detection=enable_detection,
@@ -144,7 +248,7 @@ class CameraStreamLifecycleController:
                 self.panel.yolo_enabled = False
                 self.panel._schedule_camera_start_retry(enable_detection, switch_to_depth)
                 self.panel._refresh_operation_header()
-                return
+                return True
 
             self.panel._pending_camera_start = None
             self.panel.camera_connected = True
@@ -162,8 +266,14 @@ class CameraStreamLifecycleController:
                 )
             self.panel._refresh_session_toggle_buttons()
             self.panel._refresh_operation_header()
+            continuation = getattr(
+                self.panel, "_continue_measurement_package_finalization", None
+            )
+            if callable(continuation):
+                continuation()
+            return True
 
-        start_both()
+        return start_both()
 
     def _schedule_camera_start_retry(self, enable_detection: bool, switch_to_depth: bool) -> None:
         self.panel._camera_start_request_generation += 1
@@ -197,6 +307,8 @@ class CameraStreamLifecycleController:
         self.panel._pending_camera_start = None
 
     def stop_yolo_streams(self, *, wait: bool = False) -> bool:
+        if bool(getattr(self.panel, "yolo_enabled", False)):
+            self._complete_package_detection()
         if self.panel.auto_wiris_connect_pending:
             self.panel._cancel_auto_wiris_connect_retry()
         self.panel._cancel_pending_camera_start()
@@ -216,12 +328,17 @@ class CameraStreamLifecycleController:
             self.panel._log("[종료] 카메라 worker가 아직 종료 중입니다. 다음 종료 시도에서 다시 확인합니다.")
             return False
         if finalize_session:
-            self.panel.distance_recording_enabled = False
-            self.panel.video_recording_enabled = False
-            self.panel.distance_recording_started_monotonic_s = None
-            self.panel.record_button.setText("세션 기록 시작")
-            self.panel._log(f"[저장] 카메라 Preview 해제로 세션 기록을 중지했습니다: {self.panel._format_video_recording_paths()}")
-            self.panel.save_distance_history_csv(final_clock_sync_snapshot=final_clock_sync_snapshot)
+            if bool(getattr(self.panel, "_automatic_session_recording", False)):
+                self.panel.stop_automatic_session_recording(
+                    final_clock_sync_snapshot=final_clock_sync_snapshot
+                )
+            else:
+                self.panel.distance_recording_enabled = False
+                self.panel.video_recording_enabled = False
+                self.panel.distance_recording_started_monotonic_s = None
+                self.panel.record_button.setText("세션 기록 시작")
+                self.panel._log(f"[저장] 카메라 Preview 해제로 세션 기록을 중지했습니다: {self.panel._format_video_recording_paths()}")
+                self.panel.save_distance_history_csv(final_clock_sync_snapshot=final_clock_sync_snapshot)
         self.panel._clear_detection_state()
         self.panel.camera_connected = False
         self.panel.yolo_enabled = False

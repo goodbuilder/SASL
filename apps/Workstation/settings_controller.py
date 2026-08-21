@@ -24,6 +24,10 @@ from Workstation.workstation_core.settings import (
     resolve_settings_path,
     save_settings as _save_shared_settings,
 )
+from Workstation.workstation_core.measurement_methods import (
+    normalize_measurement_method_fallback_order,
+    normalize_measurement_method_id,
+)
 from Workstation.workstation_core.yolo_stream import DEFAULT_YOLO_WEIGHTS
 
 SETTINGS_CONTROLLER_METHODS = [
@@ -122,7 +126,20 @@ class WorkstationSettingsController:
         # JSON file unchanged until the user chooses Save.
         for name, value in values.items():
             if name != "gnss_operation":
+                if name == "measurement_method_fallback_order":
+                    value = normalize_measurement_method_fallback_order(value)
+                elif name == "measurement_preferred_method":
+                    value = normalize_measurement_method_id(value)
                 panel._workstation_setting_overrides[name] = value
+        if (
+            not str(getattr(panel, "_measurement_id", "") or "")
+            and {
+                "measurement_preferred_method",
+                "measurement_method_fallback_order",
+            }
+            & set(values)
+        ):
+            panel._measurement_method_config_token = None
 
         simple_text = {
             "interface_name": "interface_edit",
@@ -157,6 +174,7 @@ class WorkstationSettingsController:
             "wiris_control_timeout_s": "zoom_timeout_spin",
             "preview_width": "preview_width_spin",
             "rtsp_latency_ms": "rtsp_latency_spin",
+            "yolo_input_size": "input_size_spin",
             "yolo_event_queue_size": "yolo_event_queue_size_spin",
             "yolo_frame_queue_size": "yolo_frame_queue_size_spin",
             "left_mavlink_baud": "left_mavlink_baud_spin",
@@ -189,7 +207,7 @@ class WorkstationSettingsController:
 
         set_combo("yolo_device", "device_combo", "cpu")
         set_text("yolo_device", "device_edit")
-        set_combo("rtsp_decoder", "decoder_combo", "nvidia")
+        set_combo("rtsp_decoder", "decoder_combo", "auto")
         set_combo("stream_backend", "stream_backend_combo", "gstreamer")
         set_combo("rtsp_transport", "rtsp_transport_combo", "tcp")
         set_combo("pixhawk_ethernet_mode", "pixhawk_ethernet_mode_combo", "mavlink")
@@ -315,6 +333,31 @@ class WorkstationSettingsController:
             if callable(setter):
                 setter(str(values[name] or ""))
 
+        if has("class_gate_enabled") or has("class_gate"):
+            current_enabled = bool(panel.yolo_gate_class_checkbox.isChecked())
+            current_target = panel.yolo_gate_class_edit.text().strip()
+            requested_enabled = (
+                bool(values["class_gate_enabled"])
+                if has("class_gate_enabled")
+                else current_enabled
+            )
+            requested_target = (
+                str(values["class_gate"] or "").strip()
+                if has("class_gate")
+                else current_target
+            )
+            pending_start = getattr(panel, "_pending_camera_start", None)
+            detection_running = bool(getattr(panel, "yolo_enabled", False)) or bool(
+                isinstance(pending_start, tuple) and pending_start and pending_start[0]
+            )
+            if detection_running and (requested_enabled, requested_target) != (
+                current_enabled,
+                current_target,
+            ):
+                raise RuntimeError(
+                    "target class gate applies when Detection starts; stop Detection before changing it"
+                )
+
         if has("intrinsics_source"):
             source = str(values["intrinsics_source"] or "checkerboard")
             if source not in {"manual", "checkerboard"}:
@@ -392,6 +435,9 @@ class WorkstationSettingsController:
         set_value("calculation_pair_count", "calib_calculation_pairs_spin")
         set_value("auto_interval_s", "calibration_auto_interval_spin")
         set_value("auto_target_pairs", "calibration_auto_target_spin")
+        if "calibration_root" in setup:
+            panel._calibration_session_root = None
+            panel._calibration_session_roots = {}
         set_text("calibration_root", "calib_dir_edit")
         if "validation_mode" in setup and setup["validation_mode"] is not None:
             panel._set_combo_data(
@@ -536,6 +582,18 @@ class WorkstationSettingsController:
                 panel._workstation_setting("use_triangulation", panel.settings.use_triangulation)
             ),
             triangulation_extrinsics_source=panel._triangulation_extrinsics_source(),
+            measurement_preferred_method=str(
+                panel._workstation_setting(
+                    "measurement_preferred_method",
+                    panel.settings.measurement_preferred_method,
+                )
+            ),
+            measurement_method_fallback_order=tuple(
+                panel._workstation_setting(
+                    "measurement_method_fallback_order",
+                    panel.settings.measurement_method_fallback_order,
+                )
+            ),
             measurement_display_mode=panel._measurement_display_mode(),
             use_rtk_baseline=bool(
                 panel._workstation_setting("use_rtk_baseline", panel.settings.use_rtk_baseline)

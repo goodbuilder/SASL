@@ -404,6 +404,21 @@ def test_dedicated_can_mag_sample_wins_over_legacy_scaled_imu_regardless_of_arri
     app.processEvents()
 
 
+def test_hidden_camera_parameter_surface_is_not_refreshed_for_each_telemetry_packet() -> None:
+    from Workstation.sensor_presentation_controller import SensorPresentationController
+
+    calls: list[str] = []
+    panel = SimpleNamespace(
+        isVisible=lambda: False,
+        _refresh_camera_parameters_tab=lambda: calls.append("refresh"),
+    )
+    controller = SensorPresentationController(panel)
+
+    controller._refresh_camera_parameters_if_needed()
+
+    assert calls == []
+
+
 def test_can_magnetometer_mavlink_decoder_keeps_port_and_device_identity() -> None:
     message = SimpleNamespace(
         can_port=2,

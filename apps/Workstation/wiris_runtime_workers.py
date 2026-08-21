@@ -10,11 +10,12 @@ from __future__ import annotations
 import ftplib
 import math
 import os
+import posixpath
 import re
 import threading
 import time
 from collections.abc import Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from statistics import median
 
 from PyQt5 import QtCore, QtGui
@@ -737,9 +738,12 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
     completed = QtCore.pyqtSignal(object)
     failed = QtCore.pyqtSignal(str)
     finished = QtCore.pyqtSignal()
+    progress = QtCore.pyqtSignal(object)
 
     #: JPG/TIFF are the only still formats WIRIS Enterprise stores for CPTR.
     FTP_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".tif", ".tiff")
+    FTP_STORAGE_ROOTS = ("ssd", "sdcard", "flashd")
+    FTP_CONNECT_ATTEMPTS = 2
 
     def __init__(
         self,
@@ -774,24 +778,52 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
         self.ftp_settings_by_label: dict[str, dict[str, object]] = {
             str(label): dict(config) for label, config in (ftp_settings_by_label or {}).items()
         }
+        capture_family = (
+            "HR"
+            if "SIHR" in self.image_enable_command.upper()
+            else "OZ"
+            if "SIVI" in self.image_enable_command.upper()
+            else ""
+        )
+        if self.capture_channel in {"calib", "calib_oz"} and capture_family:
+            capture_root = f"calib_capture/{capture_family}"
+        else:
+            capture_root = f"{self.capture_channel}_capture"
         self.ftp_output_dir = (
-            None if ftp_output_dir is None else Path(ftp_output_dir) / f"{self.capture_channel}_capture"
+            None if ftp_output_dir is None else Path(ftp_output_dir) / capture_root
         )
 
     @staticmethod
-    def _capture_busy(response: str) -> bool:
-        text = str(response or "").strip().upper()
+    def _capture_status(response: str) -> str:
+        """Classify one ICPT response without treating garbage as success.
+
+        WIRIS firmwares return either a bare boolean/0/1 or echo ``ICPT``
+        before it.  Completion must be explicit; empty, error, and malformed
+        responses are invalid rather than implicitly idle.
+        """
+
+        text = str(response or "").replace("\x00", "").strip().upper()
         if not text:
-            return False
-        if (
-            any(token in text for token in ("FALSE", "IDLE", "DONE", "READY", " 0", "=0"))
-            or text == "0"
+            return "invalid"
+        tokens = re.findall(r"[A-Z]+|[01]", text)
+        if any(
+            token in {"ERR", "ERROR", "FAILED", "FAIL", "INVALID", "UNKNOWN", "NAK", "NACK"}
+            for token in tokens
         ):
-            return False
-        return (
-            any(token in text for token in ("TRUE", "BUSY", "CAPT", " 1", "=1"))
-            or text == "1"
-        )
+            return "invalid"
+        while tokens and tokens[0] in {"OK", "ICPT"}:
+            tokens.pop(0)
+        if len(tokens) != 1:
+            return "invalid"
+        if tokens[0] in {"0", "FALSE", "IDLE", "DONE", "READY", "COMPLETE", "COMPLETED"}:
+            return "complete"
+        if tokens[0] in {"1", "TRUE", "BUSY", "CAPTURING"}:
+            return "busy"
+        return "invalid"
+
+    @classmethod
+    def _capture_busy(cls, response: str) -> bool:
+        return cls._capture_status(response) == "busy"
 
     @staticmethod
     def _send(host: str, port: int, timeout_s: float, command_text: str) -> str:
@@ -805,25 +837,207 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
             )
         )
 
-    def _latest_ftp_file_name(self, ftp: ftplib.FTP) -> str:
-        names = [
-            name
-            for name in ftp.nlst()
-            if Path(name).suffix.lower() in self.FTP_IMAGE_EXTENSIONS
+    def _preferred_ftp_suffix(self) -> str | None:
+        command = self.image_enable_command.upper()
+        if "SIHR" in command:
+            return "-highres"
+        if "SIVI" in command:
+            return "-visible"
+        return None
+
+    def _all_ftp_image_names(self, names: Sequence[object]) -> list[str]:
+        return [
+            PurePosixPath(str(name)).name
+            for name in names
+            if Path(str(name)).suffix.lower() in self.FTP_IMAGE_EXTENSIONS
         ]
+
+    def _image_names(self, names: Sequence[object]) -> list[str]:
+        image_names = self._all_ftp_image_names(names)
+        preferred_suffix = self._preferred_ftp_suffix()
+        if preferred_suffix is None:
+            return image_names
+        preferred = [
+            name
+            for name in image_names
+            if Path(name).stem.lower().endswith(preferred_suffix)
+        ]
+        # Some firmware versions use a generic filename.  Preserve the
+        # existing extension-only fallback when the channel-specific suffix
+        # is not present in the selected directory.
+        return preferred or image_names
+
+    @staticmethod
+    def _ftp_mtime(ftp: ftplib.FTP, name: str) -> str:
+        try:
+            response = ftp.voidcmd(f"MDTM {name}")
+            return response.strip().rsplit(" ", 1)[-1]
+        except ftplib.all_errors:
+            return ""
+
+    def _latest_ftp_file_name(self, ftp: ftplib.FTP) -> str:
+        names = self._image_names(ftp.nlst())
         if not names:
             raise FileNotFoundError("WIRIS FTP remote directory has no JPG/TIFF images")
 
-        def _modified_at(name: str) -> str:
+        return max(names, key=lambda name: self._ftp_mtime(ftp, name))
+
+    def _connect_ftp(
+        self,
+        host: str,
+        port: int,
+        user: str,
+        password: str,
+        timeout_s: float,
+    ) -> ftplib.FTP:
+        last_error: Exception | None = None
+        for attempt in range(self.FTP_CONNECT_ATTEMPTS):
+            ftp = ftplib.FTP()
             try:
-                response = ftp.voidcmd(f"MDTM {name}")
-                return response.strip().rsplit(" ", 1)[-1]
-            except ftplib.all_errors:
-                return ""
+                ftp.connect(host, port, timeout=timeout_s)
+                ftp.login(user=user, passwd=password)
+                return ftp
+            except Exception as exc:
+                last_error = exc
+                try:
+                    ftp.close()
+                except Exception:
+                    pass
+                if attempt + 1 < self.FTP_CONNECT_ATTEMPTS:
+                    # WIRIS FTP can take one full control timeout to become
+                    # ready immediately after CPTR; a second connection
+                    # attempt avoids turning that transient delay into a
+                    # false download failure.
+                    time.sleep(0.25)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("WIRIS FTP connection failed without an exception")
 
-        return max(names, key=_modified_at)
+    def _ftp_image_candidates(
+        self,
+        ftp: ftplib.FTP,
+        remote_dir: str,
+    ) -> list[tuple[str, int, str, str]]:
+        requested_dir = posixpath.normpath(str(remote_dir or "/").strip() or "/")
+        if not requested_dir.startswith("/"):
+            requested_dir = f"/{requested_dir}"
+        locations: list[tuple[str, list[str]]] = []
+        if requested_dir == "/":
+            # WIRIS stores captures below /<storage>/<session>/img rather
+            # than directly in /.  A fixed /ssd/... path becomes stale after
+            # an Ethernet restart, so discover current sessions when the
+            # operator leaves Remote dir at the default root.
+            for storage_root in self.FTP_STORAGE_ROOTS:
+                try:
+                    ftp.cwd(f"/{storage_root}")
+                    sessions = ftp.nlst()
+                except TimeoutError:
+                    raise
+                except ftplib.all_errors:
+                    continue
+                for session in sessions:
+                    session_name = PurePosixPath(str(session)).name
+                    if not session_name or session_name in {".", ".."}:
+                        continue
+                    image_dir = f"/{storage_root}/{session_name}/img"
+                    try:
+                        ftp.cwd(image_dir)
+                        names = self._all_ftp_image_names(ftp.nlst())
+                    except TimeoutError:
+                        raise
+                    except ftplib.all_errors:
+                        continue
+                    if names:
+                        locations.append((image_dir, names))
+        else:
+            ftp.cwd(requested_dir)
+            locations.append((requested_dir, self._all_ftp_image_names(ftp.nlst())))
 
-    def _download_latest_ftp_file(self, host: str, label: str) -> Path:
+        candidates: list[tuple[str, int, str, str]] = []
+        for order, (image_dir, names) in enumerate(locations):
+            ftp.cwd(image_dir)
+            for name in names:
+                candidates.append(
+                    (self._ftp_mtime(ftp, name), order, image_dir, name)
+                )
+        if not candidates:
+            if requested_dir == "/":
+                raise FileNotFoundError(
+                    "WIRIS FTP storage sessions contain no JPG/TIFF images "
+                    "under /ssd/*/img, /sdcard/*/img, or /flashd/*/img"
+                )
+            raise FileNotFoundError(
+                f"WIRIS FTP remote directory has no JPG/TIFF images: {requested_dir}"
+            )
+        return candidates
+
+    @staticmethod
+    def _ftp_candidate_token(candidate: tuple[str, int, str, str]) -> str:
+        mtime, _order, image_dir, name = candidate
+        return f"{image_dir.rstrip('/')}/{name}|{mtime}"
+
+    def _latest_ftp_file_location(
+        self,
+        ftp: ftplib.FTP,
+        remote_dir: str,
+        *,
+        baseline_tokens: set[str] | None = None,
+    ) -> tuple[str, str]:
+        candidates = self._ftp_image_candidates(ftp, remote_dir)
+        if baseline_tokens is not None:
+            candidates = [
+                candidate
+                for candidate in candidates
+                if self._ftp_candidate_token(candidate) not in baseline_tokens
+            ]
+            if not candidates:
+                raise FileNotFoundError(
+                    "WIRIS FTP has no new JPG/TIFF image after CPTR; refusing to reuse a stale file"
+                )
+        preferred_suffix = self._preferred_ftp_suffix()
+        preferred_candidates = (
+            [
+                row
+                for row in candidates
+                if Path(row[3]).stem.lower().endswith(preferred_suffix)
+            ]
+            if preferred_suffix is not None
+            else []
+        )
+        selected_candidates = preferred_candidates or candidates
+        _mtime, _order, image_dir, name = max(
+            selected_candidates,
+            key=lambda row: (row[0], row[1]),
+        )
+        return image_dir, name
+
+    def _snapshot_ftp_files(self, host: str, label: str) -> set[str]:
+        config = self.ftp_settings_by_label.get(label, {})
+        port = int(config.get("port", 21))
+        user = str(config.get("user") or "anonymous")
+        password = str(config.get("password", ""))
+        remote_dir = str(config.get("remote_dir") or "/")
+        timeout_s = max(0.1, float(config.get("timeout_s", 10.0)))
+        ftp = self._connect_ftp(host, port, user, password, timeout_s)
+        try:
+            try:
+                candidates = self._ftp_image_candidates(ftp, remote_dir)
+            except FileNotFoundError:
+                return set()
+            return {self._ftp_candidate_token(candidate) for candidate in candidates}
+        finally:
+            try:
+                ftp.quit()
+            except Exception:
+                ftp.close()
+
+    def _download_latest_ftp_file(
+        self,
+        host: str,
+        label: str,
+        *,
+        baseline_tokens: set[str] | None = None,
+    ) -> tuple[Path, str]:
         if self.ftp_output_dir is None:
             raise RuntimeError("no local FTP download directory was configured")
         self.ftp_output_dir.mkdir(parents=True, exist_ok=True)
@@ -833,16 +1047,38 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
         password = str(config.get("password", ""))
         remote_dir = str(config.get("remote_dir") or "/")
         timeout_s = max(0.1, float(config.get("timeout_s", 10.0)))
-        with ftplib.FTP() as ftp:
-            ftp.connect(host, port, timeout=timeout_s)
-            ftp.login(user=user, passwd=password)
-            if remote_dir:
-                ftp.cwd(remote_dir)
-            latest_name = self._latest_ftp_file_name(ftp)
-            destination = self.ftp_output_dir / f"{self.capture_id}_{label}_{latest_name}"
-            with destination.open("wb") as handle:
-                ftp.retrbinary(f"RETR {latest_name}", handle.write)
-        return destination
+        deadline_s = time.monotonic() + max(5.0, timeout_s * 2.0)
+        last_error: Exception | None = None
+        while True:
+            ftp = None
+            try:
+                ftp = self._connect_ftp(host, port, user, password, timeout_s)
+                image_dir, latest_name = self._latest_ftp_file_location(
+                    ftp,
+                    remote_dir,
+                    baseline_tokens=baseline_tokens,
+                )
+                ftp.cwd(image_dir)
+                side_output_dir = self.ftp_output_dir / label
+                side_output_dir.mkdir(parents=True, exist_ok=True)
+                destination = side_output_dir / f"{self.capture_id}_{latest_name}"
+                with destination.open("wb") as handle:
+                    ftp.retrbinary(f"RETR {latest_name}", handle.write)
+                return destination, f"{image_dir.rstrip('/')}/{latest_name}"
+            except Exception as exc:
+                last_error = exc
+            finally:
+                if ftp is not None:
+                    try:
+                        ftp.quit()
+                    except Exception:
+                        ftp.close()
+            if time.monotonic() >= deadline_s:
+                break
+            time.sleep(0.5)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("WIRIS FTP download ended without an exception")
 
     @QtCore.pyqtSlot()
     def run(self) -> None:
@@ -856,21 +1092,72 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
                 "stored_on_camera": False,
                 "ftp_downloaded": False,
             }
+            ftp_baseline_tokens: set[str] | None = None
+            ftp_baseline_error = ""
+
+            def send_capture_command(command_text: str) -> str:
+                self.progress.emit(
+                    {
+                        "source": "calibration",
+                        "phase": "command",
+                        "side": label,
+                        "command": command_text,
+                        "state": "sending",
+                    }
+                )
+                try:
+                    response = self._send(host, port, timeout_s, command_text)
+                except Exception as exc:
+                    self.progress.emit(
+                        {
+                            "source": "calibration",
+                            "phase": "response",
+                            "side": label,
+                            "command": command_text,
+                            "state": "failed",
+                            "response": f"ERROR: {exc}",
+                        }
+                    )
+                    raise
+                self.progress.emit(
+                    {
+                        "source": "calibration",
+                        "phase": "response",
+                        "side": label,
+                        "command": command_text,
+                        "state": "received",
+                        "response": response or "<no response>",
+                    }
+                )
+                return response
+
+            if self.ftp_enabled:
+                try:
+                    ftp_baseline_tokens = self._snapshot_ftp_files(host, label)
+                except Exception as exc:
+                    ftp_baseline_error = str(exc)
             try:
-                item[f"{self.capture_channel}_enable_response"] = self._send(
-                    host, port, timeout_s, self.image_enable_command
+                item[f"{self.capture_channel}_enable_response"] = send_capture_command(
+                    self.image_enable_command
                 )
                 item[f"{self.capture_channel}_enabled"] = True
                 item["capture_requested_unix_ns"] = time.time_ns()
-                item["capture_response"] = self._send(host, port, timeout_s, "CPTR")
+                item["capture_response"] = send_capture_command("CPTR")
                 deadline_s = time.monotonic() + self.completion_timeout_s
                 while True:
-                    response = self._send(host, port, timeout_s, "ICPT")
+                    response = send_capture_command("ICPT")
                     item["capture_status_response"] = response
-                    if not self._capture_busy(response):
+                    capture_status = self._capture_status(response)
+                    if capture_status == "complete":
                         item["capture_complete"] = True
                         item["stored_on_camera"] = True
                         item["state"] = "completed"
+                        item["capture_completed_monotonic_s"] = time.monotonic()
+                        item["capture_completed_unix_ns"] = time.time_ns()
+                        break
+                    if capture_status == "invalid":
+                        item["state"] = "failed"
+                        item["error"] = f"invalid ICPT response: {response!r}"
                         break
                     if time.monotonic() >= deadline_s:
                         item["state"] = "timeout"
@@ -880,13 +1167,52 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
             except Exception as exc:
                 item["error"] = str(exc)
             if item.get("stored_on_camera") and self.ftp_enabled:
-                try:
-                    downloaded = self._download_latest_ftp_file(host, label)
-                    item["ftp_downloaded"] = True
-                    item["ftp_local_path"] = str(downloaded)
-                except Exception as exc:
-                    item["ftp_downloaded"] = False
-                    item["ftp_error"] = str(exc)
+                if ftp_baseline_tokens is None:
+                    item["ftp_error"] = (
+                        "pre-capture FTP snapshot failed"
+                        + (f": {ftp_baseline_error}" if ftp_baseline_error else "")
+                    )
+                else:
+                    try:
+                        self.progress.emit(
+                            {
+                                "source": "calibration",
+                                "phase": "ftp",
+                                "side": label,
+                                "state": "downloading",
+                                "response": "waiting for new FTP image",
+                            }
+                        )
+                        downloaded, remote_path = self._download_latest_ftp_file(
+                            host,
+                            label,
+                            baseline_tokens=ftp_baseline_tokens,
+                        )
+                        item["ftp_downloaded"] = True
+                        item["ftp_local_path"] = str(downloaded)
+                        item["ftp_remote_path"] = remote_path
+                        self.progress.emit(
+                            {
+                                "source": "calibration",
+                                "phase": "ftp",
+                                "side": label,
+                                "state": "downloaded",
+                                "response": f"remote={remote_path}; local={downloaded}",
+                                "path": str(downloaded),
+                            }
+                        )
+                    except Exception as exc:
+                        item["ftp_downloaded"] = False
+                        item["ftp_error"] = str(exc)
+                        self.progress.emit(
+                            {
+                                "source": "calibration",
+                                "phase": "ftp",
+                                "side": label,
+                                "state": "failed",
+                                "response": str(exc),
+                            }
+                        )
             item["finished_unix_ns"] = time.time_ns()
             results[label] = item
 
@@ -1093,6 +1419,8 @@ class WirisOzFtpSyncWorker(QtCore.QObject):
         password = str(config.get("password", ""))
         ftp_timeout_s = max(0.1, float(config.get("timeout_s", timeout_s)))
         self.ftp_output_dir.mkdir(parents=True, exist_ok=True)
+        side_output_dir = self.ftp_output_dir / label
+        side_output_dir.mkdir(parents=True, exist_ok=True)
         items: list[dict[str, object]] = []
         with ftplib.FTP() as ftp:
             ftp.connect(host, ftp_port, timeout=ftp_timeout_s)
@@ -1106,7 +1434,7 @@ class WirisOzFtpSyncWorker(QtCore.QObject):
             for session, name in pending[:take]:
                 ftp.cwd(f"/{storage_root}/{session}/img")
                 identifier = f"{session}/{name}"
-                destination = self.ftp_output_dir / f"{label}_{session}_{name}"
+                destination = side_output_dir / f"{session}_{name}"
                 with destination.open("wb") as handle:
                     ftp.retrbinary(f"RETR {name}", handle.write)
                 valid = not QtGui.QImage(str(destination)).isNull()
@@ -1216,6 +1544,7 @@ class WirisImageFormatWorker(QtCore.QObject):
     completed = QtCore.pyqtSignal(object)
     failed = QtCore.pyqtSignal(str)
     finished = QtCore.pyqtSignal()
+    progress = QtCore.pyqtSignal(object)
 
     def __init__(
         self,
@@ -1232,13 +1561,37 @@ class WirisImageFormatWorker(QtCore.QObject):
 
     def _send_all(self, host: str, port: int, timeout_s: float) -> dict[str, str]:
         responses: dict[str, str] = {}
+        label = ""
+        for candidate_label, candidate_host, candidate_port, _candidate_timeout in self.target_infos:
+            if candidate_host == host and candidate_port == port:
+                label = candidate_label
+                break
         for command_text in self.commands:
+            self.progress.emit(
+                {
+                    "source": "calibration",
+                    "phase": "command",
+                    "side": label,
+                    "command": command_text,
+                    "state": "sending",
+                }
+            )
             try:
                 responses[command_text] = send_tcp_line(
                     build_wiris_command(host=host, port=port, command=command_text, timeout_s=timeout_s)
                 )
             except Exception as exc:
                 responses[command_text] = f"ERROR: {exc}"
+            self.progress.emit(
+                {
+                    "source": "calibration",
+                    "phase": "response",
+                    "side": label,
+                    "command": command_text,
+                    "state": "received" if not responses[command_text].startswith("ERROR:") else "failed",
+                    "response": responses[command_text] or "<no response>",
+                }
+            )
         return responses
 
     @QtCore.pyqtSlot()

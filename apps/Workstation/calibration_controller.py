@@ -13,7 +13,9 @@ import json
 import math
 import time
 import uuid
+from dataclasses import replace
 from pathlib import Path
+from typing import Mapping
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -23,6 +25,7 @@ from Workstation.calibration_workers import (
     CheckerboardExtrinsicsWorker,
     CheckerboardRandomValidationWorker,
 )
+from Workstation.calibration_sessions import write_calibration_session_manifest
 from Workstation.workstation_core.calibration import (
     CheckerboardConfig,
     StereoExtrinsics,
@@ -37,7 +40,13 @@ from Workstation.workstation_core.calibration import (
     save_intrinsics_json,
     save_stereo_extrinsics_json,
 )
+from Workstation.workstation_core.calibration_quality import (
+    CalibrationViewGeometry,
+    extract_view_geometry,
+    pose_novelty,
+)
 from Workstation.workstation_core.settings import (
+    DEFAULT_CALIBRATION_ROOT,
     DEFAULT_INTRINSICS_PATH,
     resolve_settings_path,
 )
@@ -51,6 +60,7 @@ from Workstation.wiris_runtime_workers import (
 
 CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S = 0.100
 CALIBRATION_AUTO_DETECTION_MAX_AGE_S = 2.0
+CALIBRATION_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
 CALIBRATION_WORKFLOW_METHODS = [
     "_app_relative_path_text",
@@ -74,6 +84,8 @@ CALIBRATION_WORKFLOW_METHODS = [
     "_select_calibration_pairs",
     "_checkerboard_intrinsic_delta_px",
     "_checkerboard_validation_stddev",
+    "_calibration_quality_allows_action",
+    "workstation_calibration_quality_snapshot",
     "run_checkerboard_random_validation",
     "_handle_random_validation_failed",
     "_handle_random_validation_completed",
@@ -161,6 +173,103 @@ class CalibrationWorkflowController:
         self._auto_capture_inflight_pair_key: tuple[int, int] | None = None
         self._auto_capture_last_attempt_s = 0.0
         self._capture_origin = "manual"
+
+    def _publish_calibration_capture_event(
+        self,
+        payload: object,
+        *,
+        operation: str = "",
+        capture_id: str = "",
+    ) -> None:
+        """Publish a left/right capture lifecycle event to the Workstation UI.
+
+        The camera workers remain UI-independent.  This small adapter adds the
+        calibration operation identity and forwards the raw command/response
+        evidence through the owner's Qt signal when the owner exposes it.
+        """
+
+        event = dict(payload) if isinstance(payload, dict) else {"response": str(payload)}
+        if operation:
+            event.setdefault("operation", operation)
+        if capture_id:
+            event.setdefault("capture_id", capture_id)
+        event.setdefault("timestamp_unix_ns", time.time_ns())
+        signal = getattr(self.panel, "calibration_capture_event", None)
+        emit = getattr(signal, "emit", None)
+        if callable(emit):
+            emit(event)
+
+    def _connect_calibration_worker_progress(
+        self,
+        worker: object,
+        *,
+        operation: str,
+        capture_id: str = "",
+    ) -> None:
+        signal = getattr(worker, "progress", None)
+        connect = getattr(signal, "connect", None)
+        if not callable(connect):
+            return
+
+        def relay(payload: object) -> None:
+            self._publish_calibration_capture_event(
+                payload,
+                operation=operation,
+                capture_id=capture_id,
+            )
+
+        connect(relay)
+
+    def _publish_calibration_camera_summary(
+        self,
+        *,
+        operation: str,
+        capture_id: str,
+        cameras: object,
+    ) -> None:
+        records = cameras if isinstance(cameras, dict) else {}
+        for side in ("left", "right"):
+            item = records.get(side)
+            if not isinstance(item, dict):
+                self._publish_calibration_capture_event(
+                    {
+                        "side": side,
+                        "phase": "completed",
+                        "state": "missing",
+                        "response": "camera result missing",
+                    },
+                    operation=operation,
+                    capture_id=capture_id,
+                )
+                continue
+            response_parts = []
+            for key in (
+                "hr_enable_response",
+                "oz_enable_response",
+                "capture_response",
+                "capture_status_response",
+            ):
+                value = str(item.get(key) or "").strip()
+                if value:
+                    response_parts.append(f"{key}={value}")
+            for key in ("error", "ftp_error"):
+                value = str(item.get(key) or "").strip()
+                if value:
+                    response_parts.append(f"{key}={value}")
+            self._publish_calibration_capture_event(
+                {
+                    "side": side,
+                    "phase": "completed",
+                    "state": str(item.get("state") or "failed"),
+                    "response": "; ".join(response_parts) or "capture completed",
+                    "path": str(item.get("ftp_local_path") or ""),
+                    "remote_path": str(item.get("ftp_remote_path") or ""),
+                    "stored_on_camera": bool(item.get("stored_on_camera")),
+                    "ftp_downloaded": bool(item.get("ftp_downloaded")),
+                },
+                operation=operation,
+                capture_id=capture_id,
+            )
 
     def _app_relative_path_text(self, path: str | Path) -> str:
         resolved = Path(path).expanduser().resolve()
@@ -267,7 +376,14 @@ class CalibrationWorkflowController:
         return unique_levels[0], f"capture-time zoom={unique_levels[0]}"
 
     def _calibration_image_paths_for_root(self, root: Path, side: str) -> list[Path]:
-        return sorted((root / side).glob(f"{side}_*.png"))
+        directory = root / side
+        if not directory.is_dir():
+            return []
+        return sorted(
+            path
+            for path in directory.iterdir()
+            if path.is_file() and path.suffix.lower() in CALIBRATION_IMAGE_SUFFIXES
+        )
 
     def _calibration_stereo_pair_paths_for_root(self, root: Path) -> list[tuple[str, Path, Path]]:
         def indexed(paths: list[Path], side: str) -> dict[str, Path]:
@@ -279,7 +395,17 @@ class CalibrationWorkflowController:
 
         left_by_id = indexed(self.panel._calibration_image_paths_for_root(root, "left"), "left")
         right_by_id = indexed(self.panel._calibration_image_paths_for_root(root, "right"), "right")
-        return [(key, left_by_id[key], right_by_id[key]) for key in sorted(set(left_by_id) & set(right_by_id))]
+        common_keys = sorted(set(left_by_id) & set(right_by_id))
+        if common_keys:
+            return [(key, left_by_id[key], right_by_id[key]) for key in common_keys]
+        left_paths = self.panel._calibration_image_paths_for_root(root, "left")
+        right_paths = self.panel._calibration_image_paths_for_root(root, "right")
+        if len(left_paths) == len(right_paths):
+            return [
+                (f"ordered-{index:06d}", left, right)
+                for index, (left, right) in enumerate(zip(left_paths, right_paths, strict=False))
+            ]
+        return []
 
     def _checkerboard_validation_scan_counts(self) -> tuple[Path, list[Path], list[Path], list[tuple[str, Path, Path]]]:
         root = self.panel._checkerboard_validation_root()
@@ -332,10 +458,29 @@ class CalibrationWorkflowController:
         summary: dict[str, object],
         text: str,
         zoom_level: int | None = None,
+        selection_snapshot: dict[str, object] | None = None,
     ) -> None:
+        quality_snapshot = (
+            dict(result.calibration_quality)
+            if isinstance(result.calibration_quality, dict)
+            else {
+                "schema": "workstation-camera-calibration-quality-v1",
+                "state": "UNVERIFIED",
+                "source": "legacy/no quality evidence",
+                "reason_codes": ["quality_snapshot_unavailable"],
+                "reasons": ["This result predates source-backed calibration quality checks."],
+            }
+        )
+        if result.calibration_quality is None:
+            result = replace(result, calibration_quality=quality_snapshot)
+        self.panel.calibration_quality = quality_snapshot
+        self.panel.last_calibration_quality = quality_snapshot
         self.panel.checkerboard_validation_result = result
         self.panel.checkerboard_validation_result_mode = mode
-        self.panel.checkerboard_validation_summary = dict(summary)
+        self.panel.checkerboard_validation_summary = {
+            **dict(summary),
+            "calibration_quality": quality_snapshot,
+        }
         extrinsics = getattr(result, "extrinsics", None)
         pair_count = int(
             summary.get("stereo_pair_count")
@@ -352,10 +497,27 @@ class CalibrationWorkflowController:
         ]
         self.panel.checkerboard_validation_result_saved = False
         self.panel.last_calibration_result = result
+        if selection_snapshot is None:
+            self.panel.checkerboard_calibration_selection_snapshot = None
+        else:
+            effective_selection = dict(selection_snapshot)
+            effective_selection["reference_result"] = result
+            self.panel.checkerboard_calibration_selection_snapshot = effective_selection
+        self.panel.calibration_image_diagnostics = tuple(result.image_diagnostics)
+        self.panel.calibration_diagnostics_root = str(
+            self.panel._calibration_dirs()[0]
+        )
+        diagnostics_signal = getattr(self.panel, "calibration_diagnostics_changed", None)
+        diagnostics_emit = getattr(diagnostics_signal, "emit", None)
+        if callable(diagnostics_emit):
+            diagnostics_emit(tuple(result.image_diagnostics))
         if zoom_level is not None:
             self.panel.last_calibration_zoom_level = int(zoom_level)
-        elif getattr(self.panel, "last_calibration_zoom_level", None) is None:
-            self.panel.last_calibration_zoom_level = self.panel.zoom_level_spin.value()
+        else:
+            # A newly loaded/calculated result owns its zoom provenance.  Do
+            # not inherit either the current spinner or a previous result's
+            # capture zoom when this result has no readback evidence.
+            self.panel.last_calibration_zoom_level = None
         self.panel._active_intrinsics_profile_path = (
             f"memory:checkerboard-validation:{mode}:zoom-"
             f"{self.panel.last_calibration_zoom_level:02d}"
@@ -364,10 +526,11 @@ class CalibrationWorkflowController:
         )
         self.panel.calibration_result_text.setPlainText(text)
         extrinsics_state = "with checkerboard stereo R/T" if result.extrinsics is not None else "intrinsics only"
+        quality_state = str(quality_snapshot.get("state") or "UNVERIFIED").upper()
         self.panel._set_health_label(
             self.panel.checkerboard_validation_status_label,
-            f"계산 결과 있음: {mode} | {extrinsics_state} | 저장 전",
-            "good",
+            f"계산 결과 있음: {mode} | {extrinsics_state} | quality={quality_state} | 저장 전",
+            {"PASS": "good", "FAIL": "bad"}.get(quality_state, "warn"),
         )
         self.panel._refresh_camera_parameters_tab()
         self.panel._refresh_zoom_intrinsics_tab()
@@ -431,6 +594,20 @@ class CalibrationWorkflowController:
             )
         if pair_count is not None:
             lines.append(f"selected stereo pairs: {pair_count}")
+        quality = result.calibration_quality
+        if isinstance(quality, dict):
+            lines.extend(
+                (
+                    f"Calibration quality: {quality.get('state', 'UNVERIFIED')}",
+                    "Quality reasons: "
+                    + ", ".join(str(code) for code in quality.get("reason_codes", ()) or ())
+                    if quality.get("reason_codes")
+                    else "Quality reasons: none",
+                    f"Effective poses: {quality.get('effective_pose_count', '--')}",
+                    f"Principal offsets: {quality.get('principal_point_offsets_px', '--')}",
+                    f"Subset stability: {quality.get('subset_stability', '--')}",
+                )
+            )
         return "\n".join(line for line in lines if line)
 
     def load_checkerboard_validation_json(self) -> None:
@@ -444,6 +621,22 @@ class CalibrationWorkflowController:
         except Exception as exc:
             self.panel._set_health_label(self.panel.checkerboard_validation_status_label, f"JSON 불러오기 실패: {exc}", "bad")
             return
+        try:
+            source_payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            source_payload = {}
+        source_metadata = (
+            source_payload.get("metadata")
+            if isinstance(source_payload, dict)
+            and isinstance(source_payload.get("metadata"), dict)
+            else {}
+        )
+        source_zoom_level = self._zoom_index(
+            source_metadata.get(
+                "capture_zoom_level",
+                source_metadata.get("zoom_level"),
+            )
+        )
         mode = "checkerboard" if result.extrinsics is not None else "pixhawk"
         if hasattr(self.panel, "checkerboard_validation_mode_combo"):
             self.panel._set_combo_data(self.panel.checkerboard_validation_mode_combo, mode)
@@ -455,8 +648,13 @@ class CalibrationWorkflowController:
         self.panel._checkerboard_validation_set_result(
             result,
             mode=mode,
-            summary={"source": "json", "path": str(path)},
+            summary={
+                "source": "json",
+                "path": str(path),
+                "capture_zoom_level": source_zoom_level,
+            },
             text=text,
+            zoom_level=source_zoom_level,
         )
         self.panel.checkerboard_validation_result_saved = True
         self.panel._set_health_label(
@@ -504,6 +702,27 @@ class CalibrationWorkflowController:
         )
         return [candidates[index] for index in indices]
 
+    @staticmethod
+    def _select_calibration_image_paths(
+        paths: list[Path],
+        limit: int,
+    ) -> list[Path]:
+        """Evenly sample one camera's files when no stereo IDs are available."""
+
+        candidates = list(paths)
+        if limit <= 0 or limit >= len(candidates):
+            return candidates
+        limit = max(3, limit)
+        if limit >= len(candidates):
+            return candidates
+        indices = sorted(
+            {
+                round(index * (len(candidates) - 1) / (limit - 1))
+                for index in range(limit)
+            }
+        )
+        return [candidates[index] for index in indices]
+
     def _checkerboard_intrinsic_delta_px(self, result: StereoIntrinsicsResult, reference: StereoIntrinsicsResult) -> tuple[float, float]:
         left_delta = max(
             abs(float(result.left.camera_matrix[row][col]) - float(reference.left.camera_matrix[row][col]))
@@ -520,6 +739,102 @@ class CalibrationWorkflowController:
             return 0.0
         mean = sum(values) / len(values)
         return math.sqrt(sum((value - mean) ** 2 for value in values) / (len(values) - 1))
+
+    @staticmethod
+    def _calibration_quality_mapping(value: object) -> dict[str, object] | None:
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            return dict(value)
+        to_mapping = getattr(value, "to_mapping", None)
+        if callable(to_mapping):
+            try:
+                payload = to_mapping()
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                return dict(payload)
+        state = str(getattr(value, "state", "") or "").strip().upper()
+        if not state:
+            return None
+        return {
+            "state": state,
+            "reason_codes": tuple(getattr(value, "reason_codes", ()) or ()),
+        }
+
+    def _calibration_quality_state(
+        self,
+        result: StereoIntrinsicsResult,
+    ) -> tuple[str, tuple[str, ...]]:
+        """Read quality output without turning missing assessment into success."""
+
+        containers: list[object] = [result, getattr(result, "calibration_quality", None)]
+        result_has_quality = any(
+            value is not None
+            for value in (
+                getattr(result, "calibration_quality", None),
+                getattr(result, "left_quality", None),
+                getattr(result, "right_quality", None),
+            )
+        )
+        # A result-owned snapshot is authoritative. Panel-level attributes are
+        # compatibility fallbacks for older integrations and may refer to a
+        # previously displayed result.
+        if not result_has_quality:
+            for name in (
+                "checkerboard_calibration_quality",
+                "calibration_quality_snapshot",
+                "checkerboard_quality_snapshot",
+            ):
+                value = getattr(self.panel, name, None)
+                if callable(value):
+                    try:
+                        value = value()
+                    except Exception:
+                        value = None
+                if value is not None:
+                    containers.append(value)
+
+        side_states: dict[str, str] = {}
+        overall_states: list[str] = []
+        reason_codes: list[str] = []
+        for container in containers:
+            container_mapping = self._calibration_quality_mapping(container)
+            if container_mapping is not None:
+                state = str(container_mapping.get("state") or "").strip().upper()
+                if state in {"PASS", "WARNING", "FAIL"}:
+                    overall_states.append(state)
+                reason_codes.extend(
+                    str(code)
+                    for code in container_mapping.get("reason_codes", ()) or ()
+                    if str(code)
+                )
+            for side in ("left", "right"):
+                key = f"{side}_quality"
+                value = container.get(key) if isinstance(container, dict) else getattr(container, key, None)
+                mapping = self._calibration_quality_mapping(value)
+                if mapping is None:
+                    continue
+                state = str(mapping.get("state") or "").strip().upper()
+                if state in {"PASS", "WARNING", "FAIL"}:
+                    side_states[side] = state
+                reason_codes.extend(
+                    str(code)
+                    for code in mapping.get("reason_codes", ()) or ()
+                    if str(code)
+                )
+
+        states = [*overall_states, *side_states.values()]
+        if "FAIL" in states:
+            state = "FAIL"
+        elif "WARNING" in states:
+            state = "WARNING"
+        elif overall_states or set(side_states) == {"left", "right"}:
+            state = "PASS"
+        else:
+            state = "UNASSESSED"
+            reason_codes.append("quality_snapshot_unavailable")
+        return state, tuple(dict.fromkeys(reason_codes))
 
     def run_checkerboard_random_validation(self) -> None:
         if self.panel.checkerboard_calibration_thread is not None:
@@ -542,20 +857,31 @@ class CalibrationWorkflowController:
             )
             return
         mode = self.panel._checkerboard_validation_mode()
-        _root, _left_paths, _right_paths, pairs = self.panel._checkerboard_validation_scan_counts()
-        if len(pairs) < 3:
+        _root, left_paths, right_paths, pairs = self._random_validation_inputs(
+            reference,
+            mode=mode,
+        )
+        candidate_count = len(pairs) if mode == "checkerboard" else min(
+            len(left_paths),
+            len(right_paths),
+        )
+        if candidate_count < 3:
+            input_label = "stereo pair" if mode == "checkerboard" else "left/right image"
             self.panel._set_health_label(
                 self.panel.checkerboard_validation_status_label,
-                f"랜덤 검증 실패: stereo pair가 부족합니다 (pair={len(pairs)}, need>=3)",
+                f"랜덤 검증 실패: {input_label}가 부족합니다 "
+                f"(candidate={candidate_count}, need>=3)",
                 "bad",
             )
             return
-        subset_count = self.panel._checkerboard_random_subset_count(len(pairs))
+        subset_count = self.panel._checkerboard_random_subset_count(candidate_count)
         runs = self.panel.checkerboard_validation_random_runs_spin.value()
         seed = self.panel.checkerboard_validation_seed_spin.value()
         worker = CheckerboardRandomValidationWorker(
             mode=mode,
-            pairs=pairs,
+            left_intrinsic_paths=left_paths,
+            right_intrinsic_paths=right_paths,
+            stereo_pairs=pairs,
             config=self.panel._checkerboard_config(),
             runs=runs,
             subset_count=subset_count,
@@ -658,12 +984,15 @@ class CalibrationWorkflowController:
         )
         rows.append(self.panel._checkerboard_validation_result_row("Full", reference, reference, pair_count))
         result_rows = results if isinstance(results, (tuple, list)) else ()
+        failed_runs = 0
+        successful_runs = 0
         for row in result_rows:
             if not isinstance(row, dict):
                 continue
             index = int(row.get("index") or 0)
             error = str(row.get("error") or "")
             if error:
+                failed_runs += 1
                 rows.append(f"Random {index:<2} FAILED: {error}")
                 run_results.append(
                     {
@@ -676,6 +1005,7 @@ class CalibrationWorkflowController:
                 continue
             result = row.get("result")
             if not isinstance(result, StereoIntrinsicsResult):
+                failed_runs += 1
                 rows.append(f"Random {index:<2} FAILED: invalid worker result")
                 run_results.append(
                     {
@@ -686,6 +1016,7 @@ class CalibrationWorkflowController:
                     }
                 )
                 continue
+            successful_runs += 1
             run_results.append(
                 self.panel._checkerboard_validation_result_data(
                     f"Random {index}",
@@ -716,6 +1047,15 @@ class CalibrationWorkflowController:
                 rotations.append(rotation)
         baseline_std = self.panel._checkerboard_validation_stddev(baselines)
         rotation_std = self.panel._checkerboard_validation_stddev(rotations)
+        quality_state, quality_reasons = self._calibration_quality_state(reference)
+        if successful_runs == 0:
+            quality_state = "FAIL"
+            quality_reasons = (*quality_reasons, "all_random_validation_runs_failed")
+        elif failed_runs:
+            if quality_state != "FAIL":
+                quality_state = "WARNING"
+            quality_reasons = (*quality_reasons, "random_validation_run_failed")
+        quality_reasons = tuple(dict.fromkeys(quality_reasons))
         rows.extend(
             [
                 "",
@@ -724,6 +1064,7 @@ class CalibrationWorkflowController:
                 f"max_dK_R std={self.panel._checkerboard_validation_stddev(right_deltas):.3f} px",
                 f"baseline std={baseline_std * 1000.0:.3f} mm" if baselines else "baseline std=n/a",
                 f"rotation delta std={rotation_std:.6f} deg" if rotations else "rotation delta std=n/a",
+                f"quality state={quality_state}",
             ]
         )
         summary = dict(self.panel.checkerboard_validation_summary)
@@ -735,6 +1076,10 @@ class CalibrationWorkflowController:
             "rotation_delta_std_deg": rotation_std if rotations else None,
             "left_intrinsics_delta_std_px": self.panel._checkerboard_validation_stddev(left_deltas),
             "right_intrinsics_delta_std_px": self.panel._checkerboard_validation_stddev(right_deltas),
+            "successful_runs": successful_runs,
+            "failed_runs": failed_runs,
+            "quality_state": quality_state,
+            "quality_reason_codes": list(quality_reasons),
         }
         self.panel.checkerboard_validation_summary = summary
         self.panel.checkerboard_validation_run_results = run_results
@@ -742,15 +1087,16 @@ class CalibrationWorkflowController:
         self.panel.calibration_result_text.setPlainText(full_text + "\n\nRandom stereo-pair validation:\n" + "\n".join(rows))
         self.panel._set_health_label(
             self.panel.checkerboard_validation_status_label,
-            f"랜덤 검증 완료: runs={runs}, subset_pairs={subset_count}, mode={mode}",
-            "good",
+            f"랜덤 검증 완료: runs={runs}, subset_pairs={subset_count}, "
+            f"mode={mode}, quality={quality_state}",
+            {"PASS": "good", "FAIL": "bad"}.get(quality_state, "warn"),
         )
         self.panel.calibration_progress = {
             "phase": "validation_complete",
             "processed": runs,
             "total": runs,
             "percent": 100.0,
-            "message": f"랜덤 검증 완료: {runs}회",
+            "message": f"랜덤 검증 완료: {runs}회 · quality={quality_state}",
         }
         if hasattr(self.panel, "calibration_progress_bar"):
             self.panel.calibration_progress_bar.setValue(100)
@@ -820,10 +1166,55 @@ class CalibrationWorkflowController:
             "error": "",
         }
 
-    def save_checkerboard_validation_result(self) -> None:
+    def _calibration_quality_allows_action(
+        self,
+        action: str,
+        *,
+        warning_confirmed: bool = False,
+    ) -> bool:
+        result = self.panel.checkerboard_validation_result
+        if not isinstance(result, StereoIntrinsicsResult):
+            return False
+        state, reasons = self._calibration_quality_state(result)
+        reason_text = ", ".join(reasons) or "no reason supplied"
+        if state == "FAIL":
+            self.panel._set_health_label(
+                self.panel.checkerboard_validation_status_label,
+                f"{action} 차단: calibration quality FAIL ({reason_text})",
+                "bad",
+            )
+            return False
+        if state == "WARNING" and not warning_confirmed:
+            self.panel._set_health_label(
+                self.panel.checkerboard_validation_status_label,
+                f"{action} 대기: WARNING 사유를 검토하고 명시적으로 승인하세요 ({reason_text})",
+                "warn",
+            )
+            return False
+        if state == "WARNING":
+            summary = dict(getattr(self.panel, "checkerboard_validation_summary", {}) or {})
+            summary["quality_override"] = {
+                "action": str(action),
+                "confirmed": True,
+                "confirmed_utc_ns": time.time_ns(),
+                "reason_codes": list(reasons),
+            }
+            self.panel.checkerboard_validation_summary = summary
+        return True
+
+    def save_checkerboard_validation_result(
+        self,
+        *,
+        quality_warning_confirmed: bool = False,
+    ) -> None:
         result = self.panel.checkerboard_validation_result
         if result is None:
             self.panel._set_health_label(self.panel.checkerboard_validation_status_label, "저장할 계산 결과가 없습니다", "warn")
+            return
+        if not self._calibration_quality_allows_action(
+            "저장",
+            warning_confirmed=quality_warning_confirmed,
+        ):
             return
         root, _left_dir, _right_dir = self.panel._calibration_dirs()
         root.mkdir(parents=True, exist_ok=True)
@@ -861,10 +1252,19 @@ class CalibrationWorkflowController:
         self.panel._refresh_operation_header()
         self.panel._refresh_zoom_intrinsics_tab()
 
-    def apply_checkerboard_validation_result(self) -> None:
+    def apply_checkerboard_validation_result(
+        self,
+        *,
+        quality_warning_confirmed: bool = False,
+    ) -> None:
         result = self.panel.checkerboard_validation_result
         if result is None:
             self.panel._set_health_label(self.panel.checkerboard_validation_status_label, "적용할 계산 결과가 없습니다", "warn")
+            return
+        if not self._calibration_quality_allows_action(
+            "적용",
+            warning_confirmed=quality_warning_confirmed,
+        ):
             return
         mode = self.panel.checkerboard_validation_result_mode
         if mode == "checkerboard" and result.extrinsics is None:
@@ -874,10 +1274,23 @@ class CalibrationWorkflowController:
                 "bad",
             )
             return
+        zoom_level = getattr(self.panel, "last_calibration_zoom_level", None)
+        if zoom_level is None:
+            self.panel._set_health_label(
+                self.panel.checkerboard_validation_status_label,
+                "적용 실패: 계산 결과에 촬영 당시 줌 readback이 없습니다",
+                "bad",
+            )
+            return
         self.panel.last_calibration_result = result
-        self.panel.last_calibration_zoom_level = self.panel.zoom_level_spin.value()
         self.panel._set_combo_data(self.panel.distance_mode_combo, mode)
-        self.panel.apply_intrinsics_to_distance()
+        applied = (
+            self.panel.apply_intrinsics_to_distance(quality_warning_confirmed=True)
+            if quality_warning_confirmed
+            else self.panel.apply_intrinsics_to_distance()
+        )
+        if applied is False:
+            return
         self.panel._save_current_settings()
         saved_text = "저장됨" if self.panel.checkerboard_validation_result_saved else "저장 전"
         self.panel._set_health_label(
@@ -885,6 +1298,25 @@ class CalibrationWorkflowController:
             f"계산에 적용 완료: mode={mode} | {saved_text}",
             "good",
         )
+
+    def workstation_calibration_quality_snapshot(self) -> dict[str, object]:
+        current_result = getattr(self.panel, "last_calibration_result", None)
+        source_result = current_result
+        if source_result is None:
+            validation_result = getattr(self.panel, "checkerboard_validation_result", None)
+            source_result = validation_result
+        snapshot = getattr(source_result, "calibration_quality", None)
+        if source_result is None and not isinstance(snapshot, dict):
+            snapshot = getattr(self.panel, "calibration_quality", None)
+        if isinstance(snapshot, dict):
+            return json.loads(json.dumps(snapshot, ensure_ascii=False, allow_nan=False))
+        return {
+            "schema": "workstation-camera-calibration-quality-v1",
+            "state": "UNVERIFIED",
+            "source": "legacy/no quality evidence",
+            "reason_codes": ["quality_snapshot_unavailable"],
+            "reasons": ["No source-backed calibration quality snapshot is available."],
+        }
 
     def workstation_checkerboard_validation_snapshot(self) -> dict:
         """Read-only projection of the validation workflow's current state.
@@ -912,6 +1344,7 @@ class CalibrationWorkflowController:
             "result_saved": bool(getattr(panel, "checkerboard_validation_result_saved", False)),
             "summary": dict(getattr(panel, "checkerboard_validation_summary", {}) or {}),
             "run_results": list(getattr(panel, "checkerboard_validation_run_results", []) or []),
+            "calibration_quality": self.workstation_calibration_quality_snapshot(),
         }
 
     def configure_workstation_checkerboard_validation(self, payload: dict) -> dict:
@@ -948,19 +1381,84 @@ class CalibrationWorkflowController:
         self.panel.run_checkerboard_random_validation()
         return self.panel.workstation_checkerboard_validation_snapshot()
 
-    def save_workstation_checkerboard_validation_result(self) -> dict:
-        self.panel.save_checkerboard_validation_result()
+    def save_workstation_checkerboard_validation_result(
+        self,
+        *,
+        quality_warning_confirmed: bool = False,
+    ) -> dict:
+        self.panel.save_checkerboard_validation_result(
+            quality_warning_confirmed=quality_warning_confirmed
+        )
         return self.panel.workstation_checkerboard_validation_snapshot()
 
-    def apply_workstation_checkerboard_validation_result(self) -> dict:
-        self.panel.apply_checkerboard_validation_result()
+    def apply_workstation_checkerboard_validation_result(
+        self,
+        *,
+        quality_warning_confirmed: bool = False,
+    ) -> dict:
+        self.panel.apply_checkerboard_validation_result(
+            quality_warning_confirmed=quality_warning_confirmed
+        )
         return self.panel.workstation_checkerboard_validation_snapshot()
 
-    def apply_intrinsics_to_distance(self) -> None:
+    def apply_intrinsics_to_distance(
+        self,
+        *,
+        quality_warning_confirmed: bool = False,
+    ) -> bool:
         panel = self.panel
         if panel.last_calibration_result is None:
             panel.calibration_status_label.setText("Run or load calibration before applying intrinsics.")
-            return
+            return False
+        quality_state, quality_reasons = self._calibration_quality_state(
+            panel.last_calibration_result
+        )
+        if quality_state in {"FAIL", "WARNING"} and not (
+            quality_state == "WARNING" and quality_warning_confirmed
+        ):
+            qualifier = "FAIL" if quality_state == "FAIL" else "WARNING requires confirmation"
+            panel.calibration_status_label.setText(
+                f"Cannot apply intrinsics: calibration quality {qualifier} ("
+                + ", ".join(quality_reasons)
+                + ")"
+            )
+            panel._set_health_label(
+                panel.checkerboard_validation_status_label,
+                f"적용 차단: calibration quality {qualifier}",
+                "bad" if quality_state == "FAIL" else "warn",
+            )
+            return False
+        if quality_state == "WARNING":
+            summary = dict(getattr(panel, "checkerboard_validation_summary", {}) or {})
+            summary["quality_override"] = {
+                "action": "apply_intrinsics_to_distance",
+                "confirmed": True,
+                "confirmed_utc_ns": time.time_ns(),
+                "reason_codes": list(quality_reasons),
+            }
+            panel.checkerboard_validation_summary = summary
+        for side, intrinsics in (
+            ("left", panel.last_calibration_result.left),
+            ("right", panel.last_calibration_result.right),
+        ):
+            pane = getattr(panel, f"{side}_pane", None)
+            native_reader = getattr(pane, "latest_native_calibration_frame", None)
+            native = native_reader(maximum_age_s=5.0) if callable(native_reader) else None
+            if native is None:
+                continue
+            _frame_id, image, _metadata = native
+            if (image.width(), image.height()) != (intrinsics.width, intrinsics.height):
+                panel.calibration_status_label.setText(
+                    f"Cannot apply {side} intrinsics: profile grid "
+                    f"{intrinsics.width}x{intrinsics.height} differs from live native grid "
+                    f"{image.width()}x{image.height()}"
+                )
+                panel._set_health_label(
+                    panel.checkerboard_validation_status_label,
+                    f"적용 차단: {side} native pixel grid mismatch",
+                    "bad",
+                )
+                return False
         selected_profile = panel.selected_extrinsics_profile
         if selected_profile is None and panel.last_calibration_result.extrinsics is not None:
             selected_profile = StereoExtrinsicsProfile(
@@ -1024,6 +1522,7 @@ class CalibrationWorkflowController:
         panel._refresh_distance()
         panel._refresh_optical_alignment_view()
         panel._refresh_operation_header()
+        return True
 
     def _checkerboard_config(self) -> CheckerboardConfig:
         return CheckerboardConfig(
@@ -1034,13 +1533,71 @@ class CalibrationWorkflowController:
 
     def _calibration_dirs(self) -> tuple[Path, Path, Path]:
         text = self.panel.calib_dir_edit.text().strip()
-        if text:
-            root = resolve_settings_path(text, base_dir=self.panel.app_root)
+        configured_root = (
+            resolve_settings_path(text, base_dir=self.panel.app_root)
+            if text
+            else resolve_settings_path(DEFAULT_CALIBRATION_ROOT, base_dir=self.panel.app_root)
+        )
+        session_root = getattr(self.panel, "_calibration_session_root", None)
+        default_root = resolve_settings_path(DEFAULT_CALIBRATION_ROOT, base_dir=self.panel.app_root)
+        if session_root is not None and configured_root == default_root:
+            root = Path(session_root)
         else:
-            root = resolve_settings_path(DEFAULT_INTRINSICS_PATH, base_dir=self.panel.app_root).parent
+            if session_root is not None:
+                self.panel._calibration_session_root = None
+                self.panel._calibration_session_roots = {}
+            root = configured_root
         left_dir = root / "left"
         right_dir = root / "right"
         return root, left_dir, right_dir
+
+    def _ensure_calibration_session_root(self, capture_origin: str = "manual") -> Path | None:
+        """Create one timestamped folder for this app's default calibration run."""
+
+        if not hasattr(self.panel, "calib_dir_edit") or not hasattr(self.panel, "app_root"):
+            return None
+        session_key = "auto" if str(capture_origin).strip().lower() == "auto" else "default"
+        session_roots = getattr(self.panel, "_calibration_session_roots", None)
+        if not isinstance(session_roots, dict):
+            session_roots = {}
+        existing = session_roots.get(session_key)
+        if existing is not None:
+            self.panel._calibration_session_root = Path(existing)
+            return Path(existing)
+        text = self.panel.calib_dir_edit.text().strip()
+        configured_root = (
+            resolve_settings_path(text, base_dir=self.panel.app_root)
+            if text
+            else resolve_settings_path(DEFAULT_CALIBRATION_ROOT, base_dir=self.panel.app_root)
+        )
+        default_root = resolve_settings_path(DEFAULT_CALIBRATION_ROOT, base_dir=self.panel.app_root)
+        if configured_root != default_root:
+            return None
+        session_base = default_root
+        session_base.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
+        candidate = session_base / stamp
+        suffix = 1
+        while candidate.exists():
+            candidate = session_base / f"{stamp}_{suffix:02d}"
+            suffix += 1
+        if session_key == "auto":
+            candidate = candidate / "calib_capture" / "AutoCapture"
+        candidate.mkdir(parents=True, exist_ok=False)
+        session_roots[session_key] = candidate
+        self.panel._calibration_session_roots = session_roots
+        self.panel._calibration_session_root = candidate
+        write_calibration_session_manifest(candidate, source=session_key)
+        self.panel._log(
+            f"[캘리브레이션] 이번 Workstation {session_key} 캘리브레이션 폴더: {candidate}"
+        )
+        return candidate
+
+    @staticmethod
+    def _prepare_ftp_capture_dirs(root: Path, capture_family: str) -> None:
+        capture_root = root / "calib_capture" / capture_family
+        for side in ("left", "right"):
+            (capture_root / side).mkdir(parents=True, exist_ok=True)
 
     def _intrinsics_storage_base_path(self) -> Path:
         if hasattr(self.panel, "calib_dir_edit"):
@@ -1103,7 +1660,14 @@ class CalibrationWorkflowController:
                 None,
                 "missing RTCP/NTP camera timestamp for left or right frame",
             )
-        delta_s = float(right_timestamp) - float(left_timestamp)
+        try:
+            left_value = float(left_timestamp)
+            right_value = float(right_timestamp)
+        except (TypeError, ValueError, OverflowError):
+            return False, "rtcp-ntp", None, "invalid RTCP/NTP camera timestamp"
+        if not math.isfinite(left_value) or not math.isfinite(right_value):
+            return False, "rtcp-ntp", None, "non-finite RTCP/NTP camera timestamp"
+        delta_s = right_value - left_value
         if abs(delta_s) > CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S:
             return (
                 False,
@@ -1124,13 +1688,43 @@ class CalibrationWorkflowController:
         if self.panel.checkerboard_calibration_thread is not None:
             self.panel.calibration_status_label.setText("A calibration operation is already running.")
             return False
-        frames = frames or {
-            "left": self.panel.left_pane.current_image(),
-            "right": self.panel.right_pane.current_image(),
-        }
+        if frames is None:
+            frames = {}
+            native_metadata: dict[str, dict[str, object]] = {}
+            allow_preview_fallback = bool(
+                getattr(self.panel, "_allow_legacy_calibration_preview_fallback", False)
+            )
+            for side in ("left", "right"):
+                pane = getattr(self.panel, f"{side}_pane", None)
+                getter = getattr(pane, "latest_native_calibration_frame", None)
+                if callable(getter):
+                    native = getter(maximum_age_s=CALIBRATION_AUTO_DETECTION_MAX_AGE_S)
+                    if native is not None:
+                        frame_id, image, metadata = native
+                        frames[side] = image
+                        native_metadata[side] = {
+                            **dict(metadata),
+                            "frame_id": str(frame_id),
+                            "calibration_source": "native_frame_cache",
+                        }
+                    else:
+                        frames[side] = None
+                else:
+                    if allow_preview_fallback:
+                        current = getattr(pane, "current_image", None)
+                        frames[side] = current() if callable(current) else None
+                    else:
+                        frames[side] = None
+            if native_metadata:
+                metadata_by_camera = native_metadata
         if frames["left"] is None and frames["right"] is None:
-            self.panel.calibration_status_label.setText("Start at least one camera stream before capturing calibration images.")
-            self.panel._log("[캘리브레이션] 이미지 캡처 실패: 좌/우 카메라 프레임 중 하나 이상이 필요합니다.")
+            self.panel.calibration_status_label.setText(
+                "Calibration capture requires a fresh native lossless frame; "
+                "preview-only frames are not accepted."
+            )
+            self.panel._log(
+                "[캘리브레이션] 이미지 캡처 실패: native lossless frame API/프레임이 없습니다."
+            )
             return False
         frames = {
             side: None
@@ -1139,6 +1733,7 @@ class CalibrationWorkflowController:
             for side, image in frames.items()
         }
         metadata_by_camera = metadata_by_camera or self.panel.camera_frame_metadata
+        self._ensure_calibration_session_root(capture_origin)
         root, _left_dir, _right_dir = self.panel._calibration_dirs()
         stem = self.panel._next_calibration_capture_stem()
         available, error = opencv_available()
@@ -1156,13 +1751,60 @@ class CalibrationWorkflowController:
         self.panel.last_capture_zoom_level = zoom_snapshot.get("capture_zoom_level")
         metadata_payload = {
             "capture_origin": str(capture_origin),
+            "capture_recorded_unix_ns": time.time_ns(),
             "pair_time_basis": pair_time_basis,
             "pair_delta_s": pair_delta_s,
             "pair_max_delta_s": CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S,
             "pair_timing_status": pair_timing_detail,
             "left_rtcp_frame_ntp_unix_s": (metadata_by_camera.get("left") or {}).get("rtcp_frame_ntp_unix_s"),
             "right_rtcp_frame_ntp_unix_s": (metadata_by_camera.get("right") or {}).get("rtcp_frame_ntp_unix_s"),
-            "frame_contract": "OpenCV image pixels; stereo timing uses RTCP/NTP camera timestamp before saving a left/right pair",
+            "frame_contract": (
+                "OpenCV source image pixels (x right, y down); no application resize/crop/overlay; "
+                "native/preview/saved grids are explicit per side; "
+                "stereo timing uses RTCP/NTP camera timestamp before saving a left/right pair"
+            ),
+            "frame_grid_by_side": {
+                side: {
+                    "frame_id": str((metadata_by_camera.get(side) or {}).get("frame_id") or ""),
+                    "source_native_width": int(
+                        (metadata_by_camera.get(side) or {}).get("native_width")
+                        or (frames.get(side).width() if frames.get(side) is not None else 0)
+                    ),
+                    "source_native_height": int(
+                        (metadata_by_camera.get(side) or {}).get("native_height")
+                        or (frames.get(side).height() if frames.get(side) is not None else 0)
+                    ),
+                    "saved_width": frames.get(side).width() if frames.get(side) is not None else 0,
+                    "saved_height": frames.get(side).height() if frames.get(side) is not None else 0,
+                    "preview_width": int(
+                        (getattr(self.panel, "camera_frame_metadata", {}).get(side) or {}).get(
+                            "preview_width", 0
+                        )
+                    ),
+                    "preview_height": int(
+                        (getattr(self.panel, "camera_frame_metadata", {}).get(side) or {}).get(
+                            "preview_height", 0
+                        )
+                    ),
+                    "resize_scale_xy": [1.0, 1.0],
+                    "crop_xywh": None,
+                    "overlay_applied": False,
+                    "native_lossless_source": bool(
+                        (metadata_by_camera.get(side) or {}).get("native_lossless_source", False)
+                    ),
+                }
+                for side in ("left", "right")
+            },
+            "auto_pose_geometry_by_side": {
+                side: view.to_mapping()
+                for side, view in (
+                    getattr(self, "_auto_capture_pending_pose_views", None) or {}
+                ).items()
+                if isinstance(view, CalibrationViewGeometry)
+            },
+            "auto_pose_novelty_by_side": dict(
+                getattr(self, "_auto_capture_pending_pose_novelty", None) or {}
+            ),
             **zoom_snapshot,
         }
         worker = CheckerboardCaptureWorker(
@@ -1177,6 +1819,20 @@ class CalibrationWorkflowController:
             pair_timing_detail=pair_timing_detail,
             metadata_payload=metadata_payload,
         )
+        for side in ("left", "right"):
+            self._publish_calibration_capture_event(
+                {
+                    "side": side,
+                    "phase": "started",
+                    "state": "frame_ready" if frames.get(side) is not None else "no_frame",
+                    "command": "RTSP current frame",
+                    "response": "frame queued for PNG/checkerboard validation"
+                    if frames.get(side) is not None
+                    else "no current frame",
+                },
+                operation="Capture Live Pair",
+                capture_id=stem,
+            )
         thread = QtCore.QThread(self.panel)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -1187,11 +1843,16 @@ class CalibrationWorkflowController:
         thread.finished.connect(lambda: self.panel._clear_checkerboard_calibration_worker(thread))
         self.panel.checkerboard_calibration_thread = thread
         self.panel.checkerboard_calibration_worker = worker
+        self._connect_calibration_worker_progress(
+            worker,
+            operation="Capture Live Pair",
+            capture_id=stem,
+        )
         self._capture_origin = str(capture_origin)
         self.panel.capture_calibration_button.setEnabled(False)
         self.panel.run_calibration_button.setEnabled(False)
         self.panel.checkerboard_validation_random_button.setEnabled(False)
-        self.panel.calibration_status_label.setText(f"Capture {stem}: encoding and checkerboard validation running")
+        self.panel.calibration_status_label.setText(f"Capture Live Pair {stem}: encoding and checkerboard validation running")
         thread.start()
         return True
 
@@ -1205,31 +1866,33 @@ class CalibrationWorkflowController:
         """
 
         if self.panel.calibration_wiris_ftp_thread is not None:
-            self.panel.calibration_status_label.setText(
+            self._set_ftp_status(
                 "A WIRIS FTP calibration capture is already in progress."
             )
             return False
         if self.panel.calibration_wiris_ftp_oz_thread is not None:
-            self.panel.calibration_status_label.setText(
+            self._set_ftp_status(
                 "A WIRIS FTP (OZ) calibration capture is already in progress."
             )
             return False
         if self.panel.checkerboard_calibration_thread is not None:
-            self.panel.calibration_status_label.setText("A calibration operation is already running.")
+            self._set_ftp_status("A calibration operation is already running.")
             return False
         settings = getattr(self.panel, "settings", None)
         if not bool(getattr(settings, "wiris_ftp_enabled", False)):
-            self.panel.calibration_status_label.setText(
+            self._set_ftp_status(
                 "WIRIS FTP capture requires \"Enable FTP download\" in Settings."
             )
             return False
         target_infos = self.panel._camera_photo_target_infos()
         if len(target_infos) != 2:
-            self.panel.calibration_status_label.setText(
+            self._set_ftp_status(
                 "WIRIS FTP capture failed: both WIRIS control hosts are required."
             )
             return False
+        self._ensure_calibration_session_root("ftp")
         root, _left_dir, _right_dir = self.panel._calibration_dirs()
+        self._prepare_ftp_capture_dirs(root, "HR")
         capture_id = f"calib-{time.time_ns()}-{uuid.uuid4().hex[:8]}"
         kwargs = self.panel._wiris_ftp_worker_kwargs(output_dir=root)
         thread = QtCore.QThread(self.panel)
@@ -1250,11 +1913,16 @@ class CalibrationWorkflowController:
         thread.finished.connect(self.panel._clear_calibration_wiris_ftp_capture_worker)
         self.panel.calibration_wiris_ftp_thread = thread
         self.panel.calibration_wiris_ftp_worker = worker
+        self._connect_calibration_worker_progress(
+            worker,
+            operation="Capture HR Still (FTP)",
+            capture_id=capture_id,
+        )
         self.panel.capture_calibration_button.setEnabled(False)
         self.panel.run_calibration_button.setEnabled(False)
-        self.panel.calibration_status_label.setText(
-            f"WIRIS FTP Capture {capture_id}: 좌/우 카메라 내부 저장 중"
-        )
+        status = f"WIRIS FTP Capture {capture_id}: 좌/우 카메라 내부 저장 중"
+        self.panel.calibration_status_label.setText(status)
+        self.panel._log(f"[캘리브레이션] {status}")
         thread.start()
         return True
 
@@ -1263,11 +1931,13 @@ class CalibrationWorkflowController:
         cameras = record.get("cameras")
         cameras = cameras if isinstance(cameras, dict) else {}
         capture_id = str(record.get("capture_id") or "")
-        failures = [
-            f"{side}: {item.get('error') or item.get('state', 'failed')}"
-            for side, item in cameras.items()
-            if item.get("state") != "completed" or not item.get("ftp_downloaded")
-        ]
+        self._log_ftp_camera_results("WIRIS FTP Capture", capture_id, cameras)
+        self._publish_calibration_camera_summary(
+            operation="Capture HR Still (FTP)",
+            capture_id=capture_id,
+            cameras=cameras,
+        )
+        failures = self._ftp_capture_failures(cameras)
         if set(cameras) != {"left", "right"} or failures:
             self._handle_calibration_wiris_ftp_capture_failed(
                 "; ".join(failures) or "camera result is missing left/right entries"
@@ -1284,9 +1954,27 @@ class CalibrationWorkflowController:
                 return
             frames[side] = image
         self.panel._log(f"[캘리브레이션] WIRIS FTP Capture {capture_id}: 다운로드 완료, 캘리브레이션 저장 시작")
-        self.panel.capture_calibration_images(frames=frames, capture_origin="ftp")
+        self.panel.capture_calibration_images(
+            frames=frames,
+            metadata_by_camera=self._ftp_calibration_capture_metadata(
+                capture_id=capture_id,
+                cameras=cameras,
+                frames=frames,
+            ),
+            capture_origin="ftp",
+        )
 
     def _handle_calibration_wiris_ftp_capture_failed(self, error: str) -> None:
+        for side in ("left", "right"):
+            self._publish_calibration_capture_event(
+                {
+                    "side": side,
+                    "phase": "failed",
+                    "state": "failed",
+                    "response": str(error),
+                },
+                operation="Capture HR Still (FTP)",
+            )
         self.panel._log(f"[캘리브레이션] WIRIS FTP Capture 실패: {error}")
         self.panel.calibration_status_label.setText(f"WIRIS FTP Capture failed: {error}")
         self.panel.capture_calibration_button.setEnabled(True)
@@ -1296,6 +1984,89 @@ class CalibrationWorkflowController:
         self.panel.calibration_wiris_ftp_thread = None
         self.panel.calibration_wiris_ftp_worker = None
 
+    def _set_ftp_status(self, message: str) -> None:
+        self.panel.calibration_status_label.setText(message)
+        self.panel._log(f"[캘리브레이션] FTP 상태: {message}")
+
+    def _log_ftp_camera_results(
+        self,
+        source_label: str,
+        capture_id: str,
+        cameras: dict[object, object],
+    ) -> None:
+        for side in ("left", "right"):
+            item = cameras.get(side)
+            if not isinstance(item, dict):
+                continue
+            details = [
+                f"state={item.get('state', 'failed')}",
+                f"camera_saved={bool(item.get('stored_on_camera'))}",
+                f"ftp_downloaded={bool(item.get('ftp_downloaded'))}",
+            ]
+            path = str(item.get("ftp_local_path") or "")
+            if path:
+                details.append(f"local={path}")
+            remote_path = str(item.get("ftp_remote_path") or "")
+            if remote_path:
+                details.append(f"remote={remote_path}")
+            for key in ("error", "ftp_error"):
+                error = str(item.get(key) or "")
+                if error:
+                    details.append(f"{key}={error}")
+            self.panel._log(
+                f"[캘리브레이션] {source_label} {capture_id} {side}: "
+                + "; ".join(details)
+            )
+
+    @staticmethod
+    def _ftp_capture_failures(cameras: dict[object, object]) -> list[str]:
+        failures: list[str] = []
+        for side, raw_item in cameras.items():
+            item = raw_item if isinstance(raw_item, dict) else {}
+            state = str(item.get("state") or "failed")
+            if state != "completed":
+                reason = str(item.get("error") or state)
+            elif not bool(item.get("ftp_downloaded")):
+                reason = str(item.get("ftp_error") or "FTP download failed")
+            else:
+                continue
+            failures.append(f"{side}: {reason}")
+        return failures
+
+    @staticmethod
+    def _ftp_calibration_capture_metadata(
+        *,
+        capture_id: str,
+        cameras: Mapping[object, object],
+        frames: Mapping[str, QtGui.QImage | None],
+    ) -> dict[str, dict[str, object]]:
+        """Describe FTP stills without borrowing the live RTSP clock.
+
+        CPTR/ICPT and FTP timestamps are lifecycle evidence, not exposure
+        timestamps.  Keeping the reference explicitly unknown prevents
+        ``capture_calibration_images`` from falling back to the panel's
+        unrelated current preview metadata and forming a false stereo pair.
+        """
+
+        result: dict[str, dict[str, object]] = {}
+        for side in ("left", "right"):
+            raw_item = cameras.get(side)
+            item = raw_item if isinstance(raw_item, Mapping) else {}
+            image = frames.get(side)
+            result[side] = {
+                "timestamp_reference": "unknown",
+                "capture_timestamp_known": False,
+                "ftp_capture_id": capture_id,
+                "ftp_remote_path": str(item.get("ftp_remote_path") or ""),
+                "capture_requested_unix_ns": item.get("capture_requested_unix_ns"),
+                "capture_completed_unix_ns": item.get("capture_completed_unix_ns"),
+                "ftp_download_finished_unix_ns": item.get("finished_unix_ns"),
+                "native_width": image.width() if isinstance(image, QtGui.QImage) else 0,
+                "native_height": image.height() if isinstance(image, QtGui.QImage) else 0,
+                "native_lossless_source": False,
+            }
+        return result
+
     def capture_calibration_images_wiris_ftp_oz(self) -> bool:
         """Same as ``capture_calibration_images_wiris_ftp``, on the OZ channel.
 
@@ -1303,36 +2074,38 @@ class CalibrationWorkflowController:
         of the HR still (``SIHR TRUE``) -- lower resolution than HR, but a
         faster capture with no camera reboot risk (unlike changing HR
         resolution via ``SHRR``). Downloads land in a separate
-        ``calib_oz_capture`` subfolder so they never mix with HR downloads,
+        ``calib_capture/OZ`` subfolder so they never mix with HR downloads,
         and feed the exact same ``capture_calibration_images`` save path.
         """
 
         if self.panel.calibration_wiris_ftp_oz_thread is not None:
-            self.panel.calibration_status_label.setText(
+            self._set_ftp_status(
                 "A WIRIS FTP (OZ) calibration capture is already in progress."
             )
             return False
         if self.panel.calibration_wiris_ftp_thread is not None:
-            self.panel.calibration_status_label.setText(
+            self._set_ftp_status(
                 "A WIRIS FTP calibration capture is already in progress."
             )
             return False
         if self.panel.checkerboard_calibration_thread is not None:
-            self.panel.calibration_status_label.setText("A calibration operation is already running.")
+            self._set_ftp_status("A calibration operation is already running.")
             return False
         settings = getattr(self.panel, "settings", None)
         if not bool(getattr(settings, "wiris_ftp_enabled", False)):
-            self.panel.calibration_status_label.setText(
+            self._set_ftp_status(
                 "WIRIS FTP capture requires \"Enable FTP download\" in Settings."
             )
             return False
         target_infos = self.panel._camera_photo_target_infos()
         if len(target_infos) != 2:
-            self.panel.calibration_status_label.setText(
+            self._set_ftp_status(
                 "WIRIS FTP capture failed: both WIRIS control hosts are required."
             )
             return False
+        self._ensure_calibration_session_root("ftp_oz")
         root, _left_dir, _right_dir = self.panel._calibration_dirs()
+        self._prepare_ftp_capture_dirs(root, "OZ")
         capture_id = f"calib-oz-{time.time_ns()}-{uuid.uuid4().hex[:8]}"
         kwargs = self.panel._wiris_ftp_worker_kwargs(output_dir=root)
         thread = QtCore.QThread(self.panel)
@@ -1354,11 +2127,16 @@ class CalibrationWorkflowController:
         thread.finished.connect(self.panel._clear_calibration_wiris_ftp_oz_capture_worker)
         self.panel.calibration_wiris_ftp_oz_thread = thread
         self.panel.calibration_wiris_ftp_oz_worker = worker
+        self._connect_calibration_worker_progress(
+            worker,
+            operation="Capture OZ Still (FTP)",
+            capture_id=capture_id,
+        )
         self.panel.capture_calibration_button.setEnabled(False)
         self.panel.run_calibration_button.setEnabled(False)
-        self.panel.calibration_status_label.setText(
-            f"WIRIS FTP (OZ) Capture {capture_id}: 좌/우 카메라 내부 저장 중"
-        )
+        status = f"WIRIS FTP (OZ) Capture {capture_id}: 좌/우 카메라 내부 저장 중"
+        self.panel.calibration_status_label.setText(status)
+        self.panel._log(f"[캘리브레이션] {status}")
         thread.start()
         return True
 
@@ -1367,11 +2145,13 @@ class CalibrationWorkflowController:
         cameras = record.get("cameras")
         cameras = cameras if isinstance(cameras, dict) else {}
         capture_id = str(record.get("capture_id") or "")
-        failures = [
-            f"{side}: {item.get('error') or item.get('state', 'failed')}"
-            for side, item in cameras.items()
-            if item.get("state") != "completed" or not item.get("ftp_downloaded")
-        ]
+        self._log_ftp_camera_results("WIRIS FTP (OZ) Capture", capture_id, cameras)
+        self._publish_calibration_camera_summary(
+            operation="Capture OZ Still (FTP)",
+            capture_id=capture_id,
+            cameras=cameras,
+        )
+        failures = self._ftp_capture_failures(cameras)
         if set(cameras) != {"left", "right"} or failures:
             self._handle_calibration_wiris_ftp_oz_capture_failed(
                 "; ".join(failures) or "camera result is missing left/right entries"
@@ -1388,9 +2168,27 @@ class CalibrationWorkflowController:
                 return
             frames[side] = image
         self.panel._log(f"[캘리브레이션] WIRIS FTP (OZ) Capture {capture_id}: 다운로드 완료, 캘리브레이션 저장 시작")
-        self.panel.capture_calibration_images(frames=frames, capture_origin="ftp_oz")
+        self.panel.capture_calibration_images(
+            frames=frames,
+            metadata_by_camera=self._ftp_calibration_capture_metadata(
+                capture_id=capture_id,
+                cameras=cameras,
+                frames=frames,
+            ),
+            capture_origin="ftp_oz",
+        )
 
     def _handle_calibration_wiris_ftp_oz_capture_failed(self, error: str) -> None:
+        for side in ("left", "right"):
+            self._publish_calibration_capture_event(
+                {
+                    "side": side,
+                    "phase": "failed",
+                    "state": "failed",
+                    "response": str(error),
+                },
+                operation="Capture OZ Still (FTP)",
+            )
         self.panel._log(f"[캘리브레이션] WIRIS FTP (OZ) Capture 실패: {error}")
         self.panel.calibration_status_label.setText(f"WIRIS FTP (OZ) Capture failed: {error}")
         self.panel.capture_calibration_button.setEnabled(True)
@@ -1402,7 +2200,7 @@ class CalibrationWorkflowController:
 
     # -- OZ capture-only + FTP sync -------------------------------------
     #
-    # "Capture FTP OZ" above bundles a still trigger with an immediate FTP
+    # "Capture OZ Still (FTP)" above bundles a still trigger with an immediate FTP
     # download; every capture pays the full FTP round-trip before the next
     # one can start. These three pieces decouple that: capture repeatedly
     # (fast, camera-local only), then sync everything new in one pass, then
@@ -1411,7 +2209,7 @@ class CalibrationWorkflowController:
     # Extrinsics need proof that a left/right pair came from the *same*
     # trigger. The two camera clocks can differ by hours, so remote
     # timestamps can't establish that once several stills have piled up
-    # un-downloaded. Instead a local ledger (``calib_oz_capture/ledger.json``)
+    # un-downloaded. Instead a local ledger (``calib_capture/OZ/ledger.json``)
     # records each trigger round and whether *both* sides reported
     # ``stored_on_camera`` -- only such "synchronized" rounds are ever
     # eligible for sync/pairing, and syncing matches each camera's new
@@ -1420,7 +2218,7 @@ class CalibrationWorkflowController:
 
     def _calib_oz_ledger_path(self) -> Path:
         root, _left_dir, _right_dir = self.panel._calibration_dirs()
-        return root / "calib_oz_capture" / "ledger.json"
+        return root / "calib_capture" / "OZ" / "ledger.json"
 
     def _load_calib_oz_ledger(self) -> dict[str, object]:
         empty: dict[str, object] = {"rounds": [], "consumed_remote_names": {"left": [], "right": []}}
@@ -1471,6 +2269,7 @@ class CalibrationWorkflowController:
                 "OZ capture failed: both WIRIS control hosts are required."
             )
             return False
+        self._ensure_calibration_session_root("oz_capture")
         # Force a known, single-file-per-round format state before every
         # trigger -- CPTR emits one file per enabled SIxx toggle, and the
         # two cameras were found with different toggles on (left had
@@ -1478,7 +2277,7 @@ class CalibrationWorkflowController:
         # either way, since a failed format command shouldn't block the shot,
         # it'll just be caught later by the sync's per-name ``-visible.jpg``
         # filter and count check.
-        self.panel.calibration_status_label.setText("OZ Capture: 이미지 포맷 강제 설정 중")
+        self.panel.calibration_status_label.setText("Capture OZ Still: 이미지 포맷 강제 설정 중")
         thread = QtCore.QThread(self.panel)
         worker = WirisImageFormatWorker(
             target_infos,
@@ -1494,6 +2293,10 @@ class CalibrationWorkflowController:
         thread.finished.connect(self.panel._clear_calibration_wiris_oz_format_worker)
         self.panel.calibration_wiris_oz_format_thread = thread
         self.panel.calibration_wiris_oz_format_worker = worker
+        self._connect_calibration_worker_progress(
+            worker,
+            operation="Capture OZ Still (format)",
+        )
         self._pending_oz_capture_target_infos = target_infos
         thread.start()
         return True
@@ -1517,6 +2320,7 @@ class CalibrationWorkflowController:
         self._pending_oz_capture_target_infos = ()
         if len(target_infos) != 2:
             return
+        self._ensure_calibration_session_root("oz_capture")
         capture_id = f"calib-ozcap-{time.time_ns()}-{uuid.uuid4().hex[:8]}"
         thread = QtCore.QThread(self.panel)
         worker = WirisOZPhotoCaptureWorker(target_infos, capture_id=capture_id, completion_timeout_s=10.0)
@@ -1530,7 +2334,12 @@ class CalibrationWorkflowController:
         thread.finished.connect(self.panel._clear_calibration_wiris_oz_capture_only_worker)
         self.panel.calibration_wiris_oz_capture_thread = thread
         self.panel.calibration_wiris_oz_capture_worker = worker
-        self.panel.calibration_status_label.setText(f"OZ Capture {capture_id}: 좌/우 카메라 내부 저장 중")
+        self._connect_calibration_worker_progress(
+            worker,
+            operation="Capture OZ Still",
+            capture_id=capture_id,
+        )
+        self.panel.calibration_status_label.setText(f"Capture OZ Still {capture_id}: 좌/우 카메라 내부 저장 중")
         thread.start()
 
     def _handle_calibration_wiris_oz_capture_only_completed(self, result: object) -> None:
@@ -1538,6 +2347,11 @@ class CalibrationWorkflowController:
         cameras = record.get("cameras")
         cameras = cameras if isinstance(cameras, dict) else {}
         capture_id = str(record.get("capture_id") or "")
+        self._publish_calibration_camera_summary(
+            operation="Capture OZ Still",
+            capture_id=capture_id,
+            cameras=cameras,
+        )
         left_ok = bool((cameras.get("left") or {}).get("stored_on_camera"))
         right_ok = bool((cameras.get("right") or {}).get("stored_on_camera"))
         synchronized = left_ok and right_ok
@@ -1559,16 +2373,26 @@ class CalibrationWorkflowController:
         pending = sum(1 for row in rounds if row.get("synchronized") and not row.get("downloaded"))
         if not synchronized:
             self.panel._log(
-                f"[캘리브레이션] OZ Capture {capture_id}: 좌우 중 한쪽만 성공 -- 페어링 대상에서 제외 "
+                f"[캘리브레이션] Capture OZ Still {capture_id}: 좌우 중 한쪽만 성공 -- 페어링 대상에서 제외 "
                 f"(left={left_ok}, right={right_ok})"
             )
         self.panel.calibration_status_label.setText(
-            f"OZ Capture {capture_id}: 완료 (동기화 대기 {pending}쌍)"
+            f"Capture OZ Still {capture_id}: 완료 (동기화 대기 {pending}쌍)"
         )
 
     def _handle_calibration_wiris_oz_capture_only_failed(self, error: str) -> None:
-        self.panel._log(f"[캘리브레이션] OZ Capture 실패: {error}")
-        self.panel.calibration_status_label.setText(f"OZ Capture failed: {error}")
+        for side in ("left", "right"):
+            self._publish_calibration_capture_event(
+                {
+                    "side": side,
+                    "phase": "failed",
+                    "state": "failed",
+                    "response": str(error),
+                },
+                operation="Capture OZ Still",
+            )
+        self.panel._log(f"[캘리브레이션] Capture OZ Still 실패: {error}")
+        self.panel.calibration_status_label.setText(f"Capture OZ Still failed: {error}")
 
     def _clear_calibration_wiris_oz_capture_only_worker(self) -> None:
         self.panel.calibration_wiris_oz_capture_thread = None
@@ -1614,6 +2438,7 @@ class CalibrationWorkflowController:
                 "WIRIS FTP sync failed: both WIRIS control hosts are required."
             )
             return False
+        self._ensure_calibration_session_root("ftp_oz_sync")
         ledger = self.panel._load_calib_oz_ledger()
         rounds = ledger["rounds"]
         pending_rounds = [row for row in rounds if row.get("synchronized") and not row.get("downloaded")]
@@ -1663,7 +2488,9 @@ class CalibrationWorkflowController:
             )
             return
         root, _left_dir, _right_dir = self.panel._calibration_dirs()
-        output_dir = root / "calib_oz_capture"
+        output_dir = root / "calib_capture" / "OZ"
+        for side in ("left", "right"):
+            (output_dir / side).mkdir(parents=True, exist_ok=True)
         kwargs = self.panel._wiris_ftp_worker_kwargs(output_dir=output_dir)
         ledger = self.panel._load_calib_oz_ledger()
         fetch_counts = {"left": len(pending_rounds), "right": len(pending_rounds)}
@@ -1739,7 +2566,9 @@ class CalibrationWorkflowController:
         ledger = self.panel._load_calib_oz_ledger()
         rounds_by_id = {str(row.get("capture_id")): row for row in ledger["rounds"]}
         consumed = ledger.setdefault("consumed_remote_names", {"left": [], "right": []})
-        queue: list[tuple[str, dict[str, object]]] = []
+        queue: list[
+            tuple[str, dict[str, QtGui.QImage], dict[str, dict[str, object]]]
+        ] = []
         delete_names: dict[str, list[str]] = {"left": [], "right": []}
         for index, capture_id in enumerate(round_ids):
             left_name, right_name = str(left_items[index]["name"]), str(right_items[index]["name"])
@@ -1752,13 +2581,33 @@ class CalibrationWorkflowController:
             consumed.setdefault("right", []).append(right_name)
             delete_names["left"].append(left_name)
             delete_names["right"].append(right_name)
+            frames = {
+                "left": QtGui.QImage(str(left_items[index]["path"])),
+                "right": QtGui.QImage(str(right_items[index]["path"])),
+            }
+            lifecycle = {
+                "left": {
+                    "ftp_remote_path": left_name,
+                    "capture_requested_unix_ns": None
+                    if row is None
+                    else row.get("requested_at_unix_ns"),
+                },
+                "right": {
+                    "ftp_remote_path": right_name,
+                    "capture_requested_unix_ns": None
+                    if row is None
+                    else row.get("requested_at_unix_ns"),
+                },
+            }
             queue.append(
                 (
                     capture_id,
-                    {
-                        "left": QtGui.QImage(str(left_items[index]["path"])),
-                        "right": QtGui.QImage(str(right_items[index]["path"])),
-                    },
+                    frames,
+                    self._ftp_calibration_capture_metadata(
+                        capture_id=capture_id,
+                        cameras=lifecycle,
+                        frames=frames,
+                    ),
                 )
             )
         self.panel._save_calib_oz_ledger(ledger)
@@ -1838,8 +2687,12 @@ class CalibrationWorkflowController:
             self.panel._log(f"[캘리브레이션] WIRIS FTP 동기화 완료: {saved}쌍 저장")
             self.panel.calibration_status_label.setText(f"WIRIS FTP 동기화 완료: {saved}쌍 저장")
             return
-        capture_id, frames = queue.pop(0)
-        started = self.panel.capture_calibration_images(frames=frames, capture_origin="ftp_oz_sync")
+        capture_id, frames, metadata_by_camera = queue.pop(0)
+        started = self.panel.capture_calibration_images(
+            frames=frames,
+            metadata_by_camera=metadata_by_camera,
+            capture_origin="ftp_oz_sync",
+        )
         if not started:
             QtCore.QTimer.singleShot(200, self.panel._process_next_ftp_oz_sync_pair)
             return
@@ -1857,7 +2710,15 @@ class CalibrationWorkflowController:
         return root / "calibration_pair_selection.json"
 
     def _load_calibration_pair_selection(self) -> dict[str, object]:
-        empty: dict[str, object] = {"manual_mode": False, "included_keys": []}
+        empty: dict[str, object] = {
+            "manual_mode": False,
+            "included_keys": [],
+            "left_paths": [],
+            "right_paths": [],
+            "excluded_left_paths": [],
+            "excluded_right_paths": [],
+            "excluded_pair_keys": [],
+        }
         path = self.panel._calibration_pair_selection_path()
         if not path.exists():
             return empty
@@ -1867,10 +2728,242 @@ class CalibrationWorkflowController:
             return empty
         if not isinstance(data, dict):
             return empty
+        raw_left_paths = data.get("left_paths", [])
+        raw_right_paths = data.get("right_paths", [])
+        if not isinstance(raw_left_paths, (list, tuple)):
+            raw_left_paths = []
+        if not isinstance(raw_right_paths, (list, tuple)):
+            raw_right_paths = []
+        raw_keys = data.get("included_keys", [])
+        if not isinstance(raw_keys, (list, tuple)):
+            raw_keys = []
+        raw_excluded_left = data.get("excluded_left_paths", [])
+        raw_excluded_right = data.get("excluded_right_paths", [])
+        raw_excluded_pairs = data.get("excluded_pair_keys", [])
+        if not isinstance(raw_excluded_left, (list, tuple)):
+            raw_excluded_left = []
+        if not isinstance(raw_excluded_right, (list, tuple)):
+            raw_excluded_right = []
+        if not isinstance(raw_excluded_pairs, (list, tuple)):
+            raw_excluded_pairs = []
         return {
             "manual_mode": bool(data.get("manual_mode", False)),
-            "included_keys": [str(key) for key in data.get("included_keys", []) or []],
+            "included_keys": [str(key) for key in raw_keys],
+            "left_paths": [str(path) for path in raw_left_paths],
+            "right_paths": [str(path) for path in raw_right_paths],
+            "excluded_left_paths": [str(path) for path in raw_excluded_left],
+            "excluded_right_paths": [str(path) for path in raw_excluded_right],
+            "excluded_pair_keys": [str(key) for key in raw_excluded_pairs],
         }
+
+    @staticmethod
+    def _resolve_calibration_selection_paths(
+        raw_paths: object,
+        root: Path,
+    ) -> list[Path]:
+        result: list[Path] = []
+        if not isinstance(raw_paths, (list, tuple)):
+            return result
+        for raw in raw_paths:
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            path = Path(text).expanduser()
+            if not path.is_absolute():
+                path = root / path
+            try:
+                resolved = path.resolve()
+            except OSError:
+                continue
+            if resolved.is_file() and resolved.suffix.lower() in {
+                ".png",
+                ".jpg",
+                ".jpeg",
+                ".tif",
+                ".tiff",
+                ".bmp",
+            }:
+                result.append(resolved)
+        return result
+
+    def _selected_calibration_file_lists(
+        self,
+        root: Path,
+        fallback_left: list[Path],
+        fallback_right: list[Path],
+    ) -> tuple[list[Path], list[Path], bool]:
+        selection = self.panel._load_calibration_pair_selection()
+        excluded_left = set(
+            self._resolve_calibration_selection_paths(
+                selection.get("excluded_left_paths"),
+                root,
+            )
+        )
+        excluded_right = set(
+            self._resolve_calibration_selection_paths(
+                selection.get("excluded_right_paths"),
+                root,
+            )
+        )
+        if not selection.get("manual_mode"):
+            return (
+                [path for path in fallback_left if path not in excluded_left],
+                [path for path in fallback_right if path not in excluded_right],
+                False,
+            )
+        left = [
+            path
+            for path in self._resolve_calibration_selection_paths(selection.get("left_paths"), root)
+            if path not in excluded_left
+        ]
+        right = [
+            path
+            for path in self._resolve_calibration_selection_paths(selection.get("right_paths"), root)
+            if path not in excluded_right
+        ]
+        if not left and not right:
+            return (
+                [path for path in fallback_left if path not in excluded_left],
+                [path for path in fallback_right if path not in excluded_right],
+                False,
+            )
+        return left, right, True
+
+    @staticmethod
+    def _selected_calibration_pairs(
+        left_paths: list[Path],
+        right_paths: list[Path],
+    ) -> list[tuple[str, Path, Path]]:
+        """Pair explicit selections by row, with key matching for unequal lists."""
+
+        def key(path: Path, side: str) -> str:
+            return path.stem.removeprefix(f"{side}_")
+
+        right_by_key: dict[str, list[Path]] = {}
+        for path in right_paths:
+            right_by_key.setdefault(key(path, "right"), []).append(path)
+        common_pairs: list[tuple[str, Path, Path]] = []
+        for left in left_paths:
+            capture_key = key(left, "left")
+            candidates = right_by_key.get(capture_key) or []
+            if candidates:
+                common_pairs.append((capture_key, left, candidates.pop(0)))
+        if common_pairs:
+            return common_pairs
+        if len(left_paths) == len(right_paths):
+            return [
+                (f"selected-{index:04d}", left, right)
+                for index, (left, right) in enumerate(zip(left_paths, right_paths, strict=False))
+            ]
+        right_by_key: dict[str, list[Path]] = {}
+        for path in right_paths:
+            key = path.stem.removeprefix("right_")
+            right_by_key.setdefault(key, []).append(path)
+        pairs: list[tuple[str, Path, Path]] = []
+        for left in left_paths:
+            key = left.stem.removeprefix("left_")
+            candidates = right_by_key.get(key) or []
+            if candidates:
+                pairs.append((key, left, candidates.pop(0)))
+        return pairs
+
+    def _effective_calibration_inputs(
+        self,
+        root: Path,
+        fallback_left: list[Path],
+        fallback_right: list[Path],
+        scanned_pairs: list[tuple[str, Path, Path]],
+        *,
+        mode: str,
+    ) -> tuple[list[Path], list[Path], list[tuple[str, Path, Path]], bool]:
+        """Resolve one immutable calculation input set from the selection sidecar.
+
+        Intrinsic selection belongs to each camera independently. Stereo R,t
+        receives only ordered pairs whose left and right files both survived
+        those independent selections. This prevents excluding a left outlier
+        from silently deleting its otherwise useful right-camera observation.
+        """
+
+        left_paths, right_paths, explicit_selection = self._selected_calibration_file_lists(
+            root,
+            fallback_left,
+            fallback_right,
+        )
+        left_members = set(left_paths)
+        right_members = set(right_paths)
+        pair_candidates = [
+            pair
+            for pair in scanned_pairs
+            if pair[1] in left_members and pair[2] in right_members
+        ]
+        selected_pairs = self._choose_calibration_pairs(pair_candidates)
+        return left_paths, right_paths, selected_pairs, explicit_selection
+
+    def _random_validation_inputs(
+        self,
+        reference: StereoIntrinsicsResult,
+        *,
+        mode: str,
+    ) -> tuple[Path, list[Path], list[Path], list[tuple[str, Path, Path]]]:
+        """Return the exact effective pool used by ``reference`` when available."""
+
+        snapshot = getattr(self.panel, "checkerboard_calibration_selection_snapshot", None)
+        if (
+            isinstance(snapshot, dict)
+            and snapshot.get("reference_result") is reference
+            and str(snapshot.get("mode") or "") == str(mode)
+        ):
+            return (
+                Path(snapshot["root"]),
+                [Path(path) for path in snapshot.get("left_intrinsic_paths", ())],
+                [Path(path) for path in snapshot.get("right_intrinsic_paths", ())],
+                [
+                    (str(key), Path(left), Path(right))
+                    for key, left, right in snapshot.get("stereo_pairs", ())
+                ],
+            )
+
+        root, fallback_left, fallback_right, scanned_pairs = (
+            self.panel._checkerboard_validation_scan_counts()
+        )
+        left_paths, right_paths, stereo_pairs, _explicit = self._effective_calibration_inputs(
+            root,
+            fallback_left,
+            fallback_right,
+            scanned_pairs,
+            mode=mode,
+        )
+        return root, left_paths, right_paths, stereo_pairs
+
+    @staticmethod
+    def _solver_effective_selection(
+        result: StereoIntrinsicsResult,
+    ) -> tuple[tuple[Path, ...], tuple[Path, ...], tuple[tuple[str, Path, Path], ...]] | None:
+        """Read the exact post-deduplication input set emitted by the solver."""
+
+        diagnostics = result.solver_diagnostics
+        if not isinstance(diagnostics, dict):
+            return None
+        payload = diagnostics.get("effective_selection")
+        if not isinstance(payload, dict):
+            return None
+        raw_left = payload.get("left_intrinsic_paths")
+        raw_right = payload.get("right_intrinsic_paths")
+        raw_pairs = payload.get("stereo_pairs")
+        if not isinstance(raw_left, (list, tuple)) or not isinstance(
+            raw_right, (list, tuple)
+        ) or not isinstance(raw_pairs, (list, tuple)):
+            return None
+        pairs: list[tuple[str, Path, Path]] = []
+        for row in raw_pairs:
+            if not isinstance(row, (list, tuple)) or len(row) != 3:
+                return None
+            pairs.append((str(row[0]), Path(str(row[1])), Path(str(row[2]))))
+        return (
+            tuple(Path(str(path)) for path in raw_left),
+            tuple(Path(str(path)) for path in raw_right),
+            tuple(pairs),
+        )
 
     def _choose_calibration_pairs(
         self,
@@ -1886,10 +2979,42 @@ class CalibrationWorkflowController:
         """
 
         selection = self.panel._load_calibration_pair_selection()
-        if not selection.get("manual_mode"):
-            return self._select_calibration_pairs(pairs)
-        included = set(selection.get("included_keys") or ())
-        return [pair for pair in pairs if pair[0] in included]
+        explicit_left = self._resolve_calibration_selection_paths(
+            selection.get("left_paths"),
+            self.panel._calibration_dirs()[0],
+        )
+        explicit_right = self._resolve_calibration_selection_paths(
+            selection.get("right_paths"),
+            self.panel._calibration_dirs()[0],
+        )
+        manual_mode = bool(selection.get("manual_mode"))
+        if manual_mode and (explicit_left or explicit_right):
+            candidates = self._selected_calibration_pairs(explicit_left, explicit_right)
+        elif not manual_mode:
+            candidates = list(pairs)
+        else:
+            included = set(selection.get("included_keys") or ())
+            candidates = [pair for pair in pairs if pair[0] in included]
+        root = self.panel._calibration_dirs()[0]
+        excluded_left = set(
+            self._resolve_calibration_selection_paths(selection.get("excluded_left_paths"), root)
+        )
+        excluded_right = set(
+            self._resolve_calibration_selection_paths(selection.get("excluded_right_paths"), root)
+        )
+        excluded_keys = {str(key) for key in selection.get("excluded_pair_keys") or ()}
+        eligible = [
+            pair
+            for pair in candidates
+            if pair[0] not in excluded_keys
+            and pair[1] not in excluded_left
+            and pair[2] not in excluded_right
+        ]
+        # ``calibration_calculation_pair_count`` is a stereo-pair limit. Apply
+        # it once, after exclusions and side membership have established the
+        # usable intersection. Sampling before that intersection can discard
+        # many otherwise valid pairs when only one camera has an exclusion.
+        return self._select_calibration_pairs(eligible) if not manual_mode else eligible
 
     def toggle_auto_calibration_capture(self) -> None:
         if self._auto_capture_active:
@@ -1909,6 +3034,9 @@ class CalibrationWorkflowController:
         self._auto_capture_saved_pairs = 0
         self._auto_capture_last_pair_key = None
         self._auto_capture_inflight_pair_key = None
+        self._auto_capture_pose_views = {"left": [], "right": []}
+        self._auto_capture_pending_pose_views = None
+        self._auto_capture_pending_pose_novelty = None
         self._auto_capture_last_attempt_s = 0.0
         self._auto_capture_timer.start(max(100, int(interval_s * 1000.0)))
         self.panel.capture_calibration_auto_button.setText("자동 촬영 중지")
@@ -1924,6 +3052,8 @@ class CalibrationWorkflowController:
         self._auto_capture_timer.stop()
         self._auto_capture_active = False
         self._auto_capture_inflight_pair_key = None
+        self._auto_capture_pending_pose_views = None
+        self._auto_capture_pending_pose_novelty = None
         if hasattr(self.panel, "capture_calibration_auto_button"):
             self.panel.capture_calibration_auto_button.setText("자동 촬영 시작")
         if message is not None:
@@ -1972,10 +3102,116 @@ class CalibrationWorkflowController:
         if pair_key == self._auto_capture_last_pair_key:
             return
 
-        metadata_by_camera = {
+        preview_metadata = {
             "left": dict(left.get("metadata") or {}) if isinstance(left.get("metadata"), dict) else {},
             "right": dict(right.get("metadata") or {}) if isinstance(right.get("metadata"), dict) else {},
         }
+        native_boundary_available = all(
+            callable(
+                getattr(
+                    getattr(self.panel, f"{side}_pane", None),
+                    "calibration_native_frame_near",
+                    None,
+                )
+            )
+            for side in ("left", "right")
+        )
+        allow_preview_fallback = bool(
+            getattr(self.panel, "_allow_legacy_calibration_preview_fallback", False)
+        )
+        corners_available = all(bool(row.get("corners")) for row in (left, right))
+        try:
+            pose_views = {
+                "left": extract_view_geometry(
+                    left.get("corners") or (),
+                    (left_image.width(), left_image.height()),
+                    pattern_size=self.panel._checkerboard_config().pattern_size,
+                    view_id=f"preview-left-{left_request_id}",
+                ),
+                "right": extract_view_geometry(
+                    right.get("corners") or (),
+                    (right_image.width(), right_image.height()),
+                    pattern_size=self.panel._checkerboard_config().pattern_size,
+                    view_id=f"preview-right-{right_request_id}",
+                ),
+            } if corners_available else {}
+        except (TypeError, ValueError) as exc:
+            self.panel.calibration_status_label.setText(
+                f"자동 촬영 대기: checkerboard pose 분석 실패 ({exc})"
+            )
+            return
+        if (native_boundary_available or not allow_preview_fallback) and not pose_views:
+            self.panel.calibration_status_label.setText(
+                "자동 촬영 대기: checkerboard corner geometry가 없습니다"
+            )
+            return
+        reference_views = getattr(
+            self,
+            "_auto_capture_pose_views",
+            {"left": [], "right": []},
+        )
+        novelty = {
+            side: pose_novelty(pose_views[side], reference_views.get(side, ()))
+            for side in ("left", "right")
+        } if pose_views else {"left": 2.0, "right": 2.0}
+        if any(value <= 1.0 for value in novelty.values()):
+            duplicate_sides = ", ".join(
+                side for side, value in novelty.items() if value <= 1.0
+            )
+            self.panel.calibration_status_label.setText(
+                f"자동 촬영 대기: {duplicate_sides} checkerboard pose가 이전과 거의 같습니다. "
+                "위치·거리·yaw/pitch/roll을 바꾸세요."
+            )
+            return
+
+        native_frames: dict[str, QtGui.QImage] = {}
+        metadata_by_camera: dict[str, dict[str, object]] = {}
+        for side in ("left", "right"):
+            timestamp_value = preview_metadata[side].get("timestamp_s")
+            try:
+                timestamp_s = float(timestamp_value)
+            except (TypeError, ValueError):
+                self.panel.calibration_status_label.setText(
+                    f"자동 촬영 대기: {side} preview timestamp가 없습니다"
+                )
+                return
+            pane = getattr(self.panel, f"{side}_pane", None)
+            native_getter = getattr(pane, "calibration_native_frame_near", None)
+            if not callable(native_getter):
+                if not allow_preview_fallback:
+                    self.panel.calibration_status_label.setText(
+                        f"자동 촬영 대기: {side} native lossless frame API가 없습니다"
+                    )
+                    return
+                preview_image = left_image if side == "left" else right_image
+                native_frames[side] = preview_image
+                metadata_by_camera[side] = dict(preview_metadata[side])
+                continue
+            native = (
+                native_getter(
+                    timestamp_s,
+                    maximum_delta_s=0.001,
+                    maximum_age_s=CALIBRATION_AUTO_DETECTION_MAX_AGE_S,
+                )
+                if callable(native_getter)
+                else None
+            )
+            if native is None:
+                self.panel.calibration_status_label.setText(
+                    f"자동 촬영 대기: {side} preview와 동일한 native frame을 기다리는 중"
+                )
+                return
+            frame_id, native_image, native_metadata = native
+            native_frames[side] = native_image
+            metadata_by_camera[side] = {
+                **dict(native_metadata),
+                "frame_id": str(frame_id),
+                "calibration_source": "native_frame_cache",
+                "preview_width": left_image.width() if side == "left" else right_image.width(),
+                "preview_height": left_image.height() if side == "left" else right_image.height(),
+            }
+        left_image = native_frames["left"]
+        right_image = native_frames["right"]
         now_s = time.monotonic()
         for camera in ("left", "right"):
             timestamp_s = metadata_by_camera[camera].get("timestamp_s")
@@ -2004,6 +3240,8 @@ class CalibrationWorkflowController:
         self._auto_capture_last_pair_key = pair_key
         self._auto_capture_last_attempt_s = now_s
         self._auto_capture_inflight_pair_key = pair_key
+        self._auto_capture_pending_pose_views = pose_views
+        self._auto_capture_pending_pose_novelty = novelty
         started = self.capture_calibration_images(
             frames={"left": left_image, "right": right_image},
             metadata_by_camera=metadata_by_camera,
@@ -2011,6 +3249,8 @@ class CalibrationWorkflowController:
         )
         if not started:
             self._auto_capture_inflight_pair_key = None
+            self._auto_capture_pending_pose_views = None
+            self._auto_capture_pending_pose_novelty = None
             return
         self.panel.calibration_status_label.setText(
             f"자동 촬영 중: 유효 stereo pair {self._auto_capture_saved_pairs}/{target_pairs} | "
@@ -2019,20 +3259,49 @@ class CalibrationWorkflowController:
 
     def _handle_checkerboard_capture_completed(self, result: object) -> None:
         capture_origin = self._capture_origin
+        source_label = {
+            "ftp": "FTP HR",
+            "ftp_oz": "FTP OZ",
+            "ftp_oz_sync": "FTP OZ sync",
+        }.get(capture_origin, "")
+        source_prefix = f"{source_label} " if source_label else ""
         if not isinstance(result, dict):
             self.panel._handle_checkerboard_capture_failed("worker returned an invalid capture result")
             return
         stem = str(result.get("stem") or "--")
         saved_sides = tuple(str(side) for side in result.get("saved_sides", ()) or ())
         status_parts = tuple(str(part) for part in result.get("status_parts", ()) or ())
+        side_results = result.get("side_results")
+        if isinstance(side_results, dict):
+            for side in ("left", "right"):
+                detail = side_results.get(side)
+                if isinstance(detail, dict):
+                    self._publish_calibration_capture_event(
+                        {
+                            "side": side,
+                            "phase": "completed",
+                            **detail,
+                        },
+                        operation={
+                            "ftp": "Capture HR Still (FTP)",
+                            "ftp_oz": "Capture OZ Still (FTP)",
+                            "auto": "Auto capture",
+                        }.get(capture_origin, "Capture Live Pair"),
+                        capture_id=stem,
+                    )
         if not saved_sides:
             status = f"Capture {stem}: no calibration images saved; " + ", ".join(status_parts)
             if capture_origin == "auto" and self._auto_capture_active:
                 status = f"자동 촬영 대기: Capture {stem} 실패; 다음 새 검출 pair를 기다리는 중"
             self.panel.calibration_status_label.setText(status)
-            self.panel._log(f"[캘리브레이션] 이미지 캡처 실패 {stem}: {', '.join(status_parts)}")
+            self.panel._log(
+                f"[캘리브레이션] {source_prefix}이미지 캡처 실패 {stem}: "
+                f"{', '.join(status_parts)}"
+            )
             if capture_origin == "auto":
                 self._auto_capture_inflight_pair_key = None
+                self._auto_capture_pending_pose_views = None
+                self._auto_capture_pending_pose_novelty = None
                 self._capture_origin = "manual"
             return
         status = f"Captured {stem}: " + ", ".join(status_parts)
@@ -2047,15 +3316,36 @@ class CalibrationWorkflowController:
                 f"pair_delta_s={float(pair_delta_s):.6f}"
             )
         self.panel.calibration_status_label.setText(status)
+        session_root = getattr(self.panel, "_calibration_session_root", None)
+        if session_root is not None:
+            try:
+                write_calibration_session_manifest(session_root, source=capture_origin)
+            except OSError:
+                pass
         self.panel._log(
-            f"[캘리브레이션] 이미지 캡처 {stem}: "
+            f"[캘리브레이션] {source_prefix}이미지 캡처 {stem}: "
             f"저장={','.join(saved_sides)}; {', '.join(status_parts)}"
         )
         if capture_origin == "auto":
             self._auto_capture_inflight_pair_key = None
             pair_saved = bool(result.get("pair_timing_ok")) and set(saved_sides) == {"left", "right"}
-            if pair_saved:
+            count_toward_auto_run = pair_saved and self._auto_capture_active
+            if count_toward_auto_run:
                 self._auto_capture_saved_pairs += 1
+                pending_views = getattr(self, "_auto_capture_pending_pose_views", None)
+                if isinstance(pending_views, dict):
+                    pose_views = getattr(
+                        self,
+                        "_auto_capture_pose_views",
+                        {"left": [], "right": []},
+                    )
+                    for side in ("left", "right"):
+                        view = pending_views.get(side)
+                        if isinstance(view, CalibrationViewGeometry):
+                            pose_views.setdefault(side, []).append(view)
+                    self._auto_capture_pose_views = pose_views
+            self._auto_capture_pending_pose_views = None
+            self._auto_capture_pending_pose_novelty = None
             self._capture_origin = "manual"
             if self._auto_capture_active:
                 target_pairs = int(self.panel.calibration_auto_target_spin.value())
@@ -2068,15 +3358,44 @@ class CalibrationWorkflowController:
                         f"자동 촬영 대기: 유효 stereo pair "
                         f"{self._auto_capture_saved_pairs}/{target_pairs}개 저장됨"
                     )
+            elif pair_saved:
+                self.panel.calibration_status_label.setText(
+                    "자동 촬영은 중지됨: 진행 중이던 pair는 파일로 저장됐지만 "
+                    "중지된 자동 촬영 횟수에는 포함하지 않았습니다."
+                )
 
     def _handle_checkerboard_capture_failed(self, error: str) -> None:
+        capture_origin = self._capture_origin
+        source_label = {
+            "ftp": "FTP HR",
+            "ftp_oz": "FTP OZ",
+            "ftp_oz_sync": "FTP OZ sync",
+        }.get(capture_origin, "")
+        source_prefix = f"{source_label} " if source_label else ""
+        operation = {
+            "ftp": "Capture HR Still (FTP)",
+            "ftp_oz": "Capture OZ Still (FTP)",
+            "auto": "Auto capture",
+        }.get(capture_origin, "Capture Live Pair")
+        for side in ("left", "right"):
+            self._publish_calibration_capture_event(
+                {
+                    "side": side,
+                    "phase": "failed",
+                    "state": "failed",
+                    "response": str(error),
+                },
+                operation=operation,
+            )
         if self._capture_origin == "auto" and self._auto_capture_active:
             self.panel.calibration_status_label.setText(f"자동 촬영 대기: Capture worker 실패 ({error})")
         else:
             self.panel.calibration_status_label.setText(f"Calibration capture failed: {error}")
-        self.panel._log(f"[캘리브레이션] 이미지 캡처 worker 실패: {error}")
+        self.panel._log(f"[캘리브레이션] {source_prefix}이미지 캡처 worker 실패: {error}")
         if self._capture_origin == "auto":
             self._auto_capture_inflight_pair_key = None
+            self._auto_capture_pending_pose_views = None
+            self._auto_capture_pending_pose_novelty = None
             self._capture_origin = "manual"
 
     def run_intrinsic_calibration(self) -> None:
@@ -2098,14 +3417,16 @@ class CalibrationWorkflowController:
         root, left_paths, right_paths, pairs = self.panel._checkerboard_validation_scan_counts()
         source_pair_count = len(pairs)
         calculation_pair_limit = self._calibration_calculation_pair_limit()
-        selected_pairs = self._choose_calibration_pairs(pairs)
-        if mode == "checkerboard":
-            left_paths = [left for _key, left, _right in selected_pairs]
-            right_paths = [right for _key, _left, right in selected_pairs]
-        elif calculation_pair_limit > 0:
-            left_paths = [left for _key, left, _right in selected_pairs]
-            right_paths = [right for _key, _left, right in selected_pairs]
-        pair_count = len(selected_pairs) if calculation_pair_limit > 0 or mode == "checkerboard" else len(pairs)
+        left_paths, right_paths, selected_pairs, explicit_selection = (
+            self._effective_calibration_inputs(
+                root,
+                left_paths,
+                right_paths,
+                pairs,
+                mode=mode,
+            )
+        )
+        pair_count = len(selected_pairs)
         min_images = self.panel.calib_min_images_spin.value()
         if not left_paths or not right_paths:
             self.panel._set_health_label(
@@ -2121,9 +3442,15 @@ class CalibrationWorkflowController:
                 "bad",
             )
             return
+        stereo_paths = [
+            path
+            for _key, left_path, right_path in selected_pairs
+            for path in (left_path, right_path)
+        ]
+        zoom_input_paths = list(dict.fromkeys([*left_paths, *right_paths, *stereo_paths]))
         capture_zoom_level, zoom_detail = self._capture_zoom_level_for_paths(
             root,
-            [*left_paths, *right_paths],
+            zoom_input_paths,
         )
         if capture_zoom_level is None:
             self.panel._set_health_label(
@@ -2134,10 +3461,19 @@ class CalibrationWorkflowController:
             self.panel._log(f"[캘리브레이션] 계산 중단: {zoom_detail}")
             return
         self.panel.scan_checkerboard_validation_files()
+        selection_snapshot = {
+            "root": root,
+            "mode": mode,
+            "left_intrinsic_paths": tuple(left_paths),
+            "right_intrinsic_paths": tuple(right_paths),
+            "stereo_pairs": tuple(selected_pairs),
+            "explicit_selection": bool(explicit_selection),
+        }
         worker = CheckerboardCalibrationWorker(
             mode=mode,
-            left_paths=left_paths,
-            right_paths=right_paths,
+            left_intrinsic_paths=left_paths,
+            right_intrinsic_paths=right_paths,
+            stereo_pairs=selected_pairs,
             config=self.panel._checkerboard_config(),
         )
         thread = QtCore.QThread(self.panel)
@@ -2151,7 +3487,8 @@ class CalibrationWorkflowController:
             min_images=min_images,
             capture_zoom_level=capture_zoom_level,
             left_count=len(left_paths),
-            right_count=len(right_paths): self.panel._handle_intrinsic_calibration_completed(
+            right_count=len(right_paths),
+            selection_snapshot=selection_snapshot: self.panel._handle_intrinsic_calibration_completed(
                 result,
                 mode=mode,
                 root=root,
@@ -2160,6 +3497,7 @@ class CalibrationWorkflowController:
                 capture_zoom_level=capture_zoom_level,
                 left_count=left_count,
                 right_count=right_count,
+                selection_snapshot=selection_snapshot,
             )
         )
         worker.progress.connect(self.panel._handle_calibration_progress)
@@ -2219,8 +3557,16 @@ class CalibrationWorkflowController:
                 "bad",
             )
             return
-        root, _left_paths, _right_paths, pairs = self.panel._checkerboard_validation_scan_counts()
-        selected_pairs = self._choose_calibration_pairs(pairs)
+        root, scanned_left, scanned_right, pairs = self.panel._checkerboard_validation_scan_counts()
+        _selected_left, _selected_right, selected_pairs, _explicit_selection = (
+            self._effective_calibration_inputs(
+                root,
+                scanned_left,
+                scanned_right,
+                pairs,
+                mode="checkerboard",
+            )
+        )
         if len(selected_pairs) < 3:
             self.panel._set_health_label(
                 self.panel.checkerboard_validation_status_label,
@@ -2334,13 +3680,39 @@ class CalibrationWorkflowController:
         self.panel._refresh_camera_parameters_tab()
         self.panel._refresh_operation_header()
 
-    def save_stereo_extrinsics_profile(self) -> None:
+    def save_stereo_extrinsics_profile(
+        self,
+        *,
+        quality_warning_confirmed: bool = False,
+    ) -> bool:
         profile = getattr(self.panel, "selected_extrinsics_profile", None)
         if not isinstance(profile, StereoExtrinsicsProfile):
             self.panel.calibration_status_label.setText(
                 "Calculate or load an R,t profile before saving."
             )
-            return
+            return False
+        intrinsics_result = getattr(self.panel, "last_calibration_result", None)
+        if isinstance(intrinsics_result, StereoIntrinsicsResult):
+            state, reasons = self._calibration_quality_state(intrinsics_result)
+            if state == "FAIL" or (state == "WARNING" and not quality_warning_confirmed):
+                qualifier = "FAIL" if state == "FAIL" else "WARNING requires confirmation"
+                self.panel.calibration_status_label.setText(
+                    f"Cannot save R,t: calibration quality {qualifier} ("
+                    + ", ".join(reasons)
+                    + ")"
+                )
+                return False
+            if state == "WARNING":
+                summary = dict(
+                    getattr(self.panel, "checkerboard_validation_summary", {}) or {}
+                )
+                summary["quality_override"] = {
+                    "action": "save_stereo_extrinsics_profile",
+                    "confirmed": True,
+                    "confirmed_utc_ns": time.time_ns(),
+                    "reason_codes": list(reasons),
+                }
+                self.panel.checkerboard_validation_summary = summary
         output = self.panel._extrinsics_storage_path(profile.source_zoom_level)
         output.parent.mkdir(parents=True, exist_ok=True)
         save_stereo_extrinsics_json(output, profile)
@@ -2349,6 +3721,7 @@ class CalibrationWorkflowController:
         self.panel.calibration_status_label.setText(f"Saved stereo R,t profile: {output}")
         self.panel._log(f"[캘리브레이션] 독립 R,t profile 저장: {output}")
         self.panel._refresh_operation_header()
+        return True
 
     def load_stereo_extrinsics_profile(self) -> None:
         initial_path = self.panel._extrinsics_storage_path()
@@ -2387,10 +3760,23 @@ class CalibrationWorkflowController:
         self.panel._refresh_camera_parameters_tab()
         self.panel._refresh_operation_header()
 
-    def apply_calibration_bundle(self) -> None:
-        """Apply the independently selected K/D and R/T without validation gating."""
+    def apply_calibration_bundle(
+        self,
+        *,
+        quality_warning_confirmed: bool = False,
+    ) -> bool:
+        """Apply independent K/D and R/T after the camera-quality gate.
 
-        self.panel.apply_intrinsics_to_distance()
+        Cross-zoom validation remains informational; this confirmation covers
+        only the source-backed camera calibration WARNING state.
+        """
+
+        applied = (
+            self.panel.apply_intrinsics_to_distance(quality_warning_confirmed=True)
+            if quality_warning_confirmed
+            else self.panel.apply_intrinsics_to_distance()
+        )
+        return False if applied is False else True
 
     def _handle_calibration_progress(self, progress: object) -> None:
         if not isinstance(progress, dict):
@@ -2426,21 +3812,60 @@ class CalibrationWorkflowController:
         capture_zoom_level: int,
         left_count: int,
         right_count: int,
+        selection_snapshot: dict[str, object] | None = None,
     ) -> None:
         if not isinstance(result, StereoIntrinsicsResult):
             self.panel._handle_intrinsic_calibration_failed("worker returned an invalid calibration result")
             return
+        if result.left.image_count < min_images or result.right.image_count < min_images:
+            quality = dict(result.calibration_quality or {})
+            reason_codes = list(quality.get("reason_codes", ()) or ())
+            reasons = list(quality.get("reasons", ()) or ())
+            code = "configured_minimum_effective_poses_not_met"
+            if code not in reason_codes:
+                reason_codes.append(code)
+                reasons.append(
+                    {
+                        "severity": "FAIL",
+                        "code": code,
+                        "message": (
+                            f"effective poses left={result.left.image_count}, "
+                            f"right={result.right.image_count}; configured minimum={min_images}"
+                        ),
+                    }
+                )
+            quality.update(state="FAIL", reason_codes=reason_codes, reasons=reasons)
+            result = replace(result, calibration_quality=quality)
         warning = (
             f"\nWARNING: valid images below requested minimum {min_images}."
             if result.left.image_count < min_images or result.right.image_count < min_images
             else ""
         )
+        effective_pair_count = pair_count
+        solver_effective = self._solver_effective_selection(result)
+        if solver_effective is not None:
+            effective_left, effective_right, effective_pairs = solver_effective
+            effective_pair_count = len(effective_pairs)
+            if selection_snapshot is not None:
+                selection_snapshot = {
+                    **dict(selection_snapshot),
+                    "left_intrinsic_paths": effective_left,
+                    "right_intrinsic_paths": effective_right,
+                    "stereo_pairs": effective_pairs,
+                    "input_left_intrinsic_paths": tuple(
+                        selection_snapshot.get("left_intrinsic_paths", ())
+                    ),
+                    "input_right_intrinsic_paths": tuple(
+                        selection_snapshot.get("right_intrinsic_paths", ())
+                    ),
+                    "input_stereo_pairs": tuple(selection_snapshot.get("stereo_pairs", ())),
+                }
         text = self.panel._format_checkerboard_validation_result_summary(
             result,
             mode=mode,
             title="Full checkerboard calibration result",
             root=root,
-            pair_count=pair_count if mode == "checkerboard" else None,
+            pair_count=effective_pair_count if mode == "checkerboard" else None,
         ) + warning
         self.panel._checkerboard_validation_set_result(
             result,
@@ -2452,11 +3877,15 @@ class CalibrationWorkflowController:
                 "capture_zoom_level": capture_zoom_level,
                 "left_image_count": left_count,
                 "right_image_count": right_count,
-                "stereo_pair_count": pair_count,
+                "left_effective_image_count": result.left.image_count,
+                "right_effective_image_count": result.right.image_count,
+                "stereo_input_pair_count": pair_count,
+                "stereo_pair_count": effective_pair_count,
                 "min_images": min_images,
             },
             text=text,
             zoom_level=capture_zoom_level,
+            selection_snapshot=selection_snapshot,
         )
         if mode == "checkerboard":
             self.panel._log("[캘리브레이션] 전체 사진 기반 intrinsic 및 체커보드 stereo 외부 파라미터 계산을 완료했습니다.")

@@ -32,7 +32,12 @@ if [[ -z "$PYTHON_BIN" ]]; then
 fi
 
 export PYTHONPATH="$APPS_DIR:$SASL_ROOT:$COMMON_PYTHON${PYTHONPATH:+:$PYTHONPATH}"
-export MPLCONFIGDIR="${MPLCONFIGDIR:-$SASL_ROOT/.local/workstation_data/.cache/matplotlib}"
+WORKSTATION_DATA_ROOT="${SASL_WORKSTATION_DATA_ROOT:-$SASL_ROOT/.local/workstation_data}"
+if [[ "$WORKSTATION_DATA_ROOT" != /* ]]; then
+  WORKSTATION_DATA_ROOT="$SASL_ROOT/$WORKSTATION_DATA_ROOT"
+fi
+export SASL_WORKSTATION_DATA_ROOT="$WORKSTATION_DATA_ROOT"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-$WORKSTATION_DATA_ROOT/.cache/matplotlib}"
 mkdir -p "$MPLCONFIGDIR"
 
 case "${1:-}" in
@@ -41,4 +46,4 @@ case "${1:-}" in
     ;;
 esac
 
-exec "$PYTHON_BIN" -m Workstation --maximized --start "$@"
+exec "$PYTHON_BIN" -m Workstation --maximized "$@"

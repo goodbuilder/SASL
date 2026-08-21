@@ -87,6 +87,68 @@ def test_import_artifact_copies_bytes_hashes_and_deduplicates_content(tmp_path: 
     assert manifest["event_log"]["sha256"]
 
 
+def test_register_session_artifact_records_original_relative_path_without_copy(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "session"
+    sealed = root / "ulog" / "left" / "flight.ulg"
+    sealed.parent.mkdir(parents=True)
+    payload = b"ULog\x01session-owned-bytes"
+    sealed.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    ledger = RunEvidenceLedger(root)
+    ledger.apply_setup(_setup())
+
+    record = ledger.register_session_artifact(
+        sealed,
+        role="ulog/left",
+        media_type="application/vnd.px4.ulog",
+        expected_size_bytes=len(payload),
+        expected_sha256=digest,
+        metadata={"source_id": "left"},
+    )
+
+    assert record.relative_path == "ulog/left/flight.ulg"
+    assert record.size_bytes == len(payload)
+    assert record.sha256 == digest
+    assert not (root / "assets").exists()
+    assert sealed.read_bytes() == payload
+    assert dict(record.metadata) == {
+        "registration": "session_reference",
+        "snapshot_policy": "reference_by_hash",
+        "source_id": "left",
+        "storage_class": "sealed_immutable",
+    }
+    rows = [json.loads(line) for line in (root / "run_events.jsonl").read_text().splitlines()]
+    assert rows[-1]["event_type"] == "artifact_registered"
+
+
+def test_register_session_artifact_rejects_escape_and_producer_hash_mismatch(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "session"
+    root.mkdir()
+    internal = root / "raw" / "target.jsonl"
+    internal.parent.mkdir()
+    internal.write_bytes(b'{"message":1}\n')
+    outside = tmp_path / "outside.ulg"
+    outside.write_bytes(b"outside")
+    ledger = RunEvidenceLedger(root)
+    ledger.apply_setup(_setup())
+
+    with pytest.raises(ValueError, match="inside the session root"):
+        ledger.register_session_artifact(outside, role="ulog/left")
+    with pytest.raises(ValueError, match="SHA-256"):
+        ledger.register_session_artifact(
+            internal,
+            role="target_drone_raw_mavlink_jsonl",
+            expected_sha256="0" * 64,
+        )
+
+    assert not (root / "artifacts.jsonl").exists()
+    assert not (root / "run_events.jsonl").exists()
+
+
 def test_resolve_artifact_rejects_path_traversal(tmp_path: Path) -> None:
     ledger = RunEvidenceLedger(tmp_path / "session")
     ledger.apply_setup(_setup())
@@ -121,4 +183,3 @@ def test_persisted_json_is_canonical_and_contains_no_machine_source_path(tmp_pat
     rows = [json.loads(line) for line in (tmp_path / "session" / "artifacts.jsonl").read_text().splitlines()]
     assert rows[0]["source_name"] == "hr_left.png"
     assert str(tmp_path) not in json.dumps(rows[0])
-

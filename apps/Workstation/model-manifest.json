@@ -1,0 +1,7 @@
+{
+  "schema": "workstation-yolo-model-v1",
+  "filename": "yolov8m.pt",
+  "size_bytes": 52136884,
+  "sha256": "5d4a90cdc7a21786cc59cd19778e9eafff836df9e2da32524737c7ee6efe4fe5",
+  "provisioning": "Copy the approved YOLOv8m bytes into WORKSTATION_MODELS_ROOT; runtime download is disabled."
+}

@@ -24,6 +24,7 @@ SASL_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_YOLO_PYTHON = os.environ.get("PYTHON_BIN") or sys.executable
 DEFAULT_YOLO_WEIGHTS = os.environ.get("YOLO_MODEL_PATH") or str(SASL_ROOT / ".local" / "models" / "yolov8m.pt")
 DEFAULT_RTSP_LATENCY_MS = 50
+DEFAULT_PREVIEW_DISPLAY_RATE_HZ = 15.0
 DEFAULT_CPU_YOLO_MAX_RATE_HZ = 20.0
 DEFAULT_CPU_YOLO_INITIAL_RATE_HZ = 15.0
 DEFAULT_CPU_YOLO_ADAPTIVE_MAX_RATE_HZ = 20.0
@@ -393,6 +394,28 @@ def effective_yolo_max_rate_hz(max_rate_hz: float | int | str | None, *, device:
     return max(0.0, rate_hz)
 
 
+def _should_emit_preview_frame(config: dict[str, Any], timestamp_s: float) -> bool:
+    """Rate-limit UI preview frames while keeping capture/detection independent."""
+
+    try:
+        display_rate_hz = float(config.get("display_rate_hz", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        display_rate_hz = 0.0
+    if display_rate_hz <= 0.0:
+        return True
+
+    current_s = float(timestamp_s)
+    last_s = config.get("_last_preview_emit_s")
+    try:
+        elapsed_s = current_s - float(last_s) if last_s is not None else float("inf")
+    except (TypeError, ValueError):
+        elapsed_s = float("inf")
+    if elapsed_s >= 0.0 and elapsed_s < 1.0 / display_rate_hz:
+        return False
+    config["_last_preview_emit_s"] = current_s
+    return True
+
+
 @dataclass
 class AdaptiveYoloRateLimiter:
     enabled: bool
@@ -440,6 +463,33 @@ class AdaptiveYoloRateLimiter:
         elif decoded_hz >= CPU_DECODE_HZ_RECOVERY:
             self.target_rate_hz = min(self.max_rate_hz, self.target_rate_hz + 0.15)
         return abs(self.target_rate_hz - previous_rate_hz) >= 0.05
+
+
+def _activate_cpu_fallback_rate_limiter(
+    rate_limiter: AdaptiveYoloRateLimiter,
+    config: dict[str, Any],
+) -> None:
+    """Enable the CPU limiter when a requested CUDA device falls back at runtime."""
+
+    if rate_limiter.enabled:
+        return
+    try:
+        configured_max_rate_hz = float(config.get("max_rate_hz", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        configured_max_rate_hz = 0.0
+    max_rate_hz = min(
+        configured_max_rate_hz if configured_max_rate_hz > 0.0 else DEFAULT_CPU_YOLO_MAX_RATE_HZ,
+        DEFAULT_CPU_YOLO_ADAPTIVE_MAX_RATE_HZ,
+    )
+    min_rate_hz = min(DEFAULT_CPU_YOLO_MIN_RATE_HZ, max_rate_hz)
+    rate_limiter.enabled = True
+    rate_limiter.max_rate_hz = max_rate_hz
+    rate_limiter.min_rate_hz = min_rate_hz
+    rate_limiter.target_rate_hz = min(max(DEFAULT_CPU_YOLO_INITIAL_RATE_HZ, min_rate_hz), max_rate_hz)
+    config["device"] = "cpu"
+    config["adaptive_rate"] = True
+    config["adaptive_max_rate_hz"] = max_rate_hz
+    config["max_rate_hz"] = max_rate_hz
 
 
 def _worker_cpu_threads(config: dict[str, Any]) -> int:
@@ -1464,7 +1514,9 @@ def _emit_preview_frame(
     source_timestamp_s: float | None = None,
     timestamp_source: str = "app-receive",
     extra_metadata: dict[str, Any] | None = None,
-) -> None:
+) -> bool:
+    if not _should_emit_preview_frame(config, timestamp_s):
+        return False
     display_frame = frame
     max_preview_width = int(config["preview_max_width"])
     if max_preview_width > 0 and display_frame.shape[1] > max_preview_width:
@@ -1493,6 +1545,7 @@ def _emit_preview_frame(
         else "app-receive",
     )
     output_queue.put(("frame", metadata, rgb.shape[1], rgb.shape[0], rgb.tobytes()))
+    return True
 
 
 def _emit_measurement_frame(
@@ -1620,7 +1673,7 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
                 frame = np.frombuffer(map_info.data, dtype=np.uint8).reshape((height, width, 3)).copy()
             finally:
                 buffer.unmap(map_info)
-            _emit_preview_frame(
+            preview_emitted = _emit_preview_frame(
                 cv2,
                 frame,
                 config,
@@ -1633,7 +1686,7 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
             with latest_lock:
                 latest_sequence += 1
                 decoded_frames += 1
-                displayed_frames += 1
+                displayed_frames += int(preview_emitted)
                 latest_width = width
                 latest_height = height
                 latest_frame = {
@@ -1745,6 +1798,8 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
             if annotated is None:
                 time.sleep(0.2)
                 continue
+            if config.get("_yolo_cpu_fallback_active"):
+                _activate_cpu_fallback_rate_limiter(rate_limiter, config)
             if inferred:
                 inferred_frames += 1
             last_status_s = _emit_stream_status(output_queue, enable_detection, best_detection, now_s, last_status_s)
@@ -1801,7 +1856,7 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
                 if record_writer_state is None:
                     record_writer_state = _open_record_video_writer(cv2, config, output_queue, frame_width, frame_height)
                 _write_record_video_frame(cv2, record_writer_state, frame)
-            _emit_preview_frame(
+            preview_emitted = _emit_preview_frame(
                 cv2,
                 frame,
                 config,
@@ -1812,7 +1867,7 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
             with latest_lock:
                 latest_sequence += 1
                 decoded_frames += 1
-                displayed_frames += 1
+                displayed_frames += int(preview_emitted)
                 width = frame_width
                 height = frame_height
                 latest_frame = {
@@ -1897,6 +1952,8 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
             if annotated is None:
                 time.sleep(0.2)
                 continue
+            if config.get("_yolo_cpu_fallback_active"):
+                _activate_cpu_fallback_rate_limiter(rate_limiter, config)
             if inferred:
                 inferred_frames += 1
             last_status_s = _emit_stream_status(output_queue, enable_detection, best_detection, now_s, last_status_s)
@@ -1980,7 +2037,7 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
                         source_timestamp_s = float(av_frame.pts * av_frame.time_base)
                         timestamp_source = "pyav-pts"
                         timestamp_reference = "source"
-                    _emit_preview_frame(
+                    preview_emitted = _emit_preview_frame(
                         cv2,
                         frame,
                         config,
@@ -1992,7 +2049,7 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
                     with latest_lock:
                         latest_sequence += 1
                         decoded_frames += 1
-                        displayed_frames += 1
+                        displayed_frames += int(preview_emitted)
                         width = frame_width
                         height = frame_height
                         latest_frame = {
@@ -2083,6 +2140,8 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
             if annotated is None:
                 time.sleep(0.2)
                 continue
+            if config.get("_yolo_cpu_fallback_active"):
+                _activate_cpu_fallback_rate_limiter(rate_limiter, config)
             if inferred:
                 inferred_frames += 1
             last_status_s = _emit_stream_status(output_queue, enable_detection, best_detection, now_s, last_status_s)
@@ -2144,7 +2203,16 @@ class _BoundedProcessOutputQueue:
             try:
                 self.frame_queue.put_nowait(message)
             except queue.Full:
-                return
+                # A preview is a latest-state signal.  Drop the stale queued
+                # frame so a slow GUI does not render old video indefinitely.
+                try:
+                    self.frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self.frame_queue.put_nowait(message)
+                except queue.Full:
+                    pass
             return
         self.event_queue.put(message)
 
@@ -2188,7 +2256,7 @@ class YoloStreamWorker(QtCore.QObject):
         conf_threshold: float,
         iou_threshold: float,
         max_rate_hz: float,
-        display_rate_hz: float = 0.0,
+        display_rate_hz: float = DEFAULT_PREVIEW_DISPLAY_RATE_HZ,
         preview_max_width: int = 960,
         rtsp_latency_ms: int = DEFAULT_RTSP_LATENCY_MS,
         decoder: str = DECODER_NVIDIA,

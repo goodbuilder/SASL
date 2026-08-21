@@ -108,7 +108,7 @@ def test_optical_pose_session_projection_excludes_qimages_and_is_published(
     assert projection["snapshot"]["auto_suggestions"][0]["suggestion_id"] == "suggestion-1"
 
     output_dir = tmp_path / "sessions" / "persisted-session"
-    save_session_files(
+    saved_files = save_session_files(
         output_dir,
         metadata={"session_id": "persisted-session", "optical_pose": projection},
         pair_rows=[],
@@ -116,8 +116,7 @@ def test_optical_pose_session_projection_excludes_qimages_and_is_published(
         px4_rows={"left": [], "right": []},
         gnss_base_rows=[],
     )
-    static_path = output_dir / "persisted-session_session_static.json"
-    saved = json.loads(static_path.read_text(encoding="utf-8"))
+    saved = json.loads(saved_files.context_json.read_text(encoding="utf-8"))
     assert saved["metadata"]["optical_pose"] == projection
 
 
@@ -149,7 +148,7 @@ def test_drone_rtk_observation_history_is_durable_across_session_persistence(
     assert observations[0]["observation_id"] != observations[1]["observation_id"]
 
     output_dir = tmp_path / "sessions" / "drone-rtk-session"
-    save_session_files(
+    saved_files = save_session_files(
         output_dir,
         metadata={"session_id": "drone-rtk-session", "optical_pose": projection},
         pair_rows=[],
@@ -157,8 +156,7 @@ def test_drone_rtk_observation_history_is_durable_across_session_persistence(
         px4_rows={"left": [], "right": []},
         gnss_base_rows=[],
     )
-    static_path = output_dir / "drone-rtk-session_session_static.json"
-    saved = json.loads(static_path.read_text(encoding="utf-8"))
+    saved = json.loads(saved_files.context_json.read_text(encoding="utf-8"))
     saved_observations = saved["metadata"]["optical_pose"]["snapshot"]["drone_rtk_capture_observations"]
     assert len(saved_observations) == 2
     assert saved_observations[0]["gnss"]["drone"]["latitude_deg"] == 1.0
