@@ -67,9 +67,9 @@ Apply from a PX4-Autopilot `v1.17.0-alpha1-1214-g7b1e54889d` checkout:
 
 ```sh
 cd /path/to/PX4-Autopilot
-git apply /path/to/SASL-20270724/apps/Workstation/firmware/patches/px4-v1.17-sasl-can-mag-core.patch
-git apply /path/to/SASL-20270724/apps/Workstation/firmware/patches/px4-v1.17-sasl-can-mag-v6x-flash-fit.patch
-(cd src/modules/mavlink/mavlink && git apply /path/to/SASL-20270724/apps/Workstation/firmware/patches/px4-v1.17-sasl-can-mag-mavlink-dialect.patch)
+git apply /path/to/SASL-20260821/apps/Workstation/firmware/patches/px4-v1.17-sasl-can-mag-core.patch
+git apply /path/to/SASL-20260821/apps/Workstation/firmware/patches/px4-v1.17-sasl-can-mag-v6x-flash-fit.patch
+(cd src/modules/mavlink/mavlink && git apply /path/to/SASL-20260821/apps/Workstation/firmware/patches/px4-v1.17-sasl-can-mag-mavlink-dialect.patch)
 make px4_fmu-v6x_default
 ```
 
