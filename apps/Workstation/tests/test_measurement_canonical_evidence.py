@@ -81,6 +81,22 @@ def _attempt() -> MeasurementAttempt:
     )
 
 
+def _blocked() -> BlockedMeasurementPair:
+    payload = _readiness_payload()
+    return BlockedMeasurementPair(
+        detection_pair_key=("blocked", 1),
+        created_monotonic_s=1.0,
+        created_wall_s=2.0,
+        timestamp_basis="app_receive_monotonic",
+        left_detection=_detection("left", 1.0),
+        right_detection=_detection("right", 1.01),
+        status="matched_no_ready_measurement_method",
+        reasons=("geometry missing",),
+        readiness_sha256=_readiness_hash(payload),
+        readiness_payload_json=json.dumps(payload),
+    )
+
+
 def test_attempt_canonical_payload_carries_field_policy_decision() -> None:
     attempt = _attempt()
     payload = attempt.canonical_payload()
@@ -141,6 +157,19 @@ def test_measurement_attempt_round_trips_through_its_canonical_recalculation_bou
     assert recovered.canonical_sha256() == attempt.canonical_sha256()
 
 
+def test_terminal_record_ids_are_stable_and_namespaces_cannot_collide() -> None:
+    attempt = _attempt()
+    recovered = MeasurementAttempt.from_canonical_payload(
+        json.loads(attempt.canonical_json())
+    )
+    blocked = _blocked()
+
+    assert attempt.terminal_record_id == recovered.terminal_record_id
+    assert attempt.terminal_record_id == f"attempt:{attempt.canonical_sha256()}"
+    assert blocked.terminal_record_id == f"blocked:{blocked.canonical_sha256()}"
+    assert attempt.terminal_record_id != blocked.terminal_record_id
+
+
 def test_pair_recording_row_persists_reconstructable_attempt_bytes() -> None:
     attempt = _attempt()
     no_fields = lambda *_args, **_kwargs: {}
@@ -172,6 +201,8 @@ def test_pair_recording_row_persists_reconstructable_attempt_bytes() -> None:
     assert MeasurementAttempt.from_canonical_payload(persisted).canonical_sha256() == (
         row["measurement_attempt_sha256"]
     )
+    assert row["terminal_record_id"] == f"attempt:{row['measurement_attempt_sha256']}"
+    assert row["measurement_package_id"] == row["measurement_id"]
 
 
 def test_measurement_result_evidence_has_an_independently_checkable_digest() -> None:

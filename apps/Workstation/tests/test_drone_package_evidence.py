@@ -38,7 +38,11 @@ def test_active_drone_px4_rows_are_authoritative_jsonl_and_derived_parquet(
     assert raw_name == "data/raw/px4_drone.jsonl"
     assert raw_detail["authoritative"] is True
     assert raw_detail["row_count"] == 1
-    assert json.loads((output / raw_name).read_text(encoding="utf-8")) == sentinel
+    assert json.loads((output / raw_name).read_text(encoding="utf-8")) == {
+        **sentinel,
+        "measurement_id": "drone-session",
+        "measurement_package_id": "drone-session",
+    }
     assert detail["verified"] is True
     assert detail["authoritative"] is False
     assert detail["row_count"] == 1

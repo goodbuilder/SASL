@@ -958,6 +958,84 @@ def _authoritative_jsonl_row_bytes(row: dict[str, object]) -> bytes:
     return (encoded + "\n").encode("utf-8")
 
 
+def _apply_measurement_package_identity(
+    rows: Iterable[dict[str, object]],
+    *,
+    measurement_id: str,
+) -> None:
+    """Add the package alias without changing ``measurement_id`` semantics."""
+
+    for row in rows:
+        declared = str(row.get("measurement_id") or "")
+        alias = str(row.get("measurement_package_id") or "")
+        if declared and declared != measurement_id:
+            raise ValueError(
+                f"row measurement_id {declared!r} does not match package {measurement_id!r}"
+            )
+        if alias and alias != measurement_id:
+            raise ValueError(
+                "row measurement_package_id does not match its measurement_id"
+            )
+        row["measurement_id"] = measurement_id
+        row["measurement_package_id"] = measurement_id
+
+
+def _apply_terminal_record_identities(
+    rows: Iterable[dict[str, object]],
+) -> None:
+    """Materialize deterministic, non-positional terminal primary keys."""
+
+    seen: set[str] = set()
+    for row in rows:
+        attempt_sha256 = str(row.get("measurement_attempt_sha256") or "")
+        blocked_sha256 = str(row.get("blocked_pair_sha256") or "")
+        populated = [value for value in (attempt_sha256, blocked_sha256) if value]
+        if len(populated) > 1:
+            raise ValueError("terminal row cannot be both an attempt and a blocked pair")
+        if populated:
+            digest = populated[0]
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ValueError("terminal source identity must be lowercase SHA-256 hex")
+            namespace = "attempt" if attempt_sha256 else "blocked"
+            expected = f"{namespace}:{digest}"
+        else:
+            # Pre-G2/fixture rows may not carry a canonical attempt.  Their
+            # complete content still supplies a stable, non-positional legacy
+            # identity while new Workstation terminal rows use attempt/blocked.
+            payload = {
+                key: value
+                for key, value in row.items()
+                if key
+                not in {
+                    "terminal_record_id",
+                    "sample_index",
+                    "pair_sequence",
+                }
+            }
+            try:
+                encoded = json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            except ValueError as exc:
+                raise ValueError(
+                    "terminal row contains a non-finite number"
+                ) from exc
+            expected = f"legacy:{hashlib.sha256(encoded).hexdigest()}"
+        declared = str(row.get("terminal_record_id") or "")
+        if declared and declared != expected:
+            raise ValueError("terminal_record_id disagrees with canonical source identity")
+        if expected in seen:
+            raise ValueError(f"duplicate terminal_record_id: {expected}")
+        row["terminal_record_id"] = expected
+        seen.add(expected)
+
+
 def _authoritative_jsonl_schema(
     rows: Iterable[dict[str, object]],
     *,
@@ -1047,18 +1125,23 @@ def _validate_authoritative_jsonl(
             f"path={output}, expected={len(expected_rows)}, actual={row_count}"
         )
     size = output.stat().st_size
+    schema = _authoritative_jsonl_schema(
+        expected_rows,
+        normalization=normalization,
+    )
     return {
         "role": role,
-        "path": artifact_path,
-        "size": size,
-        "size_unit": "bytes",
-        "row_count": row_count,
-        "schema": _authoritative_jsonl_schema(
-            expected_rows,
-            normalization=normalization,
-        ),
+        "media_type": "application/x-ndjson",
+        "relative_path": artifact_path,
+        "size_bytes": size,
         "sha256": digest.hexdigest(),
+        "row_count": row_count,
+        "schema_version": schema["version"],
         "authoritative": True,
+        "derived_from": [],
+        "encoding": schema["encoding"],
+        "normalization": schema["normalization"],
+        "fields": schema["fields"],
         "verified": True,
     }
 
@@ -2533,21 +2616,36 @@ def _validate_published_v2_generation(
         declared = artifact_details.get(artifact_key)
         if not isinstance(declared, Mapping):
             raise OSError(f"published Parquet descriptor is missing: {artifact_key}")
-        relative_path = str(declared.get("path") or "")
+        relative_path = str(declared.get("relative_path") or "")
         verified = verify_parquet_artifact(
             current / relative_path,
             artifact_key,
         ).to_mapping(relative_to=current)
+        derived_from = declared.get("derived_from")
+        if not isinstance(derived_from, list):
+            raise OSError(f"Parquet derived_from is invalid: {artifact_key}")
+        for source_descriptor in derived_from:
+            if not isinstance(source_descriptor, Mapping) or not any(
+                dict(source_descriptor) == dict(candidate)
+                and candidate.get("authoritative") is True
+                and candidate.get("media_type") == "application/x-ndjson"
+                for candidate in artifact_details.values()
+                if isinstance(candidate, Mapping)
+            ):
+                raise OSError(
+                    f"Parquet derived_from does not resolve: {artifact_key}"
+                )
+        verified["derived_from"] = [dict(value) for value in derived_from]
         if verified != dict(declared):
             raise OSError(f"published Parquet descriptor mismatch: {artifact_key}")
 
     context = artifact_details.get("context")
     if not isinstance(context, Mapping):
         raise OSError("published context descriptor is missing")
-    context_path = current / str(context.get("path") or "")
+    context_path = current / str(context.get("relative_path") or "")
     if (
         not context_path.is_file()
-        or context_path.stat().st_size != int(context.get("size") or -1)
+        or context_path.stat().st_size != int(context.get("size_bytes") or -1)
         or _sha256_path(context_path) != str(context.get("sha256") or "")
     ):
         raise OSError("published context bytes do not match their descriptor")
@@ -2761,7 +2859,7 @@ def _measurement_review_mapping(
         if not isinstance(declared, Mapping):
             raise OSError(f"manifest does not declare {artifact_key}")
         expected_values = {
-            "size": verified.size_bytes,
+            "size_bytes": verified.size_bytes,
             "row_count": verified.row_count,
             "sha256": verified.sha256,
             "schema_sha256": verified.schema_sha256,
@@ -2793,7 +2891,7 @@ def _measurement_review_mapping(
     context_sha256 = _sha256_path(context_path)
     if (
         not isinstance(declared_context, Mapping)
-        or declared_context.get("size") != context_path.stat().st_size
+        or declared_context.get("size_bytes") != context_path.stat().st_size
         or declared_context.get("sha256") != context_sha256
     ):
         raise OSError("context.json disagrees with measurement manifest")
@@ -2980,11 +3078,21 @@ def rebuild_session_review(session_root: Path, session_id: str) -> Path:
         status_path,
         {
             "status": "generated",
-            "path": output.relative_to(session_root).as_posix(),
-            "size_bytes": output.stat().st_size,
-            "sha256": _sha256_path(output),
-            "authoritative": False,
             "regenerable": True,
+            "artifact": {
+                "role": "derived/review",
+                "media_type": (
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                ),
+                "relative_path": output.relative_to(session_root).as_posix(),
+                "size_bytes": output.stat().st_size,
+                "sha256": _sha256_path(output),
+                "row_count": None,
+                "schema_version": "workstation-session-review-xlsx-v1",
+                "authoritative": False,
+                "derived_from": [],
+                "verified": True,
+            },
         },
     )
     _fsync_directory_path(status_path.parent)
@@ -3419,18 +3527,6 @@ def save_session_files(
     geometry_rows = _normalized_generic_rows(
         extrinsics_comparison_rows or ()
     )
-    parquet_pair_rows = _project_pair_typed_fields(
-        [dict(row) for row in pair_full_rows]
-    )
-    parquet_camera_rows = {
-        side: _project_camera_typed_fields([dict(row) for row in rows])
-        for side, rows in camera_full_rows.items()
-    }
-    parquet_px4_rows = {
-        source: _project_px4_typed_fields([dict(row) for row in rows])
-        for source, rows in px4_full_rows.items()
-    }
-
     def jsonl_stream(
         artifact_key: str,
         rows: Sequence[dict[str, object]],
@@ -3502,6 +3598,29 @@ def save_session_files(
 
     try:
         previous_target = _v2_current_target(output_dir)
+        for source_rows in (
+            pair_full_rows,
+            *camera_full_rows.values(),
+            *px4_full_rows.values(),
+            gnss_rows,
+            geometry_rows,
+        ):
+            _apply_measurement_package_identity(
+                source_rows,
+                measurement_id=measurement_id,
+            )
+        _apply_terminal_record_identities(pair_full_rows)
+        parquet_pair_rows = _project_pair_typed_fields(
+            [dict(row) for row in pair_full_rows]
+        )
+        parquet_camera_rows = {
+            side: _project_camera_typed_fields([dict(row) for row in rows])
+            for side, rows in camera_full_rows.items()
+        }
+        parquet_px4_rows = {
+            source: _project_px4_typed_fields([dict(row) for row in rows])
+            for source, rows in px4_full_rows.items()
+        }
         jsonl_details: dict[str, dict[str, object]] = {}
         for artifact_key, role, relative_path, rows, normalization in jsonl_streams:
             staged_path = staging_dir / relative_path
@@ -3538,6 +3657,7 @@ def save_session_files(
             "schema_version": "workstation-measurement-context-v2",
             "session_id": session_id,
             "measurement_id": measurement_id,
+            "measurement_package_id": measurement_id,
             "time_axis": {
                 "primary": "recording_time_ns",
                 "definition": "nanoseconds elapsed from measurement recording start",
@@ -3548,14 +3668,33 @@ def save_session_files(
         context_path = data_dir / "context.json"
         _write_manifest(context_path, context_payload)
         parquet_details = artifacts.to_mapping(relative_to=staging_dir)
+        parquet_derivations = {
+            "measurement_pairs": ("raw_stereo_measurements",),
+            "camera_timeline": ("raw_camera_left", "raw_camera_right"),
+            "pixhawk_timeline": (
+                "raw_px4_left",
+                "raw_px4_right",
+                "raw_px4_drone",
+            ),
+            "gnss_base_timeline": ("raw_gnss_base",),
+            "geometry_comparison": ("raw_extrinsics_comparison",),
+        }
+        for artifact_key, source_keys in parquet_derivations.items():
+            parquet_details[artifact_key]["derived_from"] = [
+                dict(jsonl_details[source_key])
+                for source_key in source_keys
+                if source_key in jsonl_details
+            ]
         context_detail = {
             "role": "measurement_context",
-            "path": "data/context.json",
-            "format": "json",
-            "size": context_path.stat().st_size,
-            "size_unit": "bytes",
+            "media_type": "application/json",
+            "relative_path": "data/context.json",
+            "size_bytes": context_path.stat().st_size,
             "sha256": _sha256_path(context_path),
+            "row_count": None,
+            "schema_version": "workstation-measurement-context-v2",
             "authoritative": True,
+            "derived_from": [],
             "verified": True,
         }
         required_jsonl_roles = [
@@ -3574,6 +3713,7 @@ def save_session_files(
             "schema_version": MEASUREMENT_STORAGE_SCHEMA_VERSION,
             "session_id": session_id,
             "measurement_id": measurement_id,
+            "measurement_package_id": measurement_id,
             "status": "prepared",
             "generation_id": generation_id,
             "authority_contract": {

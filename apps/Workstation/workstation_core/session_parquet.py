@@ -70,15 +70,16 @@ class ParquetArtifactMetadata:
                 pass
         return {
             "role": self.role,
-            "path": path.as_posix(),
-            "format": "parquet",
-            "size": self.size_bytes,
-            "size_unit": "bytes",
+            "media_type": "application/vnd.apache.parquet",
+            "relative_path": path.as_posix(),
+            "size_bytes": self.size_bytes,
+            "sha256": self.sha256,
             "row_count": self.row_count,
+            "schema_version": self.schema.get("version"),
+            "authoritative": self.authoritative,
+            "derived_from": [],
             "schema": self.schema,
             "schema_sha256": self.schema_sha256,
-            "sha256": self.sha256,
-            "authoritative": self.authoritative,
             "verified": self.verified,
         }
 

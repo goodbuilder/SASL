@@ -1346,6 +1346,12 @@ class MeasurementAttempt:
     def canonical_sha256(self) -> str:
         return _sha256_payload(self.canonical_payload())
 
+    @property
+    def terminal_record_id(self) -> str:
+        """Stable terminal-row identity derived from the canonical attempt."""
+
+        return f"attempt:{self.canonical_sha256()}"
+
     def content_canonical_payload(self) -> dict[str, Any]:
         payload = asdict(self)
         for field_name in (
@@ -1436,6 +1442,12 @@ class BlockedMeasurementPair:
 
     def canonical_sha256(self) -> str:
         return _sha256_payload(self.canonical_payload())
+
+    @property
+    def terminal_record_id(self) -> str:
+        """Stable terminal-row identity in the blocked-pair namespace."""
+
+        return f"blocked:{self.canonical_sha256()}"
 
 
 def detection_pair_key(

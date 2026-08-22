@@ -130,6 +130,7 @@ def test_success_descriptor_hashes_bytes_parses_probe_and_is_portable(tmp_path: 
 
     metadata = descriptor["metadata"]
     assert metadata["recording_backend"] == "<absolute-path>/gstreamer"
+    assert metadata["mp4_frame_index_contract"] == "not_available"
     assert metadata["encoding_provenance"] == {
         "binary": "<absolute-path>/ffmpeg",
         "encoder": "nvh265enc",

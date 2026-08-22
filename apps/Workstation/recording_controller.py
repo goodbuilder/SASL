@@ -2344,6 +2344,9 @@ class RecordingController:
             "session_id": self.panel.recording_session_id,
             "session_created_utc_ns": session_snapshot.get("created_utc_ns"),
             "measurement_id": str(getattr(self.panel, "_measurement_id", "") or ""),
+            "measurement_package_id": str(
+                getattr(self.panel, "_measurement_id", "") or ""
+            ),
             "recording_mode": str(
                 getattr(self.panel, "_recording_mode", "manual") or "manual"
             ),
@@ -2357,8 +2360,12 @@ class RecordingController:
             "measurement_started_unix_ns": self.panel.recording_session_started_unix_ns,
             "measurement_started_monotonic_ns": self.panel.recording_session_started_monotonic_ns,
             "measurement_time_anchor_uncertainty_ns": self.panel.recording_session_anchor_uncertainty_ns,
-            "schema_version": "stereowiris-paired-frame-v2",
-            "row_contract": "one row per accepted left/right matched detection frame pair",
+            "schema_version": "stereowiris-paired-frame-v3",
+            "row_contract": "one row per terminal left/right matched detection outcome",
+            "terminal_record_id_contract": (
+                "attempt:<measurement_attempt_sha256> or "
+                "blocked:<blocked_pair_sha256>"
+            ),
             "left_video_path": str(self.panel.video_recording_paths.get("left", "")),
             "right_video_path": str(self.panel.video_recording_paths.get("right", "")),
             "matched_frame_pair_count": len(self.panel.distance_recording_rows),
@@ -2372,6 +2379,7 @@ class RecordingController:
             "device_timeline_contract": {
                 "camera_row": "one row per frame delivered to the GUI frame_changed callback",
                 "camera_not_guaranteed": "not a one-to-one index of encoded MP4 frames",
+                "mp4_frame_index_contract": "not_available",
                 "px4_row": "one row per PX4 telemetry callback received by the GUI",
                 "sample_monotonic": "producer/app receive CLOCK_MONOTONIC timestamp",
                 "session_utc": "derived from session host Unix/monotonic anchor",
@@ -2589,6 +2597,10 @@ class RecordingController:
         row: dict[str, object] = {
             "session_id": self.panel.recording_session_id,
             "measurement_id": str(getattr(self.panel, "_measurement_id", "") or ""),
+            "measurement_package_id": str(
+                getattr(self.panel, "_measurement_id", "") or ""
+            ),
+            "terminal_record_id": measurement_attempt.terminal_record_id,
             "measurement_attempt_id": str(measurement_attempt.attempt_id),
             "measurement_attempt_session_id": measurement_attempt.attempt_session_id,
             "measurement_attempt_sha256": measurement_attempt.canonical_sha256(),
@@ -2596,7 +2608,7 @@ class RecordingController:
             "measurement_detection_pair_key": json.dumps(
                 measurement_attempt.detection_pair_key, separators=(",", ":")
             ),
-            "schema_version": "stereowiris-paired-frame-v2",
+            "schema_version": "stereowiris-paired-frame-v3",
             "measurement_attempt_content_sha256": measurement_attempt.content_sha256(),
             "measurement_attempt_instance_sha256": measurement_attempt.instance_sha256(),
             "measurement_attempt_timestamp_basis": measurement_attempt.timestamp_basis,
@@ -2961,10 +2973,15 @@ class RecordingController:
         if not self.panel.distance_recording_enabled:
             return
         key = tuple(blocked.detection_pair_key)
+        blocked_sha256 = blocked.canonical_sha256()
         row: dict[str, object] = {
             "session_id": self.panel.recording_session_id,
             "measurement_id": str(getattr(self.panel, "_measurement_id", "") or ""),
-            "schema_version": "stereowiris-paired-frame-v2",
+            "measurement_package_id": str(
+                getattr(self.panel, "_measurement_id", "") or ""
+            ),
+            "terminal_record_id": blocked.terminal_record_id,
+            "schema_version": "stereowiris-paired-frame-v3",
             "measurement_valid": "false",
             "measurement_policy_id": "field_measurement_v1",
             "measurement_validity": "INVALID",
@@ -2977,7 +2994,7 @@ class RecordingController:
             "measurement_method_id": "",
             "measurement_method_instance_id": "",
             "measurement_attempt_sha256": "",
-            "blocked_pair_sha256": blocked.canonical_sha256(),
+            "blocked_pair_sha256": blocked_sha256,
             "blocked_pair_canonical_json": blocked.canonical_json(),
             "measurement_readiness_sha256": blocked.readiness_sha256,
             "measurement_readiness_canonical_json": blocked.readiness_payload_json,
@@ -3006,13 +3023,13 @@ class RecordingController:
             self._persist_native_detection_pair(
                 left_detection=blocked.left_detection,
                 right_detection=blocked.right_detection,
-                pair_id=f"blocked-{blocked.canonical_sha256()[:20]}",
+                pair_id=f"blocked-{blocked_sha256[:20]}",
                 purpose="blocked-measurement",
             )
         )
         row.update(
             self._measurement_result_evidence(
-                attempt_sha256=blocked.canonical_sha256(),
+                attempt_sha256=blocked_sha256,
                 status=blocked.status,
                 valid=False,
                 method="",

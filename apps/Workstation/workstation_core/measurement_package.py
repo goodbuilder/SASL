@@ -425,18 +425,32 @@ class MeasurementPackage:
             return
 
         now = time.time_ns()
+        normalized_metadata = dict(_json_safe(metadata or {}))
+        metadata_measurement_id = str(normalized_metadata.get("measurement_id") or "")
+        measurement_package_id = str(
+            normalized_metadata.get("measurement_package_id")
+            or metadata_measurement_id
+            or ""
+        )
+        if (
+            metadata_measurement_id
+            and measurement_package_id
+            and metadata_measurement_id != measurement_package_id
+        ):
+            raise ValueError("measurement_package_id must alias measurement_id")
         self._data = {
             "schema": PACKAGE_SCHEMA,
             "schema_version": PACKAGE_SCHEMA_VERSION,
             "working_state_schema": WORKING_STATE_SCHEMA,
             "session_id": _session_id(session_id),
+            "measurement_package_id": measurement_package_id or None,
             "revision": _revision_name(1),
             "revision_number": 1,
             "state": "COLLECTING",
             "created_utc_ns": now,
             "updated_utc_ns": now,
             "sealed_utc_ns": None,
-            "metadata": _json_safe(metadata or {}),
+            "metadata": normalized_metadata,
             "measurement_outcome": None,
             "source_expectations": [],
             "artifacts": [],

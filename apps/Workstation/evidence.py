@@ -2075,8 +2075,12 @@ class EvidenceAdapter:
                 if name not in (None, "")
             }
             for name, detail in artifact_details.items():
-                if isinstance(detail, Mapping) and detail.get("path"):
-                    artifact_names.add(str(detail["path"]))
+                if isinstance(detail, Mapping) and (
+                    detail.get("relative_path") or detail.get("path")
+                ):
+                    artifact_names.add(
+                        str(detail.get("relative_path") or detail.get("path"))
+                    )
                 else:
                     artifact_names.add(str(name))
             artifact_names.update(_run_ledger_artifact_names(path))
@@ -2142,7 +2146,7 @@ class EvidenceAdapter:
                     "published_target": published_target,
                     "artifacts": artifacts,
                     "source": (
-                        "measurement.json v2 + typed Parquet generation"
+                        "measurement.json + authoritative JSONL generation"
                         if manifest_is_v2
                         else "session_manifest.json legacy unverified + published generation pointer"
                         if manifest_path.is_file()

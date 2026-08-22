@@ -49,6 +49,8 @@ def test_explicit_session_owns_ordered_independent_measurements(tmp_path: Path) 
     assert first.root == root / "measurements" / "m000001"
     assert first.session_id == root.name
     assert first.snapshot()["metadata"]["measurement_id"] == "m000001"
+    assert first.snapshot()["metadata"]["measurement_package_id"] == "m000001"
+    assert first.snapshot()["measurement_package_id"] == "m000001"
     with pytest.raises(RuntimeError, match="must be sealed"):
         session.begin_measurement()
 
@@ -59,6 +61,10 @@ def test_explicit_session_owns_ordered_independent_measurements(tmp_path: Path) 
     snapshot = session.snapshot()
     assert snapshot["active_measurement_id"] == "m000002"
     assert [row["measurement_id"] for row in snapshot["measurements"]] == [
+        "m000001",
+        "m000002",
+    ]
+    assert [row["measurement_package_id"] for row in snapshot["measurements"]] == [
         "m000001",
         "m000002",
     ]
@@ -179,6 +185,7 @@ def test_measurement_allocation_skips_orphan_directory_and_protects_identity(
     assert package.root.name == "m000008"
     assert package.snapshot()["metadata"] | {} == {
         "measurement_id": "m000008",
+        "measurement_package_id": "m000008",
         "measurement_sequence": 8,
         "parent_session_id": "session",
     }

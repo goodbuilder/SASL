@@ -188,6 +188,7 @@ def verify_video_evidence(
     base_metadata: dict[str, Any] = {
         "recording_backend": backend_text,
         "encoding_provenance": provenance,
+        "mp4_frame_index_contract": "not_available",
         "source_name": _portable_text(source_path.name or "video"),
         "probe": {
             "tool": Path(str(ffprobe_binary)).name or "ffprobe",

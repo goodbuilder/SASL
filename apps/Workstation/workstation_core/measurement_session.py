@@ -321,6 +321,7 @@ class MeasurementSession:
         measurement_metadata = {
             **dict(_json_safe(metadata or {})),
             "measurement_id": selected,
+            "measurement_package_id": selected,
             "measurement_sequence": sequence,
             "parent_session_id": self.session_id,
         }
@@ -519,6 +520,7 @@ class MeasurementSession:
         state = str(snapshot.get("state") or package.state)
         row: dict[str, Any] = {
             "measurement_id": measurement_id,
+            "measurement_package_id": measurement_id,
             "sequence": int(sequence),
             "relative_path": (
                 Path(MEASUREMENTS_DIRECTORY_NAME) / measurement_id
@@ -651,6 +653,18 @@ def verify_measurement_session(root: Path | str) -> SessionVerificationResult:
         if not measurement_id or measurement_id in declared_ids:
             issues.append(SessionVerificationIssue("measurement_id_invalid", "measurement ID is empty or duplicated", measurement_id=measurement_id or None))
             continue
+        measurement_package_id = str(
+            raw_row.get("measurement_package_id") or measurement_id
+        )
+        if measurement_package_id != measurement_id:
+            issues.append(
+                SessionVerificationIssue(
+                    "measurement_package_id_mismatch",
+                    "measurement package alias differs from measurement_id",
+                    measurement_id=measurement_id,
+                )
+            )
+            continue
         declared_ids.add(measurement_id)
         try:
             sequence = int(raw_row.get("sequence") or 0)
@@ -718,6 +732,9 @@ def verify_measurement_session(root: Path | str) -> SessionVerificationResult:
         metadata = metadata if isinstance(metadata, Mapping) else {}
         if (
             str(metadata.get("measurement_id") or "") != measurement_id
+            or str(
+                metadata.get("measurement_package_id") or measurement_id
+            ) != measurement_id
             or str(metadata.get("parent_session_id") or "") != str(session_id or "")
             or int(metadata.get("measurement_sequence") or 0) != sequence
         ):

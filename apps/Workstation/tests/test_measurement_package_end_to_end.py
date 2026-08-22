@@ -395,6 +395,8 @@ def test_accepted_and_blocked_rows_persist_exact_canonical_payloads_and_hashes(
     assert accepted_result["valid"] is True
     assert accepted_result["measurement_attempt_sha256"] == attempt.canonical_sha256()
     assert accepted_result["vector_frd_range_m"] == [1.0, 2.0, 3.0, 3.75]
+    assert accepted_row["terminal_record_id"] == attempt.terminal_record_id
+    assert accepted_row["measurement_package_id"] == accepted_row["measurement_id"]
 
     _assert_canonical_hash(blocked_row, "blocked_pair_canonical_json", "blocked_pair_sha256")
     _assert_canonical_hash(
@@ -408,6 +410,9 @@ def test_accepted_and_blocked_rows_persist_exact_canonical_payloads_and_hashes(
     blocked_result = json.loads(str(blocked_row["measurement_result_canonical_json"]))
     assert blocked_result["valid"] is False
     assert blocked_result["measurement_attempt_sha256"] == blocked.canonical_sha256()
+    assert blocked_row["terminal_record_id"] == blocked.terminal_record_id
+    assert blocked_row["measurement_package_id"] == blocked_row["measurement_id"]
+    assert accepted_row["terminal_record_id"] != blocked_row["terminal_record_id"]
 
 
 def test_provenance_redaction_survives_registration_and_sealing(tmp_path: Path) -> None:

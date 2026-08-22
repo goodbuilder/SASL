@@ -103,7 +103,11 @@ def test_measurement_pairs_are_typed_and_dynamic_fields_round_trip_losslessly(
     assert len(metadata.schema_sha256) == 64
     assert metadata.authoritative is False
     assert metadata.verified is True
-    assert metadata.to_mapping(relative_to=tmp_path)["path"] == MEASUREMENT_PAIRS_FILENAME
+    mapping = metadata.to_mapping(relative_to=tmp_path)
+    assert mapping["relative_path"] == MEASUREMENT_PAIRS_FILENAME
+    assert mapping["size_bytes"] == output.stat().st_size
+    assert mapping["schema_version"] == 1
+    assert mapping["derived_from"] == []
 
 
 def test_camera_partitions_are_combined_with_non_nullable_side(

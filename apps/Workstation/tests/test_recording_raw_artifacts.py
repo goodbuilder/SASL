@@ -191,8 +191,14 @@ def test_save_publishes_verified_parquet_and_one_session_review_before_discardin
         json.loads(line)
         for line in raw_pair_path.read_text(encoding="utf-8").splitlines()
     ]
+    assert len(raw_pair_rows) == 1
+    terminal_record_id = raw_pair_rows[0].pop("terminal_record_id")
+    assert terminal_record_id.startswith("legacy:")
+    assert len(terminal_record_id) == len("legacy:") + 64
     assert raw_pair_rows == [
         {
+            "measurement_id": "m000001",
+            "measurement_package_id": "m000001",
             "sample_index": 41,
             "session_elapsed_s": 1.25,
             "session_elapsed_ns": 1_250_000_000,
@@ -232,13 +238,26 @@ def test_save_publishes_verified_parquet_and_one_session_review_before_discardin
     raw_pair_detail = manifest["artifact_details"]["raw_stereo_measurements"]
     assert raw_pair_detail["authoritative"] is True
     assert raw_pair_detail["row_count"] == 1
-    assert raw_pair_detail["size"] == raw_pair_path.stat().st_size
+    assert raw_pair_detail["size_bytes"] == raw_pair_path.stat().st_size
     assert raw_pair_detail["sha256"] == hashlib.sha256(
         raw_pair_path.read_bytes()
     ).hexdigest()
-    assert raw_pair_detail["schema"]["version"] == (
+    assert raw_pair_detail["schema_version"] == (
         recording_session.AUTHORITATIVE_JSONL_SCHEMA_VERSION
     )
+    assert manifest["measurement_package_id"] == manifest["measurement_id"]
+    descriptor_fields = {
+        "role",
+        "media_type",
+        "relative_path",
+        "size_bytes",
+        "sha256",
+        "row_count",
+        "schema_version",
+        "authoritative",
+        "derived_from",
+    }
+    assert descriptor_fields <= set(raw_pair_detail)
     for parquet_key in (
         "measurement_pairs",
         "camera_timeline",
@@ -247,12 +266,28 @@ def test_save_publishes_verified_parquet_and_one_session_review_before_discardin
         "geometry_comparison",
     ):
         assert manifest["artifact_details"][parquet_key]["authoritative"] is False
+        assert descriptor_fields <= set(manifest["artifact_details"][parquet_key])
+    assert manifest["artifact_details"]["measurement_pairs"]["derived_from"] == [
+        raw_pair_detail
+    ]
+    assert manifest["artifact_details"]["camera_timeline"]["derived_from"] == [
+        manifest["artifact_details"]["raw_camera_left"],
+        manifest["artifact_details"]["raw_camera_right"],
+    ]
     review_status = json.loads(
         (session_root / ".workstation" / "review.json").read_text(encoding="utf-8")
     )
     assert review_status["status"] == "pending_session_close"
     assert rebuild_session_review(session_root, "session-001") == saved.review_xlsx
     assert saved.review_xlsx.is_file()
+    generated_review = json.loads(
+        (session_root / ".workstation" / "review.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert generated_review["status"] == "generated"
+    assert generated_review["artifact"]["authoritative"] is False
+    assert generated_review["artifact"]["relative_path"] == "review.xlsx"
     assert not list(output_dir.glob("*.csv"))
     assert not list(output_dir.glob("*_raw_*rows.jsonl"))
     assert not list(output_dir.glob("*_px4_*.xlsx"))
@@ -534,6 +569,39 @@ def test_non_finite_value_is_rejected_without_discarding_spool(tmp_path: Path) -
     assert manifest["status"] == "failed"
     for spool in _all_spools(pair_rows, camera_rows, px4_rows, gnss_base_rows):
         spool.close()
+
+
+def test_terminal_record_identity_is_retry_stable_and_duplicates_are_rejected(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "recordings" / "terminal-identity"
+    row = {"pair_id": "legacy-source", "future": {"kept": True}}
+
+    first = save_session_files(
+        output_dir,
+        metadata={"session_id": output_dir.name},
+        pair_rows=[row],
+    )
+    first_row = json.loads(
+        first.authoritative_jsonl_files[0].read_text(encoding="utf-8")
+    )
+    second = save_session_files(
+        output_dir,
+        metadata={"session_id": output_dir.name},
+        pair_rows=[row],
+    )
+    second_row = json.loads(
+        second.authoritative_jsonl_files[0].read_text(encoding="utf-8")
+    )
+
+    assert first_row["terminal_record_id"] == second_row["terminal_record_id"]
+    assert first_row["measurement_package_id"] == output_dir.name
+    with pytest.raises(ValueError, match="duplicate terminal_record_id"):
+        save_session_files(
+            tmp_path / "recordings" / "terminal-duplicate",
+            metadata={"session_id": "terminal-duplicate"},
+            pair_rows=[row, row],
+        )
 
 
 @pytest.mark.parametrize(
