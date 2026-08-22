@@ -1974,8 +1974,9 @@ class EvidenceAdapter:
                             owning_session_id=session_id,
                             measurement_id=child.name,
                         )
+                        indexed_row = measurement_rows.get(child.name, {})
                         if projection is None:
-                            row = measurement_rows.get(child.name, {})
+                            row = indexed_row
                             projection = {
                                 "session_id": session_id,
                                 "measurement_id": child.name,
@@ -1997,6 +1998,15 @@ class EvidenceAdapter:
                                 "retryable": str(row.get("state") or "") == "RECOVERABLE",
                                 "legacy": False,
                             }
+                        for field in (
+                            "measurement_package_id",
+                            "recording_generation",
+                            "authoritative_jsonl_fragments",
+                            "context_fragments",
+                            "binary_artifacts",
+                        ):
+                            if field in indexed_row:
+                                projection[field] = indexed_row[field]
                         entries.append(projection)
                         child_entries += 1
                 if child_entries == 0:
@@ -2194,6 +2204,59 @@ class EvidenceAdapter:
             owning_session_id=str(session_id) if measurement_id else None,
             measurement_id=str(measurement_id or "") or None,
         )
+        logical_aliases = {
+            "": "raw/stereo_measurements",
+            "measurement_pairs": "raw/stereo_measurements",
+            "authoritative_measurements": "raw/stereo_measurements",
+        }
+        try:
+            from Workstation.workstation_core.recording_reader import ROLE_SOURCES
+
+            logical_aliases.update({role: role for role in ROLE_SOURCES})
+        except ImportError:
+            pass
+        logical_role = logical_aliases.get(str(artifact_name or ""))
+        if measurement_id and logical_role is not None:
+            if package_entry is not None and str(
+                package_entry.get("integrity_status") or ""
+            ) == "INTEGRITY_FAILED":
+                return {
+                    "columns": (),
+                    "rows": (),
+                    "error": "package integrity verification failed",
+                    "logical_role": logical_role,
+                }
+            try:
+                from Workstation.workstation_core.recording_reader import (
+                    read_measurement_stream,
+                )
+
+                stream = read_measurement_stream(output_dir, logical_role)
+                rows = stream.rows[: max(0, int(limit))]
+                columns = tuple(
+                    dict.fromkeys(key for row in rows for key in row)
+                )
+            except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+                return {
+                    "columns": (),
+                    "rows": (),
+                    "error": str(exc),
+                    "logical_role": logical_role,
+                }
+            return {
+                "columns": columns,
+                "rows": rows,
+                "error": "",
+                "path": str(stream.path),
+                "logical_role": logical_role,
+                "authoritative": stream.authoritative,
+                "legacy_fallback": stream.legacy_fallback,
+                "time_axis": "producer clock domains preserved per row",
+                "coordinate_contract": (
+                    "producer RDF/NED/FRD/baseline_center_frd fields preserved; "
+                    "no frame reinterpretation"
+                ),
+            }
         normalized_artifact = _safe_session_relative_path(output_dir, artifact_name)
         if normalized_artifact is None:
             return {

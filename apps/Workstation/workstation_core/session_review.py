@@ -1,9 +1,11 @@
 """Create the single operator-facing workbook for a recording session.
 
-The workbook is deliberately a derived view.  Finalized Parquet/JSON evidence
-remains authoritative; this module only combines the small, operator-relevant
-rows supplied by each measurement.  It does not read recording state and has
-no dependency on a controller or on ``recording_session``.
+The workbook is deliberately a derived view.  Finalized canonical JSONL and
+native binary evidence remain authoritative; Parquet is an intermediate
+derived analysis view.  This module only combines the small,
+operator-relevant rows supplied by each measurement.  It does not read
+recording state and has no dependency on a controller or on
+``recording_session``.
 """
 
 from __future__ import annotations

@@ -364,21 +364,28 @@ python3 tools/check_portable_paths.py
   `latest_revision.json` points to the current revision and each later revision hashes its
   predecessor. Parent `measurement_session_manifest.json` uses schema
   `workstation-measurement-session-v1` and hashes every latest child manifest plus session-shared
-  evidence.
+  evidence. Schema version 2 additionally indexes each child's order/current recording generation,
+  authoritative JSONL/context fragment hashes, and native binary artifact inventory without
+  concatenating a second parent-level authoritative stream; version 1 remains readable.
 - Each finalized measurement publishes one `data` link backed by
-  `.workstation/publish/current`. It contains `measurement_pairs.parquet`,
-  `camera_timeline.parquet`, `pixhawk_timeline.parquet`, `gnss_base_timeline.parquet`,
-  `geometry_comparison.parquet`, and `context.json`. `measurement.json` records the atomic
-  generation, verified schemas, row counts, sizes, and hashes. Default CSV, final raw-row JSONL,
-  per-Pixhawk XLSX, and per-measurement XLSX files are not emitted.
+  `.workstation/publish/current`. Canonical `data/raw/*.jsonl` and
+  `data/context/{geometry_contexts,time_sync_epochs}.jsonl` are the authoritative structured
+  records. `measurement_pairs.parquet`, `camera_timeline.parquet`,
+  `pixhawk_timeline.parquet`, `gnss_base_timeline.parquet`, and
+  `geometry_comparison.parquet` are verified derived analysis views. `context.json` and
+  `measurement.json` record the atomic generation, authority/derived-from contract, schemas, row
+  counts, sizes, and hashes. Default CSV, per-Pixhawk XLSX, and per-measurement XLSX files are not
+  emitted.
 - `recordings/<session-id>/review.xlsx` is the one operator-facing integrated workbook. It combines
   Session, Measurements, Results, Quality, Geometry, Devices, Captures, Warnings, and Files views
   across all finalized child measurements. It is derived and regenerable; workbook failure never
-  invalidates verified Parquet evidence.
+  invalidates verified authoritative JSONL/native evidence.
 - Each evaluated measurement pair—valid, rejected, unresolved, or blocked—retains canonical
   input/result/readiness JSON and matching SHA-256 values in
-  `data/measurement_pairs.parquet`. Stable typed columns support analysis, while canonical
-  `row_json` preserves every dynamic source field.
+  `data/raw/stereo_measurements.jsonl`. `terminal_record_id` is stable across finalization retry,
+  and `geometry_context_id` plus side-specific time-sync epoch IDs resolve into the child context
+  registries. Derived Parquet stable typed columns support analysis, while `row_json` preserves
+  every dynamic source field.
   Its exact left/right decoded source pixels are stored as lossless, no-overlay native PNGs.
 - `measurement-method-snapshot-v1` supplies the Session operator view without creating a second
   geometry owner. Runtime `method_capabilities` remains instance-driven, while the additive
@@ -534,10 +541,10 @@ python3 tools/check_portable_paths.py
   error. Retrying resumes the unfinished boundary instead of regenerating already manifested parent
   review bytes.
 - Live recording spools and heterogeneous event ledgers remain JSONL because they must append and
-  recover a valid prefix after interruption. Successful finalization converts tabular measurement,
-  camera, Pixhawk, GNSS, and geometry rows to typed Parquet, verifies full readback, then deletes
-  the temporary spool. CSV is available only as an explicit future/export boundary, not a default
-  source of truth.
+  recover a valid prefix after interruption. Successful finalization first writes and rereads
+  canonical JSONL, then creates typed Parquet as a derived view, validates the published generation,
+  and only then deletes the temporary spool. CSV is available only as an explicit future/export
+  boundary, not a default source of truth.
 - Sealed revisions are immutable. Additional evidence requires `Create Revision`; a new manifest
   inventories the complete current folder and includes the preceding manifest hash. Adding an
   unlisted regular evidence file without a revision makes latest-package verification fail.
@@ -551,8 +558,8 @@ python3 tools/check_portable_paths.py
   `/dev`, `/opt`, bounded `/tmp`, and camera-side `/` remain explicit machine/device contracts rather
   than portable asset fields.
 - Canonical capture/event rows are append-only evidence. Hiding a graph row changes only the view,
-  corrupt JSONL lines remain represented by hashed synthetic records, and preview opens only after
-  the artifact's recorded byte size and SHA-256 have been reverified.
+  a torn final JSONL write is quarantined while a malformed middle line is a hard failure, and
+  preview opens only after the artifact's recorded byte size and SHA-256 have been reverified.
 - Full-rate RTCM envelopes enter a 4,096-item bounded worker queue. A full queue applies producer
   backpressure rather than silently discarding evidence. The separate Pixhawk delivery queue is
   latest-relevant and bounded: a replaced correction returns its exact pipeline sequence as an
@@ -688,6 +695,11 @@ links, MAVLink receiver-side acceptance, long-duration dual-video shutdown, and 
 collection still require bench and field soak verification with the intended hardware. A local
 MAVLink send result is transport evidence, not proof that the remote receiver accepted and used the
 correction.
+
+Camera JSONL rows describe GUI-delivered frame observations, while MP4 may be encoded pass-through
+or decoded-frame recording. No exact 1:1 frame index is currently proven;
+`mp4_frame_index_contract=not_available` is the authoritative limitation. Use the exact native PNG
+bound to a terminal pair when pixel-level replay is required.
 
 The Session readiness and method-input panels are software projections of the latest owner
 snapshots. They expose missing/stale/rejected evidence but do not independently prove camera timing,
@@ -869,6 +881,12 @@ live on the panel at solve time -- a later live-GPS change cannot silently retar
 frozen Mountain image.
 
 ## Change Log
+
+- 2026-08-23: Made canonical JSONL and native bytes authoritative, retained Parquet/XLSX as
+  derived views, added stable terminal IDs, static geometry contexts, observed time-sync epochs,
+  parent/child generation hash catalogs, JSONL-first readers with legacy Parquet fallback, atomic
+  WIRIS FTP byte sealing, and strict torn-tail recovery for direct ledgers. Coordinate transforms,
+  measurement methods, RTK/NTRIP behavior, and the lack of exact MP4 frame mapping are unchanged.
 
 - 2026-08-21: Made persistent Workstation asset paths checkout-independent. New defaults and saved
   settings use `SASL_WORKSTATION_DATA_ROOT`-relative paths; external intrinsics and model files are

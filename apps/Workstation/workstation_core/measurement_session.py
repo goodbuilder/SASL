@@ -18,6 +18,7 @@ import hashlib
 import json
 import math
 import os
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass
@@ -34,7 +35,8 @@ from Workstation.workstation_core.measurement_package import (
 
 
 SESSION_SCHEMA = "workstation-measurement-session-v1"
-SESSION_SCHEMA_VERSION = 1
+SESSION_SCHEMA_VERSION = 2
+LEGACY_SESSION_SCHEMA_VERSIONS = frozenset({1})
 SESSION_STATE_NAME = "session.json"
 SESSION_MANIFEST_NAME = "measurement_session_manifest.json"
 SESSION_MANIFEST_SIDECAR_NAME = "measurement_session_manifest.sha256"
@@ -45,6 +47,81 @@ _SEALED_MEASUREMENT_STATES = frozenset({"SEALED_COMPLETE", "SEALED_INCOMPLETE"})
 _MUTABLE_MEASUREMENT_STATES = frozenset(
     {"COLLECTING", "POST_CAPTURE", "VERIFYING", "RECOVERABLE"}
 )
+
+
+def _software_summary() -> dict[str, Any]:
+    repository = Path(__file__).resolve().parents[3]
+
+    def git(*arguments: str) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", *arguments],
+                cwd=repository,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=2.0,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return (
+            result.stdout.decode("utf-8", errors="replace").strip()
+            if result.returncode == 0
+            else None
+        )
+
+    status = git("status", "--porcelain=v1", "--untracked-files=normal")
+    return {
+        "branch": git("branch", "--show-current"),
+        "commit": git("rev-parse", "HEAD"),
+        "dirty": None if status is None else bool(status),
+        "session_schema": SESSION_SCHEMA,
+        "session_schema_version": SESSION_SCHEMA_VERSION,
+    }
+
+
+def _session_static_metadata(
+    session_id: str,
+    metadata: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    from Workstation.workstation_core.package_provenance import redact_secrets
+
+    normalized = dict(_json_safe(redact_secrets(dict(metadata or {}))))
+    existing_identity = normalized.get("identity")
+    existing_identity = (
+        dict(existing_identity) if isinstance(existing_identity, Mapping) else {}
+    )
+    experiment_type = existing_identity.get(
+        "experiment_type",
+        normalized.get("experiment_type"),
+    )
+    normalized["identity"] = {
+        **existing_identity,
+        "session_id": session_id,
+        "application": "Workstation",
+        "experiment_type": experiment_type,
+    }
+    normalized["software"] = _software_summary()
+    normalized.setdefault(
+        "recording_intervals",
+        {"owner": "ordered child MeasurementPackage mNNNNNN entries"},
+    )
+    normalized.setdefault(
+        "camera",
+        {
+            "requested_zoom": None,
+            "observed_zoom": None,
+            "requested_resolution_px": None,
+            "requested_fps": None,
+            "null_contract": "not observed at parent Session creation",
+        },
+    )
+    normalized.setdefault("devices", {"observed_identities": []})
+    normalized["credentials"] = {
+        "secret_values_persisted": False,
+        "allowed_reference": "credential environment-variable name only",
+    }
+    return normalized
 
 
 def _json_safe(value: Any) -> Any:
@@ -139,6 +216,113 @@ def _safe_child(root: Path, value: object, *, must_exist: bool = False) -> Path:
     return resolved
 
 
+def _recording_generation_summary(
+    measurement_root: Path,
+    package_snapshot: Mapping[str, Any],
+) -> dict[str, object]:
+    measurement_manifest_path = measurement_root / "measurement.json"
+    if not measurement_manifest_path.is_file():
+        return {
+            "recording_generation": None,
+            "authoritative_jsonl_fragments": [],
+            "context_fragments": [],
+            "binary_artifacts": [],
+        }
+    resolved_manifest = measurement_manifest_path.resolve(strict=True)
+    resolved_manifest.relative_to(measurement_root)
+    manifest = _load_json(measurement_manifest_path)
+    details = manifest.get("artifact_details")
+    details = details if isinstance(details, Mapping) else {}
+    authoritative_jsonl: list[dict[str, object]] = []
+    for key, value in details.items():
+        if not isinstance(value, Mapping):
+            continue
+        if (
+            value.get("authoritative") is not True
+            or value.get("media_type") != "application/x-ndjson"
+        ):
+            continue
+        authoritative_jsonl.append(
+            {
+                "artifact_key": str(key),
+                "role": str(value.get("role") or ""),
+                "relative_path": str(value.get("relative_path") or ""),
+                "size_bytes": int(value.get("size_bytes") or 0),
+                "sha256": str(value.get("sha256") or ""),
+                "row_count": int(value.get("row_count") or 0),
+                "schema_version": value.get("schema_version"),
+            }
+        )
+    authoritative_jsonl.sort(
+        key=lambda row: (str(row["role"]), str(row["relative_path"]))
+    )
+    current = measurement_root / ".workstation" / "publish" / "current"
+    current_target = ""
+    if current.is_symlink():
+        target = Path(os.readlink(current))
+        if (
+            not target.is_absolute()
+            and len(target.parts) == 2
+            and target.parts[0] == "generations"
+            and target.parts[1] not in {"", ".", ".."}
+        ):
+            current_target = target.as_posix()
+
+    binary_artifacts: list[dict[str, object]] = []
+    binary_suffixes = {
+        ".bin",
+        ".jpg",
+        ".jpeg",
+        ".mp4",
+        ".png",
+        ".rtcm",
+        ".tif",
+        ".tiff",
+        ".ulg",
+    }
+    for raw in package_snapshot.get("artifacts", ()) or ():
+        if not isinstance(raw, Mapping) or raw.get("status") != "present":
+            continue
+        relative = str(raw.get("relative_path") or "")
+        media_type = str(raw.get("media_type") or "")
+        if (
+            Path(relative).suffix.lower() not in binary_suffixes
+            and not media_type.startswith(("image/", "video/"))
+            and media_type
+            not in {"application/octet-stream", "application/vnd.px4.ulog"}
+        ):
+            continue
+        binary_artifacts.append(
+            {
+                "role": str(raw.get("role") or ""),
+                "relative_path": relative,
+                "media_type": media_type,
+                "size_bytes": int(raw.get("size_bytes") or 0),
+                "sha256": str(raw.get("sha256") or ""),
+            }
+        )
+    binary_artifacts.sort(
+        key=lambda row: (str(row["role"]), str(row["relative_path"]))
+    )
+    return {
+        "recording_generation": {
+            "storage_schema": str(manifest.get("schema") or ""),
+            "storage_schema_version": manifest.get("schema_version"),
+            "generation_id": str(manifest.get("generation_id") or ""),
+            "current_pointer_target": current_target,
+            "measurement_manifest_relative_path": "measurement.json",
+            "measurement_manifest_sha256": sha256_file(resolved_manifest),
+        },
+        "authoritative_jsonl_fragments": authoritative_jsonl,
+        "context_fragments": [
+            dict(row)
+            for row in authoritative_jsonl
+            if str(row["role"]).startswith("context/")
+        ],
+        "binary_artifacts": binary_artifacts,
+    }
+
+
 @dataclass(frozen=True)
 class SessionVerificationIssue:
     code: str
@@ -191,7 +375,8 @@ class MeasurementSession:
         self._data = _load_json(self._state_path)
         if (
             self._data.get("schema") != SESSION_SCHEMA
-            or int(self._data.get("schema_version") or 0) != SESSION_SCHEMA_VERSION
+            or int(self._data.get("schema_version") or 0)
+            not in LEGACY_SESSION_SCHEMA_VERSIONS | {SESSION_SCHEMA_VERSION}
         ):
             raise ValueError("unsupported measurement session schema")
         if str(self._data.get("state") or "") != "SEALED":
@@ -227,7 +412,10 @@ class MeasurementSession:
             "updated_utc_ns": now,
             "closing_utc_ns": None,
             "sealed_utc_ns": None,
-            "metadata": _json_safe(metadata or {}),
+            "metadata": _session_static_metadata(
+                normalized_session_id,
+                metadata,
+            ),
             "app_runs": (
                 [{"app_run_id": run_id, "joined_utc_ns": now}] if run_id else []
             ),
@@ -537,6 +725,7 @@ class MeasurementSession:
             "measurement_outcome": _json_safe(snapshot.get("measurement_outcome")),
             "manifest_relative_path": None,
             "manifest_sha256": None,
+            **_recording_generation_summary(package.root, snapshot),
         }
         if state in _SEALED_MEASUREMENT_STATES:
             verification = verify_package(package.root)
@@ -635,9 +824,11 @@ def verify_measurement_session(root: Path | str) -> SessionVerificationResult:
         else:
             if expected_digest != actual_digest:
                 issues.append(SessionVerificationIssue("session_sidecar_mismatch", "session sidecar hash does not match"))
+    manifest_schema_version = int(manifest.get("schema_version") or 0)
     if (
         manifest.get("schema") != SESSION_SCHEMA
-        or int(manifest.get("schema_version") or 0) != SESSION_SCHEMA_VERSION
+        or manifest_schema_version
+        not in LEGACY_SESSION_SCHEMA_VERSIONS | {SESSION_SCHEMA_VERSION}
     ):
         issues.append(SessionVerificationIssue("session_schema", "unsupported session schema"))
     if manifest.get("state") != "SEALED":
@@ -745,6 +936,41 @@ def verify_measurement_session(root: Path | str) -> SessionVerificationResult:
         ):
             issues.append(SessionVerificationIssue("measurement_outcome_mismatch", "child outcome differs from session manifest", manifest_relative, measurement_id))
             continue
+        if manifest_schema_version >= 2:
+            try:
+                expected_recording = _recording_generation_summary(
+                    child_root,
+                    child_manifest_payload,
+                )
+            except Exception as exc:
+                issues.append(
+                    SessionVerificationIssue(
+                        "measurement_recording_generation_invalid",
+                        str(exc),
+                        manifest_relative,
+                        measurement_id,
+                    )
+                )
+                continue
+            if any(
+                _json_safe(raw_row.get(field))
+                != _json_safe(expected_recording[field])
+                for field in (
+                    "recording_generation",
+                    "authoritative_jsonl_fragments",
+                    "context_fragments",
+                    "binary_artifacts",
+                )
+            ):
+                issues.append(
+                    SessionVerificationIssue(
+                        "measurement_recording_generation_mismatch",
+                        "child recording generation inventory differs from parent",
+                        manifest_relative,
+                        measurement_id,
+                    )
+                )
+                continue
         verified += 1
 
     actual_ids: set[str] = set()

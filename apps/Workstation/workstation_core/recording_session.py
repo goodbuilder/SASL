@@ -2814,8 +2814,10 @@ def _measurement_review_mapping(
     session_root: Path,
 ) -> dict[str, object] | None:
     from Workstation.workstation_core.session_parquet import (
-        read_lossless_rows,
         verify_parquet_artifact,
+    )
+    from Workstation.workstation_core.recording_reader import (
+        read_measurement_stream,
     )
 
     data = measurement_root / "data"
@@ -2835,7 +2837,12 @@ def _measurement_review_mapping(
         declared_details = manifest.get("artifact_details")
         if not isinstance(declared_details, Mapping):
             raise ValueError("measurement manifest has no artifact details")
-        rows = read_lossless_rows(pairs, "measurement_pairs")
+        rows = list(
+            read_measurement_stream(
+                measurement_root,
+                "raw/stereo_measurements",
+            ).rows
+        )
         context_payload = json.loads(context_path.read_text(encoding="utf-8"))
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise OSError(
