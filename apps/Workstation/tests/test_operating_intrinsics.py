@@ -4,18 +4,185 @@ import json
 from dataclasses import FrozenInstanceError
 
 import pytest
+from types import SimpleNamespace
 
+from Workstation.optical_pose_controller import OpticalPoseController
 from Workstation.workstation_core.calibration import (
     CameraIntrinsics,
     CheckerboardConfig,
     StereoIntrinsicsResult,
 )
 from Workstation.workstation_core.operating_intrinsics import (
+    NOMINAL_INTRINSICS_QUALITY,
     OperatingCameraEvidence,
     OperatingCameraIntrinsics,
     OperatingIntrinsicsProfile,
+    build_nominal_operating_intrinsics_profile,
     evaluate_intrinsics_applicability,
+    nominal_profile_to_stereo_result,
 )
+
+
+def test_nominal_zoom_8_builds_hand_checked_1280x720_pinhole() -> None:
+    profile = build_nominal_operating_intrinsics_profile(
+        zoom_index=8,
+        left_width_px=1280,
+        left_height_px=720,
+        right_width_px=1280,
+        right_height_px=720,
+    )
+
+    assert profile.left.camera_matrix == (
+        (8242.0, 0.0, 639.5),
+        (0.0, 8242.0, 359.5),
+        (0.0, 0.0, 1.0),
+    )
+    assert profile.left.distortion_coefficients == (0.0,) * 5
+    assert profile.provenance["quality"] == NOMINAL_INTRINSICS_QUALITY
+    assert profile.provenance["precision_qualified"] is False
+    assert profile.provenance["runtime_truth_used"] is False
+
+
+def test_nominal_intrinsics_scale_axes_and_preserve_rdf_profile_hash() -> None:
+    profile = build_nominal_operating_intrinsics_profile(
+        zoom_index=1,
+        left_width_px=640,
+        left_height_px=360,
+        right_width_px=1920,
+        right_height_px=1080,
+    )
+
+    assert profile.left.camera_matrix[0][0] == pytest.approx(618.0)
+    assert profile.left.camera_matrix[1][1] == pytest.approx(618.0)
+    assert profile.right.camera_matrix[0][0] == pytest.approx(1854.0)
+    assert profile.right.camera_matrix[1][1] == pytest.approx(1854.0)
+    assert len(profile.profile_sha256) == 64
+    result = nominal_profile_to_stereo_result(profile)
+    assert result.extrinsics is None
+    assert result.calibration_quality["state"] == NOMINAL_INTRINSICS_QUALITY
+
+
+def test_nominal_intrinsics_reject_unknown_zoom_and_invalid_raster() -> None:
+    with pytest.raises(ValueError, match="no nominal focal"):
+        build_nominal_operating_intrinsics_profile(
+            zoom_index=99,
+            left_width_px=1280,
+            left_height_px=720,
+            right_width_px=1280,
+            right_height_px=720,
+        )
+
+
+def test_optical_pose_uses_nominal_automatically_without_active_calibration(monkeypatch) -> None:
+    panel = SimpleNamespace(
+        active_intrinsics=None,
+        settings=SimpleNamespace(),
+    )
+    controller = OpticalPoseController(panel)
+    evidence = {
+        "left": OperatingCameraEvidence("left", 8, 8.0, 99.0, 1280, 720, None, None),
+        "right": OperatingCameraEvidence("right", 8, 8.0, 99.0, 1280, 720, None, None),
+    }
+    monkeypatch.setattr(controller, "_camera_evidence", lambda side, **_kwargs: evidence[side])
+
+    profile = controller._operating_intrinsics_profile()
+    assert profile is not None
+    assert profile.provenance["quality"] == NOMINAL_INTRINSICS_QUALITY
+
+
+def test_optical_pose_nominal_fallback_rejects_left_right_zoom_mismatch(monkeypatch) -> None:
+    panel = SimpleNamespace(
+        active_intrinsics=None,
+        settings=SimpleNamespace(),
+    )
+    controller = OpticalPoseController(panel)
+    evidence = {
+        "left": OperatingCameraEvidence("left", 8, 8.0, 99.0, 1280, 720, None, None),
+        "right": OperatingCameraEvidence("right", 9, 10.0, 99.0, 1280, 720, None, None),
+    }
+    monkeypatch.setattr(controller, "_camera_evidence", lambda side, **_kwargs: evidence[side])
+
+    assert controller._operating_intrinsics_profile() is None
+
+
+def test_calibrated_zoom_mismatch_selects_fresh_nominal_profile(monkeypatch) -> None:
+    camera = CameraIntrinsics(
+        width=1280,
+        height=720,
+        camera_matrix=[[7000.0, 0.0, 639.5], [0.0, 7000.0, 359.5], [0.0, 0.0, 1.0]],
+        distortion_coefficients=[0.01, 0.0, 0.0, 0.0, 0.0],
+        reprojection_error_px=0.2,
+        image_count=20,
+    )
+    active = StereoIntrinsicsResult(
+        left=camera,
+        right=camera,
+        board=CheckerboardConfig(8, 6, 0.04),
+    )
+    panel = SimpleNamespace(
+        active_intrinsics=active,
+        _active_intrinsics_source_zoom_level=7,
+        _active_intrinsics_profile_hash="a" * 64,
+        _active_intrinsics_profile_path="calibration/zoom-07.json",
+        operating_intrinsics_identity={},
+        selected_extrinsics_profile=None,
+    )
+    controller = OpticalPoseController(panel)
+    evidence = {
+        "left": OperatingCameraEvidence("left", 8, 8.0, 99.0, 1280, 720, None, None),
+        "right": OperatingCameraEvidence("right", 8, 8.0, 99.0, 1280, 720, None, None),
+    }
+    monkeypatch.setattr(controller, "_camera_evidence", lambda side, **_kwargs: evidence[side])
+    monkeypatch.setattr("Workstation.optical_pose_controller.time.monotonic", lambda: 100.0)
+
+    snapshot = controller._intrinsics_snapshot(use_frozen=False)
+
+    assert snapshot["applicability"]["geometry_allowed"] is True
+    assert snapshot["profile"]["provenance"]["quality"] == NOMINAL_INTRINSICS_QUALITY
+    assert snapshot["profile"]["left"]["source_zoom_index"] == 8
+
+
+def test_calibrated_zoom_mismatch_does_not_use_stale_nominal_profile(monkeypatch) -> None:
+    camera = CameraIntrinsics(
+        width=1280,
+        height=720,
+        camera_matrix=[[7000.0, 0.0, 639.5], [0.0, 7000.0, 359.5], [0.0, 0.0, 1.0]],
+        distortion_coefficients=[0.01, 0.0, 0.0, 0.0, 0.0],
+        reprojection_error_px=0.2,
+        image_count=20,
+    )
+    panel = SimpleNamespace(
+        active_intrinsics=StereoIntrinsicsResult(
+            left=camera,
+            right=camera,
+            board=CheckerboardConfig(8, 6, 0.04),
+        ),
+        _active_intrinsics_source_zoom_level=7,
+        _active_intrinsics_profile_hash="a" * 64,
+        _active_intrinsics_profile_path="calibration/zoom-07.json",
+        operating_intrinsics_identity={},
+        selected_extrinsics_profile=None,
+    )
+    controller = OpticalPoseController(panel)
+    stale = {
+        side: OperatingCameraEvidence(side, 8, 8.0, 90.0, 1280, 720, None, None)
+        for side in ("left", "right")
+    }
+    monkeypatch.setattr(controller, "_camera_evidence", lambda side, **_kwargs: stale[side])
+    monkeypatch.setattr("Workstation.optical_pose_controller.time.monotonic", lambda: 100.0)
+
+    snapshot = controller._intrinsics_snapshot(use_frozen=False)
+
+    assert snapshot["applicability"]["geometry_allowed"] is False
+    assert "left_operating_zoom_mismatch" in snapshot["applicability"]["reasons"]
+    with pytest.raises(ValueError, match="positive native raster"):
+        build_nominal_operating_intrinsics_profile(
+            zoom_index=8,
+            left_width_px=0,
+            left_height_px=720,
+            right_width_px=1280,
+            right_height_px=720,
+        )
 
 
 def _camera(side: str, zoom: int | None = 12) -> OperatingCameraIntrinsics:

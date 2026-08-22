@@ -38,6 +38,7 @@ from Workstation.workstation_core.operating_intrinsics import (
     OperatingCameraEvidence,
     OperatingCameraIntrinsics,
     OperatingIntrinsicsProfile,
+    build_nominal_operating_intrinsics_profile,
     evaluate_intrinsics_applicability,
 )
 
@@ -834,7 +835,7 @@ class OpticalPoseController:
             )
 
         captured_monotonic_s = time.monotonic()
-        profile = self._operating_intrinsics_profile()
+        profile = self.operating_intrinsics_profile_for_geometry()
         prior: tuple[CameraPoseNed, CameraPoseNed] | None
         try:
             prior = self._resolve_prior_poses(values, prefer_frozen=False)
@@ -1218,7 +1219,7 @@ class OpticalPoseController:
             )
 
         captured_monotonic_s = time.monotonic()
-        profile = self._operating_intrinsics_profile()
+        profile = self.operating_intrinsics_profile_for_geometry()
         try:
             prior = self._resolve_prior_poses(values, prefer_frozen=False)
         except RuntimeError:
@@ -3799,7 +3800,7 @@ class OpticalPoseController:
                 return value
         active = getattr(self.panel, "active_intrinsics", None)
         if active is None:
-            return None
+            return self._nominal_operating_intrinsics_profile(use_frozen=False)
         source_zoom = getattr(self.panel, "_active_intrinsics_source_zoom_level", None)
         source_hash = str(getattr(self.panel, "_active_intrinsics_profile_hash", "") or "")
         if len(source_hash) != 64:
@@ -3818,6 +3819,31 @@ class OpticalPoseController:
                 "source": "Workstation active_intrinsics immutable copy",
                 "serial_and_stabilization": "explicit run/profile declarations; never inferred",
             },
+        )
+
+    def _nominal_operating_intrinsics_profile(
+        self, *, use_frozen: bool
+    ) -> OperatingIntrinsicsProfile | None:
+        left = self._camera_evidence("left", use_frozen=use_frozen)
+        right = self._camera_evidence("right", use_frozen=use_frozen)
+        if (
+            left.zoom_index is None
+            or right.zoom_index is None
+            or left.zoom_index != right.zoom_index
+            or left.frame_width_px is None
+            or left.frame_height_px is None
+            or right.frame_width_px is None
+            or right.frame_height_px is None
+        ):
+            return None
+        return build_nominal_operating_intrinsics_profile(
+            zoom_index=left.zoom_index,
+            left_width_px=left.frame_width_px,
+            left_height_px=left.frame_height_px,
+            right_width_px=right.frame_width_px,
+            right_height_px=right.frame_height_px,
+            left_zoom_ratio=left.zoom_ratio,
+            right_zoom_ratio=right.zoom_ratio,
         )
 
     @staticmethod
@@ -3893,6 +3919,28 @@ class OpticalPoseController:
             now_monotonic_s=now,
             extrinsics_source_zoom_index=getattr(extrinsics, "source_zoom_level", None),
         )
+        if (
+            not use_frozen
+            and profile is not None
+            and getattr(self.panel, "active_intrinsics", None) is not None
+            and not result.geometry_allowed
+            and any(
+                "operating_zoom_mismatch" in reason or "intrinsics_zoom_unknown" in reason
+                for reason in result.reasons
+            )
+        ):
+            nominal = self._nominal_operating_intrinsics_profile(use_frozen=False)
+            if nominal is not None:
+                nominal_result = evaluate_intrinsics_applicability(
+                    nominal,
+                    left,
+                    right,
+                    now_monotonic_s=now,
+                    extrinsics_source_zoom_index=getattr(extrinsics, "source_zoom_level", None),
+                )
+                if nominal_result.geometry_allowed:
+                    profile = nominal
+                    result = nominal_result
         return {
             "schema": "optical-pose-intrinsics-snapshot-v1",
             "evidence_scope": "frozen_capture" if use_frozen else "current_live",
@@ -3903,6 +3951,17 @@ class OpticalPoseController:
                 "right": dict(right.__dict__),
             },
         }
+
+    def operating_intrinsics_profile_for_geometry(self) -> OperatingIntrinsicsProfile | None:
+        snapshot = self._intrinsics_snapshot(use_frozen=False)
+        if not bool(snapshot["applicability"].get("geometry_allowed")):
+            return None
+        profile = snapshot.get("profile")
+        return (
+            OperatingIntrinsicsProfile.from_mapping(profile)
+            if isinstance(profile, Mapping)
+            else None
+        )
 
     def _require_frozen_intrinsics(
         self,
@@ -4120,7 +4179,7 @@ class OpticalPoseController:
         )
         known_sources = {value for value in (rotation_zoom, translation_zoom) if value is not None}
         source_zoom = next(iter(known_sources)) if len(known_sources) == 1 else None
-        operating_profile = self._operating_intrinsics_profile()
+        operating_profile = self.operating_intrinsics_profile_for_geometry()
         assert operating_profile is not None
         extrinsics = StereoExtrinsics(
             rotation_left_to_right=[list(row) for row in stereo.rotation_right_from_left_rdf],

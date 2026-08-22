@@ -2818,20 +2818,31 @@ class RecordingController:
         quality: str,
         warnings: tuple[str, ...] | list[str] | str,
         vector_frd_range_m: tuple[float | None, float | None, float | None, float | None],
+        policy_id: str = "field_measurement_v1",
+        validity: str | None = None,
+        hard_block_reasons: tuple[str, ...] = (),
+        advisory_reasons: tuple[str, ...] = (),
     ) -> dict[str, str]:
         warning_values = (
             [str(value) for value in warnings]
             if isinstance(warnings, (tuple, list))
             else [str(warnings)] if warnings else []
         )
+        resolved_validity = validity or (
+            "INVALID" if not valid else "ESTIMATED" if warning_values else "VALID"
+        )
         payload = {
-            "schema": "workstation-measurement-result-v1",
+            "schema": "workstation-measurement-result-v2",
             "measurement_attempt_sha256": str(attempt_sha256),
             "status": str(status),
             "valid": bool(valid),
             "method": str(method),
             "quality": str(quality),
             "warnings": warning_values,
+            "policy_id": str(policy_id),
+            "validity": resolved_validity,
+            "hard_block_reasons": [str(value) for value in hard_block_reasons],
+            "advisory_reasons": [str(value) for value in advisory_reasons],
             "measurement_frame": MEASUREMENT_FRAME,
             "measurement_axis_contract": MEASUREMENT_AXIS_CONTRACT,
             "unit": "m",
@@ -2910,6 +2921,18 @@ class RecordingController:
             {
                 "pair_status": status,
                 "measurement_valid": "false",
+                "measurement_policy_id": measurement_attempt.measurement_policy_id,
+                "measurement_validity": "INVALID",
+                "measurement_hard_block_reasons": json.dumps(
+                    list(measurement_attempt.hard_block_reasons or (status,)),
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ),
+                "measurement_advisory_reasons": json.dumps(
+                    list(warnings or measurement_attempt.advisory_reasons),
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ),
                 "warnings": "; ".join(warnings or measurement_attempt.warnings),
             }
         )
@@ -2921,6 +2944,10 @@ class RecordingController:
                 method=measurement_attempt.measurement_method_id,
                 quality=measurement_attempt.source_quality,
                 warnings=warnings or measurement_attempt.warnings,
+                policy_id=measurement_attempt.measurement_policy_id,
+                validity="INVALID",
+                hard_block_reasons=measurement_attempt.hard_block_reasons or (status,),
+                advisory_reasons=warnings or measurement_attempt.advisory_reasons,
                 vector_frd_range_m=(None, None, None, None),
             )
         )
@@ -2935,6 +2962,12 @@ class RecordingController:
             "measurement_id": str(getattr(self.panel, "_measurement_id", "") or ""),
             "schema_version": "stereowiris-paired-frame-v2",
             "measurement_valid": "false",
+            "measurement_policy_id": "field_measurement_v1",
+            "measurement_validity": "INVALID",
+            "measurement_hard_block_reasons": json.dumps(
+                list(blocked.reasons), separators=(",", ":"), ensure_ascii=False
+            ),
+            "measurement_advisory_reasons": "[]",
             "pair_status": blocked.status,
             "measurement_geometry_kind": "unresolved",
             "measurement_method_id": "",
@@ -3092,6 +3125,14 @@ class RecordingController:
             ),
             "measurement_attempt_source_quality": measurement_attempt.source_quality,
             "measurement_attempt_warnings": "; ".join(measurement_attempt.warnings),
+            "measurement_policy_id": measurement_attempt.measurement_policy_id,
+            "measurement_validity": (
+                "ESTIMATED" if estimate.warnings else "VALID"
+            ),
+            "measurement_hard_block_reasons": json.dumps([], separators=(",", ":")),
+            "measurement_advisory_reasons": json.dumps(
+                list(estimate.warnings), separators=(",", ":"), ensure_ascii=False
+            ),
             "session_started_unix_s": self.panel._fmt_record_float(self.panel.recording_session_started_wall_s, 6),
             "left_video_path": str(self.panel.video_recording_paths.get("left", "")),
             "right_video_path": str(self.panel.video_recording_paths.get("right", "")),
@@ -3165,6 +3206,9 @@ class RecordingController:
                 method=method,
                 quality=estimate.sync_quality,
                 warnings=tuple(estimate.warnings),
+                policy_id=measurement_attempt.measurement_policy_id,
+                validity="ESTIMATED" if estimate.warnings else "VALID",
+                advisory_reasons=tuple(estimate.warnings),
                 vector_frd_range_m=(
                     point.forward_m,
                     point.right_m,

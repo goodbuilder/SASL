@@ -76,7 +76,7 @@ def _horizon_status() -> MeasurementMethodStatus:
 
 def test_method_owned_dofs_are_locked_and_missing_dofs_are_toggleable() -> None:
     controller = MeasurementViewController(_panel(_Package()))
-    controller._measurement_live_readiness = lambda: (True, True, ())
+    controller._measurement_live_readiness = lambda: (True, True, (), ())
 
     rows = controller._measurement_component_controls(_horizon_status())
 
@@ -93,7 +93,7 @@ def test_fill_toggle_is_measurement_owned_persisted_and_locked_after_detection()
     panel = _panel(package)
     controller = MeasurementViewController(panel)
     status = _horizon_status()
-    controller._measurement_live_readiness = lambda: (True, True, ())
+    controller._measurement_live_readiness = lambda: (True, True, (), ())
     controller._measurement_method_statuses = lambda: (status,)
 
     snapshot = controller.configure_workstation_measurement_method_fill(
@@ -194,7 +194,7 @@ def test_disabling_required_horizon_fill_makes_only_that_method_unready() -> Non
     panel.optical_pose_extrinsics_profile = None
     panel._optical_pose_controller = lambda: owner
     controller = MeasurementViewController(panel)
-    controller._measurement_live_readiness = lambda: (True, True, ())
+    controller._measurement_live_readiness = lambda: (True, True, (), ())
 
     ready = next(
         row for row in controller._measurement_method_statuses() if row.method_id == HORIZON_HYBRID

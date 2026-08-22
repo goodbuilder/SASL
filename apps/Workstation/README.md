@@ -97,6 +97,20 @@ comes from `Calibration > Load & Apply`. Configure `YOLO input size` under
 `Settings > YOLO / RTSP`; Apply updates the runtime owner and the new size is used from the next
 Detection start. Confidence, IoU, and pair gates remain in Measurement Settings.
 
+Workstation uses the single `field_measurement_v1` policy. When no calibrated profile is active,
+fresh equal left/right zoom readbacks plus known native rasters automatically generate a
+`NOMINAL_UNVERIFIED` pinhole profile from the 1280x720 WIRIS zoom focal table. A structurally valid
+calibrated profile whose zoom differs from the fresh readback also yields to that nominal profile.
+The generated K,D uses centered principal points and zero distortion, records its formula/hash, and
+always retains `precision_qualified=false`. Malformed K,D, stale/unknown/disagreeing zoom, and
+native-raster mismatch remain hard failures.
+
+Field measurement blocks only missing/ambiguous correspondence, missing or malformed K,D/R,t,
+same-Measurement telemetry absence for live geometry, non-finite/frame-invalid inputs, impossible
+two-ray geometry, lifecycle conflicts, and persistence integrity failures. RTCP/NTP availability,
+pair delta, vertical delta, telemetry age, GNSS fix/accuracy/readiness, nominal K,D, and Alignment
+K,D hash mismatch remain visible advisories while a finite result is recorded as `ESTIMATED`.
+
 Calibration capture now saves a lossless, no-overlay native frame and records its native,
 preview, and saved raster grids; a preview-resized image is not used as the calibration input.
 Auto capture rejects a pair when either camera's checkerboard pose is effectively a duplicate of
@@ -323,6 +337,12 @@ python3 tools/check_portable_paths.py
 
 ## Inputs/Outputs and Interfaces
 
+- Measurement result evidence schema v2 adds `policy_id=field_measurement_v1`,
+  `validity=VALID|ESTIMATED|INVALID`, `hard_block_reasons`, and `advisory_reasons`. Paired Parquet
+  rows expose the same decision as `measurement_policy_id`, `measurement_validity`,
+  `measurement_hard_block_reasons`, and `measurement_advisory_reasons`. The compatibility
+  `measurement_valid` field remains true for both computed `VALID` and `ESTIMATED` results.
+
 - The canonical runtime root is `.local/workstation_data/` at the repository root, or the path in
   `SASL_WORKSTATION_DATA_ROOT`. It owns `stereo_distance_settings.json`, `recordings/`,
   `calibration/`, `models/`, and runtime caches. The five persistent asset fields—intrinsics,
@@ -494,7 +514,10 @@ python3 tools/check_portable_paths.py
   visible as blocked catalog rows, while each accepted or blocked pair persists its own immutable
   method/readiness snapshot at the pair boundary.
 - A parent remains `OPEN` after a child is sealed. Another child may start only after the current
-  child is sealed, and `Close Session` is allowed only when no mutable child or producer remains.
+  child is sealed. `Close Session` automatically persists and seals a lifecycle-only empty child
+  or a completed Post-Capture child before closing the parent. An active Detection interval must be
+  stopped first, and any save, drain, or integrity failure leaves the parent open rather than
+  publishing a false-success Session manifest.
 - Evidence completeness and measurement validity are independent. A session with no valid range
   can be `SEALED_COMPLETE` when every expected artifact explaining that outcome exists; a valid
   range can be `SEALED_INCOMPLETE` when a required original is missing.

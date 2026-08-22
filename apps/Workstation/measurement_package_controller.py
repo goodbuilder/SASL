@@ -132,6 +132,7 @@ class MeasurementPackageController:
             "_measurement_package_detection_completed": False,
             "_measurement_package_finalize_requested": False,
             "_measurement_package_finalize_retry_scheduled": False,
+            "_measurement_session_close_requested": False,
             "_measurement_package_registered_paths": set(),
             "_measurement_package_inventory_errors": [],
             "_measurement_package_revision": 0,
@@ -144,6 +145,8 @@ class MeasurementPackageController:
             "_measurement_session_state": "IDLE",
             "_measurement_id": "",
             "_measurement_app_run_id": "",
+            "_measurement_started_monotonic_s": None,
+            "_measurement_detection_started_monotonic_s": None,
         }
         for name, value in defaults.items():
             if not hasattr(panel, name):
@@ -657,6 +660,8 @@ class MeasurementPackageController:
         self.panel._measurement_method_config_token = None
         self.panel._measurement_package_detection_started = False
         self.panel._measurement_package_detection_completed = False
+        self.panel._measurement_started_monotonic_s = time.monotonic()
+        self.panel._measurement_detection_started_monotonic_s = None
         self.panel._measurement_package_finalize_requested = False
         self.panel._measurement_package_registered_paths = set()
         self.panel._measurement_package_inventory_errors = []
@@ -796,6 +801,7 @@ class MeasurementPackageController:
             self.panel._measurement_package_detection_started = False
             self.panel._measurement_package_detection_completed = False
             self.panel._measurement_package_finalize_requested = False
+            self.panel._measurement_session_close_requested = False
             self.panel._measurement_package_registered_paths = set()
             self.panel._measurement_package_inventory_errors = []
             self.panel._measurement_package_rtcm_drain_requested_token = ""
@@ -1195,6 +1201,7 @@ class MeasurementPackageController:
             self._set_state(state, "This session already used its single Detection interval")
             return False
         self.panel._measurement_package_detection_started = True
+        self.panel._measurement_detection_started_monotonic_s = time.monotonic()
         self._ensure_measurement_input_evidence()
         self._activate_runtime_sources()
         self.activate_measurement_package_source("detector.yolo", metadata={"interval_count": 1})
@@ -1457,6 +1464,9 @@ class MeasurementPackageController:
                 return False
             self.panel._measurement_package_finalize_requested = False
             self._set_state(existing_core_state, f"Package sealed as {existing_core_state}")
+            if bool(getattr(self.panel, "_measurement_session_close_requested", False)):
+                self.panel._measurement_session_close_requested = False
+                return self.close_measurement_session()
             return True
 
         active = getattr(self.panel, "_session_recording_active", None)
@@ -1583,6 +1593,9 @@ class MeasurementPackageController:
         logger = getattr(self.panel, "_log", None)
         if callable(logger):
             logger(f"[패키지] Finalize 완료: {final_state}")
+        if bool(getattr(self.panel, "_measurement_session_close_requested", False)):
+            self.panel._measurement_session_close_requested = False
+            return self.close_measurement_session()
         return True
 
     def _measurement_outcome(self) -> dict[str, object]:
@@ -2541,7 +2554,51 @@ class MeasurementPackageController:
             return False
         state = _state_text(getattr(self.panel, "_measurement_package_state", "IDLE"))
         if state not in _SEALED_STATES | {"IDLE"}:
-            self._set_state(state, "Seal the current measurement before closing the session")
+            detection_started = bool(
+                getattr(self.panel, "_measurement_package_detection_started", False)
+            )
+            detection_completed = bool(
+                getattr(self.panel, "_measurement_package_detection_completed", False)
+            )
+            if state == "COLLECTING" and detection_started and not detection_completed:
+                self._set_state(
+                    state,
+                    "Stop Detection before closing; Session will close automatically after save and seal",
+                )
+                return False
+            if (
+                state in {"COLLECTING", "RECOVERABLE"}
+                and not detection_started
+                and not detection_completed
+            ):
+                # A lifecycle-only child may be closed without inventing a
+                # Detection interval.  This also covers an empty child moved
+                # to RECOVERABLE when a new app run reopens its parent
+                # Session.  Preserve it as an explicit empty measurement,
+                # run the normal persistence/inventory gates, and let
+                # completeness resolve to COMPLETE or INCOMPLETE.
+                self.panel._measurement_package_detection_completed = True
+                package = self.package
+                transition = getattr(package, "mark_post_capture", None)
+                if callable(transition):
+                    transition()
+                else:
+                    transition = getattr(package, "transition", None)
+                    if callable(transition):
+                        _call_supported(transition, "POST_CAPTURE")
+                self._sync_measurement_session()
+                self._set_state(
+                    "POST_CAPTURE",
+                    "Empty measurement will be saved and sealed before Session close",
+                )
+                state = "POST_CAPTURE"
+                detection_completed = True
+            if state in {"POST_CAPTURE", "VERIFYING", "RECOVERABLE"} and detection_completed:
+                self.panel._measurement_session_close_requested = True
+                if bool(getattr(self.panel, "_measurement_package_finalize_requested", False)):
+                    return self._continue_measurement_package_finalization()
+                return self.finalize_measurement_package()
+            self._set_state(state, "Measurement could not enter the automatic close workflow")
             return False
         session = self.session
         if session is None:

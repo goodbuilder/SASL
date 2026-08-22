@@ -62,6 +62,10 @@ from Workstation.workstation_core.optical_pose import (
     pose_parameters_from_camera_pose,
     stereo_pose_from_absolute,
 )
+from Workstation.workstation_core.operating_intrinsics import (
+    NOMINAL_INTRINSICS_QUALITY,
+    nominal_profile_to_stereo_result,
+)
 from Workstation.workstation_core.gnss_operation import (
     GnssOperationState,
     GnssReadinessSnapshot,
@@ -252,32 +256,58 @@ class MeasurementViewController:
     def _measurement_fill_source(self, method_id: str, side: str, dof: str) -> str:
         return self._measurement_fill_policy()[method_id][f"{side}.{dof}"]
 
-    def _measurement_live_readiness(self) -> tuple[bool, bool, tuple[str, ...]]:
-        """Return fresh Pixhawk and usable GNSS readiness for hybrid fills."""
+    def _measurement_live_readiness(
+        self,
+    ) -> tuple[bool, bool, tuple[str, ...], tuple[str, ...]]:
+        """Return field-policy hard readiness plus telemetry advisories."""
 
         now_s = time.monotonic()
+        measurement_start = getattr(self.panel, "_measurement_started_monotonic_s", None)
         extrinsics = getattr(self.panel, "latest_extrinsics", {}) or {}
-        attitude_reasons: list[str] = []
+        hard_reasons: list[str] = []
+        advisories: list[str] = []
         for side in ("left", "right"):
             sample = extrinsics.get(side) if isinstance(extrinsics, dict) else None
             if sample is None:
-                attitude_reasons.append(f"{side} Pixhawk attitude missing")
+                hard_reasons.append(f"{side} Pixhawk attitude missing")
                 continue
             timestamp_s = getattr(sample, "timestamp_s", None)
             try:
                 age_s = now_s - float(timestamp_s)
             except (TypeError, ValueError):
                 age_s = float("nan")
-            if not math.isfinite(age_s) or age_s < 0.0 or age_s > 2.0:
-                attitude_reasons.append(f"{side} Pixhawk attitude stale")
-        pixhawk_ready = not attitude_reasons
+            if not math.isfinite(age_s) or age_s < 0.0:
+                hard_reasons.append(f"{side} Pixhawk attitude timestamp invalid")
+            elif measurement_start is not None and float(timestamp_s) < float(measurement_start):
+                hard_reasons.append(f"{side} Pixhawk attitude not received in current Measurement")
+            elif age_s > 2.0:
+                advisories.append(f"{side} Pixhawk attitude stale ({age_s:.3f}s)")
+        pixhawk_hard = tuple(reason for reason in hard_reasons if "Pixhawk" in reason)
+        pixhawk_ready = not pixhawk_hard
         baseline = getattr(self.panel, "latest_rtk_baseline", None)
         gnss_ready = False
-        gnss_reason = "live GNSS baseline missing"
-        if baseline is not None:
+        left_gps, right_gps = self.panel._selected_baseline_gps_states()
+        if baseline is None or left_gps is None or right_gps is None:
+            hard_reasons.append("live GNSS baseline missing")
+        elif measurement_start is not None and (
+            float(left_gps.timestamp_s) < float(measurement_start)
+            or float(right_gps.timestamp_s) < float(measurement_start)
+        ):
+            hard_reasons.append("GNSS samples not received in current Measurement")
+        elif not left_gps.has_position or not right_gps.has_position or not all(
+            math.isfinite(float(value))
+            for sample in (left_gps, right_gps)
+            for value in (sample.latitude_deg, sample.longitude_deg, sample.altitude_m)
+        ):
+            hard_reasons.append("GNSS position missing or non-finite")
+        elif not math.isfinite(float(baseline.baseline_m)) or baseline.baseline_m <= 0.0:
+            hard_reasons.append("GPS baseline length <= 0 or non-finite")
+        else:
+            gnss_ready = True
+            advisories.extend(tuple(getattr(baseline, "warnings", ()) or ()))
             usable, reason = self.panel._gps_baseline_usable_for_translation(baseline)
-            gnss_ready = bool(usable)
-            gnss_reason = str(reason or "live GNSS baseline unusable")
+            if not usable and reason:
+                advisories.append(str(reason))
         if gnss_ready and bool(getattr(self.panel, "gnss_operation_gate_active", False)):
             manager = getattr(self.panel, "gnss_operation_manager", None)
             readiness = None if manager is None else manager.readiness()
@@ -287,14 +317,18 @@ class MeasurementViewController:
                 and bool(getattr(config, "readiness_gate_enabled", False))
                 and (readiness is None or not readiness.ready)
             ):
-                gnss_ready = False
-                gnss_reason = (
+                gnss_warning = (
                     "GNSS readiness snapshot missing"
                     if readiness is None
                     else "; ".join(readiness.reasons) or "GNSS readiness blocked"
                 )
-        reasons = tuple(attitude_reasons + ([] if gnss_ready else [gnss_reason]))
-        return pixhawk_ready, gnss_ready, reasons
+                advisories.append(gnss_warning)
+        return (
+            pixhawk_ready,
+            gnss_ready,
+            tuple(dict.fromkeys(hard_reasons)),
+            tuple(dict.fromkeys(advisories)),
+        )
 
     @staticmethod
     def _candidate_observed_dofs(
@@ -329,14 +363,20 @@ class MeasurementViewController:
         """Return exact live K,D applicability and its immutable profile ID."""
 
         reasons: list[str] = []
-        if getattr(self.panel, "active_intrinsics", None) is None:
-            reasons.append("exact operating K,D missing")
         applicability: object = None
+        profile: object = None
         try:
             snapshot = owner._intrinsics_snapshot(use_frozen=False)
             applicability = snapshot["applicability"]
+            profile = snapshot.get("profile")
         except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
             reasons.append("exact operating K,D applicability unavailable")
+        profile_row = profile if isinstance(profile, Mapping) else {}
+        provenance = profile_row.get("provenance")
+        provenance = provenance if isinstance(provenance, Mapping) else {}
+        nominal_active = provenance.get("quality") == NOMINAL_INTRINSICS_QUALITY
+        if getattr(self.panel, "active_intrinsics", None) is None and not nominal_active:
+            reasons.append("exact operating K,D missing")
         row = applicability if isinstance(applicability, Mapping) else {}
         geometry_allowed = bool(row.get("geometry_allowed"))
         if not geometry_allowed:
@@ -362,14 +402,16 @@ class MeasurementViewController:
         _geometry_allowed, current_profile_hash, intrinsics_reasons = (
             self._operating_intrinsics_readiness(owner)
         )
-        pixhawk_ready, gnss_ready, live_reasons = self._measurement_live_readiness()
+        pixhawk_ready, gnss_ready, live_hard_reasons, live_advisories = (
+            self._measurement_live_readiness()
+        )
         statuses: list[MeasurementMethodStatus] = []
 
         pixhawk_reasons = list(intrinsics_reasons)
         if not pixhawk_ready:
-            pixhawk_reasons.extend(reason for reason in live_reasons if "Pixhawk" in reason)
+            pixhawk_reasons.extend(reason for reason in live_hard_reasons if "Pixhawk" in reason)
         if not gnss_ready:
-            pixhawk_reasons.extend(reason for reason in live_reasons if "Pixhawk" not in reason)
+            pixhawk_reasons.extend(reason for reason in live_hard_reasons if "Pixhawk" not in reason)
         statuses.append(
             MeasurementMethodStatus(
                 method_id=PIXHAWK_RTK_LIVE,
@@ -388,6 +430,7 @@ class MeasurementViewController:
                 ),
                 requires_live_pixhawk=True,
                 requires_live_gnss=True,
+                warnings=live_advisories,
             )
         )
 
@@ -442,10 +485,11 @@ class MeasurementViewController:
                 "operating_intrinsics_profile_sha256", ""
             )
             reasons: list[str] = list(intrinsics_reasons)
+            candidate_warnings = list(candidate.warnings)
             if not expected_profile_hash:
-                reasons.append("candidate operating K,D profile SHA-256 missing")
+                candidate_warnings.append("candidate operating K,D profile SHA-256 missing")
             elif expected_profile_hash != current_profile_hash:
-                reasons.append("candidate K,D differs from active K,D")
+                candidate_warnings.append("candidate K,D differs from active K,D")
             if method_id == HORIZON_HYBRID:
                 for side in ("left", "right"):
                     if not {"roll_deg", "pitch_deg"} <= set(observed_by_side[side]):
@@ -489,10 +533,10 @@ class MeasurementViewController:
                         requires_live_gnss = True
             if requires_live_pixhawk and not pixhawk_ready:
                 reasons.append("fresh live Pixhawk required for missing rotation axes")
-                reasons.extend(reason for reason in live_reasons if "Pixhawk" in reason)
+                reasons.extend(reason for reason in live_hard_reasons if "Pixhawk" in reason)
             if requires_live_gnss and not gnss_ready:
                 reasons.append("usable live GNSS required for missing translation axes")
-                reasons.extend(reason for reason in live_reasons if "Pixhawk" not in reason)
+                reasons.extend(reason for reason in live_hard_reasons if "Pixhawk" not in reason)
             component_sources = tuple(
                 (
                     f"{side}.{name}",
@@ -522,7 +566,7 @@ class MeasurementViewController:
                     created_utc_ns=int(candidate.created_utc_ns or 0),
                     observed_dofs=observed,
                     component_sources=component_sources,
-                    warnings=tuple(candidate.warnings),
+                    warnings=tuple(dict.fromkeys((*candidate_warnings, *live_advisories))),
                     requires_live_pixhawk=requires_live_pixhawk,
                     requires_live_gnss=requires_live_gnss,
                 )
@@ -548,10 +592,11 @@ class MeasurementViewController:
                     )
                     or ""
                 )
+                loaded_warnings: list[str] = []
                 if not expected_profile_hash:
-                    reasons.append("loaded optical profile operating K,D SHA-256 missing")
+                    loaded_warnings.append("loaded optical profile operating K,D SHA-256 missing")
                 elif expected_profile_hash != current_profile_hash:
-                    reasons.append("loaded optical profile K,D differs from active K,D")
+                    loaded_warnings.append("loaded optical profile K,D differs from active K,D")
                 stable_reasons = tuple(dict.fromkeys(reasons))
                 statuses.append(
                     MeasurementMethodStatus(
@@ -574,6 +619,7 @@ class MeasurementViewController:
                             for side in ("left", "right")
                             for name in POSE_DOF_NAMES
                         ),
+                        warnings=tuple(dict.fromkeys((*loaded_warnings, *live_advisories))),
                     )
                 )
         return tuple(statuses)
@@ -601,7 +647,7 @@ class MeasurementViewController:
         status: MeasurementMethodStatus,
     ) -> dict[str, dict[str, object]]:
         sources = dict(status.component_sources)
-        pixhawk_ready, gnss_ready, _reasons = self._measurement_live_readiness()
+        pixhawk_ready, gnss_ready, _hard_reasons, _advisories = self._measurement_live_readiness()
         locked = self._measurement_fill_policy_locked()
         rows: dict[str, dict[str, object]] = {}
         atomic_method = status.method_id in {PIXHAWK_RTK_LIVE, CHECKERBOARD_STEREO} or bool(
@@ -1031,7 +1077,14 @@ class MeasurementViewController:
         right_gps: GpsSnapshot | None = None,
     ) -> StereoIntrinsicsResult | None:
         current = getattr(self.panel, "active_intrinsics", None)
-        if current is None:
+        owner = self.panel._optical_pose_controller()
+        profile_reader = getattr(owner, "operating_intrinsics_profile_for_geometry", None)
+        profile = profile_reader() if callable(profile_reader) else owner._operating_intrinsics_profile()
+        if profile is None:
+            return None
+        if profile.provenance.get("quality") == NOMINAL_INTRINSICS_QUALITY:
+            current = nominal_profile_to_stereo_result(profile)
+        elif current is None:
             return None
         intrinsics_only = without_stereo_extrinsics(current)
         if status.method_id == PIXHAWK_RTK_LIVE:
@@ -1866,19 +1919,41 @@ class MeasurementViewController:
         )
 
         selected_left_gps, selected_right_gps = self.panel._selected_baseline_gps_states()
+        measurement_start = getattr(self.panel, "_measurement_started_monotonic_s", None)
+        if measurement_start is not None:
+            if (
+                selected_left_gps is not None
+                and float(selected_left_gps.timestamp_s) < float(measurement_start)
+            ):
+                selected_left_gps = None
+            if (
+                selected_right_gps is not None
+                and float(selected_right_gps.timestamp_s) < float(measurement_start)
+            ):
+                selected_right_gps = None
         left_gps = None if selected_left_gps is None else GpsSnapshot.from_state(selected_left_gps)
         right_gps = None if selected_right_gps is None else GpsSnapshot.from_state(selected_right_gps)
 
         attitude_for_geometry_left = (
             left_attitude
-            if left_attitude_age_s is not None and left_attitude_age_s <= 2.0
+            if left_attitude is not None
+            and (
+                measurement_start is None
+                or left_attitude.timestamp_s >= float(measurement_start)
+            )
             else None
         )
         attitude_for_geometry_right = (
             right_attitude
-            if right_attitude_age_s is not None and right_attitude_age_s <= 2.0
+            if right_attitude is not None
+            and (
+                measurement_start is None
+                or right_attitude.timestamp_s >= float(measurement_start)
+            )
             else None
         )
+        left_attitude = attitude_for_geometry_left
+        right_attitude = attitude_for_geometry_right
         measurement_result = self._measurement_intrinsics_result_for_method(
             method_status,
             left_attitude=attitude_for_geometry_left,
@@ -1888,8 +1963,20 @@ class MeasurementViewController:
         )
         intrinsics = None
         if measurement_result is not None:
-            profile_path = self.panel._active_intrinsics_profile_path or (
-                f"memory:active-calibration:zoom-{self.panel.zoom_level_spin.value():02d}"
+            nominal_quality = (
+                dict(measurement_result.calibration_quality or {}).get("state")
+                == NOMINAL_INTRINSICS_QUALITY
+            )
+            operating_profile = (
+                self.panel._optical_pose_controller()._operating_intrinsics_profile()
+                if nominal_quality
+                else None
+            )
+            profile_path = (
+                operating_profile.source_path
+                if operating_profile is not None
+                else self.panel._active_intrinsics_profile_path
+                or f"memory:active-calibration:zoom-{self.panel.zoom_level_spin.value():02d}"
             )
             intrinsics = StereoIntrinsicsSnapshot.from_result(
                 measurement_result,
@@ -1898,14 +1985,28 @@ class MeasurementViewController:
                 selected_extrinsics_profile_path=method_status.instance_id,
                 intrinsics_source_zoom_level=getattr(
                     self.panel, "_active_intrinsics_source_zoom_level", None
-                ),
+                ) if operating_profile is None else operating_profile.left.source_zoom_index,
                 extrinsics_source_zoom_level=getattr(
                     self.panel, "_active_extrinsics_source_zoom_level", None
                 ),
                 selection_mode=f"measurement_method/{method_id}",
             )
 
-        warnings: tuple[str, ...] = tuple(method_status.warnings)
+        warnings: tuple[str, ...] = tuple(
+            dict.fromkeys(
+                (*method_status.warnings, *tuple(getattr(self.panel, "_last_pair_advisories", ()) or ()))
+            )
+        )
+        if (
+            measurement_result is not None
+            and dict(measurement_result.calibration_quality or {}).get("state")
+            == NOMINAL_INTRINSICS_QUALITY
+        ):
+            warnings = tuple(
+                dict.fromkeys(
+                    (*warnings, "NOMINAL_UNVERIFIED intrinsics; zero distortion assumed; precision not qualified")
+                )
+            )
         if triangulation_source == "checkerboard":
             baseline = build_checkerboard_baseline_snapshot(
                 intrinsics,
@@ -1988,6 +2089,7 @@ class MeasurementViewController:
             require_rtk_fixed_setting=bool(
                 self.panel._workstation_setting("require_rtk_fixed", self.panel.settings.require_rtk_fixed)
             ),
+            field_quality_gates_advisory=True,
         )
         candidate_attempt_id = self.panel._measurement_attempt_counter + 1
         attempt = MeasurementAttempt(
@@ -2026,6 +2128,7 @@ class MeasurementViewController:
                 getattr(self.panel, "_measurement_selection_reason", "selected")
             ),
             measurement_component_sources=method_status.component_sources,
+            measurement_started_monotonic_s=measurement_start,
         )
         if cached_attempt is not None:
             previous_missing = set(cached_attempt.missing_geometry_inputs)
@@ -2346,8 +2449,7 @@ class MeasurementViewController:
                 detail="해당 matched pair를 geometry 미준비 상태로 기록했습니다.",
             )
             return
-        gnss_measurement_block_reason: str | None = None
-        gnss_measurement_block_warnings: tuple[str, ...] = ()
+        gnss_measurement_advisories: tuple[str, ...] = ()
         if (
             selected_method_status is not None
             and selected_method_status.requires_live_gnss
@@ -2358,13 +2460,8 @@ class MeasurementViewController:
             if config.readiness_gate_enabled and (readiness is None or not readiness.ready):
                 reasons = ("GNSS readiness snapshot 대기",) if readiness is None else readiness.reasons
                 reason_text = "; ".join(reasons[:3]) or self.panel.gnss_operation_manager.state.value
-                # A failed readiness check invalidates this measurement result,
-                # but must not discard the matched pair while a recording is
-                # active.  Build the immutable attempt below and persist it as
-                # an unresolved sample with the GNSS reason attached.
-                gnss_measurement_block_reason = "readiness"
-                gnss_measurement_block_warnings = tuple(reasons) or (reason_text,)
-            if readiness is not None and gnss_measurement_block_reason is None:
+                gnss_measurement_advisories = tuple(reasons) or (reason_text,)
+            if readiness is not None:
                 try:
                     contract = self.panel._capture_measurement_gnss_contract(readiness)
                     if self.panel.gnss_operation_manager.state == GnssOperationState.READY:
@@ -2373,10 +2470,9 @@ class MeasurementViewController:
                         if not self.panel.gnss_operation_manager.validate_measurement_contract(contract, readiness):
                             raise RuntimeError("GNSS measurement contract changed")
                 except (RuntimeError, ValueError) as exc:
-                    # Keep the pair for recording even when its GNSS contract
-                    # cannot be accepted for a valid distance result.
-                    gnss_measurement_block_reason = "contract"
-                    gnss_measurement_block_warnings = (str(exc),)
+                    gnss_measurement_advisories = tuple(
+                        dict.fromkeys((*gnss_measurement_advisories, str(exc)))
+                    )
         if self.panel._measurement_display_mode() == "detection":
             self.panel._show_measurement_pair(pair.left, pair.right)
         else:
@@ -2393,36 +2489,18 @@ class MeasurementViewController:
             )
             return
 
-        if gnss_measurement_block_reason is not None:
-            warnings = tuple(dict.fromkeys((*attempt.warnings, *gnss_measurement_block_warnings)))
-            self.panel._record_unresolved_pair(
-                attempt,
-                status=f"matched_gnss_{gnss_measurement_block_reason}_blocked",
-                warnings=warnings,
+        if gnss_measurement_advisories:
+            attempt = MeasurementAttempt.from_canonical_payload(
+                {
+                    **attempt.canonical_payload(),
+                    "warnings": list(
+                        dict.fromkeys((*attempt.warnings, *gnss_measurement_advisories))
+                    ),
+                }
             )
-            self.panel._clear_triangulation_quality("GNSS 운용 준비 조건 미충족")
-            self.panel._set_distance_text(
-                "거리: GNSS 운용 준비 조건 미충족 | " + "; ".join(warnings),
-                quality="WARNING",
-                detail="그래프 미표시: 해당 pair를 무효 측정으로 기록했습니다.",
-            )
-            return
 
         baseline_m = attempt.baseline_m
         baseline_source = attempt.baseline_source
-        if baseline_source in {"rtk-blocked", "gps-rtk-blocked"}:
-            self.panel._record_unresolved_pair(
-                attempt,
-                status="matched_baseline_blocked",
-                warnings=attempt.warnings,
-            )
-            self.panel._clear_triangulation_quality("GPS baseline 조건 미충족")
-            self.panel._set_distance_text(
-                "거리: GPS baseline 조건 미충족 | " + "; ".join(attempt.warnings),
-                quality="WARNING",
-                detail="그래프 미표시: GPS baseline 조건을 만족하지 못했습니다.",
-            )
-            return
         triangulation_source = attempt.triangulation_source
         geometry_result = calculate_measurement_geometry(attempt)
         match = geometry_result.match
@@ -2470,6 +2548,15 @@ class MeasurementViewController:
             )
             return
 
+        if tuple(estimate.warnings) != tuple(attempt.warnings):
+            attempt = MeasurementAttempt.from_canonical_payload(
+                {
+                    **attempt.canonical_payload(),
+                    "warnings": list(estimate.warnings),
+                    "advisory_reasons": list(estimate.warnings),
+                }
+            )
+
         public_point_m = triangulated.point_m
         source_point_left_rdf_m = getattr(triangulated, "source_point_left_rdf_m", None)
         display_point_m = public_point_m
@@ -2505,6 +2592,9 @@ class MeasurementViewController:
         display_quality = estimate.sync_quality
         if attitude_timing_status in {"STALE", "VERY_STALE"} and display_quality == "GOOD":
             display_quality = "DEGRADED"
+        measurement_validity = "ESTIMATED" if estimate.warnings else "VALID"
+        if measurement_validity == "ESTIMATED":
+            display_quality = "ESTIMATED"
         relative_text = "relRPY=대기"
         if estimate.relative_roll_deg is not None:
             relative_text = (
@@ -2516,7 +2606,8 @@ class MeasurementViewController:
             f"거리: {display_distance_m:.2f} m ({method_text}{gap_text}) | bboxΔx={estimate.disparity_px:.1f}px "
             f"camΔt={estimate.time_delta_s * 1000:.0f}ms Δy={estimate.vertical_delta_px:.1f}px "
             f"baseline={display_baseline_source}:{display_baseline_m:.3f}m "
-            f"ATT:{attitude_badge} {relative_text} quality={display_quality}{warning_text}",
+            f"ATT:{attitude_badge} {relative_text} validity={measurement_validity} "
+            f"quality={display_quality}{warning_text}",
             quality=display_quality,
         )
         appended = self.panel._append_distance_history(
@@ -2811,7 +2902,7 @@ class MeasurementViewController:
     def _distance_style(self, quality: str) -> str:
         if quality == "GOOD":
             return f"background: {PANEL_ALT_BG}; color: {SUCCESS_TEXT}; border-color: {SUCCESS};"
-        if quality in {"DEGRADED", "WARNING", "WARN"}:
+        if quality in {"DEGRADED", "WARNING", "WARN", "ESTIMATED"}:
             return f"background: {PANEL_ALT_BG}; color: {WARNING_TEXT}; border-color: {WARNING};"
         if quality in {"BAD", "ERROR"}:
             return f"background: {PANEL_ALT_BG}; color: {ERROR_TEXT}; border-color: {ERROR};"

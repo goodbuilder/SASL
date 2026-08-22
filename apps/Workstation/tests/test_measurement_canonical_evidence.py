@@ -81,6 +81,17 @@ def _attempt() -> MeasurementAttempt:
     )
 
 
+def test_attempt_canonical_payload_carries_field_policy_decision() -> None:
+    attempt = _attempt()
+    payload = attempt.canonical_payload()
+
+    assert payload["measurement_policy_id"] == "field_measurement_v1"
+    assert payload["measurement_validity"] == "INVALID"
+    assert "intrinsics" in payload["hard_block_reasons"]
+    assert payload["advisory_reasons"] == ("geometry missing",)
+    assert MeasurementAttempt.from_canonical_payload(payload).canonical_payload() == payload
+
+
 def test_blocked_pair_retains_the_exact_readiness_payload_for_hash_verification() -> None:
     payload = _readiness_payload()
     blocked = BlockedMeasurementPair(

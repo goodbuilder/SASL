@@ -3447,10 +3447,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         return detection_timestamp_for_basis(observation, self._effective_yolo_time_basis())
 
     def _effective_yolo_time_basis(self) -> str:
+        if self._runtime_pair_uses_app_fallback:
+            return "detection"
         if self._camera_sync_gate_active():
             return "camera_rtc_required"
-        if self._yolo_time_basis() == "camera_rtcp" and self._runtime_pair_uses_app_fallback:
-            return "detection"
         return self._yolo_time_basis()
 
     def _camera_sync_gate_active(self) -> bool:
@@ -8616,7 +8616,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         elif self.last_calibration_result is not None:
             detail = "불러옴/계산됨, 아직 적용 전"
         else:
-            detail = "대기 중"
+            detail = "NOMINAL_UNVERIFIED 자동 fallback · fresh zoom/raster readback 필요"
         self.intrinsics_status_label.setText(f"내부 파라미터: {source_text} | {detail}")
 
     def _configure_collapsible_group(
@@ -9326,45 +9326,52 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def _recent_detection_observations(self, camera: str, *, now_s: float | None = None) -> list[DetectionObservation]:
         if not self.yolo_enabled and not self.camera_connected:
             return list(self.detection_buffers[camera])
-        now_s = time.monotonic() if now_s is None else now_s
+        _ = time.monotonic() if now_s is None else now_s
+        interval_start = getattr(self, "_measurement_detection_started_monotonic_s", None)
         return [
             detection
             for detection in self.detection_buffers[camera]
-            if 0.0 <= now_s - float(detection.timestamp_s) <= DETECTION_PAIR_MAX_AGE_S
+            if interval_start is None or float(detection.timestamp_s) >= float(interval_start)
         ]
 
     def _matched_detection_pair(self):
         now_s = time.monotonic()
+        advisories: list[str] = []
         if self._camera_sync_gate_active() and self.camera_sync_status != CAMERA_SYNC_STATUS_VERIFIED:
-            self._runtime_pair_uses_app_fallback = False
-            self._last_correspondence_rejection_reason = (
-                f"camera_time_sync_{self.camera_sync_status}"
-            )
-            return None
+            advisories.append(f"camera time sync {self.camera_sync_status}")
         left_samples = self._recent_detection_observations("left", now_s=now_s)
         right_samples = self._recent_detection_observations("right", now_s=now_s)
         self._runtime_pair_uses_app_fallback = False
         pair = match_nearest_pair(
             left_samples,
             right_samples,
-            max_delta_s=self._yolo_pair_max_delta_s(),
+            max_delta_s=float("inf"),
             timestamp=self._yolo_match_timestamp_s,
         )
-        if pair is not None or self._yolo_time_basis() != "camera_rtcp":
-            return self._validated_correspondence_pair(pair, left_samples, right_samples)
+        if pair is None:
+            pair = match_nearest_pair(
+                left_samples,
+                right_samples,
+                max_delta_s=float("inf"),
+                timestamp=lambda sample: float(sample.timestamp_s),
+            )
+            self._runtime_pair_uses_app_fallback = pair is not None
+            if pair is not None:
+                advisories.append("RTCP/NTP pairing unavailable; app receive time used")
 
-        # The WIRIS units can emit valid RTCP/NTP fields while their two
-        # camera clocks drift apart. Keep RTCP as the preferred diagnostic
-        # basis, but use the common app receive monotonic clock for live
-        # pairing so a long-running session does not stop producing pairs.
-        pair = match_nearest_pair(
-            left_samples,
-            right_samples,
-            max_delta_s=self._yolo_pair_max_delta_s(),
-            timestamp=lambda sample: float(sample.timestamp_s),
-        )
-        self._runtime_pair_uses_app_fallback = pair is not None
-        return self._validated_correspondence_pair(pair, left_samples, right_samples)
+        validated = self._validated_correspondence_pair(pair, left_samples, right_samples)
+        if validated is not None:
+            if validated.delta_s > self._yolo_pair_max_delta_s():
+                advisories.append(
+                    f"camera pair delta {validated.delta_s:.6f}s exceeds configured limit"
+                )
+            vertical_delta = abs(validated.left.center[1] - validated.right.center[1])
+            if vertical_delta > self._yolo_vertical_max_delta_px():
+                advisories.append(
+                    f"vertical bbox delta {vertical_delta:.3f}px exceeds configured limit"
+                )
+        self._last_pair_advisories = tuple(dict.fromkeys(advisories))
+        return validated
 
     def _validated_correspondence_pair(self, pair, left_samples, right_samples):
         if pair is None:

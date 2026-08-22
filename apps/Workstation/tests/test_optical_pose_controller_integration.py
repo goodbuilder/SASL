@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import hashlib
 import math
 import time
 from pathlib import Path
@@ -249,7 +251,15 @@ def test_horizon_candidate_becomes_measurement_ready_with_live_pixhawk_and_gnss_
         north_m=0.0,
         east_m=2.0,
         down_m=0.1,
+        baseline_m=math.sqrt(4.01),
+        warnings=(),
     )
+    live_left_gps = _gps_state("left", timestamp_s=now)
+    live_right_gps = _gps_state(
+        "right", timestamp_s=now, longitude_deg=127.987676321
+    )
+    panel._selected_baseline_gps_states = lambda: (live_left_gps, live_right_gps)
+    panel.gnss_operation_gate_active = False
     panel._gps_baseline_usable_for_translation = lambda _baseline: (True, "")
     panel.settings = SimpleNamespace(
         measurement_preferred_method=HORIZON_HYBRID,
@@ -341,8 +351,29 @@ def test_capture_horizon_and_apply_create_next_pair_immutable_profile(tmp_path: 
     assert panel.selected_extrinsics_profile.metadata["rotation_observation_zoom_index"] == 8
     assert panel.selected_extrinsics_profile.metadata["translation_source_zoom_index"] == 1
     assert panel.selected_extrinsics_profile.source_zoom_level is None
+    alignment_path = tmp_path / "session-001" / "alignment" / "active_alignment.json"
+    assert alignment_path.is_file()
+    alignment_payload = json.loads(alignment_path.read_text(encoding="utf-8"))
+    assert alignment_payload["session_id"] == "session-001"
+    assert alignment_payload["alignment"]["active_selection_id"] == applied["selection_id"]
+    applied_version = tmp_path / "session-001" / "alignment" / alignment_payload[
+        "selection_relative_path"
+    ]
+    assert applied_version.is_file()
+    assert panel._active_alignment_snapshot_path == str(applied_version)
+    assert hashlib.sha256(applied_version.read_bytes()).hexdigest() == alignment_payload[
+        "selection_sha256"
+    ]
 
     controller.revert_workstation_optical_pose({})
+    reverted_payload = json.loads(alignment_path.read_text(encoding="utf-8"))
+    assert reverted_payload["alignment"]["active_selection_id"] == ""
+    reverted_version = tmp_path / "session-001" / "alignment" / reverted_payload[
+        "selection_relative_path"
+    ]
+    assert reverted_version.is_file()
+    assert reverted_version != applied_version
+    assert applied_version.is_file()
     assert panel.selected_extrinsics_profile is base_profile
     assert panel.active_intrinsics is base_active_intrinsics
 

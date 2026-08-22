@@ -22,6 +22,10 @@ from Workstation.workstation_core.measurement_methods import (
     PIXHAWK_RTK_LIVE,
     normalize_measurement_method_id,
 )
+from Workstation.workstation_core.measurement_policy import (
+    FIELD_MEASUREMENT_POLICY_ID,
+    MEASUREMENT_VALIDITY_VALUES,
+)
 from Workstation.workstation_core.stereo import StereoCalibration
 from Workstation.workstation_core.triangulation import (
     camera_translation_right_in_left_camera,
@@ -949,6 +953,7 @@ class GeometryConfigSnapshot:
     timestamp_basis: str
     manual_focal_override: bool
     require_rtk_fixed_setting: bool = False
+    field_quality_gates_advisory: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "focal_length_px", _finite_float(self.focal_length_px, name="focal_length_px"))
@@ -958,6 +963,7 @@ class GeometryConfigSnapshot:
         object.__setattr__(self, "timestamp_basis", str(self.timestamp_basis))
         object.__setattr__(self, "manual_focal_override", bool(self.manual_focal_override))
         object.__setattr__(self, "require_rtk_fixed_setting", bool(self.require_rtk_fixed_setting))
+        object.__setattr__(self, "field_quality_gates_advisory", bool(self.field_quality_gates_advisory))
         _finite_float(self.focal_length_px, name="focal_length_px")
         _optional_finite_float(self.max_time_delta_s, name="max_time_delta_s")
         _optional_finite_float(self.max_vertical_delta_px, name="max_vertical_delta_px")
@@ -972,6 +978,7 @@ class GeometryConfigSnapshot:
             ),
             require_same_class=self.require_same_class,
             timestamp_basis=self.timestamp_basis,
+            quality_gates_advisory=self.field_quality_gates_advisory,
         )
 
 
@@ -1008,6 +1015,11 @@ class MeasurementAttempt:
     measurement_geometry_sha256: str = ""
     measurement_selection_reason: str = "legacy"
     measurement_component_sources: tuple[tuple[str, str], ...] = ()
+    measurement_policy_id: str = FIELD_MEASUREMENT_POLICY_ID
+    measurement_validity: str = "VALID"
+    hard_block_reasons: tuple[str, ...] = ()
+    advisory_reasons: tuple[str, ...] = ()
+    measurement_started_monotonic_s: float | None = None
     world_frame: str = WORLD_FRAME
     body_frame: str = BODY_FRAME
     camera_frame: str = CAMERA_FRAME
@@ -1030,6 +1042,7 @@ class MeasurementAttempt:
             "relative_roll_deg",
             "relative_pitch_deg",
             "relative_yaw_deg",
+            "measurement_started_monotonic_s",
         ):
             object.__setattr__(self, name, _optional_finite_float(getattr(self, name), name=name))
         for name in (
@@ -1047,6 +1060,25 @@ class MeasurementAttempt:
         ):
             object.__setattr__(self, name, str(getattr(self, name)))
         object.__setattr__(self, "warnings", tuple(str(value) for value in self.warnings))
+        hard_reasons = tuple(
+            dict.fromkeys(str(value) for value in self.hard_block_reasons if str(value))
+        )
+        advisory_reasons = tuple(
+            dict.fromkeys(str(value) for value in self.advisory_reasons if str(value))
+        )
+        if not hard_reasons:
+            hard_reasons = tuple(self.missing_geometry_inputs)
+        if not advisory_reasons:
+            advisory_reasons = tuple(self.warnings)
+        validity = "INVALID" if hard_reasons else "ESTIMATED" if advisory_reasons else "VALID"
+        object.__setattr__(self, "measurement_policy_id", str(self.measurement_policy_id))
+        object.__setattr__(self, "measurement_validity", validity)
+        object.__setattr__(self, "hard_block_reasons", hard_reasons)
+        object.__setattr__(self, "advisory_reasons", advisory_reasons)
+        if self.measurement_policy_id != FIELD_MEASUREMENT_POLICY_ID:
+            raise ValueError(f"measurement_policy_id must be {FIELD_MEASUREMENT_POLICY_ID}")
+        if self.measurement_validity not in MEASUREMENT_VALIDITY_VALUES:
+            raise ValueError("unsupported measurement_validity")
         object.__setattr__(
             self,
             "measurement_method_id",
@@ -1125,6 +1157,7 @@ class MeasurementAttempt:
             ("relative_roll_deg", self.relative_roll_deg),
             ("relative_pitch_deg", self.relative_pitch_deg),
             ("relative_yaw_deg", self.relative_yaw_deg),
+            ("measurement_started_monotonic_s", self.measurement_started_monotonic_s),
         ):
             if value is None:
                 continue
@@ -1448,17 +1481,10 @@ def build_pixhawk_baseline_snapshot(
     if right_gps.fix_type != 6:
         warnings.append(f"right {right_gps.rtk_label}")
     fix_quality = "DEGRADED" if warnings else "GOOD"
-    fixes_usable = (
-        left_gps.has_position
-        and right_gps.has_position
-        and left_gps.fix_type is not None
-        and right_gps.fix_type is not None
-        and left_gps.fix_type >= 3
-        and right_gps.fix_type >= 3
-    )
+    fixes_usable = left_gps.has_position and right_gps.has_position
     usable = fixes_usable and baseline_m > 0.0
     if not fixes_usable:
-        unusable_reason = "GPS fix < 3D"
+        unusable_reason = "GPS position missing or non-finite"
     elif baseline_m <= 0.0:
         unusable_reason = "GPS baseline length <= 0"
     else:

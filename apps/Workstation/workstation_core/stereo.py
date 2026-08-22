@@ -125,6 +125,7 @@ class StereoCalibration:
     max_vertical_delta_px: float = 80.0
     require_same_class: bool = True
     timestamp_basis: str = "detection"
+    quality_gates_advisory: bool = False
 
 
 @dataclass(frozen=True)
@@ -192,14 +193,27 @@ def match_stereo_observations(
         return None
     left_timestamp_s = detection_timestamp_for_basis(left, calibration.timestamp_basis)
     right_timestamp_s = detection_timestamp_for_basis(right, calibration.timestamp_basis)
+    advisory_warnings = list(warnings)
     if left_timestamp_s is None or right_timestamp_s is None:
-        return None
+        if not calibration.quality_gates_advisory:
+            return None
+        left_timestamp_s = float(left.timestamp_s)
+        right_timestamp_s = float(right.timestamp_s)
+        advisory_warnings.append("RTCP/NTP timestamp unavailable; app receive time used")
     time_delta = abs(left_timestamp_s - right_timestamp_s)
     if time_delta > calibration.max_time_delta_s:
-        return None
+        if not calibration.quality_gates_advisory:
+            return None
+        advisory_warnings.append(
+            f"camera pair delta {time_delta:.6f}s exceeds {calibration.max_time_delta_s:.6f}s"
+        )
     vertical_delta = abs(left_center_y - right_center_y)
     if vertical_delta > calibration.max_vertical_delta_px:
-        return None
+        if not calibration.quality_gates_advisory:
+            return None
+        advisory_warnings.append(
+            f"vertical bbox delta {vertical_delta:.3f}px exceeds {calibration.max_vertical_delta_px:.3f}px"
+        )
     if calibration.require_same_class and left.class_id != right.class_id:
         return None
     extrinsic_time_delta_s = None
@@ -224,7 +238,7 @@ def match_stereo_observations(
         relative_pitch_deg=relative_pitch_deg,
         relative_yaw_deg=relative_yaw_deg,
         sync_quality=sync_quality,
-        warnings=warnings,
+        warnings=tuple(dict.fromkeys(advisory_warnings)),
     )
 
 

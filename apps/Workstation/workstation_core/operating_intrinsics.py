@@ -24,6 +24,7 @@ OPERATING_INTRINSICS_PROFILE_SCHEMA = "operating-intrinsics-profile-v1"
 OPERATING_INTRINSICS_MATH_SCHEMA = "operating-intrinsics-math-v1"
 OPERATING_INTRINSICS_APPLICABILITY_SCHEMA = "operating-intrinsics-applicability-v1"
 OPENCV_OPTICAL_FRAME = "opencv_optical:RDF(right,down,forward)"
+NOMINAL_INTRINSICS_QUALITY = "NOMINAL_UNVERIFIED"
 
 
 def _finite_float(value: object, *, name: str) -> float:
@@ -396,6 +397,102 @@ class OperatingIntrinsicsProfile:
         return profile
 
 
+def build_nominal_operating_intrinsics_profile(
+    *,
+    zoom_index: int,
+    left_width_px: int,
+    left_height_px: int,
+    right_width_px: int,
+    right_height_px: int,
+    left_zoom_ratio: float | None = None,
+    right_zoom_ratio: float | None = None,
+) -> OperatingIntrinsicsProfile:
+    """Build an explicitly uncalibrated, zero-distortion pinhole profile.
+
+    The WIRIS nominal focal table is defined on a 1280x720 visible raster.
+    Horizontal and vertical focal lengths are scaled independently to retain
+    native OpenCV pixel units.  This is runtime geometry evidence, never a
+    camera-calibration PASS claim.
+    """
+
+    from .wiris_zoom import nominal_focal_length_px
+
+    zoom = int(zoom_index)
+    nominal_fx = nominal_focal_length_px(zoom)
+    if nominal_fx is None:
+        raise ValueError(f"no nominal focal estimate for zoom index {zoom}")
+
+    def camera(side: str, width: int, height: int, ratio: float | None) -> OperatingCameraIntrinsics:
+        width = int(width)
+        height = int(height)
+        if width <= 0 or height <= 0:
+            raise ValueError("nominal intrinsics require positive native raster dimensions")
+        fx = float(nominal_fx) * float(width) / 1280.0
+        fy = float(nominal_fx) * float(height) / 720.0
+        return OperatingCameraIntrinsics(
+            side=side,
+            width_px=width,
+            height_px=height,
+            camera_matrix=(
+                (fx, 0.0, (float(width) - 1.0) / 2.0),
+                (0.0, fy, (float(height) - 1.0) / 2.0),
+                (0.0, 0.0, 1.0),
+            ),
+            distortion_coefficients=(0.0, 0.0, 0.0, 0.0, 0.0),
+            source_zoom_index=zoom,
+            source_zoom_ratio=ratio,
+            distortion_model="opencv_pinhole_zero_distortion_assumed",
+        )
+
+    profile = OperatingIntrinsicsProfile(
+        left=camera("left", left_width_px, left_height_px, left_zoom_ratio),
+        right=camera("right", right_width_px, right_height_px, right_zoom_ratio),
+        profile_id=f"wiris-nominal-zoom-{zoom:02d}",
+        source_path="generated:wiris_zoom_nominal_pinhole",
+        provenance_json=_canonical_json_text(
+            {
+                "source": "wiris_zoom_nominal_pinhole",
+                "quality": NOMINAL_INTRINSICS_QUALITY,
+                "precision_qualified": False,
+                "runtime_truth_used": False,
+                "reference_raster_px": [1280, 720],
+                "reference_fx_px": nominal_fx,
+                "scaling": "fx=reference_fx*width/1280;fy=reference_fx*height/720",
+                "principal_point": "((width-1)/2,(height-1)/2)",
+                "distortion_assumption": "zero",
+            }
+        ),
+    )
+    return profile
+
+
+def nominal_profile_to_stereo_result(profile: OperatingIntrinsicsProfile) -> Any:
+    """Adapt one nominal operating profile to the legacy triangulation value."""
+
+    from .calibration import CameraIntrinsics, CheckerboardConfig, StereoIntrinsicsResult
+
+    def camera(value: OperatingCameraIntrinsics) -> CameraIntrinsics:
+        return CameraIntrinsics(
+            width=value.width_px,
+            height=value.height_px,
+            camera_matrix=[list(row) for row in value.camera_matrix],
+            distortion_coefficients=list(value.distortion_coefficients),
+            reprojection_error_px=float("nan"),
+            image_count=0,
+        )
+
+    return StereoIntrinsicsResult(
+        left=camera(profile.left),
+        right=camera(profile.right),
+        board=CheckerboardConfig(inner_cols=2, inner_rows=2, square_size_m=1.0),
+        extrinsics=None,
+        calibration_quality={
+            "state": NOMINAL_INTRINSICS_QUALITY,
+            "precision_qualified": False,
+            "profile_sha256": profile.profile_sha256,
+        },
+    )
+
 @dataclass(frozen=True)
 class OperatingCameraEvidence:
     """Observed optical state for one live camera stream."""
@@ -564,6 +661,7 @@ def evaluate_intrinsics_applicability(
     if profile is None:
         reasons.append("operating_intrinsics_profile_missing")
     else:
+        nominal_profile = profile.provenance.get("quality") == NOMINAL_INTRINSICS_QUALITY
         for side, expected, observed in (
             ("left", profile.left, left_evidence),
             ("right", profile.right, right_evidence),
@@ -597,6 +695,8 @@ def evaluate_intrinsics_applicability(
             ):
                 reasons.append(f"{side}_frame_resolution_mismatch")
 
+            if nominal_profile:
+                continue
             if expected.camera_serial is None:
                 reasons.append(f"{side}_profile_serial_unknown")
             elif observed.camera_serial is None:
@@ -643,4 +743,3 @@ def evaluate_intrinsics_applicability(
         intrinsics_math_sha256=("" if profile is None else profile.intrinsics_math_sha256),
         profile_sha256=("" if profile is None else profile.profile_sha256),
     )
-

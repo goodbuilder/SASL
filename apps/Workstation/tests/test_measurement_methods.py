@@ -127,7 +127,7 @@ def _method_readiness_controller(
         _optical_pose_controller=lambda: owner,
     )
     controller = MeasurementViewController(panel)
-    controller._measurement_live_readiness = lambda: (True, True, ())
+    controller._measurement_live_readiness = lambda: (True, True, (), ())
     return controller
 
 
@@ -479,6 +479,88 @@ def test_zoom_mismatch_blocks_every_measurement_geometry_source() -> None:
     )
 
 
+def test_nominal_unverified_profile_can_satisfy_geometry_readiness() -> None:
+    profile_hash = "f" * 64
+    owner = SimpleNamespace(
+        _intrinsics_snapshot=lambda **_kwargs: {
+            "profile": {
+                "provenance": {
+                    "quality": "NOMINAL_UNVERIFIED",
+                    "precision_qualified": False,
+                }
+            },
+            "applicability": {
+                "geometry_allowed": True,
+                "profile_sha256": profile_hash,
+                "reasons": (),
+            },
+        }
+    )
+    controller = MeasurementViewController(SimpleNamespace(active_intrinsics=None))
+
+    ready, digest, reasons = controller._operating_intrinsics_readiness(owner)
+
+    assert ready is True
+    assert digest == profile_hash
+    assert reasons == ()
+
+
+def test_field_live_readiness_accepts_same_measurement_stale_samples(monkeypatch) -> None:
+    monkeypatch.setattr("Workstation.measurement_view_controller.time.monotonic", lambda: 100.0)
+    left_gps = _gps_state("left", timestamp_s=91.0)
+    right_gps = _gps_state("right", timestamp_s=91.1, longitude_deg=127.00001)
+    baseline = SimpleNamespace(
+        baseline_m=1.0,
+        warnings=("left NO_FIX",),
+    )
+    panel = SimpleNamespace(
+        _measurement_started_monotonic_s=90.0,
+        latest_extrinsics={
+            "left": SimpleNamespace(timestamp_s=91.0),
+            "right": SimpleNamespace(timestamp_s=91.1),
+        },
+        latest_rtk_baseline=baseline,
+        _selected_baseline_gps_states=lambda: (left_gps, right_gps),
+        _gps_baseline_usable_for_translation=lambda _baseline: (False, "fix quality low"),
+        gnss_operation_gate_active=False,
+    )
+
+    pixhawk_ready, gnss_ready, hard, advisories = MeasurementViewController(
+        panel
+    )._measurement_live_readiness()
+
+    assert pixhawk_ready is True
+    assert gnss_ready is True
+    assert hard == ()
+    assert "left Pixhawk attitude stale (9.000s)" in advisories
+    assert "fix quality low" in advisories
+
+
+def test_field_live_readiness_rejects_samples_from_before_measurement(monkeypatch) -> None:
+    monkeypatch.setattr("Workstation.measurement_view_controller.time.monotonic", lambda: 100.0)
+    left_gps = _gps_state("left", timestamp_s=80.0)
+    right_gps = _gps_state("right", timestamp_s=80.1, longitude_deg=127.00001)
+    panel = SimpleNamespace(
+        _measurement_started_monotonic_s=90.0,
+        latest_extrinsics={
+            "left": SimpleNamespace(timestamp_s=80.0),
+            "right": SimpleNamespace(timestamp_s=80.1),
+        },
+        latest_rtk_baseline=SimpleNamespace(baseline_m=1.0, warnings=()),
+        _selected_baseline_gps_states=lambda: (left_gps, right_gps),
+        _gps_baseline_usable_for_translation=lambda _baseline: (True, "usable"),
+        gnss_operation_gate_active=False,
+    )
+
+    pixhawk_ready, gnss_ready, hard, _advisories = MeasurementViewController(
+        panel
+    )._measurement_live_readiness()
+
+    assert pixhawk_ready is False
+    assert gnss_ready is False
+    assert any("not received in current Measurement" in reason for reason in hard)
+
+
 def test_profile_sha_evidence_is_required_for_candidate_geometry() -> None:
     controller = _method_readiness_controller(
         geometry_allowed=True,
@@ -492,8 +574,8 @@ def test_profile_sha_evidence_is_required_for_candidate_geometry() -> None:
         if row.instance_id == "candidate:mountain-1"
     )
 
-    assert status.ready is False
-    assert "candidate operating K,D profile SHA-256 missing" in status.reasons
+    assert status.ready is True
+    assert "candidate operating K,D profile SHA-256 missing" in status.warnings
 
 
 def test_valid_exact_kd_keeps_cross_zoom_rt_geometry_ready() -> None:
