@@ -8,10 +8,12 @@ leave UI state ownership with the workstation panel/controller.
 from __future__ import annotations
 
 import ftplib
+import hashlib
 import math
 import os
 import posixpath
 import re
+import tempfile
 import threading
 import time
 from collections.abc import Mapping, Sequence
@@ -752,6 +754,7 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
         capture_id: str,
         image_enable_command: str = "SIHR TRUE",
         capture_channel: str = "hr",
+        capture_purpose: str = "unspecified",
         completion_timeout_s: float = 10.0,
         ftp_enabled: bool = False,
         ftp_settings_by_label: Mapping[str, Mapping[str, object]] | None = None,
@@ -763,8 +766,17 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
             for label, host, port, timeout_s in target_infos
         )
         self.capture_id = str(capture_id)
+        if (
+            not self.capture_id
+            or Path(self.capture_id).name != self.capture_id
+            or self.capture_id in {".", ".."}
+            or "\\" in self.capture_id
+            or "\x00" in self.capture_id
+        ):
+            raise ValueError("capture_id must be one safe path component")
         self.image_enable_command = str(image_enable_command).strip()
         self.capture_channel = str(capture_channel).strip().lower() or "hr"
+        self.capture_purpose = str(capture_purpose or "unspecified")
         self.completion_timeout_s = max(0.0, float(completion_timeout_s))
         # FTP reaches the same WIRIS Enterprise host as the TCP command
         # channel above; only the port differs. Downloading is best-effort:
@@ -789,8 +801,15 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
             capture_root = f"calib_capture/{capture_family}"
         else:
             capture_root = f"{self.capture_channel}_capture"
+        self.ftp_session_root = (
+            None
+            if ftp_output_dir is None
+            else Path(ftp_output_dir).expanduser().resolve(strict=False)
+        )
         self.ftp_output_dir = (
-            None if ftp_output_dir is None else Path(ftp_output_dir) / capture_root
+            None
+            if self.ftp_session_root is None
+            else self.ftp_session_root / capture_root
         )
 
     @staticmethod
@@ -1040,7 +1059,10 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
     ) -> tuple[Path, str]:
         if self.ftp_output_dir is None:
             raise RuntimeError("no local FTP download directory was configured")
-        self.ftp_output_dir.mkdir(parents=True, exist_ok=True)
+        if label not in {"left", "right"}:
+            raise ValueError("FTP capture side must be left or right")
+        output_root = self.ftp_output_dir.resolve(strict=False)
+        output_root.mkdir(parents=True, exist_ok=True)
         config = self.ftp_settings_by_label.get(label, {})
         port = int(config.get("port", 21))
         user = str(config.get("user") or "anonymous")
@@ -1059,11 +1081,61 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
                     baseline_tokens=baseline_tokens,
                 )
                 ftp.cwd(image_dir)
-                side_output_dir = self.ftp_output_dir / label
+                side_output_dir = output_root / label
                 side_output_dir.mkdir(parents=True, exist_ok=True)
-                destination = side_output_dir / f"{self.capture_id}_{latest_name}"
-                with destination.open("wb") as handle:
-                    ftp.retrbinary(f"RETR {latest_name}", handle.write)
+                resolved_side = side_output_dir.resolve(strict=True)
+                resolved_side.relative_to(output_root)
+                destination = resolved_side / f"{self.capture_id}_{latest_name}"
+                digest = hashlib.sha256()
+                size_bytes = 0
+                descriptor, temporary_name = tempfile.mkstemp(
+                    dir=resolved_side,
+                    prefix=f".{destination.name}.",
+                    suffix=".part",
+                )
+                temporary = Path(temporary_name)
+                try:
+                    with os.fdopen(descriptor, "wb") as handle:
+                        def write_chunk(chunk: bytes) -> None:
+                            nonlocal size_bytes
+                            written = handle.write(chunk)
+                            if written != len(chunk):
+                                raise OSError("short WIRIS FTP download write")
+                            digest.update(chunk)
+                            size_bytes += len(chunk)
+
+                        ftp.retrbinary(f"RETR {latest_name}", write_chunk)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    if size_bytes <= 0:
+                        raise OSError("WIRIS FTP downloaded an empty still image")
+                    expected_sha256 = digest.hexdigest()
+                    if os.path.lexists(destination):
+                        if destination.is_symlink() or not destination.is_file():
+                            raise OSError("WIRIS FTP destination is not a regular file")
+                        existing = destination.read_bytes()
+                        if (
+                            len(existing) != size_bytes
+                            or hashlib.sha256(existing).hexdigest()
+                            != expected_sha256
+                        ):
+                            raise OSError("WIRIS FTP capture destination collision")
+                        temporary.unlink()
+                    else:
+                        os.replace(temporary, destination)
+                        directory_descriptor = os.open(resolved_side, os.O_RDONLY)
+                        try:
+                            os.fsync(directory_descriptor)
+                        finally:
+                            os.close(directory_descriptor)
+                    sealed = destination.read_bytes()
+                    if (
+                        len(sealed) != size_bytes
+                        or hashlib.sha256(sealed).hexdigest() != expected_sha256
+                    ):
+                        raise OSError("WIRIS FTP sealed-byte verification failed")
+                finally:
+                    temporary.unlink(missing_ok=True)
                 return destination, f"{image_dir.rstrip('/')}/{latest_name}"
             except Exception as exc:
                 last_error = exc
@@ -1087,6 +1159,9 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
         def capture_one(label: str, host: str, port: int, timeout_s: float) -> None:
             item: dict[str, object] = {
                 "state": "failed",
+                "side": label,
+                "capture_id": self.capture_id,
+                "purpose": self.capture_purpose,
                 f"{self.capture_channel}_enabled": False,
                 "capture_complete": False,
                 "stored_on_camera": False,
@@ -1141,6 +1216,7 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
                     self.image_enable_command
                 )
                 item[f"{self.capture_channel}_enabled"] = True
+                item["capture_requested_monotonic_ns"] = time.monotonic_ns()
                 item["capture_requested_unix_ns"] = time.time_ns()
                 item["capture_response"] = send_capture_command("CPTR")
                 deadline_s = time.monotonic() + self.completion_timeout_s
@@ -1190,7 +1266,28 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
                         )
                         item["ftp_downloaded"] = True
                         item["ftp_local_path"] = str(downloaded)
+                        item["ftp_local_path_usage_contract"] = (
+                            "historical_provenance_only"
+                        )
+                        if self.ftp_session_root is not None:
+                            item["ftp_local_relative_path"] = downloaded.relative_to(
+                                self.ftp_session_root
+                            ).as_posix()
                         item["ftp_remote_path"] = remote_path
+                        item["ftp_remote_filename"] = PurePosixPath(
+                            remote_path
+                        ).name
+                        item["ftp_size_bytes"] = downloaded.stat().st_size
+                        item["ftp_sha256"] = hashlib.sha256(
+                            downloaded.read_bytes()
+                        ).hexdigest()
+                        item["zoom_readback"] = None
+                        item["zoom_readback_status"] = (
+                            "not_available_in_capture_worker"
+                        )
+                        item["ftp_byte_verification"] = (
+                            "size_and_sha256_after_atomic_rename"
+                        )
                         self.progress.emit(
                             {
                                 "source": "calibration",

@@ -49,6 +49,10 @@ from Workstation.workstation_core.mavlink_sources import (
     session_ulog_candidates,
     validate_ulog_artifact,
 )
+from Workstation.workstation_core.strict_jsonl import (
+    append_jsonl_record,
+    prepare_jsonl_append,
+)
 
 
 ULOG_CONTROLLER_METHODS = (
@@ -330,6 +334,7 @@ class ULogController:
         self._states: dict[MavlinkSourceId, _AutomaticState] = {}
         self._artifacts: list[SessionULogArtifact] = []
         self._manifest_path = self.session_root / "ulog_artifacts.jsonl"
+        self._manifest_recovery = prepare_jsonl_append(self._manifest_path)
         self._lock = threading.RLock()
         for source, value in (automatic_sources or {}).items():
             binding = (
@@ -832,17 +837,7 @@ class ULogController:
 
     @staticmethod
     def _append_json_line(path: Path, value: Mapping[str, Any]) -> None:
-        data = json.dumps(
-            value,
-            ensure_ascii=False,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8") + b"\n"
-        with path.open("ab") as writer:
-            writer.write(data)
-            writer.flush()
-            os.fsync(writer.fileno())
+        append_jsonl_record(path, value, prepared=True)
 
     @staticmethod
     def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:

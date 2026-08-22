@@ -74,3 +74,35 @@ def test_missing_timestamp_reference_remains_unknown(tmp_path: Path) -> None:
     )
 
     assert artifact.timestamp_reference == "unknown"
+
+
+def test_native_frame_ledger_recovers_only_a_torn_final_record(tmp_path: Path) -> None:
+    root = tmp_path / "session"
+    root.mkdir()
+    ledger = root / "native_frames.jsonl"
+    prefix = b'{"frame_id":"valid"}\n'
+    ledger.write_bytes(prefix + b'{"frame_id":')
+
+    store = NativeFrameStore(root)
+
+    assert ledger.read_bytes() == prefix
+    assert store.ledger_recovery.quarantined_tail is not None
+
+
+def test_nonfinite_native_timestamp_is_persisted_as_unknown_value(tmp_path: Path) -> None:
+    artifact = NativeFrameStore(tmp_path / "session").persist(
+        side="left",
+        purpose="sync-rejection",
+        image=_image(8, 6),
+        metadata={
+            "timestamp_s": float("nan"),
+            "timestamp_reference": "app-receive",
+            "native_width": 8,
+            "native_height": 6,
+            "overlay_applied": False,
+        },
+    )
+
+    assert artifact.timestamp_s is None
+    row = json.loads((tmp_path / "session" / "native_frames.jsonl").read_text())
+    assert row["timestamp_s"] is None

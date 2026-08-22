@@ -2227,6 +2227,13 @@ class MeasurementPackageController:
             cameras = record.get("cameras")
             if isinstance(cameras, Mapping):
                 item = cameras.get(side)
+                if isinstance(item, Mapping) and item.get(
+                    "ftp_local_relative_path"
+                ):
+                    return session_owned(
+                        item["ftp_local_relative_path"],
+                        field="session_relative_path",
+                    )
                 if isinstance(item, Mapping) and item.get("ftp_local_path"):
                     # Measurement capture workers stage FTP originals below the
                     # session root.  A recovered JSONL row is evidence, not
@@ -2242,15 +2249,36 @@ class MeasurementPackageController:
             for container_name in ("stored_files", "cameras"):
                 container = record.get(container_name)
                 if isinstance(container, Mapping) and isinstance(container.get(side), Mapping):
-                    return dict(container[side])
+                    detail = dict(container[side])
+                    detail.setdefault("capture_id", record.get("capture_id"))
+                    detail.setdefault("purpose", record.get("purpose"))
+                    detail.setdefault("request_utc_ns", record.get("request_utc_ns"))
+                    detail.setdefault(
+                        "request_monotonic_ns",
+                        record.get("request_monotonic_ns"),
+                    )
+                    zoom = record.get("active_zoom")
+                    if isinstance(zoom, Mapping) and isinstance(
+                        zoom.get(side), Mapping
+                    ):
+                        detail["zoom_readback"] = dict(zoom[side])
+                        detail["zoom_readback_status"] = (
+                            "observed_workstation_readback"
+                        )
+                    return detail
         return {}
 
     @staticmethod
     def _validated_capture_metadata(path: Path, detail: Mapping[str, object]) -> dict[str, object]:
         payload = path.read_bytes()
         digest = hashlib.sha256(payload).hexdigest()
-        expected_sha = str(detail.get("sha256") or "")
-        expected_size = detail.get("size_bytes", detail.get("byte_size"))
+        expected_sha = str(
+            detail.get("sha256") or detail.get("ftp_sha256") or ""
+        )
+        expected_size = detail.get(
+            "size_bytes",
+            detail.get("ftp_size_bytes", detail.get("byte_size")),
+        )
         if expected_sha and expected_sha != digest:
             raise ValueError("downloaded image bytes do not match capture SHA-256")
         if expected_size not in (None, "") and int(expected_size) != len(payload):
@@ -2271,6 +2299,30 @@ class MeasurementPackageController:
             "height_px": image.height(),
             "camera_serial": str(detail.get("camera_serial") or ""),
             "decode_verified": True,
+            "ftp_downloaded": bool(detail.get("ftp_downloaded")),
+            "ftp_remote_path": str(detail.get("ftp_remote_path") or ""),
+            "ftp_remote_filename": str(
+                detail.get("ftp_remote_filename") or ""
+            ),
+            "ftp_local_relative_path": str(
+                detail.get("ftp_local_relative_path") or ""
+            ),
+            "capture_id": str(detail.get("capture_id") or ""),
+            "side": str(detail.get("side") or ""),
+            "purpose": str(detail.get("purpose") or ""),
+            "zoom_readback": detail.get("zoom_readback"),
+            "zoom_readback_status": str(
+                detail.get("zoom_readback_status") or ""
+            ),
+            "capture_requested_unix_ns": detail.get(
+                "capture_requested_unix_ns"
+            ),
+            "capture_requested_monotonic_ns": detail.get(
+                "capture_requested_monotonic_ns"
+            ),
+            "request_utc_ns": detail.get("request_utc_ns"),
+            "request_monotonic_ns": detail.get("request_monotonic_ns"),
+            "camera_exposure_utc_ns": detail.get("camera_exposure_utc_ns"),
         }
 
     @staticmethod

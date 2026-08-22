@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ import pytest
 from PyQt5 import QtWidgets
 
 from Workstation.recording_controller import RecordingController
+from Workstation.measurement_package_controller import MeasurementPackageController
 from Workstation.wiris_runtime_workers import (
     WirisOZPhotoCaptureWorker,
     WirisPnPPhotoCaptureWorker,
@@ -113,6 +115,28 @@ def test_pnp_worker_separates_downloads_by_camera_side(tmp_path: Path, monkeypat
     assert local_path.parent == tmp_path / "calib_capture" / "HR" / "left"
     assert local_path.name == "calib-remote-layout_10-01-00-highRes.jpg"
     assert remote_path == "/ssd/new-session/img/10-01-00-highRes.jpg"
+    assert local_path.read_bytes() == b"fake-image"
+    assert not list(local_path.parent.glob("*.part"))
+
+
+@pytest.mark.parametrize("capture_id", ("../escape", "..\\escape", "..", ""))
+def test_pnp_worker_rejects_unsafe_capture_id(capture_id: str) -> None:
+    with pytest.raises(ValueError, match="safe path component"):
+        WirisPnPPhotoCaptureWorker((), capture_id=capture_id)
+
+
+def test_package_capture_validation_honors_worker_ftp_hash(tmp_path: Path) -> None:
+    path = tmp_path / "capture.jpg"
+    path.write_bytes(b"exact-camera-bytes")
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        MeasurementPackageController._validated_capture_metadata(
+            path,
+            {
+                "ftp_sha256": "0" * 64,
+                "ftp_size_bytes": path.stat().st_size,
+            },
+        )
 
 
 def test_pnp_worker_enables_hr_and_captures_both_cameras(monkeypatch) -> None:
@@ -158,6 +182,56 @@ def test_pnp_worker_enables_hr_and_captures_both_cameras(monkeypatch) -> None:
         ("right", "CPTR"),
         ("right", "ICPT"),
     }
+
+
+def test_ftp_capture_result_carries_sealed_byte_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = WirisPnPPhotoCaptureWorker(
+        (("left", "10.0.0.1", 2240, 0.5),),
+        capture_id="hr-provenance",
+        capture_purpose="pre",
+        completion_timeout_s=0.1,
+        ftp_enabled=True,
+        ftp_output_dir=tmp_path,
+    )
+    downloaded = worker.ftp_output_dir / "left" / "hr-provenance_image.jpg"
+    downloaded.parent.mkdir(parents=True)
+    downloaded.write_bytes(b"sealed-ftp-bytes")
+    monkeypatch.setattr(worker, "_snapshot_ftp_files", lambda *_args: set())
+    monkeypatch.setattr(
+        worker,
+        "_download_latest_ftp_file",
+        lambda *_args, **_kwargs: (downloaded, "/ssd/run/img/image.jpg"),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_send",
+        lambda *_args: "0" if _args[-1] == "ICPT" else "OK",
+    )
+    completed: list[dict[str, object]] = []
+    worker.completed.connect(completed.append)
+
+    worker.run()
+
+    item = completed[0]["cameras"]["left"]
+    assert item["side"] == "left"
+    assert item["capture_id"] == "hr-provenance"
+    assert item["purpose"] == "pre"
+    assert item["ftp_downloaded"] is True
+    assert item["ftp_local_relative_path"] == (
+        "hr_capture/left/hr-provenance_image.jpg"
+    )
+    assert item["ftp_local_path_usage_contract"] == "historical_provenance_only"
+    assert item["ftp_remote_path"] == "/ssd/run/img/image.jpg"
+    assert item["ftp_remote_filename"] == "image.jpg"
+    assert item["ftp_size_bytes"] == len(b"sealed-ftp-bytes")
+    assert item["ftp_sha256"] == hashlib.sha256(b"sealed-ftp-bytes").hexdigest()
+    assert item["capture_requested_unix_ns"] > 0
+    assert item["capture_requested_monotonic_ns"] > 0
+    assert item["zoom_readback"] is None
+    assert "camera_exposure_utc_ns" not in item
 
 
 @pytest.mark.parametrize(

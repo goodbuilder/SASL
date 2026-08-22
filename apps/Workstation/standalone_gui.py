@@ -11768,6 +11768,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             if session_id:
                 try:
                     from Workstation.workstation_core.package_provenance import redact_secrets
+                    from Workstation.workstation_core.strict_jsonl import (
+                        append_jsonl_record,
+                        prepare_jsonl_append,
+                    )
 
                     log_path = self._recording_session_dir(session_id) / "audit" / "application_log.jsonl"
                     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -11776,19 +11780,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                         "utc_ns": time.time_ns(),
                         "message": redact_secrets(str(text)),
                     }
-                    with log_path.open("ab") as handle:
-                        handle.write(
-                            json.dumps(
-                                record,
-                                ensure_ascii=False,
-                                allow_nan=False,
-                                sort_keys=True,
-                                separators=(",", ":"),
-                            ).encode("utf-8")
-                            + b"\n"
-                        )
-                        handle.flush()
-                        os.fsync(handle.fileno())
+                    prepared_paths = getattr(
+                        self,
+                        "_prepared_application_log_paths",
+                        set(),
+                    )
+                    if log_path not in prepared_paths:
+                        prepare_jsonl_append(log_path)
+                        prepared_paths.add(log_path)
+                        self._prepared_application_log_paths = prepared_paths
+                    append_jsonl_record(log_path, record, prepared=True)
                 except (OSError, TypeError, ValueError):
                     # Evidence-log failure is surfaced by package inventory;
                     # it must never recursively break the operator log path.

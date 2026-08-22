@@ -314,3 +314,16 @@ def test_manual_expected_hash_mismatch_leaves_no_session_artifact(tmp_path):
     assert not tuple((tmp_path / "session").rglob("*.part"))
     assert not tuple((tmp_path / "session").rglob("*.ulg"))
     assert controller.ulog_snapshot()["artifacts"] == []
+
+
+def test_ulog_artifact_ledger_recovers_torn_tail_before_append(tmp_path):
+    root = tmp_path / "session"
+    root.mkdir()
+    ledger = root / "ulog_artifacts.jsonl"
+    prefix = b'{"artifact_id":"valid"}\n'
+    ledger.write_bytes(prefix + b'{"artifact_id":')
+
+    controller = ULogController(root, SESSION)
+
+    assert ledger.read_bytes() == prefix
+    assert controller._manifest_recovery.quarantined_tail is not None

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-import json
+import math
 import os
 import time
 import uuid
@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from PyQt5 import QtGui
+
+from Workstation.workstation_core.strict_jsonl import (
+    append_jsonl_record,
+    prepare_jsonl_append,
+)
 
 
 @dataclass(frozen=True)
@@ -24,7 +29,7 @@ class NativeFrameArtifact:
     height: int
     size_bytes: int
     sha256: str
-    timestamp_s: float
+    timestamp_s: float | None
     source_timestamp_s: float | None
     timestamp_reference: str
     source_native_frame_id: str = ""
@@ -49,6 +54,7 @@ class NativeFrameStore:
         self.root = Path(session_root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.events_path = self.root / "native_frames.jsonl"
+        self.ledger_recovery = prepare_jsonl_append(self.events_path)
 
     def persist(
         self,
@@ -97,6 +103,28 @@ class NativeFrameStore:
         decoded = QtGui.QImage(str(destination))
         if decoded.isNull() or (decoded.width(), decoded.height()) != (image.width(), image.height()):
             raise IOError("persisted native PNG failed decode/dimension verification")
+        raw_timestamp = metadata.get("timestamp_s")
+        if raw_timestamp is None:
+            timestamp_s: float | None = time.monotonic()
+        else:
+            try:
+                timestamp_s = float(raw_timestamp)
+            except (TypeError, ValueError):
+                timestamp_s = None
+            if timestamp_s is not None and not math.isfinite(timestamp_s):
+                timestamp_s = None
+        raw_source_timestamp = metadata.get("source_timestamp_s")
+        try:
+            source_timestamp_s = (
+                None
+                if raw_source_timestamp is None
+                else float(raw_source_timestamp)
+            )
+        except (TypeError, ValueError):
+            source_timestamp_s = None
+        if source_timestamp_s is not None and not math.isfinite(source_timestamp_s):
+            source_timestamp_s = None
+        timestamp_reference = str(metadata.get("timestamp_reference") or "unknown")
         record = NativeFrameArtifact(
             frame_id=identifier,
             side=side_value,
@@ -106,19 +134,18 @@ class NativeFrameStore:
             height=image.height(),
             size_bytes=len(payload),
             sha256=hashlib.sha256(payload).hexdigest(),
-            timestamp_s=float(metadata.get("timestamp_s", time.monotonic())),
-            source_timestamp_s=(
-                None if metadata.get("source_timestamp_s") is None else float(metadata["source_timestamp_s"])
-            ),
+            timestamp_s=timestamp_s,
+            source_timestamp_s=source_timestamp_s,
             # Missing provenance is unknown.  It must never be promoted to the
             # host monotonic clock merely because a caller omitted the field.
-            timestamp_reference=str(metadata.get("timestamp_reference") or "unknown"),
+            timestamp_reference=timestamp_reference,
             source_native_frame_id=str(metadata.get("source_native_frame_id") or ""),
         )
-        with self.events_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record.to_mapping(), ensure_ascii=False, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        append_jsonl_record(
+            self.events_path,
+            record.to_mapping(),
+            prepared=True,
+        )
         return record
 
 

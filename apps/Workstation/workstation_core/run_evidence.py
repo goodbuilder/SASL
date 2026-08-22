@@ -26,6 +26,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping
 
+from Workstation.workstation_core.strict_jsonl import (
+    append_jsonl_record,
+    prepare_jsonl_append,
+)
 
 RUN_SETUP_SCHEMA = "workstation-run-setup-v1"
 RUN_EVENT_SCHEMA = "workstation-run-event-v1"
@@ -196,6 +200,10 @@ class RunEvidenceLedger:
         self._events_path = self.root / "run_events.jsonl"
         self._artifacts_path = self.root / "artifacts.jsonl"
         self._setup: RunSetup | None = self._load_setup()
+        self._ledger_recovery = {
+            "run_events": prepare_jsonl_append(self._events_path),
+            "artifacts": prepare_jsonl_append(self._artifacts_path),
+        }
         self._locked = self._events_path.exists() and self._events_path.stat().st_size > 0
 
     @property
@@ -523,12 +531,7 @@ class RunEvidenceLedger:
 
     @staticmethod
     def _append_json_line(path: Path, value: Mapping[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        data = canonical_json_bytes(value) + b"\n"
-        with path.open("ab") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
+        append_jsonl_record(path, value, prepared=True)
 
     @staticmethod
     def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:

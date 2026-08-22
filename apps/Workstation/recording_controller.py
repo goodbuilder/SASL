@@ -76,6 +76,10 @@ from Workstation.workstation_core.sync import (
     ATTITUDE_VERY_STALE_PAIR_DELTA_S,
     classify_attitude_timing,
 )
+from Workstation.workstation_core.strict_jsonl import (
+    append_jsonl_record,
+    prepare_jsonl_append,
+)
 from Workstation.device_runtime_workers import PixhawkParameterWorker
 from Workstation.evidence import mavlink_link_provenance
 from Workstation.session_workers import SessionSaveWorker
@@ -561,6 +565,7 @@ class RecordingController:
     def _load_jsonl_records(path: Path) -> list[dict[str, object]]:
         if not path.is_file():
             return []
+        prepare_jsonl_append(path)
         records: list[dict[str, object]] = []
         for line_number, raw_line in enumerate(
             path.read_text(encoding="utf-8").splitlines(),
@@ -1203,6 +1208,7 @@ class RecordingController:
         self.panel.pnp_photo_capture_worker = WirisPnPPhotoCaptureWorker(
             target_infos,
             capture_id=capture_id,
+            capture_purpose=normalized_purpose.value,
             completion_timeout_s=10.0,
             **self._wiris_ftp_worker_kwargs(),
         )
@@ -1272,6 +1278,7 @@ class RecordingController:
         self.panel.oz_photo_capture_worker = WirisOZPhotoCaptureWorker(
             target_infos,
             capture_id=capture_id,
+            capture_purpose=normalized_purpose.value,
             completion_timeout_s=10.0,
             **self._wiris_ftp_worker_kwargs(),
         )
@@ -1391,10 +1398,7 @@ class RecordingController:
         output_dir = self.panel._recording_session_dir(self.panel.recording_session_id)
         output_dir.mkdir(parents=True, exist_ok=True)
         event_path = output_dir / "hr_captures.jsonl"
-        with event_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(normalized, ensure_ascii=False, sort_keys=True) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
+        append_jsonl_record(event_path, normalized)
         self.panel.pnp_photo_capture_records.append(normalized)
         run_event_writer = getattr(self.panel, "append_workstation_run_event", None)
         if callable(run_event_writer):
@@ -1460,10 +1464,7 @@ class RecordingController:
         output_dir = self.panel._recording_session_dir(self.panel.recording_session_id)
         output_dir.mkdir(parents=True, exist_ok=True)
         event_path = output_dir / "oz_captures.jsonl"
-        with event_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(normalized, ensure_ascii=False, sort_keys=True) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
+        append_jsonl_record(event_path, normalized)
         records.append(normalized)
         run_event_writer = getattr(self.panel, "append_workstation_run_event", None)
         if callable(run_event_writer):

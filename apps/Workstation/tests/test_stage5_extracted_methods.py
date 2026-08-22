@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 import Workstation.recording_controller as recording_controller_module
 from Workstation.device_runtime_controller import DeviceRuntimeController
 from Workstation.recording_controller import RecordingController
@@ -83,7 +85,7 @@ def test_recover_retryable_recording_session_returns_false_without_candidates(tm
     assert result is False
 
 
-def test_capture_jsonl_corruption_is_preserved_and_next_id_uses_high_water(
+def test_capture_jsonl_malformed_middle_row_is_a_hard_failure_without_rewrite(
     tmp_path,
 ) -> None:
     path = tmp_path / "hr_captures.jsonl"
@@ -94,16 +96,11 @@ def test_capture_jsonl_corruption_is_preserved_and_next_id_uses_high_water(
         encoding="utf-8",
     )
 
-    records = RecordingController._load_jsonl_records(path)
+    original = path.read_bytes()
+    with pytest.raises(OSError, match="line=2"):
+        RecordingController._load_jsonl_records(path)
 
-    assert [row["capture_id"] for row in records] == [
-        "hr-001",
-        "corrupt-line-000002",
-        "hr-003",
-    ]
-    assert records[1]["state"] == "corrupt"
-    assert records[1]["raw_line_sha256"]
-    assert RecordingController._next_capture_id(records, "hr") == "hr-004"
+    assert path.read_bytes() == original
 
 
 def test_recover_retryable_recording_session_restores_hr_oz_capture_records(tmp_path) -> None:
