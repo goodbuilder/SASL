@@ -202,6 +202,9 @@ def test_save_publishes_verified_parquet_and_one_session_review_before_discardin
         {
             "measurement_id": "m000001",
             "measurement_package_id": "m000001",
+            "time_sync_epoch_id": None,
+            "left_time_sync_epoch_id": None,
+            "right_time_sync_epoch_id": None,
             "sample_index": 41,
             "session_elapsed_s": 1.25,
             "session_elapsed_ns": 1_250_000_000,
@@ -290,6 +293,9 @@ def test_save_publishes_verified_parquet_and_one_session_review_before_discardin
     assert manifest["artifact_details"]["geometry_contexts"]["role"] == (
         "context/geometry_contexts"
     )
+    time_sync_path = output_dir / manifest["resource_files"]["time_sync_epochs"]
+    assert time_sync_path.read_bytes() == b""
+    assert manifest["artifact_details"]["time_sync_epochs"]["row_count"] == 0
     review_status = json.loads(
         (session_root / ".workstation" / "review.json").read_text(encoding="utf-8")
     )

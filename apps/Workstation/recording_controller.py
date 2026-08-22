@@ -3434,6 +3434,22 @@ class RecordingController:
                 "rtp_marker_seq": (
                     "" if metadata.get("rtp_marker_seq") is None else str(int(metadata["rtp_marker_seq"]))
                 ),
+                "stream_generation": (
+                    ""
+                    if metadata.get("stream_generation") is None
+                    else int(metadata["stream_generation"])
+                ),
+                "rtcp_sr_ntp_raw": (
+                    ""
+                    if metadata.get("rtcp_sr_ntp_raw") is None
+                    else int(metadata["rtcp_sr_ntp_raw"])
+                ),
+                "rtcp_sr_ntp_unix_s": self.panel._fmt_record_float(
+                    None
+                    if metadata.get("rtcp_sr_ntp_unix_s") is None
+                    else float(metadata["rtcp_sr_ntp_unix_s"]),
+                    9,
+                ),
                 "rtcp_sr_received_count": (
                     ""
                     if metadata.get("rtcp_sr_received_count") is None
@@ -3711,6 +3727,11 @@ class RecordingController:
             row[f"{camera}_frame_timestamp_reference"] = timestamp_reference
             row[f"{camera}_rtp_timestamp"] = "" if metadata.get("rtp_timestamp") is None else str(int(metadata["rtp_timestamp"]))
             row[f"{camera}_rtp_ssrc"] = "" if metadata.get("rtp_ssrc") is None else str(int(metadata["rtp_ssrc"]))
+            row[f"{camera}_stream_generation"] = (
+                ""
+                if metadata.get("stream_generation") is None
+                else int(metadata["stream_generation"])
+            )
             row[f"{camera}_rtcp_frame_ntp_unix_s"] = self.panel._fmt_record_float(
                 None if metadata.get("rtcp_frame_ntp_unix_s") is None else float(metadata["rtcp_frame_ntp_unix_s"]),
                 6,

@@ -51,6 +51,7 @@ DETECTION_METADATA_ALLOWLIST = (
     "timestamp_reference",
     "rtp_timestamp",
     "rtp_ssrc",
+    "stream_generation",
     "rtp_marker_seq",
     "rtp_pts_s",
     "rtcp_sr_ntp_raw",

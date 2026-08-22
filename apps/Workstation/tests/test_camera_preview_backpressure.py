@@ -15,9 +15,11 @@ def test_preview_inbox_replaces_only_stale_ui_frames_and_renders_latest() -> Non
     _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     pane = CameraPane("left")
     pane.stream_generation = 7
-    delivered: list[tuple[str, int]] = []
+    delivered: list[tuple[str, int, int]] = []
     pane.frame_changed.connect(
-        lambda side, _image, metadata: delivered.append((side, int(metadata["sequence"])))
+        lambda side, _image, metadata: delivered.append(
+            (side, int(metadata["sequence"]), int(metadata["stream_generation"]))
+        )
     )
 
     pane._submit_preview_frame_for_generation(7, _image(10), {"sequence": 1})
@@ -36,7 +38,7 @@ def test_preview_inbox_replaces_only_stale_ui_frames_and_renders_latest() -> Non
 
     pane._drain_preview_frame()
 
-    assert delivered == [("left", 3)]
+    assert delivered == [("left", 3, 7)]
     assert pane.current_image().pixelColor(0, 0).red() == 30
     after = pane.preview_delivery_snapshot()
     assert after["submitted"] == 3
@@ -94,5 +96,38 @@ def test_native_measurement_frame_bypasses_preview_replacement() -> None:
     assert stored[0] == 12.5
     assert (stored[1].width(), stored[1].height()) == (16, 12)
     assert stored[2]["source_native_frame_id"] == "native-1"
+    assert stored[2]["stream_generation"] == 3
     assert pane.preview_delivery_snapshot()["queued_latest"] is True
+    pane.deleteLater()
+
+
+def test_detection_metadata_carries_the_owning_stream_generation() -> None:
+    _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    pane = CameraPane("left")
+    pane.stream_generation = 11
+    delivered = []
+    pane.detection_changed.connect(lambda _side, observation: delivered.append(observation))
+
+    pane._handle_detection_payload_if_current(
+        11,
+        {
+            "timestamp_s": 5.0,
+            "width": 640,
+            "height": 480,
+            "best_detection": {
+                "x1": 1.0,
+                "y1": 2.0,
+                "x2": 3.0,
+                "y2": 4.0,
+                "confidence": 0.9,
+                "class_id": 1,
+                "class_name": "target",
+            },
+            "detections": [{"class_id": 1}],
+            "timestamp_metadata": {"rtp_ssrc": 101},
+        },
+    )
+
+    assert len(delivered) == 1
+    assert delivered[0].timestamp_metadata["stream_generation"] == 11
     pane.deleteLater()

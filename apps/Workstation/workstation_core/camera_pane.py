@@ -360,7 +360,9 @@ class CameraPane(QtWidgets.QGroupBox):
     def _show_frame_if_current(self, generation: int, image: QtGui.QImage, metadata: object) -> None:
         if generation != self.stream_generation:
             return
-        self._show_frame(image, metadata)
+        frame_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        frame_metadata["stream_generation"] = int(generation)
+        self._show_frame(image, frame_metadata)
 
     def _configure_preview_timer(self, requested_rate_hz: object) -> None:
         try:
@@ -383,6 +385,7 @@ class CameraPane(QtWidgets.QGroupBox):
         if generation != self.stream_generation:
             return
         frame_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        frame_metadata["stream_generation"] = int(generation)
         with self._preview_lock:
             self._preview_submitted += 1
             if self._pending_preview is not None:
@@ -450,6 +453,7 @@ class CameraPane(QtWidgets.QGroupBox):
         if generation != self.stream_generation:
             return
         frame_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        frame_metadata["stream_generation"] = int(generation)
         timestamp_s = float(frame_metadata.get("timestamp_s", time.monotonic()))
         # The compatibility signal above may arrive immediately before this
         # metadata-rich signal.  Store the native raster and metadata together
@@ -766,7 +770,14 @@ class CameraPane(QtWidgets.QGroupBox):
     def _handle_detection_payload_if_current(self, generation: int, payload: dict) -> None:
         if generation != self.stream_generation:
             return
-        self._handle_detection_payload(payload)
+        current_payload = dict(payload)
+        timestamp_metadata = current_payload.get("timestamp_metadata")
+        timestamp_metadata = (
+            dict(timestamp_metadata) if isinstance(timestamp_metadata, dict) else {}
+        )
+        timestamp_metadata["stream_generation"] = int(generation)
+        current_payload["timestamp_metadata"] = timestamp_metadata
+        self._handle_detection_payload(current_payload)
 
     def _handle_stats_payload(self, payload: dict) -> None:
         self.stats_changed.emit(self.camera_label, payload)

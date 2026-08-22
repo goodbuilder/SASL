@@ -356,6 +356,10 @@ AUTHORITATIVE_JSONL_STREAMS = {
         "context/geometry_contexts",
         "data/context/geometry_contexts.jsonl",
     ),
+    "time_sync_epochs": (
+        "context/time_sync_epochs",
+        "data/context/time_sync_epochs.jsonl",
+    ),
     "raw_px4_drone": ("raw/px4_drone", "data/raw/px4_drone.jsonl"),
     "raw_extrinsics_comparison": (
         "raw/extrinsics_comparison",
@@ -3511,6 +3515,9 @@ def save_session_files(
     from Workstation.workstation_core.geometry_context import (
         materialize_geometry_contexts,
     )
+    from Workstation.workstation_core.time_sync_epoch import (
+        materialize_time_sync_epochs,
+    )
 
     output_dir = Path(output_dir)
     session_id, measurement_id = _validate_measurement_storage_identity(
@@ -3543,6 +3550,7 @@ def save_session_files(
         return artifact_key, role, relative_path, rows, normalization
 
     geometry_context_rows: list[dict[str, object]] = []
+    time_sync_epoch_rows: list[dict[str, object]] = []
     jsonl_streams = [
         jsonl_stream(
             "raw_stereo_measurements",
@@ -3578,6 +3586,11 @@ def save_session_files(
             "geometry_contexts",
             geometry_context_rows,
             "geometry_context_record_v1",
+        ),
+        jsonl_stream(
+            "time_sync_epochs",
+            time_sync_epoch_rows,
+            "time_sync_epoch_record_v1",
         ),
     ]
     if "drone" in px4_full_rows:
@@ -3625,6 +3638,15 @@ def save_session_files(
         _apply_terminal_record_identities(pair_full_rows)
         geometry_context_rows.extend(
             materialize_geometry_contexts(pair_full_rows)
+        )
+        time_sync_epoch_rows.extend(
+            materialize_time_sync_epochs(
+                camera_rows=camera_full_rows,
+                terminal_rows=pair_full_rows,
+                metadata=metadata,
+                session_id=session_id,
+                measurement_package_id=measurement_id,
+            )
         )
         parquet_pair_rows = _project_pair_typed_fields(
             [dict(row) for row in pair_full_rows]
@@ -3680,6 +3702,7 @@ def save_session_files(
             },
             "resource_files": resource_files,
             "geometry_context_registry": resource_files["geometry_contexts"],
+            "time_sync_epoch_registry": resource_files["time_sync_epochs"],
             "metadata": metadata,
         }
         context_path = data_dir / "context.json"
@@ -3724,6 +3747,7 @@ def save_session_files(
                 "raw_px4_right",
                 "raw_gnss_base",
                 "geometry_contexts",
+                "time_sync_epochs",
             )
         ]
         generation_manifest = {
