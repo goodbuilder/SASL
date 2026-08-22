@@ -1955,7 +1955,11 @@ class RecordingController:
     @QtCore.pyqtSlot(object)
     def _handle_session_saved(self, saved_files: SavedSessionFiles) -> None:
         self.panel._log(
-            "[저장] typed Parquet 원본을 저장했습니다: "
+            "[저장] canonical JSONL 원본을 저장했습니다: "
+            + ", ".join(str(path) for path in saved_files.authoritative_jsonl_files)
+        )
+        self.panel._log(
+            "[저장] derived typed Parquet을 저장했습니다: "
             f"pairs={saved_files.measurement_pairs_parquet}, "
             f"camera={saved_files.camera_timeline_parquet}, "
             f"pixhawk={saved_files.pixhawk_timeline_parquet}, "
@@ -1970,7 +1974,7 @@ class RecordingController:
             )
         elif saved_files.review_error:
             self.panel._log(
-                "[저장] Parquet 원본은 확정되었지만 review.xlsx 재생성은 실패했습니다: "
+                "[저장] JSONL 원본은 확정되었지만 review.xlsx 재생성은 실패했습니다: "
                 + saved_files.review_error
             )
         else:

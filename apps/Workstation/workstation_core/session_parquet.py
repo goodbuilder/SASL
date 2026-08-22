@@ -1,4 +1,4 @@
-"""Typed, lossless Parquet artifacts for finalized measurement sessions.
+"""Typed, lossless derived Parquet artifacts for finalized measurements.
 
 The real-time recorder may append JSONL rows while a session is active.  This
 module owns the other side of that boundary: it converts finalized JSON-safe
@@ -10,10 +10,10 @@ Every Parquet row contains two representations of the same logical record:
 * stable typed columns for common filtering and analysis; and
 * ``row_json``, a canonical JSON object containing every source field.
 
-The typed projection is deliberately not the authority for dynamic fields.
-``row_json`` prevents a newly added device or solver field from disappearing
-merely because an older writer does not yet have a dedicated Arrow column for
-it.
+The canonical JSONL fragments owned by ``recording_session`` are authoritative.
+The typed projection is deliberately a derived analysis view; ``row_json``
+still prevents a newly added device or solver field from disappearing merely
+because an older writer does not yet have a dedicated Arrow column for it.
 """
 
 from __future__ import annotations
@@ -58,7 +58,7 @@ class ParquetArtifactMetadata:
     sha256: str
     schema: dict[str, object]
     schema_sha256: str
-    authoritative: bool = True
+    authoritative: bool = False
     verified: bool = True
 
     def to_mapping(self, *, relative_to: Path | None = None) -> dict[str, object]:
@@ -839,7 +839,7 @@ def finalize_measurement_pairs(
     output: Path,
     rows: Iterable[Mapping[str, object]],
 ) -> ParquetArtifactMetadata:
-    """Write and verify the authoritative measurement-pair Parquet file."""
+    """Write and verify the derived measurement-pair Parquet file."""
 
     return _atomic_write(output, rows, MEASUREMENT_PAIRS)
 

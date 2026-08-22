@@ -28,7 +28,10 @@ from typing import Any
 from PyQt5 import QtCore, QtGui
 
 from Workstation.runtime_paths import resolve_workstation_data_path
-from Workstation.workstation_core.recording_session import session_id_now
+from Workstation.workstation_core.recording_session import (
+    MEASUREMENT_STORAGE_SCHEMA,
+    session_id_now,
+)
 
 
 MEASUREMENT_PACKAGE_METHODS = [
@@ -715,7 +718,7 @@ class MeasurementPackageController:
         )
         self.activate_measurement_package_source(
             "measurement",
-            required_roles=("measurements/pairs_parquet",),
+            required_roles=("measurements/pairs_jsonl",),
         )
         self.activate_measurement_package_source(
             "session.persistence",
@@ -2427,16 +2430,67 @@ class MeasurementPackageController:
                 failed=True,
             )
 
-        raw_pair_path = self._actual_generation_file("measurement_pairs.parquet")
-        self._required_file(
-            "measurements/pairs_parquet",
-            raw_pair_path,
-            producer="SessionSaveWorker",
-            source="measurement",
-            reason="authoritative measurement-pair Parquet is missing",
-            allow_empty=True,
+        manifest_schema = ""
+        if session_manifest.is_file():
+            try:
+                manifest_payload = json.loads(
+                    session_manifest.read_text(encoding="utf-8")
+                )
+                if isinstance(manifest_payload, Mapping):
+                    manifest_schema = str(manifest_payload.get("schema") or "")
+            except (OSError, UnicodeError, ValueError):
+                manifest_schema = ""
+        measurement_roles = {
+            str(role)
+            for source in self._core_snapshot().get("source_expectations", ()) or ()
+            if isinstance(source, Mapping)
+            and str(source.get("source_id") or "") == "measurement"
+            for role in source.get("required_roles", ()) or ()
+        }
+        raw_pair_jsonl = self._actual_generation_file(
+            "raw/stereo_measurements.jsonl"
         )
-        self._register_measurement_pair_evidence(raw_pair_path)
+        pair_parquet = self._actual_generation_file("measurement_pairs.parquet")
+        requires_jsonl = (
+            manifest_schema == MEASUREMENT_STORAGE_SCHEMA
+            or "measurements/pairs_jsonl" in measurement_roles
+            or raw_pair_jsonl is not None
+        )
+        requires_legacy_parquet = (
+            "measurements/pairs_parquet" in measurement_roles
+            and not requires_jsonl
+        )
+        if requires_jsonl:
+            self._required_file(
+                "measurements/pairs_jsonl",
+                raw_pair_jsonl,
+                producer="SessionSaveWorker",
+                source="measurement",
+                reason="authoritative measurement-pair JSONL is missing",
+                metadata={"authoritative": True},
+                allow_empty=True,
+            )
+        if pair_parquet is not None and pair_parquet.is_file():
+            self._register_artifact(
+                "measurements/pairs_parquet",
+                pair_parquet,
+                required=requires_legacy_parquet,
+                producer="SessionSaveWorker",
+                source="measurement",
+                classification="derived",
+                metadata={
+                    "authoritative": False,
+                    "legacy_authority_accepted": requires_legacy_parquet,
+                },
+            )
+        elif requires_legacy_parquet:
+            self._register_missing(
+                "measurements/pairs_parquet",
+                "legacy authoritative measurement-pair Parquet is missing",
+                producer="SessionSaveWorker",
+                source="measurement",
+            )
+        self._register_measurement_pair_evidence(raw_pair_jsonl or pair_parquet)
         self._register_runtime_source_inventory()
 
         self._register_capture_records(

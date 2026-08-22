@@ -7,7 +7,9 @@ from Workstation.workstation_core.recording_session import save_session_files
 from Workstation.workstation_core.session_parquet import read_lossless_rows
 
 
-def test_active_drone_px4_rows_are_published_in_authoritative_parquet(tmp_path: Path) -> None:
+def test_active_drone_px4_rows_are_authoritative_jsonl_and_derived_parquet(
+    tmp_path: Path,
+) -> None:
     output = tmp_path / "recordings" / "drone-session"
     sentinel = {
         "sequence": 7,
@@ -29,9 +31,16 @@ def test_active_drone_px4_rows_are_published_in_authoritative_parquet(tmp_path: 
     )
 
     manifest = json.loads(saved.manifest.read_text(encoding="utf-8"))
+    raw_name = manifest["resource_files"]["raw_px4_drone"]
+    raw_detail = manifest["artifact_details"]["raw_px4_drone"]
     name = manifest["resource_files"]["pixhawk_timeline_parquet"]
     detail = manifest["artifact_details"]["pixhawk_timeline"]
+    assert raw_name == "data/raw/px4_drone.jsonl"
+    assert raw_detail["authoritative"] is True
+    assert raw_detail["row_count"] == 1
+    assert json.loads((output / raw_name).read_text(encoding="utf-8")) == sentinel
     assert detail["verified"] is True
+    assert detail["authoritative"] is False
     assert detail["row_count"] == 1
     assert name == "data/pixhawk_timeline.parquet"
     row = read_lossless_rows(saved.pixhawk_timeline_parquet, "pixhawk_timeline")[0]

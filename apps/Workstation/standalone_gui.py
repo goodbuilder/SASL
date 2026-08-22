@@ -3276,7 +3276,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.save_history_button = QtWidgets.QPushButton("세션 파일 저장")
         self.save_history_button.clicked.connect(self.save_distance_history_csv)
         self.save_history_button.setToolTip(
-            "현재 측정을 typed Parquet 원본으로 확정하고 세션 통합 review.xlsx를 갱신합니다."
+            "현재 측정을 canonical JSONL 원본과 derived Parquet으로 확정합니다. "
+            "review.xlsx는 세션 종료 시 갱신됩니다."
         )
         self.save_settings_button = QtWidgets.QPushButton("전체 설정 저장")
         self.save_settings_button.clicked.connect(self.save_current_settings_from_ui)

@@ -22,8 +22,8 @@ import pyarrow.parquet as pq
 import xlsxwriter
 
 
-# Finalized typed tables are Parquet.  JSONL remains the crash-recovery spool
-# and append-only event format; the one operator-facing view is review.xlsx.
+# Finalized structured records are canonical JSONL.  Typed Parquet tables and
+# the operator-facing review.xlsx are reproducible derived views.
 WRITE_PARQUET_ARTIFACTS = True
 
 PAIR_AXIS_COLUMNS = ("sample_index", "session_elapsed_s")
@@ -340,6 +340,24 @@ CALIBRATION_KEYWORDS = (
 )
 
 AUTHORITATIVE_JSONL_SCHEMA_VERSION = "stereowiris-authoritative-jsonl-v1"
+MEASUREMENT_STORAGE_SCHEMA = "workstation-measurement-storage-v3"
+MEASUREMENT_STORAGE_SCHEMA_VERSION = 3
+AUTHORITATIVE_JSONL_STREAMS = {
+    "raw_stereo_measurements": (
+        "raw/stereo_measurements",
+        "data/raw/stereo_measurements.jsonl",
+    ),
+    "raw_camera_left": ("raw/camera_left", "data/raw/camera_left.jsonl"),
+    "raw_camera_right": ("raw/camera_right", "data/raw/camera_right.jsonl"),
+    "raw_px4_left": ("raw/px4_left", "data/raw/px4_left.jsonl"),
+    "raw_px4_right": ("raw/px4_right", "data/raw/px4_right.jsonl"),
+    "raw_gnss_base": ("raw/gnss_base", "data/raw/gnss_base.jsonl"),
+    "raw_px4_drone": ("raw/px4_drone", "data/raw/px4_drone.jsonl"),
+    "raw_extrinsics_comparison": (
+        "raw/extrinsics_comparison",
+        "data/raw/extrinsics_comparison.jsonl",
+    ),
+}
 
 
 _SESSION_ID_LOCK = threading.Lock()
@@ -436,6 +454,7 @@ class SavedSessionFiles:
     geometry_comparison_parquet: Path
     review_xlsx: Path
     manifest: Path
+    authoritative_jsonl_files: tuple[Path, ...] = ()
     finalized: bool = True
     error: str = ""
     review_error: str = ""
@@ -449,7 +468,7 @@ class SavedSessionFiles:
 
     @property
     def distance_measurements_parquet(self) -> Path:
-        """Compatibility alias for the authoritative pair Parquet."""
+        """Compatibility alias for the derived pair Parquet."""
 
         return self.measurement_pairs_parquet
 
@@ -463,6 +482,7 @@ class SavedSessionFiles:
     def outputs(self) -> list[Path]:
         return [
             self.context_json,
+            *self.authoritative_jsonl_files,
             self.measurement_pairs_parquet,
             self.camera_timeline_parquet,
             self.pixhawk_timeline_parquet,
@@ -924,9 +944,18 @@ def _iter_project_px4_typed_fields(
 
 
 def _authoritative_jsonl_row_bytes(row: dict[str, object]) -> bytes:
-    return (
-        json.dumps(row, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n"
-    ).encode("utf-8")
+    try:
+        encoded = json.dumps(
+            row,
+            ensure_ascii=False,
+            sort_keys=True,
+            allow_nan=False,
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "authoritative JSONL row contains a non-finite number"
+        ) from exc
+    return (encoded + "\n").encode("utf-8")
 
 
 def _authoritative_jsonl_schema(
@@ -964,6 +993,7 @@ def _write_authoritative_jsonl(
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, output)
+        _fsync_directory_path(output.parent)
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
@@ -2395,6 +2425,134 @@ def _publish_v2_generation(output_dir: Path, generation_dir: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _v2_current_target(output_dir: Path) -> Path | None:
+    current = _v2_publish_root(output_dir) / "current"
+    if not os.path.lexists(current):
+        return None
+    if not current.is_symlink():
+        raise OSError(f"measurement generation pointer is not a symlink: {current}")
+    target = Path(os.readlink(current))
+    if target.is_absolute() or len(target.parts) != 2 or target.parts[0] != "generations":
+        raise OSError(f"measurement generation pointer target is invalid: {target}")
+    if target.parts[1] in {"", ".", ".."}:
+        raise OSError(f"measurement generation pointer target is invalid: {target}")
+    return target
+
+
+def _restore_v2_current_target(
+    output_dir: Path,
+    *,
+    failed_generation: Path,
+    previous_target: Path | None,
+) -> None:
+    """Roll back only the pointer published by the failed finalization."""
+
+    publish_root = _v2_publish_root(output_dir)
+    current = publish_root / "current"
+    expected_failed_target = Path("generations") / failed_generation.name
+    if _v2_current_target(output_dir) != expected_failed_target:
+        raise OSError("measurement generation pointer changed during validation")
+    if previous_target is None:
+        current.unlink()
+        _fsync_directory_path(publish_root)
+        return
+    temporary = publish_root / f".current-rollback-{failed_generation.name}.tmp"
+    temporary.unlink(missing_ok=True)
+    temporary.symlink_to(previous_target)
+    try:
+        os.replace(temporary, current)
+        _fsync_directory_path(publish_root)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _strict_json_object(path: Path) -> dict[str, object]:
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-finite JSON constant is forbidden: {value}")
+
+    payload = json.loads(
+        path.read_text(encoding="utf-8"),
+        parse_constant=reject_constant,
+    )
+    if not isinstance(payload, dict):
+        raise OSError(f"JSON artifact is not an object: {path}")
+    return payload
+
+
+def _validate_published_v2_generation(
+    output_dir: Path,
+    *,
+    generation_id: str,
+    expected_manifest: Mapping[str, object],
+    jsonl_streams: Sequence[
+        tuple[str, str, str, Sequence[dict[str, object]], str]
+    ],
+) -> None:
+    """Verify the bytes reached through the atomically published pointer."""
+
+    from Workstation.workstation_core.session_parquet import verify_parquet_artifact
+
+    publish_root = _v2_publish_root(output_dir)
+    current = publish_root / "current"
+    expected_target = Path("generations") / generation_id
+    if _v2_current_target(output_dir) != expected_target:
+        raise OSError("published measurement generation pointer is stale")
+    expected_root = (publish_root / expected_target).resolve(strict=True)
+    published_root = current.resolve(strict=True)
+    if published_root != expected_root or not published_root.is_dir():
+        raise OSError("published measurement generation resolves outside its target")
+
+    published_manifest = _strict_json_object(current / "measurement.json")
+    if published_manifest != dict(expected_manifest):
+        raise OSError("published measurement manifest changed after staging")
+    artifact_details = published_manifest.get("artifact_details")
+    if not isinstance(artifact_details, Mapping):
+        raise OSError("published measurement artifact_details is missing")
+
+    for artifact_key, role, relative_path, rows, normalization in jsonl_streams:
+        declared = artifact_details.get(artifact_key)
+        if not isinstance(declared, Mapping):
+            raise OSError(f"published JSONL descriptor is missing: {artifact_key}")
+        verified = _validate_authoritative_jsonl(
+            current / relative_path,
+            rows,
+            role=role,
+            artifact_path=relative_path,
+            normalization=normalization,
+        )
+        if verified != dict(declared):
+            raise OSError(f"published JSONL descriptor mismatch: {artifact_key}")
+
+    for artifact_key in (
+        "measurement_pairs",
+        "camera_timeline",
+        "pixhawk_timeline",
+        "gnss_base_timeline",
+        "geometry_comparison",
+    ):
+        declared = artifact_details.get(artifact_key)
+        if not isinstance(declared, Mapping):
+            raise OSError(f"published Parquet descriptor is missing: {artifact_key}")
+        relative_path = str(declared.get("path") or "")
+        verified = verify_parquet_artifact(
+            current / relative_path,
+            artifact_key,
+        ).to_mapping(relative_to=current)
+        if verified != dict(declared):
+            raise OSError(f"published Parquet descriptor mismatch: {artifact_key}")
+
+    context = artifact_details.get("context")
+    if not isinstance(context, Mapping):
+        raise OSError("published context descriptor is missing")
+    context_path = current / str(context.get("path") or "")
+    if (
+        not context_path.is_file()
+        or context_path.stat().st_size != int(context.get("size") or -1)
+        or _sha256_path(context_path) != str(context.get("sha256") or "")
+    ):
+        raise OSError("published context bytes do not match their descriptor")
+
+
 def _cleanup_v2_generations(output_dir: Path) -> None:
     publish_root = _v2_publish_root(output_dir)
     generations = publish_root / "generations"
@@ -3222,13 +3380,12 @@ def save_session_files(
     gnss_base_rows: Iterable[dict[str, object]] | None = None,
     extrinsics_comparison_rows: Iterable[dict[str, object]] | None = None,
 ) -> SavedSessionFiles:
-    """Finalize one measurement as typed Parquet plus one session review.
+    """Finalize canonical JSONL plus derived Parquet in one generation.
 
-    JSONL remains the durable live spool and append-only event format.  This
-    boundary materializes the latest spool state, writes five lossless typed
-    Parquet artifacts inside a generation staging directory, verifies them,
-    and atomically swaps a single ``data`` view.  CSV and per-device XLSX
-    files are intentionally not emitted.
+    The closed spool state is materialized once.  Complete source rows are
+    written and reread as canonical JSONL before any derived Parquet is built.
+    The generation is published atomically, verified again through the
+    ``current`` pointer, and only then may the retry spool be discarded.
     """
 
     from Workstation.workstation_core.session_parquet import (
@@ -3245,27 +3402,91 @@ def save_session_files(
         output_dir, metadata
     )
     output_dir.mkdir(parents=True, exist_ok=True)
-    rows = _project_pair_typed_fields(_normalized_pair_rows(pair_rows))
+    pair_full_rows = _normalized_pair_rows(pair_rows)
     camera_sources = camera_rows or {}
     px4_sources = px4_rows or {}
     camera_full_rows = {
-        side: _iter_project_camera_typed_fields(
-            _iter_normalized_generic_rows(camera_sources.get(side, ()))
-        )
+        side: _normalized_generic_rows(camera_sources.get(side, ()))
         for side in ("left", "right")
     }
     px4_full_rows = {
-        source: _iter_project_px4_typed_fields(
-            _iter_normalized_generic_rows(values)
-        )
+        source: _normalized_generic_rows(values)
         for source, values in px4_sources.items()
     }
     for source in ("left", "right"):
         px4_full_rows.setdefault(source, [])
-    gnss_rows = _iter_normalized_generic_rows(gnss_base_rows or ())
-    geometry_rows = _iter_normalized_generic_rows(
+    gnss_rows = _normalized_generic_rows(gnss_base_rows or ())
+    geometry_rows = _normalized_generic_rows(
         extrinsics_comparison_rows or ()
     )
+    parquet_pair_rows = _project_pair_typed_fields(
+        [dict(row) for row in pair_full_rows]
+    )
+    parquet_camera_rows = {
+        side: _project_camera_typed_fields([dict(row) for row in rows])
+        for side, rows in camera_full_rows.items()
+    }
+    parquet_px4_rows = {
+        source: _project_px4_typed_fields([dict(row) for row in rows])
+        for source, rows in px4_full_rows.items()
+    }
+
+    def jsonl_stream(
+        artifact_key: str,
+        rows: Sequence[dict[str, object]],
+        normalization: str,
+    ) -> tuple[str, str, str, Sequence[dict[str, object]], str]:
+        role, relative_path = AUTHORITATIVE_JSONL_STREAMS[artifact_key]
+        return artifact_key, role, relative_path, rows, normalization
+
+    jsonl_streams = [
+        jsonl_stream(
+            "raw_stereo_measurements",
+            pair_full_rows,
+            "_normalized_pair_rows",
+        ),
+        jsonl_stream(
+            "raw_camera_left",
+            camera_full_rows["left"],
+            "_normalized_generic_rows",
+        ),
+        jsonl_stream(
+            "raw_camera_right",
+            camera_full_rows["right"],
+            "_normalized_generic_rows",
+        ),
+        jsonl_stream(
+            "raw_px4_left",
+            px4_full_rows["left"],
+            "_normalized_generic_rows",
+        ),
+        jsonl_stream(
+            "raw_px4_right",
+            px4_full_rows["right"],
+            "_normalized_generic_rows",
+        ),
+        jsonl_stream(
+            "raw_gnss_base",
+            gnss_rows,
+            "_normalized_generic_rows",
+        ),
+    ]
+    if "drone" in px4_full_rows:
+        jsonl_streams.append(
+            jsonl_stream(
+                "raw_px4_drone",
+                px4_full_rows["drone"],
+                "_normalized_generic_rows",
+            )
+        )
+    if geometry_rows:
+        jsonl_streams.append(
+            jsonl_stream(
+                "raw_extrinsics_comparison",
+                geometry_rows,
+                "_normalized_generic_rows",
+            )
+        )
 
     manifest_output = output_dir / "measurement.json"
     generation_id = session_id_now()
@@ -3276,17 +3497,35 @@ def save_session_files(
     staging_dir.mkdir()
     data_dir = staging_dir / "data"
     data_dir.mkdir()
+    previous_target: Path | None = None
+    generation_dir: Path | None = None
 
     try:
+        previous_target = _v2_current_target(output_dir)
+        jsonl_details: dict[str, dict[str, object]] = {}
+        for artifact_key, role, relative_path, rows, normalization in jsonl_streams:
+            staged_path = staging_dir / relative_path
+            _write_authoritative_jsonl(staged_path, rows)
+            jsonl_details[artifact_key] = _validate_authoritative_jsonl(
+                staged_path,
+                rows,
+                role=role,
+                artifact_path=relative_path,
+                normalization=normalization,
+            )
         artifacts = finalize_session_parquet_artifacts(
             data_dir,
-            measurement_pairs=rows,
-            camera_rows=camera_full_rows,
-            px4_rows=px4_full_rows,
+            measurement_pairs=parquet_pair_rows,
+            camera_rows=parquet_camera_rows,
+            px4_rows=parquet_px4_rows,
             gnss_base_rows=gnss_rows,
             geometry_comparison_rows=geometry_rows,
         )
         resource_files = {
+            **{
+                artifact_key: relative_path
+                for artifact_key, _role, relative_path, _rows, _normalization in jsonl_streams
+            },
             "measurement_pairs_parquet": f"data/{MEASUREMENT_PAIRS_FILENAME}",
             "camera_timeline_parquet": f"data/{CAMERA_TIMELINE_FILENAME}",
             "pixhawk_timeline_parquet": f"data/{PX4_TIMELINE_FILENAME}",
@@ -3308,7 +3547,7 @@ def save_session_files(
         }
         context_path = data_dir / "context.json"
         _write_manifest(context_path, context_payload)
-        artifact_details = artifacts.to_mapping(relative_to=staging_dir)
+        parquet_details = artifacts.to_mapping(relative_to=staging_dir)
         context_detail = {
             "role": "measurement_context",
             "path": "data/context.json",
@@ -3319,16 +3558,46 @@ def save_session_files(
             "authoritative": True,
             "verified": True,
         }
+        required_jsonl_roles = [
+            AUTHORITATIVE_JSONL_STREAMS[key][0]
+            for key in (
+                "raw_stereo_measurements",
+                "raw_camera_left",
+                "raw_camera_right",
+                "raw_px4_left",
+                "raw_px4_right",
+                "raw_gnss_base",
+            )
+        ]
         generation_manifest = {
-            "schema": "workstation-measurement-storage-v2",
+            "schema": MEASUREMENT_STORAGE_SCHEMA,
+            "schema_version": MEASUREMENT_STORAGE_SCHEMA_VERSION,
             "session_id": session_id,
             "measurement_id": measurement_id,
             "status": "prepared",
             "generation_id": generation_id,
-            "resource_files_authoritative": True,
+            "authority_contract": {
+                "structured_records": "canonical_jsonl",
+                "binary_evidence": "native_bytes",
+                "static_metadata": "json",
+                "parquet": "derived_analysis",
+                "xlsx": "derived_review",
+            },
+            "resource_files_authoritative": False,
             "resource_files": resource_files,
-            "artifact_details": {**artifact_details, "context": context_detail},
-            "authoritative_parquet_artifacts_verified": True,
+            "artifact_details": {
+                **jsonl_details,
+                **parquet_details,
+                "context": context_detail,
+            },
+            "authoritative_jsonl_artifacts_verified": True,
+            "parquet_artifacts_verified": True,
+            "authoritative_parquet_artifacts_verified": False,
+            "completeness": {
+                "complete": True,
+                "required_authoritative_roles": required_jsonl_roles,
+                "missing_required_authoritative_roles": [],
+            },
             "time_axis": "recording_time_ns",
         }
         manifest = {
@@ -3350,20 +3619,45 @@ def save_session_files(
         os.replace(staging_dir, generation_dir)
         _fsync_directory_path(generations_root)
         _publish_v2_generation(output_dir, generation_dir)
+        _validate_published_v2_generation(
+            output_dir,
+            generation_id=generation_id,
+            expected_manifest=manifest,
+            jsonl_streams=jsonl_streams,
+        )
     except Exception as exc:
+        rollback_error = ""
+        if generation_dir is not None:
+            try:
+                current_target = _v2_current_target(output_dir)
+                if current_target == Path("generations") / generation_dir.name:
+                    _restore_v2_current_target(
+                        output_dir,
+                        failed_generation=generation_dir,
+                        previous_target=previous_target,
+                    )
+            except Exception as rollback_exc:
+                rollback_error = str(rollback_exc)
         failure = {
-            "schema": "workstation-measurement-storage-v2",
+            "schema": MEASUREMENT_STORAGE_SCHEMA,
+            "schema_version": MEASUREMENT_STORAGE_SCHEMA_VERSION,
             "session_id": session_id,
             "measurement_id": measurement_id,
             "status": "failed",
-            "phase": "prepare_or_publish_parquet",
-            "error": str(exc),
+            "phase": "prepare_validate_or_publish_generation",
+            "error": (
+                str(exc)
+                if not rollback_error
+                else f"{exc}; generation pointer rollback failed: {rollback_error}"
+            ),
             "retryable": True,
             "generation_id": generation_id,
         }
         failure_path = output_dir / ".workstation" / "save_failure.json"
         _write_manifest(failure_path, failure)
         _fsync_directory_path(failure_path.parent)
+        if rollback_error:
+            raise OSError(failure["error"]) from exc
         raise
     failure_path = output_dir / ".workstation" / "save_failure.json"
     failure_path.unlink(missing_ok=True)
@@ -3403,6 +3697,10 @@ def save_session_files(
         geometry_comparison_parquet=data_view / GEOMETRY_COMPARISON_FILENAME,
         review_xlsx=review_path,
         manifest=manifest_output,
+        authoritative_jsonl_files=tuple(
+            output_dir / relative_path
+            for _key, _role, relative_path, _rows, _normalization in jsonl_streams
+        ),
         finalized=True,
         review_error=review_error,
         review_pending=review_pending,

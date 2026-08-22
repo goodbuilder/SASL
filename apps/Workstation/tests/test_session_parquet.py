@@ -101,7 +101,7 @@ def test_measurement_pairs_are_typed_and_dynamic_fields_round_trip_losslessly(
     assert metadata.schema["id"] == "workstation-measurement-pairs-parquet-v1"
     assert metadata.schema["version"] == 1
     assert len(metadata.schema_sha256) == 64
-    assert metadata.authoritative is True
+    assert metadata.authoritative is False
     assert metadata.verified is True
     assert metadata.to_mapping(relative_to=tmp_path)["path"] == MEASUREMENT_PAIRS_FILENAME
 

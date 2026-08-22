@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from collections import deque
@@ -175,7 +176,35 @@ def test_save_publishes_verified_parquet_and_one_session_review_before_discardin
         "gnss_base_timeline.parquet",
         "measurement_pairs.parquet",
         "pixhawk_timeline.parquet",
+        "raw",
     }
+    assert {path.name for path in (output_dir / "data" / "raw").iterdir()} == {
+        "camera_left.jsonl",
+        "camera_right.jsonl",
+        "gnss_base.jsonl",
+        "px4_left.jsonl",
+        "px4_right.jsonl",
+        "stereo_measurements.jsonl",
+    }
+    raw_pair_path = output_dir / "data" / "raw" / "stereo_measurements.jsonl"
+    raw_pair_rows = [
+        json.loads(line)
+        for line in raw_pair_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert raw_pair_rows == [
+        {
+            "sample_index": 41,
+            "session_elapsed_s": 1.25,
+            "session_elapsed_ns": 1_250_000_000,
+            "recorded_unix_ns": 1_700_000_000_000_000_123,
+            "pair_mid_utc_ns": 1_700_000_000_000_000_100,
+            "rtcp_pair_delta_ns": 10_000_000,
+            "distance_m": 17.5,
+            "measurement_valid": True,
+            "odd_pair_private": {"nested": [1, "산"]},
+            "odd_native_path": "native/left-0041.png",
+        }
+    ]
     recovered = read_lossless_rows(saved.measurement_pairs_parquet, "measurement_pairs")
     assert recovered[0]["odd_pair_private"] == {"nested": [1, "산"]}
     assert recovered[0]["odd_native_path"] == "native/left-0041.png"
@@ -197,7 +226,27 @@ def test_save_publishes_verified_parquet_and_one_session_review_before_discardin
     )
     manifest = json.loads(saved.manifest.read_text(encoding="utf-8"))
     assert manifest["status"] == "finalized"
-    assert manifest["authoritative_parquet_artifacts_verified"] is True
+    assert manifest["authoritative_jsonl_artifacts_verified"] is True
+    assert manifest["authoritative_parquet_artifacts_verified"] is False
+    assert manifest["parquet_artifacts_verified"] is True
+    raw_pair_detail = manifest["artifact_details"]["raw_stereo_measurements"]
+    assert raw_pair_detail["authoritative"] is True
+    assert raw_pair_detail["row_count"] == 1
+    assert raw_pair_detail["size"] == raw_pair_path.stat().st_size
+    assert raw_pair_detail["sha256"] == hashlib.sha256(
+        raw_pair_path.read_bytes()
+    ).hexdigest()
+    assert raw_pair_detail["schema"]["version"] == (
+        recording_session.AUTHORITATIVE_JSONL_SCHEMA_VERSION
+    )
+    for parquet_key in (
+        "measurement_pairs",
+        "camera_timeline",
+        "pixhawk_timeline",
+        "gnss_base_timeline",
+        "geometry_comparison",
+    ):
+        assert manifest["artifact_details"][parquet_key]["authoritative"] is False
     review_status = json.loads(
         (session_root / ".workstation" / "review.json").read_text(encoding="utf-8")
     )
@@ -254,6 +303,54 @@ def test_parquet_failure_preserves_spools_and_previous_generation(
     )
     assert manifest["status"] == "failed"
     assert manifest["retryable"] is True
+    for spool in _all_spools(pair_rows, camera_rows, px4_rows, gnss_base_rows):
+        spool.close()
+
+
+@pytest.mark.parametrize(
+    "fault_target",
+    ("_write_authoritative_jsonl", "_validate_authoritative_jsonl"),
+)
+def test_jsonl_fault_preserves_spools_and_previous_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_target: str,
+) -> None:
+    output_dir = tmp_path / "recordings" / f"jsonl-{fault_target}"
+    first = save_session_files(
+        output_dir,
+        metadata={"session_id": output_dir.name},
+        pair_rows=[{"sample_index": 0, "stable": "old"}],
+    )
+    current = output_dir / ".workstation" / "publish" / "current"
+    previous_pointer = current.readlink()
+    previous_manifest = first.manifest.read_bytes()
+    previous_jsonl = first.authoritative_jsonl_files[0].read_bytes()
+    pair_rows, camera_rows, px4_rows, gnss_base_rows = _bound_source_spools(
+        output_dir
+    )
+    pair_rows.append({"sample_index": 1, "must_survive": {"retry": True}})
+    write_recovery_metadata(output_dir, {"session_id": output_dir.name})
+    spool_path = pair_rows.spool_path
+
+    def fail_jsonl(*_args, **_kwargs):
+        raise OSError(f"injected {fault_target} fault")
+
+    monkeypatch.setattr(recording_session, fault_target, fail_jsonl)
+    with pytest.raises(OSError, match=fault_target):
+        save_session_files(
+            output_dir,
+            metadata={"session_id": output_dir.name},
+            pair_rows=pair_rows,
+            camera_rows=camera_rows,
+            px4_rows=px4_rows,
+            gnss_base_rows=gnss_base_rows,
+        )
+
+    assert current.readlink() == previous_pointer
+    assert first.manifest.read_bytes() == previous_manifest
+    assert first.authoritative_jsonl_files[0].read_bytes() == previous_jsonl
+    assert spool_path is not None and spool_path.is_file()
     for spool in _all_spools(pair_rows, camera_rows, px4_rows, gnss_base_rows):
         spool.close()
 
@@ -492,6 +589,53 @@ def test_publish_failure_keeps_old_data_and_retry_spool(
 
     assert current.readlink() == previous_pointer
     assert first.measurement_pairs_parquet.read_bytes() == previous_bytes
+    assert spool_path is not None and spool_path.is_file()
+    for spool in _all_spools(pair_rows, camera_rows, px4_rows, gnss_base_rows):
+        spool.close()
+
+
+def test_published_generation_validation_failure_rolls_back_and_keeps_spool(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "recordings" / "published-validation-retry"
+    first = save_session_files(
+        output_dir,
+        metadata={"session_id": output_dir.name},
+        pair_rows=[{"sample_index": 0, "stable": "old"}],
+    )
+    current = output_dir / ".workstation" / "publish" / "current"
+    previous_pointer = current.readlink()
+    previous_manifest = first.manifest.read_bytes()
+    previous_jsonl = first.authoritative_jsonl_files[0].read_bytes()
+    pair_rows, camera_rows, px4_rows, gnss_base_rows = _bound_source_spools(
+        output_dir
+    )
+    pair_rows.append({"sample_index": 1, "must_survive": "validation"})
+    write_recovery_metadata(output_dir, {"session_id": output_dir.name})
+    spool_path = pair_rows.spool_path
+
+    def fail_published_validation(*_args, **_kwargs) -> None:
+        raise OSError("injected published validation fault")
+
+    monkeypatch.setattr(
+        recording_session,
+        "_validate_published_v2_generation",
+        fail_published_validation,
+    )
+    with pytest.raises(OSError, match="published validation fault"):
+        save_session_files(
+            output_dir,
+            metadata={"session_id": output_dir.name},
+            pair_rows=pair_rows,
+            camera_rows=camera_rows,
+            px4_rows=px4_rows,
+            gnss_base_rows=gnss_base_rows,
+        )
+
+    assert current.readlink() == previous_pointer
+    assert first.manifest.read_bytes() == previous_manifest
+    assert first.authoritative_jsonl_files[0].read_bytes() == previous_jsonl
     assert spool_path is not None and spool_path.is_file()
     for spool in _all_spools(pair_rows, camera_rows, px4_rows, gnss_base_rows):
         spool.close()

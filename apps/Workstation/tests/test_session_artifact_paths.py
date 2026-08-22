@@ -89,3 +89,38 @@ def test_direct_session_parquet_rows_are_previewed_losslessly(tmp_path: Path) ->
     assert preview["rows"] == (
         {"pair_id": "pair-1", "distance_m": 12.5, "future": {"kept": True}},
     )
+
+
+def test_legacy_parquet_only_session_remains_readable(tmp_path: Path) -> None:
+    root = tmp_path / "recordings" / "sessions" / "legacy-parquet"
+    root.mkdir(parents=True)
+    artifact = root / "measurement_pairs.parquet"
+    finalize_measurement_pairs(
+        artifact,
+        [{"pair_id": "legacy-pair", "recording_time_ns": 9_007_199_254_740_993}],
+    )
+    (root / "session_manifest.json").write_text(
+        json.dumps(
+            {
+                "status": "finalized",
+                "resource_files": {
+                    "measurement_pairs_parquet": artifact.name,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    adapter = EvidenceAdapter(SimpleNamespace(app_root=tmp_path))
+    preview = adapter.session_artifact_rows(
+        "legacy-parquet",
+        artifact.name,
+    )
+
+    assert preview["error"] == ""
+    assert preview["rows"] == (
+        {
+            "pair_id": "legacy-pair",
+            "recording_time_ns": 9_007_199_254_740_993,
+        },
+    )
