@@ -352,6 +352,10 @@ AUTHORITATIVE_JSONL_STREAMS = {
     "raw_px4_left": ("raw/px4_left", "data/raw/px4_left.jsonl"),
     "raw_px4_right": ("raw/px4_right", "data/raw/px4_right.jsonl"),
     "raw_gnss_base": ("raw/gnss_base", "data/raw/gnss_base.jsonl"),
+    "geometry_contexts": (
+        "context/geometry_contexts",
+        "data/context/geometry_contexts.jsonl",
+    ),
     "raw_px4_drone": ("raw/px4_drone", "data/raw/px4_drone.jsonl"),
     "raw_extrinsics_comparison": (
         "raw/extrinsics_comparison",
@@ -3504,6 +3508,9 @@ def save_session_files(
         PX4_TIMELINE_FILENAME,
         finalize_session_parquet_artifacts,
     )
+    from Workstation.workstation_core.geometry_context import (
+        materialize_geometry_contexts,
+    )
 
     output_dir = Path(output_dir)
     session_id, measurement_id = _validate_measurement_storage_identity(
@@ -3535,6 +3542,7 @@ def save_session_files(
         role, relative_path = AUTHORITATIVE_JSONL_STREAMS[artifact_key]
         return artifact_key, role, relative_path, rows, normalization
 
+    geometry_context_rows: list[dict[str, object]] = []
     jsonl_streams = [
         jsonl_stream(
             "raw_stereo_measurements",
@@ -3565,6 +3573,11 @@ def save_session_files(
             "raw_gnss_base",
             gnss_rows,
             "_normalized_generic_rows",
+        ),
+        jsonl_stream(
+            "geometry_contexts",
+            geometry_context_rows,
+            "geometry_context_record_v1",
         ),
     ]
     if "drone" in px4_full_rows:
@@ -3610,6 +3623,9 @@ def save_session_files(
                 measurement_id=measurement_id,
             )
         _apply_terminal_record_identities(pair_full_rows)
+        geometry_context_rows.extend(
+            materialize_geometry_contexts(pair_full_rows)
+        )
         parquet_pair_rows = _project_pair_typed_fields(
             [dict(row) for row in pair_full_rows]
         )
@@ -3663,6 +3679,7 @@ def save_session_files(
                 "definition": "nanoseconds elapsed from measurement recording start",
             },
             "resource_files": resource_files,
+            "geometry_context_registry": resource_files["geometry_contexts"],
             "metadata": metadata,
         }
         context_path = data_dir / "context.json"
@@ -3706,6 +3723,7 @@ def save_session_files(
                 "raw_px4_left",
                 "raw_px4_right",
                 "raw_gnss_base",
+                "geometry_contexts",
             )
         ]
         generation_manifest = {

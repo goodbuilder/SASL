@@ -171,6 +171,7 @@ def test_save_publishes_verified_parquet_and_one_session_review_before_discardin
     assert output_dir.joinpath("data").is_symlink()
     assert {path.name for path in output_dir.joinpath("data").iterdir()} == {
         "camera_timeline.parquet",
+        "context",
         "context.json",
         "geometry_comparison.parquet",
         "gnss_base_timeline.parquet",
@@ -193,8 +194,10 @@ def test_save_publishes_verified_parquet_and_one_session_review_before_discardin
     ]
     assert len(raw_pair_rows) == 1
     terminal_record_id = raw_pair_rows[0].pop("terminal_record_id")
+    geometry_context_id = raw_pair_rows[0].pop("geometry_context_id")
     assert terminal_record_id.startswith("legacy:")
     assert len(terminal_record_id) == len("legacy:") + 64
+    assert geometry_context_id.startswith("gc:")
     assert raw_pair_rows == [
         {
             "measurement_id": "m000001",
@@ -274,6 +277,19 @@ def test_save_publishes_verified_parquet_and_one_session_review_before_discardin
         manifest["artifact_details"]["raw_camera_left"],
         manifest["artifact_details"]["raw_camera_right"],
     ]
+    geometry_context_path = output_dir / manifest["resource_files"][
+        "geometry_contexts"
+    ]
+    geometry_context_rows = [
+        json.loads(line)
+        for line in geometry_context_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["geometry_context_id"] for row in geometry_context_rows] == [
+        geometry_context_id
+    ]
+    assert manifest["artifact_details"]["geometry_contexts"]["role"] == (
+        "context/geometry_contexts"
+    )
     review_status = json.loads(
         (session_root / ".workstation" / "review.json").read_text(encoding="utf-8")
     )
