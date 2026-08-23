@@ -103,6 +103,38 @@ def test_explicit_nvidia_decoder_falls_back_when_plugin_is_missing() -> None:
     )
 
 
+def test_gstreamer_pipeline_repeats_h264_codec_headers_for_recovery() -> None:
+    from Workstation.workstation_core import yolo_stream
+
+    pipeline = yolo_stream.build_gst_pipeline_text(
+        "rtsp://camera.invalid/visible",
+        decoder=yolo_stream.SOFTWARE_H264_DECODER,
+        transport="tcp",
+    )
+
+    assert "h264parse config-interval=-1" in pipeline
+    assert "max-size-time=250000000" in pipeline
+    assert "queue leaky=downstream max-size-buffers=8" in pipeline
+    assert "appsink name=sink" in pipeline
+
+
+def test_gstreamer_recording_branch_is_memory_bounded_and_leaky() -> None:
+    from Workstation.workstation_core import yolo_stream
+
+    pipeline = yolo_stream.build_gst_pipeline_text(
+        "rtsp://camera.invalid/visible",
+        decoder=yolo_stream.SOFTWARE_H264_DECODER,
+        transport="tcp",
+        record_video_path="/tmp/camera.mkv",
+    )
+
+    assert (
+        "encoded. ! queue leaky=downstream max-size-buffers=0 max-size-bytes=0 "
+        "max-size-time=5000000000"
+    ) in pipeline
+    assert "queue leaky=downstream max-size-buffers=8" in pipeline
+
+
 def test_gstreamer_launch_retries_software_for_explicit_nvidia(monkeypatch) -> None:
     from Workstation.workstation_core import yolo_stream
 

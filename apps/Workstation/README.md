@@ -32,6 +32,11 @@ The derived session `review.xlsx` keeps the common operator sheets and adds one 
 for each of the eight Measurement geometry methods, populated from that method's authoritative
 per-pair outcome stream.
 
+Runtime fault isolation keeps one callback, device, camera child, or evidence writer failure from
+silently taking down unrelated links. Qt callback exceptions are logged and trigger a best-effort
+session flush; bounded device/worker queues expose timeout, retry, partial-success, and recoverable
+storage states instead of blocking the GUI indefinitely.
+
 ## Current Run Flow
 
 From the repository root, run `./apps/Workstation/run.sh --check`, then start the UI with
@@ -46,6 +51,9 @@ verification attempt. A failed request does not retry the same camera IP in the 
 `Connect cameras` again to start a fresh discovery after correcting power, Ethernet mode, or IP.
 This initial-connect rule does not disable the default GStreamer backend's post-connect recovery
 for an interrupted live RTSP stream.
+If a camera child process itself exits unexpectedly, its owner reports
+`스트림 프로세스 크래시 복구 중`, restarts it with bounded backoff, and stops after three
+consecutive failed recoveries with an explicit manual-restart alarm.
 
 The field dual-Pixhawk profile uses Workstation `10.0.0.10/24`, P1/Left
 `10.0.0.2:14550` with MAVLink system ID `1`, and P2/Right `10.0.0.3:14551` with system ID `2`.
@@ -382,8 +390,9 @@ The three manual actions have distinct roles: `Manual Horizon` marks two visible
 points and estimates Roll/Pitch only; `Manual Mountain` marks matching terrain features in
 the same order on both images and supplies the paired observations for the GNSS + Mountain
 metric `R,t` solve (at least four pairs); `Manual Target` marks one Drone RTK target pixel
-per image for the single-target Drone RTK Yaw fallback. Full multi-view `R,t` refinement
-uses the separately imported synchronized observations.
+per image for the single-target Drone RTK Yaw fallback. Once both target pixels are present,
+the Workstation also binds that pair to the same Frozen burst's Drone/P1/P2 GNSS snapshot and
+accumulates it for JSON-free multi-view `R,t` refinement.
 
 In Alignment's frozen Left/Right camera previews, wheel up/down zooms around the native pixel under
 the cursor from 1× to 8×. Zoom changes presentation only: annotation coordinates and frozen source
@@ -426,8 +435,8 @@ snapshots may be pending; the next pair is still persisted as `BACKPRESSURE_BLOC
 contain paths/hashes and immutable numeric metadata, never QImage or raw pixel bytes; native PNGs
 are stored before enqueue.
 
-Each Alignment method tab shows method-specific evidence in addition to the common Candidate DOF
-control: Horizon shows model/RMS/sensitivity, Mountain shows pair/inlier/Sampson/baseline/lever-arm
+Each Alignment method tab shows method-specific evidence alongside the read-only Candidate
+observability summary: Horizon shows model/RMS/sensitivity, Mountain shows pair/inlier/Sampson/baseline/lever-arm
 metrics, Terrain shows GeoTIFF/2D↔3D/reprojection/rank data, Drone tabs show target/observation/sync
 and 3D-spread data, References shows profile compatibility, and Combine shows source/axis conflict
 status. References only registers reusable sources; Combine only composes them.
@@ -470,27 +479,38 @@ delta number is fabricated. `Import` does not create a Drone RTK observation bec
 capture-time GNSS is unknown. `Capture HR Still (FTP)` and `Capture OZ Still (FTP)` snapshot
 Left/Right/Drone GNSS at the camera capture request and attach that evidence to the downloaded
 Burst after FTP completes. The request timestamp is retained as the GNSS snapshot source; the
-later download time is never substituted. Binding an annotated target pixel `(u, v)` to a specific
-past observation, and feeding this evidence automatically into `Refine Drone RTK Multi-view R,t`,
-are both later work; today the observation detail panel shows `Target: NOT ANNOTATED` for every
-entry.
+later download time is never substituted. When both frozen images have exactly one Drone Target,
+the annotation is bound to the capture observation with matching burst/frame identities. The
+Observation History `Target` column shows `READY` only when Drone/P1/P2 positions are RTK_FIXED,
+the frame/Drone GNSS clock domain is verified, the delta is within the configured 350 ms bound,
+and the exact frozen operating `K,D` is geometry-applicable. Incomplete or unverified bindings are
+retained as `BLOCKED` audit evidence and are never passed to the solver.
 
-The `Drone RTK Multi-view R,t` tab imports a JSON set of synchronized per-camera rays (or native
-pixel coordinates) and Drone RTK target positions, then optimizes full 6-DOF camera `R,t` for
-both sides. The target positions must be in one local NED frame, with at least four
-non-degenerate observations per side. The separate `Drone RTK Rotation` tab uses one target for
-Yaw or two or more non-degenerate target/ray observations for full rotation; Measurement supplies
-its missing Translation from live GNSS.
+The `Drone RTK Multi-view R,t` tab consumes the Session's accumulated READY target pairs directly;
+its normal UI path does not open or require a JSON file. Capture and annotate at least four Frozen
+pairs in `Drone Rotation`, move the Drone through varied three-dimensional positions, then press
+`Solve Drone RTK Multi-view R,t`. All samples must share the same exact operating
+`K,D` profile. The first READY sample's P1 GNSS is the local NED origin; every captured Drone GNSS
+position is converted to `(north, east, down)` metres in that frame. P1 is initialized at the
+origin and P2 from its captured P2-minus-P1 GNSS baseline, while the solver optimizes full 6-DOF
+camera `R,t` for both sides. Full-rank geometry is mandatory; repeated or poorly distributed
+Drone positions fail closed. GNSS antenna positions initialize camera centers, but optical lever
+arms remain unmodeled. Explicit `drone_rtk_multiview` payloads and JSON paths remain backend
+compatibility inputs, not the default operator workflow. The separate `Drone RTK Rotation` tab
+uses one target for Yaw or two or more non-degenerate explicit target/ray observations for full
+rotation; Measurement supplies its missing Translation from live GNSS.
 
-In Drone Target annotation mode, capturing another frozen burst keeps the previous target mark
-visible for multi-view review until `Clear` is pressed. The mark remains bound
-to its original frame identity; it is not silently reused as a pixel from the new frame, and new
-points are blocked until the old mark is cleared.
+In Drone Target annotation mode, capturing another frozen burst automatically clears a completed
+target pair after it has been accumulated, so the new pair is ready for the next left/right click.
+An incomplete or not-yet-recorded mark stays visible and remains bound to its original frame
+identity; it is never silently reused as a pixel from the new frame, and `Clear` is required before
+discarding that unfinished operator work.
 
 When the session is saved, the static JSON also stores the frozen-frame artifact identities,
-complete automatic proposals, accepted points, current annotation payload, and provenance.
+complete automatic proposals, accepted points, current annotation payload, Drone RTK capture
+history, accumulated multi-view samples, and provenance.
 Native pixels remain in the session frame artifacts; the append-only `run_events.jsonl` keeps
-the full proposal, approval, and annotation-update audit events.
+the full proposal, approval, annotation-update, and multi-view sample-revision audit events.
 
 Run the Workstation regression suite from `apps/Workstation` with:
 
@@ -515,7 +535,8 @@ python3 tools/check_portable_paths.py
 - Each Pixhawk exposes both `GPS_RAW_INT` (GPS1) and `GPS2_RAW` (GPS2). The Pixhawk workspace
   shows all four receiver rows, including MSL/ellipsoid altitude, HDOP/VDOP, H/V accuracy, fix,
   satellites, and age. Its bottom P1/P2 antenna selectors independently choose the receiver used
-  by the P1→P2 GNSS baseline and Measurement calculation; the default and persisted mapping is
+  by the P1→P2 GNSS baseline, NTRIP GGA, rover readiness/status, Drone reference calculation,
+  Measurement calculation, and frozen GNSS contract; the default and persisted mapping is
   `P1 GPS1 → P2 GPS1`. No automatic averaging or best-fix substitution occurs.
 - The approved patched v6X custom firmware is
   `firmware/px4_fmu-v6x_sasl_can_mag/px4_fmu-v6x_default.px4`, with SHA-256
@@ -605,6 +626,9 @@ python3 tools/check_portable_paths.py
   registries. Derived Parquet stable typed columns support analysis, while `row_json` preserves
   every dynamic source field.
   Its exact left/right decoded source pixels are stored as lossless, no-overlay native PNGs.
+  PNG encoding, fsync, and delayed decode/dimension verification run on a bounded daemon writer;
+  the GUI records a deterministic pending path and finalization waits until every queued request
+  has published a complete, missing, or failed terminal result.
 - `measurement-method-snapshot-v1` supplies the Measurement operator view without creating a second
   geometry owner. Runtime `method_capabilities` remains instance-driven, while the additive
   `method_catalog` always contains all eight stable method IDs. Every available capability carries
@@ -615,7 +639,9 @@ python3 tools/check_portable_paths.py
   and OpenCV RDF values.
 - Continuous `video/raw_left.mp4` and `video/raw_right.mp4` are hashed only after their size and
   modification time stabilize. Bounded `ffprobe` metadata records codec, frame count, dimensions,
-  FPS, duration, recording backend, and encoding provenance.
+  FPS, duration, recording backend, and encoding provenance. Probe and optional full-stream decode
+  run on a dedicated verification thread while the UI/status timers continue; sealing waits for
+  the worker's terminal descriptors.
 - The package copies active calibration/Alignment profile inputs, the selected calibration source
   images and metadata reachable from those profiles, redacted effective settings, Git/software provenance,
   device evidence, application logs, ULogs, target/drone telemetry, and exact RTCM bytes when the
@@ -751,11 +777,32 @@ python3 tools/check_portable_paths.py
   unicast and broadcast packets immediately after boot, before any host MAVLink packet is sent,
   indicate competing instances. Keep QGC closed while Workstation owns UDP ports `14550` and
   `14551`.
+- While Workstation performs the automatic PX4 calibration-parameter readback after a side's first
+  heartbeat, that side's normal ATTITUDE/GNSS receive loop is intentionally reserved. Its status
+  shows `PARAM SYNC` with detail `PX4 파라미터 조회 중 (정상)` instead of falsely reporting
+  `STALE` or `DISCONNECTED`. Nonmatching ATTITUDE/GPS messages consumed by the blocking PARAM or
+  shell receive path are deferred and replayed through the normal handler after the reservation;
+  they are not discarded. P1/P2 remain independent, and identical receive errors are reported at
+  most once per second per side.
+- Pixhawk connect and disconnect operations are mutually exclusive. Their P1/P2 buttons are
+  disabled while either worker owns the subscriber; rapid repeated clicks cannot start an
+  overlapping socket transition or publish a connected label for a closed transport.
+- Base GNSS serial uses a one-second write timeout and a 64-item latest-preserving output queue.
+  A blocked USB/radio writer emits `failed`, closes the port, and lets lifecycle shutdown continue
+  instead of keeping the Base status falsely connected. PC-IP elevation through `pkexec` has a
+  15-second authorization timeout and returns an actionable `sudo ip addr add ...` fallback.
+- A dual-camera WIRIS command treats a broken synchronization barrier as partial failure: the
+  healthy camera continues without waiting for or inheriting the peer's error. Interactive zoom
+  contention is reported as control-channel busy and retried up to five times; it is not labeled
+  as a camera failure. TCP command responses are accumulated across fragments until terminator,
+  EOF, bounded idle, or the request deadline.
 - Treat GPS1/GPS2 as independent receiver solutions. `RTK_FLOAT` alone does not prove vertical
   agreement. Before a measurement, inspect all four rows and choose the physically corresponding
   P1/P2 antennas at the bottom of the Pixhawk workspace. The baseline uses `GPS_RAW_INT.alt`
   (MSL metres), not `GPS_RTK` internal moving-base vector fields; `GPS_RAW_INT.eph/epv` are HDOP/
   VDOP factors, while `h_acc/v_acc` are the metre accuracy fields displayed in the receiver table.
+  A selected GPS2 source with no current sample remains unavailable and never falls back to GPS1;
+  changing source also resets its cached Measurement fix and RTK-Fixed duration.
 - WIRIS encoder-profile application is fail-closed. An SDK error, malformed readback, or value
   mismatch marks that camera `encoder-profile-failed` and prevents the activation workflow from
   reporting the stream check as successful. Changing encoder settings may pause RTSP temporarily.
@@ -845,6 +892,10 @@ python3 tools/check_portable_paths.py
 - Canonical capture/event rows are append-only evidence. Hiding a graph row changes only the view,
   a torn final JSONL write is quarantined while a malformed middle line is a hard failure, and
   preview opens only after the artifact's recorded byte size and SHA-256 have been reverified.
+- Spool and run-evidence `OSError` failures stop recording, retain the working spool, and expose a
+  retryable/`RECOVERABLE` session error without escaping a GUI timer callback. Run-event JSONL
+  appends flush to the kernel immediately but batch `fsync` at session/manifest/shutdown barriers;
+  native PNG and video verification each have their own asynchronous durability barrier.
 - Full-rate RTCM envelopes enter a 4,096-item bounded worker queue. A full queue applies producer
   backpressure rather than silently discarding evidence. The separate Pixhawk delivery queue is
   latest-relevant and bounded: a replaced correction returns its exact pipeline sequence as an
@@ -864,17 +915,26 @@ python3 tools/check_portable_paths.py
 - Shutdown stops NTRIP and Base producers first, drains RTCM ingress and evidence, waits for every
   Pixhawk injection outcome (or records the exact unconfirmed sequences after the bounded timeout),
   and only then disconnects MAVLink/runtime workers and finalizes the session. Window close remains
-  non-blocking and retryable: it is not accepted while a Pixhawk disconnect or RTCM worker is still
-  running, and no live `QThread` owner is destroyed to force shutdown.
+  non-blocking and retryable during the cooperative phase. A five-second process-wide close
+  deadline then flushes evidence, terminates any remaining camera child, requests interruption on
+  outstanding `QThread`s, and bounds the final forced wait to one additional second.
 - Preview replacement applies only to resized UI frames. Native measurement/calibration frames,
   detection events, recording streams, command results, and RTCM evidence do not use the preview
   inbox and cannot be inferred from a skipped display frame.
 - Raw camera frames update the latest calibration snapshot without broadcasting a duplicate
   calibration-preview signal. Hidden legacy/advanced preview widgets do not render those frames;
   checkerboard overlays remain available through the throttled overlay path or explicit Refresh.
+- The normal GStreamer H.264 path repeats SPS/PPS at every IDR (`h264parse config-interval=-1`)
+  and keeps compressed H.264 queues non-leaky and bounded to 250 ms so access units/IDRs are not
+  discarded before decode. The post-decoder queue is `leaky=downstream` with eight buffers, so a
+  stalled reader drops stale decoded frames without back-pressuring depay/decoder. The recording
+  tee branch is independently `leaky=downstream` with a five-second time bound, preventing disk
+  stalls from growing memory without limit. `decoded_hz` uses a five-second rolling window and
+  returns to zero after a genuine gap.
 - Linux camera child processes arm a parent-death signal. A Workstation crash or Force Quit
   therefore terminates its decode children instead of leaving CPU-consuming orphan workers for
-  the next launch; normal shutdown still uses the cooperative stop/drain path.
+  the next launch; normal shutdown still uses the cooperative stop/drain path. Unexpected child
+  death is supervised separately from RTSP reconnect and receives bounded automatic restart.
 - Keep `wiris_visible_encoder_bitrate=0` for both WIRIS cameras. Confirm camera readback as
   `GEBR VISIBLE=0` and `GEQZ VISIBLE=17` after RTSP enable/reactivation; a nonzero bitrate makes
   QP ineffective and is not the approved Workstation Live-preview profile.
@@ -1058,6 +1118,13 @@ the visible macroblocking observed with bitrate `1`. Constant-quality mode can i
 especially during fast full-frame motion, so the current dual-camera 720p stream still requires
 field qualification for sustained FPS and network stability.
 
+The five-second decoded-rate window stabilizes the operator value; it is not a substitute for a
+throughput test. If the value remains low after warm-up, inspect the status/log for the active
+GStreamer decoder and test the selected RTSP transport independently. UDP can lose RTP packets on
+the camera link, while TCP can expose camera-side RTSP service resets or startup codec-header gaps;
+changing transport alone is not an approved performance fix. Restart the Workstation after changing
+the decoder, transport, or pipeline code so existing child processes do not retain the prior setup.
+
 The Session folder panel is a software projection of `measurement_session_snapshot`. Its displayed
 basename, creation time, and path identify the selected storage owner, but do not prove that every
 later producer successfully wrote an artifact. Confirm producer-specific results in Measurement and
@@ -1145,7 +1212,12 @@ Per-DOF fill currently permits only frame-compatible live sources: Pixhawk for v
 rotation axes and GNSS/RTK for NED translation. Checkerboard and saved relative R,t profiles remain
 atomic geometry and cannot be used as arbitrary absolute NED axis fillers. Full coupled
 Mountain/Multi-view/Terrain/Combined candidates still fail closed when any method-defining DOF is
-unobservable; use the explicit Combined solver when cross-candidate axis composition is required.
+unobservable. Alignment Candidate review has no editable Apply-DOF checkboxes: `Apply candidate`
+always promotes the candidate's complete owner-declared `optimized_dof` mask, and rejects the
+candidate if any owned axis is not observable on both camera sides. Legacy callers may include a
+`dof` payload only when it exactly equals that owner mask; partial overrides fail closed. Use the
+explicit Combined solver when axes must come from different candidates; its per-source axis table
+remains the sole editable candidate-axis composition surface.
 
 Automatic HR/OZ retrieval requires working FTP credentials and a camera directory that can be
 listed. The freshness guard never substitutes an older still when a new post-CPTR file does not
@@ -1158,11 +1230,13 @@ or legal non-repudiation. There is no electronic signature, organization PKI int
 source tree, virtual environment, or container image. Reproduction therefore requires a compatible
 Workstation checkout identified by the recorded Git/software provenance.
 
-Video package verification waits for stable bytes and runs bounded `ffprobe`; full-stream decode is
-available to the verification helper but is not enabled for every automatic Measurement finalization because it can be
-expensive on long recordings. Validate long-duration dual-camera writer shutdown, camera FTP, and
-automatic ULog collection with the actual field hardware before treating those boundaries as
-field-qualified.
+Video package verification waits for stable bytes and runs bounded `ffprobe`; optional full-stream
+decode runs off the GUI thread but finalization still waits for it and each side retains a
+300-second decode timeout. It is not enabled for every automatic Measurement finalization because
+long recordings remain expensive. The queue/supervisor/write-timeout regressions use mock or local
+process boundaries; validate sustained RSS, blocked removable storage, USB serial timeout, dual
+camera recovery, camera FTP, and automatic ULog collection with actual field hardware before
+treating those boundaries as field-qualified.
 
 Automatic restart recovery resumes an open hierarchical session only when exactly one such session
 is discoverable. Its interrupted active measurement is marked `RECOVERABLE`; if several open
@@ -1271,6 +1345,48 @@ live on the panel at solve time -- a later live-GPS change cannot silently retar
 frozen Mountain image.
 
 ## Change Log
+
+- 2026-08-24: Hardened Workstation runtime isolation and shutdown across Qt, Pixhawk/GNSS, WIRIS,
+  camera children, Measurement evaluators, and evidence storage. Added a non-aborting Qt exception
+  hook with emergency flush, Base serial write timeout/bounded latest queue, lossless deferred
+  MAVLink command telemetry, receive-error throttling, mutually exclusive connect/disconnect,
+  asynchronous RTCM-worker replacement, partial-success WIRIS barriers, bounded fragmented TCP
+  reads, and a five-second shutdown deadline. GStreamer now uses an eight-frame leaky decoded queue
+  plus a five-second bounded recording branch, and camera child SIGKILL receives supervised restart.
+  Measurement spawn/join/restart, native PNG persistence, and video verification moved off the GUI
+  thread; worker geometry is reused without GUI recalculation. Disk errors become recoverable
+  recording failures with batched run-event fsync. Malformed detection payloads, zero quaternions,
+  and malformed status values fail closed. Full Workstation suite: `1100 passed, 1 skipped`.
+
+- 2026-08-24: Prevented false Pixhawk `STALE`/`DISCONNECTED` UI status during the automatic
+  calibration-parameter refresh triggered by the first heartbeat. The status projection now reuses
+  the subscriber's exclusive-command state, reports only the reserved P1/P2 side as `PARAM SYNC`,
+  and returns to the normal ATTITUDE-age-based `LIVE` state after command completion.
+
+- 2026-08-24: Removed editable Candidate Apply-DOF checkboxes. Candidate Apply now derives its
+  immutable mask from `optimized_dof`, requires every owned axis to be observable on both camera
+  sides, and applies the complete mask automatically. This prevents full 6-DOF Multi-view `t`
+  from being silently dropped by the former rotation-only UI default. Combine retains its explicit
+  non-overlapping per-source axis selection.
+
+- 2026-08-24: Propagated the operator-selected P1/P2 GPS1/GPS2 source through NTRIP GGA, GNSS
+  readiness/status, Drone reference geometry, Measurement package activation, and frozen GNSS
+  contract provenance. Source changes reset cached fix/fixed-duration state. Consolidated
+  `latest_rtk_baseline` ownership in `MeasurementViewController`; Alignment now renders the
+  canonical estimate without replacing it. Full suite: `1068 passed, 1 skipped`.
+
+- 2026-08-24: Added JSON-free Drone RTK Multi-view collection. Each completed left/right target
+  pair is bound to the matching Frozen burst's immutable Drone/P1/P2 GNSS and synchronization
+  evidence, persisted with READY/BLOCKED state, and accumulated per Session. The Alignment
+  Multi-view action now consumes at least four READY same-K,D samples directly, builds a stable
+  first-P1-origin local NED input, and solves full camera `R,t`; explicit payload/JSON input remains
+  backend-compatible. Added automatic editor rollover after a completed sample plus controller,
+  UI-routing, persistence, failure, and full-R,t regression coverage.
+
+- 2026-08-24: Hardened the live H.264 decode path. GStreamer now repeats SPS/PPS at IDR boundaries,
+  avoids one-buffer leaky queues before decode while retaining bounded latency, and reports decoded
+  rate through a five-second rolling estimator. Added pipeline-parse, recovery, and rolling-rate
+  regression coverage; the full Workstation suite passes `1058 passed, 1 skipped`.
 
 - 2026-08-24: Replaced single-method candidate/fallback execution with one immutable-pair,
   eight-method Measurement barrier. Pixhawk attitude + GNSS/RTK is the fixed representative;

@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -129,6 +130,8 @@ class RunEvidenceLedger:
             "run_events": prepare_jsonl_append(self._events_path),
             "artifacts": prepare_jsonl_append(self._artifacts_path),
         }
+        self._write_lock = threading.RLock()
+        self._dirty_paths: set[Path] = set()
         self._locked = self._events_path.exists() and self._events_path.stat().st_size > 0
 
     @property
@@ -411,6 +414,7 @@ class RunEvidenceLedger:
         return tuple(records)
 
     def manifest_snapshot(self) -> dict[str, Any]:
+        self.flush()
         artifacts = self.artifacts()
         return {
             "schema": SESSION_MANIFEST_SCHEMA,
@@ -423,9 +427,31 @@ class RunEvidenceLedger:
             "artifacts": [record.to_mapping() for record in artifacts],
         }
 
-    @staticmethod
-    def _append_json_line(path: Path, value: Mapping[str, Any]) -> None:
-        append_jsonl_record(path, value, prepared=True)
+    def _append_json_line(self, path: Path, value: Mapping[str, Any]) -> None:
+        # Event-frequency appends are flushed to the kernel but fsync is
+        # batched at session barriers.  This prevents every UI/device event
+        # from stalling on removable storage while preserving an explicit
+        # durability boundary through flush()/manifest_snapshot().
+        with self._write_lock:
+            append_jsonl_record(path, value, prepared=True, fsync=False)
+            self._dirty_paths.add(path)
+
+    def flush(self) -> None:
+        with self._write_lock:
+            dirty = tuple(self._dirty_paths)
+            if not dirty:
+                return
+            directories: set[Path] = set()
+            for path in dirty:
+                descriptor = os.open(path, os.O_RDONLY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                directories.add(path.parent)
+            for directory in directories:
+                self._fsync_directory(directory)
+            self._dirty_paths.difference_update(dirty)
 
     @staticmethod
     def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:

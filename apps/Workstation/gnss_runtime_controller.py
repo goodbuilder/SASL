@@ -103,6 +103,7 @@ def _connect_gui_signal(signal, callback) -> None:
 
 
 GNSS_RUNTIME_CONTROLLER_METHODS = [
+    "_selected_rover_gps_state",
     "_refresh_gnss_base_tab",
     "_gnss_selected_operation_mode",
     "_gnss_active_operation_config",
@@ -621,13 +622,30 @@ class GnssRuntimeController:
         self._last_ntrip_ui_update_s = now_s
         return True
 
+    def _selected_rover_gps_state(self, side: str):
+        """Return the position from the operator-selected GPS1/GPS2 source."""
+
+        side = str(side)
+        latest = getattr(self.panel, "latest_gps", {}) or {}
+        if side not in {"left", "right"}:
+            return latest.get(side) if isinstance(latest, dict) else None
+        selector = getattr(self.panel, "_selected_baseline_gps_state", None)
+        if callable(selector):
+            return selector(side)
+        pair_selector = getattr(self.panel, "_selected_baseline_gps_states", None)
+        if callable(pair_selector):
+            selected = pair_selector()
+            if isinstance(selected, (tuple, list)) and len(selected) == 2:
+                return selected[0 if side == "left" else 1]
+        return latest.get(side) if isinstance(latest, dict) else None
+
     def _refresh_gnss_base_tab(self) -> None:
         if not hasattr(self.panel, "gnss_base_status_labels"):
             return
         labels = self.panel.gnss_base_status_labels
         now_s = time.monotonic()
         for side, key in (("left", "left_rover"), ("right", "right_rover")):
-            gps = self.panel.latest_gps.get(side)
+            gps = self._selected_rover_gps_state(side)
             if gps is None:
                 self.panel._set_health_label(labels[key], "GPS/RTK 대기 중", "idle")
                 continue
@@ -957,8 +975,8 @@ class GnssRuntimeController:
         if policy == GgaPolicy.MANUAL:
             self.panel._log("[GNSS][NTRIP] GGA skipped: GGA policy is MANUAL; GGA is intentionally never sent")
             return None
-        left = self.panel.latest_gps.get("left")
-        right = self.panel.latest_gps.get("right")
+        left = self._selected_rover_gps_state("left")
+        right = self._selected_rover_gps_state("right")
         now_s = time.monotonic()
         maximum_age_s = float(active_config.readiness.maximum_gps_sample_age_s)
 
@@ -1794,7 +1812,7 @@ class GnssRuntimeController:
                 fault_reason=("injection failed" if int(side_stats.get("fail") or 0) > 0 else ""),
             )
         for side in ("left", "right", "drone"):
-            gps = self.panel.latest_gps.get(side)
+            gps = self._selected_rover_gps_state(side)
             if gps is None:
                 self.panel.gnss_rover_fixed_since[side] = None
                 continue
@@ -2605,8 +2623,31 @@ class GnssRuntimeController:
             self._wire_rtcm_pipeline_injection_worker(existing_worker)
             return existing_worker
         if existing_thread is not None or existing_worker is not None:
-            if not self._retire_pixhawk_rtcm_worker(wait=True):
+            restart_token = (existing_thread, subscriber)
+            if (
+                existing_thread is not None
+                and existing_thread.isRunning()
+                and getattr(
+                    self.panel,
+                    "_pixhawk_rtcm_restart_pending",
+                    None,
+                ) != restart_token
+            ):
+                self.panel._pixhawk_rtcm_restart_pending = restart_token
+                _connect_gui_signal(
+                    existing_thread.finished,
+                    lambda old_thread=existing_thread, desired=subscriber: self._restart_pixhawk_rtcm_worker_after_retire(
+                        old_thread,
+                        desired,
+                    ),
+                )
+            # QThread.wait() here used to freeze the GUI for up to one second
+            # on every subscriber replacement.  Request retirement and let
+            # the finished signal resume construction instead.
+            if not self._retire_pixhawk_rtcm_worker(wait=False):
                 return None
+            if getattr(self.panel, "_pixhawk_rtcm_restart_pending", None) == restart_token:
+                self.panel._pixhawk_rtcm_restart_pending = None
         self._ensure_rtcm_pipeline()
         thread = QtCore.QThread(self.panel)
         worker = PixhawkRtcmInjectionWorker(subscriber)
@@ -2625,6 +2666,18 @@ class GnssRuntimeController:
         self._wire_rtcm_pipeline_injection_worker(worker)
         thread.start()
         return worker
+
+    def _restart_pixhawk_rtcm_worker_after_retire(
+        self,
+        old_thread: object,
+        desired_subscriber: object,
+    ) -> None:
+        token = (old_thread, desired_subscriber)
+        if getattr(self.panel, "_pixhawk_rtcm_restart_pending", None) != token:
+            return
+        self.panel._pixhawk_rtcm_restart_pending = None
+        if getattr(self.panel, "mavlink_pixhawk", None) is desired_subscriber:
+            self._ensure_pixhawk_rtcm_worker()
 
     def _retire_pixhawk_rtcm_worker(
         self,

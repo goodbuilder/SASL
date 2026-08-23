@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -270,7 +271,8 @@ def test_native_pair_lookup_uses_app_receive_clock_when_pairing_uses_rtcp(
         }
     )
 
-    result = RecordingController(panel)._persist_native_detection_pair(
+    controller = RecordingController(panel)
+    result = controller._persist_native_detection_pair(
         left_detection=left,
         right_detection=right,
         pair_id="pair-rtcp",
@@ -278,8 +280,13 @@ def test_native_pair_lookup_uses_app_receive_clock_when_pairing_uses_rtcp(
     )
 
     assert requested == {"left": [10.0], "right": [10.01]}
-    assert result["native_pair_status"] == "complete"
+    assert result["native_pair_status"] == "pending"
     assert result["native_left_source_frame_id"] == "native-left"
     assert result["native_right_source_frame_id"] == "native-right"
+    deadline_s = time.monotonic() + 2.0
+    while controller.native_frame_persistence_pending_count() and time.monotonic() < deadline_s:
+        time.sleep(0.01)
+    assert controller.native_frame_persistence_pending_count() == 0
     assert (tmp_path / "rtcp-native-session" / result["native_left_png_path"]).is_file()
     assert (tmp_path / "rtcp-native-session" / result["native_right_png_path"]).is_file()
+    assert controller._shutdown_native_frame_stores() is True

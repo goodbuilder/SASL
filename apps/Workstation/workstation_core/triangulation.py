@@ -130,7 +130,15 @@ def camera_translation_right_in_left_camera(
     scale_to_m: float | None = None,
 ) -> tuple[float, float, float] | None:
     _ = right_body_to_world_q
-    translation_left_body = world_ned_vector_to_body_frd(baseline_right_in_left_world_m, left_body_to_world_q)
+    try:
+        normalize_quaternion(left_body_to_world_q)
+        normalize_quaternion(right_body_to_world_q)
+        translation_left_body = world_ned_vector_to_body_frd(
+            baseline_right_in_left_world_m,
+            left_body_to_world_q,
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
     translation_left_camera = body_frd_vector_to_camera(translation_left_body)
     if scale_to_m is None:
         return translation_left_camera
@@ -285,6 +293,21 @@ def triangulate_pixels_with_pixhawk_mount_attempt(
     right_body_to_world_q: Iterable[float],
     translation_right_in_left_m: tuple[float, float, float],
 ) -> RayTriangulationAttempt:
+    try:
+        normalize_quaternion(left_body_to_world_q)
+        normalize_quaternion(right_body_to_world_q)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return RayTriangulationAttempt(
+            None,
+            "invalid_quaternion",
+            {"error": str(exc)},
+        )
+    if translation_right_in_left_m is None:
+        return RayTriangulationAttempt(
+            None,
+            "invalid_quaternion",
+            {"error": "camera translation unavailable for supplied quaternion"},
+        )
     left_ray = normalized_ray_from_pixel(left_pixel[0], left_pixel[1], left_intrinsics)
     right_ray = normalized_ray_from_pixel(right_pixel[0], right_pixel[1], right_intrinsics)
     right_ray_in_left = normalize_vector(

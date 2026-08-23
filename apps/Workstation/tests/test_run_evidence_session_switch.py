@@ -28,3 +28,26 @@ def test_controller_registers_owned_artifact_without_copy(tmp_path: Path) -> Non
     record = RunEvidenceController(panel).register_workstation_session_artifact(artifact, role="capture/raw")
     assert record["relative_path"] == "capture.bin"
     assert not (session / "assets").exists()
+
+
+def test_run_evidence_oserror_becomes_recording_failure_not_callback_exception(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from Workstation.workstation_core.run_evidence import RunEvidenceLedger
+
+    panel = _panel(tmp_path, "A")
+    panel.logs = []
+    panel._log = panel.logs.append
+    monkeypatch.setattr(
+        RunEvidenceLedger,
+        "append_event",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("read-only-sentinel")),
+    )
+
+    result = RunEvidenceController(panel).ensure_workstation_run_evidence("sample")
+
+    assert result["status"] == "failed"
+    assert panel._session_save_retry_required is True
+    assert "read-only-sentinel" in panel._session_save_last_error
+    assert panel.logs

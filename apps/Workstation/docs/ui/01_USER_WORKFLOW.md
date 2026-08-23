@@ -177,11 +177,12 @@ wrapper. The workflow is:
    `Manual Horizon` marks two horizon points for Roll/Pitch only. `Manual Mountain` marks
    same-order terrain correspondences for the GNSS + Mountain metric `R,t` solve (at least
    four pairs). `Manual Target` marks one Drone RTK target pixel per image for the
-   single-target Drone RTK Yaw fallback; full multi-view `R,t` uses imported observations.
+   single-target Drone RTK Yaw fallback; completing both sides also accumulates that Frozen
+   pair with capture-time Drone/P1/P2 GNSS for JSON-free multi-view `R,t`.
    The corresponding
    `Auto Horizon Roll/Pitch` and `Auto Mountain PnP` buttons remain available after manual
-   marking; they run the owner solver over the frozen evidence. Selecting Horizon disables
-   the Yaw DOF because a horizon cannot observe Yaw. Use Mountain PnP or live target-Drone
+   marking; they run the owner solver over the frozen evidence. Horizon candidates own only
+   Roll/Pitch because a horizon cannot observe Yaw. Use Mountain PnP or live target-Drone
    RTK with explicit camera/target line of sight for Yaw. Terrain PnP also requires a
    declared vertical datum; a skyline alone is not promoted to a 3-D correspondence or
    truth source.
@@ -190,8 +191,10 @@ wrapper. The workflow is:
    select Horizon/Ridge/Target annotation mode without deleting points from other modes.
 4. Inspect immutable candidates, residual/uncertainty evidence, warnings, and observable
    degrees of freedom. Independent non-overlapping candidates may be combined.
-5. Apply only selected DOF that the candidate actually optimized and observed, or revert to
-   the previous immutable profile. The main KPI is right-minus-left optical boresight Yaw;
+5. Press `Apply candidate` to apply every DOF that the candidate owner optimized. Apply is
+   blocked if any owned axis is not observable on both camera sides; there is no editable
+   Candidate Apply-DOF mask. Use `Combine` when axes must come from different candidates, or
+   revert to the previous immutable profile. The main KPI is right-minus-left optical boresight Yaw;
    low numerical residual never overrides missing applicability/observability evidence.
 
 `Existing calibration` is a reference, not another Alignment solver. `Pre-run Calibration`

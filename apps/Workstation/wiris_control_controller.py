@@ -159,6 +159,7 @@ class WirisControlController:
 
     def _apply_wiris_zoom_result(self, target: str, action: str, result: object) -> None:
         statuses: list[str] = []
+        busy = False
         for item in list(result or []):
             if not isinstance(item, dict):
                 continue
@@ -175,12 +176,36 @@ class WirisControlController:
                     }
                 suffix = f" 응답={response}" if response else " 전송됨"
                 statuses.append(f"{self.panel._camera_name_ko(label)}: {item.get('command', '')}{suffix}")
+            elif item.get("state") == "busy":
+                busy = True
+                statuses.append(
+                    f"{self.panel._camera_name_ko(label)}: 제어 채널 사용 중 — 자동 재시도"
+                )
             else:
                 statuses.append(f"{self.panel._camera_name_ko(label)}: 실패: {item.get('detail', 'unknown')}")
         status_text = " | ".join(statuses)
         self.panel.zoom_status_label.setText(status_text)
         self.panel._log(f"[카메라] 줌 명령 target={target}, action={action}: {status_text}")
-        if action == "set":
+        retry_key = (str(target), str(action))
+        retries = getattr(self.panel, "_zoom_control_busy_retries", None)
+        if not isinstance(retries, dict):
+            retries = {}
+            self.panel._zoom_control_busy_retries = retries
+        if busy:
+            attempt = int(retries.get(retry_key, 0)) + 1
+            retries[retry_key] = attempt
+            if attempt <= 5:
+                QtCore.QTimer.singleShot(
+                    100,
+                    lambda target=target, action=action: self.panel.send_zoom(target, action),
+                )
+            else:
+                statuses.append("제어 채널 busy 재시도 한도 초과 — 카메라 실패로 판정하지 않음")
+                self.panel.zoom_status_label.setText(" | ".join(statuses))
+                retries.pop(retry_key, None)
+        else:
+            retries.pop(retry_key, None)
+        if not busy and action in {"set", "in", "out"}:
             self.panel._zoom_readback_target = target
 
     def _wiris_zoom_failed(self, error: str) -> None:

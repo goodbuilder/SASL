@@ -49,6 +49,41 @@ def test_rtp_timing_tracker_matches_depay_output_by_pts_and_discards_merged_mark
     assert not tracker._pending_rtp_frames
 
 
+def test_status_refresh_ignores_malformed_fps_and_recovers_next_tick() -> None:
+    panel = SimpleNamespace(
+        camera_stream_stats={"left": {"decoded_hz": "not-a-number"}},
+    )
+    adapter = BackendStatusAdapter(panel)
+    snapshots: list[object] = []
+    adapter.polled.connect(snapshots.append)
+
+    adapter.refresh()
+    assert adapter.model.record("fps").state == "NO DATA"
+
+    panel.camera_stream_stats = {"left": {"decoded_hz": 19.5}}
+    adapter.refresh()
+    assert adapter.model.record("fps").state == "AVAILABLE"
+    assert len(snapshots) == 2
+
+
+def test_status_refresh_isolates_one_projection_exception(monkeypatch) -> None:
+    panel = SimpleNamespace(camera_stream_stats={})
+    adapter = BackendStatusAdapter(panel)
+    original = adapter._refresh_camera
+
+    def fail_left(panel, side, label, now_s):
+        if side == "left":
+            raise ValueError("malformed camera sentinel")
+        return original(panel, side, label, now_s)
+
+    monkeypatch.setattr(adapter, "_refresh_camera", fail_left)
+    adapter.refresh()
+
+    assert adapter.model.record("camera.right") is not None
+    assert adapter.model.record("status.adapter").state == "DEGRADED"
+    assert "malformed camera sentinel" in adapter.model.record("status.adapter").detail
+
+
 def test_overview_shows_all_read_only_method_states_and_navigates_to_details() -> None:
     from Workstation.workspaces import OverviewWorkspace
     from Workstation.status_model import StatusModel

@@ -181,6 +181,7 @@ class WirisFtpBrowserDialog(QtWidgets.QDialog):
         self._credentials = {label: dict(config) for label, config in (credentials or {}).items()}
         self._thread: QtCore.QThread | None = None
         self._worker: QtCore.QObject | None = None
+        self._pending_done_result: int | None = None
         self._current_path = remote_dir or "/"
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -272,7 +273,6 @@ class WirisFtpBrowserDialog(QtWidgets.QDialog):
             self.up_button,
             self.download_button,
             self.use_path_button,
-            self.close_button,
             self.camera_combo,
             self.host_edit,
             self.port_spin,
@@ -282,22 +282,30 @@ class WirisFtpBrowserDialog(QtWidgets.QDialog):
             self.path_edit,
         ):
             widget.setEnabled(not busy)
+        self.close_button.setEnabled(True)
 
     def done(self, result: int) -> None:
-        # QThread aborts the whole process if its C++ object is destroyed
-        # while still running (e.g. the dialog closing mid-request). Block
-        # until any in-flight FTP worker thread actually finishes -- bounded
-        # by ftplib's own connect/read timeout -- before allowing Qt to tear
-        # the dialog (and its child QThread) down.
+        # Keep the dialog alive until its bounded FTP operation finishes, but
+        # never block the GUI thread with QThread.wait().
         if self._thread is not None and self._thread.isRunning():
+            self._pending_done_result = int(result)
+            self.status_label.setText("Closing after the current FTP request stops...")
+            self._busy(True)
             self._thread.quit()
-            self._thread.wait()
+            return
         super().done(result)
 
     def _clear_thread(self) -> None:
         self._thread = None
         self._worker = None
         self._busy(False)
+        pending_result = self._pending_done_result
+        if pending_result is not None:
+            self._pending_done_result = None
+            QtCore.QTimer.singleShot(
+                0,
+                lambda result=pending_result: QtWidgets.QDialog.done(self, result),
+            )
 
     def _start_listing(self) -> None:
         if self._thread is not None:

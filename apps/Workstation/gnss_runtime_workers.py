@@ -804,6 +804,9 @@ class RtcmDataPlaneWorker(QtCore.QObject):
 
 
 class GnssBaseSerialWorker(QtCore.QObject):
+    WRITE_TIMEOUT_S = 1.0
+    MAX_WRITE_QUEUE = 64
+
     connected = QtCore.pyqtSignal(str, int)
     stats_changed = QtCore.pyqtSignal(int, float, float)
     survey_in_changed = QtCore.pyqtSignal(object)
@@ -824,7 +827,9 @@ class GnssBaseSerialWorker(QtCore.QObject):
         self.baud = int(baud)
         self.height_type = HeightType(height_type)
         self._stop_requested = False
-        self._write_queue: queue.Queue[tuple[str, bytes]] = queue.Queue()
+        self._write_queue: queue.Queue[tuple[str, bytes]] = queue.Queue(
+            maxsize=self.MAX_WRITE_QUEUE
+        )
 
     @QtCore.pyqtSlot()
     def run(self) -> None:
@@ -843,7 +848,12 @@ class GnssBaseSerialWorker(QtCore.QObject):
             except Exception as exc:
                 self.failed.emit(f"pyserial 필요: {exc}")
                 return
-            serial_obj = serial.Serial(self.port, self.baud, timeout=0.2)
+            serial_obj = serial.Serial(
+                self.port,
+                self.baud,
+                timeout=0.2,
+                write_timeout=self.WRITE_TIMEOUT_S,
+            )
             self.connected.emit(self.port, self.baud)
             while not self._stop_requested:
                 self._drain_writes(serial_obj)
@@ -923,7 +933,26 @@ class GnssBaseSerialWorker(QtCore.QObject):
 
     @QtCore.pyqtSlot(str, bytes)
     def send_bytes(self, label: str, payload: bytes) -> None:
-        self._write_queue.put((label, bytes(payload)))
+        item = (str(label), bytes(payload))
+        try:
+            self._write_queue.put_nowait(item)
+            return
+        except queue.Full:
+            pass
+        # The base output is a live correction/command stream.  Never block a
+        # producer behind a stalled USB writer: discard the oldest queued item
+        # and retain the newest request.  A racing consumer may free the slot
+        # between operations, so retry until either operation succeeds.
+        while True:
+            try:
+                self._write_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._write_queue.put_nowait(item)
+                return
+            except queue.Full:
+                continue
 
     def _drain_writes(self, serial_obj) -> None:
         while True:

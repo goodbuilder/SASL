@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from Workstation.workstation_core.theme import (
@@ -70,6 +72,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self._optical_pose_auto_worker: OpticalPoseAutoSelectWorker | None = None
         self._optical_pose_auto_command_id: str | None = None
         self._close_after_optical_pose_auto = False
+        self._close_requested_monotonic_s: float | None = None
         self._build_commands()
         self._build_shell()
         self._build_workspaces()
@@ -1289,23 +1292,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                         )
                         return
                     values["drone_yaw_path"] = source_path
-                if command_id == "alignment.pose.solve_drone_rtk_multiview" and not (
-                    values.get("drone_rtk_multiview")
-                    or values.get("multiview")
-                    or values.get("drone_rtk_multiview_path")
-                ):
-                    source_path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
-                        self,
-                        "Import Drone RTK multi-view observation JSON",
-                        "",
-                        "JSON (*.json);;All files (*)",
-                    )
-                    if not source_path:
-                        self.statusBar().showMessage(
-                            "Drone RTK multi-view import cancelled", 2500
-                        )
-                        return
-                    values["drone_rtk_multiview_path"] = source_path
                 if command_id == "alignment.pose.solve_terrain" and not (
                     values.get("correspondences") or values.get("correspondences_path")
                 ):
@@ -2050,12 +2036,24 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             event.ignore()
             return
         if self._optical_pose_auto_thread is not None and self._optical_pose_auto_thread.isRunning():
+            now_s = time.monotonic()
+            if self._close_requested_monotonic_s is None:
+                self._close_requested_monotonic_s = now_s
             self._close_after_optical_pose_auto = True
             if self._optical_pose_auto_worker is not None:
                 self._optical_pose_auto_worker.cancel()
-            self.statusBar().showMessage("Waiting for optical-pose analysis to finish", 3000)
-            event.ignore()
-            return
+            if now_s - self._close_requested_monotonic_s >= 5.0:
+                self._optical_pose_auto_thread.requestInterruption()
+                self._optical_pose_auto_thread.quit()
+                self._optical_pose_auto_thread.terminate()
+                self._optical_pose_auto_thread.wait(500)
+                self._optical_pose_auto_thread = None
+                self._optical_pose_auto_worker = None
+            else:
+                self.statusBar().showMessage("Waiting for optical-pose analysis to finish", 3000)
+                event.ignore()
+                QtCore.QTimer.singleShot(250, self.close)
+                return
         self._closing = True
         if not bool(self.backend.shutdown_for_close()):
             event.ignore()
@@ -2064,4 +2062,5 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             return
         self._save_ui_state()
         self.status_adapter.stop()
+        self._close_requested_monotonic_s = None
         super().closeEvent(event)

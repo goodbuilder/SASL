@@ -23,6 +23,7 @@ DEFAULT_RTSP_PORTS = (8554, 554, 8555, 8556, 8080, 8081, 8000, 5000, 5004)
 DEFAULT_RTSP_PATHS = ("visible", "stream1", "stream2", "live", "h264", "video", "cam/realmonitor")
 DEFAULT_RTSP_SCAN_WORKERS = 64
 DEFAULT_TCP_PORT_SCAN_WORKERS = 256
+PKEXEC_TIMEOUT_SECONDS = 15.0
 
 
 @dataclass(frozen=True)
@@ -692,7 +693,19 @@ def apply_interface_address(interface_name: str, address_text: str) -> tuple[boo
     if pkexec is None or headless_qt or not has_display:
         fallback_error = error or f"ip addr add failed with rc={result.returncode}"
         return False, f"{fallback_error}; run: sudo {' '.join(command)}"
-    elevated = subprocess.run([pkexec, *command], check=False, capture_output=True, text=True)
+    try:
+        elevated = subprocess.run(
+            [pkexec, *command],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=PKEXEC_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return False, (
+            f"pkexec authorization timed out after {PKEXEC_TIMEOUT_SECONDS:.0f}s; "
+            f"run: sudo {' '.join(command)}"
+        )
     if elevated.returncode == 0:
         return True, f"applied {address} to {interface_name}"
     elevated_error = (elevated.stderr or elevated.stdout or "").strip()

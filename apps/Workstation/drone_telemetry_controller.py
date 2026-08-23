@@ -327,8 +327,21 @@ class DroneTelemetryController:
             connection_state = str(getattr(self.panel, "drone_telemetry_connection_state", "DISCONNECTED"))
         gps_states = getattr(self.panel, "latest_gps", {}) or {}
         drone_gps = gps_states.get("drone") if isinstance(gps_states, Mapping) else None
-        left_gps = gps_states.get("left") if isinstance(gps_states, Mapping) else None
-        right_gps = gps_states.get("right") if isinstance(gps_states, Mapping) else None
+        selected_reader = getattr(self.panel, "_selected_rover_gps_state", None)
+        left_gps = (
+            selected_reader("left")
+            if callable(selected_reader)
+            else gps_states.get("left")
+            if isinstance(gps_states, Mapping)
+            else None
+        )
+        right_gps = (
+            selected_reader("right")
+            if callable(selected_reader)
+            else gps_states.get("right")
+            if isinstance(gps_states, Mapping)
+            else None
+        )
         focal_length_px, focal_source = self._focal_length_px()
         estimate = estimate_ideal_disparity(
             left_gps,

@@ -66,7 +66,6 @@ from Workstation.workstation_core.pose_solvers import (
     fit_normalized_horizon_line,
     fixed_center_orientation_ray_residuals,
     pose_target_ray_residuals,
-    pose_reprojection_residuals,
     solve_constrained_pose_least_squares,
     solve_mountain_relative_rotation_robust,
     solve_pnp_ensemble,
@@ -215,6 +214,9 @@ def _payload_sha256(value: Mapping[str, Any]) -> str:
 
 
 _DRONE_RTK_OBSERVATION_SCHEMA = "optical-pose-drone-rtk-capture-observation-v1"
+_DRONE_RTK_MULTIVIEW_SAMPLE_SCHEMA = "optical-pose-drone-rtk-multiview-sample-v1"
+_DRONE_RTK_MULTIVIEW_COLLECTION_SCHEMA = "optical-pose-drone-rtk-multiview-collection-v1"
+_DRONE_RTK_MULTIVIEW_MIN_OBSERVATIONS = 4
 
 
 def _gps_state_observation_mapping(value: Any, *, role: str) -> dict[str, Any] | None:
@@ -447,6 +449,10 @@ def _candidate_mapping(candidate: OpticalPoseCandidate) -> dict[str, Any]:
         ),
         "observable_dof": common_observability,
         "observable_dof_by_side": side_observability,
+        "optimized_dof": {
+            name: bool(getattr(candidate.optimized_dofs, name))
+            for name in POSE_DOF_NAMES
+        },
         "applicable": True,
         "state": "WARNING" if candidate.warnings else "CANDIDATE",
         "warnings": list(candidate.warnings),
@@ -474,7 +480,6 @@ class OpticalPoseController:
         self._candidate_priors: dict[
             str, tuple[CameraPoseNed, CameraPoseNed]
         ] = {}
-        self._candidate_solver_context: dict[str, dict[str, PnpCorrespondences]] = {}
         self._candidate_drone_rotation_context: dict[str, dict[str, dict[str, Any]]] = {}
         self._active_selection: OpticalPoseSelection | None = None
         self._active_poses: tuple[CameraPoseNed, CameraPoseNed] | None = None
@@ -498,6 +503,12 @@ class OpticalPoseController:
         # that capture request. A later Capture must never rewrite or drop an
         # earlier entry.
         self._drone_rtk_observations: list[dict[str, Any]] = []
+        # One operator-selected target pair per frozen burst, bound to the
+        # immutable Drone/P1/P2 GNSS snapshot captured with that same burst.
+        # The latest edit for a burst is the active sample; every edit is also
+        # appended to run_events so replacing a pixel never erases the audit
+        # trail. Different bursts are never overwritten.
+        self._drone_rtk_multiview_samples: dict[str, dict[str, Any]] = {}
         # Operator-tunable Mountain ridge-boundary match margin (fraction of
         # image height); see optical_pose_auto_select.detect_mountain. An
         # in-session control, not a persisted AppSettings field -- it is
@@ -535,7 +546,6 @@ class OpticalPoseController:
 
         self._candidates.clear()
         self._candidate_priors.clear()
-        self._candidate_solver_context.clear()
         self._candidate_drone_rotation_context.clear()
         self._active_selection = None
         self._active_poses = None
@@ -551,6 +561,7 @@ class OpticalPoseController:
         self._last_accepted_auto_suggestion = None
         self._annotation_review = None
         self._drone_rtk_observations.clear()
+        self._drone_rtk_multiview_samples.clear()
         self._pending_wiris_ftp_payload.clear()
         setattr(self.panel, "selected_extrinsics_profile", None)
         setattr(self.panel, "_active_optical_pose_selection_id", "")
@@ -732,23 +743,33 @@ class OpticalPoseController:
         candidate = self._candidates.get(candidate_id)
         if candidate is None:
             raise ValueError(f"unknown optical pose candidate: {candidate_id}")
-        mask = self._mask(payload)
+        mask = candidate.optimized_dofs
         if not mask.selected_names:
-            raise ValueError("at least one pose DOF must be selected")
+            raise ValueError("candidate did not optimize any pose DOF")
         side_observable = {
             side: dict(values) for side, values in candidate.observability_by_side
         }
-        unsupported = tuple(
+        unobservable = tuple(
             name
             for name in mask.selected_names
-            if not getattr(candidate.optimized_dofs, name)
-            or not all(side_observable[side].get(name, False) for side in ("left", "right"))
+            if not all(side_observable[side].get(name, False) for side in ("left", "right"))
         )
-        if unsupported:
+        if unobservable:
             raise ValueError(
-                "selected DOF were not optimized/observable for this candidate: "
-                + ", ".join(unsupported)
+                "candidate optimized DOF are not observable on both camera sides: "
+                + ", ".join(unobservable)
             )
+        # Legacy callers may still send the former UI mask. Accept it only
+        # when it exactly matches the owner-derived candidate contract; a
+        # stale/partial mask must fail closed instead of silently dropping t.
+        if isinstance(payload.get("dof"), Mapping):
+            requested_mask = self._mask(payload)
+            if requested_mask.selected_names != mask.selected_names:
+                raise ValueError(
+                    "candidate DOF is owner-derived; payload override does not match: "
+                    f"expected={','.join(mask.selected_names)} "
+                    f"requested={','.join(requested_mask.selected_names) or 'none'}"
+                )
         applicability = self._intrinsics_snapshot(use_frozen=False)
         if not bool(applicability["applicability"]["geometry_allowed"]):
             raise RuntimeError(
@@ -834,42 +855,8 @@ class OpticalPoseController:
         prior_left: CameraPoseNed,
         prior_right: CameraPoseNed,
     ) -> tuple[PoseParametersNed, PoseParametersNed]:
-        """Apply a candidate without splicing coupled PnP Euler components.
+        """Apply exactly the candidate-owned optimized/observable DOF mask."""
 
-        Horizon and Drone-yaw observations are axis-specific by construction.
-        Terrain PnP is coupled, so a partial DOF mask is re-solved against the
-        retained raw correspondences with unchecked values fixed at the prior.
-        This keeps the UI's explicit mask mathematically meaningful.
-        """
-
-        context = self._candidate_solver_context.get(candidate.candidate_id, {})
-        if candidate.method == "terrain-pnp-ensemble" and mask.selected_names != candidate.optimized_dofs.selected_names:
-            if not context:
-                raise RuntimeError(
-                    "terrain candidate lacks retained 2-D/3-D observations for constrained re-solve"
-                )
-            outputs: list[PoseParametersNed] = []
-            for side, prior, fallback in (
-                ("left", prior_left, candidate.left_pose_ned),
-                ("right", prior_right, candidate.right_pose_ned),
-            ):
-                correspondences = context.get(side)
-                if correspondences is None:
-                    outputs.append(pose_parameters_from_camera_pose(prior))
-                    continue
-                result = solve_constrained_pose_least_squares(
-                    pose_parameters_from_camera_pose(prior),
-                    mask,
-                    lambda parameters, corr=correspondences: pose_reprojection_residuals(
-                        parameters, corr
-                    ),
-                )
-                if not result.success or not all(math.isfinite(value) for value in result.residuals):
-                    raise RuntimeError(
-                        f"terrain constrained re-solve failed for {side}: {result.message}"
-                    )
-                outputs.append(result.parameters)
-            return outputs[0], outputs[1]
         left_parameters = apply_selected_dofs(
             pose_parameters_from_camera_pose(prior_left),
             pose_parameters_from_camera_pose(candidate.left_pose_ned),
@@ -990,6 +977,263 @@ class OpticalPoseController:
             if observation.get("burst_id") == burst_id:
                 return observation
         return None
+
+    def _record_drone_rtk_multiview_sample(
+        self,
+        review: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Bind one frozen target pair to that burst's captured RTK evidence.
+
+        A partially clicked pair is not a sample. Once both sides contain one
+        target pixel, the pair is recorded even when its RTK/synchronization
+        evidence is blocked; this keeps the failure auditable while ensuring
+        only ``READY`` samples can enter the full-R,t solve.
+        """
+
+        if str(review.get("annotation_mode") or "").lower() != "target":
+            return None
+        annotations = review.get("annotations")
+        if not isinstance(annotations, Mapping):
+            return None
+        normalized: dict[str, dict[str, Any]] = {}
+        target_pixels: dict[str, dict[str, float]] = {}
+        for side in ("left", "right"):
+            annotation = annotations.get(side)
+            if not isinstance(annotation, Mapping):
+                return None
+            points = self._annotation_points(annotation, "target_point")
+            if len(points) != 1:
+                return None
+            normalized[side] = copy.deepcopy(dict(annotation))
+            target_pixels[side] = {"u_px": points[0][0], "v_px": points[0][1]}
+
+        left_frozen = self._frozen_frames.get("left")
+        right_frozen = self._frozen_frames.get("right")
+        left_artifact = (
+            left_frozen.get("artifact") if isinstance(left_frozen, Mapping) else None
+        )
+        right_artifact = (
+            right_frozen.get("artifact") if isinstance(right_frozen, Mapping) else None
+        )
+        if not isinstance(left_artifact, NativeFrameArtifact) or not isinstance(
+            right_artifact, NativeFrameArtifact
+        ):
+            return None
+        burst_id = left_artifact.frame_id
+        observation = self._capture_observation_for_frozen_burst()
+        reasons: list[str] = []
+        frozen_profile = self._frozen_intrinsics_profile
+        frozen_profile_sha256 = (
+            "" if frozen_profile is None else str(frozen_profile.profile_sha256)
+        )
+        intrinsics_snapshot = self._intrinsics_snapshot(use_frozen=True)
+        intrinsics_applicability = intrinsics_snapshot.get("applicability")
+        intrinsics_applicability = (
+            intrinsics_applicability
+            if isinstance(intrinsics_applicability, Mapping)
+            else {}
+        )
+        if not bool(intrinsics_applicability.get("geometry_allowed", False)):
+            intrinsics_reasons = intrinsics_applicability.get("reasons")
+            reason_text = ", ".join(str(value) for value in intrinsics_reasons or ())
+            reasons.append(
+                "frozen exact operating K,D is not geometry-applicable"
+                + (f": {reason_text}" if reason_text else "")
+            )
+        if observation is None:
+            reasons.append("no capture-associated Drone/P1/P2 GNSS observation")
+            observation_id = ""
+            gnss: Mapping[str, Any] = {}
+            synchronization: Mapping[str, Any] = {}
+            capture_state = "INCOMPLETE"
+        else:
+            observation_id = str(observation.get("observation_id") or "")
+            gnss_value = observation.get("gnss")
+            gnss = gnss_value if isinstance(gnss_value, Mapping) else {}
+            sync_value = observation.get("synchronization")
+            synchronization = sync_value if isinstance(sync_value, Mapping) else {}
+            capture_state = str(observation.get("state") or "INCOMPLETE")
+            if capture_state != "EVIDENCE_READY":
+                reasons.append(f"capture evidence state is {capture_state}, not EVIDENCE_READY")
+            if synchronization.get("state") != "SYNC_OK":
+                reasons.append(
+                    str(synchronization.get("reason") or "frame/Drone GNSS synchronization is not verified")
+                )
+            frames = observation.get("frames")
+            frames = frames if isinstance(frames, Mapping) else {}
+            for side, artifact in (("left", left_artifact), ("right", right_artifact)):
+                frame = frames.get(side)
+                if not isinstance(frame, Mapping) or str(frame.get("frame_id") or "") != artifact.frame_id:
+                    reasons.append(f"{side} frame identity does not match capture observation")
+
+        previous = self._drone_rtk_multiview_samples.get(burst_id)
+        sample_id = (
+            str(previous.get("sample_id") or "")
+            if isinstance(previous, Mapping)
+            else ""
+        ) or f"drone-rtk-multiview-sample-{uuid.uuid4().hex}"
+        revision = int(previous.get("revision", 0)) + 1 if isinstance(previous, Mapping) else 1
+        sequence = (
+            int(previous.get("sequence", 0))
+            if isinstance(previous, Mapping)
+            else len(self._drone_rtk_multiview_samples)
+        )
+        sample = {
+            "schema": _DRONE_RTK_MULTIVIEW_SAMPLE_SCHEMA,
+            "sample_id": sample_id,
+            "sequence": sequence,
+            "revision": revision,
+            "session_id": str(observation.get("session_id") or "") if observation else "",
+            "burst_id": burst_id,
+            "capture_observation_id": observation_id,
+            "capture_state": capture_state,
+            "operating_intrinsics_profile_sha256": frozen_profile_sha256,
+            "capture_zoom": {
+                side: copy.deepcopy(dict(self._frozen_frames[side].get("zoom") or {}))
+                for side in ("left", "right")
+            },
+            "state": "READY" if not reasons else "BLOCKED",
+            "reasons": list(dict.fromkeys(reasons)),
+            "frames": {
+                "left": left_artifact.to_mapping(),
+                "right": right_artifact.to_mapping(),
+            },
+            "annotations": normalized,
+            "target_pixels": target_pixels,
+            "annotation_hashes": {
+                side: _payload_sha256(normalized[side]) for side in ("left", "right")
+            },
+            "gnss": copy.deepcopy(dict(gnss)),
+            "synchronization": copy.deepcopy(dict(synchronization)),
+            "coordinate_contract": {
+                "pixel": "native OpenCV pixels; u right, v down",
+                "gnss": "WGS84 latitude/longitude degrees and altitude metres",
+                "solve_world": "local NED metres; origin selected when collection is solved",
+            },
+            "updated_utc_ns": time.time_ns(),
+        }
+        self._drone_rtk_multiview_samples[burst_id] = sample
+        self._append_event("optical_pose_drone_rtk_multiview_sample_recorded", sample)
+        return sample
+
+    def _accumulated_drone_rtk_multiview_root(self) -> dict[str, Any]:
+        """Build the existing solver contract from READY in-session samples."""
+
+        samples = sorted(
+            (
+                copy.deepcopy(sample)
+                for sample in self._drone_rtk_multiview_samples.values()
+                if sample.get("state") == "READY"
+            ),
+            key=lambda sample: int(sample.get("sequence", 0)),
+        )
+        if len(samples) < _DRONE_RTK_MULTIVIEW_MIN_OBSERVATIONS:
+            blocked_count = sum(
+                sample.get("state") != "READY"
+                for sample in self._drone_rtk_multiview_samples.values()
+            )
+            raise ValueError(
+                "Drone RTK Multi-view requires at least four READY accumulated Frozen target "
+                f"observations; ready={len(samples)}, blocked={blocked_count}"
+            )
+
+        profile_hashes = {
+            str(sample.get("operating_intrinsics_profile_sha256") or "")
+            for sample in samples
+        }
+        if "" in profile_hashes or len(profile_hashes) != 1:
+            raise ValueError(
+                "READY Multi-view samples must share one exact operating K,D profile"
+            )
+        current_profile_hash = (
+            ""
+            if self._frozen_intrinsics_profile is None
+            else str(self._frozen_intrinsics_profile.profile_sha256)
+        )
+        if current_profile_hash not in profile_hashes:
+            raise ValueError(
+                "accumulated Multi-view K,D profile does not match the current frozen burst"
+            )
+
+        first_gnss = samples[0].get("gnss")
+        first_gnss = first_gnss if isinstance(first_gnss, Mapping) else {}
+        origin = _gps_state_from_capture_mapping(first_gnss.get("left"))
+        first_right = _gps_state_from_capture_mapping(first_gnss.get("right"))
+        if origin is None or first_right is None:
+            raise ValueError("first READY Multi-view sample lacks a usable P1/P2 GNSS origin")
+        right_center = ned_delta_m(origin, first_right)
+        if right_center is None:
+            raise ValueError("first READY Multi-view sample cannot derive the P2-P1 NED baseline")
+
+        observations: dict[str, list[dict[str, Any]]] = {"left": [], "right": []}
+        for sample in samples:
+            gnss = sample.get("gnss")
+            gnss = gnss if isinstance(gnss, Mapping) else {}
+            drone_row = gnss.get("drone")
+            drone = _gps_state_from_capture_mapping(drone_row)
+            if drone is None:
+                raise ValueError(
+                    f"READY Multi-view sample {sample.get('sample_id')} lacks usable Drone GNSS"
+                )
+            target_ned = ned_delta_m(origin, drone)
+            if target_ned is None:
+                raise ValueError(
+                    f"READY Multi-view sample {sample.get('sample_id')} cannot derive target NED"
+                )
+            pixels = sample.get("target_pixels")
+            pixels = pixels if isinstance(pixels, Mapping) else {}
+            frames = sample.get("frames")
+            frames = frames if isinstance(frames, Mapping) else {}
+            for side in ("left", "right"):
+                pixel = pixels.get(side)
+                frame = frames.get(side)
+                if not isinstance(pixel, Mapping) or not isinstance(frame, Mapping):
+                    raise ValueError(
+                        f"READY Multi-view sample {sample.get('sample_id')} lacks {side} pixel/frame evidence"
+                    )
+                observations[side].append(
+                    {
+                        "observation_id": str(sample.get("sample_id") or ""),
+                        "capture_observation_id": str(
+                            sample.get("capture_observation_id") or ""
+                        ),
+                        "burst_id": str(sample.get("burst_id") or ""),
+                        "frame_id": str(frame.get("frame_id") or ""),
+                        "image_sha256": str(frame.get("sha256") or ""),
+                        "pixel_uv": [float(pixel["u_px"]), float(pixel["v_px"])],
+                        "target_point_ned_m": [float(value) for value in target_ned],
+                        "drone_gps": copy.deepcopy(dict(drone_row)),
+                        "timestamp_alignment_verified": True,
+                    }
+                )
+
+        collection_evidence = {
+            "sample_ids": [str(sample.get("sample_id") or "") for sample in samples],
+            "capture_observation_ids": [
+                str(sample.get("capture_observation_id") or "") for sample in samples
+            ],
+            "annotation_hashes": [sample.get("annotation_hashes") for sample in samples],
+            "operating_intrinsics_profile_sha256": next(iter(profile_hashes)),
+        }
+        return {
+            "schema": _DRONE_RTK_MULTIVIEW_COLLECTION_SCHEMA,
+            "source": "session_accumulated_frozen_targets",
+            "origin_gps": copy.deepcopy(dict(first_gnss["left"])),
+            "camera_centers_ned_m": {
+                "left": [0.0, 0.0, 0.0],
+                "right": [float(value) for value in right_center],
+            },
+            "observations": observations,
+            "collection_sample_ids": collection_evidence["sample_ids"],
+            "collection_sha256": _payload_sha256(collection_evidence),
+            "coordinate_contract": {
+                "origin": "P1/left GNSS from the first READY accumulated sample",
+                "world": "local NED metres: north, east, down",
+                "target": "Drone GNSS minus origin converted to local NED metres",
+                "ray_input": "native OpenCV pixel (u right, v down), undistorted with frozen K,D",
+                "camera_center_initialization": "P1=(0,0,0), P2=P2_GNSS-P1_GNSS; optical centers are solved",
+            },
+        }
 
     def capture_workstation_optical_pose_burst(
         self,
@@ -1769,6 +2013,9 @@ class OpticalPoseController:
         clone._active_poses = self._active_poses
         clone._frozen_capture_monotonic_s = self._frozen_capture_monotonic_s
         clone._drone_rtk_observations = copy.deepcopy(self._drone_rtk_observations)
+        clone._drone_rtk_multiview_samples = copy.deepcopy(
+            self._drone_rtk_multiview_samples
+        )
         clone._mountain_ridge_margin_fraction = self._mountain_ridge_margin_fraction
         clone._mountain_max_points = self._mountain_max_points
         return clone
@@ -2160,6 +2407,7 @@ class OpticalPoseController:
         )
         self._annotation_review = review
         self._append_event("optical_pose_annotations_updated", review)
+        self._record_drone_rtk_multiview_sample(review)
         return self.workstation_optical_pose_snapshot()
 
     def import_workstation_optical_pose_terrain(
@@ -2478,7 +2726,6 @@ class OpticalPoseController:
                     "terrain correspondence JSON must contain a left/right object map"
                 )
         solved: dict[str, Any] = {}
-        correspondence_context: dict[str, PnpCorrespondences] = {}
         failures: list[str] = []
         for side, camera in (("left", profile.left), ("right", profile.right)):
             annotation = annotations.get(side)
@@ -2512,7 +2759,6 @@ class OpticalPoseController:
                     failures.append(f"{side}: all PnP solvers failed: {ensemble.failures}")
                     continue
                 solved[side] = (best, ensemble, annotation)
-                correspondence_context[side] = correspondences
             except Exception as exc:
                 failures.append(f"{side}: {exc}")
         if not solved:
@@ -2577,7 +2823,6 @@ class OpticalPoseController:
             ),
         )
         self.register_workstation_optical_pose_candidate(candidate, prior_poses=priors)
-        self._candidate_solver_context[candidate.candidate_id] = correspondence_context
         return self.workstation_optical_pose_snapshot()
 
     def _resolve_gnss_baseline_for_mountain(
@@ -3063,9 +3308,7 @@ class OpticalPoseController:
             if isinstance(loaded_root, Mapping):
                 root = loaded_root
         if root is None:
-            raise ValueError(
-                "Drone RTK Multi-view requires an observation JSON or a drone_rtk_multiview payload"
-            )
+            root = self._accumulated_drone_rtk_multiview_root()
         observation_root = root.get("observations", root)
         if not isinstance(observation_root, Mapping):
             raise ValueError("Drone RTK multi-view observations must contain left/right arrays")
@@ -3112,10 +3355,23 @@ class OpticalPoseController:
         ]
         if source_file_sha256:
             input_hashes.append(("drone_rtk_multiview_json_sha256", source_file_sha256))
+        collection_sha256 = str(root.get("collection_sha256") or "")
+        if collection_sha256:
+            input_hashes.append(
+                ("drone_rtk_multiview_collection_sha256", collection_sha256)
+            )
         warning_set: list[str] = [
             "Drone RTK target positions and camera rays are solved jointly for full R,t",
             "camera pose coordinate contract: X_NED = R_NED<-optical_RDF X_RDF + C_NED",
         ]
+        if str(root.get("source") or "") == "session_accumulated_frozen_targets":
+            warning_set.extend(
+                (
+                    "input source: in-session Frozen target pairs with capture-associated Drone RTK",
+                    "local NED origin is the first READY sample's P1 GNSS position",
+                    "P1/P2 GNSS antenna positions initialize camera centers; optical lever arms remain unmodeled",
+                )
+            )
         for side, prior, camera in (
             ("left", priors[0], profile.left),
             ("right", priors[1], profile.right),
@@ -3123,7 +3379,7 @@ class OpticalPoseController:
             raw_rows = observation_root.get(side)
             if not isinstance(raw_rows, (tuple, list)):
                 raise ValueError(f"Drone RTK multi-view requires a {side} observation array")
-            if len(raw_rows) < 4:
+            if len(raw_rows) < _DRONE_RTK_MULTIVIEW_MIN_OBSERVATIONS:
                 raise ValueError(f"{side}: Drone RTK multi-view requires at least four observations")
             rays: list[tuple[float, float, float]] = []
             targets: list[tuple[float, float, float]] = []
@@ -3817,6 +4073,16 @@ class OpticalPoseController:
             # unaffected by this key.
             "drone_rtk_capture_observations": [
                 copy.deepcopy(observation) for observation in self._drone_rtk_observations
+            ],
+            # Latest operator target-pair revision per frozen burst. The
+            # capture observation remains immutable; edits replace only this
+            # derived binding while run_events preserves every revision.
+            "drone_rtk_multiview_samples": [
+                copy.deepcopy(sample)
+                for sample in sorted(
+                    self._drone_rtk_multiview_samples.values(),
+                    key=lambda value: int(value.get("sequence", 0)),
+                )
             ],
         }
 

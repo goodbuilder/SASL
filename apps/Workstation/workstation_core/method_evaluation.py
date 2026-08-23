@@ -530,6 +530,11 @@ def _geometry_result_payload(result: MeasurementGeometryResult) -> dict[str, obj
             "left_center_px": list(result.match.left.center),
             "right_center_px": list(result.match.right.center),
             "class_name": result.match.left.class_name,
+            "disparity_px": float(result.match.disparity_px),
+            "time_delta_s": float(result.match.time_delta_s),
+            "vertical_delta_px": float(result.match.vertical_delta_px),
+            "sync_quality": str(result.match.sync_quality),
+            "warnings": list(result.match.warnings),
         },
         "triangulated": None
         if triangulated is None

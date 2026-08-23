@@ -5,12 +5,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from PyQt5 import QtGui
-
+from test_optical_pose_controller_integration import _annotations, _gps_state, _panel
 from Workstation.optical_pose_controller import OpticalPoseController
 from Workstation.recording_controller import RecordingController
 from Workstation.workstation_core.recording_session import save_session_files
-
-from test_optical_pose_controller_integration import _gps_state, _panel
 
 
 def test_auto_suggestion_and_annotation_review_are_durable_audit_data(
@@ -130,7 +128,13 @@ def test_drone_rtk_observation_history_is_durable_across_session_persistence(
         "drone": _gps_state("drone", timestamp_s=100.0, latitude_deg=1.0, longitude_deg=2.0, altitude_m=3.0),
     }
     controller = OpticalPoseController(panel)
-    controller.capture_workstation_optical_pose_burst({})
+    first_frozen = controller.capture_workstation_optical_pose_burst({})
+    target_annotations = _annotations(first_frozen, horizon=False)
+    target_annotations["left"]["target_point"] = [{"u_px": 300.0, "v_px": 230.0}]
+    target_annotations["right"]["target_point"] = [{"u_px": 280.0, "v_px": 230.0}]
+    controller.record_workstation_optical_pose_annotation(
+        {"annotation_mode": "target", "annotations": target_annotations}
+    )
 
     panel.latest_gps = {
         "left": _gps_state("left", timestamp_s=200.0),
@@ -146,6 +150,10 @@ def test_drone_rtk_observation_history_is_durable_across_session_persistence(
     assert observations[0]["gnss"]["drone"]["latitude_deg"] == 1.0
     assert observations[1]["gnss"]["drone"]["latitude_deg"] == 9.0
     assert observations[0]["observation_id"] != observations[1]["observation_id"]
+    samples = projection["snapshot"]["drone_rtk_multiview_samples"]
+    assert len(samples) == 1
+    assert samples[0]["state"] == "READY"
+    assert samples[0]["capture_observation_id"] == observations[0]["observation_id"]
 
     output_dir = tmp_path / "sessions" / "drone-rtk-session"
     saved_files = save_session_files(
@@ -163,5 +171,12 @@ def test_drone_rtk_observation_history_is_durable_across_session_persistence(
     assert saved_observations[1]["gnss"]["drone"]["latitude_deg"] == 9.0
     assert saved_observations[0]["frames"]["left"]["frame_id"]
     assert saved_observations[0]["synchronization"]["state"] in {"SYNC_OK", "SYNC_UNVERIFIED"}
+    saved_samples = saved["metadata"]["optical_pose"]["snapshot"][
+        "drone_rtk_multiview_samples"
+    ]
+    assert saved_samples[0]["target_pixels"]["left"] == {"u_px": 300.0, "v_px": 230.0}
+    assert saved_samples[0]["coordinate_contract"]["solve_world"].startswith("local NED")
     # No QImage or other raw Python object leaked into the JSON projection.
-    assert "image" not in json.dumps(saved_observations)
+    assert '"image":' not in json.dumps(
+        {"observations": saved_observations, "samples": saved_samples}
+    )

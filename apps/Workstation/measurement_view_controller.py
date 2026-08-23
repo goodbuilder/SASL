@@ -13,7 +13,7 @@ import json
 import math
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from math import isfinite
 
 from PyQt5 import QtCore
@@ -103,7 +103,7 @@ from Workstation.workstation_core.rtk_geometry import (
     ned_delta_m,
     validate_gps_pair_for_baseline,
 )
-from Workstation.workstation_core.stereo import DetectionObservation
+from Workstation.workstation_core.stereo import DetectionObservation, StereoEstimate
 from Workstation.workstation_core.sync import classify_attitude_timing
 from Workstation.workstation_core.theme import (
     ERROR, ERROR_BG, ERROR_TEXT, PANEL_ALT_BG, PANEL_BORDER,
@@ -184,6 +184,9 @@ class MeasurementViewController:
         self.panel = panel
         self._method_evaluation_coordinator: MethodEvaluationCoordinator | None = None
         self._method_evaluation_timer: QtCore.QTimer | None = None
+        self._retiring_method_evaluation_coordinators: list[
+            MethodEvaluationCoordinator
+        ] = []
 
     def _ensure_method_evaluation_coordinator(self) -> MethodEvaluationCoordinator:
         coordinator = self._method_evaluation_coordinator
@@ -209,7 +212,14 @@ class MeasurementViewController:
         self._method_evaluation_coordinator = None
         if coordinator is not None:
             coordinator.close()
-        return True
+            self._retiring_method_evaluation_coordinators.append(coordinator)
+        remaining: list[MethodEvaluationCoordinator] = []
+        for retiring in self._retiring_method_evaluation_coordinators:
+            retiring.close()
+            if not retiring.closed:
+                remaining.append(retiring)
+        self._retiring_method_evaluation_coordinators = remaining
+        return not remaining
 
     def _measurement_method_state(self) -> None:
         panel = self.panel
@@ -2841,10 +2851,28 @@ class MeasurementViewController:
             side: f"mavlink:{side}"
             for side in self.panel._gnss_base_rtcm_target_sides()
         }
+        selector = getattr(self.panel, "_selected_rover_gps_state", None)
+        if callable(selector):
+            selected_samples = {
+                side: selector(side)
+                for side in ("left", "right", "drone")
+            }
+        else:
+            pair_selector = getattr(self.panel, "_selected_baseline_gps_states", None)
+            if callable(pair_selector):
+                selected_left, selected_right = pair_selector()
+            else:
+                selected_left = self.panel.latest_gps.get("left")
+                selected_right = self.panel.latest_gps.get("right")
+            selected_samples = {
+                "left": selected_left,
+                "right": selected_right,
+                "drone": self.panel.latest_gps.get("drone"),
+            }
         device_ids = {
             side: str(getattr(sample, "topic", side))
-            for side, sample in self.panel.latest_gps.items()
-            if side in {"left", "right", "drone"}
+            for side, sample in selected_samples.items()
+            if sample is not None
         }
         return self.panel.gnss_operation_manager.capture_measurement_contract(
             readiness,
@@ -3290,13 +3318,6 @@ class MeasurementViewController:
         identity = (bundle.pair_id, bundle.request_generation)
         if identity in committed:
             return
-        rows = getattr(self.panel, "method_evaluation_bundle_rows", None)
-        if rows is not None and bool(getattr(self.panel, "distance_recording_enabled", False)):
-            rows.append(bundle.to_record())
-        committed.add(identity)
-        self.panel._last_method_evaluation_bundle = bundle
-        self._update_method_evaluation_counters(bundle)
-
         primary = bundle.primary
         attempt: MeasurementAttempt | None = None
         if primary.attempt_payload:
@@ -3304,48 +3325,180 @@ class MeasurementViewController:
                 attempt = MeasurementAttempt.from_canonical_payload(primary.attempt_payload)
             except (TypeError, ValueError):
                 attempt = None
-        if attempt is None:
-            self._display_primary_method_outcome(primary, waiting_for_barrier=False)
-            return
-        geometry = calculate_measurement_geometry(attempt)
-        if (
-            primary.status in {"VALID", "ESTIMATED"}
-            and geometry.match is not None
-            and geometry.triangulated is not None
-            and geometry.estimate is not None
-        ):
-            triangulated = geometry.triangulated
-            estimate = geometry.estimate
+                if primary.status in {"VALID", "ESTIMATED"}:
+                    bundle = self._method_bundle_with_primary_failure(
+                        bundle,
+                        "GUI commit rejected malformed worker attempt payload",
+                    )
+                    primary = bundle.primary
+
+        history_payload: dict[str, object] | None = None
+        if primary.status in {"VALID", "ESTIMATED"} and attempt is not None:
+            try:
+                history_payload = self._method_history_payload(primary, attempt)
+            except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                bundle = self._method_bundle_with_primary_failure(
+                    bundle,
+                    f"GUI commit rejected malformed worker geometry result: {exc}",
+                )
+                primary = bundle.primary
+
+        if attempt is not None and primary.status in {"VALID", "ESTIMATED"} and history_payload is not None:
+            estimate = history_payload["estimate"]
             self.panel._append_distance_history(
                 estimate=estimate,
-                distance_m=triangulated.range_m,
-                method=f"{triangulated.method}-{PIXHAWK_RTK_LIVE}",
+                distance_m=float(history_payload["distance_m"]),
+                method=f"{history_payload['method']}-{PIXHAWK_RTK_LIVE}",
                 baseline_source=attempt.baseline_source,
                 baseline_m=attempt.baseline_m,
-                point_m=triangulated.point_m,
-                raw_point_m=triangulated.point_m,
-                raw_point_left_m=getattr(
-                    triangulated, "source_point_left_rdf_m", None
-                ),
+                point_m=history_payload["point_m"],
+                raw_point_m=history_payload["point_m"],
+                raw_point_left_m=history_payload["source_point_left_rdf_m"],
                 measurement_attempt=attempt,
             )
-        else:
+        elif attempt is not None:
             self.panel._record_unresolved_pair(
                 attempt,
                 status=f"method_{primary.status.lower()}",
                 warnings=tuple(dict.fromkeys((*primary.reasons, *primary.warnings))),
             )
+
+        rows = getattr(self.panel, "method_evaluation_bundle_rows", None)
+        if rows is not None and bool(getattr(self.panel, "distance_recording_enabled", False)):
+            rows.append(bundle.to_record())
+        committed.add(identity)
+        self.panel._last_method_evaluation_bundle = bundle
+        self._update_method_evaluation_counters(bundle)
         self._display_primary_method_outcome(primary, waiting_for_barrier=False)
+
+    @staticmethod
+    def _method_bundle_with_primary_failure(
+        bundle: MethodEvaluationBundle,
+        reason: str,
+    ) -> MethodEvaluationBundle:
+        outcomes = list(bundle.outcomes)
+        primary_index = MEASUREMENT_METHOD_IDS.index(PIXHAWK_RTK_LIVE)
+        primary = outcomes[primary_index]
+        outcomes[primary_index] = replace(
+            primary,
+            status="FAILED",
+            result={},
+            reasons=(str(reason),),
+            warnings=tuple(dict.fromkeys((*primary.warnings, str(reason)))),
+        )
+        return replace(bundle, outcomes=tuple(outcomes))
+
+    @staticmethod
+    def _method_history_payload(
+        outcome: MethodEvaluationOutcome,
+        attempt: MeasurementAttempt,
+    ) -> dict[str, object]:
+        result = outcome.result
+        match = result.get("match")
+        triangulated = result.get("triangulated")
+        estimate_payload = result.get("estimate")
+        if not all(
+            isinstance(value, Mapping)
+            for value in (match, triangulated, estimate_payload)
+        ):
+            raise ValueError("worker result is missing match/triangulated/estimate")
+
+        def finite_number(mapping: Mapping[str, object], name: str) -> float:
+            value = float(mapping[name])
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
+            return value
+
+        def vector3(mapping: Mapping[str, object], name: str) -> tuple[float, float, float]:
+            raw = mapping[name]
+            if not isinstance(raw, (tuple, list)) or len(raw) != 3:
+                raise ValueError(f"{name} must contain three values")
+            result_vector = tuple(float(value) for value in raw)
+            if not all(math.isfinite(value) for value in result_vector):
+                raise ValueError(f"{name} must be finite")
+            return result_vector  # type: ignore[return-value]
+
+        point_m = vector3(triangulated, "point_m")
+        source_raw = triangulated.get("source_point_left_rdf_m")
+        source_point = (
+            None
+            if source_raw is None
+            else vector3(
+                {"source_point_left_rdf_m": source_raw},
+                "source_point_left_rdf_m",
+            )
+        )
+        distance_m = finite_number(triangulated, "range_m")
+        if distance_m <= 0.0:
+            raise ValueError("range_m must be positive")
+        estimate = StereoEstimate(
+            distance_m=finite_number(estimate_payload, "distance_m"),
+            disparity_px=finite_number(match, "disparity_px"),
+            time_delta_s=finite_number(match, "time_delta_s"),
+            vertical_delta_px=finite_number(match, "vertical_delta_px"),
+            left=attempt.left_detection,  # type: ignore[arg-type]
+            right=attempt.right_detection,  # type: ignore[arg-type]
+            left_extrinsic=attempt.left_attitude,
+            right_extrinsic=attempt.right_attitude,
+            extrinsic_time_delta_s=(
+                None
+                if attempt.left_attitude is None or attempt.right_attitude is None
+                else abs(
+                    attempt.left_attitude.timestamp_s
+                    - attempt.right_attitude.timestamp_s
+                )
+            ),
+            left_attitude_age_s=attempt.left_attitude_age_s,
+            right_attitude_age_s=attempt.right_attitude_age_s,
+            attitude_pair_delta_s=attempt.attitude_pair_delta_s,
+            relative_roll_deg=attempt.relative_roll_deg,
+            relative_pitch_deg=attempt.relative_pitch_deg,
+            relative_yaw_deg=attempt.relative_yaw_deg,
+            sync_quality=str(estimate_payload.get("sync_quality") or match.get("sync_quality") or "unknown"),
+            warnings=tuple(str(value) for value in estimate_payload.get("warnings", ()) or ()),
+        )
+        return {
+            "estimate": estimate,
+            "distance_m": distance_m,
+            "method": str(triangulated.get("method") or "unknown"),
+            "point_m": point_m,
+            "source_point_left_rdf_m": source_point,
+        }
 
     def _poll_method_evaluations(self) -> None:
         coordinator = self._method_evaluation_coordinator
         if coordinator is None:
             return
-        polled = coordinator.poll()
+        try:
+            polled = coordinator.poll()
+        except Exception as exc:  # noqa: BLE001 - this method is a 20 ms Qt timer slot.
+            logger = getattr(self.panel, "_log", None)
+            if callable(logger):
+                logger(f"[측정] method worker poll 실패(타이머 유지): {exc}")
+            return
         for primary in polled.primary_outcomes:
-            self._display_primary_method_outcome(primary, waiting_for_barrier=True)
+            try:
+                self._display_primary_method_outcome(primary, waiting_for_barrier=True)
+            except Exception as exc:  # noqa: BLE001 - isolate one malformed outcome.
+                logger = getattr(self.panel, "_log", None)
+                if callable(logger):
+                    logger(f"[측정] primary method 표시 실패: {exc}")
         for bundle in polled.completed_bundles:
-            self._commit_method_evaluation_bundle(bundle)
+            try:
+                self._commit_method_evaluation_bundle(bundle)
+            except Exception as exc:  # noqa: BLE001 - never escape the QTimer callback.
+                failed_bundle = self._method_bundle_with_primary_failure(
+                    bundle,
+                    f"GUI method bundle commit failure: {type(exc).__name__}: {exc}",
+                )
+                logger = getattr(self.panel, "_log", None)
+                if callable(logger):
+                    logger(f"[측정] method bundle FAILED 처리: {exc}")
+                try:
+                    self._commit_method_evaluation_bundle(failed_bundle)
+                except Exception as nested_exc:  # noqa: BLE001 - last-resort isolation.
+                    if callable(logger):
+                        logger(f"[측정] FAILED bundle 기록도 실패: {nested_exc}")
 
     def _refresh_distance(self) -> None:
         self.panel.geometry_comparison_rows = ()
@@ -3451,7 +3604,6 @@ class MeasurementViewController:
 
         baseline_m = attempt.baseline_m
         baseline_source = attempt.baseline_source
-        triangulation_source = attempt.triangulation_source
         geometry_result = calculate_measurement_geometry(attempt)
         match = geometry_result.match
         triangulated = geometry_result.triangulated

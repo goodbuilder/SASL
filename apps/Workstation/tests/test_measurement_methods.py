@@ -592,6 +592,40 @@ def test_measurement_gps_cache_updates_sides_independently_and_ignores_sub_3d_fi
     assert second_reused == ("right_gps",)
 
 
+def test_measurement_gnss_contract_uses_selected_gps2_device_identity() -> None:
+    from dataclasses import replace
+
+    selected = {
+        "left": _gps_state("left", timestamp_s=10.0),
+        "right": _gps_state(
+            "right", timestamp_s=10.0, longitude_deg=127.00001
+        ),
+    }
+    selected["left"] = replace(selected["left"], topic="mavlink/GPS2_RAW")
+    captured = []
+    manager = SimpleNamespace(
+        config=SimpleNamespace(readiness_gate_enabled=True),
+        capture_measurement_contract=lambda readiness, **kwargs: captured.append(kwargs) or kwargs,
+    )
+    panel = SimpleNamespace(
+        gnss_operation_manager=manager,
+        gnss_fixed_base_profile=None,
+        latest_baseline_vector=None,
+        _selected_rover_gps_state=lambda side: selected.get(side),
+        _gnss_base_rtcm_target_sides=lambda: ("left", "right"),
+        latest_gps={},
+    )
+
+    result = MeasurementViewController(panel)._capture_measurement_gnss_contract(
+        SimpleNamespace()
+    )
+
+    assert result["device_ids"] == {
+        "left": "mavlink/GPS2_RAW",
+        "right": "mavlink/GPS_RAW_INT",
+    }
+
+
 def test_profile_sha_evidence_is_required_for_candidate_geometry() -> None:
     controller = _method_readiness_controller(
         geometry_allowed=True,
@@ -912,3 +946,59 @@ def test_preflight_explicitly_blocks_when_method_snapshot_has_no_ready_source() 
     assert "geometry" in blocking
     assert "pixhawk" not in {check.key for check in readiness.checks}
     assert "baseline" not in {check.key for check in readiness.checks}
+
+
+@pytest.mark.parametrize(
+    "missing_key,in_best",
+    (("timestamp_s", False), ("width", False), ("x1", True), ("class_id", True)),
+)
+def test_detection_observation_malformed_payload_returns_none(
+    missing_key: str,
+    in_best: bool,
+) -> None:
+    payload = {
+        "timestamp_s": 10.0,
+        "width": 640,
+        "height": 480,
+        "best_detection": {
+            "x1": 1.0,
+            "y1": 2.0,
+            "x2": 3.0,
+            "y2": 4.0,
+            "confidence": 0.9,
+            "class_id": 1,
+        },
+    }
+    target = payload["best_detection"] if in_best else payload
+    target.pop(missing_key)
+
+    assert DetectionObservation.from_payload("left", payload) is None
+
+
+def test_zero_quaternion_returns_invalid_triangulation_attempt() -> None:
+    from Workstation.workstation_core.calibration import CameraIntrinsics
+    from Workstation.workstation_core.triangulation import (
+        triangulate_pixels_with_pixhawk_mount_attempt,
+    )
+
+    intrinsics = CameraIntrinsics(
+        width=640,
+        height=480,
+        camera_matrix=((900.0, 0.0, 320.0), (0.0, 900.0, 240.0), (0.0, 0.0, 1.0)),
+        distortion_coefficients=(0.0, 0.0, 0.0, 0.0, 0.0),
+        reprojection_error_px=0.1,
+        image_count=10,
+    )
+
+    attempt = triangulate_pixels_with_pixhawk_mount_attempt(
+        left_pixel=(340.0, 240.0),
+        right_pixel=(300.0, 240.0),
+        left_intrinsics=intrinsics,
+        right_intrinsics=intrinsics,
+        left_body_to_world_q=(0.0, 0.0, 0.0, 0.0),
+        right_body_to_world_q=(1.0, 0.0, 0.0, 0.0),
+        translation_right_in_left_m=(0.4, 0.0, 0.0),
+    )
+
+    assert attempt.result is None
+    assert attempt.reason == "invalid_quaternion"

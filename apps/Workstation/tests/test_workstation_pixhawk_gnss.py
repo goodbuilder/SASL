@@ -39,6 +39,169 @@ def test_p1_body_frd_baseline_projection_keeps_raw_ned_contract_explicit() -> No
     rotated = project_ned_baseline_to_p1_body_frd((1.0, 2.0, 3.0), yaw_90)
     assert rotated.vector_m == pytest.approx((2.0, -1.0, 3.0))
 
+
+def test_param_read_defers_attitude_instead_of_dropping_telemetry() -> None:
+    from Workstation.workstation_core.pixhawk_attitude import DualPixhawkMavlinkSubscriber
+
+    class Message:
+        def __init__(self, message_type: str, **values) -> None:
+            self._message_type = message_type
+            self.__dict__.update(values)
+
+        def get_type(self) -> str:
+            return self._message_type
+
+    class Mav:
+        def param_request_read_send(self, *_args) -> None:
+            return None
+
+    class Connection:
+        target_system = 1
+        target_component = 1
+        mav = Mav()
+
+        def __init__(self) -> None:
+            self.messages = [
+                Message("ATTITUDE", roll=0.1, pitch=0.2, yaw=0.3, time_boot_ms=1),
+                Message("PARAM_VALUE", param_id="TEST", param_value=3.5, param_type=9),
+            ]
+
+        def recv_match(self, **_kwargs):
+            return self.messages.pop(0) if self.messages else None
+
+    subscriber = DualPixhawkMavlinkSubscriber(left_url="udp:fake", right_url="")
+    subscriber.connections["left"] = Connection()
+    attitudes: list[object] = []
+    subscriber.extrinsic_changed.connect(lambda _side, state: attitudes.append(state))
+
+    assert subscriber.read_param("left", "TEST", timeout_s=0.1) == pytest.approx(3.5)
+    assert not attitudes
+    subscriber.spin_once()
+
+    assert len(attitudes) == 1
+    assert attitudes[0].roll_deg == pytest.approx(5.72957795)
+
+
+def test_repeated_mavlink_receive_error_is_rate_limited(monkeypatch) -> None:
+    from Workstation.workstation_core import pixhawk_attitude
+
+    class Connection:
+        def recv_match(self, **_kwargs):
+            raise OSError("serial sentinel")
+
+    now = {"value": 100.0}
+    monkeypatch.setattr(pixhawk_attitude.time, "monotonic", lambda: now["value"])
+    subscriber = pixhawk_attitude.DualPixhawkMavlinkSubscriber(
+        left_url="udp:fake",
+        right_url="",
+    )
+    subscriber.connections["left"] = Connection()
+    statuses: list[str] = []
+    subscriber.status_changed.connect(statuses.append)
+
+    subscriber.spin_once()
+    subscriber.spin_once()
+    now["value"] += 1.0
+    subscriber.spin_once()
+
+    assert len(statuses) == 2
+    assert all("serial sentinel" in status for status in statuses)
+
+
+def test_pixhawk_connect_disconnect_operations_do_not_overlap() -> None:
+    from Workstation.device_runtime_controller import DeviceRuntimeController
+
+    logs: list[str] = []
+    panel = SimpleNamespace(
+        _session_recording_active=lambda: False,
+        pixhawk_connection_thread=object(),
+        pixhawk_disconnection_thread=object(),
+        _log=logs.append,
+    )
+    controller = DeviceRuntimeController(panel)
+
+    controller.connect_mavlink_pixhawk("left")
+    controller.disconnect_mavlink_pixhawk("left")
+
+    assert any("연결 해제가 끝난 뒤" in message for message in logs)
+    assert any("연결 작업이 끝난 뒤" in message for message in logs)
+
+
+def test_alignment_refresh_never_overwrites_the_canonical_rtk_baseline() -> None:
+    from Workstation.standalone_gui import WirisStereoDistancePanel
+
+    canonical = SimpleNamespace(
+        baseline_m=1.0,
+        north_m=0.0,
+        east_m=1.0,
+        down_m=0.0,
+        fix_quality="GOOD",
+        warnings=(),
+    )
+    vector = SimpleNamespace(
+        east_m=1.0,
+        north_m=0.0,
+        up_m=0.0,
+        length_m=1.0,
+        azimuth_deg=90.0,
+        elevation_deg=0.0,
+        altitude_delta_m=0.0,
+        timestamp_delta_ms=10.0,
+    )
+    left = SimpleNamespace(timestamp_s=10.0, fix_type=6)
+    right = SimpleNamespace(timestamp_s=10.01, fix_type=6)
+    plotted = []
+    panel = SimpleNamespace(
+        latest_rtk_baseline=canonical,
+        latest_baseline_vector=None,
+        latest_p1_body_frd_baseline=None,
+        latest_extrinsics={},
+        rtk_alignment_plot=SimpleNamespace(
+            set_alignment=lambda baseline, *_args: plotted.append(baseline)
+        ),
+        rtk_alignment_detail_label=SimpleNamespace(setText=lambda _text: None),
+        _refresh_baseline_gps_cards=lambda: None,
+        _current_baseline_vector=lambda: (vector, left, right),
+        _refresh_p1_body_frd_baseline=lambda: None,
+        _alignment_view_camera_translation_right_in_left_m=lambda baseline: None,
+        _baseline_camera_translation_in_side_rdf_m=lambda baseline, side: None,
+        _baseline_forward_geometry_from_camera_translation=lambda translation: None,
+        _baseline_forward_geometry_text=lambda translation: "waiting",
+        _set_label_text_if_changed=lambda *args: None,
+        _set_p1_body_frd_baseline_labels=lambda projection: None,
+        _refresh_alignment_overview=lambda: None,
+        _refresh_alignment_validation=lambda: None,
+    )
+
+    WirisStereoDistancePanel._refresh_baseline_alignment_ui(panel)
+
+    assert panel.latest_rtk_baseline is canonical
+    assert plotted == [canonical]
+
+
+def test_gnss_source_change_resets_receiver_cache_and_fixed_duration() -> None:
+    from Workstation.standalone_gui import WirisStereoDistancePanel
+
+    panel = SimpleNamespace(
+        settings=SimpleNamespace(
+            pixhawk_left_gnss_source="GPS1",
+            pixhawk_right_gnss_source="GPS1",
+        ),
+        _workstation_setting_overrides={},
+        gnss_monitor=SimpleNamespace(left_source="GPS1", right_source="GPS1"),
+        _measurement_latest_valid_gps_source={"left": "GPS1"},
+        gnss_rover_fixed_since={"left": 10.0, "right": 20.0, "drone": None},
+    )
+
+    selected = WirisStereoDistancePanel.set_pixhawk_gnss_source(
+        panel, "left", "GPS2", persist=False
+    )
+
+    assert selected == "GPS2"
+    assert panel.gnss_monitor.left_source == "GPS2"
+    assert "left" not in panel._measurement_latest_valid_gps_source
+    assert panel.gnss_rover_fixed_since["left"] is None
+
 def test_workstation_mavlink_packet_provenance_reaches_state_and_timeline() -> None:
     from Workstation.workstation_core.pixhawk_attitude import (
         DualPixhawkMavlinkSubscriber,
@@ -707,17 +870,7 @@ def test_inspector_centralizes_active_geometry_and_applies_gnss_mountain_candida
     window.inspector.geometry_apply_candidate_button.click()
     assert backend.calls[-1] == (
         "optical_pose_apply_candidate",
-        {
-            "candidate_id": "gnss-mountain-1",
-            "dof": {
-                "roll": True,
-                "pitch": True,
-                "yaw": True,
-                "north": True,
-                "east": True,
-                "down": True,
-            },
-        },
+        {"candidate_id": "gnss-mountain-1"},
     )
 
     window.close()
@@ -840,7 +993,7 @@ def test_pixhawk_stream_setup_never_creates_a_second_runtime_instance(monkeypatc
     monkeypatch.setattr(
         pixhawk_attitude,
         "_send_mavlink_shell_command",
-        lambda _connection, command: commands.append(command),
+        lambda _connection, command, **_kwargs: commands.append(command),
     )
     subscriber = pixhawk_attitude.DualPixhawkMavlinkSubscriber(left_url="", right_url="")
     subscriber.connections["left"] = object()

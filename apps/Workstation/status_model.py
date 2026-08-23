@@ -181,20 +181,39 @@ class BackendStatusAdapter(QtCore.QObject):
     def refresh(self) -> None:
         panel = getattr(self.backend, "panel", self.backend)
         now_s = time.monotonic()
+        failures: list[str] = []
+        sections = (
+            ("camera.left", self._refresh_camera, (panel, "left", "CAM L", now_s)),
+            ("camera.right", self._refresh_camera, (panel, "right", "CAM R", now_s)),
+            ("lrf", self._refresh_lrf, (panel, now_s)),
+            ("pixhawk.left", self._refresh_pixhawk, (panel, "left", "P1", now_s)),
+            ("pixhawk.right", self._refresh_pixhawk, (panel, "right", "P2", now_s)),
+            ("gnss.base", self._refresh_base_gnss, (panel, now_s)),
+            ("ntrip", self._refresh_ntrip, (panel, now_s)),
+            ("gnss", self._refresh_gnss, (panel, now_s)),
+            ("detection", self._refresh_detection, (panel, now_s)),
+            ("synchronization", self._refresh_synchronization, (panel, now_s)),
+            ("measurement", self._refresh_measurement, (panel, now_s)),
+            ("recording", self._refresh_recording, (panel, now_s)),
+            ("fps", self._refresh_fps, (panel, now_s)),
+        )
         with self.model.batch():
-            self._refresh_camera(panel, "left", "CAM L", now_s)
-            self._refresh_camera(panel, "right", "CAM R", now_s)
-            self._refresh_lrf(panel, now_s)
-            self._refresh_pixhawk(panel, "left", "P1", now_s)
-            self._refresh_pixhawk(panel, "right", "P2", now_s)
-            self._refresh_base_gnss(panel, now_s)
-            self._refresh_ntrip(panel, now_s)
-            self._refresh_gnss(panel, now_s)
-            self._refresh_detection(panel, now_s)
-            self._refresh_synchronization(panel, now_s)
-            self._refresh_measurement(panel, now_s)
-            self._refresh_recording(panel, now_s)
-            self._refresh_fps(panel, now_s)
+            for name, refresher, args in sections:
+                try:
+                    refresher(*args)
+                except Exception as exc:  # noqa: BLE001 - isolate independent status projections.
+                    failures.append(f"{name}: {type(exc).__name__}: {exc}")
+            if failures or self.model.record("status.adapter") is not None:
+                self.model.set_status(
+                    "status.adapter",
+                    "STATUS",
+                    "DEGRADED" if failures else "OK",
+                    StatusSeverity.WARN if failures else StatusSeverity.OK,
+                    detail="; ".join(failures) if failures else "all status sections refreshed",
+                    source="BackendStatusAdapter.refresh section isolation",
+                    clock="app_receive_monotonic",
+                    observed_monotonic_s=now_s,
+                )
         self.polled.emit(self.model.snapshot())
 
     def _refresh_camera(self, panel: object, side: str, label: str, now_s: float) -> None:
@@ -453,7 +472,13 @@ class BackendStatusAdapter(QtCore.QObject):
         attitude_times = getattr(panel, "pixhawk_attitude_times", {}) or {}
         age_s = _sample_age(attitude_times.get(side, []), now_s)
         transport = "MAVLink" if side in mavlink_sides else "telemetry"
-        if age_s is not None and float(age_s) < 2.0:
+        subscriber = getattr(panel, "mavlink_pixhawk", None)
+        active_command_cameras = getattr(subscriber, "_active_command_cameras", ()) or ()
+        command_active = side in active_command_cameras
+        if command_active:
+            state, severity = "PARAM SYNC", StatusSeverity.OK
+            detail = "PX4 파라미터 조회 중 (정상)"
+        elif age_s is not None and float(age_s) < 2.0:
             state, severity = "LIVE", StatusSeverity.OK
             detail = f"{transport} attitude age {float(age_s):.2f} s"
         elif age_s is not None:
@@ -480,7 +505,11 @@ class BackendStatusAdapter(QtCore.QObject):
             state,
             severity,
             detail=detail,
-            source="MAVLink heartbeat + attitude sample",
+            source=(
+                "MAVLink exclusive command reservation"
+                if command_active
+                else "MAVLink heartbeat + attitude sample"
+            ),
             age_s=None if age_s is None else float(age_s),
             clock="app_receive_monotonic",
             observed_monotonic_s=now_s,
@@ -503,12 +532,19 @@ class BackendStatusAdapter(QtCore.QObject):
         if not math.isfinite(maximum_gps_age_s) or maximum_gps_age_s < 0.0:
             maximum_gps_age_s = 1.0
         gps_states = getattr(panel, "latest_gps", {}) or {}
+        selected_gps_reader = getattr(panel, "_selected_rover_gps_state", None)
         baseline = getattr(panel, "latest_rtk_baseline", None)
         receiver_details = []
         receiver_ages: dict[str, float] = {}
         receiver_labels: list[str] = []
         for side, label in (("left", "P1"), ("right", "P2")):
-            gps = gps_states.get(side) if isinstance(gps_states, dict) else None
+            gps = (
+                selected_gps_reader(side)
+                if callable(selected_gps_reader)
+                else gps_states.get(side)
+                if isinstance(gps_states, dict)
+                else None
+            )
             if gps is None:
                 receiver_details.append(f"{label}=NO DATA")
                 continue
@@ -783,11 +819,21 @@ class BackendStatusAdapter(QtCore.QObject):
 
     def _refresh_fps(self, panel: object, now_s: float) -> None:
         stats = getattr(panel, "camera_stream_stats", {}) or {}
+        stats = stats if isinstance(stats, Mapping) else {}
         values = []
         for side in ("left", "right"):
-            value = (stats.get(side) or {}).get("decoded_hz")
-            if value not in (None, ""):
-                values.append(float(value))
+            side_stats = stats.get(side) or {}
+            if not isinstance(side_stats, Mapping):
+                continue
+            value = side_stats.get("decoded_hz")
+            if value in (None, ""):
+                continue
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(parsed) and parsed >= 0.0:
+                values.append(parsed)
         detail = " / ".join(f"{value:.1f} Hz" for value in values) if values else "--"
         self.model.set_status(
             "fps",

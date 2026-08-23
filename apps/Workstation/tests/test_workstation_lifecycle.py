@@ -105,6 +105,47 @@ assert not any("workspace/main/install" in path for path in sys.path)
         text=True,
     )
 
+
+def test_qt_callback_exception_hook_logs_and_keeps_event_loop_alive() -> None:
+    repository = Path(__file__).resolve().parents[3]
+    environment = os.environ.copy()
+    environment["QT_QPA_PLATFORM"] = "offscreen"
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (str(repository / "apps"), str(repository), str(repository / "common" / "python"))
+    )
+    script = r'''
+from PyQt5 import QtCore, QtWidgets
+from Workstation.__main__ import _install_qt_exception_hook
+
+app = QtWidgets.QApplication([])
+flushes = []
+ticks = []
+_install_qt_exception_hook(lambda: flushes.append("flushed"))
+
+def explode():
+    raise RuntimeError("timer-sentinel")
+
+QtCore.QTimer.singleShot(0, explode)
+QtCore.QTimer.singleShot(20, lambda: ticks.append("continued"))
+QtCore.QTimer.singleShot(50, app.quit)
+assert app.exec_() == 0
+assert ticks == ["continued"]
+assert flushes == ["flushed"]
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repository / "apps" / "Workstation",
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "timer-sentinel" in completed.stderr
+    assert "Unhandled Workstation Qt callback exception" in completed.stderr
+
 def test_legacy_entrypoint_does_not_import_workstation_modules() -> None:
     repository = Path(__file__).resolve().parents[3]
     app_root = repository / "apps" / "StereoWIRIS"
@@ -506,6 +547,43 @@ def test_close_requested_during_optical_pose_analysis_retries_after_worker_finis
     window.deleteLater()
     app.processEvents()
 
+
+def test_accumulated_drone_multiview_command_does_not_open_json_dialog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    solve_payloads: list[dict[str, object]] = []
+    backend.optical_pose_solve_drone_rtk_multiview = lambda payload: (
+        solve_payloads.append(dict(payload))
+        or {"candidates": [], "drone_rtk_multiview_samples": []}
+    )
+
+    def forbidden_dialog(*_args, **_kwargs):
+        raise AssertionError("accumulated Drone RTK Multi-view must not open a JSON dialog")
+
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", forbidden_dialog)
+    window = WorkstationMainWindow(backend=backend)
+    window.status_adapter.stop()
+    window._handle_optical_pose_command(
+        "alignment.pose.solve_drone_rtk_multiview",
+        {
+            "command_id": "alignment.pose.solve_drone_rtk_multiview",
+            "multiview_source": "accumulated_frozen_targets",
+        },
+    )
+
+    assert solve_payloads == [
+        {
+            "command_id": "alignment.pose.solve_drone_rtk_multiview",
+            "multiview_source": "accumulated_frozen_targets",
+        }
+    ]
+    window.close()
+    app.processEvents()
+    window.deleteLater()
+    app.processEvents()
+
 def test_detection_lifecycle_starts_and_stops_automatic_session() -> None:
     from Workstation.camera_stream_controller import CameraStreamLifecycleController
 
@@ -667,6 +745,41 @@ def test_workstation_shutdown_requests_workers_without_blocking_ui_thread(
     panel.close()
     panel.deleteLater()
     app.processEvents()
+
+
+def test_shutdown_deadline_force_terminates_an_unresponsive_worker(monkeypatch) -> None:
+    from Workstation import app_lifecycle_controller
+
+    calls: list[str] = []
+
+    class Thread:
+        def isRunning(self) -> bool:  # noqa: N802
+            return True
+
+        def requestInterruption(self) -> None:  # noqa: N802
+            calls.append("interrupt")
+
+        def quit(self) -> None:
+            calls.append("quit")
+
+        def terminate(self) -> None:
+            calls.append("terminate")
+
+        def wait(self, timeout_ms: int) -> bool:
+            calls.append(f"wait:{timeout_ms}")
+            return True
+
+    panel = SimpleNamespace(
+        _shutdown_coordinator=SimpleNamespace(run=lambda: False),
+        _shutdown_started_monotonic_s=10.0,
+        blocked_thread=Thread(),
+        _log=lambda message: calls.append(message),
+    )
+    monkeypatch.setattr(app_lifecycle_controller.time, "monotonic", lambda: 16.0)
+
+    assert app_lifecycle_controller.AppLifecycleController(panel).shutdown_for_close() is True
+    assert "terminate" in calls
+    assert any(str(value).startswith("wait:") for value in calls)
 
 
 def test_stop_all_stays_pending_after_starting_async_pixhawk_disconnect() -> None:

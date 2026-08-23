@@ -10,6 +10,7 @@ import os
 import signal
 import sys
 import tempfile
+import traceback
 from importlib import import_module, metadata
 from pathlib import Path
 from typing import Callable, Mapping, NamedTuple
@@ -306,6 +307,80 @@ def _acquire_single_instance_lock(lock_path: Path | None = None):
     return lock if lock.tryLock(0) else None
 
 
+def _flush_window_session_state(window: object | None) -> None:
+    """Best-effort durability barrier used after an unhandled Qt callback error."""
+
+    if window is None:
+        return
+    backend = getattr(window, "backend", None)
+    owner = getattr(backend, "owner_widget", None) or getattr(backend, "panel", None)
+    if owner is None:
+        owner = window
+
+    flusher = getattr(owner, "flush_workstation_run_evidence", None)
+    if callable(flusher):
+        try:
+            flusher()
+        except Exception as exc:  # noqa: BLE001 - emergency path must keep going.
+            print(f"Emergency run-evidence flush failed: {exc}", file=sys.stderr)
+
+    spool_groups = (
+        getattr(owner, "distance_recording_rows", None),
+        getattr(owner, "gnss_base_recording_rows", None),
+        getattr(owner, "extrinsics_comparison_recording_rows", None),
+        getattr(owner, "method_evaluation_bundle_rows", None),
+    )
+    nested_groups = (
+        getattr(owner, "camera_recording_rows", None),
+        getattr(owner, "px4_recording_rows", None),
+    )
+    spools = list(spool_groups)
+    for group in nested_groups:
+        if isinstance(group, Mapping):
+            spools.extend(group.values())
+    for spool in spools:
+        flush = getattr(spool, "flush", None)
+        if not callable(flush):
+            continue
+        try:
+            flush()
+        except Exception as exc:  # noqa: BLE001 - report every independent spool.
+            print(f"Emergency recording-spool flush failed: {exc}", file=sys.stderr)
+
+
+def _install_qt_exception_hook(
+    emergency_flush: Callable[[], object] | None = None,
+) -> Callable[[type[BaseException], BaseException, object], None]:
+    """Install a non-aborting hook for exceptions escaping Qt slots/timers.
+
+    PyQt routes callback exceptions through ``sys.excepthook``.  Its default
+    hook may terminate the process; this hook records the traceback, attempts
+    a bounded session flush, and returns so unrelated device links stay alive.
+    """
+
+    handling = False
+
+    def handle_exception(exc_type, exc_value, exc_traceback) -> None:
+        nonlocal handling
+        if handling:
+            traceback.print_exception(exc_type, exc_value, exc_traceback, file=sys.stderr)
+            return
+        handling = True
+        try:
+            print("Unhandled Workstation Qt callback exception:", file=sys.stderr)
+            traceback.print_exception(exc_type, exc_value, exc_traceback, file=sys.stderr)
+            if emergency_flush is not None:
+                try:
+                    emergency_flush()
+                except Exception as flush_exc:  # noqa: BLE001 - never recurse through the hook.
+                    print(f"Emergency session flush failed: {flush_exc}", file=sys.stderr)
+        finally:
+            handling = False
+
+    sys.excepthook = handle_exception
+    return handle_exception
+
+
 def main(argv: list[str] | None = None) -> int:
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
     try:
@@ -323,6 +398,10 @@ def main(argv: list[str] | None = None) -> int:
 
     _configure_gl_surface_format()
     app = QtWidgets.QApplication([sys.argv[0], *qt_args])
+    window_holder: dict[str, object] = {}
+    _install_qt_exception_hook(
+        lambda: _flush_window_session_state(window_holder.get("window"))
+    )
     instance_lock = _acquire_single_instance_lock()
     if instance_lock is None:
         print("SASL Workstation is already running; duplicate launch was blocked.", file=sys.stderr)
@@ -331,6 +410,7 @@ def main(argv: list[str] | None = None) -> int:
         auto_start=bool(args.start),
         auto_start_pixhawk=bool(args.start_pixhawk),
     )
+    window_holder["window"] = window
     if args.maximized:
         window.showMaximized()
     else:

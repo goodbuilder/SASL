@@ -15,19 +15,14 @@ def _app() -> QtWidgets.QApplication:
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
-def test_optical_pose_defaults_rotation_dof_and_keeps_position_fixed() -> None:
+def test_optical_pose_has_no_editable_candidate_dof_controls() -> None:
     app = _app()
     pane = OpticalPosePane()
 
-    assert pane.dof_payload() == {
-        "roll": True,
-        "pitch": True,
-        "yaw": False,
-        "north": False,
-        "east": False,
-        "down": False,
-    }
-    assert not pane.dof_checkboxes["yaw"].isEnabled()
+    assert not hasattr(pane, "dof_group")
+    assert not hasattr(pane, "dof_checkboxes")
+    assert not hasattr(pane, "dof_payload")
+    assert pane.apply_button.text() == "Apply candidate"
     assert "NO FROZEN BURST" in pane.frozen_preview_labels["left"].text()
     assert "NO FROZEN BURST" in pane.frozen_preview_labels["right"].text()
     assert pane.apply_payload() is None
@@ -36,19 +31,15 @@ def test_optical_pose_defaults_rotation_dof_and_keeps_position_fixed() -> None:
     app.processEvents()
 
 
-def test_horizon_disables_yaw_and_manual_mountain_restores_it() -> None:
+def test_annotation_modes_do_not_expose_candidate_apply_dof_controls() -> None:
     app = _app()
     pane = OpticalPosePane()
 
     pane.annotation_mode_combo.setCurrentIndex(pane.annotation_mode_combo.findData("ridge"))
     assert pane.annotation_mode_combo.currentData() == "ridge"
-    assert pane.dof_checkboxes["yaw"].isEnabled()
-    assert pane.dof_payload()["yaw"] is True
 
     pane.annotation_mode_combo.setCurrentIndex(pane.annotation_mode_combo.findData("horizon"))
     assert pane.annotation_mode_combo.currentData() == "horizon"
-    assert not pane.dof_checkboxes["yaw"].isEnabled()
-    assert pane.dof_payload()["yaw"] is False
 
     # The automatic actions remain available for both manual annotation modes.
     assert pane.solver_buttons["alignment.pose.solve_horizon"].text() == "Solve Horizon Roll/Pitch"
@@ -86,7 +77,7 @@ def test_horizon_disables_yaw_and_manual_mountain_restores_it() -> None:
     ]
     assert "alignment.pose.initialize_telemetry" not in pane.solver_buttons
     assert pane.solver_buttons["alignment.pose.solve_drone_rtk_multiview"].text() == (
-        "Refine Drone RTK Multi-view R,t"
+        "Solve Drone RTK Multi-view R,t"
     )
     assert set(pane.method_information_labels) == {
         "Horizon",
@@ -99,31 +90,6 @@ def test_horizon_disables_yaw_and_manual_mountain_restores_it() -> None:
     }
     assert candidates_group.parentWidget() is pane.candidate_review_widget
     assert method_tabs.parentWidget() is pane.method_column
-
-    pane.set_candidates(
-        [
-            {
-                "candidate_id": "gnss-mountain-1",
-                "method": "gnss-constrained-mountain-uv",
-                "observable_dof": {
-                    "roll_deg": True,
-                    "pitch_deg": True,
-                    "yaw_deg": True,
-                    "north_m": True,
-                    "east_m": True,
-                    "down_m": True,
-                },
-            }
-        ]
-    )
-    assert pane.dof_payload() == {
-        "roll": True,
-        "pitch": True,
-        "yaw": True,
-        "north": True,
-        "east": True,
-        "down": True,
-    }
 
     pane.deleteLater()
     app.processEvents()
@@ -319,7 +285,22 @@ def test_low_quality_candidate_remains_selectable_and_emits_explicit_payload() -
                 "method": "terrain-pnp",
                 "quality": "LOW",
                 "residual_px": 99.0,
-                "observable_dof": {"roll": True, "pitch": True, "yaw": True},
+                "optimized_dof": {
+                    "roll_deg": True,
+                    "pitch_deg": True,
+                    "yaw_deg": True,
+                    "north_m": True,
+                    "east_m": True,
+                    "down_m": True,
+                },
+                "observable_dof": {
+                    "roll_deg": True,
+                    "pitch_deg": True,
+                    "yaw_deg": True,
+                    "north_m": True,
+                    "east_m": True,
+                    "down_m": True,
+                },
             }
         ]
     )
@@ -327,17 +308,10 @@ def test_low_quality_candidate_remains_selectable_and_emits_explicit_payload() -
     assert pane.candidate_table.item(0, 0).data(QtCore.Qt.UserRole) == "pose-low-quality"
     assert pane.selected_candidate_id() == "pose-low-quality"
     assert pane.apply_button.isEnabled()
-    assert pane.apply_payload() == {
-        "candidate_id": "pose-low-quality",
-        "dof": {
-            "roll": True,
-            "pitch": True,
-            "yaw": False,
-            "north": False,
-            "east": False,
-            "down": False,
-        },
-    }
+    assert pane.apply_payload() == {"candidate_id": "pose-low-quality"}
+    assert "Apply DOF=roll_deg,pitch_deg,yaw_deg,north_m,east_m,down_m" in (
+        pane.candidate_status_label.text()
+    )
 
     pane.apply_button.click()
     assert emitted == [
@@ -346,6 +320,41 @@ def test_low_quality_candidate_remains_selectable_and_emits_explicit_payload() -
             pane.apply_payload(),
         )
     ]
+
+    pane.deleteLater()
+    app.processEvents()
+
+
+def test_candidate_apply_is_blocked_when_an_owned_dof_is_unobservable() -> None:
+    app = _app()
+    pane = OpticalPosePane()
+    pane.set_candidates(
+        [
+            {
+                "candidate_id": "full-but-rank-deficient",
+                "method": "drone-rtk-multiview-r-t",
+                "optimized_dof": {
+                    "roll_deg": True,
+                    "pitch_deg": True,
+                    "yaw_deg": True,
+                    "north_m": True,
+                    "east_m": True,
+                    "down_m": True,
+                },
+                "observable_dof": {
+                    "roll_deg": True,
+                    "pitch_deg": True,
+                    "yaw_deg": True,
+                    "north_m": True,
+                    "east_m": True,
+                    "down_m": False,
+                },
+            }
+        ]
+    )
+
+    assert not pane.apply_button.isEnabled()
+    assert "BLOCKED unobservable=down_m" in pane.candidate_status_label.text()
 
     pane.deleteLater()
     app.processEvents()
@@ -504,6 +513,7 @@ def test_frozen_native_annotations_follow_capture_and_solver_commands() -> None:
     ]
     for command, payload in emitted:
         assert payload["command_id"] == command
+        assert "dof" not in payload
         annotations = payload["annotations"]
         assert isinstance(annotations, dict)
         assert isinstance(annotations["left"], FrozenAnnotationPayload)
@@ -628,6 +638,58 @@ def test_multiview_capture_keeps_target_marks_until_clear_current_annotation() -
     assert pane.annotation_payloads()["right"].frame_id == "burst-1-right"
 
     pane.annotation_clear_button.click()
+    assert pane.annotation_views["left"].annotation_points("target") == ()
+    assert pane.annotation_views["right"].annotation_points("target") == ()
+    assert pane.annotation_payloads()["left"].frame_id == "burst-2-left"
+    assert pane.annotation_payloads()["right"].frame_id == "burst-2-right"
+
+    pane.deleteLater()
+    app.processEvents()
+
+
+def test_multiview_capture_clears_a_target_pair_after_it_was_accumulated() -> None:
+    app = _app()
+    pane = OpticalPosePane()
+    first = QtGui.QImage(640, 480, QtGui.QImage.Format_RGB888)
+    second = QtGui.QImage(640, 480, QtGui.QImage.Format_RGB888)
+    first.fill(QtGui.QColor("#333333"))
+    second.fill(QtGui.QColor("#444444"))
+
+    def frames(image: QtGui.QImage, suffix: str) -> dict[str, object]:
+        return {
+            side: {
+                "image": image,
+                "frame_id": f"{suffix}-{side}",
+                "sha256": (("a" if side == "left" else "b") + suffix) * 16,
+                "width": 640,
+                "height": 480,
+                "overlay_applied": False,
+            }
+            for side in ("left", "right")
+        }
+
+    pane.apply_snapshot({"frozen_frames": frames(first, "burst-1")})
+    pane.annotation_mode_combo.setCurrentIndex(pane.annotation_mode_combo.findData("target"))
+    pane.annotation_views["left"].add_source_point((100.0, 120.0), mode="target")
+    pane.annotation_views["right"].add_source_point((200.0, 220.0), mode="target")
+    pane.apply_snapshot(
+        {
+            "drone_rtk_multiview_samples": [
+                {
+                    "sample_id": "sample-1",
+                    "capture_observation_id": "obs-1",
+                    "burst_id": "burst-1",
+                    "state": "READY",
+                    "annotations": {
+                        side: {"frame_id": f"burst-1-{side}"}
+                        for side in ("left", "right")
+                    },
+                }
+            ],
+            "frozen_frames": frames(second, "burst-2"),
+        }
+    )
+
     assert pane.annotation_views["left"].annotation_points("target") == ()
     assert pane.annotation_views["right"].annotation_points("target") == ()
     assert pane.annotation_payloads()["left"].frame_id == "burst-2-left"
@@ -875,6 +937,49 @@ def test_drone_rtk_observation_history_and_detail_selection() -> None:
     pane.apply_snapshot({"drone_rtk_capture_observations": [ready, incomplete]})
     assert pane.observation_detail_values["observation_id"].value.text() == "obs-001"
     assert pane.observation_detail_values["drone_latitude"].value.text().startswith("37.111111111")
+
+    pane.deleteLater()
+    app.processEvents()
+
+
+def test_drone_rtk_multiview_sample_projects_target_and_readiness_state() -> None:
+    app = _app()
+    pane = OpticalPosePane()
+    observation = _drone_rtk_observation(
+        "obs-001",
+        sequence=0,
+        state="EVIDENCE_READY",
+        drone=_drone_rtk_gnss_row(role="drone", latitude_deg=37.1, longitude_deg=127.1),
+        left=_drone_rtk_gnss_row(role="left", latitude_deg=37.2, longitude_deg=127.2),
+        right=_drone_rtk_gnss_row(role="right", latitude_deg=37.3, longitude_deg=127.3),
+        sync_left_s=0.008,
+        sync_right_s=0.004,
+        left_frame_timestamp_s=100.0,
+        right_frame_timestamp_s=100.004,
+    )
+    sample = {
+        "sample_id": "sample-001",
+        "capture_observation_id": "obs-001",
+        "burst_id": observation["burst_id"],
+        "state": "READY",
+        "annotations": {
+            "left": {"frame_id": observation["frames"]["left"]["frame_id"]},
+            "right": {"frame_id": observation["frames"]["right"]["frame_id"]},
+        },
+    }
+
+    pane.apply_snapshot(
+        {
+            "drone_rtk_multiview_samples": [sample],
+            "drone_rtk_capture_observations": [observation],
+        }
+    )
+
+    assert pane.observation_history_table.item(0, 7).text() == "READY"
+    assert pane.current_observation_values["target"].value.text() == "READY"
+    assert "READY/total=1/1" in pane.method_information_labels["Drone Multi-view"].text()
+    payload = pane.command_payload("alignment.pose.solve_drone_rtk_multiview")
+    assert payload["multiview_source"] == "accumulated_frozen_targets"
 
     pane.deleteLater()
     app.processEvents()

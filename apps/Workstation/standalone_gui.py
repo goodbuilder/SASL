@@ -3539,13 +3539,19 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._set_button_role(self.record_button, "danger" if self._session_recording_active() else "success")
 
         connected_mavlink_sides = self._mavlink_open_sides()
+        mavlink_operation_busy = bool(
+            self.pixhawk_connection_thread is not None
+            or self.pixhawk_disconnection_thread is not None
+        )
         self.left_mavlink_button.setText(
             "Disconnect P1 MAVLink" if "left" in connected_mavlink_sides else "Connect P1 MAVLink"
         )
+        self.left_mavlink_button.setEnabled(not mavlink_operation_busy)
         self._set_button_role(self.left_mavlink_button, "danger" if "left" in connected_mavlink_sides else "primary")
         self.right_mavlink_button.setText(
             "Disconnect P2 MAVLink" if "right" in connected_mavlink_sides else "Connect P2 MAVLink"
         )
+        self.right_mavlink_button.setEnabled(not mavlink_operation_busy)
         self._set_button_role(self.right_mavlink_button, "danger" if "right" in connected_mavlink_sides else "primary")
 
     def _install_tooltips(self) -> None:
@@ -4351,9 +4357,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if not hasattr(self, "alignment_step_status_labels"):
             return
 
+        selected_left_gps, selected_right_gps = self._selected_baseline_gps_states()
         gps_ready = [
-            self._gps_fix_ready_for_baseline(self.latest_gps.get("left")),
-            self._gps_fix_ready_for_baseline(self.latest_gps.get("right")),
+            self._gps_fix_ready_for_baseline(selected_left_gps),
+            self._gps_fix_ready_for_baseline(selected_right_gps),
         ]
         gps_count = sum(1 for ready in gps_ready if ready)
         mag_count = sum(
@@ -5780,39 +5787,45 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 self.baseline_calc_labels["timestamp_delta"], f"{vector.timestamp_delta_ms:.1f} ms"
             )
         if hasattr(self, "rtk_alignment_plot"):
-            estimate = RtkBaselineEstimate(
-                baseline_m=vector.length_m,
-                north_m=vector.north_m,
-                east_m=vector.east_m,
-                down_m=-vector.up_m,
-                left_age_s=max(0.0, time.monotonic() - left.timestamp_s),
-                right_age_s=max(0.0, time.monotonic() - right.timestamp_s),
-                fix_quality="GOOD" if left.fix_type == 6 and right.fix_type == 6 else "DEGRADED",
-            )
-            self.latest_rtk_baseline = estimate
-            self._refresh_p1_body_frd_baseline()
-            camera_translation = self._alignment_view_camera_translation_right_in_left_m(estimate)
-            right_camera_translation = self._baseline_camera_translation_in_side_rdf_m(estimate, "right")
-            self.rtk_alignment_plot.set_alignment(
-                estimate,
-                camera_translation,
-                self.latest_extrinsics.get("left"),
-                self.latest_extrinsics.get("right"),
-            )
-            geometry = self._baseline_forward_geometry_from_camera_translation(camera_translation)
-            right_geometry = self._baseline_forward_geometry_from_camera_translation(right_camera_translation)
-            if hasattr(self, "baseline_attitude_labels"):
-                self._set_baseline_forward_metric_labels(prefix="left", geometry=geometry)
-                self._set_baseline_forward_metric_labels(prefix="right", geometry=right_geometry)
-            right_geometry_text = self._baseline_forward_geometry_text(right_camera_translation).replace(
-                "P1 RDF Forward", "P2 RDF Forward"
-            )
-            self._set_label_text_if_changed(
-                self.rtk_alignment_detail_label,
-                f"ENU E/N/U={vector.east_m:+.3f}/{vector.north_m:+.3f}/{vector.up_m:+.3f} m | "
-                f"NED N/E/D={vector.north_m:+.3f}/{vector.east_m:+.3f}/{-vector.up_m:+.3f} m | "
-                f"{self._baseline_forward_geometry_text(camera_translation)} | {right_geometry_text}",
-            )
+            # The Measurement controller is the sole owner of
+            # latest_rtk_baseline.  Alignment derives display-only ENU/angle
+            # values without replacing that canonical estimate.
+            estimate = self.latest_rtk_baseline
+            if estimate is None:
+                self.latest_p1_body_frd_baseline = None
+                self.rtk_alignment_plot.set_alignment(
+                    None,
+                    left_attitude=self.latest_extrinsics.get("left"),
+                    right_attitude=self.latest_extrinsics.get("right"),
+                )
+                self._set_label_text_if_changed(
+                    self.rtk_alignment_detail_label,
+                    "정렬 성분: canonical GPS/RTK baseline 계산 대기 중",
+                )
+            else:
+                self._refresh_p1_body_frd_baseline()
+                camera_translation = self._alignment_view_camera_translation_right_in_left_m(estimate)
+                right_camera_translation = self._baseline_camera_translation_in_side_rdf_m(estimate, "right")
+                self.rtk_alignment_plot.set_alignment(
+                    estimate,
+                    camera_translation,
+                    self.latest_extrinsics.get("left"),
+                    self.latest_extrinsics.get("right"),
+                )
+                geometry = self._baseline_forward_geometry_from_camera_translation(camera_translation)
+                right_geometry = self._baseline_forward_geometry_from_camera_translation(right_camera_translation)
+                if hasattr(self, "baseline_attitude_labels"):
+                    self._set_baseline_forward_metric_labels(prefix="left", geometry=geometry)
+                    self._set_baseline_forward_metric_labels(prefix="right", geometry=right_geometry)
+                right_geometry_text = self._baseline_forward_geometry_text(right_camera_translation).replace(
+                    "P1 RDF Forward", "P2 RDF Forward"
+                )
+                self._set_label_text_if_changed(
+                    self.rtk_alignment_detail_label,
+                    f"ENU E/N/U={vector.east_m:+.3f}/{vector.north_m:+.3f}/{vector.up_m:+.3f} m | "
+                    f"NED N/E/D={vector.north_m:+.3f}/{vector.east_m:+.3f}/{-vector.up_m:+.3f} m | "
+                    f"{self._baseline_forward_geometry_text(camera_translation)} | {right_geometry_text}",
+                )
         else:
             self._refresh_p1_body_frd_baseline()
         if hasattr(self, "baseline_calc_labels"):
@@ -5825,7 +5838,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return
         now_s = time.monotonic()
         for side, labels in self.baseline_gps_card_labels.items():
-            gps = self.latest_gps.get(side)
+            gps = self._selected_baseline_gps_state(side)
             sensors = self.latest_gps_sensors.get(side, {})
             connected = gps is not None or bool(sensors)
             self._set_health_label(labels["connection"], "connected" if connected else "waiting", "good" if connected else "idle")
@@ -6303,6 +6316,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def workstation_physical_alignment_snapshot(self) -> dict[str, object]:
         """Return Workstation alignment evidence without applying corrections."""
 
+        selected_left_gps, selected_right_gps = self._selected_baseline_gps_states()
         baseline = self.latest_rtk_baseline
         projection = self.latest_p1_body_frd_baseline
         left = self.latest_extrinsics.get("left")
@@ -6339,8 +6353,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             ),
             "relative_rpy_deg": relative_rpy,
             "fix_type": {
-                "left": getattr(self.latest_gps.get("left"), "fix_type", None),
-                "right": getattr(self.latest_gps.get("right"), "fix_type", None),
+                "left": getattr(selected_left_gps, "fix_type", None),
+                "right": getattr(selected_right_gps, "fix_type", None),
             },
             "quality": {} if quality is None else quality.to_mapping(),
             "reference_baseline_frd_m": self._physical_alignment_reference_baseline_frd_m(),
@@ -9835,6 +9849,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def toggle_distance_recording(self, *args: Any, **kwargs: Any) -> Any: ...
         def toggle_video_recording(self, *args: Any, **kwargs: Any) -> Any: ...
         def _pair_recording_base_row(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _persist_native_detection_pair(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _persist_native_measurement_pair(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_async_native_frame_result(self, *args: Any, **kwargs: Any) -> Any: ...
+        def native_frame_persistence_pending_count(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _shutdown_native_frame_stores(self, *args: Any, **kwargs: Any) -> Any: ...
         def _upsert_pair_recording_row(self, *args: Any, **kwargs: Any) -> Any: ...
         def _record_unresolved_pair(self, *args: Any, **kwargs: Any) -> Any: ...
         def _record_blocked_measurement_pair(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -9880,6 +9899,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def append_workstation_run_event(self, *args: Any, **kwargs: Any) -> Any: ...
         def import_workstation_session_artifact(self, *args: Any, **kwargs: Any) -> Any: ...
         def register_workstation_session_artifact(self, *args: Any, **kwargs: Any) -> Any: ...
+        def flush_workstation_run_evidence(self, *args: Any, **kwargs: Any) -> Any: ...
         def reset_workstation_optical_pose_session(self, *args: Any, **kwargs: Any) -> Any: ...
         def workstation_optical_pose_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
         def register_workstation_optical_pose_candidate(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -10084,6 +10104,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def _apply_pixhawk_parameter_worker_result(self, *args: Any, **kwargs: Any) -> Any: ...
         def _pixhawk_parameter_worker_failed(self, *args: Any, **kwargs: Any) -> Any: ...
         def _clear_pixhawk_parameter_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _selected_rover_gps_state(self, *args: Any, **kwargs: Any) -> Any: ...
         def _refresh_gnss_base_tab(self, *args: Any, **kwargs: Any) -> Any: ...
         def _gnss_selected_operation_mode(self, *args: Any, **kwargs: Any) -> Any: ...
         def _gnss_active_operation_config(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -10401,6 +10422,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         cache_sources = getattr(self, "_measurement_latest_valid_gps_source", {})
         if isinstance(cache_sources, dict):
             cache_sources.pop(side, None)
+        fixed_since = getattr(self, "gnss_rover_fixed_since", None)
+        if isinstance(fixed_since, dict):
+            fixed_since[side] = None
         if persist:
             self._save_current_settings()
         if hasattr(self, "_refresh_baseline_source_summary"):
@@ -12051,12 +12075,21 @@ def main() -> int:
         sys.argv.remove("--maximized")
     _configure_gl_surface_format()
     app = QtWidgets.QApplication(sys.argv)
+    from Workstation.__main__ import (
+        _flush_window_session_state,
+        _install_qt_exception_hook,
+    )
     from Workstation.main_window import WorkstationMainWindow
 
+    window_holder: dict[str, object] = {}
+    _install_qt_exception_hook(
+        lambda: _flush_window_session_state(window_holder.get("window"))
+    )
     window = WorkstationMainWindow(
         auto_start=auto_start,
         auto_start_pixhawk=auto_start_pixhawk,
     )
+    window_holder["window"] = window
     if maximized:
         window.showMaximized()
     else:

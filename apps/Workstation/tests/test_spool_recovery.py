@@ -162,3 +162,23 @@ def test_retry_discovery_ignores_spool_without_identity_metadata(tmp_path) -> No
     (orphan / "pair_rows.jsonl").write_text('{"pair_id":"unknown"}\n')
 
     assert discover_retryable_sessions(recordings) == []
+
+
+def test_spool_write_error_is_contained_and_marks_volatile_row(tmp_path) -> None:
+    failures: list[str] = []
+    rows = SpoolRows(on_write_error=lambda exc: failures.append(str(exc)))
+    rows.bind(tmp_path / "spool.jsonl")
+
+    class FailingHandle:
+        def write(self, _payload: str) -> int:
+            raise OSError("disk-full-sentinel")
+
+        def close(self) -> None:
+            return None
+
+    rows._handle = FailingHandle()
+
+    assert rows.append({"value": 7}) is False
+    assert failures == ["disk-full-sentinel"]
+    assert rows.write_error == "disk-full-sentinel"
+    assert list(rows) == [{"value": 7}]

@@ -59,3 +59,19 @@ def test_non_finite_payload_is_rejected_without_partial_line(tmp_path: Path) -> 
     with pytest.raises(ValueError, match="non-finite"):
         ledger.append_event("bad", {"value": float("nan")}, source="test")
     assert not (ledger.root / "run_events.jsonl").exists()
+
+
+def test_run_events_batch_fsync_until_explicit_session_flush(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from Workstation.workstation_core import run_evidence
+
+    calls: list[int] = []
+    monkeypatch.setattr(run_evidence.os, "fsync", lambda descriptor: calls.append(descriptor))
+    ledger = RunEvidenceLedger(tmp_path / "SESSION-BATCH")
+
+    ledger.append_event("sample", {"value": 1}, source="test")
+    assert calls == []
+    ledger.flush()
+    assert calls

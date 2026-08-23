@@ -317,10 +317,7 @@ def test_horizon_candidate_is_blocked_until_explicit_apply(
     assert status.ready is False
     assert "optical pose candidate not applied" in status.reasons
     applied = pose.apply_workstation_optical_pose_candidate(
-        {
-            "candidate_id": status.candidate_id,
-            "dof": {"roll": True, "pitch": True},
-        }
+        {"candidate_id": status.candidate_id}
     )
     status = next(
         row
@@ -378,10 +375,7 @@ def test_optical_apply_missing_active_intrinsics_preserves_every_active_field(
 
     with pytest.raises(RuntimeError, match="active exact K,D is required"):
         controller.apply_workstation_optical_pose_candidate(
-            {
-                "candidate_id": candidate_id,
-                "dof": {"roll": True, "pitch": True},
-            }
+            {"candidate_id": candidate_id}
         )
 
     assert _active_geometry_state(panel, controller) == before
@@ -412,10 +406,7 @@ def test_optical_apply_persistence_failure_rolls_back_complete_active_identity(
 
     with pytest.raises(OSError, match="forced alignment persistence failure"):
         controller.apply_workstation_optical_pose_candidate(
-            {
-                "candidate_id": candidate_id,
-                "dof": {"roll": True, "pitch": True},
-            }
+            {"candidate_id": candidate_id}
         )
 
     assert _active_geometry_state(panel, controller) == before
@@ -450,10 +441,7 @@ def test_optical_apply_changed_kd_identity_preserves_previous_active_state(
 
     with pytest.raises(RuntimeError, match="operating K,D changed"):
         controller.apply_workstation_optical_pose_candidate(
-            {
-                "candidate_id": candidate_id,
-                "dof": {"roll": True, "pitch": True},
-            }
+            {"candidate_id": candidate_id}
         )
 
     assert _active_geometry_state(panel, controller) == before
@@ -480,17 +468,23 @@ def test_capture_horizon_and_apply_create_next_pair_immutable_profile(tmp_path: 
     assert candidate["method"] == "flat-horizon-roll-pitch"
     assert candidate["observable_dof"]["yaw_deg"] is False
 
-    with pytest.raises(ValueError, match="not optimized/observable"):
+    with pytest.raises(ValueError, match="owner-derived"):
         controller.apply_workstation_optical_pose_candidate(
             {"candidate_id": candidate["candidate_id"], "dof": {"yaw": True}}
         )
 
     applied = controller.apply_workstation_optical_pose_candidate(
-        {
-            "candidate_id": candidate["candidate_id"],
-            "dof": {"roll": True, "pitch": True},
-        }
+        {"candidate_id": candidate["candidate_id"]}
     )
+
+    assert applied["selected_dof"] == {
+        "roll": True,
+        "pitch": True,
+        "yaw": False,
+        "north": False,
+        "east": False,
+        "down": False,
+    }
 
     assert applied["effective_from_pair_sequence"] == 2
     assert panel.selected_extrinsics_profile is not base_profile
@@ -540,6 +534,44 @@ def test_capture_horizon_and_apply_create_next_pair_immutable_profile(tmp_path: 
     assert applied_version.is_file()
     assert panel.selected_extrinsics_profile is base_profile
     assert panel.active_intrinsics is base_active_intrinsics
+
+
+def test_apply_rejects_candidate_when_any_owned_dof_is_unobservable(tmp_path: Path) -> None:
+    panel = _panel(tmp_path)
+    controller = OpticalPoseController(panel)
+    controller.capture_workstation_optical_pose_burst({})
+    prior = controller._resolve_prior_poses({}, prefer_frozen=True)
+    all_names = (
+        "roll_deg",
+        "pitch_deg",
+        "yaw_deg",
+        "north_m",
+        "east_m",
+        "down_m",
+    )
+    candidate = OpticalPoseCandidate(
+        candidate_id="rank-deficient-full-pose",
+        method="drone-rtk-multiview-r-t",
+        left_pose_ned=prior[0],
+        right_pose_ned=prior[1],
+        optimized_dofs=PoseDofMask.from_names(all_names),
+        observability=tuple((name, name != "down_m") for name in all_names),
+        input_hashes=(
+            (
+                "operating_intrinsics_profile_sha256",
+                panel.operating_intrinsics_profile.profile_sha256,
+            ),
+        ),
+    )
+    controller.register_workstation_optical_pose_candidate(candidate, prior_poses=prior)
+
+    with pytest.raises(ValueError, match="not observable on both camera sides: down_m"):
+        controller.apply_workstation_optical_pose_candidate(
+            {"candidate_id": candidate.candidate_id}
+        )
+
+    assert controller._active_selection is None
+    assert controller._active_poses is None
 
 
 def test_auto_select_job_keeps_owner_state_until_ui_commit_and_rejects_stale_result(

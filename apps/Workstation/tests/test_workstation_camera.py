@@ -785,6 +785,9 @@ def test_wiris_control_sessions_are_serialized_per_camera(monkeypatch) -> None:
     count_lock = threading.Lock()
 
     class FakeSocket:
+        def __init__(self) -> None:
+            self._responses = iter((b"OK\n", b""))
+
         def __enter__(self):
             return self
 
@@ -798,7 +801,7 @@ def test_wiris_control_sessions_are_serialized_per_camera(monkeypatch) -> None:
             return None
 
         def recv(self, _size: int) -> bytes:
-            return b"OK"
+            return next(self._responses, b"")
 
     def fake_create_connection(_endpoint, *, timeout):
         nonlocal connection_count
@@ -832,6 +835,97 @@ def test_wiris_control_sessions_are_serialized_per_camera(monkeypatch) -> None:
     assert not second.is_alive()
     assert connection_count == 2
     assert responses == ["OK", "OK"]
+
+
+def test_wiris_control_response_is_assembled_across_tcp_fragments(monkeypatch) -> None:
+    from Workstation.workstation_core import wiris_zoom
+
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.responses = iter((b"GZ", b"VV 7", b" 8.0\n"))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def settimeout(self, _timeout: float) -> None:
+            return None
+
+        def sendall(self, _payload: bytes) -> None:
+            return None
+
+        def recv(self, _size: int) -> bytes:
+            return next(self.responses, b"")
+
+    monkeypatch.setattr(
+        wiris_zoom.socket,
+        "create_connection",
+        lambda *_args, **_kwargs: FakeSocket(),
+    )
+    command = wiris_zoom.build_wiris_command(
+        host="10.0.0.249",
+        port=2240,
+        command="GZVV",
+        timeout_s=0.5,
+    )
+
+    assert wiris_zoom.send_tcp_line(command) == "GZVV 7 8.0"
+
+
+def test_wiris_zoom_reports_control_contention_as_busy_not_camera_failure(
+    monkeypatch,
+) -> None:
+    from Workstation import wiris_runtime_workers
+    from Workstation.workstation_core.wiris_zoom import WirisControlBusyError
+
+    monkeypatch.setattr(
+        wiris_runtime_workers,
+        "send_tcp_line",
+        lambda _command: (_ for _ in ()).throw(WirisControlBusyError("busy sentinel")),
+    )
+    results: list[object] = []
+    worker = wiris_runtime_workers.WirisZoomWorker(
+        (("left", "10.0.0.231", 2240),),
+        template="GZVV",
+        level=None,
+        timeout_s=0.1,
+    )
+    worker.completed.connect(results.append)
+    worker.run()
+
+    assert results == [[{"label": "left", "state": "busy", "detail": "busy sentinel"}]]
+
+
+def test_wiris_both_command_continues_healthy_side_when_peer_fails_before_barrier(
+    monkeypatch,
+) -> None:
+    from Workstation import wiris_runtime_workers
+
+    sent: list[str] = []
+    monkeypatch.setattr(
+        wiris_runtime_workers,
+        "send_tcp_line",
+        lambda command: sent.append(command.host) or "OK",
+    )
+    results: list[object] = []
+    worker = wiris_runtime_workers.WirisCommandWorker(
+        (
+            ("left", "10.0.0.231", 2240, 0.1),
+            ("right", "", 2240, 0.1),
+        ),
+        command_text="HIWS",
+        terminator="\n",
+    )
+    worker.completed.connect(results.append)
+    started_s = time.monotonic()
+    worker.run()
+
+    assert time.monotonic() - started_s < 0.5
+    assert sent == ["10.0.0.231"]
+    assert results[0]["statuses"]["left"] == "OK"
+    assert results[0]["statuses"]["right"].startswith("실패:")
 
 def test_camera_network_discovery_worker_keeps_nm_queries_off_ui_path(monkeypatch) -> None:
     from Workstation import standalone_gui
@@ -952,6 +1046,36 @@ def test_camera_network_address_worker_keeps_interface_apply_off_ui_path(monkeyp
             "addresses": "enx-camera UP",
         }
     ]
+
+
+def test_camera_network_pkexec_timeout_returns_finite_failure(monkeypatch) -> None:
+    import subprocess
+
+    from Workstation.workstation_core import network
+
+    calls: list[tuple[list[str], object]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append((list(command), kwargs.get("timeout")))
+        if command[0] == "ip":
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="RTNETLINK answers: Operation not permitted",
+            )
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(network, "interface_has_address", lambda *_args: False)
+    monkeypatch.setattr(network.subprocess, "run", fake_run)
+    monkeypatch.setattr(network.shutil, "which", lambda _name: "/usr/bin/pkexec")
+    monkeypatch.setenv("DISPLAY", ":1")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "xcb")
+
+    ok, message = network.apply_interface_address("enx-camera", "10.0.0.10/24")
+
+    assert ok is False
+    assert "timed out" in message
+    assert calls[-1][1] == network.PKEXEC_TIMEOUT_SECONDS
 
 def test_wiris_stip_worker_keeps_interface_and_tcp_io_off_ui_path(monkeypatch) -> None:
     from Workstation import standalone_gui

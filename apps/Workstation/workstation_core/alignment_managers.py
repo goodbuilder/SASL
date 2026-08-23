@@ -150,7 +150,10 @@ class AttitudeMonitor:
         right = self.states.get("right")
         if left is None or right is None:
             return None
-        relative = relative_attitude(left.q, right.q)
+        try:
+            relative = relative_attitude(left.q, right.q)
+        except (TypeError, ValueError, OverflowError):
+            return None
         return relative.roll_deg, relative.pitch_deg, relative.yaw_deg
 
 

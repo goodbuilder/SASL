@@ -3,6 +3,7 @@ from __future__ import annotations
 import socket
 import re
 import threading
+import time
 from dataclasses import dataclass
 
 
@@ -48,17 +49,23 @@ _ZOOM_NUMBER_RE = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)")
 
 
 _CONTROL_LOCKS_GUARD = threading.Lock()
-_CONTROL_LOCKS: dict[tuple[str, int], threading.RLock] = {}
+_CONTROL_LOCKS: dict[tuple[str, int], threading.Lock] = {}
+MAX_CONTROL_RESPONSE_BYTES = 1024 * 1024
+CONTROL_RESPONSE_IDLE_S = 0.1
 
 
-def _control_lock(host: str, port: int) -> threading.RLock:
+class WirisControlBusyError(TimeoutError):
+    """The endpoint is healthy but another Workstation command owns it."""
+
+
+def _control_lock(host: str, port: int) -> threading.Lock:
     """Return the process-wide serializer for one camera control endpoint."""
 
     endpoint = (str(host).strip(), int(port))
     with _CONTROL_LOCKS_GUARD:
         lock = _CONTROL_LOCKS.get(endpoint)
         if lock is None:
-            lock = threading.RLock()
+            lock = threading.Lock()
             _CONTROL_LOCKS[endpoint] = lock
         return lock
 
@@ -148,15 +155,42 @@ def send_tcp_line(command: WirisZoomCommand) -> str:
     payload = (command.command.rstrip("\r\n\0") + command.terminator).encode("utf-8", errors="replace")
     # WIRIS exposes one SDK control service per camera.  Keep all Workstation
     # workers from opening overlapping command sessions against that service.
-    with _control_lock(command.host, command.port):
-        with socket.create_connection((command.host, command.port), timeout=command.timeout_s) as sock:
-            sock.settimeout(command.timeout_s)
+    timeout_s = max(0.01, float(command.timeout_s))
+    deadline_s = time.monotonic() + timeout_s
+    lock = _control_lock(command.host, command.port)
+    if not lock.acquire(timeout=timeout_s):
+        raise WirisControlBusyError(
+            f"WIRIS control busy: {command.host}:{command.port}"
+        )
+    try:
+        remaining_s = max(0.01, deadline_s - time.monotonic())
+        with socket.create_connection((command.host, command.port), timeout=remaining_s) as sock:
+            sock.settimeout(remaining_s)
             sock.sendall(payload)
-            try:
-                response = sock.recv(4096)
-            except socket.timeout:
-                return ""
-    return response.decode("utf-8", errors="replace").strip(" \t\r\n\0")
+            chunks: list[bytes] = []
+            size = 0
+            while time.monotonic() < deadline_s:
+                remaining_s = max(0.001, deadline_s - time.monotonic())
+                sock.settimeout(
+                    remaining_s
+                    if not chunks
+                    else min(CONTROL_RESPONSE_IDLE_S, remaining_s)
+                )
+                try:
+                    chunk = sock.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                chunks.append(bytes(chunk))
+                size += len(chunk)
+                if size > MAX_CONTROL_RESPONSE_BYTES:
+                    raise OSError("WIRIS control response exceeds 1 MiB")
+                if any(terminator in chunk for terminator in (b"\n", b"\r", b"\0")):
+                    break
+    finally:
+        lock.release()
+    return b"".join(chunks).decode("utf-8", errors="replace").strip(" \t\r\n\0")
 
 
 def build_wiris_command(

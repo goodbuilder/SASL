@@ -5578,7 +5578,6 @@ class OpticalPosePane(QtWidgets.QWidget):
         "Observable",
         "State",
     )
-    DOF_KEYS = ("roll", "pitch", "yaw", "north", "east", "down")
     DRONE_RTK_OBSERVATION_HEADERS = (
         "#",
         "State",
@@ -5594,8 +5593,6 @@ class OpticalPosePane(QtWidgets.QWidget):
         super().__init__(parent)
         self._active_profile_id = ""
         self._candidate_rows: dict[str, dict[str, object]] = {}
-        self._yaw_checked_before_horizon = True
-        self._dof_default_candidate_id = ""
         self._auto_suggestions: dict[str, dict[str, object]] = {}
         self._active_auto_suggestion_id = ""
         self._auto_suggestion_excluded_indices: dict[str, set[int]] = {}
@@ -5680,8 +5677,9 @@ class OpticalPosePane(QtWidgets.QWidget):
             ),
             AnnotationMode.TARGET.value: (
                 "Mark one Drone RTK target pixel in each frozen image. The single-target "
-                "Drone RTK Yaw solver uses it with line-of-sight evidence; multi-view "
-                "refinement uses imported observations separately."
+                "Drone RTK Yaw solver uses the current pair; once both sides are marked, "
+                "the pair and capture-time Drone/P1/P2 GNSS are also accumulated for "
+                "JSON-free multi-view refinement."
             ),
         }
         self.annotation_clear_button = QtWidgets.QPushButton("Clear")
@@ -5892,6 +5890,13 @@ class OpticalPosePane(QtWidgets.QWidget):
 
         self._drone_rtk_observation_rows: dict[str, dict[str, object]] = {}
         self._drone_rtk_observation_order: list[str] = []
+        self._drone_rtk_multiview_samples: list[dict[str, object]] = []
+        self._drone_rtk_multiview_sample_by_observation: dict[str, dict[str, object]] = {}
+        self._drone_rtk_multiview_sample_by_burst: dict[str, dict[str, object]] = {}
+        self._drone_rtk_multiview_collected_frame_ids: dict[str, set[str]] = {
+            "left": set(),
+            "right": set(),
+        }
 
         auto_group = QtWidgets.QGroupBox("Automatic point suggestion · review required")
         self.auto_group = auto_group
@@ -5936,11 +5941,11 @@ class OpticalPosePane(QtWidgets.QWidget):
 
         multiview_button = make_solver_button(
             "alignment.pose.solve_drone_rtk_multiview",
-            "Refine Drone RTK Multi-view R,t",
+            "Solve Drone RTK Multi-view R,t",
         )
         multiview_button.setToolTip(
-            "Import a multi-view JSON containing per-side camera rays/pixels and synchronized Drone RTK "
-            "target positions, then solve full 6-DOF R,t for both cameras."
+            "Use at least four READY Frozen target pairs accumulated in this Session, together "
+            "with their capture-time Drone RTK positions, to solve full 6-DOF R,t for both cameras."
         )
         workflow_note = QtWidgets.QLabel(
             "Each solver below creates an independent candidate and shares the same review/apply path."
@@ -5958,7 +5963,7 @@ class OpticalPosePane(QtWidgets.QWidget):
             "Mountain + GNSS": "Observed: relative R from paired u,v · t: frozen GNSS baseline · no terrain height",
             "Terrain PnP": "Observed: full 6-DOF · requires GeoTIFF vertical datum and matched 2D/3D points",
             "Drone Rotation": "1 target: Yaw · 2+ targets: Roll/Pitch/Yaw · Measurement t: pair-frozen GNSS",
-            "Drone Multi-view": "Observed: full 6-DOF R,t · requires at least four synchronized observations per side",
+            "Drone Multi-view": "Observed: full 6-DOF R,t · requires at least four READY accumulated Frozen target pairs",
             "References": "Register existing Checkerboard R,t or live Pixhawk+RTK Translation as reusable reference evidence",
             "Combine": "Compose only non-overlapping axes observable on both camera sides with shared prior/K,D",
         }
@@ -6075,8 +6080,9 @@ class OpticalPosePane(QtWidgets.QWidget):
         )
         add_method_tab(
             "Drone Multi-view",
-            "Import at least four synchronized target observations per side and solve full six-DOF "
-            "camera pose. Translation is solved from the observations instead of inherited from live GNSS.",
+            "Accumulate at least four synchronized Frozen target pairs in Drone Rotation, then solve "
+            "full six-DOF camera pose without a separate JSON file. Translation is solved from the "
+            "observations instead of inherited from live GNSS.",
             (multiview_button,),
         )
         def register_reference_candidate(source: str) -> None:
@@ -6195,33 +6201,6 @@ class OpticalPosePane(QtWidgets.QWidget):
             "not used as a hard gate. Assumes camera optical center equals GNSS antenna."
         )
 
-        dof_group = QtWidgets.QGroupBox("Candidate degrees of freedom")
-        self.dof_group = dof_group
-        dof_layout = QtWidgets.QGridLayout(dof_group)
-        self.dof_checkboxes: dict[str, QtWidgets.QCheckBox] = {}
-        for index, key in enumerate(self.DOF_KEYS):
-            label = key.title() if key not in {"north", "east", "down"} else f"{key.title()} position"
-            checkbox = QtWidgets.QCheckBox(label)
-            checkbox.setChecked(key in {"roll", "pitch", "yaw"})
-            checkbox.setToolTip(
-                "Rotation is PX4/NED Roll/Pitch/Yaw"
-                if key in {"roll", "pitch", "yaw"}
-                else "Optical-center displacement in world NED metres"
-            )
-            self.dof_checkboxes[key] = checkbox
-            dof_layout.addWidget(checkbox, 0, index)
-        # Horizon is the initial/manual mode and observes only Roll/Pitch.
-        # Apply this after all checkboxes exist so the UI cannot briefly expose
-        # an invalid Yaw selection during construction.
-        self._set_annotation_mode(self.annotation_mode_combo.currentIndex())
-        dof_contract = QtWidgets.QLabel(
-            "Unchecked DOF remain at the base pose; the owner must re-solve the same observations "
-            "with these constraints. The UI never splices Euler components into a rotation matrix."
-        )
-        dof_contract.setObjectName("compactContract")
-        dof_contract.setWordWrap(True)
-        dof_layout.addWidget(dof_contract, 1, 0, 1, len(self.DOF_KEYS))
-
         candidate_group = QtWidgets.QGroupBox("R,t candidates · compare")
         self.candidate_group = candidate_group
         candidate_group.setObjectName("opticalPoseCandidatesGroup")
@@ -6252,9 +6231,13 @@ class OpticalPosePane(QtWidgets.QWidget):
         candidate_layout.addWidget(self.reference_value)
 
         candidate_actions = QtWidgets.QHBoxLayout()
-        self.apply_button = QtWidgets.QPushButton("Apply selected DOF")
+        self.apply_button = QtWidgets.QPushButton("Apply candidate")
         self.apply_button.setProperty("commandId", "alignment.pose.apply_candidate")
         self.apply_button.setEnabled(False)
+        self.apply_button.setToolTip(
+            "Apply every DOF the selected candidate optimized and observed on both camera sides. "
+            "Use Combine when axes must come from different candidates."
+        )
         self.apply_button.clicked.connect(self._request_apply)
         self.revert_button = QtWidgets.QPushButton("Revert active pose")
         self.revert_button.setProperty("commandId", "alignment.pose.revert")
@@ -6290,7 +6273,6 @@ class OpticalPosePane(QtWidgets.QWidget):
         candidate_review_layout = QtWidgets.QVBoxLayout(candidate_review)
         candidate_review_layout.setContentsMargins(0, 0, 0, 0)
         candidate_review_layout.setSpacing(6)
-        candidate_review_layout.addWidget(self.dof_group)
         candidate_review_layout.addWidget(self.candidate_group)
         candidate_review_layout.addWidget(self.observations_group)
         candidate_review_layout.addWidget(self.contract_label)
@@ -6423,6 +6405,11 @@ class OpticalPosePane(QtWidgets.QWidget):
         terrain_state = self.readiness_values["terrain"].value.text()
         base_state = self.readiness_values["base_extrinsics"].value.text()
         observation_count = len(self._drone_rtk_observation_order)
+        multiview_sample_count = len(self._drone_rtk_multiview_samples)
+        multiview_ready_count = sum(
+            str(sample.get("state") or "").upper() == "READY"
+            for sample in self._drone_rtk_multiview_samples
+        )
         candidate_count = len(self._candidate_rows)
         information = {
             "Horizon": (
@@ -6444,7 +6431,8 @@ class OpticalPosePane(QtWidgets.QWidget):
                 f"captured observations={observation_count} · candidate={candidate_state_by_method.get('Drone Rotation', '--')}"
             ),
             "Drone Multi-view": (
-                f"Solve readiness · imported observations require ≥4 per side · captured evidence={observation_count} · "
+                f"Solve readiness · accumulated READY/total={multiview_ready_count}/{multiview_sample_count} "
+                f"(≥4 READY required) · captured evidence={observation_count} · "
                 f"candidate={candidate_state_by_method.get('Drone Multi-view', '--')}"
             ),
             "References": (
@@ -6500,7 +6488,8 @@ class OpticalPosePane(QtWidgets.QWidget):
                 f"{candidate_metric('Drone Multi-view', 'right_observation_count')} · "
                 f"angular RMS={candidate_metric('Drone Multi-view', 'left_angular_rms_chord')} / "
                 f"{candidate_metric('Drone Multi-view', 'right_angular_rms_chord')} · "
-                f"JSON={candidate_input('Drone Multi-view', 'drone_rtk_multiview_json_sha256')}"
+                f"collection={candidate_input('Drone Multi-view', 'drone_rtk_multiview_collection_sha256')} · "
+                f"JSON fallback={candidate_input('Drone Multi-view', 'drone_rtk_multiview_json_sha256')}"
             ),
             "References": (
                 f"checkerboard profile={base_state or '--'} · "
@@ -6552,23 +6541,16 @@ class OpticalPosePane(QtWidgets.QWidget):
             return ",".join(str(value) for value in raw) or "none"
         return str(raw or "--")
 
-    def dof_payload(self) -> dict[str, bool]:
-        """Return an explicit, ordering-independent 6-DOF constraint mask."""
+    @staticmethod
+    def _candidate_owned_dofs(candidate: Mapping[str, object]) -> tuple[str, ...]:
+        """Read-only owner mask shown to the operator and sent implicitly on Apply."""
 
-        payload = {
-            key: bool(self.dof_checkboxes[key].isChecked())
-            for key in self.DOF_KEYS
-        }
-        # Keep the owner contract fail-closed even if a test, snapshot, or
-        # accessibility action programmatically checks a disabled checkbox.
-        selected = self._candidate_rows.get(self.selected_candidate_id(), {})
-        candidate_method = str(selected.get("method", "") or "")
-        if (
-            str(self.annotation_mode_combo.currentData() or "") == AnnotationMode.HORIZON.value
-            and candidate_method != "gnss-constrained-mountain-uv"
-        ):
-            payload["yaw"] = False
-        return payload
+        optimized = candidate.get("optimized_dof")
+        observable = candidate.get("observable_dof")
+        source = optimized if isinstance(optimized, Mapping) else observable
+        if not isinstance(source, Mapping):
+            return ()
+        return tuple(str(name) for name, enabled in source.items() if bool(enabled))
 
     def annotation_payloads(self) -> dict[str, object]:
         """Return frame-pinned immutable annotation objects for both sides.
@@ -6630,7 +6612,6 @@ class OpticalPosePane(QtWidgets.QWidget):
     def command_payload(self, command_id: str) -> dict[str, object]:
         payload: dict[str, object] = {
             "command_id": str(command_id),
-            "dof": self.dof_payload(),
             "annotation_mode": str(
                 self.annotation_mode_combo.currentData()
                 or AnnotationMode.HORIZON.value
@@ -6666,6 +6647,8 @@ class OpticalPosePane(QtWidgets.QWidget):
                     self._active_auto_suggestion_id, set()
                 )
             )
+        if command_id == "alignment.pose.solve_drone_rtk_multiview":
+            payload["multiview_source"] = "accumulated_frozen_targets"
         return payload
 
     def selected_candidate_id(self) -> str:
@@ -6680,10 +6663,7 @@ class OpticalPosePane(QtWidgets.QWidget):
         candidate_id = self.selected_candidate_id()
         if not candidate_id:
             return None
-        return {
-            "candidate_id": candidate_id,
-            "dof": self.dof_payload(),
-        }
+        return {"candidate_id": candidate_id}
 
     def revert_payload(self) -> dict[str, object]:
         return {
@@ -6730,12 +6710,24 @@ class OpticalPosePane(QtWidgets.QWidget):
         metadata.setdefault("native_height", detail.get("height", image.height()))
         metadata.setdefault("overlay_applied", detail.get("overlay_applied", False))
         previous_identity = (view.frame_id, view.image_sha256)
-        # Drone RTK multi-view uses one target mark per captured frame. Keep
-        # the previous target mark visible across a new frozen burst until
-        # the operator explicitly presses Clear. The view
-        # keeps its exported frame identity pinned to the old evidence, so a
-        # normal single-frame solver cannot silently consume stale pixels.
-        preserve_annotations = bool(view.annotation_points(AnnotationMode.TARGET))
+        # Once a target pair has been bound to capture-time RTK evidence, a
+        # new Frozen burst starts with a clean target editor automatically.
+        # An incomplete/unrecorded mark is retained and remains pinned to its
+        # old frame identity so capture cannot silently discard operator work.
+        annotation_payload = view.export_annotations()
+        previous_annotation_frame_id = (
+            str(annotation_payload.frame_id)
+            if annotation_payload is not None
+            else ""
+        )
+        previous_target_collected = (
+            previous_annotation_frame_id
+            in self._drone_rtk_multiview_collected_frame_ids.get(side, set())
+        )
+        preserve_annotations = bool(
+            view.annotation_points(AnnotationMode.TARGET)
+            and not previous_target_collected
+        )
         try:
             self._auto_accept_in_progress = True
             try:
@@ -7091,27 +7083,6 @@ class OpticalPosePane(QtWidgets.QWidget):
         )
         for view in self.annotation_views.values():
             view.set_annotation_mode(mode)
-        yaw_checkbox = self.dof_checkboxes.get("yaw")
-        if yaw_checkbox is not None:
-            if mode == AnnotationMode.HORIZON.value:
-                if yaw_checkbox.isEnabled():
-                    self._yaw_checked_before_horizon = yaw_checkbox.isChecked()
-                yaw_checkbox.setChecked(False)
-                yaw_checkbox.setEnabled(False)
-                yaw_checkbox.setToolTip(
-                    "Disabled: a flat horizon observes Roll/Pitch, not Yaw. "
-                    "Use paired Mountain u,v + GNSS or Drone RTK for Yaw."
-                )
-            else:
-                was_disabled = not yaw_checkbox.isEnabled()
-                yaw_checkbox.setEnabled(True)
-                if was_disabled:
-                    yaw_checkbox.setChecked(self._yaw_checked_before_horizon)
-                yaw_checkbox.setToolTip(
-                    "Rotation is PX4/NED Roll/Pitch/Yaw. Mountain u,v + GNSS or Drone RTK "
-                    "may provide Yaw when it is observable."
-                )
-
         self.annotation_mode_combo.setToolTip(
             "Click the frozen native image to add points. "
             + self._manual_mode_tooltips.get(mode, "")
@@ -7239,7 +7210,6 @@ class OpticalPosePane(QtWidgets.QWidget):
         else:
             self.candidate_table.clearSelection()
         self._sync_combine_candidate_list(rows, selected_combine_ids)
-        self._apply_candidate_dof_defaults()
         self._refresh_candidate_actions()
         self._refresh_method_information()
 
@@ -7247,6 +7217,60 @@ class OpticalPosePane(QtWidgets.QWidget):
         row = self.observation_history_table.currentRow()
         item = self.observation_history_table.item(row, 0) if row >= 0 else None
         return "" if item is None else str(item.data(QtCore.Qt.UserRole) or "")
+
+    def set_drone_rtk_multiview_samples(self, samples: object) -> None:
+        """Project frozen-target/RTK bindings without mutating capture rows."""
+
+        rows = (
+            [dict(value) for value in samples if isinstance(value, Mapping)]
+            if isinstance(samples, (tuple, list))
+            else []
+        )
+        self._drone_rtk_multiview_samples = rows
+        self._drone_rtk_multiview_sample_by_observation = {}
+        self._drone_rtk_multiview_sample_by_burst = {}
+        self._drone_rtk_multiview_collected_frame_ids = {
+            "left": set(),
+            "right": set(),
+        }
+        for sample in rows:
+            observation_id = str(sample.get("capture_observation_id") or "")
+            burst_id = str(sample.get("burst_id") or "")
+            if observation_id:
+                self._drone_rtk_multiview_sample_by_observation[observation_id] = sample
+            if burst_id:
+                self._drone_rtk_multiview_sample_by_burst[burst_id] = sample
+            annotations = sample.get("annotations")
+            annotations = annotations if isinstance(annotations, Mapping) else {}
+            for side in ("left", "right"):
+                annotation = annotations.get(side)
+                if isinstance(annotation, Mapping):
+                    frame_id = str(annotation.get("frame_id") or "")
+                    if frame_id:
+                        self._drone_rtk_multiview_collected_frame_ids[side].add(frame_id)
+
+        # A snapshot may update only the derived sample projection. Repaint
+        # existing immutable observation rows so Target status stays current.
+        if self._drone_rtk_observation_order:
+            self.set_drone_rtk_observations(
+                [
+                    self._drone_rtk_observation_rows[observation_id]
+                    for observation_id in self._drone_rtk_observation_order
+                    if observation_id in self._drone_rtk_observation_rows
+                ]
+            )
+        else:
+            self._refresh_method_information()
+
+    def _drone_rtk_target_state(self, observation: Mapping[str, object]) -> str:
+        observation_id = str(observation.get("observation_id") or "")
+        burst_id = str(observation.get("burst_id") or "")
+        sample = self._drone_rtk_multiview_sample_by_observation.get(observation_id)
+        if sample is None:
+            sample = self._drone_rtk_multiview_sample_by_burst.get(burst_id)
+        if sample is None:
+            return "NOT ANNOTATED"
+        return str(sample.get("state") or "ANNOTATED")
 
     def set_drone_rtk_observations(self, observations: object) -> None:
         """Refresh Observation History from an append-only, immutable list.
@@ -7292,7 +7316,7 @@ class OpticalPosePane(QtWidgets.QWidget):
                     _drone_rtk_gnss_label(gnss.get("right")),
                     _format_drone_rtk_sync_delta_ms(sync.get("left_frame_to_drone_gnss_s")),
                     _format_drone_rtk_sync_delta_ms(sync.get("right_frame_to_drone_gnss_s")),
-                    "NOT ANNOTATED",
+                    self._drone_rtk_target_state(observation),
                 )
                 for column, value in enumerate(values):
                     item = QtWidgets.QTableWidgetItem(str(value))
@@ -7349,9 +7373,9 @@ class OpticalPosePane(QtWidgets.QWidget):
         left_delta = _format_drone_rtk_sync_delta_ms(sync.get("left_frame_to_drone_gnss_s"))
         right_delta = _format_drone_rtk_sync_delta_ms(sync.get("right_frame_to_drone_gnss_s"))
         self.current_observation_values["sync"].set_value(f"L {left_delta} / R {right_delta}")
-        # Target-pixel <-> observation binding is a later phase; always show
-        # the same explicit "not yet connected" state rather than guessing.
-        self.current_observation_values["target"].set_value("NOT ANNOTATED")
+        self.current_observation_values["target"].set_value(
+            self._drone_rtk_target_state(observation)
+        )
 
     @staticmethod
     def _apply_gnss_detail_rows(
@@ -7428,6 +7452,9 @@ class OpticalPosePane(QtWidgets.QWidget):
         if isinstance(candidates, (tuple, list)):
             self.set_candidates(candidates)
         self.set_active_profile(snapshot.get("active_profile_id"))
+        drone_rtk_multiview_samples = snapshot.get("drone_rtk_multiview_samples")
+        if isinstance(drone_rtk_multiview_samples, (tuple, list)):
+            self.set_drone_rtk_multiview_samples(drone_rtk_multiview_samples)
         drone_rtk_observations = snapshot.get("drone_rtk_capture_observations")
         if isinstance(drone_rtk_observations, (tuple, list)):
             self.set_drone_rtk_observations(drone_rtk_observations)
@@ -7514,16 +7541,34 @@ class OpticalPosePane(QtWidgets.QWidget):
 
     def _refresh_candidate_actions(self) -> None:
         candidate_id = self.selected_candidate_id()
-        self.apply_button.setEnabled(bool(candidate_id) and self._selected_candidate_applicable())
         detail_widget = getattr(self, "candidate_detail_text", None)
         if not candidate_id:
+            self.apply_button.setEnabled(False)
             self.candidate_status_label.setText("No pose candidate")
             if detail_widget is not None:
                 detail_widget.setPlainText("")
             return
         candidate = self._candidate_rows.get(candidate_id, {})
         state = candidate.get("state", candidate.get("quality", "available"))
-        self.candidate_status_label.setText(f"{candidate_id} · {state}")
+        owned_dofs = self._candidate_owned_dofs(candidate)
+        observable = candidate.get("observable_dof")
+        observable = observable if isinstance(observable, Mapping) else {}
+        unobservable = tuple(name for name in owned_dofs if not bool(observable.get(name, False)))
+        apply_ready = (
+            self._selected_candidate_applicable()
+            and bool(owned_dofs)
+            and not unobservable
+        )
+        self.apply_button.setEnabled(apply_ready)
+        dof_text = ",".join(owned_dofs) or "none"
+        suffix = (
+            " · BLOCKED unobservable=" + ",".join(unobservable)
+            if unobservable
+            else ""
+        )
+        self.candidate_status_label.setText(
+            f"{candidate_id} · {state} · Apply DOF={dof_text}{suffix}"
+        )
         if detail_widget is not None:
             detail_widget.setPlainText(self._candidate_detail_text(candidate))
 
@@ -7686,19 +7731,6 @@ class OpticalPosePane(QtWidgets.QWidget):
             status.setText(
                 f"{selected_count} candidates checked · owner will verify shared prior and exact K,D"
             )
-
-    def _apply_candidate_dof_defaults(self) -> None:
-        """Expose the full metric mask when GNSS constrains Mountain u,v."""
-
-        candidate_id = self.selected_candidate_id()
-        if not candidate_id or candidate_id == self._dof_default_candidate_id:
-            return
-        self._dof_default_candidate_id = candidate_id
-        candidate = self._candidate_rows.get(candidate_id, {})
-        if str(candidate.get("method", "") or "") != "gnss-constrained-mountain-uv":
-            return
-        for key, checkbox in self.dof_checkboxes.items():
-            checkbox.setChecked(True)
 
     def _request_apply(self) -> None:
         payload = self.apply_payload()
@@ -8043,12 +8075,16 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         zoom_group = QtWidgets.QGroupBox("Actual zoom readback")
         zoom_layout = QtWidgets.QHBoxLayout(zoom_group)
         self.zoom_level_spin = QtWidgets.QSpinBox()
+        # This control carries the WIRIS zoom *index*, not the optical ratio:
+        # index 0 is the nominal 1.0x position and index 1 is nominal 1.2x.
         self.zoom_level_spin.setRange(0, 100)
         self.zoom_level_spin.setValue(1)
         self.zoom_level_spin.setToolTip(
             "WIRIS zoom index (index 0 = nominal 1.0x; index 1 = nominal 1.2x)."
         )
         self.zoom_set_button = QtWidgets.QPushButton("Set both")
+        self.zoom_in_button = QtWidgets.QPushButton("Zoom-in")
+        self.zoom_out_button = QtWidgets.QPushButton("Zoom-out")
         self.zoom_query_button = QtWidgets.QPushButton("GZVV")
         self.zoom_readback_label = QtWidgets.QLabel(
             "left=unknown, right=unknown"
@@ -8063,9 +8099,23 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         self.zoom_query_button.clicked.connect(
             lambda: self._send_calibration_zoom("query", None)
         )
+        self.zoom_in_button.clicked.connect(
+            lambda: self._send_calibration_zoom("in", None)
+        )
+        self.zoom_out_button.clicked.connect(
+            lambda: self._send_calibration_zoom("out", None)
+        )
+        self.zoom_in_button.setToolTip(
+            "Send WIRIS SZIN to both cameras, then refresh the GZVV readback."
+        )
+        self.zoom_out_button.setToolTip(
+            "Send WIRIS SZOT to both cameras, then refresh the GZVV readback."
+        )
         zoom_layout.addWidget(QtWidgets.QLabel("Index"))
         zoom_layout.addWidget(self.zoom_level_spin)
         zoom_layout.addWidget(self.zoom_set_button)
+        zoom_layout.addWidget(self.zoom_in_button)
+        zoom_layout.addWidget(self.zoom_out_button)
         zoom_layout.addWidget(self.zoom_query_button)
         zoom_layout.addWidget(self.zoom_readback_label, 1)
         layout.addWidget(zoom_group)
@@ -8395,11 +8445,15 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                 f"Zoom command failed: {exc}"
             )
             return
-        self.zoom_readback_label.setText(
-            f"Requested both={level}×; GZVV readback pending"
-            if action == "set"
-            else "GZVV readback pending"
-        )
+        if action == "set":
+            status = f"Requested both={level}×; GZVV readback pending"
+        elif action == "in":
+            status = "Requested Zoom-in for both; GZVV readback pending"
+        elif action == "out":
+            status = "Requested Zoom-out for both; GZVV readback pending"
+        else:
+            status = "GZVV readback pending"
+        self.zoom_readback_label.setText(status)
 
     def _build_operation_tabs(self) -> QtWidgets.QTabWidget:
         kind_tabs = _ContentSizedOperationTabs()

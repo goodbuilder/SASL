@@ -1345,6 +1345,97 @@ def test_gga_provider_system_center_success_does_not_log_anything() -> None:
     assert logged == []
 
 
+def test_gga_provider_uses_the_operator_selected_gps2_source() -> None:
+    logged: list[str] = []
+    now_s = time.monotonic()
+    gps1 = SimpleNamespace(
+        latitude_deg=35.0,
+        longitude_deg=125.0,
+        altitude_m=40.0,
+        has_position=True,
+        timestamp_s=now_s,
+        fix_type=3,
+        satellites_used=8,
+        eph_m=1.0,
+    )
+    gps2 = SimpleNamespace(
+        latitude_deg=37.0,
+        longitude_deg=127.0,
+        altitude_m=50.0,
+        has_position=True,
+        timestamp_s=now_s,
+        fix_type=6,
+        satellites_used=18,
+        eph_m=0.02,
+    )
+    panel = _gga_panel(
+        gga_policy=GgaPolicy.LEFT_GNSS,
+        log_sink=logged,
+        latest_gps={"left": gps1, "left_GPS2": gps2},
+    )
+    panel._selected_baseline_gps_state = lambda side: panel.latest_gps.get(f"{side}_GPS2")
+
+    result = GnssRuntimeController(panel)._gnss_gga_provider()
+
+    assert result == gga_from_position(gps2)
+    assert logged == []
+
+
+def test_gnss_readiness_uses_the_operator_selected_gps2_source(monkeypatch) -> None:
+    from Workstation import gnss_runtime_controller
+
+    now_s = time.monotonic()
+    gps1 = SimpleNamespace(
+        fix_type=3,
+        timestamp_s=now_s,
+        eph_m=1.0,
+        epv_m=2.0,
+        topic="mavlink/GPS_RAW_INT",
+    )
+    gps2 = SimpleNamespace(
+        fix_type=6,
+        timestamp_s=now_s,
+        eph_m=0.02,
+        epv_m=0.03,
+        topic="mavlink/GPS2_RAW",
+    )
+    captured = []
+    config = GnssOperationConfig(operation_mode=GnssOperationMode.NETWORK_RTK_DIRECT)
+    manager = SimpleNamespace(
+        config=config,
+        state=GnssOperationState.MEASURING,
+        source_identity=None,
+        update_readiness=lambda snapshot: None,
+        invalidate=lambda reason: None,
+    )
+    panel = SimpleNamespace(
+        gnss_operation_gate_active=True,
+        gnss_operation_manager=manager,
+        gnss_active_operation_config=None,
+        _build_gnss_operation_config=lambda: config,
+        _gnss_base_rtcm_target_sides=lambda: (),
+        gnss_base_rtcm_stats={},
+        mavlink_pixhawk=None,
+        latest_gps={"left": gps1, "left_GPS2": gps2},
+        _selected_baseline_gps_state=lambda side: gps2 if side == "left" else None,
+        gnss_rover_fixed_since={"left": None, "right": None, "drone": None},
+        latest_baseline_vector=None,
+        latest_baseline_quality=None,
+    )
+
+    def capture_readiness(_config, inputs):
+        captured.append(inputs)
+        return SimpleNamespace(reasons=(), warnings=(), reason_messages={})
+
+    monkeypatch.setattr(gnss_runtime_controller, "evaluate_gnss_readiness", capture_readiness)
+
+    GnssRuntimeController(panel)._refresh_gnss_operation_readiness()
+
+    selected = captured[0].rover_samples["left"]
+    assert selected.fix_type == 6
+    assert selected.device_id == "mavlink/GPS2_RAW"
+
+
 def test_gga_provider_rejects_stale_or_skewed_rover_positions() -> None:
     now_s = time.monotonic()
     base = {

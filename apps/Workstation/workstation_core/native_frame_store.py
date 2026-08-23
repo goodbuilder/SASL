@@ -5,13 +5,15 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import queue
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+import threading
+from typing import Any, Mapping, Sequence
 
-from PyQt5 import QtGui
+from PyQt5 import QtCore, QtGui
 
 from Workstation.workstation_core.strict_jsonl import (
     append_jsonl_record,
@@ -149,4 +151,201 @@ class NativeFrameStore:
         return record
 
 
-__all__ = ["NativeFrameArtifact", "NativeFrameStore"]
+class AsyncNativeFrameStore(QtCore.QObject):
+    """Bounded single-writer queue that keeps PNG/fsync work off the GUI."""
+
+    completed = QtCore.pyqtSignal(object)
+    DEFAULT_MAX_PENDING = 16
+
+    def __init__(
+        self,
+        session_root: Path | str,
+        *,
+        max_pending: int = DEFAULT_MAX_PENDING,
+        parent: QtCore.QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.root = Path(session_root).expanduser().resolve()
+        self.max_pending = max(1, int(max_pending))
+        self._lock = threading.RLock()
+        self._pending: set[str] = set()
+        self._work_queue: queue.Queue[object] = queue.Queue(
+            maxsize=self.max_pending
+        )
+        self._store: NativeFrameStore | None = None
+        self._closed = False
+        self._writer_thread = threading.Thread(
+            target=self._run_writer,
+            name="native-frame-store",
+            daemon=True,
+        )
+        self._writer_thread.start()
+
+    @property
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._pending)
+
+    def enqueue_pair(
+        self,
+        *,
+        request_id: str,
+        pair_id: str,
+        purpose: str,
+        frames: Sequence[tuple[str, QtGui.QImage, Mapping[str, Any]]],
+        missing_sides: Sequence[str] = (),
+        context: Mapping[str, object] | None = None,
+    ) -> dict[str, object] | None:
+        request = str(request_id)
+        with self._lock:
+            if self._closed or request in self._pending:
+                return None
+            if len(self._pending) >= self.max_pending:
+                return None
+            frozen_frames = tuple(
+                (str(side), QtGui.QImage(image), dict(metadata))
+                for side, image, metadata in frames
+            )
+            task = (
+                request,
+                str(pair_id),
+                str(purpose),
+                frozen_frames,
+                tuple(str(side) for side in missing_sides),
+                dict(context or {}),
+            )
+            self._pending.add(request)
+            try:
+                self._work_queue.put_nowait(task)
+            except queue.Full:
+                self._pending.discard(request)
+                return None
+
+        purpose_value = _safe_token(purpose, "unspecified")
+        identifier = _safe_token(pair_id, "frame")
+        scheduled: dict[str, object] = {
+            "native_pair_status": "pending",
+            "native_pair_request_id": request,
+        }
+        for side, image, metadata in frozen_frames:
+            scheduled.update(
+                {
+                    f"native_{side}_frame_id": identifier,
+                    f"native_{side}_png_path": (
+                        Path("frames")
+                        / purpose_value
+                        / f"{identifier}-{side}.png"
+                    ).as_posix(),
+                    f"native_{side}_width_px": image.width(),
+                    f"native_{side}_height_px": image.height(),
+                    f"native_{side}_timestamp_reference": str(
+                        metadata.get("timestamp_reference") or "unknown"
+                    ),
+                    f"native_{side}_source_frame_id": str(
+                        metadata.get("source_native_frame_id") or ""
+                    ),
+                }
+            )
+        if missing_sides:
+            scheduled["native_pair_missing_sides"] = ",".join(missing_sides)
+        return scheduled
+
+    def acknowledge(self, request_id: str) -> None:
+        with self._lock:
+            self._pending.discard(str(request_id))
+
+    def close(self) -> bool:
+        with self._lock:
+            if self._pending:
+                return False
+            if self._closed:
+                return True
+            self._closed = True
+        try:
+            self._work_queue.put_nowait(None)
+        except queue.Full:
+            return False
+        return True
+
+    def _persist_pair(
+        self,
+        request_id: str,
+        pair_id: str,
+        purpose: str,
+        frames: tuple[tuple[str, QtGui.QImage, dict[str, Any]], ...],
+        missing_sides: tuple[str, ...],
+        context: dict[str, object],
+    ) -> dict[str, object]:
+        if self._store is None:
+            self._store = NativeFrameStore(self.root)
+        fields: dict[str, object] = {"native_pair_status": "complete"}
+        failed = list(missing_sides)
+        for side, image, metadata in frames:
+            try:
+                artifact = self._store.persist(
+                    side=side,
+                    purpose=purpose,
+                    frame_id=pair_id,
+                    image=image,
+                    metadata=metadata,
+                )
+            except Exception as exc:  # noqa: BLE001 - one side remains explicit evidence.
+                fields[f"native_{side}_error"] = str(exc)
+                failed.append(side)
+                continue
+            fields.update(
+                {
+                    f"native_{side}_frame_id": artifact.frame_id,
+                    f"native_{side}_png_path": artifact.relative_path,
+                    f"native_{side}_png_sha256": artifact.sha256,
+                    f"native_{side}_width_px": artifact.width,
+                    f"native_{side}_height_px": artifact.height,
+                    f"native_{side}_timestamp_reference": artifact.timestamp_reference,
+                    f"native_{side}_source_frame_id": artifact.source_native_frame_id,
+                }
+            )
+        if failed:
+            fields["native_pair_status"] = "missing:" + ",".join(
+                dict.fromkeys(failed)
+            )
+        return {
+            "request_id": request_id,
+            "context": context,
+            "fields": fields,
+        }
+
+    def _run_writer(self) -> None:
+        while True:
+            task = self._work_queue.get()
+            if task is None:
+                return
+            (
+                request_id,
+                pair_id,
+                purpose,
+                frames,
+                missing_sides,
+                context,
+            ) = task
+            try:
+                result = self._persist_pair(
+                    request_id,
+                    pair_id,
+                    purpose,
+                    frames,
+                    missing_sides,
+                    context,
+                )
+            except Exception as exc:  # noqa: BLE001 - surface executor/setup failures.
+                result = {
+                    "request_id": request_id,
+                    "context": context,
+                    "fields": {
+                        "native_pair_status": "failed",
+                        "native_pair_error": f"{type(exc).__name__}: {exc}",
+                    },
+                }
+            self.completed.emit(result)
+
+
+__all__ = ["AsyncNativeFrameStore", "NativeFrameArtifact", "NativeFrameStore"]

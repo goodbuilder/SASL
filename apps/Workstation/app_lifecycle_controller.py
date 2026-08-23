@@ -1,7 +1,12 @@
 """Workstation startup and shutdown resource lifecycle controller."""
 
 from __future__ import annotations
+import time
 from PyQt5 import QtCore, QtWidgets
+
+
+SHUTDOWN_DEADLINE_S = 5.0
+SHUTDOWN_FORCE_WAIT_S = 1.0
 
 APP_LIFECYCLE_METHODS = [
     "_shutdown_save_settings",
@@ -21,6 +26,12 @@ class AppLifecycleController:
         self.panel = panel
 
     def _shutdown_save_settings(self) -> bool:
+        flusher = getattr(self.panel, "flush_workstation_run_evidence", None)
+        if callable(flusher):
+            try:
+                flusher()
+            except Exception as exc:
+                self.panel._log(f"[종료] run evidence flush 실패: {exc}")
         try:
             self.panel._save_current_settings()
         except Exception as exc:
@@ -54,6 +65,16 @@ class AppLifecycleController:
             if measurement_owner is None
             else bool(measurement_owner.close_method_evaluation_workers())
         )
+        native_store_closer = getattr(
+            self.panel,
+            "_shutdown_native_frame_stores",
+            None,
+        )
+        native_stores_stopped = (
+            True
+            if not callable(native_store_closer)
+            else bool(native_store_closer())
+        )
         attrs = (
             "camera_auto_detect_thread",
             "wiris_control_check_thread",
@@ -82,6 +103,7 @@ class AppLifecycleController:
             "wiris_image_format_thread",
             "optical_pose_wiris_ftp_thread",
             "optical_pose_wiris_ftp_oz_thread",
+            "_measurement_media_verification_thread",
         )
         results = [self.panel._shutdown_stop_thread(attr) for attr in attrs]
         return bool(
@@ -89,6 +111,7 @@ class AppLifecycleController:
             and preview_stopped
             and lrf_stopped
             and measurement_workers_stopped
+            and native_stores_stopped
             and all(results)
         )
 
@@ -153,7 +176,103 @@ class AppLifecycleController:
         coordinator = getattr(self.panel, "_shutdown_coordinator", None)
         if coordinator is None:
             return False
-        return bool(coordinator.run())
+        now_s = time.monotonic()
+        started_s = getattr(self.panel, "_shutdown_started_monotonic_s", None)
+        if started_s is None:
+            started_s = now_s
+            self.panel._shutdown_started_monotonic_s = started_s
+        try:
+            complete = bool(coordinator.run())
+        except Exception as exc:  # noqa: BLE001 - shutdown must still reach its deadline.
+            self.panel._log(f"[종료] lifecycle 단계 예외: {exc}")
+            complete = False
+        if complete:
+            self.panel._shutdown_started_monotonic_s = None
+            return True
+        if now_s - float(started_s) < SHUTDOWN_DEADLINE_S:
+            return False
+        self._force_shutdown_after_deadline()
+        self.panel._shutdown_started_monotonic_s = None
+        return True
+
+    def _force_shutdown_after_deadline(self) -> None:
+        """Bound the final close even when one device QThread ignores quit()."""
+
+        logger = getattr(self.panel, "_log", None)
+        if callable(logger):
+            logger(
+                f"[종료] {SHUTDOWN_DEADLINE_S:.1f}초 deadline 초과; "
+                "남은 worker를 강제 종료합니다."
+            )
+        flusher = getattr(self.panel, "flush_workstation_run_evidence", None)
+        if callable(flusher):
+            try:
+                flusher()
+            except Exception as exc:  # noqa: BLE001 - force close continues.
+                if callable(logger):
+                    logger(f"[종료] run evidence 최종 flush 실패: {exc}")
+
+        for side in ("left", "right"):
+            pane = getattr(self.panel, f"{side}_pane", None)
+            worker = getattr(pane, "worker", None)
+            for method_name in ("request_stop", "terminate_child_process", "kill_child_process"):
+                method = getattr(worker, method_name, None)
+                if callable(method):
+                    try:
+                        method()
+                    except Exception:
+                        pass
+
+        threads: list[object] = []
+        seen: set[int] = set()
+
+        def add_thread(candidate: object | None) -> None:
+            if candidate is None or id(candidate) in seen:
+                return
+            seen.add(id(candidate))
+            threads.append(candidate)
+
+        for name in dir(self.panel):
+            if name.endswith("_thread"):
+                try:
+                    add_thread(getattr(self.panel, name, None))
+                except Exception:
+                    pass
+        finder = getattr(self.panel, "findChildren", None)
+        if callable(finder):
+            try:
+                for thread in finder(QtCore.QThread):
+                    add_thread(thread)
+            except (RuntimeError, TypeError):
+                pass
+
+        running: list[object] = []
+        for thread in threads:
+            try:
+                if not thread.isRunning():
+                    continue
+                interrupter = getattr(thread, "requestInterruption", None)
+                if callable(interrupter):
+                    interrupter()
+                thread.quit()
+                terminator = getattr(thread, "terminate", None)
+                if callable(terminator):
+                    terminator()
+                running.append(thread)
+            except (AttributeError, RuntimeError, TypeError):
+                continue
+
+        force_deadline_s = time.monotonic() + SHUTDOWN_FORCE_WAIT_S
+        for thread in running:
+            remaining_ms = max(0, int((force_deadline_s - time.monotonic()) * 1000.0))
+            if remaining_ms <= 0:
+                break
+            waiter = getattr(thread, "wait", None)
+            if callable(waiter):
+                try:
+                    waiter(min(100, remaining_ms))
+                except (AttributeError, RuntimeError, TypeError):
+                    pass
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override.
         if not self.panel.shutdown_for_close():

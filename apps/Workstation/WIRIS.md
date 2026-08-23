@@ -97,6 +97,21 @@ snapshot 시점에 같은 인터페이스에는 `10.41.10.1/24`, `192.168.0.254/
 | Visible HR video save (`GVHR`) | `FALSE` | `FALSE` |
 | Radiometric video save (`GVTH`) | `TRUE` | `TRUE` |
 
+### Actual zoom readback UI
+
+Calibration의 `Actual zoom readback`에는 다음 조작이 있다.
+
+| Control | Target | SDK action | Result |
+|---|---|---|---|
+| `Set both` | 양쪽 | `SZVN <level>` | 완료 후 `GZVV` 자동 readback |
+| `Zoom-in` | 양쪽 | `SZIN` | 완료 후 `GZVV` 자동 readback |
+| `Zoom-out` | 양쪽 | `SZOT` | 완료 후 `GZVV` 자동 readback |
+| `GZVV` | 양쪽 | `GZVV` | actual index/ratio 갱신 |
+
+Zoom-in/out 버튼은 새 SDK 구현을 만들지 않고 기존 `advanced_send_zoom` worker를 사용한다. 명령은
+GUI thread 밖에서 실행되며, 완료 뒤 예약된 query가 `actual_visible_zoom`을 갱신한다. 물리 zoom
+정지나 좌/우 개별 조작이 필요하면 기존 `Advanced Zoom` 화면을 사용한다.
+
 ## 4. 상태/온도 snapshot
 
 온도는 설정이 아니라 `2026-08-24T00:02:11+09:00` 시점의 관측값이다.
@@ -174,8 +189,7 @@ Focused RTSP worker tests: 5 passed
 Camera regression file: 44 passed
 Camera/contract/recovery tests: 71 passed
 Full Workstation suite after first guard: 999 passed, 1 skipped
-Latest full suite: 1002 passed, 1 skipped, 1 unrelated existing failure
-Unrelated failure: tests/test_measurement_fill_policy.py::test_disabling_required_horizon_fill_makes_only_that_method_unready
+Latest full suite: 1056 passed, 1 skipped in 90.24 s
 ```
 
 ## 6. 성능 기준선
@@ -423,3 +437,5 @@ SSSS 0         # final / rollback
   changed-field-only SET, 필드별 복구/readback을 구현했다. 전체 suite `999 passed, 1 skipped`.
 - `2026-08-24`: 실장비 반복에서 연속 GET만으로도 FW service reset이 재현돼 SDK command 간격
   `250 ms`, transient readback 재시도, 중복 final readback 제거를 추가했다. 관련 테스트 71개 PASS.
+- `2026-08-24`: Calibration `Actual zoom readback`에 양쪽 `Zoom-in`/`Zoom-out` 버튼과 명령 완료 후
+  자동 `GZVV` readback 예약을 추가했다. Calibration regression 40개 PASS.

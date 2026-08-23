@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import median
 from typing import Any, Callable
@@ -34,6 +34,7 @@ DEFAULT_CPU_YOLO_MAX_RATE_HZ = 20.0
 DEFAULT_CPU_YOLO_INITIAL_RATE_HZ = 15.0
 DEFAULT_CPU_YOLO_ADAPTIVE_MAX_RATE_HZ = 20.0
 DEFAULT_CPU_YOLO_MIN_RATE_HZ = 2.0
+DEFAULT_DECODE_RATE_WINDOW_S = 5.0
 CPU_DECODE_HZ_FLOOR = 10.0
 CPU_DECODE_HZ_CRITICAL_GUARD = 11.5
 CPU_DECODE_HZ_SOFT_FLOOR = 12.5
@@ -72,6 +73,11 @@ MAX_RTCP_RATE_SAMPLES = 12
 DEFAULT_RECORD_VIDEO_QUEUE_SIZE = 300
 MAX_RTCP_SR_PC_OFFSET_S = 0.5
 GST_RTSP_RECONNECT_DELAYS_S = (1.0, 2.0, 4.0, 8.0)
+GST_ENCODED_QUEUE_MAX_TIME_NS = 250_000_000
+GST_DECODED_QUEUE_MAX_BUFFERS = 8
+GST_RECORDING_QUEUE_MAX_TIME_NS = 5_000_000_000
+YOLO_PROCESS_CRASH_RESTART_DELAYS_S = (0.25, 0.5, 1.0)
+YOLO_PROCESS_STABLE_RUN_S = 30.0
 _LINUX_PR_SET_PDEATHSIG = 1
 
 
@@ -495,6 +501,53 @@ def _should_emit_preview_frame(config: dict[str, Any], timestamp_s: float) -> bo
         return False
     config["_last_preview_emit_s"] = current_s
     return True
+
+
+@dataclass
+class RollingFrameRateEstimator:
+    """Estimate a decoded frame rate without one-second boundary jitter."""
+
+    window_s: float = DEFAULT_DECODE_RATE_WINDOW_S
+    _timestamps: deque[float] = field(default_factory=deque)
+
+    def __post_init__(self) -> None:
+        try:
+            window_s = float(self.window_s)
+        except (TypeError, ValueError):
+            window_s = DEFAULT_DECODE_RATE_WINDOW_S
+        self.window_s = max(1.0, window_s) if math.isfinite(window_s) else DEFAULT_DECODE_RATE_WINDOW_S
+
+    def _trim(self, now_s: float) -> None:
+        cutoff_s = now_s - self.window_s
+        while self._timestamps and self._timestamps[0] < cutoff_s:
+            self._timestamps.popleft()
+
+    def add(self, timestamp_s: float) -> None:
+        try:
+            timestamp_s = float(timestamp_s)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(timestamp_s):
+            return
+        if self._timestamps and timestamp_s < self._timestamps[-1]:
+            return
+        self._timestamps.append(timestamp_s)
+        self._trim(timestamp_s)
+
+    def rate(self, now_s: float) -> float:
+        try:
+            now_s = float(now_s)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(now_s):
+            return 0.0
+        self._trim(now_s)
+        if len(self._timestamps) < 2:
+            return 0.0
+        elapsed_s = min(self.window_s, max(0.0, now_s - self._timestamps[0]))
+        if elapsed_s <= 0.0:
+            return 0.0
+        return (len(self._timestamps) - 1) / elapsed_s
 
 
 @dataclass
@@ -1200,7 +1253,27 @@ def build_gst_pipeline_text(
     latency_ms = max(0, int(latency_ms))
     rtsp_transport = normalize_rtsp_transport(transport)
     decoder_element = decoder_element_text(decoder)
-    h264parse_element = "h264parse"
+    # Repeat SPS/PPS at every IDR.  WIRIS can accept an RTSP client while the
+    # stream is already inside a GOP, and a lossy/restarted session can also
+    # lose the initial codec headers.  Without config-interval=-1 the parser
+    # may pass P-frames to the decoder with no usable parameter set, leaving
+    # appsink silent until a fresh stream happens to provide one.
+    h264parse_element = "h264parse config-interval=-1"
+    # Do not use a one-buffer leaky queue on compressed H.264.  Dropping an
+    # access unit before the parser/decoder lowers the observed decode rate
+    # and can also discard the only IDR carrying a usable recovery point.
+    encoded_queue = (
+        "queue "
+        "max-size-buffers=0 "
+        "max-size-bytes=0 "
+        f"max-size-time={GST_ENCODED_QUEUE_MAX_TIME_NS}"
+    )
+    decoded_queue = (
+        "queue leaky=downstream "
+        f"max-size-buffers={GST_DECODED_QUEUE_MAX_BUFFERS} "
+        "max-size-bytes=0 "
+        "max-size-time=0"
+    )
     keyframe_filter = ""
     if keyframe_only:
         h264parse_element = "h264parse config-interval=-1 disable-passthrough=true"
@@ -1215,17 +1288,18 @@ def build_gst_pipeline_text(
             f"rtspsrc name=src location={url} latency={latency_ms} protocols={rtsp_transport} "
             "drop-on-latency=true do-rtcp=true "
             "! rtph264depay name=depay source-info=true "
-            "! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
+            f"! {encoded_queue} "
             f"! {h264parse_element} "
             f"{keyframe_filter}"
             "! tee name=encoded "
-            "encoded. ! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
+            f"encoded. ! {encoded_queue} "
             f"! {decoder_element} "
-            "! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
+            f"! {decoded_queue} "
             "! videoconvert "
             "! video/x-raw,format=BGR "
             "! appsink name=sink emit-signals=false sync=false max-buffers=1 drop=true "
-            "encoded. ! queue max-size-buffers=0 max-size-bytes=0 max-size-time=0 "
+            "encoded. ! queue leaky=downstream max-size-buffers=0 max-size-bytes=0 "
+            f"max-size-time={GST_RECORDING_QUEUE_MAX_TIME_NS} "
             "! h264parse config-interval=-1 "
             "! matroskamux "
             f"! filesink location={_gst_location(record_path)} sync=false"
@@ -1234,12 +1308,12 @@ def build_gst_pipeline_text(
         f"rtspsrc name=src location={url} latency={latency_ms} protocols={rtsp_transport} "
         "drop-on-latency=true do-rtcp=true "
         "! rtph264depay name=depay source-info=true "
-        "! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
+        f"! {encoded_queue} "
         f"! {h264parse_element} "
         f"{keyframe_filter}"
-        "! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
+        f"! {encoded_queue} "
         f"! {decoder_element} "
-        "! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
+        f"! {decoded_queue} "
         "! videoconvert "
         "! video/x-raw,format=BGR "
         "! appsink name=sink emit-signals=false sync=false max-buffers=1 drop=true"
@@ -1858,7 +1932,7 @@ def _run_gstreamer_stream_once(
     latest_lock = threading.Lock()
     latest_frame: dict[str, Any] | None = None
     latest_sequence = 0
-    decoded_frames = 0
+    decoded_rate = RollingFrameRateEstimator()
     latest_width = 0
     latest_height = 0
     stream_started_s = time.monotonic()
@@ -1875,7 +1949,7 @@ def _run_gstreamer_stream_once(
     reader_stop = threading.Event()
 
     def reader_loop() -> None:
-        nonlocal decoded_frames, displayed_frames, last_frame_received_s
+        nonlocal displayed_frames, last_frame_received_s
         nonlocal latest_frame, latest_height, latest_sequence, latest_width
         while not stop_event.is_set() and not reader_stop.is_set():
             sample = sink.emit("try-pull-sample", 200_000_000)
@@ -1912,7 +1986,7 @@ def _run_gstreamer_stream_once(
             )
             with latest_lock:
                 latest_sequence += 1
-                decoded_frames += 1
+                decoded_rate.add(receive_s)
                 displayed_frames += int(preview_emitted)
                 latest_width = width
                 latest_height = height
@@ -1967,13 +2041,11 @@ def _run_gstreamer_stream_once(
             if now_s - last_stats_s >= 1.0:
                 elapsed_s = now_s - last_stats_s
                 with latest_lock:
-                    interval_decoded_frames = decoded_frames
-                    decoded_frames = 0
                     interval_displayed_frames = displayed_frames
                     displayed_frames = 0
                     stats_width = latest_width
                     stats_height = latest_height
-                decoded_hz = interval_decoded_frames / elapsed_s
+                    decoded_hz = decoded_rate.rate(now_s)
                 displayed_hz = interval_displayed_frames / elapsed_s
                 inferred_hz = inferred_frames / elapsed_s
                 output_queue.put(
@@ -2111,12 +2183,12 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
     latest_lock = threading.Lock()
     latest_frame: dict[str, Any] | None = None
     latest_sequence = 0
-    decoded_frames = 0
+    decoded_rate = RollingFrameRateEstimator()
     reader_stop = threading.Event()
     record_writer_state = None
 
     def reader_loop() -> None:
-        nonlocal decoded_frames, displayed_frames, height, latest_frame, latest_sequence, record_writer_state, width
+        nonlocal displayed_frames, height, latest_frame, latest_sequence, record_writer_state, width
         while not stop_event.is_set() and not reader_stop.is_set():
             ok, frame = cap.read()
             receive_s = time.monotonic()
@@ -2138,7 +2210,7 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
             )
             with latest_lock:
                 latest_sequence += 1
-                decoded_frames += 1
+                decoded_rate.add(receive_s)
                 displayed_frames += int(preview_emitted)
                 width = frame_width
                 height = frame_height
@@ -2160,13 +2232,11 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
             if now_s - last_stats_s >= 1.0:
                 elapsed_s = now_s - last_stats_s
                 with latest_lock:
-                    interval_decoded_frames = decoded_frames
-                    decoded_frames = 0
                     interval_displayed_frames = displayed_frames
                     displayed_frames = 0
                     stats_width = width
                     stats_height = height
-                decoded_hz = interval_decoded_frames / elapsed_s
+                    decoded_hz = decoded_rate.rate(now_s)
                 displayed_hz = interval_displayed_frames / elapsed_s
                 inferred_hz = inferred_frames / elapsed_s
                 output_queue.put(
@@ -2276,12 +2346,12 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
     latest_lock = threading.Lock()
     latest_frame: dict[str, Any] | None = None
     latest_sequence = 0
-    decoded_frames = 0
+    decoded_rate = RollingFrameRateEstimator()
     reader_stop = threading.Event()
     record_writer_state = None
 
     def reader_loop() -> None:
-        nonlocal decoded_frames, displayed_frames, height, latest_frame, latest_sequence, record_writer_state, width
+        nonlocal displayed_frames, height, latest_frame, latest_sequence, record_writer_state, width
         try:
             for packet in container.demux(video_stream):
                 if stop_event.is_set() or reader_stop.is_set():
@@ -2320,7 +2390,7 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
                     )
                     with latest_lock:
                         latest_sequence += 1
-                        decoded_frames += 1
+                        decoded_rate.add(receive_s)
                         displayed_frames += int(preview_emitted)
                         width = frame_width
                         height = frame_height
@@ -2348,13 +2418,11 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
             if now_s - last_stats_s >= 1.0:
                 elapsed_s = now_s - last_stats_s
                 with latest_lock:
-                    interval_decoded_frames = decoded_frames
-                    decoded_frames = 0
                     interval_displayed_frames = displayed_frames
                     displayed_frames = 0
                     stats_width = width
                     stats_height = height
-                decoded_hz = interval_decoded_frames / elapsed_s
+                    decoded_hz = decoded_rate.rate(now_s)
                 displayed_hz = interval_displayed_frames / elapsed_s
                 inferred_hz = inferred_frames / elapsed_s
                 output_queue.put(
@@ -2543,6 +2611,9 @@ class YoloStreamWorker(QtCore.QObject):
         record_video_fps: float = 30.0,
         event_queue_size: int = DEFAULT_EVENT_QUEUE_SIZE,
         frame_queue_size: int = DEFAULT_FRAME_QUEUE_SIZE,
+        process_target: Callable[..., None] = _run_yolo_process,
+        mp_context: multiprocessing.context.BaseContext | None = None,
+        crash_restart_delays_s: tuple[float, ...] = YOLO_PROCESS_CRASH_RESTART_DELAYS_S,
     ) -> None:
         super().__init__()
         effective_max_rate = effective_yolo_max_rate_hz(
@@ -2580,7 +2651,11 @@ class YoloStreamWorker(QtCore.QObject):
             "event_queue_size": max(1, int(event_queue_size)),
             "frame_queue_size": max(1, int(frame_queue_size)),
         }
-        self._mp_context = multiprocessing.get_context("spawn")
+        self._mp_context = mp_context or multiprocessing.get_context("spawn")
+        self._process_target = process_target
+        self._crash_restart_delays_s = tuple(
+            max(0.0, float(delay_s)) for delay_s in crash_restart_delays_s
+        )
         self._stop_event = None
         self._event_queue = None
         self._frame_queue = None
@@ -2593,25 +2668,64 @@ class YoloStreamWorker(QtCore.QObject):
         status = "YOLO worker 시작 중" if self.config["enable_detection"] else "카메라 worker 시작 중"
         self.status_changed.emit(status)
         self._stop_requested = False
-        self._stop_event = self._mp_context.Event()
-        self._event_queue = self._mp_context.Queue(maxsize=int(self.config["event_queue_size"]))
-        self._frame_queue = self._mp_context.Queue(maxsize=int(self.config["frame_queue_size"]))
-        process = self._mp_context.Process(
-            target=_run_yolo_process,
-            args=(self.config, _BoundedProcessOutputQueue(self._event_queue, self._frame_queue), self._stop_event),
-            daemon=True,
-        )
-        self._process = process
+        self._finished = False
+        consecutive_crashes = 0
         try:
-            process.start()
-            self.status_changed.emit(f"{status}: pid={process.pid}")
-            while process.is_alive() or self._queue_has_pending_messages():
-                self._drain_output_queue(timeout_s=0.1)
-            process.join(timeout=0.2)
-            if process.exitcode not in (0, None) and not self._stop_requested:
-                self.status_changed.emit(f"스트림 프로세스 종료 코드: {process.exitcode}")
-        except Exception as exc:
-            self.status_changed.emit(f"스트림 프로세스 오류: {exc}")
+            while not self._stop_requested:
+                self._stop_event = self._mp_context.Event()
+                self._event_queue = self._mp_context.Queue(
+                    maxsize=int(self.config["event_queue_size"])
+                )
+                self._frame_queue = self._mp_context.Queue(
+                    maxsize=int(self.config["frame_queue_size"])
+                )
+                process = self._mp_context.Process(
+                    target=self._process_target,
+                    args=(
+                        self.config,
+                        _BoundedProcessOutputQueue(self._event_queue, self._frame_queue),
+                        self._stop_event,
+                    ),
+                    daemon=True,
+                )
+                self._process = process
+                process_started_s = time.monotonic()
+                launch_error = ""
+                try:
+                    process.start()
+                    self.status_changed.emit(f"{status}: pid={process.pid}")
+                    while process.is_alive() or self._queue_has_pending_messages():
+                        self._drain_output_queue(timeout_s=0.1)
+                    process.join(timeout=0.2)
+                except Exception as exc:
+                    launch_error = f"{type(exc).__name__}: {exc}"
+                    self.status_changed.emit(f"스트림 프로세스 오류: {launch_error}")
+
+                exitcode = getattr(process, "exitcode", None)
+                runtime_s = max(0.0, time.monotonic() - process_started_s)
+                self._stop_child_process()
+                if self._stop_requested:
+                    break
+                if runtime_s >= YOLO_PROCESS_STABLE_RUN_S:
+                    consecutive_crashes = 0
+                consecutive_crashes += 1
+                if consecutive_crashes > len(self._crash_restart_delays_s):
+                    detail = launch_error or f"exitcode={exitcode}"
+                    self.status_changed.emit(
+                        "스트림 프로세스 크래시 복구 한도 초과: "
+                        f"{detail}; 수동 재시작이 필요합니다."
+                    )
+                    break
+                delay_s = self._crash_restart_delays_s[consecutive_crashes - 1]
+                detail = launch_error or f"exitcode={exitcode}"
+                self.status_changed.emit(
+                    "스트림 프로세스 크래시 복구 중 "
+                    f"({consecutive_crashes}/{len(self._crash_restart_delays_s)}, "
+                    f"{detail}, backoff={delay_s:.2f}s)"
+                )
+                retry_at_s = time.monotonic() + delay_s
+                while not self._stop_requested and time.monotonic() < retry_at_s:
+                    time.sleep(min(0.05, max(0.0, retry_at_s - time.monotonic())))
         finally:
             self._stop_child_process()
             self._emit_finished_once()
@@ -2691,6 +2805,17 @@ class YoloStreamWorker(QtCore.QObject):
                 process.join(timeout=1.0)
         self._process = None
         self._stop_event = None
+        for message_queue in (self._event_queue, self._frame_queue):
+            if message_queue is None:
+                continue
+            try:
+                message_queue.cancel_join_thread()
+            except (AttributeError, OSError, ValueError):
+                pass
+            try:
+                message_queue.close()
+            except (AttributeError, OSError, ValueError):
+                pass
         self._event_queue = None
         self._frame_queue = None
 
@@ -2797,6 +2922,7 @@ class YoloStreamWorker(QtCore.QObject):
             self.stats_ready.emit(
                 {
                     "decoded_hz": decoded_hz,
+                    "decoded_rate_window_s": DEFAULT_DECODE_RATE_WINDOW_S,
                     "displayed_hz": displayed_hz,
                     "inferred_hz": inferred_hz,
                     "width": width,

@@ -23,8 +23,6 @@ import re
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
-
 from PyQt5 import QtCore, QtGui
 
 from Workstation.runtime_paths import resolve_workstation_data_path
@@ -122,6 +120,67 @@ def _call_supported(callable_obj, *args: object, **kwargs: object) -> object:
     return callable_obj(*args, **supported)
 
 
+class _VideoEvidenceVerificationWorker(QtCore.QObject):
+    """Run hashing/ffprobe/full ffmpeg decode away from the GUI thread."""
+
+    finished = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        *,
+        root: Path,
+        backend: str,
+        decoder: str,
+        full_decode: bool,
+        probe_runner: object = None,
+        decode_runner: object = None,
+        result_box: dict[str, object],
+    ) -> None:
+        super().__init__()
+        self.root = Path(root)
+        self.backend = str(backend)
+        self.decoder = str(decoder)
+        self.full_decode = bool(full_decode)
+        self.probe_runner = probe_runner
+        self.decode_runner = decode_runner
+        self.result_box = result_box
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            from Workstation.workstation_core.media_evidence import (
+                verify_video_evidence,
+            )
+
+            descriptors = []
+            for side in ("left", "right"):
+                path = self.root / "video" / f"raw_{side}.mp4"
+                descriptors.append(
+                    verify_video_evidence(
+                        path,
+                        session_root=self.root,
+                        role=f"video/{side}/raw",
+                        source=f"camera.{side}",
+                        recording_backend=self.backend,
+                        encoding_provenance={
+                            "decoder": self.decoder,
+                            "contract": (
+                                "continuous MP4 plus exact evaluated-pair native PNG; "
+                                "MP4 may be encoded pass-through or decoded-frame recording"
+                            ),
+                        },
+                        full_decode=self.full_decode,
+                        probe_runner=self.probe_runner,
+                        decode_runner=self.decode_runner,
+                    )
+                )
+            self.result_box["descriptors"] = descriptors
+        except Exception as exc:  # noqa: BLE001 - controller converts this to RECOVERABLE.
+            self.result_box["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            self.finished.emit()
+
+
 class MeasurementPackageController:
     """Coordinate the explicit package lifecycle around existing producers."""
 
@@ -142,6 +201,10 @@ class MeasurementPackageController:
             "_measurement_package_revision": 0,
             "_measurement_package_calibration_collected": False,
             "_measurement_package_video_observations": None,
+            "_measurement_package_video_descriptors": None,
+            "_measurement_media_verification_thread": None,
+            "_measurement_media_verification_worker": None,
+            "_measurement_media_verification_result": None,
             "_measurement_package_rtcm_drain_requested_token": "",
             "_measurement_package_rtcm_drain_result": None,
             "_measurement_session": None,
@@ -663,6 +726,7 @@ class MeasurementPackageController:
         )
         self.panel._measurement_package_calibration_collected = False
         self.panel._measurement_package_video_observations = None
+        self.panel._measurement_package_video_descriptors = None
         self.panel._measurement_package_rtcm_drain_requested_token = ""
         self.panel._measurement_package_rtcm_drain_result = None
         # Pre-capture belongs to the newly prepared measurement.  The
@@ -1174,9 +1238,17 @@ class MeasurementPackageController:
         now_ns = time.time_ns()
         latest_extrinsics = getattr(self.panel, "latest_extrinsics", {}) or {}
         latest_gps = getattr(self.panel, "latest_gps", {}) or {}
+        selected_gps_reader = getattr(self.panel, "_selected_rover_gps_state", None)
         px4_runtime = getattr(self.panel, "mavlink_pixhawk", None)
         for side in ("left", "right"):
-            if px4_runtime is not None or side in latest_extrinsics or side in latest_gps:
+            selected_gps = (
+                selected_gps_reader(side)
+                if callable(selected_gps_reader)
+                else latest_gps.get(side)
+                if isinstance(latest_gps, dict)
+                else None
+            )
+            if px4_runtime is not None or side in latest_extrinsics or selected_gps is not None:
                 self.activate_measurement_package_source(
                     f"px4.{side}",
                     required_roles=(f"telemetry/px4/{side}/parquet",),
@@ -1382,6 +1454,96 @@ class MeasurementPackageController:
             return "confirming that finalized video bytes are stable"
         return ""
 
+    def _ensure_video_evidence_verified(self) -> bool:
+        if not bool(getattr(self.panel, "_measurement_package_verify_media", True)):
+            return True
+        cached = getattr(self.panel, "_measurement_package_video_descriptors", None)
+        if isinstance(cached, list):
+            return True
+        thread = getattr(self.panel, "_measurement_media_verification_thread", None)
+        if thread is None:
+            root = self._session_root()
+            backend_widget = getattr(self.panel, "stream_backend_combo", None)
+            backend_reader = getattr(backend_widget, "currentData", None)
+            backend = str(
+                backend_reader() if callable(backend_reader) else "workstation-camera"
+            )
+            decoder_widget = getattr(self.panel, "decoder_combo", None)
+            decoder_reader = getattr(decoder_widget, "currentData", None)
+            decoder = str(decoder_reader() if callable(decoder_reader) else "unknown")
+            result_box: dict[str, object] = {}
+            thread = QtCore.QThread(
+                self.panel if isinstance(self.panel, QtCore.QObject) else None
+            )
+            worker = _VideoEvidenceVerificationWorker(
+                root=root,
+                backend=backend,
+                decoder=decoder,
+                full_decode=bool(
+                    getattr(
+                        self.panel,
+                        "_measurement_package_full_video_decode",
+                        False,
+                    )
+                ),
+                probe_runner=getattr(
+                    self.panel,
+                    "_measurement_package_video_probe_runner",
+                    None,
+                ),
+                decode_runner=getattr(
+                    self.panel,
+                    "_measurement_package_video_decode_runner",
+                    None,
+                ),
+                result_box=result_box,
+            )
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            self.panel._measurement_media_verification_thread = thread
+            self.panel._measurement_media_verification_worker = worker
+            self.panel._measurement_media_verification_result = result_box
+            thread.start()
+            self._set_state("VERIFYING", "video evidence verification worker running")
+            self._schedule_finalize_retry()
+            return False
+        if self._thread_running(thread):
+            self._set_state("VERIFYING", "video evidence verification worker running")
+            self._schedule_finalize_retry()
+            return False
+
+        result_box = getattr(
+            self.panel,
+            "_measurement_media_verification_result",
+            None,
+        )
+        result_box = dict(result_box) if isinstance(result_box, Mapping) else {}
+        self.panel._measurement_media_verification_thread = None
+        self.panel._measurement_media_verification_worker = None
+        self.panel._measurement_media_verification_result = None
+        error = str(result_box.get("error") or "")
+        if error:
+            self.panel._measurement_package_finalize_requested = False
+            self._set_state(
+                "RECOVERABLE",
+                "video evidence verification worker failed",
+                error,
+            )
+            return False
+        descriptors = result_box.get("descriptors")
+        if not isinstance(descriptors, list) or len(descriptors) != 2:
+            self.panel._measurement_package_finalize_requested = False
+            self._set_state(
+                "RECOVERABLE",
+                "video evidence verification produced no complete result",
+            )
+            return False
+        self.panel._measurement_package_video_descriptors = descriptors
+        return True
+
     def _rtcm_context_token(self) -> str:
         session_id = str(getattr(self.panel, "recording_session_id", "") or "")
         measurement_id = str(getattr(self.panel, "_measurement_id", "") or "")
@@ -1556,6 +1718,9 @@ class MeasurementPackageController:
         if stability_reason:
             self._set_state("VERIFYING", stability_reason)
             self._schedule_finalize_retry()
+            return False
+
+        if not self._ensure_video_evidence_verified():
             return False
 
         # Session persistence is a hard barrier, not merely another inventory
@@ -2481,39 +2646,14 @@ class MeasurementPackageController:
 
         verify_media = bool(getattr(self.panel, "_measurement_package_verify_media", True))
         if verify_media:
-            from Workstation.workstation_core.media_evidence import verify_video_evidence
-
-            backend_widget = getattr(self.panel, "stream_backend_combo", None)
-            backend_reader = getattr(backend_widget, "currentData", None)
-            backend = str(backend_reader() if callable(backend_reader) else "workstation-camera")
-            decoder_widget = getattr(self.panel, "decoder_combo", None)
-            decoder_reader = getattr(decoder_widget, "currentData", None)
-            decoder = str(decoder_reader() if callable(decoder_reader) else "unknown")
-            for side in ("left", "right"):
-                path = root / "video" / f"raw_{side}.mp4"
-                descriptor = verify_video_evidence(
-                    path,
-                    session_root=root,
-                    role=f"video/{side}/raw",
-                    source=f"camera.{side}",
-                    recording_backend=backend,
-                    encoding_provenance={
-                        "decoder": decoder,
-                        "contract": (
-                            "continuous MP4 plus exact evaluated-pair native PNG; "
-                            "MP4 may be encoded pass-through or decoded-frame recording"
-                        ),
-                    },
-                    full_decode=bool(
-                        getattr(self.panel, "_measurement_package_full_video_decode", False)
-                    ),
-                    probe_runner=getattr(
-                        self.panel, "_measurement_package_video_probe_runner", None
-                    ),
-                    decode_runner=getattr(
-                        self.panel, "_measurement_package_video_decode_runner", None
-                    ),
-                )
+            descriptors = getattr(
+                self.panel,
+                "_measurement_package_video_descriptors",
+                None,
+            )
+            if not isinstance(descriptors, list):
+                raise RuntimeError("video verification result is not ready")
+            for descriptor in descriptors:
                 self._register_descriptor(descriptor)
         else:
             for side in ("left", "right"):
@@ -2840,6 +2980,7 @@ class MeasurementPackageController:
         self.panel._measurement_package_finalize_requested = False
         self.panel._measurement_package_calibration_collected = False
         self.panel._measurement_package_video_observations = None
+        self.panel._measurement_package_video_descriptors = None
         self.panel._measurement_package_rtcm_drain_requested_token = ""
         self.panel._measurement_package_rtcm_drain_result = None
         # Revisions append post-session evidence; they never grant another

@@ -137,6 +137,7 @@ def append_jsonl_record(
     value: Mapping[str, Any],
     *,
     prepared: bool = False,
+    fsync: bool = True,
 ) -> None:
     """Append one canonical JSON object after the one-time recovery gate."""
 
@@ -158,8 +159,9 @@ def append_jsonl_record(
         if written != len(data):
             raise OSError(f"short JSONL append: {output}")
         handle.flush()
-        os.fsync(handle.fileno())
-    if not existed:
+        if fsync:
+            os.fsync(handle.fileno())
+    if not existed and fsync:
         _fsync_directory(output.parent)
 
 

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
-from PyQt5 import QtGui
+from PyQt5 import QtCore, QtGui, QtWidgets
 
-from Workstation.workstation_core.native_frame_store import NativeFrameStore
+from Workstation.workstation_core.native_frame_store import (
+    AsyncNativeFrameStore,
+    NativeFrameStore,
+)
 
 
 def _image(width: int, height: int) -> QtGui.QImage:
@@ -106,3 +110,53 @@ def test_nonfinite_native_timestamp_is_persisted_as_unknown_value(tmp_path: Path
     assert artifact.timestamp_s is None
     row = json.loads((tmp_path / "session" / "native_frames.jsonl").read_text())
     assert row["timestamp_s"] is None
+
+
+def test_async_native_store_does_not_block_gui_timer(monkeypatch, tmp_path: Path) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    original_persist = NativeFrameStore.persist
+
+    def delayed_persist(self, **kwargs):
+        time.sleep(0.2)
+        return original_persist(self, **kwargs)
+
+    monkeypatch.setattr(NativeFrameStore, "persist", delayed_persist)
+    store = AsyncNativeFrameStore(tmp_path / "session")
+    completed: list[dict[str, object]] = []
+    store.completed.connect(completed.append)
+    ticks: list[float] = []
+    timer = QtCore.QTimer()
+    timer.setInterval(10)
+    timer.timeout.connect(lambda: ticks.append(time.monotonic()))
+    timer.start()
+
+    enqueue_started_s = time.monotonic()
+    scheduled = store.enqueue_pair(
+        request_id="request-1",
+        pair_id="pair-1",
+        purpose="measurement",
+        frames=(
+            (
+                "left",
+                _image(64, 48),
+                {
+                    "native_width": 64,
+                    "native_height": 48,
+                    "overlay_applied": False,
+                },
+            ),
+        ),
+    )
+    assert time.monotonic() - enqueue_started_s < 0.05
+    assert scheduled is not None and scheduled["native_pair_status"] == "pending"
+
+    deadline_s = time.monotonic() + 2.0
+    while not completed and time.monotonic() < deadline_s:
+        app.processEvents()
+        time.sleep(0.005)
+    timer.stop()
+
+    assert completed
+    assert len(ticks) >= 5
+    store.acknowledge("request-1")
+    assert store.close() is True

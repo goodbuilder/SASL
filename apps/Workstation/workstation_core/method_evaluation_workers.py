@@ -14,6 +14,7 @@ import os
 import queue
 import signal
 import sys
+import threading
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping, Sequence
@@ -194,8 +195,8 @@ class _WorkerSlot:
     started_monotonic_ns: int = 0
 
 
-class MethodEvaluationCoordinator:
-    """Non-blocking parent-side owner of eight isolated method processes."""
+class _MethodEvaluationRuntime:
+    """Synchronous process runtime owned only by the coordinator actor thread."""
 
     def __init__(
         self,
@@ -563,6 +564,233 @@ class MethodEvaluationCoordinator:
 
     def __exit__(self, *_args: object) -> None:
         self.close()
+
+
+class MethodEvaluationCoordinator:
+    """Non-blocking facade for the isolated per-method process runtime.
+
+    Process spawn, join, timeout termination, and restart all run on one
+    dedicated daemon actor thread.  ``submit()``, ``poll()``, and ``close()``
+    therefore remain bounded operations suitable for a 20 ms Qt timer.
+    """
+
+    def __init__(
+        self,
+        *,
+        mp_context: multiprocessing.context.BaseContext | None = None,
+        process_target: Callable[..., None] = method_evaluation_worker_main,
+        start_workers: bool = True,
+    ) -> None:
+        self._context = mp_context or multiprocessing.get_context("spawn")
+        self._process_target = process_target
+        self._start_workers = bool(start_workers)
+        self._commands: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._results: queue.Queue[MethodEvaluationPoll] = queue.Queue()
+        self._lock = threading.RLock()
+        self._pending_requests: dict[
+            tuple[str, int], tuple[MethodEvaluationRequest, ...]
+        ] = {}
+        self._worker_generations = {
+            method_id: 0 for method_id in MEASUREMENT_METHOD_IDS
+        }
+        self._close_requested = False
+        self._closed_event = threading.Event()
+        self._actor_error = ""
+        self._actor = threading.Thread(
+            target=self._run_actor,
+            name="measurement-method-runtime",
+            daemon=True,
+        )
+        self._actor.start()
+
+    @property
+    def pending_pair_count(self) -> int:
+        with self._lock:
+            return len(self._pending_requests)
+
+    @property
+    def worker_generations(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._worker_generations)
+
+    @property
+    def closed(self) -> bool:
+        return self._closed_event.is_set()
+
+    def start(self) -> None:
+        if self._close_requested:
+            raise RuntimeError("method evaluation coordinator is closed")
+
+    def submit(
+        self,
+        requests: Sequence[MethodEvaluationRequest],
+    ) -> MethodEvaluationSubmission:
+        if self._close_requested:
+            raise RuntimeError("method evaluation coordinator is closed")
+        frozen = _MethodEvaluationRuntime._validate_requests(requests)
+        first = frozen[0]
+        key = (first.pair_id, first.request_generation)
+        with self._lock:
+            if key in self._pending_requests:
+                raise ValueError("duplicate method evaluation pair submission")
+            if len(self._pending_requests) >= METHOD_EVALUATION_QUEUE_LIMIT:
+                outcomes = tuple(
+                    failed_outcome(
+                        request,
+                        status="BACKPRESSURE_BLOCKED",
+                        reason=(
+                            f"method evaluation queue limit "
+                            f"{METHOD_EVALUATION_QUEUE_LIMIT} reached"
+                        ),
+                    )
+                    for request in frozen
+                )
+                return MethodEvaluationSubmission(
+                    accepted=False,
+                    pair_id=first.pair_id,
+                    backpressure_bundle=MethodEvaluationBundle(
+                        measurement_id=first.measurement_id,
+                        pair_id=first.pair_id,
+                        pair_sequence=first.pair_sequence,
+                        snapshot_sha256=first.snapshot_sha256,
+                        request_generation=first.request_generation,
+                        outcomes=outcomes,
+                        snapshot_payload=dict(first.snapshot_payload),
+                    ),
+                )
+            self._pending_requests[key] = frozen
+        self._commands.put(("submit", frozen))
+        return MethodEvaluationSubmission(accepted=True, pair_id=first.pair_id)
+
+    def poll(self) -> MethodEvaluationPoll:
+        primary: list[MethodEvaluationOutcome] = []
+        bundles: list[MethodEvaluationBundle] = []
+        while True:
+            try:
+                result = self._results.get_nowait()
+            except queue.Empty:
+                break
+            primary.extend(result.primary_outcomes)
+            bundles.extend(result.completed_bundles)
+        return MethodEvaluationPoll(
+            primary_outcomes=tuple(primary),
+            completed_bundles=tuple(bundles),
+        )
+
+    def close(self) -> bool:
+        with self._lock:
+            if not self._close_requested:
+                self._close_requested = True
+                self._commands.put(("close", None))
+        return self._closed_event.is_set()
+
+    def wait_closed(self, timeout_s: float = 5.0) -> bool:
+        return self._closed_event.wait(max(0.0, float(timeout_s)))
+
+    def _publish_poll(
+        self,
+        polled: MethodEvaluationPoll,
+        runtime: _MethodEvaluationRuntime,
+    ) -> None:
+        with self._lock:
+            self._worker_generations = runtime.worker_generations
+            for bundle in polled.completed_bundles:
+                self._pending_requests.pop(
+                    (bundle.pair_id, bundle.request_generation),
+                    None,
+                )
+        if polled.primary_outcomes or polled.completed_bundles:
+            self._results.put(polled)
+
+    def _publish_actor_failure(self, exc: BaseException) -> None:
+        reason = f"method evaluation runtime failed: {type(exc).__name__}: {exc}"
+        with self._lock:
+            pending = tuple(self._pending_requests.values())
+            self._pending_requests.clear()
+            self._actor_error = reason
+        bundles: list[MethodEvaluationBundle] = []
+        for requests in pending:
+            first = requests[0]
+            bundles.append(
+                MethodEvaluationBundle(
+                    measurement_id=first.measurement_id,
+                    pair_id=first.pair_id,
+                    pair_sequence=first.pair_sequence,
+                    snapshot_sha256=first.snapshot_sha256,
+                    request_generation=first.request_generation,
+                    outcomes=tuple(
+                        failed_outcome(
+                            request,
+                            status="FAILED",
+                            reason=reason,
+                        )
+                        for request in requests
+                    ),
+                    snapshot_payload=dict(first.snapshot_payload),
+                )
+            )
+        if bundles:
+            self._results.put(MethodEvaluationPoll(completed_bundles=tuple(bundles)))
+
+    def _run_actor(self) -> None:
+        runtime: _MethodEvaluationRuntime | None = None
+        try:
+            runtime = _MethodEvaluationRuntime(
+                mp_context=self._context,
+                process_target=self._process_target,
+                start_workers=self._start_workers,
+            )
+            with self._lock:
+                self._worker_generations = runtime.worker_generations
+            closing = False
+            while not closing:
+                try:
+                    command, payload = self._commands.get(timeout=0.005)
+                except queue.Empty:
+                    command = ""
+                    payload = None
+                commands = [] if not command else [(command, payload)]
+                while True:
+                    try:
+                        commands.append(self._commands.get_nowait())
+                    except queue.Empty:
+                        break
+                for command, payload in commands:
+                    if command == "close":
+                        closing = True
+                        break
+                    if command == "submit":
+                        submission = runtime.submit(payload)  # type: ignore[arg-type]
+                        if submission.backpressure_bundle is not None:
+                            bundle = submission.backpressure_bundle
+                            with self._lock:
+                                self._pending_requests.pop(
+                                    (bundle.pair_id, bundle.request_generation),
+                                    None,
+                                )
+                            self._results.put(
+                                MethodEvaluationPoll(completed_bundles=(bundle,))
+                            )
+                if not closing:
+                    self._publish_poll(runtime.poll(), runtime)
+        except BaseException as exc:  # noqa: BLE001 - convert actor death to terminal outcomes.
+            self._publish_actor_failure(exc)
+        finally:
+            if runtime is not None:
+                try:
+                    runtime.close()
+                except Exception as exc:  # noqa: BLE001 - actor must always publish closed.
+                    self._actor_error = f"runtime close failed: {exc}"
+            with self._lock:
+                self._pending_requests.clear()
+            self._closed_event.set()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+        self.wait_closed()
 
 
 __all__ = [

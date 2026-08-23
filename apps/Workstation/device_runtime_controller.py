@@ -786,6 +786,9 @@ class DeviceRuntimeController:
         if self.panel._session_recording_active():
             self.panel._log("[픽스호크] 세션 기록 중에는 Pixhawk MAVLink 연결을 변경할 수 없습니다.")
             return
+        if getattr(self.panel, "pixhawk_disconnection_thread", None) is not None:
+            self.panel._log("[픽스호크] MAVLink 연결 해제가 끝난 뒤 다시 연결하세요.")
+            return
         target_sides = self.panel._mavlink_target_sides(camera)
         if all(side in self.panel._mavlink_connected_sides() for side in target_sides):
             stale_sides = tuple(side for side in target_sides if self._mavlink_side_is_stale(side))
@@ -820,6 +823,7 @@ class DeviceRuntimeController:
         self.panel.pixhawk_connection_thread = thread
         self.panel.pixhawk_connection_worker = worker
         self.panel.pixhawk_connection_label.setText(f"픽스호크 MAVLink: {label} 연결 중...")
+        self.panel._refresh_session_toggle_buttons()
         self.panel._log(f"[픽스호크] {label} MAVLink 연결을 시작했습니다.")
         thread.start()
 
@@ -906,6 +910,7 @@ class DeviceRuntimeController:
     def _clear_pixhawk_connection_worker(self) -> None:
         self.panel.pixhawk_connection_thread = None
         self.panel.pixhawk_connection_worker = None
+        self.panel._refresh_session_toggle_buttons()
 
     def _mavlink_side_is_stale(self, side: str) -> bool:
         """True if ``side`` has a logged heartbeat but has gone quiet.
@@ -961,6 +966,9 @@ class DeviceRuntimeController:
         if self.panel._session_recording_active():
             self.panel._log("[픽스호크] 세션 기록 중에는 Pixhawk MAVLink 연결을 변경할 수 없습니다.")
             return
+        if getattr(self.panel, "pixhawk_connection_thread", None) is not None:
+            self.panel._log("[픽스호크] MAVLink 연결 작업이 끝난 뒤 연결을 해제하세요.")
+            return
         if self.panel.pixhawk_disconnection_thread is not None:
             self.panel._log("[픽스호크] MAVLink 연결 해제 작업이 이미 진행 중입니다.")
             return
@@ -1003,6 +1011,7 @@ class DeviceRuntimeController:
         )
         self.panel.pixhawk_disconnection_thread = thread
         self.panel.pixhawk_disconnection_worker = worker
+        self.panel._refresh_session_toggle_buttons()
         thread.start()
 
     def _finish_pixhawk_disconnect(
@@ -1050,6 +1059,7 @@ class DeviceRuntimeController:
     def _clear_pixhawk_disconnection_worker(self) -> None:
         self.panel.pixhawk_disconnection_thread = None
         self.panel.pixhawk_disconnection_worker = None
+        self.panel._refresh_session_toggle_buttons()
 
     def apply_selected_pixhawk_candidate(self, side: str, *, source: str | None = None) -> None:
         if source is None:

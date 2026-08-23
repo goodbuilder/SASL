@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import acos, asin, atan2, copysign, degrees, pi, sqrt
+from math import acos, asin, atan2, copysign, degrees, isfinite, pi, sqrt
 from typing import Iterable
 
 
@@ -17,8 +17,10 @@ class RelativeAttitude:
 
 def normalize_quaternion(q: Iterable[float]) -> Quaternion:
     w, x, y, z = (float(value) for value in q)
+    if not all(isfinite(value) for value in (w, x, y, z)):
+        raise ValueError("quaternion must contain four finite values")
     norm = sqrt(w * w + x * x + y * y + z * z)
-    if norm <= 0.0:
+    if norm <= 1.0e-12:
         raise ValueError("zero-length quaternion")
     return (w / norm, x / norm, y / norm, z / norm)
 

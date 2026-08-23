@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -538,7 +538,13 @@ class RetryableSession:
 class SpoolRows(Sequence[dict[str, object]]):
     """Disk-backed append-only rows with a bounded in-memory preview."""
 
-    def __init__(self, *, preview_limit: int = 256, supports_updates: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        preview_limit: int = 256,
+        supports_updates: bool = False,
+        on_write_error: Callable[[OSError], None] | None = None,
+    ) -> None:
         self.preview_limit = max(1, int(preview_limit))
         self.supports_updates = supports_updates
         self._preview: deque[dict[str, object]] = deque(maxlen=self.preview_limit)
@@ -548,6 +554,10 @@ class SpoolRows(Sequence[dict[str, object]]):
         self._lock = threading.RLock()
         self._recovery_warnings: list[str] = []
         self._recovery_artifacts: list[Path] = []
+        self._on_write_error = on_write_error
+        self._write_error: str | None = None
+        self._volatile_appends: list[dict[str, object]] = []
+        self._volatile_updates: dict[int, dict[str, object]] = {}
 
     @property
     def spool_path(self) -> Path | None:
@@ -565,6 +575,26 @@ class SpoolRows(Sequence[dict[str, object]]):
     def recovery_artifacts(self) -> tuple[Path, ...]:
         return tuple(self._recovery_artifacts)
 
+    @property
+    def write_error(self) -> str | None:
+        return self._write_error
+
+    def _record_write_error(self, exc: OSError) -> None:
+        first = self._write_error is None
+        self._write_error = str(exc)
+        handle = self._handle
+        self._handle = None
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        if first and self._on_write_error is not None:
+            try:
+                self._on_write_error(exc)
+            except Exception:
+                pass
+
     def bind(self, path: Path) -> None:
         with self._lock:
             self.close()
@@ -576,6 +606,9 @@ class SpoolRows(Sequence[dict[str, object]]):
             self._count = 0
             self._recovery_warnings.clear()
             self._recovery_artifacts.clear()
+            self._write_error = None
+            self._volatile_appends.clear()
+            self._volatile_updates.clear()
 
     def open_existing(self, path: Path) -> None:
         with self._lock:
@@ -585,6 +618,9 @@ class SpoolRows(Sequence[dict[str, object]]):
             self._count = 0
             self._recovery_warnings.clear()
             self._recovery_artifacts.clear()
+            self._write_error = None
+            self._volatile_appends.clear()
+            self._volatile_updates.clear()
             if path.exists():
                 self._repair_unterminated_tail(path)
                 for row in self._materialized_rows() if self.supports_updates else self._plain_rows():
@@ -643,15 +679,27 @@ class SpoolRows(Sequence[dict[str, object]]):
         self._atomic_replace_bytes(path, payload + b"\n")
         self._recovery_warnings.append("normalized valid unterminated final JSONL record")
 
-    def append(self, row: dict[str, object]) -> None:
+    def append(self, row: dict[str, object]) -> bool:
         stored = {key: _serializable_value(value) for key, value in row.items()}
+        persisted = True
         with self._lock:
             if self._handle is not None:
-                self._handle.write(json.dumps(stored, ensure_ascii=False, sort_keys=True) + "\n")
+                try:
+                    self._handle.write(
+                        json.dumps(stored, ensure_ascii=False, sort_keys=True) + "\n"
+                    )
+                except OSError as exc:
+                    persisted = False
+                    self._record_write_error(exc)
+                    self._volatile_appends.append(stored)
+            elif self._path is not None and self._write_error is not None:
+                persisted = False
+                self._volatile_appends.append(stored)
             self._preview.append(stored)
             self._count += 1
+        return persisted
 
-    def replace(self, index: int, row: dict[str, object]) -> None:
+    def replace(self, index: int, row: dict[str, object]) -> bool:
         if not self.supports_updates:
             raise TypeError("this spool does not support row replacement")
         resolved = index if index >= 0 else self._count + index
@@ -659,12 +707,24 @@ class SpoolRows(Sequence[dict[str, object]]):
             raise IndexError(index)
         stored = {key: _serializable_value(value) for key, value in row.items()}
         record = {"__spool_update_index": resolved, "__spool_row": stored}
+        persisted = True
         with self._lock:
             if self._handle is not None:
-                self._handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+                try:
+                    self._handle.write(
+                        json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+                    )
+                except OSError as exc:
+                    persisted = False
+                    self._record_write_error(exc)
+                    self._volatile_updates[resolved] = stored
+            elif self._path is not None and self._write_error is not None:
+                persisted = False
+                self._volatile_updates[resolved] = stored
             preview_start = self._count - len(self._preview)
             if resolved >= preview_start:
                 self._preview[resolved - preview_start] = stored
+        return persisted
 
     def pop(self, index: int = -1) -> dict[str, object]:
         rows = list(self)
@@ -672,18 +732,36 @@ class SpoolRows(Sequence[dict[str, object]]):
         self._rewrite(rows)
         return removed
 
-    def close(self) -> None:
+    def close(self) -> bool:
+        success = True
         with self._lock:
             if self._handle is not None:
-                self._handle.flush()
-                os.fsync(self._handle.fileno())
-                self._handle.close()
-                self._handle = None
+                handle = self._handle
+                try:
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                except OSError as exc:
+                    success = False
+                    self._record_write_error(exc)
+                else:
+                    try:
+                        handle.close()
+                    except OSError as exc:
+                        success = False
+                        self._record_write_error(exc)
+                    else:
+                        self._handle = None
+        return success
 
-    def flush(self) -> None:
+    def flush(self) -> bool:
         with self._lock:
             if self._handle is not None:
-                self._handle.flush()
+                try:
+                    self._handle.flush()
+                except OSError as exc:
+                    self._record_write_error(exc)
+                    return False
+        return self._write_error is None
 
     def clear(self) -> None:
         with self._lock:
@@ -693,6 +771,9 @@ class SpoolRows(Sequence[dict[str, object]]):
             self._path = None
             self._preview.clear()
             self._count = 0
+            self._volatile_appends.clear()
+            self._volatile_updates.clear()
+            self._write_error = None
 
     def discard_spool(self) -> bool:
         """Best-effort removal after every final artifact is committed.
@@ -703,9 +784,7 @@ class SpoolRows(Sequence[dict[str, object]]):
         for later maintenance; callers never lose the full materialized rows.
         """
         with self._lock:
-            try:
-                self.close()
-            except OSError:
+            if not self.close():
                 return False
             path = self._path
             if path is not None:
@@ -748,6 +827,7 @@ class SpoolRows(Sequence[dict[str, object]]):
                     )
                 if "__spool_update_index" not in row:
                     yield row
+        yield from self._volatile_appends
 
     def _materialized_rows(self) -> list[dict[str, object]]:
         path = self._path
@@ -781,6 +861,10 @@ class SpoolRows(Sequence[dict[str, object]]):
                         ) from exc
                 else:
                     rows.append(record)
+        for index, row in self._volatile_updates.items():
+            if 0 <= index < len(rows):
+                rows[index] = row
+        rows.extend(self._volatile_appends)
         return rows
 
     def _rewrite(self, rows: list[dict[str, object]]) -> None:
@@ -788,6 +872,9 @@ class SpoolRows(Sequence[dict[str, object]]):
         self.close()
         self._preview.clear()
         self._count = 0
+        self._volatile_appends.clear()
+        self._volatile_updates.clear()
+        self._write_error = None
         if path is None:
             for row in rows:
                 self._preview.append(row)

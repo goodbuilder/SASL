@@ -53,7 +53,7 @@ from Workstation.workstation_core.hr_evidence import (
     create_hr_capture_event,
     import_hr_image_file,
 )
-from Workstation.workstation_core.native_frame_store import NativeFrameStore
+from Workstation.workstation_core.native_frame_store import AsyncNativeFrameStore
 from Workstation.ulog_controller import (
     ManualOwnershipClaim,
     ULogController,
@@ -133,6 +133,11 @@ RECORDING_CONTROLLER_METHODS = [
     "toggle_distance_recording",
     "toggle_video_recording",
     "_pair_recording_base_row",
+    "_persist_native_detection_pair",
+    "_persist_native_measurement_pair",
+    "_handle_async_native_frame_result",
+    "native_frame_persistence_pending_count",
+    "_shutdown_native_frame_stores",
     "_upsert_pair_recording_row",
     "_record_unresolved_pair",
     "_record_blocked_measurement_pair",
@@ -185,6 +190,32 @@ class RecordingController:
         # in the GUI owner until the worker returns; it is never camera truth.
         self._pending_hr_requests: dict[str, dict[str, object]] = {}
         self._pending_oz_requests: dict[str, dict[str, object]] = {}
+
+    def _handle_recording_spool_error(self, exc: OSError) -> None:
+        message = f"recording spool write failed: {exc}"
+        self.panel.distance_recording_enabled = False
+        self.panel.video_recording_enabled = False
+        self.panel._session_save_retry_required = True
+        self.panel._session_save_last_error = message
+        label = getattr(self.panel, "recording_status_label", None)
+        setter = getattr(label, "setText", None)
+        if callable(setter):
+            setter(f"세션 기록 실패(복구 가능): {message}")
+        logger = getattr(self.panel, "_log", None)
+        if callable(logger):
+            logger(f"[저장] {message}")
+
+    def _new_recording_spool(
+        self,
+        *,
+        preview_limit: int = 256,
+        supports_updates: bool = False,
+    ) -> SpoolRows:
+        return SpoolRows(
+            preview_limit=preview_limit,
+            supports_updates=supports_updates,
+            on_write_error=self._handle_recording_spool_error,
+        )
 
     def _refresh_recording_status_label(self) -> None:
         if self.panel._session_save_thread is not None:
@@ -490,7 +521,7 @@ class RecordingController:
         self.panel.recording_session_started_wall_s = self.panel.recording_session_started_unix_ns * 1e-9
         self.panel.recording_session_started_monotonic_s = self.panel.recording_session_started_monotonic_ns * 1e-9
         self.panel.distance_recording_started_monotonic_s = self.panel.recording_session_started_monotonic_s
-        self.panel.distance_recording_rows = SpoolRows(
+        self.panel.distance_recording_rows = self._new_recording_spool(
             preview_limit=RECORDING_PREVIEW_LIMIT,
             supports_updates=True,
         )
@@ -499,14 +530,14 @@ class RecordingController:
         spool_root = self.panel._recording_session_dir(self.panel.recording_session_id) / ".spool"
         self.panel.distance_recording_rows.bind(spool_root / "pair_rows.jsonl")
         self.panel.camera_recording_rows = {
-            side: SpoolRows() for side in ("left", "right")
+            side: self._new_recording_spool() for side in ("left", "right")
         }
         self.panel.px4_recording_rows = {
-            side: SpoolRows() for side in ("left", "right")
+            side: self._new_recording_spool() for side in ("left", "right")
         }
-        self.panel.gnss_base_recording_rows = SpoolRows()
-        self.panel.extrinsics_comparison_recording_rows = SpoolRows()
-        self.panel.method_evaluation_bundle_rows = SpoolRows()
+        self.panel.gnss_base_recording_rows = self._new_recording_spool()
+        self.panel.extrinsics_comparison_recording_rows = self._new_recording_spool()
+        self.panel.method_evaluation_bundle_rows = self._new_recording_spool()
         for side, rows in self.panel.camera_recording_rows.items():
             rows.bind(spool_root / f"camera_{side}.jsonl")
         for side, rows in self.panel.px4_recording_rows.items():
@@ -784,6 +815,26 @@ class RecordingController:
 
                     QtCore.QTimer.singleShot(100, retry_stop)
                 return
+        pending_native_frames = self.native_frame_persistence_pending_count()
+        if pending_native_frames:
+            self.panel.recording_status_label.setText(
+                f"세션 기록: native frame 저장 barrier 대기 ({pending_native_frames} requests)"
+            )
+            if not bool(
+                getattr(self.panel, "_native_frame_stop_retry_scheduled", False)
+            ):
+                self.panel._native_frame_stop_retry_scheduled = True
+
+                def retry_native_stop() -> None:
+                    self.panel._native_frame_stop_retry_scheduled = False
+                    self.panel._stop_session_recording(
+                        restart_streams=restart_streams,
+                        final_clock_sync_snapshot=final_clock_sync_snapshot,
+                    )
+
+                QtCore.QTimer.singleShot(100, retry_native_stop)
+            return
+        self._shutdown_native_frame_stores()
         if final_clock_sync_snapshot is None:
             final_clock_sync_snapshot = (
                 self.panel._camera_time_sync_snapshot("last_observed_before_session_stop")
@@ -799,6 +850,16 @@ class RecordingController:
                 f"세션 기록: ULog finalization failed ({exc})"
             )
             self.panel._log(f"[저장] ULog finalization 실패: {exc}")
+            return
+        evidence_flusher = getattr(
+            self.panel,
+            "flush_workstation_run_evidence",
+            None,
+        )
+        if callable(evidence_flusher) and not bool(evidence_flusher()):
+            self.panel.recording_status_label.setText(
+                "세션 기록: run evidence flush 실패 — 복구 가능한 spool을 보존합니다"
+            )
             return
         target_owner = getattr(self.panel, "_target_drone_controller_owner", None)
         if target_owner is not None:
@@ -1967,6 +2028,8 @@ class RecordingController:
                     "auto_suggestions",
                     "accepted_auto_suggestion",
                     "annotation_review",
+                    "drone_rtk_capture_observations",
+                    "drone_rtk_multiview_samples",
                     "candidates",
                     "active_profile_id",
                 )
@@ -2830,6 +2893,7 @@ class RecordingController:
         right_detection: object,
         pair_id: str,
         purpose: str,
+        record_key: tuple[object, ...] | None = None,
     ) -> dict[str, object]:
         """Persist evaluated-pair source pixels without resizing or overlays.
 
@@ -2843,8 +2907,10 @@ class RecordingController:
         resolver = getattr(self.panel, "_recording_session_dir", None)
         if not callable(resolver):
             return {"native_pair_status": "session_directory_owner_missing"}
-        store = NativeFrameStore(resolver(self.panel.recording_session_id))
-        output: dict[str, object] = {"native_pair_status": "complete"}
+        session_id = str(self.panel.recording_session_id)
+        root = Path(resolver(session_id))
+        store = self._native_frame_store_for_session(session_id, root)
+        frames: list[tuple[str, QtGui.QImage, Mapping[str, object]]] = []
         missing: list[str] = []
         for side, detection in (
             ("left", left_detection),
@@ -2864,32 +2930,121 @@ class RecordingController:
                 missing.append(side)
                 continue
             _timestamp_s, image, metadata = cached
-            try:
-                artifact = store.persist(
-                    side=side,
-                    purpose=purpose,
-                    frame_id=pair_id,
-                    image=image,
-                    metadata=metadata,
-                )
-            except Exception as exc:
-                output[f"native_{side}_error"] = str(exc)
-                missing.append(side)
-                continue
-            output.update(
-                {
-                    f"native_{side}_frame_id": artifact.frame_id,
-                    f"native_{side}_png_path": artifact.relative_path,
-                    f"native_{side}_png_sha256": artifact.sha256,
-                    f"native_{side}_width_px": artifact.width,
-                    f"native_{side}_height_px": artifact.height,
-                    f"native_{side}_timestamp_reference": artifact.timestamp_reference,
-                    f"native_{side}_source_frame_id": artifact.source_native_frame_id,
-                }
+            frames.append((side, image, dict(metadata)))
+        if not frames:
+            return {"native_pair_status": "missing:" + ",".join(missing)}
+        request_id = f"native-{uuid.uuid4().hex}"
+        scheduled = store.enqueue_pair(
+            request_id=request_id,
+            pair_id=pair_id,
+            purpose=purpose,
+            frames=frames,
+            missing_sides=missing,
+            context={
+                "session_id": session_id,
+                "record_key": list(record_key) if record_key is not None else None,
+            },
+        )
+        if scheduled is None:
+            return {
+                "native_pair_status": "queue_full",
+                "native_pair_error": (
+                    f"native frame queue limit {store.max_pending} reached"
+                ),
+            }
+        return scheduled
+
+    def _native_frame_store_for_session(
+        self,
+        session_id: str,
+        root: Path,
+    ) -> AsyncNativeFrameStore:
+        stores = getattr(self.panel, "_native_frame_async_stores", None)
+        if not isinstance(stores, dict):
+            stores = {}
+            self.panel._native_frame_async_stores = stores
+        store = stores.get(session_id)
+        if isinstance(store, AsyncNativeFrameStore):
+            return store
+        parent = self.panel if isinstance(self.panel, QtCore.QObject) else None
+        store = AsyncNativeFrameStore(root, parent=parent)
+        callback = getattr(self.panel, "_handle_async_native_frame_result", None)
+        if callable(callback):
+            store.completed.connect(callback, QtCore.Qt.QueuedConnection)
+        else:
+            store.completed.connect(
+                self._handle_async_native_frame_result,
+                QtCore.Qt.DirectConnection,
             )
-        if missing:
-            output["native_pair_status"] = "missing:" + ",".join(missing)
-        return output
+        stores[session_id] = store
+        return store
+
+    def _handle_async_native_frame_result(self, payload: object) -> None:
+        data = dict(payload or {})
+        request_id = str(data.get("request_id") or "")
+        context = data.get("context")
+        context = dict(context) if isinstance(context, Mapping) else {}
+        session_id = str(context.get("session_id") or "")
+        fields = data.get("fields")
+        fields = dict(fields) if isinstance(fields, Mapping) else {
+            "native_pair_status": "failed",
+            "native_pair_error": "async native frame result is malformed",
+        }
+        stores = getattr(self.panel, "_native_frame_async_stores", None)
+        store = stores.get(session_id) if isinstance(stores, dict) else None
+        try:
+            raw_key = context.get("record_key")
+            record_key = tuple(raw_key) if isinstance(raw_key, (tuple, list)) else None
+            if record_key is not None:
+                row_index = getattr(self.panel, "_recording_pair_row_index", {}).get(
+                    record_key
+                )
+                rows = getattr(self.panel, "distance_recording_rows", None)
+                if row_index is not None and rows is not None:
+                    current = dict(rows[row_index])
+                    current.update(fields)
+                    if isinstance(rows, SpoolRows):
+                        rows.replace(row_index, current)
+                    else:
+                        rows[row_index] = current
+                    refresher = getattr(self.panel, "_refresh_recording_table", None)
+                    if callable(refresher):
+                        refresher()
+            if str(fields.get("native_pair_status") or "").startswith(("failed", "missing", "queue")):
+                logger = getattr(self.panel, "_log", None)
+                if callable(logger):
+                    logger(
+                        "[저장] native frame 비동기 저장 실패/누락: "
+                        f"{fields.get('native_pair_status')} "
+                        f"{fields.get('native_pair_error', '')}"
+                    )
+        finally:
+            if isinstance(store, AsyncNativeFrameStore):
+                store.acknowledge(request_id)
+
+    def native_frame_persistence_pending_count(self) -> int:
+        stores = getattr(self.panel, "_native_frame_async_stores", None)
+        if not isinstance(stores, dict):
+            return 0
+        return sum(
+            store.pending_count
+            for store in stores.values()
+            if isinstance(store, AsyncNativeFrameStore)
+        )
+
+    def _shutdown_native_frame_stores(self) -> bool:
+        stores = getattr(self.panel, "_native_frame_async_stores", None)
+        if not isinstance(stores, dict):
+            return True
+        all_closed = True
+        for session_id, store in list(stores.items()):
+            if not isinstance(store, AsyncNativeFrameStore) or store.close():
+                stores.pop(session_id, None)
+                if isinstance(store, QtCore.QObject):
+                    store.deleteLater()
+            else:
+                all_closed = False
+        return all_closed
 
     def _persist_native_measurement_pair(
         self,
@@ -2900,6 +3055,7 @@ class RecordingController:
             right_detection=measurement_attempt.right_detection,
             pair_id=f"pair-{measurement_attempt.attempt_id}",
             purpose="accepted-measurement",
+            record_key=tuple(measurement_attempt.detection_pair_key),
         )
 
     @staticmethod
@@ -3103,6 +3259,7 @@ class RecordingController:
                 right_detection=blocked.right_detection,
                 pair_id=f"blocked-{blocked_sha256[:20]}",
                 purpose="blocked-measurement",
+                record_key=key,
             )
         )
         row.update(
@@ -3630,7 +3787,7 @@ class RecordingController:
         if side is None:
             return
         if side not in self.panel.px4_recording_rows:
-            rows = SpoolRows()
+            rows = self._new_recording_spool()
             rows.bind(
                 self.panel._recording_session_dir(self.panel.recording_session_id)
                 / ".spool"

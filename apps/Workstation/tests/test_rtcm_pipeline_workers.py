@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -30,6 +31,91 @@ class _Subscriber:
     def send_rtcm_data(self, side: str, payload: bytes) -> int:
         self.sent.append((side, bytes(payload)))
         return 2
+
+
+def test_gnss_base_serial_write_timeout_fails_and_finishes(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class SerialPort:
+        def __init__(self, port, baud, **kwargs) -> None:
+            captured.update(port=port, baud=baud, **kwargs)
+
+        def write(self, _payload: bytes) -> int:
+            raise TimeoutError("blocked writer sentinel")
+
+        def read(self, _size: int) -> bytes:
+            return b""
+
+        def close(self) -> None:
+            captured["closed"] = True
+
+    monkeypatch.setitem(sys.modules, "serial", SimpleNamespace(Serial=SerialPort))
+    worker = GnssBaseSerialWorker(port="/dev/fake", baud=115200)
+    failures: list[str] = []
+    finished: list[bool] = []
+    worker.failed.connect(failures.append)
+    worker.finished.connect(lambda: finished.append(True))
+
+    worker.run()
+
+    assert captured["write_timeout"] == worker.WRITE_TIMEOUT_S
+    assert failures == ["blocked writer sentinel"]
+    assert finished == [True]
+    assert captured["closed"] is True
+
+
+def test_gnss_base_serial_write_queue_is_bounded_and_keeps_newest() -> None:
+    worker = GnssBaseSerialWorker(port="/dev/fake", baud=115200)
+    total = worker.MAX_WRITE_QUEUE + 10
+    for index in range(total):
+        worker.send_bytes(f"item-{index}", bytes((index % 256,)))
+
+    queued = []
+    while not worker._write_queue.empty():
+        queued.append(worker._write_queue.get_nowait())
+
+    assert len(queued) == worker.MAX_WRITE_QUEUE
+    assert queued[0][0] == "item-10"
+    assert queued[-1][0] == f"item-{total - 1}"
+
+
+def test_rtcm_worker_replacement_never_waits_on_the_gui_thread() -> None:
+    callbacks: list[object] = []
+    calls: list[str] = []
+
+    class Signal:
+        def connect(self, callback, *_args) -> None:
+            callbacks.append(callback)
+
+    class Thread:
+        finished = Signal()
+
+        def isRunning(self) -> bool:  # noqa: N802
+            return True
+
+        def quit(self) -> None:
+            calls.append("quit")
+
+        def wait(self, _timeout: int) -> bool:
+            raise AssertionError("GUI path must not call QThread.wait")
+
+    old_subscriber = object()
+    new_subscriber = object()
+    thread = Thread()
+    panel = SimpleNamespace(
+        mavlink_pixhawk=new_subscriber,
+        pixhawk_rtcm_thread=thread,
+        pixhawk_rtcm_worker=SimpleNamespace(
+            subscriber=old_subscriber,
+            clear_pending=lambda: calls.append("clear"),
+        ),
+        rtcm_pipeline_worker=None,
+        _rtcm_pipeline_injection_worker=None,
+    )
+
+    assert GnssRuntimeController(panel)._ensure_pixhawk_rtcm_worker() is None
+    assert calls == ["clear", "quit"]
+    assert callbacks
 
 
 def test_injection_worker_echoes_pipeline_identity_with_delivery_result(monkeypatch) -> None:
@@ -795,7 +881,17 @@ def test_pixhawk_worker_is_replaced_when_subscriber_identity_changes() -> None:
         threads.append(first_thread)
 
         panel.mavlink_pixhawk = subscriber_b
+        replacement_started_s = time.monotonic()
         second = controller._ensure_pixhawk_rtcm_worker()
+        assert second is None
+        assert time.monotonic() - replacement_started_s < 0.05
+        deadline_s = time.monotonic() + 2.0
+        while time.monotonic() < deadline_s:
+            app.processEvents()
+            second = panel.pixhawk_rtcm_worker
+            if second is not None and second is not first:
+                break
+            time.sleep(0.005)
         second_thread = panel.pixhawk_rtcm_thread
         assert second is not None and second_thread is not None
         threads.append(second_thread)

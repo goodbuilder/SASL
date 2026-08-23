@@ -389,12 +389,15 @@ def test_seven_comparison_workers_run_independently_and_timed_out_worker_restart
     )
     primary_seen_at: float | None = None
     bundle = None
+    poll_durations: list[float] = []
     started_at = time.monotonic()
     try:
         assert coordinator.submit(_blocked_requests(1)).accepted is True
         deadline = started_at + 8.0
         while time.monotonic() < deadline and bundle is None:
+            poll_started_s = time.monotonic()
             polled = coordinator.poll()
+            poll_durations.append(time.monotonic() - poll_started_s)
             if polled.primary_outcomes and primary_seen_at is None:
                 primary_seen_at = time.monotonic()
             if polled.completed_bundles:
@@ -412,8 +415,61 @@ def test_seven_comparison_workers_run_independently_and_timed_out_worker_restart
             if outcome.method_id != "horizon_hybrid"
         )
         assert coordinator.worker_generations["horizon_hybrid"] >= 2
+        assert max(poll_durations, default=0.0) < 0.05
     finally:
+        close_started_s = time.monotonic()
         coordinator.close()
+        assert time.monotonic() - close_started_s < 0.05
+        assert coordinator.wait_closed(10.0)
+
+
+def test_gui_bundle_commit_reuses_worker_geometry_without_recalculation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from Workstation import measurement_view_controller
+
+    attempt = _attempt()
+    base = evaluate_method_request(
+        _request(attempt_payload=attempt.canonical_payload()),
+        worker_started_monotonic_ns=2_000,
+    )
+    outcomes = tuple(
+        replace(
+            base,
+            method_id=method_id,
+            method_instance_id=f"{method_id}:worker",
+        )
+        for method_id in MEASUREMENT_METHOD_IDS
+    )
+    bundle = MethodEvaluationBundle(
+        measurement_id=base.measurement_id,
+        pair_id=base.pair_id,
+        pair_sequence=base.pair_sequence,
+        snapshot_sha256=base.snapshot_sha256,
+        request_generation=base.request_generation,
+        outcomes=outcomes,
+    )
+    history: list[dict[str, object]] = []
+    panel = SimpleNamespace(
+        _method_evaluation_committed=set(),
+        method_evaluation_bundle_rows=[],
+        distance_recording_enabled=True,
+        _measurement_method_result_counters={},
+        _append_distance_history=lambda **kwargs: history.append(kwargs),
+        _record_unresolved_pair=lambda *_args, **_kwargs: None,
+        _set_distance_text=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        measurement_view_controller,
+        "calculate_measurement_geometry",
+        lambda _attempt: (_ for _ in ()).throw(AssertionError("GUI recalculation forbidden")),
+    )
+
+    MeasurementViewController(panel)._commit_method_evaluation_bundle(bundle)
+
+    assert len(history) == 1
+    assert history[0]["distance_m"] == pytest.approx(9.0, rel=1e-3)
+    assert len(panel.method_evaluation_bundle_rows) == 1
 
 
 def test_atomic_bundle_materializes_eight_verified_method_jsonl_streams(tmp_path) -> None:

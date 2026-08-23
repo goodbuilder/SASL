@@ -258,6 +258,8 @@ def test_calibration_workspace_separates_live_and_ftp_previews_with_actions_belo
     )
     assert set(workspace.camera_buttons) == {"camera.toggle"}
     assert workspace.zoom_set_button.text() == "Set both"
+    assert workspace.zoom_in_button.text() == "Zoom-in"
+    assert workspace.zoom_out_button.text() == "Zoom-out"
     assert workspace.zoom_level_spin.minimum() == 0
     workspace.zoom_level_spin.setValue(0)
     assert workspace.zoom_level_spin.value() == 0
@@ -401,6 +403,27 @@ def test_calibration_workspace_shows_zoom_index_and_actual_ratio() -> None:
     workspace.refresh({})
 
     assert "actual=left=14 (30×), right=14 (30×)" in workspace.zoom_readback_label.text()
+    workspace.deleteLater()
+    app.processEvents()
+
+
+def test_calibration_actual_zoom_buttons_send_both_and_show_pending_readback() -> None:
+    from Workstation.workspaces import CalibrationWorkspace
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    workspace = CalibrationWorkspace(backend, lambda: None, lambda _command_id: True)
+
+    backend.calls.clear()
+    workspace.zoom_in_button.click()
+    assert backend.calls == [("advanced_zoom", "both", "in", None)]
+    assert workspace.zoom_readback_label.text() == "Requested Zoom-in for both; GZVV readback pending"
+
+    backend.calls.clear()
+    workspace.zoom_out_button.click()
+    assert backend.calls == [("advanced_zoom", "both", "out", None)]
+    assert workspace.zoom_readback_label.text() == "Requested Zoom-out for both; GZVV readback pending"
+
     workspace.deleteLater()
     app.processEvents()
 
@@ -863,6 +886,34 @@ def test_wiris_command_and_zoom_workers_keep_tcp_io_off_ui_path(monkeypatch) -> 
     assert sent == ["HIWS", "SZIN"]
     assert command_results[0]["statuses"] == {"left": "OK"}
     assert zoom_results == [[{"label": "right", "state": "sent", "command": "SZIN", "response": "OK"}]]
+
+
+def test_zoom_in_result_schedules_actual_zoom_readback() -> None:
+    from Workstation.wiris_control_controller import WirisControlController
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = SimpleNamespace(
+        actual_visible_zoom={"left": {}, "right": {}},
+        zoom_status_label=QtWidgets.QLabel(),
+        _camera_name_ko=lambda label: label,
+        _log=lambda _text: None,
+    )
+    controller = WirisControlController(panel)
+
+    controller._apply_wiris_zoom_result(
+        "both",
+        "in",
+        [
+            {"label": "left", "state": "sent", "command": "SZIN", "response": "OK"},
+            {"label": "right", "state": "sent", "command": "SZIN", "response": "OK"},
+        ],
+    )
+
+    assert panel._zoom_readback_target == "both"
+    assert "left: SZIN 응답=OK" in panel.zoom_status_label.text()
+    assert "right: SZIN 응답=OK" in panel.zoom_status_label.text()
+    panel.zoom_status_label.deleteLater()
+    app.processEvents()
 
 def test_checkerboard_pair_timing_allows_100ms_but_rejects_larger() -> None:
     from Workstation.calibration_controller import (

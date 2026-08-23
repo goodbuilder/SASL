@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
+
+from PyQt5 import QtCore, QtWidgets
 
 from Workstation.camera_stream_controller import CameraStreamLifecycleController
 from Workstation.measurement_package_controller import MeasurementPackageController
@@ -494,6 +497,7 @@ def test_controller_reopens_a_recoverable_working_package_after_restart(tmp_path
 
 
 def test_finalize_waits_for_stable_videos_then_registers_probe_evidence(tmp_path: Path) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     panel = _panel(tmp_path)
     panel._measurement_package_verify_media = True
     panel._measurement_package_video_probe_runner = lambda *_args, **_kwargs: SimpleNamespace(
@@ -525,7 +529,13 @@ def test_finalize_waits_for_stable_videos_then_registers_probe_evidence(tmp_path
 
     assert controller.finalize_measurement_package() is False
     assert "stable" in controller.measurement_package_snapshot()["detail"]
-    assert controller._continue_measurement_package_finalization() is True
+    finalized = controller._continue_measurement_package_finalization()
+    deadline_s = time.monotonic() + 2.0
+    while not finalized and time.monotonic() < deadline_s:
+        app.processEvents()
+        time.sleep(0.01)
+        finalized = controller._continue_measurement_package_finalization()
+    assert finalized is True
 
     manifest = controller.measurement_package_snapshot()
     videos = [
@@ -535,3 +545,62 @@ def test_finalize_waits_for_stable_videos_then_registers_probe_evidence(tmp_path
     ]
     assert {row["source"] for row in videos} == {"camera.left", "camera.right"}
     assert all(row["metadata"]["codec"] == "h264" for row in videos)
+
+
+def test_full_video_decode_worker_keeps_gui_timer_running(tmp_path: Path) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = _panel(tmp_path)
+    panel.recording_session_id = "decode-session"
+    panel._measurement_package_verify_media = True
+    panel._measurement_package_full_video_decode = True
+    root = panel._recording_session_dir(panel.recording_session_id)
+    (root / "video").mkdir(parents=True)
+    for side in ("left", "right"):
+        (root / "video" / f"raw_{side}.mp4").write_bytes(b"video-sentinel")
+    panel._measurement_package_video_probe_runner = lambda *_args, **_kwargs: SimpleNamespace(
+        returncode=0,
+        stderr="",
+        stdout=json.dumps(
+            {
+                "streams": [
+                    {
+                        "index": 0,
+                        "codec_type": "video",
+                        "codec_name": "h264",
+                        "width": 640,
+                        "height": 480,
+                        "avg_frame_rate": "30/1",
+                        "nb_frames": "3",
+                        "duration": "0.1",
+                    }
+                ],
+                "format": {"format_name": "mov,mp4", "duration": "0.1"},
+            }
+        ),
+    )
+
+    def slow_decode(*_args, **_kwargs):
+        time.sleep(0.15)
+        return SimpleNamespace(returncode=0, stderr=b"")
+
+    panel._measurement_package_video_decode_runner = slow_decode
+    controller = MeasurementPackageController(panel)
+    ticks: list[float] = []
+    timer = QtCore.QTimer()
+    timer.setInterval(10)
+    timer.timeout.connect(lambda: ticks.append(time.monotonic()))
+    timer.start()
+
+    started_s = time.monotonic()
+    assert controller._ensure_video_evidence_verified() is False
+    assert time.monotonic() - started_s < 0.05
+    ready = False
+    deadline_s = time.monotonic() + 2.0
+    while not ready and time.monotonic() < deadline_s:
+        app.processEvents()
+        ready = controller._ensure_video_evidence_verified()
+        time.sleep(0.005)
+    timer.stop()
+
+    assert ready is True
+    assert len(ticks) >= 10

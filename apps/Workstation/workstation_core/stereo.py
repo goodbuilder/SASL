@@ -71,27 +71,60 @@ class DetectionObservation:
         best = payload.get("best_detection")
         if not isinstance(best, Mapping):
             return None
+        required_payload = ("timestamp_s", "width", "height")
+        required_detection = ("x1", "y1", "x2", "y2", "confidence", "class_id")
+        if any(payload.get(name) is None for name in required_payload) or any(
+            best.get(name) is None for name in required_detection
+        ):
+            return None
         candidates = payload.get("detections")
-        candidate_class_ids = tuple(
-            int(candidate["class_id"])
-            for candidate in candidates
-            if isinstance(candidate, Mapping) and candidate.get("class_id") is not None
-        ) if isinstance(candidates, (list, tuple)) else ()
-        return cls(
-            camera=camera,
-            timestamp_s=float(payload["timestamp_s"]),
-            width=int(payload["width"]),
-            height=int(payload["height"]),
-            x1=float(best["x1"]),
-            y1=float(best["y1"]),
-            x2=float(best["x2"]),
-            y2=float(best["y2"]),
-            confidence=float(best["confidence"]),
-            class_id=int(best["class_id"]),
-            class_name=str(best["class_name"]) if best.get("class_name") is not None else None,
-            timestamp_metadata=_materialize_timestamp_metadata(
+        try:
+            candidate_class_ids = tuple(
+                int(candidate.get("class_id"))
+                for candidate in candidates
+                if isinstance(candidate, Mapping)
+                and candidate.get("class_id") is not None
+            ) if isinstance(candidates, (list, tuple)) else ()
+            timestamp_s = float(payload.get("timestamp_s"))
+            width = int(payload.get("width"))
+            height = int(payload.get("height"))
+            x1 = float(best.get("x1"))
+            y1 = float(best.get("y1"))
+            x2 = float(best.get("x2"))
+            y2 = float(best.get("y2"))
+            confidence = float(best.get("confidence"))
+            class_id = int(best.get("class_id"))
+            timestamp_metadata = _materialize_timestamp_metadata(
                 payload.get("timestamp_metadata")
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+        numeric_values = (timestamp_s, x1, y1, x2, y2, confidence)
+        if (
+            width <= 0
+            or height <= 0
+            or not all(isfinite(value) for value in numeric_values)
+            or x2 < x1
+            or y2 < y1
+        ):
+            return None
+        return cls(
+            camera=str(camera),
+            timestamp_s=timestamp_s,
+            width=width,
+            height=height,
+            x1=x1,
+            y1=y1,
+            x2=x2,
+            y2=y2,
+            confidence=confidence,
+            class_id=class_id,
+            class_name=(
+                str(best.get("class_name"))
+                if best.get("class_name") is not None
+                else None
             ),
+            timestamp_metadata=timestamp_metadata,
             candidate_class_ids=candidate_class_ids,
         )
 

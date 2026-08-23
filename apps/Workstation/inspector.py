@@ -544,11 +544,20 @@ class InspectorWidget(QtWidgets.QWidget):
         candidate = self._selected_geometry_candidate()
         applicable = bool(candidate and candidate.get("applicable", True))
         observable = candidate.get("observable_dof") if isinstance(candidate, Mapping) else {}
-        has_dof = bool(
-            isinstance(observable, Mapping)
-            and any(bool(value) for value in observable.values())
+        optimized = candidate.get("optimized_dof") if isinstance(candidate, Mapping) else {}
+        owned = optimized if isinstance(optimized, Mapping) else observable
+        owned_names = (
+            tuple(str(name) for name, enabled in owned.items() if bool(enabled))
+            if isinstance(owned, Mapping)
+            else ()
         )
-        self.geometry_apply_candidate_button.setEnabled(applicable and has_dof)
+        apply_ready = bool(
+            applicable
+            and owned_names
+            and isinstance(observable, Mapping)
+            and all(bool(observable.get(name, False)) for name in owned_names)
+        )
+        self.geometry_apply_candidate_button.setEnabled(apply_ready)
         active = bool(self._optical_pose_snapshot.get("active_selection_id"))
         self.geometry_revert_button.setEnabled(active)
         calibration_state = str(
@@ -563,23 +572,9 @@ class InspectorWidget(QtWidgets.QWidget):
         candidate = self._selected_geometry_candidate()
         if not isinstance(candidate, Mapping):
             return
-        raw = candidate.get("observable_dof")
-        if not isinstance(raw, Mapping):
-            return
-        aliases = {
-            "roll_deg": "roll",
-            "pitch_deg": "pitch",
-            "yaw_deg": "yaw",
-            "north_m": "north",
-            "east_m": "east",
-            "down_m": "down",
-        }
         self.command_requested.emit(
             "alignment.pose.apply_candidate",
-            {
-                "candidate_id": str(candidate.get("candidate_id") or ""),
-                "dof": {external: bool(raw.get(internal, False)) for internal, external in aliases.items()},
-            },
+            {"candidate_id": str(candidate.get("candidate_id") or "")},
         )
 
     def _request_geometry_revert(self) -> None:

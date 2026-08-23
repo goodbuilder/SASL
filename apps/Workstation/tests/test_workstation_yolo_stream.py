@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+import multiprocessing
+import os
 import queue
+import signal
+import threading
+import time
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
+from PyQt5 import QtCore
 
 from Workstation.workstation_core.yolo_stream import (
     AdaptiveYoloRateLimiter,
     DEFAULT_CPU_YOLO_ADAPTIVE_MAX_RATE_HZ,
     DEFAULT_CPU_YOLO_INITIAL_RATE_HZ,
     DEFAULT_PREVIEW_DISPLAY_RATE_HZ,
+    RollingFrameRateEstimator,
     YoloStreamWorker,
     _BoundedProcessOutputQueue,
     _activate_cpu_fallback_rate_limiter,
@@ -16,6 +26,16 @@ from Workstation.workstation_core.yolo_stream import (
     filter_detections_by_class_gate,
     DetectionBox,
 )
+
+
+def _crash_once_then_publish_live(config, output_queue, stop_event) -> None:
+    marker = Path(str(config["_supervisor_test_marker"]))
+    if not marker.exists():
+        marker.write_text(str(os.getpid()), encoding="utf-8")
+        os.kill(os.getpid(), signal.SIGKILL)
+    output_queue.put(("status", f"supervisor sentinel live pid={os.getpid()}"))
+    while not stop_event.wait(0.02):
+        pass
 
 
 def test_class_gate_filters_before_highest_confidence_selection() -> None:
@@ -135,6 +155,15 @@ def test_preview_output_rate_limiter_accepts_invalid_or_unlimited_values() -> No
     assert _should_emit_preview_frame({"display_rate_hz": -1.0}, 1.0)
 
 
+def test_decoded_rate_uses_a_rolling_window_and_expires_after_a_gap() -> None:
+    estimator = RollingFrameRateEstimator(window_s=5.0)
+    for index in range(100):
+        estimator.add(index / 20.0)
+
+    assert estimator.rate(5.0) == pytest.approx(19.8)
+    assert estimator.rate(10.1) == 0.0
+
+
 def test_preview_queue_replaces_stale_frame_but_preserves_events() -> None:
     event_queue: queue.Queue = queue.Queue(maxsize=1)
     frame_queue: queue.Queue = queue.Queue(maxsize=1)
@@ -169,3 +198,45 @@ def test_cuda_fallback_activates_cpu_adaptive_rate_limit() -> None:
     assert limiter.target_rate_hz == DEFAULT_CPU_YOLO_INITIAL_RATE_HZ
     assert limiter.max_rate_hz == DEFAULT_CPU_YOLO_ADAPTIVE_MAX_RATE_HZ
     assert worker.config["device"] == "cpu"
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGKILL"), reason="requires SIGKILL")
+def test_stream_supervisor_recovers_after_child_sigkill(tmp_path: Path) -> None:
+    marker = tmp_path / "first-child.pid"
+    worker = YoloStreamWorker(
+        url="rtsp://camera.invalid/visible",
+        weights_path="weights.pt",
+        device="cpu",
+        input_size=640,
+        conf_threshold=0.5,
+        iou_threshold=0.45,
+        max_rate_hz=0.0,
+        enable_detection=False,
+        process_target=_crash_once_then_publish_live,
+        mp_context=multiprocessing.get_context("spawn"),
+        crash_restart_delays_s=(0.05, 0.1, 0.2),
+    )
+    worker.config["_supervisor_test_marker"] = str(marker)
+    statuses: list[str] = []
+    finished: list[bool] = []
+    worker.status_changed.connect(statuses.append, QtCore.Qt.DirectConnection)
+    worker.finished.connect(lambda: finished.append(True), QtCore.Qt.DirectConnection)
+    owner = threading.Thread(target=worker.run, name="yolo-supervisor-test")
+    owner.start()
+    try:
+        deadline_s = time.monotonic() + 5.0
+        while time.monotonic() < deadline_s and not any(
+            "supervisor sentinel live" in status for status in statuses
+        ):
+            time.sleep(0.01)
+
+        assert any("스트림 프로세스 크래시 복구 중" in status for status in statuses)
+        assert any("supervisor sentinel live" in status for status in statuses)
+        child_start_messages = [status for status in statuses if "worker 시작 중: pid=" in status]
+        assert len(child_start_messages) >= 2
+        assert marker.is_file()
+    finally:
+        worker.request_stop()
+        owner.join(5.0)
+    assert not owner.is_alive()
+    assert finished == [True]

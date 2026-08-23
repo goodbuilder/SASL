@@ -43,6 +43,7 @@ from Workstation.workstation_core.wiris_zoom import (
     build_wiris_command,
     build_zoom_command,
     send_tcp_line,
+    WirisControlBusyError,
 )
 from Workstation.workstation_core.yolo_stream import (
     DECODER_AUTO,
@@ -70,6 +71,31 @@ WIRIS_LRF_COMMAND = "GLRD"
 
 
 _LRF_NUMBER_RE = re.compile(r"[-+]?(?:\d+(?:[.,]\d*)?|[.,]\d+)(?:[eE][-+]?\d+)?")
+
+
+def _wait_for_peer_or_continue(
+    barrier: threading.Barrier | None,
+    *,
+    timeout_s: float,
+) -> bool:
+    """Synchronize healthy peers without making one failed side contagious."""
+
+    if barrier is None:
+        return True
+    try:
+        barrier.wait(timeout=max(0.1, float(timeout_s)))
+        return True
+    except threading.BrokenBarrierError:
+        return False
+
+
+def _abort_barrier(barrier: threading.Barrier | None) -> None:
+    if barrier is None:
+        return
+    try:
+        barrier.abort()
+    except threading.BrokenBarrierError:
+        pass
 
 
 def parse_lrf_distance(response: object) -> float | None:
@@ -245,7 +271,10 @@ class WirisClockCommandWorker(QtCore.QObject):
                     compensation_s = one_way_delay_s + parse_margin_s
                 rtt_probe_by_camera[label] = probe
                 if barrier is not None:
-                    barrier.wait(timeout=max(1.0, timeout_s))
+                    _wait_for_peer_or_continue(
+                        barrier,
+                        timeout_s=max(1.0, timeout_s),
+                    )
                     tcp_start_utc_s = time.time()
                     command_time_s = float(shared_command_time.get("unix", tcp_start_utc_s))
                 else:
@@ -267,6 +296,7 @@ class WirisClockCommandWorker(QtCore.QObject):
                 tcp_start_times[label] = time.perf_counter()
                 response = send_tcp_line(command)
             except Exception as exc:
+                _abort_barrier(barrier)
                 results[label] = {
                     "response": f"실패: {exc}",
                     "query_started_utc_s": started_utc_s,
@@ -800,10 +830,14 @@ class WirisCommandWorker(QtCore.QObject):
                     terminator=self.terminator,
                 )
                 if barrier is not None:
-                    barrier.wait(timeout=max(1.0, timeout_s))
+                    _wait_for_peer_or_continue(
+                        barrier,
+                        timeout_s=max(1.0, timeout_s),
+                    )
                 send_times[label] = time.perf_counter()
                 response = send_tcp_line(command)
             except Exception as exc:
+                _abort_barrier(barrier)
                 statuses[label] = f"실패: {exc}"
                 return
             response_text = response or "<no response>"
@@ -1337,7 +1371,10 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
                 # still. Synchronize the host dispatches, but never relabel
                 # this proxy as the unknown camera exposure timestamp.
                 if capture_barrier is not None:
-                    capture_barrier.wait(timeout=max(1.0, timeout_s))
+                    _wait_for_peer_or_continue(
+                        capture_barrier,
+                        timeout_s=max(1.0, timeout_s),
+                    )
                 item["capture_requested_monotonic_ns"] = time.monotonic_ns()
                 item["capture_requested_unix_ns"] = time.time_ns()
                 item["capture_pairing_contract"] = (
@@ -1366,6 +1403,7 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
                         break
                     time.sleep(0.25)
             except Exception as exc:
+                _abort_barrier(capture_barrier)
                 item["error"] = str(exc)
             if item.get("stored_on_camera") and self.ftp_enabled:
                 if ftp_baseline_tokens is None:
@@ -1993,6 +2031,10 @@ class WirisZoomWorker(QtCore.QObject):
                         timeout_s=self.timeout_s,
                     )
                     response = send_tcp_line(command)
+                except WirisControlBusyError as exc:
+                    statuses.append(
+                        {"label": label, "state": "busy", "detail": str(exc)}
+                    )
                 except Exception as exc:
                     statuses.append({"label": label, "state": "failed", "detail": str(exc)})
                 else:
