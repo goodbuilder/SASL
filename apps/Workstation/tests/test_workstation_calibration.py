@@ -258,7 +258,10 @@ def test_calibration_workspace_separates_live_and_ftp_previews_with_actions_belo
     )
     assert set(workspace.camera_buttons) == {"camera.toggle"}
     assert workspace.zoom_set_button.text() == "Set both"
-    assert workspace.zoom_level_spin.value() == 1
+    assert workspace.zoom_level_spin.minimum() == 0
+    workspace.zoom_level_spin.setValue(0)
+    assert workspace.zoom_level_spin.value() == 0
+    assert workspace.zoom_level_spin.toolTip().startswith("WIRIS zoom index")
     assert not hasattr(workspace, "zoom_8x_button")
     assert "calibration.capture_images" in workspace.operation_buttons
     assert (

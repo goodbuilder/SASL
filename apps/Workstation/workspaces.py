@@ -8043,9 +8043,11 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         zoom_group = QtWidgets.QGroupBox("Actual zoom readback")
         zoom_layout = QtWidgets.QHBoxLayout(zoom_group)
         self.zoom_level_spin = QtWidgets.QSpinBox()
-        self.zoom_level_spin.setRange(1, 100)
+        self.zoom_level_spin.setRange(0, 100)
         self.zoom_level_spin.setValue(1)
-        self.zoom_level_spin.setSuffix("×")
+        self.zoom_level_spin.setToolTip(
+            "WIRIS zoom index (index 0 = nominal 1.0x; index 1 = nominal 1.2x)."
+        )
         self.zoom_set_button = QtWidgets.QPushButton("Set both")
         self.zoom_query_button = QtWidgets.QPushButton("GZVV")
         self.zoom_readback_label = QtWidgets.QLabel(
@@ -8061,7 +8063,7 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         self.zoom_query_button.clicked.connect(
             lambda: self._send_calibration_zoom("query", None)
         )
-        zoom_layout.addWidget(QtWidgets.QLabel("Level"))
+        zoom_layout.addWidget(QtWidgets.QLabel("Index"))
         zoom_layout.addWidget(self.zoom_level_spin)
         zoom_layout.addWidget(self.zoom_set_button)
         zoom_layout.addWidget(self.zoom_query_button)
@@ -11388,7 +11390,7 @@ class AdvancedWorkspace(QtWidgets.QWidget):
             (("Both cameras", "both"), ("Left camera", "left"), ("Right camera", "right"))
         )
         self.zoom_level_spin = QtWidgets.QSpinBox()
-        self.zoom_level_spin.setRange(1, 100)
+        self.zoom_level_spin.setRange(0, 100)
         self.zoom_level_spin.setValue(10)
         self.zoom_buttons = {
             "in": self._button("In", "advanced.zoom.in"),
