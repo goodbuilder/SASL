@@ -6,7 +6,7 @@ import inspect
 import hashlib
 import json
 import random
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from PyQt5 import QtCore, QtGui
@@ -25,6 +25,7 @@ from Workstation.workstation_core.calibration_quality import (
     CameraCalibrationQuality,
     evaluate_camera_calibration_quality,
 )
+from Workstation.workstation_core.calibration_input import CalibrationInputSnapshot
 
 
 def _solver_diagnostics_mapping(solve) -> dict[str, object]:
@@ -179,6 +180,7 @@ class CheckerboardCaptureWorker(QtCore.QObject):
         pair_delta_s: float | None,
         pair_timing_detail: str,
         metadata_payload: dict[str, object],
+        timing_evidence: Mapping[str, object] | None = None,
     ) -> None:
         super().__init__()
         self.root = Path(root)
@@ -191,6 +193,7 @@ class CheckerboardCaptureWorker(QtCore.QObject):
         self.pair_delta_s = pair_delta_s
         self.pair_timing_detail = str(pair_timing_detail)
         self.metadata_payload = dict(metadata_payload)
+        self.timing_evidence = dict(timing_evidence or {})
 
     @QtCore.pyqtSlot()
     def run(self) -> None:
@@ -351,6 +354,7 @@ class CheckerboardCaptureWorker(QtCore.QObject):
                     "pair_timing_ok": self.pair_timing_ok,
                     "pair_time_basis": self.pair_time_basis,
                     "pair_delta_s": self.pair_delta_s,
+                    "calibration_timing_evidence": dict(self.timing_evidence),
                     "side_results": side_results,
                 }
             )
@@ -376,11 +380,28 @@ class CheckerboardCalibrationWorker(QtCore.QObject):
         stereo_pairs: Sequence[tuple[str, Path, Path]] | None = None,
         left_paths: Sequence[Path] | None = None,
         right_paths: Sequence[Path] | None = None,
+        input_snapshot: CalibrationInputSnapshot | Mapping[str, object] | None = None,
     ) -> None:
         super().__init__()
-        self.mode = str(mode)
-        resolved_left = left_intrinsic_paths if left_intrinsic_paths is not None else left_paths
-        resolved_right = right_intrinsic_paths if right_intrinsic_paths is not None else right_paths
+        snapshot = (
+            CalibrationInputSnapshot.from_mapping(input_snapshot)
+            if isinstance(input_snapshot, Mapping)
+            else input_snapshot
+        )
+        if snapshot is not None and not isinstance(snapshot, CalibrationInputSnapshot):
+            raise TypeError("input_snapshot must be CalibrationInputSnapshot or mapping")
+        self.input_snapshot = snapshot
+        self.mode = snapshot.mode if snapshot is not None else str(mode)
+        resolved_left = (
+            snapshot.left_paths
+            if snapshot is not None
+            else left_intrinsic_paths if left_intrinsic_paths is not None else left_paths
+        )
+        resolved_right = (
+            snapshot.right_paths
+            if snapshot is not None
+            else right_intrinsic_paths if right_intrinsic_paths is not None else right_paths
+        )
         if resolved_left is None or resolved_right is None:
             raise TypeError(
                 "left/right intrinsic paths are required; pass left_intrinsic_paths and "
@@ -391,7 +412,16 @@ class CheckerboardCalibrationWorker(QtCore.QObject):
         # Compatibility aliases for integrations which inspect the worker.
         self.left_paths = self.left_intrinsic_paths
         self.right_paths = self.right_intrinsic_paths
-        if stereo_pairs is None:
+        if snapshot is not None:
+            supplied_pairs = (
+                tuple((str(key), Path(left), Path(right)) for key, left, right in stereo_pairs)
+                if stereo_pairs is not None
+                else snapshot.pair_paths
+            )
+            if supplied_pairs != snapshot.pair_paths:
+                raise ValueError("worker stereo_pairs differ from calibration input snapshot")
+            self.stereo_pairs = snapshot.pair_paths
+        elif stereo_pairs is None:
             # Legacy callers supplied two parallel lists. Preserve their exact
             # ordering while keeping the new stereo boundary explicit inside
             # the worker.
@@ -439,6 +469,8 @@ class CheckerboardCalibrationWorker(QtCore.QObject):
     @QtCore.pyqtSlot()
     def run(self) -> None:
         try:
+            if self.input_snapshot is not None:
+                self.input_snapshot.verify_files()
             self._emit_progress(
                 "left_intrinsic",
                 0,
@@ -570,6 +602,12 @@ class CheckerboardCalibrationWorker(QtCore.QObject):
                             for key, left_path, right_path in effective_stereo_pairs
                         ],
                     },
+                    "calibration_input_snapshot": (
+                        None if self.input_snapshot is None else self.input_snapshot.to_mapping()
+                    ),
+                    "calibration_input_snapshot_sha256": (
+                        "" if self.input_snapshot is None else self.input_snapshot.snapshot_sha256
+                    ),
                 },
             )
         except Exception as exc:
@@ -591,15 +629,38 @@ class CheckerboardExtrinsicsWorker(QtCore.QObject):
     def __init__(
         self,
         *,
-        left_paths: Sequence[Path],
-        right_paths: Sequence[Path],
+        left_paths: Sequence[Path] | None = None,
+        right_paths: Sequence[Path] | None = None,
         config: CheckerboardConfig,
         left_intrinsics: CameraIntrinsics,
         right_intrinsics: CameraIntrinsics,
+        input_snapshot: CalibrationInputSnapshot | Mapping[str, object] | None = None,
     ) -> None:
         super().__init__()
-        self.left_paths = tuple(Path(path) for path in left_paths)
-        self.right_paths = tuple(Path(path) for path in right_paths)
+        snapshot = (
+            CalibrationInputSnapshot.from_mapping(input_snapshot)
+            if isinstance(input_snapshot, Mapping)
+            else input_snapshot
+        )
+        if snapshot is not None and not isinstance(snapshot, CalibrationInputSnapshot):
+            raise TypeError("input_snapshot must be CalibrationInputSnapshot or mapping")
+        self.input_snapshot = snapshot
+        snapshot_left = () if snapshot is None else tuple(left for _key, left, _right in snapshot.pair_paths)
+        snapshot_right = () if snapshot is None else tuple(right for _key, _left, right in snapshot.pair_paths)
+        supplied_left = None if left_paths is None else tuple(Path(path) for path in left_paths)
+        supplied_right = None if right_paths is None else tuple(Path(path) for path in right_paths)
+        if snapshot is not None:
+            if supplied_left is not None and supplied_left != snapshot_left:
+                raise ValueError("worker left_paths differ from calibration input snapshot")
+            if supplied_right is not None and supplied_right != snapshot_right:
+                raise ValueError("worker right_paths differ from calibration input snapshot")
+            self.left_paths = snapshot_left
+            self.right_paths = snapshot_right
+        else:
+            if supplied_left is None or supplied_right is None:
+                raise TypeError("left_paths and right_paths are required without input_snapshot")
+            self.left_paths = supplied_left
+            self.right_paths = supplied_right
         self.config = config
         self.left_intrinsics = left_intrinsics
         self.right_intrinsics = right_intrinsics
@@ -621,6 +682,8 @@ class CheckerboardExtrinsicsWorker(QtCore.QObject):
             )
 
         try:
+            if self.input_snapshot is not None:
+                self.input_snapshot.verify_files()
             self.progress.emit(
                 {
                     "phase": "stereo_extrinsic_only",

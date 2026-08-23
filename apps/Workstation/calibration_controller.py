@@ -10,7 +10,9 @@ performs no NED/ENU aliasing.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
+import os
 import time
 import uuid
 from dataclasses import replace
@@ -46,6 +48,23 @@ from Workstation.workstation_core.calibration_quality import (
     extract_view_geometry,
     pose_novelty,
 )
+from Workstation.workstation_core.calibration_input import (
+    CalibrationInputSnapshot,
+    build_calibration_input_snapshot,
+)
+from Workstation.workstation_core.calibration_timing import (
+    CAMERA_TIMESTAMP_VERIFIED,
+    EXPOSURE_TIMESTAMP_VERIFIED,
+    HOST_DISPATCH_PROXY,
+    UNKNOWN_TIMING_EVIDENCE,
+    CalibrationTimingEvidence,
+)
+from Workstation.workstation_core.calibration_selection import (
+    CALIBRATION_IMAGE_SUFFIXES,
+    CALIBRATION_SELECTION_SCHEMA,
+    load_calibration_selection_sidecar,
+    resolve_calibration_selection_paths,
+)
 from Workstation.workstation_core.settings import (
     DEFAULT_CALIBRATION_ROOT,
     resolve_settings_path,
@@ -60,8 +79,7 @@ from Workstation.wiris_runtime_workers import (
 
 CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S = 0.100
 CALIBRATION_AUTO_DETECTION_MAX_AGE_S = 2.0
-CALIBRATION_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
-
+_USE_SELECTED_EXTRINSICS = object()
 CALIBRATION_WORKFLOW_METHODS = [
     "_app_relative_path_text",
     "_checkerboard_validation_mode",
@@ -85,6 +103,9 @@ CALIBRATION_WORKFLOW_METHODS = [
     "_checkerboard_intrinsic_delta_px",
     "_checkerboard_validation_stddev",
     "_calibration_quality_allows_action",
+    "_publish_immutable_calibration_file",
+    "_publish_immutable_intrinsics_profile",
+    "_publish_immutable_extrinsics_profile",
     "workstation_calibration_quality_snapshot",
     "run_checkerboard_random_validation",
     "_handle_random_validation_failed",
@@ -95,6 +116,7 @@ CALIBRATION_WORKFLOW_METHODS = [
     "apply_checkerboard_validation_result",
     "apply_intrinsics_to_distance",
     "_checkerboard_config",
+    "_archive_loaded_intrinsics",
     "_calibration_dirs",
     "_intrinsics_storage_base_path",
     "_intrinsics_storage_path",
@@ -102,6 +124,7 @@ CALIBRATION_WORKFLOW_METHODS = [
     "_calibration_image_paths",
     "_next_calibration_capture_stem",
     "_checkerboard_capture_pair_timing",
+    "_checkerboard_capture_pair_timing_evidence",
     "capture_calibration_images",
     "toggle_auto_calibration_capture",
     "start_auto_calibration_capture",
@@ -271,6 +294,38 @@ class CalibrationWorkflowController:
                 capture_id=capture_id,
             )
 
+    def _publish_calibration_ftp_pair_ready(
+        self,
+        *,
+        operation: str,
+        capture_id: str,
+        cameras: Mapping[str, object],
+        frames: Mapping[str, QtGui.QImage | None],
+    ) -> None:
+        """Publish one atomic UI event after both downloaded images decode."""
+
+        paths = {
+            side: str((cameras.get(side) or {}).get("ftp_local_path") or "")
+            if isinstance(cameras.get(side), Mapping)
+            else ""
+            for side in ("left", "right")
+        }
+        dimensions = {
+            side: [int(frames[side].width()), int(frames[side].height())]
+            for side in ("left", "right")
+            if isinstance(frames.get(side), QtGui.QImage) and not frames[side].isNull()
+        }
+        self._publish_calibration_capture_event(
+            {
+                "phase": "ftp_pair_ready",
+                "state": "ready",
+                "paths": paths,
+                "dimensions": dimensions,
+            },
+            operation=operation,
+            capture_id=capture_id,
+        )
+
     def _app_relative_path_text(self, path: str | Path) -> str:
         return portable_workstation_data_path_text(
             path,
@@ -393,13 +448,13 @@ class CalibrationWorkflowController:
                 result[suffix] = path
             return result
 
-        left_by_id = indexed(self.panel._calibration_image_paths_for_root(root, "left"), "left")
-        right_by_id = indexed(self.panel._calibration_image_paths_for_root(root, "right"), "right")
+        left_by_id = indexed(self._calibration_image_paths_for_root(root, "left"), "left")
+        right_by_id = indexed(self._calibration_image_paths_for_root(root, "right"), "right")
         common_keys = sorted(set(left_by_id) & set(right_by_id))
         if common_keys:
             return [(key, left_by_id[key], right_by_id[key]) for key in common_keys]
-        left_paths = self.panel._calibration_image_paths_for_root(root, "left")
-        right_paths = self.panel._calibration_image_paths_for_root(root, "right")
+        left_paths = self._calibration_image_paths_for_root(root, "left")
+        right_paths = self._calibration_image_paths_for_root(root, "right")
         if len(left_paths) == len(right_paths):
             return [
                 (f"ordered-{index:06d}", left, right)
@@ -518,7 +573,7 @@ class CalibrationWorkflowController:
             # not inherit either the current spinner or a previous result's
             # capture zoom when this result has no readback evidence.
             self.panel.last_calibration_zoom_level = None
-        self.panel._active_intrinsics_profile_path = (
+        self.panel._candidate_intrinsics_profile_path = (
             f"memory:checkerboard-validation:{mode}:zoom-"
             f"{self.panel.last_calibration_zoom_level:02d}"
             if self.panel.last_calibration_zoom_level is not None
@@ -625,6 +680,15 @@ class CalibrationWorkflowController:
             source_payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
             source_payload = {}
+        try:
+            archived_path = self._archive_loaded_intrinsics(path)
+        except Exception as exc:
+            self.panel._set_health_label(
+                self.panel.checkerboard_validation_status_label,
+                f"JSON Session 보관 실패: {exc}",
+                "bad",
+            )
+            return
         source_metadata = (
             source_payload.get("metadata")
             if isinstance(source_payload, dict)
@@ -656,10 +720,14 @@ class CalibrationWorkflowController:
             text=text,
             zoom_level=source_zoom_level,
         )
+        # Loading creates a candidate.  Preserve its exact bytes without
+        # changing the identity of any calibration already active at runtime.
+        self.panel._candidate_intrinsics_profile_path = str(archived_path or path)
         self.panel.checkerboard_validation_result_saved = True
         self.panel._set_health_label(
             self.panel.checkerboard_validation_status_label,
-            f"기존 JSON 불러옴: {mode} | {path}",
+            f"기존 JSON 불러옴: {mode} | {path}"
+            + (f" | Session copy={archived_path}" if archived_path is not None else ""),
             "good",
         )
 
@@ -680,6 +748,8 @@ class CalibrationWorkflowController:
     def _select_calibration_pairs(
         self,
         pairs: list[tuple[str, Path, Path]],
+        *,
+        pair_limit: int | None = None,
     ) -> list[tuple[str, Path, Path]]:
         """Select evenly distributed capture pairs for calibration input.
 
@@ -688,7 +758,11 @@ class CalibrationWorkflowController:
         """
 
         candidates = list(pairs)
-        limit = self._calibration_calculation_pair_limit()
+        limit = (
+            self._calibration_calculation_pair_limit()
+            if pair_limit is None
+            else max(0, int(pair_limit))
+        )
         if limit <= 0 or limit >= len(candidates):
             return candidates
         limit = max(3, limit)
@@ -1202,32 +1276,112 @@ class CalibrationWorkflowController:
             self.panel.checkerboard_validation_summary = summary
         return True
 
+    def _publish_immutable_calibration_file(
+        self,
+        source: Path,
+        *,
+        family: str,
+        prefix: str,
+    ) -> Path:
+        """Publish exact profile bytes once under a content-addressed name."""
+
+        payload = Path(source).read_bytes()
+        digest = hashlib.sha256(payload).hexdigest()
+        root, _left_dir, _right_dir = self.panel._calibration_dirs()
+        destination_dir = root / "profiles" / family
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination = destination_dir / f"{prefix}-{digest}.json"
+        if destination.exists():
+            if destination.read_bytes() != payload:
+                raise RuntimeError(
+                    f"immutable calibration hash collision at {destination}"
+                )
+            return destination
+        temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary, destination)
+            except FileExistsError:
+                if destination.read_bytes() != payload:
+                    raise RuntimeError(
+                        f"immutable calibration destination changed at {destination}"
+                    )
+            descriptor = os.open(destination_dir, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return destination
+
+    def _publish_immutable_intrinsics_profile(
+        self,
+        result: StereoIntrinsicsResult,
+        *,
+        metadata: Mapping[str, object],
+    ) -> Path:
+        root, _left_dir, _right_dir = self.panel._calibration_dirs()
+        staging = root / "profiles" / ".staging"
+        staging.mkdir(parents=True, exist_ok=True)
+        temporary = staging / f"intrinsics-{uuid.uuid4().hex}.json"
+        try:
+            save_intrinsics_json(temporary, result, metadata=dict(metadata))
+            return self._publish_immutable_calibration_file(
+                temporary,
+                family="intrinsics",
+                prefix="intrinsics",
+            )
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _publish_immutable_extrinsics_profile(
+        self,
+        profile: StereoExtrinsicsProfile,
+    ) -> Path:
+        root, _left_dir, _right_dir = self.panel._calibration_dirs()
+        staging = root / "profiles" / ".staging"
+        staging.mkdir(parents=True, exist_ok=True)
+        temporary = staging / f"extrinsics-{uuid.uuid4().hex}.json"
+        try:
+            save_stereo_extrinsics_json(temporary, profile)
+            return self._publish_immutable_calibration_file(
+                temporary,
+                family="extrinsics",
+                prefix="extrinsics",
+            )
+        finally:
+            temporary.unlink(missing_ok=True)
+
     def save_checkerboard_validation_result(
         self,
         *,
         quality_warning_confirmed: bool = False,
     ) -> None:
+        self._ensure_calibration_session_root("calculation")
         result = self.panel.checkerboard_validation_result
         if result is None:
             self.panel._set_health_label(self.panel.checkerboard_validation_status_label, "저장할 계산 결과가 없습니다", "warn")
             return
-        if not self._calibration_quality_allows_action(
-            "저장",
-            warning_confirmed=quality_warning_confirmed,
-        ):
-            return
         root, _left_dir, _right_dir = self.panel._calibration_dirs()
         root.mkdir(parents=True, exist_ok=True)
         zoom_level = getattr(self.panel, "last_calibration_zoom_level", None)
-        if zoom_level is None:
-            self.panel._set_health_label(
-                self.panel.checkerboard_validation_status_label,
-                "저장 실패: 계산 결과에 촬영 당시 줌 readback이 없습니다",
-                "bad",
+        quality_state, quality_reasons = self._calibration_quality_state(result)
+        approved = quality_state in {"PASS", "UNASSESSED"} and zoom_level is not None
+        if approved:
+            output = self.panel._intrinsics_storage_path(zoom_level)
+        else:
+            attempts = root / "attempts"
+            attempts.mkdir(parents=True, exist_ok=True)
+            zoom_token = "unknown" if zoom_level is None else f"{int(zoom_level):02d}"
+            state_token = str(quality_state or "unassessed").lower()
+            output = attempts / (
+                f"intrinsics_zoom_{zoom_token}_{state_token}_{time.time_ns()}.json"
             )
-            return
-        zoom_output = self.panel._intrinsics_storage_path(zoom_level)
-        latest_output = self.panel._intrinsics_storage_base_path()
         metadata = {
             "note": "Generated by StereoWIRIS calibration calculation",
             "timestamp_s": time.time(),
@@ -1236,18 +1390,44 @@ class CalibrationWorkflowController:
             "zoom_target": str(self.panel.zoom_target_combo.currentData() or "both"),
             "calculation_mode": self.panel.checkerboard_validation_result_mode,
             "validation": self.panel.checkerboard_validation_summary,
+            "profile_status": "approved" if approved else "attempt_only",
+            "eligible_for_application": bool(approved),
+            "quality_state": quality_state,
+            "quality_reasons": list(quality_reasons),
         }
-        save_intrinsics_json(zoom_output, result, metadata=metadata)
-        if zoom_output != latest_output:
-            save_intrinsics_json(latest_output, result, metadata=metadata)
+        save_intrinsics_json(output, result, metadata=metadata)
         self.panel.checkerboard_validation_result_saved = True
-        self.panel.last_calibration_zoom_level = zoom_level
-        self.panel._add_zoom_intrinsics_comparison_path(zoom_output)
-        self.panel._save_current_settings()
+        self.panel._last_calibration_attempt_path = str(output)
+        if approved:
+            latest_output = self.panel._intrinsics_storage_base_path()
+            if output != latest_output:
+                save_intrinsics_json(latest_output, result, metadata=metadata)
+            immutable_output = self._publish_immutable_intrinsics_profile(
+                result,
+                metadata=metadata,
+            )
+            self.panel.last_calibration_zoom_level = zoom_level
+            self.panel._candidate_intrinsics_profile_path = str(immutable_output)
+            self.panel._add_zoom_intrinsics_comparison_path(immutable_output)
+            self.panel._save_current_settings()
+            message = (
+                f"승인 profile 저장 완료: zoom {int(zoom_level):02d} | "
+                f"immutable={immutable_output} | alias={output}"
+            )
+            level = "good"
+        else:
+            reason = ", ".join(quality_reasons) or (
+                "capture zoom readback missing" if zoom_level is None else quality_state
+            )
+            message = (
+                f"적용 불가 calibration attempt 저장 완료: {quality_state} | "
+                f"{reason} | {output}"
+            )
+            level = "bad" if quality_state == "FAIL" else "warn"
         self.panel._set_health_label(
             self.panel.checkerboard_validation_status_label,
-            f"계산 결과 저장 완료: zoom {zoom_level:02d} | {zoom_output}",
-            "good",
+            message,
+            level,
         )
         self.panel._refresh_operation_header()
         self.panel._refresh_zoom_intrinsics_tab()
@@ -1284,10 +1464,20 @@ class CalibrationWorkflowController:
             return
         self.panel.last_calibration_result = result
         self.panel._set_combo_data(self.panel.distance_mode_combo, mode)
+        explicit_profile = (
+            self._full_checkerboard_result_profile(result, zoom_level=zoom_level)
+            if mode == "checkerboard"
+            else None
+        )
         applied = (
-            self.panel.apply_intrinsics_to_distance(quality_warning_confirmed=True)
+            self.panel.apply_intrinsics_to_distance(
+                quality_warning_confirmed=True,
+                extrinsics_profile_override=explicit_profile,
+            )
             if quality_warning_confirmed
-            else self.panel.apply_intrinsics_to_distance()
+            else self.panel.apply_intrinsics_to_distance(
+                extrinsics_profile_override=explicit_profile,
+            )
         )
         if applied is False:
             return
@@ -1405,6 +1595,7 @@ class CalibrationWorkflowController:
         self,
         *,
         quality_warning_confirmed: bool = False,
+        extrinsics_profile_override: object = _USE_SELECTED_EXTRINSICS,
     ) -> bool:
         panel = self.panel
         if panel.last_calibration_result is None:
@@ -1459,28 +1650,100 @@ class CalibrationWorkflowController:
                     "bad",
                 )
                 return False
-        selected_profile = panel.selected_extrinsics_profile
-        if selected_profile is None and panel.last_calibration_result.extrinsics is not None:
+        candidate_path_text = str(
+            getattr(panel, "_candidate_intrinsics_profile_path", "") or ""
+        )
+        # Lightweight legacy facades may not expose the candidate slot yet.
+        # Reuse their pre-Apply marker only when no active matrix exists, so a
+        # new candidate can never borrow an older active profile identity.
+        if not candidate_path_text and getattr(panel, "active_intrinsics", None) is None:
+            candidate_path_text = str(
+                getattr(panel, "_active_intrinsics_profile_path", "") or ""
+            )
+        current_intrinsics_path = Path(candidate_path_text)
+        if (
+            current_intrinsics_path.is_file()
+            and current_intrinsics_path.parent.name == "intrinsics"
+            and current_intrinsics_path.parent.parent.name == "profiles"
+        ):
+            immutable_intrinsics = current_intrinsics_path
+        else:
+            immutable_intrinsics = self._publish_immutable_intrinsics_profile(
+                panel.last_calibration_result,
+                metadata={
+                    "profile_status": "runtime_applied",
+                    "eligible_for_application": True,
+                    "zoom_level": panel.last_calibration_zoom_level,
+                    "capture_zoom_level": panel.last_calibration_zoom_level,
+                    "quality_state": quality_state,
+                    "quality_reasons": list(quality_reasons),
+                    "quality_warning_confirmed": bool(
+                        quality_state == "WARNING" and quality_warning_confirmed
+                    ),
+                },
+            )
+        panel._candidate_intrinsics_profile_path = str(immutable_intrinsics)
+        selected_profile = (
+            panel.selected_extrinsics_profile
+            if extrinsics_profile_override is _USE_SELECTED_EXTRINSICS
+            else extrinsics_profile_override
+        )
+        if selected_profile is not None and not isinstance(
+            selected_profile, StereoExtrinsicsProfile
+        ):
+            raise TypeError(
+                "extrinsics_profile_override must be StereoExtrinsicsProfile or None"
+            )
+        if (
+            selected_profile is None
+            and extrinsics_profile_override is _USE_SELECTED_EXTRINSICS
+            and panel.last_calibration_result.extrinsics is not None
+        ):
             selected_profile = StereoExtrinsicsProfile(
                 extrinsics=panel.last_calibration_result.extrinsics,
                 source_zoom_level=panel.last_calibration_zoom_level,
                 method="legacy_embedded_checkerboard",
-                source_intrinsics_path=panel._active_intrinsics_profile_path,
+                source_intrinsics_path=panel._candidate_intrinsics_profile_path,
                 source_intrinsics_sha256=intrinsics_content_sha256(
                     panel.last_calibration_result
                 ),
                 profile_id="legacy_embedded_extrinsics",
             )
             panel.selected_extrinsics_profile = selected_profile
-            panel.checkerboard_extrinsics_profile = selected_profile
             panel._selected_extrinsics_profile_path = (
-                f"{panel._active_intrinsics_profile_path}#embedded-extrinsics"
+                f"{panel._candidate_intrinsics_profile_path}#embedded-extrinsics"
             )
+            panel._selected_extrinsics_profile_hash = selected_profile.content_sha256
+        if selected_profile is not None:
+            # Always derive the immutable path from the profile being applied.
+            # Reusing the currently selected path can pair a fresh profile hash
+            # with stale R,t bytes from an earlier candidate.
+            immutable_extrinsics = self._publish_immutable_extrinsics_profile(
+                selected_profile
+            )
+            panel.selected_extrinsics_profile = selected_profile
+            if str(selected_profile.method or "").startswith("optical_pose/"):
+                panel.optical_pose_extrinsics_candidate_profile = selected_profile
+            else:
+                panel.checkerboard_extrinsics_candidate_profile = selected_profile
+            panel._selected_extrinsics_profile_path = str(immutable_extrinsics)
             panel._selected_extrinsics_profile_hash = selected_profile.content_sha256
         panel.active_intrinsics = compose_stereo_calibration(
             panel.last_calibration_result,
             selected_profile,
         )
+        panel.active_extrinsics_profile = selected_profile
+        if selected_profile is None:
+            panel.checkerboard_extrinsics_profile = None
+            panel.optical_pose_extrinsics_profile = None
+        else:
+            if str(selected_profile.method or "").startswith("optical_pose/"):
+                panel.optical_pose_extrinsics_profile = selected_profile
+            else:
+                panel.checkerboard_extrinsics_profile = selected_profile
+        # Apply is the only transition that promotes candidate provenance to
+        # the active K,D identity consumed by Measurement and package export.
+        panel._active_intrinsics_profile_path = str(immutable_intrinsics)
         panel._active_intrinsics_source_zoom_level = panel.last_calibration_zoom_level
         panel._active_intrinsics_profile_hash = intrinsics_content_sha256(
             panel.last_calibration_result
@@ -1524,6 +1787,35 @@ class CalibrationWorkflowController:
         panel._refresh_operation_header()
         return True
 
+    def _full_checkerboard_result_profile(
+        self,
+        result: StereoIntrinsicsResult,
+        *,
+        zoom_level: int,
+    ) -> StereoExtrinsicsProfile:
+        """Bind one full-calibration Apply to that result's own R,t bytes."""
+
+        if result.extrinsics is None:
+            raise ValueError("full checkerboard result has no stereo R,t")
+        profile = StereoExtrinsicsProfile(
+            extrinsics=result.extrinsics,
+            source_zoom_level=int(zoom_level),
+            method="checkerboard_full_result",
+            source_intrinsics_path=str(
+                getattr(self.panel, "_candidate_intrinsics_profile_path", "") or ""
+            ),
+            source_intrinsics_sha256=intrinsics_content_sha256(result),
+            profile_id="full-checkerboard-result",
+            metadata={
+                "application_contract": "exact_full_result_kd_rt_bundle",
+                "calculation_mode": "checkerboard",
+            },
+        )
+        return replace(
+            profile,
+            profile_id=f"full-checkerboard-{profile.content_sha256[:16]}",
+        )
+
     def _checkerboard_config(self) -> CheckerboardConfig:
         return CheckerboardConfig(
             inner_cols=self.panel.calib_cols_spin.value(),
@@ -1540,7 +1832,10 @@ class CalibrationWorkflowController:
         )
         session_root = getattr(self.panel, "_calibration_session_root", None)
         default_root = resolve_settings_path(DEFAULT_CALIBRATION_ROOT, base_dir=self.panel.app_root)
-        if session_root is not None and configured_root == default_root:
+        if session_root is not None and (
+            configured_root == default_root
+            or bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", False))
+        ):
             root = Path(session_root)
         else:
             if session_root is not None:
@@ -1552,28 +1847,76 @@ class CalibrationWorkflowController:
         return root, left_dir, right_dir
 
     def _ensure_calibration_session_root(self, capture_origin: str = "manual") -> Path | None:
-        """Create one timestamped folder for this app's default calibration run."""
+        """Resolve the calibration root for the current lifecycle state.
+
+        Calibration is also a pre-session operation: its output is one of the
+        inputs needed to make a measurement method ready.  When no parent
+        Session is open, use the configured reusable calibration root instead
+        of requiring the very Session that calibration is meant to prepare.
+        Once a Session is open, retain the existing session-owned run layout.
+        """
 
         if not hasattr(self.panel, "calib_dir_edit") or not hasattr(self.panel, "app_root"):
             return None
-        session_key = "auto" if str(capture_origin).strip().lower() == "auto" else "default"
-        session_roots = getattr(self.panel, "_calibration_session_roots", None)
-        if not isinstance(session_roots, dict):
-            session_roots = {}
-        existing = session_roots.get(session_key)
-        if existing is not None:
-            self.panel._calibration_session_root = Path(existing)
-            return Path(existing)
         text = self.panel.calib_dir_edit.text().strip()
         configured_root = (
             resolve_settings_path(text, base_dir=self.panel.app_root)
             if text
             else resolve_settings_path(DEFAULT_CALIBRATION_ROOT, base_dir=self.panel.app_root)
         )
-        default_root = resolve_settings_path(DEFAULT_CALIBRATION_ROOT, base_dir=self.panel.app_root)
-        if configured_root != default_root:
-            return None
-        session_base = default_root
+        hierarchy_enabled = bool(
+            getattr(self.panel, "_measurement_session_hierarchy_enabled", False)
+        )
+        session_id = ""
+        if hierarchy_enabled:
+            session_state = str(
+                getattr(self.panel, "_measurement_session_state", "IDLE") or "IDLE"
+            ).upper()
+            session_id = str(
+                getattr(self.panel, "_measurement_session_id", "")
+                or getattr(self.panel, "recording_session_id", "")
+                or ""
+            )
+            resolver = getattr(self.panel, "_measurement_session_dir", None)
+            if session_state == "OPEN":
+                if not session_id or not callable(resolver):
+                    raise RuntimeError("open Session calibration owner is unavailable")
+                session_base = Path(resolver(session_id)) / "calibration"
+            else:
+                # Pre-session calibration is deliberately reusable and is not
+                # owned by a not-yet-created measurement Session.  Keep the
+                # configured path stable so a later compute action can use the
+                # same photo set selected by the UI.
+                configured_root.mkdir(parents=True, exist_ok=True)
+                write_calibration_session_manifest(
+                    configured_root,
+                    session_kind="calibration_pre_session",
+                    source=f"pre_session:{capture_origin}",
+                )
+                self.panel._log(
+                    f"[캘리브레이션] 세션 전 공용 캘리브레이션 폴더: {configured_root}"
+                )
+                return configured_root
+        else:
+            default_root = resolve_settings_path(DEFAULT_CALIBRATION_ROOT, base_dir=self.panel.app_root)
+            if configured_root != default_root:
+                return None
+            session_base = default_root
+        origin_key = "auto" if str(capture_origin).strip().lower() == "auto" else "default"
+        session_key = f"{session_id}:{origin_key}" if hierarchy_enabled else origin_key
+        session_roots = getattr(self.panel, "_calibration_session_roots", None)
+        if not isinstance(session_roots, dict):
+            session_roots = {}
+        existing = session_roots.get(session_key)
+        if existing is not None:
+            existing_path = Path(existing)
+            try:
+                existing_path.resolve(strict=False).relative_to(session_base.resolve(strict=False))
+            except ValueError:
+                session_roots.pop(session_key, None)
+            else:
+                self.panel._calibration_session_root = existing_path
+                return existing_path
         session_base.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
         candidate = session_base / stamp
@@ -1581,17 +1924,55 @@ class CalibrationWorkflowController:
         while candidate.exists():
             candidate = session_base / f"{stamp}_{suffix:02d}"
             suffix += 1
-        if session_key == "auto":
+        if origin_key == "auto":
             candidate = candidate / "calib_capture" / "AutoCapture"
         candidate.mkdir(parents=True, exist_ok=False)
         session_roots[session_key] = candidate
         self.panel._calibration_session_roots = session_roots
         self.panel._calibration_session_root = candidate
-        write_calibration_session_manifest(candidate, source=session_key)
+        write_calibration_session_manifest(candidate, source=origin_key)
         self.panel._log(
             f"[캘리브레이션] 이번 Workstation {session_key} 캘리브레이션 폴더: {candidate}"
         )
         return candidate
+
+    def _archive_loaded_intrinsics(self, source: Path) -> Path | None:
+        """Copy one operator-loaded intrinsic JSON into the open Session."""
+
+        if not bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", False)):
+            return None
+        session_state = str(
+            getattr(self.panel, "_measurement_session_state", "IDLE") or "IDLE"
+        ).upper()
+        session_id = str(
+            getattr(self.panel, "_measurement_session_id", "")
+            or getattr(self.panel, "recording_session_id", "")
+            or ""
+        )
+        resolver = getattr(self.panel, "_measurement_session_dir", None)
+        if session_state != "OPEN":
+            # A pre-session load remains a valid reusable calibration input;
+            # its bytes will be snapshotted into the measurement package when
+            # that package is later created.
+            return None
+        if not session_id or not callable(resolver):
+            raise RuntimeError("open Session calibration owner is unavailable")
+        calibration_root = self._ensure_calibration_session_root("loaded_intrinsics")
+        if calibration_root is None:
+            return None
+        destination_dir = calibration_root / "loaded_intrinsics"
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination = destination_dir / f"{time.time_ns()}-{source.name}"
+        payload = source.read_bytes()
+        temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(payload)
+                handle.flush()
+            temporary.replace(destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return destination
 
     @staticmethod
     def _prepare_ftp_capture_dirs(root: Path, capture_family: str) -> None:
@@ -1644,39 +2025,236 @@ class CalibrationWorkflowController:
         self.panel.calibration_capture_index = max_index + 1
         return f"{self.panel.calibration_capture_index:03d}"
 
+    def _checkerboard_pair_max_delta_s(self) -> float:
+        """Return the operator-selected Live pair timing gate in seconds."""
+
+        widget = getattr(self.panel, "calibration_pair_max_delta_spin", None)
+        reader = getattr(widget, "value", None)
+        try:
+            if callable(reader):
+                value_s = float(reader()) / 1000.0
+            else:
+                settings = getattr(self.panel, "settings", None)
+                value_s = float(
+                    getattr(
+                        settings,
+                        "calibration_pair_max_delta_s",
+                        CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S,
+                    )
+                )
+        except (TypeError, ValueError, OverflowError):
+            return CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S
+        if not math.isfinite(value_s) or value_s < 0.0:
+            return CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S
+        return min(1.0, value_s)
+
     def _checkerboard_capture_pair_timing(
         self,
         metadata_by_camera: dict[str, dict[str, object]] | None = None,
+        *,
+        maximum_delta_s: float | None = None,
     ) -> tuple[bool, str, float | None, str]:
+        evidence = self._checkerboard_capture_pair_timing_evidence(
+            metadata_by_camera,
+            maximum_delta_s=maximum_delta_s,
+        )
+        compatibility_detail = (
+            "ok"
+            if evidence.pair_persistence_allowed
+            and evidence.evidence_class == CAMERA_TIMESTAMP_VERIFIED
+            else evidence.detail
+        )
+        return (
+            evidence.pair_persistence_allowed,
+            evidence.timestamp_reference,
+            evidence.pair_delta_s,
+            compatibility_detail,
+        )
+
+    def _checkerboard_capture_pair_timing_evidence(
+        self,
+        metadata_by_camera: dict[str, dict[str, object]] | None = None,
+        *,
+        maximum_delta_s: float | None = None,
+    ) -> CalibrationTimingEvidence:
         metadata_by_camera = metadata_by_camera or self.panel.camera_frame_metadata
         left_metadata = metadata_by_camera.get("left") or {}
         right_metadata = metadata_by_camera.get("right") or {}
+        limit_s = (
+            self._checkerboard_pair_max_delta_s()
+            if maximum_delta_s is None
+            else float(maximum_delta_s)
+        )
+        if not math.isfinite(limit_s) or limit_s < 0.0:
+            limit_s = CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S
+
+        def exposure_timestamp(metadata: Mapping[str, object]) -> float | None:
+            if metadata.get("exposure_timestamp_verified") is not True:
+                return None
+            try:
+                if metadata.get("exposure_timestamp_unix_ns") is not None:
+                    return int(metadata["exposure_timestamp_unix_ns"]) * 1.0e-9
+                if metadata.get("exposure_timestamp_unix_s") is not None:
+                    return float(metadata["exposure_timestamp_unix_s"])
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return None
+
+        left_exposure = exposure_timestamp(left_metadata)
+        right_exposure = exposure_timestamp(right_metadata)
+        if left_exposure is not None or right_exposure is not None:
+            if left_exposure is None or right_exposure is None:
+                return CalibrationTimingEvidence(
+                    UNKNOWN_TIMING_EVIDENCE,
+                    False,
+                    False,
+                    False,
+                    "camera-exposure",
+                    None,
+                    limit_s,
+                    "verified exposure timestamp is missing for one camera",
+                )
+            delta_s = right_exposure - left_exposure
+            allowed = abs(delta_s) <= limit_s
+            return CalibrationTimingEvidence(
+                EXPOSURE_TIMESTAMP_VERIFIED,
+                allowed,
+                allowed,
+                True,
+                "camera-exposure",
+                delta_s,
+                limit_s,
+                "verified exposure timestamp pair within gate"
+                if allowed
+                else (
+                    f"exposure timestamp delta {delta_s * 1000.0:.1f} ms exceeds "
+                    f"{limit_s * 1000.0:.1f} ms"
+                ),
+            )
+
+        left_ftp_id = str(left_metadata.get("ftp_capture_id") or "")
+        right_ftp_id = str(right_metadata.get("ftp_capture_id") or "")
+        if left_ftp_id or right_ftp_id:
+            contract = "same_capture_id_and_synchronized_cptr_dispatch_v1"
+            if not left_ftp_id or left_ftp_id != right_ftp_id:
+                return CalibrationTimingEvidence(
+                    HOST_DISPATCH_PROXY, False, False, False,
+                    "ftp-cptr-dispatch", None, limit_s, "FTP capture_id mismatch",
+                )
+            if (
+                left_metadata.get("capture_pairing_contract") != contract
+                or right_metadata.get("capture_pairing_contract") != contract
+            ):
+                return CalibrationTimingEvidence(
+                    HOST_DISPATCH_PROXY,
+                    False,
+                    False,
+                    False,
+                    "ftp-cptr-dispatch",
+                    None,
+                    limit_s,
+                    "FTP still lacks the synchronized CPTR dispatch pairing contract",
+                )
+            timestamp_fields = (
+                ("capture_requested_monotonic_ns", 1.0e-9, "ftp-cptr-dispatch-monotonic"),
+                ("capture_requested_unix_ns", 1.0e-9, "ftp-cptr-dispatch-unix"),
+            )
+            for field, scale, basis in timestamp_fields:
+                try:
+                    left_value = int(left_metadata.get(field))
+                    right_value = int(right_metadata.get(field))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if left_value <= 0 or right_value <= 0:
+                    continue
+                delta_s = (right_value - left_value) * scale
+                if abs(delta_s) > limit_s:
+                    return CalibrationTimingEvidence(
+                        HOST_DISPATCH_PROXY,
+                        False,
+                        False,
+                        False,
+                        basis,
+                        delta_s,
+                        limit_s,
+                        (
+                            f"FTP CPTR dispatch delta {delta_s * 1000.0:.1f} ms exceeds "
+                            f"{limit_s * 1000.0:.1f} ms; exposure timestamps remain unknown"
+                        ),
+                    )
+                return CalibrationTimingEvidence(
+                    HOST_DISPATCH_PROXY,
+                    True,
+                    False,
+                    False,
+                    basis,
+                    delta_s,
+                    limit_s,
+                    (
+                        "same FTP capture_id; synchronized CPTR dispatch within gate; "
+                        "camera exposure timestamps unknown"
+                    ),
+                )
+            return CalibrationTimingEvidence(
+                HOST_DISPATCH_PROXY,
+                False,
+                False,
+                False,
+                "ftp-cptr-dispatch",
+                None,
+                limit_s,
+                "FTP still lacks per-camera CPTR dispatch timestamps",
+            )
+
         left_timestamp = self.panel._camera_rtc_timestamp_s_from_metadata(left_metadata)
         right_timestamp = self.panel._camera_rtc_timestamp_s_from_metadata(right_metadata)
         if left_timestamp is None or right_timestamp is None:
-            return (
+            return CalibrationTimingEvidence(
+                UNKNOWN_TIMING_EVIDENCE,
+                False,
+                False,
                 False,
                 "rtcp-ntp",
                 None,
+                limit_s,
                 "missing RTCP/NTP camera timestamp for left or right frame",
             )
         try:
             left_value = float(left_timestamp)
             right_value = float(right_timestamp)
         except (TypeError, ValueError, OverflowError):
-            return False, "rtcp-ntp", None, "invalid RTCP/NTP camera timestamp"
+            return CalibrationTimingEvidence(
+                UNKNOWN_TIMING_EVIDENCE, False, False, False,
+                "rtcp-ntp", None, limit_s, "invalid RTCP/NTP camera timestamp",
+            )
         if not math.isfinite(left_value) or not math.isfinite(right_value):
-            return False, "rtcp-ntp", None, "non-finite RTCP/NTP camera timestamp"
+            return CalibrationTimingEvidence(
+                UNKNOWN_TIMING_EVIDENCE, False, False, False,
+                "rtcp-ntp", None, limit_s, "non-finite RTCP/NTP camera timestamp",
+            )
         delta_s = right_value - left_value
-        if abs(delta_s) > CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S:
-            return (
+        if abs(delta_s) > limit_s:
+            return CalibrationTimingEvidence(
+                CAMERA_TIMESTAMP_VERIFIED,
+                False,
+                False,
                 False,
                 "rtcp-ntp",
                 delta_s,
+                limit_s,
                 f"RTCP/NTP pair delta {delta_s * 1000.0:.1f} ms exceeds "
-                f"{CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S * 1000.0:.1f} ms",
+                f"{limit_s * 1000.0:.1f} ms",
             )
-        return True, "rtcp-ntp", delta_s, "ok"
+        return CalibrationTimingEvidence(
+            CAMERA_TIMESTAMP_VERIFIED,
+            True,
+            True,
+            False,
+            "rtcp-ntp",
+            delta_s,
+            limit_s,
+            "ok",
+        )
 
     def capture_calibration_images(
         self,
@@ -1739,14 +2317,28 @@ class CalibrationWorkflowController:
         available, error = opencv_available()
         config = self.panel._checkerboard_config() if available else None
         pair_candidate = frames["left"] is not None and frames["right"] is not None
-        pair_timing_ok = False
-        pair_time_basis = "rtcp-ntp"
-        pair_delta_s: float | None = None
-        pair_timing_detail = "single-camera capture"
-        if pair_candidate:
-            pair_timing_ok, pair_time_basis, pair_delta_s, pair_timing_detail = self.panel._checkerboard_capture_pair_timing(
-                metadata_by_camera
+        pair_max_delta_s = self._checkerboard_pair_max_delta_s()
+        timing_evidence = (
+            self._checkerboard_capture_pair_timing_evidence(
+                metadata_by_camera,
+                maximum_delta_s=pair_max_delta_s,
             )
+            if pair_candidate
+            else CalibrationTimingEvidence(
+                UNKNOWN_TIMING_EVIDENCE,
+                False,
+                False,
+                False,
+                "none",
+                None,
+                pair_max_delta_s,
+                "single-camera capture",
+            )
+        )
+        pair_timing_ok = timing_evidence.pair_persistence_allowed
+        pair_time_basis = timing_evidence.timestamp_reference
+        pair_delta_s = timing_evidence.pair_delta_s
+        pair_timing_detail = timing_evidence.detail
         zoom_snapshot = self._capture_zoom_snapshot()
         self.panel.last_capture_zoom_level = zoom_snapshot.get("capture_zoom_level")
         metadata_payload = {
@@ -1754,14 +2346,20 @@ class CalibrationWorkflowController:
             "capture_recorded_unix_ns": time.time_ns(),
             "pair_time_basis": pair_time_basis,
             "pair_delta_s": pair_delta_s,
-            "pair_max_delta_s": CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S,
+            "pair_max_delta_s": pair_max_delta_s,
             "pair_timing_status": pair_timing_detail,
+            "calibration_timing_evidence": timing_evidence.to_mapping(),
+            "timing_evidence_class": timing_evidence.evidence_class,
+            "pair_persistence_allowed": timing_evidence.pair_persistence_allowed,
+            "precision_timing_qualified": timing_evidence.precision_qualified,
+            "actual_exposure_verified": timing_evidence.actual_exposure_verified,
             "left_rtcp_frame_ntp_unix_s": (metadata_by_camera.get("left") or {}).get("rtcp_frame_ntp_unix_s"),
             "right_rtcp_frame_ntp_unix_s": (metadata_by_camera.get("right") or {}).get("rtcp_frame_ntp_unix_s"),
             "frame_contract": (
                 "OpenCV source image pixels (x right, y down); no application resize/crop/overlay; "
                 "native/preview/saved grids are explicit per side; "
-                "stereo timing uses RTCP/NTP camera timestamp before saving a left/right pair"
+                f"stereo pairing gate uses {pair_time_basis}; FTP CPTR dispatch is a host-side "
+                "pairing proxy and never an exposure timestamp"
             ),
             "frame_grid_by_side": {
                 side: {
@@ -1818,6 +2416,7 @@ class CalibrationWorkflowController:
             pair_delta_s=pair_delta_s,
             pair_timing_detail=pair_timing_detail,
             metadata_payload=metadata_payload,
+            timing_evidence=timing_evidence.to_mapping(),
         )
         for side in ("left", "right"):
             self._publish_calibration_capture_event(
@@ -1953,6 +2552,12 @@ class CalibrationWorkflowController:
                 )
                 return
             frames[side] = image
+        self._publish_calibration_ftp_pair_ready(
+            operation="Capture HR Still (FTP)",
+            capture_id=capture_id,
+            cameras=cameras,
+            frames=frames,
+        )
         self.panel._log(f"[캘리브레이션] WIRIS FTP Capture {capture_id}: 다운로드 완료, 캘리브레이션 저장 시작")
         self.panel.capture_calibration_images(
             frames=frames,
@@ -2059,6 +2664,10 @@ class CalibrationWorkflowController:
                 "ftp_capture_id": capture_id,
                 "ftp_remote_path": str(item.get("ftp_remote_path") or ""),
                 "capture_requested_unix_ns": item.get("capture_requested_unix_ns"),
+                "capture_requested_monotonic_ns": item.get(
+                    "capture_requested_monotonic_ns"
+                ),
+                "capture_pairing_contract": item.get("capture_pairing_contract"),
                 "capture_completed_unix_ns": item.get("capture_completed_unix_ns"),
                 "ftp_download_finished_unix_ns": item.get("finished_unix_ns"),
                 "native_width": image.width() if isinstance(image, QtGui.QImage) else 0,
@@ -2167,6 +2776,12 @@ class CalibrationWorkflowController:
                 )
                 return
             frames[side] = image
+        self._publish_calibration_ftp_pair_ready(
+            operation="Capture OZ Still (FTP)",
+            capture_id=capture_id,
+            cameras=cameras,
+            frames=frames,
+        )
         self.panel._log(f"[캘리브레이션] WIRIS FTP (OZ) Capture {capture_id}: 다운로드 완료, 캘리브레이션 저장 시작")
         self.panel.capture_calibration_images(
             frames=frames,
@@ -2360,9 +2975,40 @@ class CalibrationWorkflowController:
         rounds.append(
             {
                 "capture_id": capture_id,
-                "requested_at_unix_ns": time.time_ns(),
-                "left": {"stored_on_camera": left_ok, "state": (cameras.get("left") or {}).get("state")},
-                "right": {"stored_on_camera": right_ok, "state": (cameras.get("right") or {}).get("state")},
+                "requested_at_unix_ns": min(
+                    (
+                        int((cameras.get(side) or {}).get("capture_requested_unix_ns"))
+                        for side in ("left", "right")
+                        if (cameras.get(side) or {}).get("capture_requested_unix_ns")
+                    ),
+                    default=time.time_ns(),
+                ),
+                "left": {
+                    "stored_on_camera": left_ok,
+                    "state": (cameras.get("left") or {}).get("state"),
+                    "capture_requested_unix_ns": (cameras.get("left") or {}).get(
+                        "capture_requested_unix_ns"
+                    ),
+                    "capture_requested_monotonic_ns": (cameras.get("left") or {}).get(
+                        "capture_requested_monotonic_ns"
+                    ),
+                    "capture_pairing_contract": (cameras.get("left") or {}).get(
+                        "capture_pairing_contract"
+                    ),
+                },
+                "right": {
+                    "stored_on_camera": right_ok,
+                    "state": (cameras.get("right") or {}).get("state"),
+                    "capture_requested_unix_ns": (cameras.get("right") or {}).get(
+                        "capture_requested_unix_ns"
+                    ),
+                    "capture_requested_monotonic_ns": (cameras.get("right") or {}).get(
+                        "capture_requested_monotonic_ns"
+                    ),
+                    "capture_pairing_contract": (cameras.get("right") or {}).get(
+                        "capture_pairing_contract"
+                    ),
+                },
                 "synchronized": synchronized,
                 "downloaded": False,
                 "left_remote_name": None,
@@ -2588,15 +3234,29 @@ class CalibrationWorkflowController:
             lifecycle = {
                 "left": {
                     "ftp_remote_path": left_name,
-                    "capture_requested_unix_ns": None
-                    if row is None
-                    else row.get("requested_at_unix_ns"),
+                    "capture_requested_unix_ns": None if row is None else (
+                        (row.get("left") or {}).get("capture_requested_unix_ns")
+                        or row.get("requested_at_unix_ns")
+                    ),
+                    "capture_requested_monotonic_ns": None if row is None else (
+                        (row.get("left") or {}).get("capture_requested_monotonic_ns")
+                    ),
+                    "capture_pairing_contract": None if row is None else (
+                        (row.get("left") or {}).get("capture_pairing_contract")
+                    ),
                 },
                 "right": {
                     "ftp_remote_path": right_name,
-                    "capture_requested_unix_ns": None
-                    if row is None
-                    else row.get("requested_at_unix_ns"),
+                    "capture_requested_unix_ns": None if row is None else (
+                        (row.get("right") or {}).get("capture_requested_unix_ns")
+                        or row.get("requested_at_unix_ns")
+                    ),
+                    "capture_requested_monotonic_ns": None if row is None else (
+                        (row.get("right") or {}).get("capture_requested_monotonic_ns")
+                    ),
+                    "capture_pairing_contract": None if row is None else (
+                        (row.get("right") or {}).get("capture_pairing_contract")
+                    ),
                 },
             }
             queue.append(
@@ -2710,123 +3370,111 @@ class CalibrationWorkflowController:
         return root / "calibration_pair_selection.json"
 
     def _load_calibration_pair_selection(self) -> dict[str, object]:
-        empty: dict[str, object] = {
-            "manual_mode": False,
-            "included_keys": [],
-            "left_paths": [],
-            "right_paths": [],
-            "excluded_left_paths": [],
-            "excluded_right_paths": [],
-            "excluded_pair_keys": [],
-        }
         path = self.panel._calibration_pair_selection_path()
-        if not path.exists():
-            return empty
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return empty
-        if not isinstance(data, dict):
-            return empty
-        raw_left_paths = data.get("left_paths", [])
-        raw_right_paths = data.get("right_paths", [])
-        if not isinstance(raw_left_paths, (list, tuple)):
-            raw_left_paths = []
-        if not isinstance(raw_right_paths, (list, tuple)):
-            raw_right_paths = []
-        raw_keys = data.get("included_keys", [])
-        if not isinstance(raw_keys, (list, tuple)):
-            raw_keys = []
-        raw_excluded_left = data.get("excluded_left_paths", [])
-        raw_excluded_right = data.get("excluded_right_paths", [])
-        raw_excluded_pairs = data.get("excluded_pair_keys", [])
-        if not isinstance(raw_excluded_left, (list, tuple)):
-            raw_excluded_left = []
-        if not isinstance(raw_excluded_right, (list, tuple)):
-            raw_excluded_right = []
-        if not isinstance(raw_excluded_pairs, (list, tuple)):
-            raw_excluded_pairs = []
-        return {
-            "manual_mode": bool(data.get("manual_mode", False)),
-            "included_keys": [str(key) for key in raw_keys],
-            "left_paths": [str(path) for path in raw_left_paths],
-            "right_paths": [str(path) for path in raw_right_paths],
-            "excluded_left_paths": [str(path) for path in raw_excluded_left],
-            "excluded_right_paths": [str(path) for path in raw_excluded_right],
-            "excluded_pair_keys": [str(key) for key in raw_excluded_pairs],
-        }
+        return load_calibration_selection_sidecar(path).to_mapping()
 
     @staticmethod
     def _resolve_calibration_selection_paths(
         raw_paths: object,
         root: Path,
+        *,
+        stored_root: object = None,
     ) -> list[Path]:
-        result: list[Path] = []
-        if not isinstance(raw_paths, (list, tuple)):
-            return result
-        for raw in raw_paths:
-            text = str(raw or "").strip()
-            if not text:
-                continue
-            path = Path(text).expanduser()
-            if not path.is_absolute():
-                path = root / path
-            try:
-                resolved = path.resolve()
-            except OSError:
-                continue
-            if resolved.is_file() and resolved.suffix.lower() in {
-                ".png",
-                ".jpg",
-                ".jpeg",
-                ".tif",
-                ".tiff",
-                ".bmp",
-            }:
-                result.append(resolved)
-        return result
+        paths, _errors = resolve_calibration_selection_paths(
+            raw_paths,
+            root,
+            stored_root=stored_root,
+        )
+        return paths
+
+    def _report_calibration_selection_errors(self, errors: tuple[str, ...]) -> None:
+        if not errors:
+            return
+        text = (
+            "Calibration selection is invalid; all-photo fallback blocked: "
+            + ", ".join(errors)
+        )
+        if hasattr(self.panel, "calibration_status_label"):
+            self.panel.calibration_status_label.setText(text)
+        if hasattr(self.panel, "checkerboard_validation_status_label") and hasattr(
+            self.panel, "_set_health_label"
+        ):
+            self.panel._set_health_label(
+                self.panel.checkerboard_validation_status_label,
+                text,
+                "bad",
+            )
+        logger = getattr(self.panel, "_log", None)
+        if callable(logger):
+            logger(f"[캘리브레이션] {text}")
 
     def _selected_calibration_file_lists(
         self,
         root: Path,
         fallback_left: list[Path],
         fallback_right: list[Path],
+        *,
+        selection: Mapping[str, object] | None = None,
     ) -> tuple[list[Path], list[Path], bool]:
-        selection = self.panel._load_calibration_pair_selection()
-        excluded_left = set(
-            self._resolve_calibration_selection_paths(
-                selection.get("excluded_left_paths"),
-                root,
-            )
+        selection = (
+            self.panel._load_calibration_pair_selection()
+            if selection is None
+            else dict(selection)
         )
-        excluded_right = set(
-            self._resolve_calibration_selection_paths(
-                selection.get("excluded_right_paths"),
-                root,
-            )
+        if str(selection.get("_sidecar_state") or "") == "INVALID":
+            errors = tuple(str(value) for value in selection.get("_sidecar_errors") or ())
+            self._report_calibration_selection_errors(errors)
+            return [], [], True
+        stored_root = selection.get("root")
+        excluded_left_paths, excluded_left_errors = resolve_calibration_selection_paths(
+            selection.get("excluded_left_paths"), root, stored_root=stored_root
         )
+        excluded_right_paths, excluded_right_errors = resolve_calibration_selection_paths(
+            selection.get("excluded_right_paths"), root, stored_root=stored_root
+        )
+        left_paths, left_errors = resolve_calibration_selection_paths(
+            selection.get("left_paths"), root, stored_root=stored_root
+        )
+        right_paths, right_errors = resolve_calibration_selection_paths(
+            selection.get("right_paths"), root, stored_root=stored_root
+        )
+        errors = (
+            *excluded_left_errors,
+            *excluded_right_errors,
+            *left_errors,
+            *right_errors,
+        )
+        if errors:
+            self._report_calibration_selection_errors(errors)
+            return [], [], True
+        excluded_left = set(excluded_left_paths)
+        excluded_right = set(excluded_right_paths)
         if not selection.get("manual_mode"):
             return (
                 [path for path in fallback_left if path not in excluded_left],
                 [path for path in fallback_right if path not in excluded_right],
                 False,
             )
-        left = [
-            path
-            for path in self._resolve_calibration_selection_paths(selection.get("left_paths"), root)
-            if path not in excluded_left
-        ]
-        right = [
-            path
-            for path in self._resolve_calibration_selection_paths(selection.get("right_paths"), root)
-            if path not in excluded_right
-        ]
-        if not left and not right:
-            return (
-                [path for path in fallback_left if path not in excluded_left],
-                [path for path in fallback_right if path not in excluded_right],
-                False,
-            )
+        if not left_paths and not right_paths:
+            included = {str(key) for key in selection.get("included_keys") or ()}
+            if included:
+                left_paths = [
+                    path
+                    for path in fallback_left
+                    if path.stem.removeprefix("left_") in included
+                ]
+                right_paths = [
+                    path
+                    for path in fallback_right
+                    if path.stem.removeprefix("right_") in included
+                ]
+            else:
+                self._report_calibration_selection_errors(
+                    ("manual selection contains no recoverable files or pair keys",)
+                )
+                return [], [], True
+        left = [path for path in left_paths if path not in excluded_left]
+        right = [path for path in right_paths if path not in excluded_right]
         return left, right, True
 
     @staticmethod
@@ -2875,6 +3523,8 @@ class CalibrationWorkflowController:
         scanned_pairs: list[tuple[str, Path, Path]],
         *,
         mode: str,
+        selection: Mapping[str, object] | None = None,
+        pair_limit: int | None = None,
     ) -> tuple[list[Path], list[Path], list[tuple[str, Path, Path]], bool]:
         """Resolve one immutable calculation input set from the selection sidecar.
 
@@ -2888,6 +3538,7 @@ class CalibrationWorkflowController:
             root,
             fallback_left,
             fallback_right,
+            selection=selection,
         )
         left_members = set(left_paths)
         right_members = set(right_paths)
@@ -2896,7 +3547,12 @@ class CalibrationWorkflowController:
             for pair in scanned_pairs
             if pair[1] in left_members and pair[2] in right_members
         ]
-        selected_pairs = self._choose_calibration_pairs(pair_candidates)
+        selected_pairs = self._choose_calibration_pairs(
+            pair_candidates,
+            selection=selection,
+            root=root,
+            pair_limit=pair_limit,
+        )
         return left_paths, right_paths, selected_pairs, explicit_selection
 
     def _random_validation_inputs(
@@ -2968,6 +3624,10 @@ class CalibrationWorkflowController:
     def _choose_calibration_pairs(
         self,
         pairs: list[tuple[str, Path, Path]],
+        *,
+        selection: Mapping[str, object] | None = None,
+        root: Path | None = None,
+        pair_limit: int | None = None,
     ) -> list[tuple[str, Path, Path]]:
         """Manual picker override of ``_select_calibration_pairs``.
 
@@ -2978,15 +3638,42 @@ class CalibrationWorkflowController:
         JSON sidecar is the handoff instead of a cross-panel command).
         """
 
-        selection = self.panel._load_calibration_pair_selection()
-        explicit_left = self._resolve_calibration_selection_paths(
+        selection = (
+            self.panel._load_calibration_pair_selection()
+            if selection is None
+            else dict(selection)
+        )
+        if str(selection.get("_sidecar_state") or "") == "INVALID":
+            errors = tuple(str(value) for value in selection.get("_sidecar_errors") or ())
+            self._report_calibration_selection_errors(errors)
+            return []
+        root = self.panel._calibration_dirs()[0] if root is None else Path(root)
+        stored_root = selection.get("root")
+        explicit_left, left_errors = resolve_calibration_selection_paths(
             selection.get("left_paths"),
-            self.panel._calibration_dirs()[0],
+            root,
+            stored_root=stored_root,
         )
-        explicit_right = self._resolve_calibration_selection_paths(
+        explicit_right, right_errors = resolve_calibration_selection_paths(
             selection.get("right_paths"),
-            self.panel._calibration_dirs()[0],
+            root,
+            stored_root=stored_root,
         )
+        excluded_left_paths, excluded_left_errors = resolve_calibration_selection_paths(
+            selection.get("excluded_left_paths"), root, stored_root=stored_root
+        )
+        excluded_right_paths, excluded_right_errors = resolve_calibration_selection_paths(
+            selection.get("excluded_right_paths"), root, stored_root=stored_root
+        )
+        errors = (
+            *left_errors,
+            *right_errors,
+            *excluded_left_errors,
+            *excluded_right_errors,
+        )
+        if errors:
+            self._report_calibration_selection_errors(errors)
+            return []
         manual_mode = bool(selection.get("manual_mode"))
         if manual_mode and (explicit_left or explicit_right):
             candidates = self._selected_calibration_pairs(explicit_left, explicit_right)
@@ -2995,13 +3682,8 @@ class CalibrationWorkflowController:
         else:
             included = set(selection.get("included_keys") or ())
             candidates = [pair for pair in pairs if pair[0] in included]
-        root = self.panel._calibration_dirs()[0]
-        excluded_left = set(
-            self._resolve_calibration_selection_paths(selection.get("excluded_left_paths"), root)
-        )
-        excluded_right = set(
-            self._resolve_calibration_selection_paths(selection.get("excluded_right_paths"), root)
-        )
+        excluded_left = set(excluded_left_paths)
+        excluded_right = set(excluded_right_paths)
         excluded_keys = {str(key) for key in selection.get("excluded_pair_keys") or ()}
         eligible = [
             pair
@@ -3014,7 +3696,11 @@ class CalibrationWorkflowController:
         # it once, after exclusions and side membership have established the
         # usable intersection. Sampling before that intersection can discard
         # many otherwise valid pairs when only one camera has an exclusion.
-        return self._select_calibration_pairs(eligible) if not manual_mode else eligible
+        return (
+            self._select_calibration_pairs(eligible, pair_limit=pair_limit)
+            if not manual_mode
+            else eligible
+        )
 
     def toggle_auto_calibration_capture(self) -> None:
         if self._auto_capture_active:
@@ -3029,7 +3715,6 @@ class CalibrationWorkflowController:
             self.panel.calibration_status_label.setText("A calibration operation is already running.")
             return False
         interval_s = float(self.panel.calibration_auto_interval_spin.value())
-        target_pairs = int(self.panel.calibration_auto_target_spin.value())
         self._auto_capture_active = True
         self._auto_capture_saved_pairs = 0
         self._auto_capture_last_pair_key = None
@@ -3041,8 +3726,8 @@ class CalibrationWorkflowController:
         self._auto_capture_timer.start(max(100, int(interval_s * 1000.0)))
         self.panel.capture_calibration_auto_button.setText("자동 촬영 중지")
         self.panel.calibration_status_label.setText(
-            f"자동 촬영 대기: 유효 stereo pair 0/{target_pairs} | "
-            f"간격={interval_s:.1f}s | 좌·우 보드를 움직여 주세요."
+            f"자동 촬영 대기: 유효 stereo pair 0개 | "
+            f"간격={interval_s:.1f}s | Stop할 때까지 계속 촬영합니다."
         )
         self._auto_calibration_capture_tick()
         return True
@@ -3068,12 +3753,6 @@ class CalibrationWorkflowController:
         if not self._auto_capture_active:
             return
         if self.panel.checkerboard_calibration_thread is not None:
-            return
-        target_pairs = int(self.panel.calibration_auto_target_spin.value())
-        if self._auto_capture_saved_pairs >= target_pairs:
-            self.stop_auto_calibration_capture(
-                f"자동 촬영 완료: 유효 stereo pair {self._auto_capture_saved_pairs}/{target_pairs}개 저장"
-            )
             return
 
         detections = getattr(self.panel, "calibration_preview_detection_results", {})
@@ -3253,7 +3932,7 @@ class CalibrationWorkflowController:
             self._auto_capture_pending_pose_novelty = None
             return
         self.panel.calibration_status_label.setText(
-            f"자동 촬영 중: 유효 stereo pair {self._auto_capture_saved_pairs}/{target_pairs} | "
+            f"자동 촬영 중: 유효 stereo pair {self._auto_capture_saved_pairs}개 | "
             f"Capture worker가 보드 검증 중"
         )
 
@@ -3348,16 +4027,10 @@ class CalibrationWorkflowController:
             self._auto_capture_pending_pose_novelty = None
             self._capture_origin = "manual"
             if self._auto_capture_active:
-                target_pairs = int(self.panel.calibration_auto_target_spin.value())
-                if self._auto_capture_saved_pairs >= target_pairs:
-                    self.stop_auto_calibration_capture(
-                        f"자동 촬영 완료: 유효 stereo pair {self._auto_capture_saved_pairs}/{target_pairs}개 저장"
-                    )
-                else:
-                    self.panel.calibration_status_label.setText(
-                        f"자동 촬영 대기: 유효 stereo pair "
-                        f"{self._auto_capture_saved_pairs}/{target_pairs}개 저장됨"
-                    )
+                self.panel.calibration_status_label.setText(
+                    f"자동 촬영 대기: 유효 stereo pair "
+                    f"{self._auto_capture_saved_pairs}개 저장됨 | Stop할 때까지 계속"
+                )
             elif pair_saved:
                 self.panel.calibration_status_label.setText(
                     "자동 촬영은 중지됨: 진행 중이던 pair는 파일로 저장됐지만 "
@@ -3398,7 +4071,104 @@ class CalibrationWorkflowController:
             self._auto_capture_pending_pose_novelty = None
             self._capture_origin = "manual"
 
-    def run_intrinsic_calibration(self) -> None:
+    def _calibration_input_snapshot(
+        self,
+        input_request: Mapping[str, object] | None,
+        *,
+        mode_override: str | None = None,
+    ) -> tuple[CalibrationInputSnapshot, int, bool]:
+        """Resolve one UI-requested root into the sole worker input identity."""
+
+        request = dict(input_request or {})
+        raw_root = str(request.get("root") or "").strip()
+        if raw_root:
+            root = resolve_settings_path(raw_root, base_dir=self.panel.app_root)
+        else:
+            root_reader = getattr(self.panel, "_checkerboard_validation_root", None)
+            if callable(root_reader):
+                root = Path(root_reader())
+            else:
+                root = Path(self.panel._checkerboard_validation_scan_counts()[0])
+        root = root.resolve(strict=True)
+        mode = str(
+            mode_override
+            or request.get("mode")
+            or self.panel._checkerboard_validation_mode()
+        )
+        if mode not in {"pixhawk", "checkerboard"}:
+            raise ValueError(f"unsupported calibration calculation mode: {mode}")
+        pair_limit = max(
+            0,
+            int(
+                request.get("pair_limit")
+                if request.get("pair_limit") is not None
+                else self._calibration_calculation_pair_limit()
+            ),
+        )
+        fallback_left = self._calibration_image_paths_for_root(root, "left")
+        fallback_right = self._calibration_image_paths_for_root(root, "right")
+        scanned_pairs = self._calibration_stereo_pair_paths_for_root(root)
+        sidecar_path = root / "calibration_pair_selection.json"
+        document = load_calibration_selection_sidecar(sidecar_path)
+        selection = document.to_mapping()
+        if document.state == "INVALID":
+            self._report_calibration_selection_errors(document.errors)
+            raise ValueError("; ".join(document.errors))
+        left_paths, right_paths, selected_pairs, explicit = (
+            self._effective_calibration_inputs(
+                root,
+                fallback_left,
+                fallback_right,
+                scanned_pairs,
+                mode=mode,
+                selection=selection,
+                pair_limit=pair_limit,
+            )
+        )
+        if not left_paths or not right_paths:
+            raise ValueError(
+                f"left/right calibration images are required: left={len(left_paths)}, "
+                f"right={len(right_paths)}"
+            )
+        if mode == "checkerboard" and len(selected_pairs) < 3:
+            raise ValueError(
+                f"checkerboard calibration requires at least 3 stereo pairs; "
+                f"found {len(selected_pairs)}"
+            )
+        stored_root = selection.get("root")
+        excluded_left, excluded_left_errors = resolve_calibration_selection_paths(
+            selection.get("excluded_left_paths"), root, stored_root=stored_root
+        )
+        excluded_right, excluded_right_errors = resolve_calibration_selection_paths(
+            selection.get("excluded_right_paths"), root, stored_root=stored_root
+        )
+        if excluded_left_errors or excluded_right_errors:
+            errors = (*excluded_left_errors, *excluded_right_errors)
+            self._report_calibration_selection_errors(errors)
+            raise ValueError("; ".join(errors))
+        snapshot = build_calibration_input_snapshot(
+            root=root,
+            mode=mode,
+            left_paths=left_paths,
+            right_paths=right_paths,
+            stereo_pairs=selected_pairs,
+            included_pair_keys=tuple(selection.get("included_keys") or ()),
+            excluded_pair_keys=tuple(selection.get("excluded_pair_keys") or ()),
+            excluded_left_paths=excluded_left,
+            excluded_right_paths=excluded_right,
+            selection_policy=("manual_explicit" if explicit else "automatic_even_spread"),
+            pair_limit=pair_limit,
+            sidecar_state=document.state,
+            sidecar_schema=str(selection.get("schema") or ""),
+            sidecar_path=sidecar_path,
+        )
+        return snapshot, len(scanned_pairs), explicit
+
+    def run_intrinsic_calibration(
+        self,
+        input_request: Mapping[str, object] | None = None,
+    ) -> None:
+        self._ensure_calibration_session_root("calculation")
         if self._auto_capture_active:
             self.stop_auto_calibration_capture()
         if self.panel.checkerboard_calibration_thread is not None:
@@ -3413,35 +4183,25 @@ class CalibrationWorkflowController:
             self.panel._set_health_label(self.panel.checkerboard_validation_status_label, f"OpenCV unavailable: {error}", "bad")
             self.panel.calibration_result_text.setPlainText(f"OpenCV unavailable:\n{error}")
             return
-        mode = self.panel._checkerboard_validation_mode()
-        root, left_paths, right_paths, pairs = self.panel._checkerboard_validation_scan_counts()
-        source_pair_count = len(pairs)
-        calculation_pair_limit = self._calibration_calculation_pair_limit()
-        left_paths, right_paths, selected_pairs, explicit_selection = (
-            self._effective_calibration_inputs(
-                root,
-                left_paths,
-                right_paths,
-                pairs,
-                mode=mode,
+        try:
+            input_snapshot, source_pair_count, explicit_selection = (
+                self._calibration_input_snapshot(input_request)
             )
-        )
+        except (OSError, TypeError, ValueError) as exc:
+            self.panel._set_health_label(
+                self.panel.checkerboard_validation_status_label,
+                f"계산 입력 차단: {exc}",
+                "bad",
+            )
+            return
+        mode = input_snapshot.mode
+        root = input_snapshot.root_path
+        left_paths = list(input_snapshot.left_paths)
+        right_paths = list(input_snapshot.right_paths)
+        selected_pairs = list(input_snapshot.pair_paths)
+        calculation_pair_limit = input_snapshot.pair_limit
         pair_count = len(selected_pairs)
         min_images = self.panel.calib_min_images_spin.value()
-        if not left_paths or not right_paths:
-            self.panel._set_health_label(
-                self.panel.checkerboard_validation_status_label,
-                f"계산 실패: left/right 이미지가 부족합니다 (left={len(left_paths)}, right={len(right_paths)})",
-                "bad",
-            )
-            return
-        if mode == "checkerboard" and pair_count < 3:
-            self.panel._set_health_label(
-                self.panel.checkerboard_validation_status_label,
-                f"계산 실패: stereo pair가 부족합니다 (pair={pair_count}, need>=3)",
-                "bad",
-            )
-            return
         stereo_paths = [
             path
             for _key, left_path, right_path in selected_pairs
@@ -3468,13 +4228,13 @@ class CalibrationWorkflowController:
             "right_intrinsic_paths": tuple(right_paths),
             "stereo_pairs": tuple(selected_pairs),
             "explicit_selection": bool(explicit_selection),
+            "calibration_input_snapshot": input_snapshot.to_mapping(),
+            "calibration_input_snapshot_sha256": input_snapshot.snapshot_sha256,
         }
         worker = CheckerboardCalibrationWorker(
             mode=mode,
-            left_intrinsic_paths=left_paths,
-            right_intrinsic_paths=right_paths,
-            stereo_pairs=selected_pairs,
             config=self.panel._checkerboard_config(),
+            input_snapshot=input_snapshot,
         )
         thread = QtCore.QThread(self.panel)
         worker.moveToThread(thread)
@@ -3529,8 +4289,13 @@ class CalibrationWorkflowController:
         }
         thread.start()
 
-    def run_stereo_extrinsics_calibration(self) -> None:
+    def run_stereo_extrinsics_calibration(
+        self,
+        input_request: Mapping[str, object] | None = None,
+    ) -> None:
         """Run only OpenCV stereo R/T with the selected K/D held fixed."""
+
+        self._ensure_calibration_session_root("calculation")
 
         if self._auto_capture_active:
             self.stop_auto_calibration_capture()
@@ -3557,23 +4322,22 @@ class CalibrationWorkflowController:
                 "bad",
             )
             return
-        root, scanned_left, scanned_right, pairs = self.panel._checkerboard_validation_scan_counts()
-        _selected_left, _selected_right, selected_pairs, _explicit_selection = (
-            self._effective_calibration_inputs(
-                root,
-                scanned_left,
-                scanned_right,
-                pairs,
-                mode="checkerboard",
+        try:
+            input_snapshot, _source_pair_count, _explicit_selection = (
+                self._calibration_input_snapshot(
+                    input_request,
+                    mode_override="checkerboard",
+                )
             )
-        )
-        if len(selected_pairs) < 3:
+        except (OSError, TypeError, ValueError) as exc:
             self.panel._set_health_label(
                 self.panel.checkerboard_validation_status_label,
-                f"R,t only 계산 실패: matching stereo pair={len(selected_pairs)}, need>=3",
+                f"R,t only 계산 입력 차단: {exc}",
                 "bad",
             )
             return
+        root = input_snapshot.root_path
+        selected_pairs = list(input_snapshot.pair_paths)
         left_paths = [left for _key, left, _right in selected_pairs]
         right_paths = [right for _key, _left, right in selected_pairs]
         source_zoom, zoom_detail = self._capture_zoom_level_for_paths(
@@ -3588,14 +4352,17 @@ class CalibrationWorkflowController:
             )
             self.panel._log(f"[캘리브레이션] R,t 계산 중단: {zoom_detail}")
             return
-        source_path = str(getattr(self.panel, "_active_intrinsics_profile_path", "") or "")
+        source_path = str(
+            getattr(self.panel, "_candidate_intrinsics_profile_path", "")
+            or getattr(self.panel, "_active_intrinsics_profile_path", "")
+            or ""
+        )
         source_hash = intrinsics_content_sha256(intrinsics)
         worker = CheckerboardExtrinsicsWorker(
-            left_paths=left_paths,
-            right_paths=right_paths,
             config=self.panel._checkerboard_config(),
             left_intrinsics=intrinsics.left,
             right_intrinsics=intrinsics.right,
+            input_snapshot=input_snapshot,
         )
         thread = QtCore.QThread(self.panel)
         worker.moveToThread(thread)
@@ -3605,12 +4372,14 @@ class CalibrationWorkflowController:
             source_zoom=source_zoom,
             source_path=source_path,
             source_hash=source_hash,
-            root=root: self.panel._handle_stereo_extrinsics_completed(
+            root=root,
+            input_snapshot=input_snapshot: self.panel._handle_stereo_extrinsics_completed(
                 result,
                 source_zoom=source_zoom,
                 source_path=source_path,
                 source_hash=source_hash,
                 root=root,
+                input_snapshot=input_snapshot,
             )
         )
         worker.progress.connect(self.panel._handle_calibration_progress)
@@ -3635,6 +4404,7 @@ class CalibrationWorkflowController:
         source_path: str,
         source_hash: str,
         root: Path,
+        input_snapshot: CalibrationInputSnapshot | None = None,
     ) -> None:
         if not isinstance(result, StereoExtrinsics):
             self.panel._handle_intrinsic_calibration_failed(
@@ -3656,13 +4426,18 @@ class CalibrationWorkflowController:
                 "timestamp_s": time.time(),
                 "calibration_root": str(root),
                 "validation_managed_by_application": False,
+                "calibration_input_snapshot": (
+                    None if input_snapshot is None else input_snapshot.to_mapping()
+                ),
+                "calibration_input_snapshot_sha256": (
+                    "" if input_snapshot is None else input_snapshot.snapshot_sha256
+                ),
             },
         )
         self.panel.selected_extrinsics_profile = profile
-        # Kept separate from ``selected_extrinsics_profile`` (which a later
-        # PnP apply would overwrite) so the geometry-comparison display can
-        # always show the raw checkerboard stereoCalibrate result on its own.
-        self.panel.checkerboard_extrinsics_profile = profile
+        # Raw stereoCalibrate output remains preview-only until Apply promotes
+        # it through the quality and live-grid gates.
+        self.panel.checkerboard_extrinsics_candidate_profile = profile
         self.panel._selected_extrinsics_profile_path = (
             f"memory:{profile.profile_id}"
         )
@@ -3685,6 +4460,7 @@ class CalibrationWorkflowController:
         *,
         quality_warning_confirmed: bool = False,
     ) -> bool:
+        self._ensure_calibration_session_root("calculation")
         profile = getattr(self.panel, "selected_extrinsics_profile", None)
         if not isinstance(profile, StereoExtrinsicsProfile):
             self.panel.calibration_status_label.setText(
@@ -3692,34 +4468,36 @@ class CalibrationWorkflowController:
             )
             return False
         intrinsics_result = getattr(self.panel, "last_calibration_result", None)
+        quality_state = "UNASSESSED"
+        quality_reasons: tuple[str, ...] = ()
         if isinstance(intrinsics_result, StereoIntrinsicsResult):
-            state, reasons = self._calibration_quality_state(intrinsics_result)
-            if state == "FAIL" or (state == "WARNING" and not quality_warning_confirmed):
-                qualifier = "FAIL" if state == "FAIL" else "WARNING requires confirmation"
-                self.panel.calibration_status_label.setText(
-                    f"Cannot save R,t: calibration quality {qualifier} ("
-                    + ", ".join(reasons)
-                    + ")"
-                )
-                return False
-            if state == "WARNING":
-                summary = dict(
-                    getattr(self.panel, "checkerboard_validation_summary", {}) or {}
-                )
-                summary["quality_override"] = {
-                    "action": "save_stereo_extrinsics_profile",
-                    "confirmed": True,
-                    "confirmed_utc_ns": time.time_ns(),
-                    "reason_codes": list(reasons),
-                }
-                self.panel.checkerboard_validation_summary = summary
+            quality_state, quality_reasons = self._calibration_quality_state(intrinsics_result)
         output = self.panel._extrinsics_storage_path(profile.source_zoom_level)
+        approved = quality_state in {"PASS", "UNASSESSED"}
+        if not approved:
+            attempts = output.parent / "attempts"
+            attempts.mkdir(parents=True, exist_ok=True)
+            output = attempts / (
+                f"{output.stem}_{quality_state.lower()}_{time.time_ns()}{output.suffix}"
+            )
         output.parent.mkdir(parents=True, exist_ok=True)
         save_stereo_extrinsics_json(output, profile)
-        self.panel._selected_extrinsics_profile_path = str(output)
-        self.panel._selected_extrinsics_profile_hash = profile.content_sha256
-        self.panel.calibration_status_label.setText(f"Saved stereo R,t profile: {output}")
-        self.panel._log(f"[캘리브레이션] 독립 R,t profile 저장: {output}")
+        self.panel._last_calibration_attempt_path = str(output)
+        if approved:
+            immutable_output = self._publish_immutable_extrinsics_profile(profile)
+            self.panel._selected_extrinsics_profile_path = str(immutable_output)
+            self.panel._selected_extrinsics_profile_hash = profile.content_sha256
+            message = (
+                f"Saved approved stereo R,t profile: immutable={immutable_output} | "
+                f"alias={output}"
+            )
+        else:
+            message = (
+                f"Saved non-applicable stereo R,t attempt: {quality_state} "
+                f"({', '.join(quality_reasons)}) | {output}"
+            )
+        self.panel.calibration_status_label.setText(message)
+        self.panel._log(f"[캘리브레이션] {message}")
         self.panel._refresh_operation_header()
         return True
 
@@ -3741,13 +4519,12 @@ class CalibrationWorkflowController:
             self.panel._log(f"[캘리브레이션] R,t profile 로드 실패: {path}: {exc}")
             return
         self.panel.selected_extrinsics_profile = profile
-        # Route into the geometry-comparison slot matching this profile's
-        # origin so a loaded file doesn't silently blend checkerboard and
-        # PnP provenance in the comparison display.
+        # A loaded profile is still a candidate. Route it only into a preview
+        # slot; Apply is the sole promotion into Measurement-ready state.
         if str(profile.method or "").startswith("optical_pose/"):
-            self.panel.optical_pose_extrinsics_profile = profile
+            self.panel.optical_pose_extrinsics_candidate_profile = profile
         else:
-            self.panel.checkerboard_extrinsics_profile = profile
+            self.panel.checkerboard_extrinsics_candidate_profile = profile
         self.panel._selected_extrinsics_profile_path = str(path)
         self.panel._selected_extrinsics_profile_hash = profile.content_sha256
         self.panel.calibration_status_label.setText(

@@ -158,7 +158,7 @@ def test_recovery_loads_each_measurements_independent_fill_policy() -> None:
     )
 
 
-def test_disabling_required_horizon_fill_makes_only_that_method_unready() -> None:
+def test_unapplied_horizon_candidate_stays_blocked_and_fill_errors_are_additive() -> None:
     profile_hash = "a" * 64
     mask = SimpleNamespace(
         roll_deg=True,
@@ -196,11 +196,15 @@ def test_disabling_required_horizon_fill_makes_only_that_method_unready() -> Non
     controller = MeasurementViewController(panel)
     controller._measurement_live_readiness = lambda: (True, True, (), ())
 
-    ready = next(
+    unapplied = next(
         row for row in controller._measurement_method_statuses() if row.method_id == HORIZON_HYBRID
     )
-    assert ready.ready is True
-    assert dict(ready.component_sources)["left.yaw_deg"] == MEASUREMENT_FILL_LIVE_PIXHAWK
+    assert unapplied.ready is False
+    assert "optical pose candidate not applied" in unapplied.reasons
+    assert (
+        dict(unapplied.component_sources)["left.yaw_deg"]
+        == MEASUREMENT_FILL_LIVE_PIXHAWK
+    )
 
     policy = controller._measurement_fill_policy()
     policy[HORIZON_HYBRID]["left.yaw_deg"] = MEASUREMENT_FILL_NONE
@@ -209,6 +213,7 @@ def test_disabling_required_horizon_fill_makes_only_that_method_unready() -> Non
         row for row in controller._measurement_method_statuses() if row.method_id == HORIZON_HYBRID
     )
     assert blocked.ready is False
+    assert "optical pose candidate not applied" in blocked.reasons
     assert "left.yaw_deg has no compatible fill source" in blocked.reasons
     assert dict(blocked.component_sources)["left.yaw_deg"] == MEASUREMENT_FILL_NONE
 

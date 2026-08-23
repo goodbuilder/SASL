@@ -67,10 +67,31 @@ def _begin_and_stop_detection(controller: MeasurementPackageController) -> None:
     assert controller.complete_measurement_detection() is True
 
 
+def test_session_open_does_not_require_devices_or_verified_time_sync(tmp_path: Path) -> None:
+    panel = _panel(tmp_path)
+    panel.camera_connected = False
+    panel.camera_sync_status = "failed"
+    panel._mavlink_open_sides = lambda: ()
+    controller = MeasurementPackageController(panel)
+
+    assert controller.begin_measurement_session() is True
+
+
+def test_detection_completion_requests_automatic_measurement_save(tmp_path: Path) -> None:
+    panel = _panel(tmp_path)
+    panel._measurement_auto_finalize_enabled = True
+    controller = MeasurementPackageController(panel)
+    assert controller.begin_measurement_session()
+    assert controller.begin_measurement_detection()
+    calls: list[str] = []
+    controller.finalize_measurement_package = lambda: calls.append("finalize") or False  # type: ignore[method-assign]
+
+    assert controller.complete_measurement_detection()
+    assert calls == ["finalize"]
+
+
 def test_explicit_begin_allocates_one_session_and_one_detection_interval(tmp_path: Path) -> None:
     panel = _panel(tmp_path)
-    applied_identity: list[dict[str, object]] = []
-    panel.apply_workstation_run_setup = lambda values: applied_identity.append(dict(values))
     controller = MeasurementPackageController(panel)
 
     assert controller.begin_measurement_session() is True
@@ -79,18 +100,6 @@ def test_explicit_begin_allocates_one_session_and_one_detection_interval(tmp_pat
     assert first["session_id"]
     assert first["revision"] == "r0001"
     assert panel._pnp_session_prepared is True
-    assert applied_identity == [
-        {
-            "experiment_id": "unassigned",
-            "run_id": first["session_id"],
-            "condition_id": "unspecified",
-            "mode": "drone",
-            "condition": {
-                "identity_source": "automatic_session_identity",
-                "operator_metadata": "not_collected",
-            },
-        }
-    ]
 
     assert controller.begin_measurement_detection() is True
     assert controller.begin_measurement_detection() is False
@@ -368,7 +377,7 @@ def test_revision_does_not_mutate_previous_manifest(tmp_path: Path) -> None:
     assert controller.verify_measurement_package()["valid"] is True
 
 
-def test_camera_controller_blocks_explicit_detection_before_begin() -> None:
+def test_camera_controller_blocks_measurement_start_when_child_creation_is_rejected() -> None:
     calls: list[object] = []
     panel = SimpleNamespace(
         camera_connected=False,
@@ -377,7 +386,11 @@ def test_camera_controller_blocks_explicit_detection_before_begin() -> None:
         _automatic_session_recording=False,
         _measurement_package_explicit_lifecycle=True,
         _session_recording_active=lambda: False,
-        measurement_package_snapshot=lambda: {"state": "IDLE"},
+        measurement_package_snapshot=lambda: {
+            "state": "IDLE",
+            "detail": "Create Session Folder first",
+        },
+        begin_measurement=lambda: calls.append("measurement.begin") or False,
         begin_measurement_detection=lambda: calls.append("detection.begin") or False,
         start_automatic_session_recording=lambda: calls.append("recording.begin") or True,
         _start_camera_streams=lambda **kwargs: calls.append(kwargs),
@@ -385,8 +398,81 @@ def test_camera_controller_blocks_explicit_detection_before_begin() -> None:
     )
 
     assert CameraStreamLifecycleController(panel).start_yolo() is False
-    assert "detection.begin" in calls
+    assert "measurement.begin" in calls
+    assert "detection.begin" not in calls
     assert "recording.begin" not in calls
+
+
+def test_camera_controller_start_creates_child_then_reserves_detection() -> None:
+    calls: list[object] = []
+    package = {"state": "IDLE"}
+
+    def begin_measurement() -> bool:
+        calls.append("measurement.begin")
+        package["state"] = "COLLECTING"
+        return True
+
+    def begin_detection() -> bool:
+        calls.append("detection.begin")
+        assert package["state"] == "COLLECTING"
+        return True
+
+    panel = SimpleNamespace(
+        camera_connected=False,
+        yolo_enabled=False,
+        _pending_camera_start=None,
+        _automatic_session_recording=False,
+        _measurement_package_explicit_lifecycle=True,
+        _session_recording_active=lambda: False,
+        measurement_package_snapshot=lambda: dict(package),
+        begin_measurement=begin_measurement,
+        begin_measurement_detection=begin_detection,
+        start_automatic_session_recording=lambda: calls.append("recording.begin") or True,
+        _start_camera_streams=lambda **kwargs: calls.append(("streams.begin", kwargs)),
+        _log=lambda message: calls.append(("log", message)),
+    )
+
+    assert CameraStreamLifecycleController(panel).start_yolo() is None
+    assert calls == [
+        "measurement.begin",
+        "detection.begin",
+        "recording.begin",
+        ("streams.begin", {"enable_detection": True, "switch_to_depth": True}),
+    ]
+
+
+def test_camera_controller_reuses_prepared_child_and_creates_after_seal() -> None:
+    calls: list[object] = []
+    package = {"state": "COLLECTING"}
+
+    def begin_measurement() -> bool:
+        calls.append("measurement.begin")
+        package["state"] = "COLLECTING"
+        return True
+
+    panel = SimpleNamespace(
+        camera_connected=False,
+        yolo_enabled=False,
+        _pending_camera_start=None,
+        _automatic_session_recording=False,
+        _measurement_package_explicit_lifecycle=True,
+        _session_recording_active=lambda: False,
+        measurement_package_snapshot=lambda: dict(package),
+        begin_measurement=begin_measurement,
+        begin_measurement_detection=lambda: calls.append("detection.begin") or True,
+        start_automatic_session_recording=lambda: calls.append("recording.begin") or True,
+        _start_camera_streams=lambda **kwargs: calls.append(("streams.begin", kwargs)),
+        _log=lambda message: calls.append(("log", message)),
+    )
+    controller = CameraStreamLifecycleController(panel)
+
+    assert controller.start_yolo() is None
+    assert "measurement.begin" not in calls
+
+    calls.clear()
+    package["state"] = "SEALED_COMPLETE"
+    assert controller.start_yolo() is None
+    assert calls[:2] == ["measurement.begin", "detection.begin"]
 
 
 def test_controller_reopens_a_recoverable_working_package_after_restart(tmp_path: Path) -> None:

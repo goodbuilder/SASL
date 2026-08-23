@@ -31,6 +31,10 @@ Source diff (patches): same core diff as v6x, see
 instructions -- `../patches/px4-v1.17-sasl-can-mag-core.patch` and
 `../patches/px4-v1.17-sasl-can-mag-mavlink-dialect.patch` apply here
 unchanged; skip `px4-v1.17-sasl-can-mag-v6x-flash-fit.patch`, it is v6x-only.
+Also apply `../patches/px4-v1.17-mavlink-signing-null-instance.patch` in the
+outer PX4 tree; the sparse-instance signing callback bug is board-independent.
+The v6c artifact and SHA-256 recorded below predate that guard and have not
+been rebuilt; do not claim the v6c binary contains the correction.
 
 Source build record:
 

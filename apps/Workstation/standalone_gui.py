@@ -90,6 +90,7 @@ from Workstation.workstation_core.fixed_base_initializer import FixedBaseInitial
 from Workstation.workstation_core.gnss_network import NtripClient, format_nmea_gga, gga_from_position, gga_from_coordinate_sample
 from Workstation.workstation_core.gnss_operation import (
     CorrectionSourceIdentity,
+    DEFAULT_NTRIP_SESSION_PASSWORD,
     evaluate_gnss_readiness,
     GnssReadinessInputs,
     GnssOperationConfig,
@@ -214,6 +215,7 @@ from Workstation.workstation_core.settings import (
     DEFAULT_INTRINSICS_PATH,
     AppSettings,
     load_settings as _load_shared_settings,
+    normalize_pixhawk_gnss_source,
     resolve_settings_path,
     save_settings as _save_shared_settings,
 )
@@ -390,10 +392,14 @@ RUNTIME_CAMERA_LAYOUT_HYSTERESIS_PX = 48
 VISIBLE_STREAM_GOP_GET_COMMAND = "GEGS VISIBLE"
 RECORDING_PREVIEW_LIMIT = 256
 RECORDING_KEY_CACHE_LIMIT = 1024
-# WIRIS cameras expose the SDK and RTSP services a short time after power-up.
-# Keep auto-connect responsive while allowing that normal boot window to settle.
-CAMERA_AUTO_CONNECT_MAX_ATTEMPTS = 6
+# One manual Connect cameras request owns one discovery/activation attempt.
+# Repeating the same configured WIRIS IP hid unavailable-camera failures and
+# made one click keep mutating camera state after the operator had moved on.
+# A later click starts a fresh discovery; post-connect GStreamer recovery is
+# independent and continues to retry an interrupted live RTSP endpoint.
+CAMERA_AUTO_CONNECT_MAX_ATTEMPTS = 1
 CAMERA_AUTO_CONNECT_RETRY_DELAY_MS = 1_500
+RTSP_STREAM_CHECK_TIMEOUT_S = 12.0
 
 
 def _format_visible_zoom_fx_estimates() -> str:
@@ -1101,11 +1107,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.last_calibration_zoom_level: int | None = None
         self.active_intrinsics: StereoIntrinsicsResult | None = None
         self._active_intrinsics_profile_path = ""
+        # ``last_calibration_result`` is the operator's current candidate.
+        # Its file identity must not replace the provenance of
+        # ``active_intrinsics`` until the Apply gate succeeds.
+        self._candidate_intrinsics_profile_path = ""
         self.selected_extrinsics_profile: StereoExtrinsicsProfile | None = None
-        # Independent geometry-comparison slots: unlike selected_extrinsics_profile,
-        # these never overwrite each other, so Measurement-tab comparison rows
-        # can always show the last checkerboard result and the last applied
-        # PnP result side by side.
+        self.active_extrinsics_profile: StereoExtrinsicsProfile | None = None
+        # Candidate slots are preview-only. Applied slots are the only profile
+        # objects Measurement may expose as ready geometry methods.
+        self.checkerboard_extrinsics_candidate_profile: StereoExtrinsicsProfile | None = None
+        self.optical_pose_extrinsics_candidate_profile: StereoExtrinsicsProfile | None = None
         self.checkerboard_extrinsics_profile: StereoExtrinsicsProfile | None = None
         self.optical_pose_extrinsics_profile: StereoExtrinsicsProfile | None = None
         self._selected_extrinsics_profile_path = ""
@@ -1286,6 +1297,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         }
         self.gnss_base_recording_rows: SpoolRows = SpoolRows()
         self.extrinsics_comparison_recording_rows: SpoolRows = SpoolRows()
+        self.method_evaluation_bundle_rows: SpoolRows = SpoolRows()
         self._session_save_thread: QtCore.QThread | None = None
         self._session_save_worker: SessionSaveWorker | None = None
         self._session_save_retry_required = False
@@ -1304,6 +1316,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._measurement_session = None
         self._measurement_session_id = ""
         self._measurement_session_state = "IDLE"
+        self._measurement_auto_finalize_enabled = True
         self._measurement_id = ""
         self._measurement_app_run_id = (
             f"run-{datetime.now(timezone.utc):%Y%m%dT%H%M%S.%fZ}-{uuid.uuid4().hex[:8]}"
@@ -1395,6 +1408,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "yaw": deque(maxlen=600),
         }
         self.gnss_monitor = GNSSMonitor()
+        self.gnss_monitor.left_source = self._pixhawk_gnss_source("left")
+        self.gnss_monitor.right_source = self._pixhawk_gnss_source("right")
         self.baseline_manager = BaselineManager(self.gnss_monitor)
         self.magnetometer_monitor = MagnetometerMonitor()
         self.attitude_monitor = AttitudeMonitor()
@@ -2885,15 +2900,24 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "Capture the newest decoded native pair from the live RTSP streams; raw RTP packets are not captured."
         )
         self.capture_calibration_button.clicked.connect(self.capture_calibration_images)
+        self.calibration_pair_max_delta_spin = QtWidgets.QDoubleSpinBox()
+        self.calibration_pair_max_delta_spin.setRange(0.0, 1000.0)
+        self.calibration_pair_max_delta_spin.setSingleStep(5.0)
+        self.calibration_pair_max_delta_spin.setDecimals(1)
+        self.calibration_pair_max_delta_spin.setValue(
+            self.settings.calibration_pair_max_delta_s * 1000.0
+        )
+        self.calibration_pair_max_delta_spin.setSuffix(" ms")
+        self.calibration_pair_max_delta_spin.setToolTip(
+            "좌·우 원본 frame의 RTCP/NTP 촬영 시각 차이가 이 값 이하인 pair만 "
+            "calibration stereo pair로 저장합니다."
+        )
         self.calibration_auto_interval_spin = QtWidgets.QDoubleSpinBox()
-        self.calibration_auto_interval_spin.setRange(0.5, 10.0)
-        self.calibration_auto_interval_spin.setSingleStep(0.5)
+        self.calibration_auto_interval_spin.setRange(0.1, 10.0)
+        self.calibration_auto_interval_spin.setSingleStep(0.1)
+        self.calibration_auto_interval_spin.setDecimals(1)
         self.calibration_auto_interval_spin.setValue(self.settings.calibration_auto_interval_s)
         self.calibration_auto_interval_spin.setSuffix(" s")
-        self.calibration_auto_target_spin = QtWidgets.QSpinBox()
-        self.calibration_auto_target_spin.setRange(1, 200)
-        self.calibration_auto_target_spin.setValue(self.settings.calibration_auto_target_pairs)
-        self.calibration_auto_target_spin.setSuffix(" pair")
         self.capture_calibration_auto_button = QtWidgets.QPushButton("자동 촬영 시작")
         self.capture_calibration_auto_button.clicked.connect(self.toggle_auto_calibration_capture)
         self.save_intrinsics_button = QtWidgets.QPushButton("저장")
@@ -2934,12 +2958,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         calib_form.addWidget(self.capture_calibration_button, 1, 6)
         auto_interval_label = QtWidgets.QLabel("자동 간격")
         auto_interval_label.setProperty("compactFormLabel", True)
-        auto_target_label = QtWidgets.QLabel("목표 pair")
-        auto_target_label.setProperty("compactFormLabel", True)
+        pair_max_delta_label = QtWidgets.QLabel("최대 pair Δt")
+        pair_max_delta_label.setProperty("compactFormLabel", True)
         calib_form.addWidget(auto_interval_label, 2, 0)
         calib_form.addWidget(self.calibration_auto_interval_spin, 2, 1)
-        calib_form.addWidget(auto_target_label, 2, 2)
-        calib_form.addWidget(self.calibration_auto_target_spin, 2, 3)
+        calib_form.addWidget(pair_max_delta_label, 2, 2)
+        calib_form.addWidget(self.calibration_pair_max_delta_spin, 2, 3)
         calib_form.addWidget(self.capture_calibration_auto_button, 2, 4, 1, 3)
 
         validation_source_group = QtWidgets.QGroupBox("입력 / 계산 목적")
@@ -3694,8 +3718,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.right_mavlink_url_edit: "Pixhawk 2 MAVLink URL입니다. 예: udpin:0.0.0.0:14551, /dev/ttyACM1, tcp:10.41.10.2:5760",
             self.left_mavlink_baud_spin: "Pixhawk 1 MAVLink URL이 시리얼 장치일 때 사용할 baud rate입니다.",
             self.right_mavlink_baud_spin: "Pixhawk 2 MAVLink URL이 시리얼 장치일 때 사용할 baud rate입니다.",
-            self.mavlink_configure_streams_checkbox: "MAVLink 연결 후 MAV_SYS_ID 설정과 Pixhawk Host IP 방향 MAVLink stream 시작 명령을 보냅니다.",
-            self.mavlink_stream_rate_spin: "PX4 shell로 MAVLink stream을 설정할 때 사용할 mavlink start -r 값입니다.",
+            self.mavlink_configure_streams_checkbox: "MAVLink 연결 후 MAV_SYS_ID와 MAV_2 단일-instance 파라미터를 저장합니다. 수동 mavlink start는 실행하지 않으며 재부팅 후 적용됩니다.",
+            self.mavlink_stream_rate_spin: "재부팅 후 MAV_2 Ethernet instance에 적용할 MAV_2_RATE 값입니다.",
             self.custom_watch_name_edit: "사용자 지정 MAVLink 필드 감시의 표시 이름입니다.",
             self.custom_watch_message_edit: "감시할 MAVLink message 이름입니다. 예: ATTITUDE, GPS_RAW_INT",
             self.custom_watch_field_edit: "읽을 메시지 필드 경로입니다. 예: z, q[0], position[2]. 숫자 필드는 그래프로 표시됩니다.",
@@ -3744,9 +3768,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             ),
             self.calib_dir_edit: "보정 이미지와 intrinsics.json / intrinsics_zoom_##.json을 저장/로드할 디렉터리입니다.",
             self.capture_calibration_button: "현재 좌/우 카메라 프레임 중 체커보드가 검출된 쪽만 내부 파라미터 보정 이미지로 저장합니다.",
+            self.calibration_pair_max_delta_spin: "좌·우 Live 원본 frame의 RTCP/NTP 촬영 시각 차이 허용치입니다. 수동/자동 Live pair에 모두 적용됩니다.",
             self.calibration_auto_interval_spin: "자동 촬영 시도 간격입니다. 보드 검출·좌우 시각 동기·중복 검사를 통과한 pair만 저장합니다.",
-            self.calibration_auto_target_spin: "자동 촬영을 멈출 유효한 좌/우 체커보드 pair 개수입니다.",
-            self.capture_calibration_auto_button: "좌·우 모두 체커보드가 검출되고 RTCP/NTP 시각 차이가 100ms 이하인 pair를 자동으로 저장합니다.",
+            self.capture_calibration_auto_button: "좌·우 모두 체커보드가 검출되고 RTCP/NTP 시각 차이가 설정된 최대 pair Δt 이하인 pair를 Stop할 때까지 자동으로 저장합니다.",
             self.run_calibration_button: "캡처된 체커보드 이미지로 OpenCV 내부 파라미터 보정을 실행합니다.",
             self.calibration_progress_bar: "내부 파라미터 및 stereo 계산에서 실제 검사한 이미지/pair 기준 진행률입니다.",
             self.save_intrinsics_button: "촬영 당시 양쪽 카메라 GZVV readback으로 확인된 줌 레벨의 내부 파라미터를 intrinsics_zoom_##.json으로 저장하고 latest alias intrinsics.json도 갱신합니다.",
@@ -4544,12 +4568,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_ntrip_mountpoint_edit.setPlaceholderText("MOUNTPOINT")
         self.gnss_ntrip_username_edit = QtWidgets.QLineEdit(operation_config.network.username)
         self.gnss_ntrip_username_edit.setPlaceholderText("NTRIP username")
-        # Session-only: never pre-filled from a stored password, and never
-        # read back into GnssOperationConfig/settings JSON. See
+        # Session-only: initialized from the deployment default, never read
+        # back into GnssOperationConfig/settings JSON, and still directly
+        # replaceable/clearable by the operator. See
         # gnss_runtime_controller._resolve_ntrip_credentials for how this
         # value is used (and workstation_core/ntrip_credentials.py for where
         # "Remember" actually persists it).
-        self.gnss_ntrip_password_edit = QtWidgets.QLineEdit()
+        self.gnss_ntrip_password_edit = QtWidgets.QLineEdit(DEFAULT_NTRIP_SESSION_PASSWORD)
         self.gnss_ntrip_password_edit.setEchoMode(QtWidgets.QLineEdit.Password)
         self.gnss_ntrip_password_edit.setPlaceholderText("NTRIP password")
         self.gnss_ntrip_remember_checkbox = QtWidgets.QCheckBox("Remember password securely")
@@ -5222,8 +5247,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             ("fix", "fix_type"),
             ("rtk", "RTK 상태"),
             ("sats", "satellites_visible"),
-            ("eph", "eph"),
-            ("epv", "epv"),
+            ("hdop", "HDOP"),
+            ("vdop", "VDOP"),
             ("h_acc", "h_acc"),
             ("v_acc", "v_acc"),
             ("lla", "lat / lon / alt"),
@@ -5294,9 +5319,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         form = QtWidgets.QGridLayout(control_group)
         self.baseline_left_gps_combo = QtWidgets.QComboBox()
         self.baseline_right_gps_combo = QtWidgets.QComboBox()
-        for combo in (self.baseline_left_gps_combo, self.baseline_right_gps_combo):
+        for side, combo in (("left", self.baseline_left_gps_combo), ("right", self.baseline_right_gps_combo)):
             combo.addItem("GPS1", "GPS1")
             combo.addItem("GPS2", "GPS2")
+            selected = self._pixhawk_gnss_source(side)
+            selected_index = combo.findData(selected)
+            if selected_index >= 0:
+                combo.setCurrentIndex(selected_index)
             combo.currentIndexChanged.connect(lambda _index: self._handle_baseline_source_changed())
         form.addWidget(QtWidgets.QLabel("좌측 카메라 기준 GPS"), 0, 0)
         form.addWidget(self.baseline_left_gps_combo, 0, 1)
@@ -5601,8 +5630,17 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def _handle_baseline_source_changed(self) -> None:
         if hasattr(self, "baseline_left_gps_combo"):
-            self.gnss_monitor.left_source = str(self.baseline_left_gps_combo.currentData() or "GPS1")
-            self.gnss_monitor.right_source = str(self.baseline_right_gps_combo.currentData() or "GPS1")
+            self.set_pixhawk_gnss_source(
+                "left",
+                str(self.baseline_left_gps_combo.currentData() or "GPS1"),
+                persist=False,
+            )
+            self.set_pixhawk_gnss_source(
+                "right",
+                str(self.baseline_right_gps_combo.currentData() or "GPS1"),
+                persist=False,
+            )
+            self._save_current_settings()
         self._refresh_baseline_source_summary()
         self._refresh_rtk_baseline()
         self._refresh_baseline_alignment_ui()
@@ -5799,7 +5837,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                     text += f" fix={state.fix_type}"
                 self._set_health_label(labels[label_key], text, level)
             if gps is None:
-                for key in ("fix", "rtk", "sats", "eph", "epv", "h_acc", "v_acc", "lla", "rate", "age", "timestamp"):
+                for key in ("fix", "rtk", "sats", "hdop", "vdop", "h_acc", "v_acc", "lla", "rate", "age", "timestamp"):
                     labels[key].setText("대기 중")
                 continue
             age_ms = max(0.0, now_s - gps.timestamp_s) * 1000.0
@@ -5807,8 +5845,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             labels["fix"].setText("--" if gps.fix_type is None else str(gps.fix_type))
             self._set_health_label(labels["rtk"], gps.rtk_label, self._gps_fix_level(gps.fix_type, age_ms=age_ms))
             labels["sats"].setText("--" if gps.satellites_used is None else str(gps.satellites_used))
-            labels["eph"].setText("--" if gps.eph_m is None else f"{gps.eph_m:.3f} m")
-            labels["epv"].setText("--" if gps.epv_m is None else f"{gps.epv_m:.3f} m")
+            labels["hdop"].setText("--" if gps.hdop is None else f"{gps.hdop:.2f}")
+            labels["vdop"].setText("--" if gps.vdop is None else f"{gps.vdop:.2f}")
             labels["h_acc"].setText("--" if gps.eph_m is None else f"{gps.eph_m:.3f} m")
             labels["v_acc"].setText("--" if gps.epv_m is None else f"{gps.epv_m:.3f} m")
             if gps.has_position:
@@ -7956,7 +7994,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             decoder=self.decoder_combo.currentData(),
             backend=self.stream_backend_combo.currentData(),
             transport=self.rtsp_transport_combo.currentData(),
-            timeout_s=4.0,
+            timeout_s=RTSP_STREAM_CHECK_TIMEOUT_S,
         )
         self.rtsp_check_worker.moveToThread(self.rtsp_check_thread)
         self.rtsp_check_thread.started.connect(self.rtsp_check_worker.run)
@@ -8059,6 +8097,22 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             timeout_s=self.zoom_timeout_spin.value(),
             target_labels=target_labels,
             reactivate=reactivate,
+            visible_encoder_profile={
+                "bitrate": int(
+                    self._workstation_setting(
+                        "wiris_visible_encoder_bitrate", self.settings.wiris_visible_encoder_bitrate
+                    )
+                ),
+                "qp": int(
+                    self._workstation_setting("wiris_visible_encoder_qp", self.settings.wiris_visible_encoder_qp)
+                ),
+                "gop": int(
+                    self._workstation_setting("wiris_visible_encoder_gop", self.settings.wiris_visible_encoder_gop)
+                ),
+                "idr": int(
+                    self._workstation_setting("wiris_visible_encoder_idr", self.settings.wiris_visible_encoder_idr)
+                ),
+            },
         )
         self.rtsp_enable_worker.moveToThread(self.rtsp_enable_thread)
         self.rtsp_enable_thread.started.connect(self.rtsp_enable_worker.run)
@@ -8791,18 +8845,22 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def _current_zoom_intrinsics_result(self) -> tuple[StereoIntrinsicsResult | None, str, str, Path | None]:
         zoom_level = self.zoom_level_spin.value()
         if self.last_calibration_result is not None and self.last_calibration_zoom_level == zoom_level:
-            active_path_text = str(getattr(self, "_active_intrinsics_profile_path", "") or "")
-            active_path = (
-                Path(active_path_text)
-                if active_path_text and not active_path_text.startswith("memory:")
+            candidate_path_text = str(
+                getattr(self, "_candidate_intrinsics_profile_path", "") or ""
+            )
+            candidate_path = (
+                Path(candidate_path_text)
+                if candidate_path_text and not candidate_path_text.startswith("memory:")
                 else None
             )
-            active_name = active_path.name if active_path is not None else "in-memory result"
+            candidate_name = (
+                candidate_path.name if candidate_path is not None else "in-memory result"
+            )
             return (
                 self.last_calibration_result,
-                f"active calibration result (zoom {zoom_level:02d})",
-                f"active calibration result for zoom {zoom_level:02d} ({active_name})",
-                active_path,
+                f"calibration candidate (zoom {zoom_level:02d})",
+                f"calibration candidate for zoom {zoom_level:02d} ({candidate_name})",
+                candidate_path,
             )
         zoom_path = self._intrinsics_storage_path(zoom_level)
         if zoom_path.exists():
@@ -9032,7 +9090,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.last_calibration_result = result
         self.calibration_image_diagnostics = tuple(result.image_diagnostics)
         self.last_calibration_zoom_level = zoom_level
-        self._active_intrinsics_profile_path = str(path)
+        self._candidate_intrinsics_profile_path = str(path)
         if self.apply_intrinsics_to_distance() is False:
             self._refresh_zoom_intrinsics_tab()
             self._refresh_operation_header()
@@ -9301,19 +9359,18 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.camera_frame_metadata_history[camera].append(dict(frame_metadata))
         self.camera_frame_times[camera].append(frame_timestamp_s)
         self._capture_recording_clock_sync_start_observation()
-        self._update_camera_connection_status()
+        # Stream stats already refresh the camera status/header once per
+        # second. Rebuilding those UI labels on every preview frame made two
+        # live cameras continuously consume the GUI event loop.
         self._record_clock_offset_sample(now_s)
         if self._is_clock_sync_tab_visible():
             self._update_clock_sync_display()
-        self.latest_calibration_preview_images[camera] = image.copy()
-        self.calibration_preview_changed.emit(
-            {
-                "camera": camera,
-                "image": image.copy(),
-                "kind": "raw",
-                "metadata": dict(frame_metadata),
-            }
-        )
+        # QImage is implicitly shared. Keep a cheap, value-semantics handle for
+        # explicit snapshots/checkerboard work instead of two deep copies and a
+        # duplicate raw-preview signal on every frame. CalibrationWorkspace
+        # already receives the same raw frame from CameraPane.frame_changed;
+        # calibration_preview_changed remains reserved for throttled overlays.
+        self.latest_calibration_preview_images[camera] = QtGui.QImage(image)
         if not (
             self._is_checkerboard_calibration_visible()
             or self._workstation_calibration_preview_active
@@ -9819,12 +9876,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def workstation_ulog_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
         def import_workstation_ulog(self, *args: Any, **kwargs: Any) -> Any: ...
         def _remove_distance_history_point(self, *args: Any, **kwargs: Any) -> Any: ...
-        def apply_workstation_run_setup(self, *args: Any, **kwargs: Any) -> Any: ...
-        def workstation_run_setup_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
         def ensure_workstation_run_evidence(self, *args: Any, **kwargs: Any) -> Any: ...
         def append_workstation_run_event(self, *args: Any, **kwargs: Any) -> Any: ...
         def import_workstation_session_artifact(self, *args: Any, **kwargs: Any) -> Any: ...
         def register_workstation_session_artifact(self, *args: Any, **kwargs: Any) -> Any: ...
+        def reset_workstation_optical_pose_session(self, *args: Any, **kwargs: Any) -> Any: ...
         def workstation_optical_pose_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
         def register_workstation_optical_pose_candidate(self, *args: Any, **kwargs: Any) -> Any: ...
         def apply_workstation_optical_pose_candidate(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -9892,6 +9948,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def _checkerboard_intrinsic_delta_px(self, *args: Any, **kwargs: Any) -> Any: ...
         def _checkerboard_validation_stddev(self, *args: Any, **kwargs: Any) -> Any: ...
         def _calibration_quality_allows_action(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _publish_immutable_calibration_file(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _publish_immutable_intrinsics_profile(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _publish_immutable_extrinsics_profile(self, *args: Any, **kwargs: Any) -> Any: ...
         def workstation_calibration_quality_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
         def run_checkerboard_random_validation(self, *args: Any, **kwargs: Any) -> Any: ...
         def _handle_random_validation_failed(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -9902,6 +9961,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def apply_checkerboard_validation_result(self, *args: Any, **kwargs: Any) -> Any: ...
         def apply_intrinsics_to_distance(self, *args: Any, **kwargs: Any) -> Any: ...
         def _checkerboard_config(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _archive_loaded_intrinsics(self, *args: Any, **kwargs: Any) -> Any: ...
         def _calibration_dirs(self, *args: Any, **kwargs: Any) -> Any: ...
         def _intrinsics_storage_base_path(self, *args: Any, **kwargs: Any) -> Any: ...
         def _intrinsics_storage_path(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -9909,6 +9969,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def _calibration_image_paths(self, *args: Any, **kwargs: Any) -> Any: ...
         def _next_calibration_capture_stem(self, *args: Any, **kwargs: Any) -> Any: ...
         def _checkerboard_capture_pair_timing(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _checkerboard_capture_pair_timing_evidence(self, *args: Any, **kwargs: Any) -> Any: ...
         def capture_calibration_images(self, *args: Any, **kwargs: Any) -> Any: ...
         def toggle_auto_calibration_capture(self, *args: Any, **kwargs: Any) -> Any: ...
         def start_auto_calibration_capture(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -10280,6 +10341,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.px4_recording_rows["right"].clear()
         self.gnss_base_recording_rows.clear()
         self.extrinsics_comparison_recording_rows.clear()
+        self.method_evaluation_bundle_rows.clear()
         if self.distance_recording_enabled and self.recording_session_id:
             spool_root = self._recording_session_dir(self.recording_session_id) / ".spool"
             if isinstance(self.distance_recording_rows, SpoolRows):
@@ -10290,6 +10352,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 rows.bind(spool_root / f"px4_{side}.jsonl")
             self.gnss_base_recording_rows.bind(spool_root / "gnss_base.jsonl")
             self.extrinsics_comparison_recording_rows.bind(spool_root / "extrinsics_comparison.jsonl")
+            self.method_evaluation_bundle_rows.bind(
+                spool_root / "method_evaluation_bundles.jsonl"
+            )
         self._recording_pair_row_index.clear()
         if not self.distance_recording_enabled:
             self.distance_recording_started_monotonic_s = None
@@ -10303,6 +10368,48 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def _workstation_setting(self, name: str, default: object = None) -> object:
         value = self._workstation_setting_overrides.get(name, default)
         return default if value is None else value
+
+    def _pixhawk_gnss_source(self, side: str) -> str:
+        if side not in {"left", "right"}:
+            raise ValueError(f"Unknown Pixhawk side: {side}")
+        key = "pixhawk_left_gnss_source" if side == "left" else "pixhawk_right_gnss_source"
+        default = getattr(self.settings, key, "GPS1")
+        return normalize_pixhawk_gnss_source(self._workstation_setting(key, default))
+
+    def set_pixhawk_gnss_source(self, side: str, source: str, *, persist: bool = True) -> str:
+        """Select the GPS1/GPS2 position source used by P1/P2 calculations."""
+
+        if side not in {"left", "right"}:
+            raise ValueError(f"Unknown Pixhawk side: {side}")
+        selected = normalize_pixhawk_gnss_source(source)
+        key = "pixhawk_left_gnss_source" if side == "left" else "pixhawk_right_gnss_source"
+        self._workstation_setting_overrides[key] = selected
+        if side == "left":
+            self.gnss_monitor.left_source = selected
+            combo = getattr(self, "baseline_left_gps_combo", None)
+        else:
+            self.gnss_monitor.right_source = selected
+            combo = getattr(self, "baseline_right_gps_combo", None)
+        if combo is not None:
+            index = combo.findData(selected)
+            if index >= 0 and combo.currentIndex() != index:
+                blocked = combo.blockSignals(True)
+                combo.setCurrentIndex(index)
+                combo.blockSignals(blocked)
+        # A source change must not allow a previous receiver's snapshot to be
+        # reused for the new source during the current Measurement.
+        cache_sources = getattr(self, "_measurement_latest_valid_gps_source", {})
+        if isinstance(cache_sources, dict):
+            cache_sources.pop(side, None)
+        if persist:
+            self._save_current_settings()
+        if hasattr(self, "_refresh_baseline_source_summary"):
+            self._refresh_baseline_source_summary()
+        if hasattr(self, "_refresh_rtk_baseline"):
+            self._refresh_rtk_baseline()
+        if hasattr(self, "_refresh_baseline_alignment_ui"):
+            self._refresh_baseline_alignment_ui()
+        return selected
 
 
 
@@ -11428,12 +11535,17 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         state_names = (
             "last_calibration_result",
             "last_calibration_zoom_level",
+            "_candidate_intrinsics_profile_path",
             "_active_intrinsics_profile_path",
             "active_intrinsics",
             "_active_intrinsics_source_zoom_level",
             "_active_intrinsics_profile_hash",
             "selected_extrinsics_profile",
+            "active_extrinsics_profile",
+            "checkerboard_extrinsics_candidate_profile",
+            "optical_pose_extrinsics_candidate_profile",
             "checkerboard_extrinsics_profile",
+            "optical_pose_extrinsics_profile",
             "_selected_extrinsics_profile_path",
             "_selected_extrinsics_profile_hash",
             "_active_extrinsics_profile_path",
@@ -11450,7 +11562,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         try:
             self.last_calibration_result = result
             self.last_calibration_zoom_level = zoom_level
-            self._active_intrinsics_profile_path = str(source_path)
+            self._candidate_intrinsics_profile_path = str(source_path)
             if self.apply_intrinsics_to_distance() is False:
                 restore_previous_state()
                 self._log(
@@ -11478,32 +11590,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if self.last_calibration_result is None:
             self.calibration_status_label.setText("Run calibration before saving intrinsics.")
             return
+        quality_state = "UNASSESSED"
+        quality_reasons: tuple[str, ...] = ()
         quality_reader = getattr(self, "_calibration_quality_state", None)
         if callable(quality_reader):
             quality_state, quality_reasons = quality_reader(self.last_calibration_result)
-            if quality_state == "FAIL" or (
-                quality_state == "WARNING" and not quality_warning_confirmed
-            ):
-                qualifier = (
-                    "FAIL"
-                    if quality_state == "FAIL"
-                    else "WARNING requires explicit confirmation"
-                )
-                self.calibration_status_label.setText(
-                    f"Cannot save intrinsics: calibration quality {qualifier} ("
-                    + ", ".join(quality_reasons)
-                    + ")"
-                )
-                return
-            if quality_state == "WARNING":
-                summary = dict(getattr(self, "checkerboard_validation_summary", {}) or {})
-                summary["quality_override"] = {
-                    "action": "save_intrinsics",
-                    "confirmed": True,
-                    "confirmed_utc_ns": time.time_ns(),
-                    "reason_codes": list(quality_reasons),
-                }
-                self.checkerboard_validation_summary = summary
         root, _left_dir, _right_dir = self._calibration_dirs()
         try:
             portable_workstation_data_path_text(
@@ -11519,17 +11610,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return
         root.mkdir(parents=True, exist_ok=True)
         zoom_level = self.last_calibration_zoom_level
-        if zoom_level is None:
-            self.calibration_status_label.setText(
-                "Cannot save intrinsics: capture-time camera zoom readback is unavailable."
+        approved = quality_state in {"PASS", "UNASSESSED"} and zoom_level is not None
+        if approved:
+            output = self._intrinsics_storage_path(zoom_level)
+        else:
+            attempts = root / "attempts"
+            attempts.mkdir(parents=True, exist_ok=True)
+            zoom_token = "unknown" if zoom_level is None else f"{int(zoom_level):02d}"
+            output = attempts / (
+                f"intrinsics_zoom_{zoom_token}_{quality_state.lower()}_{time.time_ns()}.json"
             )
-            self._log(
-                "[캘리브레이션] intrinsic 저장을 중단했습니다. "
-                "촬영 당시 양쪽 카메라 GZVV readback이 필요합니다."
-            )
-            return
-        zoom_output = self._intrinsics_storage_path(zoom_level)
-        latest_output = self._intrinsics_storage_base_path()
         metadata = {
             "note": "Generated by StereoWIRIS Camera Calibration tab",
             "timestamp_s": time.time(),
@@ -11537,23 +11627,46 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "capture_zoom_level": zoom_level,
             "zoom_source": "capture_metadata",
             "zoom_target": str(self.zoom_target_combo.currentData() or "both"),
+            "profile_status": "approved" if approved else "attempt_only",
+            "eligible_for_application": bool(approved),
+            "quality_state": quality_state,
+            "quality_reasons": list(quality_reasons),
         }
         # K/D and R/T have independent lifecycles.  Keep the generic JSON
         # loader backward-compatible with older embedded files, but new
         # per-zoom intrinsic saves intentionally exclude stereo extrinsics.
         intrinsics_only = without_stereo_extrinsics(self.last_calibration_result)
         save_intrinsics_json(
-            zoom_output,
+            output,
             intrinsics_only,
             metadata=metadata,
         )
-        if zoom_output != latest_output:
-            save_intrinsics_json(latest_output, intrinsics_only, metadata=metadata)
-        self.last_calibration_zoom_level = zoom_level
-        self.calibration_status_label.setText(f"Saved intrinsics for zoom {zoom_level:02d}: {zoom_output}")
-        self._add_zoom_intrinsics_comparison_path(zoom_output)
-        self._save_current_settings(zoom_output)
-        self._log(f"[캘리브레이션] intrinsic 파일을 저장했습니다 (zoom={zoom_level:02d}): {zoom_output}")
+        self._last_calibration_attempt_path = str(output)
+        if approved:
+            latest_output = self._intrinsics_storage_base_path()
+            if output != latest_output:
+                save_intrinsics_json(latest_output, intrinsics_only, metadata=metadata)
+            immutable_output = self._publish_immutable_intrinsics_profile(
+                intrinsics_only,
+                metadata=metadata,
+            )
+            self.last_calibration_zoom_level = zoom_level
+            self._candidate_intrinsics_profile_path = str(immutable_output)
+            self.calibration_status_label.setText(
+                f"Saved approved intrinsics: immutable={immutable_output} | alias={output}"
+            )
+            self._add_zoom_intrinsics_comparison_path(immutable_output)
+            self._save_current_settings(immutable_output)
+        else:
+            reason = ", ".join(quality_reasons) or (
+                "capture-time camera zoom readback unavailable"
+                if zoom_level is None
+                else quality_state
+            )
+            self.calibration_status_label.setText(
+                f"Saved non-applicable calibration attempt: {quality_state} ({reason}) | {output}"
+            )
+        self._log(f"[캘리브레이션] {self.calibration_status_label.text()}")
         self._refresh_operation_header()
         self._refresh_zoom_intrinsics_tab()
 
@@ -11627,6 +11740,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 f"[캘리브레이션] intrinsic portable import 실패: {source_path}: {exc}"
             )
             return
+        try:
+            session_copy = self._archive_loaded_intrinsics(path)
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.calibration_status_label.setText(
+                f"Failed to preserve intrinsics in current Session: {exc}"
+            )
+            self._log(f"[캘리브레이션] intrinsic Session 보관 실패: {path}: {exc}")
+            return
         if path != source_path.resolve(strict=False):
             self._log(
                 f"[캘리브레이션] 외부 intrinsic을 portable data root로 가져왔습니다: "
@@ -11637,7 +11758,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.last_calibration_zoom_level = (
             self.zoom_level_spin.value() if metadata_zoom_level is None else metadata_zoom_level
         )
-        self._active_intrinsics_profile_path = str(path)
+        self._candidate_intrinsics_profile_path = str(path)
         if self.apply_intrinsics_to_distance() is False:
             self._log(f"[캘리브레이션] intrinsic 적용이 quality/grid gate에서 차단됐습니다: {path}")
             self._refresh_zoom_intrinsics_tab()
@@ -11654,7 +11775,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 f"차단됐습니다: {exc}"
             )
         else:
-            self.calibration_status_label.setText(f"Loaded and applied intrinsics: {path.name}")
+            self.calibration_status_label.setText(
+                f"Loaded and applied intrinsics: {path.name}"
+                + (f" | Session copy={session_copy.name}" if session_copy is not None else "")
+            )
         self._add_zoom_intrinsics_comparison_path(path)
         self._log(f"[캘리브레이션] intrinsic 파일을 선택해 적용했습니다: {path}")
         self._refresh_zoom_intrinsics_tab()
@@ -11673,7 +11797,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.calibration_image_diagnostics = tuple(result.image_diagnostics)
         self.last_calibration_zoom_level = zoom_level
         zoom_path = self._intrinsics_storage_path(zoom_level)
-        self._active_intrinsics_profile_path = str(
+        self._candidate_intrinsics_profile_path = str(
             zoom_path if zoom_path.exists() else self._intrinsics_storage_base_path()
         )
         if self.apply_intrinsics_to_distance() is False:

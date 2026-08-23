@@ -8,11 +8,14 @@ from Workstation.workspaces import CalibrationWorkspace
 
 
 GATED_COMMANDS = (
+    "calibration.apply_bundle",
+    "calibration.validation.apply",
+)
+
+EVIDENCE_SAVE_COMMANDS = (
     "calibration.save_intrinsics",
     "calibration.save_extrinsics",
-    "calibration.apply_bundle",
     "calibration.validation.save",
-    "calibration.validation.apply",
 )
 
 
@@ -122,7 +125,7 @@ def test_calibration_quality_warning_requires_explicit_confirmation_and_resets()
     _dispose(workspace)
 
 
-def test_calibration_quality_fail_blocks_save_apply_but_not_compute() -> None:
+def test_calibration_quality_fail_allows_attempt_save_but_blocks_apply() -> None:
     backend = _QualityBackend(
         {
             "quality_state": "FAIL",
@@ -138,11 +141,16 @@ def test_calibration_quality_fail_blocks_save_apply_but_not_compute() -> None:
 
     assert workspace.calibration_quality_values["state"].value.text() == "FAIL"
     assert all(not workspace.operation_buttons[command].isEnabled() for command in GATED_COMMANDS)
-    assert workspace.operation_buttons["calibration.run_intrinsic"].isEnabled()
-    assert workspace.operation_buttons["calibration.run_extrinsics"].isEnabled()
-    assert "Save / Apply blocked" in workspace.calibration_quality_gate_label.text()
+    assert all(workspace.operation_buttons[command].isEnabled() for command in EVIDENCE_SAVE_COMMANDS)
+    assert "Save preserves an attempt" in workspace.calibration_quality_gate_label.text()
+    assert not workspace.operation_buttons["calibration.run_intrinsic"].isEnabled()
+    assert not workspace.operation_buttons["calibration.run_extrinsics"].isEnabled()
+    assert "Select a Photo set" in workspace.operation_buttons[
+        "calibration.run_intrinsic"
+    ].toolTip()
+    assert "Apply is blocked" in workspace.calibration_quality_gate_label.text()
     assert "principal_offset_out_of_range" in workspace.operation_buttons[
-        "calibration.save_intrinsics"
+        "calibration.apply_bundle"
     ].toolTip()
     assert workspace.confirm_calibration_quality_warning(True) is False
 

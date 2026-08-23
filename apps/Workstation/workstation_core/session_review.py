@@ -25,6 +25,19 @@ from xml.etree import ElementTree
 
 import xlsxwriter
 
+from Workstation.workstation_core.measurement_methods import (
+    CHECKERBOARD_STEREO,
+    COMBINED_HYBRID,
+    DRONE_RTK_MULTIVIEW,
+    DRONE_RTK_ROTATION_HYBRID,
+    HORIZON_HYBRID,
+    MEASUREMENT_METHOD_IDS,
+    MEASUREMENT_METHOD_LABELS,
+    MOUNTAIN_GNSS,
+    PIXHAWK_RTK_LIVE,
+    TERRAIN_PNP,
+)
+
 
 REVIEW_WORKBOOK_NAME = "review.xlsx"
 EXCEL_MAX_ROWS = 1_048_576
@@ -42,6 +55,70 @@ BASE_SHEET_NAMES = (
     "Captures",
     "Warnings",
     "Files",
+)
+
+# Excel sheet names are capped at 31 characters.  Keep these stable and
+# compact while preserving a one-to-one mapping to the canonical method IDs.
+METHOD_SHEET_NAMES: dict[str, str] = {
+    PIXHAWK_RTK_LIVE: "M_Pixhawk_RTK",
+    CHECKERBOARD_STEREO: "M_Checkerboard",
+    HORIZON_HYBRID: "M_Horizon",
+    MOUNTAIN_GNSS: "M_Mountain_GNSS",
+    DRONE_RTK_ROTATION_HYBRID: "M_Drone_RTK_Rotation",
+    DRONE_RTK_MULTIVIEW: "M_Drone_RTK_Multiview",
+    TERRAIN_PNP: "M_Terrain_PnP",
+    COMBINED_HYBRID: "M_Combined",
+}
+if tuple(METHOD_SHEET_NAMES) != MEASUREMENT_METHOD_IDS:
+    raise RuntimeError("method worksheet mapping must cover every canonical method in order")
+if len(set(METHOD_SHEET_NAMES.values())) != len(METHOD_SHEET_NAMES) or any(
+    len(name) > 31 for name in METHOD_SHEET_NAMES.values()
+):
+    raise RuntimeError("method worksheet names must be unique and Excel-compatible")
+
+METHOD_SHEET_COLUMNS = (
+    "record_type",
+    "measurement_id",
+    "pair_id",
+    "method_id",
+    "method_label",
+    "profile_id",
+    "geometry_sha256",
+    "utc_time",
+    "recording_time_ns",
+    "object_class",
+    "distance_m",
+    "forward_m",
+    "right_m",
+    "down_m",
+    "valid",
+    "status",
+    "warning_code",
+    "sync_delta_ns",
+    "left_confidence",
+    "right_confidence",
+    "vertical_disparity_px",
+    "reprojection_error_px",
+    "gnss_fix_type",
+    "geometry_state",
+    "zoom",
+    "resolution",
+    "baseline_m",
+    "rotation_source",
+    "translation_source",
+    "measurement_method_instance_id",
+    "measurement_geometry_kind",
+    "measurement_selection_reason",
+    "measurement_component_sources",
+    "reasons",
+    "warnings",
+    "reused_inputs",
+    "queue_wait_ms",
+    "evaluation_duration_ms",
+    "snapshot_sha256",
+    "attempt_sha256",
+    "method_evaluation_sha256",
+    "method_evaluation_bundle_sha256",
 )
 
 _TABLE_NAMES = (
@@ -176,6 +253,9 @@ class MeasurementReview:
     captures: Sequence[Mapping[str, object]] = ()
     warnings: Sequence[Mapping[str, object]] = ()
     artifacts: Sequence[Mapping[str, object]] = ()
+    method_results: Mapping[str, Sequence[Mapping[str, object]]] = field(
+        default_factory=dict
+    )
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "MeasurementReview":
@@ -196,6 +276,11 @@ class MeasurementReview:
         if not isinstance(summary, Mapping):
             raise TypeError("measurement 'summary' must be a mapping")
         artifacts = value.get("artifacts", ())
+        raw_method_results = value.get("method_results", {})
+        if raw_method_results is None:
+            raw_method_results = {}
+        if not isinstance(raw_method_results, Mapping):
+            raise TypeError("measurement 'method_results' must be a mapping")
         return cls(
             measurement_id=measurement_id,
             summary=dict(summary),
@@ -208,6 +293,13 @@ class MeasurementReview:
             artifacts=_require_rows(
                 artifacts, label=f"{measurement_id or '<missing>'}.artifacts"
             ),
+            method_results={
+                str(method_id): _require_rows(
+                    rows,
+                    label=f"{measurement_id or '<missing>'}.method_results.{method_id}",
+                )
+                for method_id, rows in raw_method_results.items()
+            },
         )
 
 
@@ -300,6 +392,12 @@ def _normalize_measurement(
             captures=_require_rows(value.captures, label="captures"),
             warnings=_require_rows(value.warnings, label="warnings"),
             artifacts=_require_rows(value.artifacts, label="artifacts"),
+            method_results={
+                str(method_id): _require_rows(
+                    rows, label=f"method_results.{method_id}"
+                )
+                for method_id, rows in value.method_results.items()
+            },
         )
     if not isinstance(value, Mapping):
         raise TypeError("each measurement must be MeasurementReview or a mapping")
@@ -336,6 +434,7 @@ def _write_workbook(
     max_rows_per_sheet: int,
 ) -> None:
     rows_by_sheet = _collect_rows(measurements)
+    rows_by_method = _collect_method_rows(measurements)
     with xlsxwriter.Workbook(
         output,
         {
@@ -383,6 +482,17 @@ def _write_workbook(
                 output_parent=output.parent,
                 max_rows_per_sheet=max_rows_per_sheet,
             )
+        for method_id in MEASUREMENT_METHOD_IDS:
+            _write_table_shards(
+                workbook,
+                base_name=METHOD_SHEET_NAMES[method_id],
+                rows=rows_by_method[method_id],
+                default_columns=METHOD_SHEET_COLUMNS,
+                formats=formats,
+                session_root=session_root,
+                output_parent=output.parent,
+                max_rows_per_sheet=max_rows_per_sheet,
+            )
 
 
 def _collect_rows(
@@ -414,6 +524,127 @@ def _collect_rows(
                     / str(measurement_path).replace("\\", "/")
                 )
             result["Files"].append(resolved)
+    return result
+
+
+def _collect_method_rows(
+    measurements: Sequence[MeasurementReview],
+) -> dict[str, list[dict[str, object]]]:
+    """Build one derived review table for each canonical Measurement method.
+
+    A method tab contains only geometry summaries and terminal pair results
+    that identify that method.  Empty tabs remain header-only so absence of
+    use is explicit without fabricating readiness or candidate evidence.
+    """
+
+    result = {method_id: [] for method_id in MEASUREMENT_METHOD_IDS}
+    for measurement in measurements:
+        quality_by_pair = {
+            str(row.get("pair_id") or ""): dict(row)
+            for row in measurement.quality
+            if row.get("pair_id") not in (None, "")
+        }
+        for method_id, outcome_rows in measurement.method_results.items():
+            if method_id not in result:
+                continue
+            for outcome in outcome_rows:
+                row = {
+                    "record_type": "method_outcome",
+                    "pair_id": outcome.get("pair_id"),
+                    "method_id": method_id,
+                    "method_label": MEASUREMENT_METHOD_LABELS[method_id],
+                    "profile_id": outcome.get("method_instance_id"),
+                    "measurement_method_instance_id": outcome.get(
+                        "method_instance_id"
+                    ),
+                    "geometry_sha256": outcome.get("geometry_sha256"),
+                    "status": outcome.get("status"),
+                    "valid": str(outcome.get("status") or "")
+                    in {"VALID", "ESTIMATED"},
+                    "reasons": "; ".join(
+                        str(value) for value in outcome.get("reasons", ()) or ()
+                    ),
+                    "warnings": "; ".join(
+                        str(value) for value in outcome.get("warnings", ()) or ()
+                    ),
+                    "reused_inputs": "; ".join(
+                        str(value)
+                        for value in outcome.get("reused_inputs", ()) or ()
+                    ),
+                    "queue_wait_ms": outcome.get("queue_wait_ms"),
+                    "evaluation_duration_ms": outcome.get(
+                        "evaluation_duration_ms"
+                    ),
+                    "snapshot_sha256": outcome.get("snapshot_sha256"),
+                    "attempt_sha256": outcome.get("attempt_sha256"),
+                    "method_evaluation_sha256": outcome.get(
+                        "method_evaluation_sha256"
+                    ),
+                    "method_evaluation_bundle_sha256": outcome.get(
+                        "method_evaluation_bundle_sha256"
+                    ),
+                }
+                row["warning_code"] = row["warnings"]
+                triangulated = outcome.get("result")
+                triangulated = (
+                    triangulated.get("triangulated")
+                    if isinstance(triangulated, Mapping)
+                    else None
+                )
+                if isinstance(triangulated, Mapping):
+                    point = triangulated.get("point_m")
+                    if isinstance(point, (list, tuple)) and len(point) == 3:
+                        row.update(
+                            forward_m=point[0],
+                            right_m=point[1],
+                            down_m=point[2],
+                        )
+                    row["distance_m"] = triangulated.get("range_m")
+                _set_measurement_id(
+                    row,
+                    measurement.measurement_id,
+                    label="method outcome",
+                )
+                result[method_id].append(row)
+        for geometry in measurement.geometry:
+            method_id = str(geometry.get("method_id") or "")
+            if method_id not in result:
+                continue
+            row = {
+                **dict(geometry),
+                "record_type": "geometry",
+                "method_id": method_id,
+                "method_label": MEASUREMENT_METHOD_LABELS[method_id],
+            }
+            _set_measurement_id(row, measurement.measurement_id, label="method geometry")
+            result[method_id].append(row)
+        for measurement_result in measurement.results:
+            # Terminal blocked pairs deliberately carry no method: geometry
+            # was never selected. Do not inherit the Measurement summary's
+            # preferred method and misclassify them in a method worksheet.
+            pair_status = str(measurement_result.get("pair_status") or "").lower()
+            geometry_kind = str(
+                measurement_result.get("measurement_geometry_kind") or ""
+            ).lower()
+            if (
+                geometry_kind == "unresolved"
+                or "blocked" in pair_status
+                or "no_ready" in pair_status
+            ):
+                continue
+            method_id = str(measurement_result.get("measurement_method_id") or "")
+            if method_id not in result:
+                continue
+            pair_id = str(measurement_result.get("pair_id") or "")
+            row = {
+                **dict(quality_by_pair.get(pair_id, {})),
+                **dict(measurement_result),
+                "record_type": "result",
+                "method_id": method_id,
+                "method_label": MEASUREMENT_METHOD_LABELS[method_id],
+            }
+            _set_measurement_id(row, measurement.measurement_id, label="method result")
+            result[method_id].append(row)
     return result
 
 
@@ -497,6 +728,14 @@ def _write_readme_sheet(
         ("Captures", "HR, OZ, alignment, and checkpoint capture inventory."),
         ("Warnings", "Warnings and errors with their measurement impact."),
         ("Files", "Relative links and hashes for evidence and authoritative data."),
+        *(
+            (
+                sheet_name,
+                f"{MEASUREMENT_METHOD_LABELS[method_id]} geometry summaries and "
+                "terminal pair results. Header-only means the method was not used.",
+            )
+            for method_id, sheet_name in METHOD_SHEET_NAMES.items()
+        ),
     )
     for row_index, (name, description) in enumerate(descriptions, start=5):
         worksheet.write_string(row_index, 0, name, formats["text"])
@@ -728,7 +967,11 @@ def _validate_workbook(path: Path) -> None:
             element.attrib.get("name", "")
             for element in root.findall("m:sheets/m:sheet", namespace)
         }
-        missing = set(BASE_SHEET_NAMES).difference(sheet_names)
+        required_sheet_names = {
+            *BASE_SHEET_NAMES,
+            *METHOD_SHEET_NAMES.values(),
+        }
+        missing = required_sheet_names.difference(sheet_names)
         if missing:
             raise ValueError(
                 "generated review workbook is missing sheets: " + ", ".join(sorted(missing))
@@ -750,6 +993,7 @@ def _fsync_directory(path: Path) -> None:
 __all__ = [
     "BASE_SHEET_NAMES",
     "EXCEL_MAX_ROWS",
+    "METHOD_SHEET_NAMES",
     "MeasurementReview",
     "REVIEW_WORKBOOK_NAME",
     "write_session_review_xlsx",

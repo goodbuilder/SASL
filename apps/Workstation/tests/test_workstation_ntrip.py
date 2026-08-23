@@ -4,12 +4,13 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from PyQt5 import QtWidgets
+from PyQt5 import QtCore, QtWidgets
 
 from Workstation.gnss_runtime_controller import (
     GnssRuntimeController,
     NtripCredentialError,
     NtripCredentialResolution,
+    _connect_gui_signal,
 )
 from Workstation.settings_workspace import SettingsWorkspace
 from Workstation.workstation_core import ntrip_credentials
@@ -26,6 +27,8 @@ from Workstation.workstation_core.gnss_network import (
 )
 from Workstation.workstation_core.gnss_operation import (
     CorrectionSourceIdentity,
+    DEFAULT_NTRIP_SESSION_PASSWORD,
+    DEFAULT_NTRIP_USERNAME,
     GgaPolicy,
     GnssOperationConfig,
     GnssOperationManager,
@@ -35,6 +38,7 @@ from Workstation.workstation_core.gnss_operation import (
     HeightType,
     NetworkConfig,
 )
+from Workstation.workstation_core.rtcm_pipeline import RtcmRouteConfig
 from Workstation.workstation_core.settings import AppSettings, load_settings, save_settings
 
 
@@ -102,6 +106,7 @@ def test_ngii_rts2_base_assisted_profile_uses_non_gating_field_defaults() -> Non
     assert config.network.caster_host == "RTS2.ngii.go.kr"
     assert config.network.caster_port == 2101
     assert config.network.mountpoint == "VRS-RTCM32"
+    assert config.network.username == DEFAULT_NTRIP_USERNAME
     assert config.network.username_env == "NGII_RTS2_USERNAME"
     assert config.network.password_env == "NGII_RTS2_PASSWORD"
     assert config.network.gga_policy is GgaPolicy.BASE_GNSS
@@ -673,6 +678,54 @@ def test_ntrip_worker_emits_updated_stream_stats_after_each_chunk(monkeypatch) -
     assert int(envelopes[0]["receive_utc_ns"]) > 0
 
 
+def test_worker_ui_signal_is_queued_to_the_gui_thread_without_text_document_warnings() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    qt_messages: list[str] = []
+
+    class Emitter(QtCore.QObject):
+        diagnostic = QtCore.pyqtSignal(str)
+
+        @QtCore.pyqtSlot()
+        def run(self) -> None:
+            self.diagnostic.emit("NTRIP diagnostic")
+
+    class Panel(QtWidgets.QWidget):
+        def __init__(self) -> None:
+            super().__init__()
+            self.log = QtWidgets.QPlainTextEdit(self)
+            self.callback_threads: list[QtCore.QThread] = []
+
+        def delegated_log_handler(self, message: str) -> None:
+            self.callback_threads.append(QtCore.QThread.currentThread())
+            self.log.appendPlainText(message)
+
+    previous_handler = QtCore.qInstallMessageHandler(
+        lambda _kind, _context, message: qt_messages.append(str(message))
+    )
+    thread = QtCore.QThread()
+    emitter = Emitter()
+    panel = Panel()
+    emitter.moveToThread(thread)
+    _connect_gui_signal(emitter.diagnostic, panel.delegated_log_handler)
+    thread.started.connect(emitter.run)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 2.0
+        while not panel.callback_threads and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(0.005)
+
+        assert panel.callback_threads == [app.thread()]
+        assert panel.log.toPlainText() == "NTRIP diagnostic"
+        assert not any("QTextBlock" in message or "QTextCursor" in message for message in qt_messages)
+    finally:
+        thread.quit()
+        assert thread.wait(1000)
+        panel.deleteLater()
+        app.processEvents()
+        QtCore.qInstallMessageHandler(previous_handler)
+
+
 # --- Direct username/password UI: credential plumbing, storage, and UI ----
 
 
@@ -916,6 +969,42 @@ def test_set_gnss_ntrip_session_password_bridges_settings_workspace_field_into_r
     )
 
 
+def test_ntrip_route_preparation_allows_transport_without_pixhawk() -> None:
+    health_calls: list[tuple[object, str, str]] = []
+    logs: list[str] = []
+    panel = SimpleNamespace(
+        mavlink_pixhawk=None,
+        gnss_base_status_labels={"network": "network-label"},
+        _set_health_label=lambda label, text, tone: health_calls.append((label, text, tone)),
+        _log=lambda text: logs.append(text),
+    )
+    controller = GnssRuntimeController(panel)
+    controller._ensure_pixhawk_rtcm_worker = lambda: pytest.fail("transport-only start must not require a worker")
+
+    assert controller._prepare_ntrip_rtcm_route(RtcmRouteConfig(ntrip_targets=("left", "right"))) is True
+    assert health_calls == [
+        ("network-label", "NTRIP transport 시작 | MAVLink RTCM route 대기 중", "warn")
+    ]
+    assert logs == ["[GNSS] NTRIP transport 시작 | MAVLink RTCM route 대기 중"]
+
+
+def test_ntrip_route_preparation_keeps_pixhawk_worker_failure_blocking() -> None:
+    health_calls: list[tuple[object, str, str]] = []
+    logs: list[str] = []
+    panel = SimpleNamespace(
+        mavlink_pixhawk=object(),
+        gnss_base_status_labels={"network": "network-label"},
+        _set_health_label=lambda label, text, tone: health_calls.append((label, text, tone)),
+        _log=lambda text: logs.append(text),
+    )
+    controller = GnssRuntimeController(panel)
+    controller._ensure_pixhawk_rtcm_worker = lambda: None
+
+    assert controller._prepare_ntrip_rtcm_route(RtcmRouteConfig(ntrip_targets=("left",))) is False
+    assert health_calls == [("network-label", "RTCM 주입 worker를 시작할 수 없습니다", "bad")]
+    assert logs == ["[GNSS] NTRIP 시작 거부: RTCM 주입 worker를 시작할 수 없습니다"]
+
+
 def test_resolve_ntrip_credentials_falls_back_to_keyring(monkeypatch) -> None:
     import Workstation.gnss_runtime_controller as gnss_runtime_controller
 
@@ -992,21 +1081,82 @@ def test_resolved_credential_password_never_appears_in_ntrip_request_bytes() -> 
     assert resolved.password == "field-secret"  # sanity: the credential itself was resolved correctly
 
 
-def test_settings_workspace_ntrip_password_field_is_masked_and_not_a_settings_widget() -> None:
-    """Required test 9 (+ structural half of test 2): password input is masked and untracked."""
+def test_settings_workspace_ntrip_defaults_are_masked_and_not_in_settings_payload() -> None:
+    """Untouched deployment defaults are usable without becoming persisted settings."""
 
     QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     workspace = SettingsWorkspace(backend=object())
     try:
         assert workspace.gnss_network_password_edit.echoMode() == QtWidgets.QLineEdit.Password
-        assert workspace.gnss_network_password_edit.text() == ""
+        assert workspace.settings_widgets["gnss_network_username"].text() == DEFAULT_NTRIP_USERNAME
+        assert workspace.gnss_network_password_edit.text() == DEFAULT_NTRIP_SESSION_PASSWORD
         # The password widget must never be reachable through the generic
         # settings payload path that gets serialized to disk.
         assert "gnss_network_password" not in workspace.settings_widgets
         payload = workspace.settings_payload()
+        assert payload["gnss_operation"]["network"]["username"] == DEFAULT_NTRIP_USERNAME
         assert "gnss_network_password" not in payload
+        assert "password" not in payload["gnss_operation"]["network"]
     finally:
         workspace.deleteLater()
+
+
+def test_untouched_ntrip_defaults_resolve_and_operator_edits_override_them() -> None:
+    panel = _panel_with_password(DEFAULT_NTRIP_SESSION_PASSWORD)
+    controller = GnssRuntimeController(panel)
+    network = NetworkConfig(caster_host="caster", mountpoint="MOUNT")
+
+    assert controller._resolve_ntrip_credentials(network) == NtripCredentialResolution(
+        username=DEFAULT_NTRIP_USERNAME,
+        password=DEFAULT_NTRIP_SESSION_PASSWORD,
+        source="session",
+    )
+
+    panel.gnss_ntrip_password_edit.setText("operator-password")
+    overridden = NetworkConfig(
+        caster_host="caster",
+        mountpoint="MOUNT",
+        username="operator-user",
+    )
+    assert controller._resolve_ntrip_credentials(overridden) == NtripCredentialResolution(
+        username="operator-user",
+        password="operator-password",
+        source="session",
+    )
+
+
+def test_runtime_owner_has_usable_ntrip_defaults_before_settings_apply(
+    monkeypatch, tmp_path
+) -> None:
+    """Direct Start NTRIP uses the defaults even if Settings was never opened."""
+
+    from Workstation import standalone_gui
+
+    monkeypatch.setattr(
+        standalone_gui.WirisStereoDistancePanel,
+        "_initial_status",
+        lambda _self: None,
+    )
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = standalone_gui.WirisStereoDistancePanel(
+        app_root=tmp_path,
+        settings_path=tmp_path / "settings.json",
+    )
+    try:
+        assert panel.gnss_ntrip_username_edit.text() == DEFAULT_NTRIP_USERNAME
+        assert panel.gnss_ntrip_password_edit.text() == DEFAULT_NTRIP_SESSION_PASSWORD
+        assert panel._resolve_ntrip_credentials(panel._build_gnss_operation_config().network) == (
+            NtripCredentialResolution(
+                username=DEFAULT_NTRIP_USERNAME,
+                password=DEFAULT_NTRIP_SESSION_PASSWORD,
+                source="session",
+            )
+        )
+    finally:
+        panel._save_current_settings = lambda: None
+        panel.close()
+        panel.deleteLater()
+        app.processEvents()
 
 
 def test_network_reconnect_after_ready_does_not_attempt_invalid_state_transition() -> None:

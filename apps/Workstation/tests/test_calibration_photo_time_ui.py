@@ -135,6 +135,7 @@ def test_compute_photo_table_displays_left_and_right_times_and_refreshes_for_met
     workspace.calibration_selected_files_table = QtWidgets.QTableWidget(0, 6)
     workspace.calibration_file_selection_summary = QtWidgets.QLabel()
     workspace._calibration_file_picker_signature = None
+    workspace._calibration_session_explicit_root = str(tmp_path)
 
     workspace._sync_calibration_file_selection()
 

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from PyQt5 import QtCore, QtTest, QtWidgets
 
+from Workstation.camera_stream_controller import CameraStreamLifecycleController
 from Workstation.measurement_package_controller import MeasurementPackageController
+from Workstation.status_model import StatusModel
+from Workstation.workspaces import SessionWorkspace
 from Workstation.workstation_core import measurement_session as measurement_session_module
 from Workstation.workstation_core.measurement_session import verify_measurement_session
 from Workstation.workstation_core.recording_session import save_session_files
@@ -86,6 +92,63 @@ def _write_outputs(panel: SimpleNamespace, *, valid_count: int) -> Path:
     return root
 
 
+def test_pointer_click_creates_timestamp_folder_and_displays_exact_identity(
+    tmp_path: Path,
+) -> None:
+    app = QtWidgets.QApplication.instance()
+    assert app is not None
+    panel = _panel(tmp_path)
+    controller = MeasurementPackageController(panel)
+    backend = SimpleNamespace(
+        panel=panel,
+        begin_measurement_session=controller.begin_measurement_session,
+        measurement_session_snapshot=controller.measurement_session_snapshot,
+        measurement_package_snapshot=controller.measurement_package_snapshot,
+        close_measurement_session=controller.close_measurement_session,
+    )
+    workspace = SessionWorkspace(backend, StatusModel())
+    workspace.resize(900, 500)
+    workspace.show()
+    app.processEvents()
+
+    center = workspace.start_session_button.rect().center()
+    assert QtWidgets.QApplication.widgetAt(
+        workspace.start_session_button.mapToGlobal(center)
+    ) is workspace.start_session_button
+    QtTest.QTest.mouseClick(
+        workspace.start_session_button,
+        QtCore.Qt.LeftButton,
+        pos=center,
+    )
+    app.processEvents()
+
+    snapshot = controller.measurement_session_snapshot()
+    session_id = str(snapshot["session_id"])
+    root = tmp_path / "recordings" / session_id
+    assert re.fullmatch(r"\d{8}_\d{6}_\d{9}", session_id)
+    assert root.is_dir()
+    assert (root / "session.json").is_file()
+    assert Path(str(snapshot["session_dir"])) == root
+    assert root.name == session_id
+    assert not (root / "measurements").exists()
+    assert workspace.folder_name_label.text() == root.name
+    assert workspace.folder_path_label.text() == str(root)
+    assert workspace.folder_created_label.text() != "—"
+    assert workspace.session_status_label.text() == "Ready for saving"
+
+    QtTest.QTest.mouseClick(
+        workspace.start_session_button,
+        QtCore.Qt.LeftButton,
+        pos=center,
+    )
+    app.processEvents()
+    assert [path for path in (tmp_path / "recordings").iterdir() if path.is_dir()] == [root]
+
+    workspace.close()
+    workspace.deleteLater()
+    app.processEvents()
+
+
 def test_one_explicit_session_contains_two_isolated_measurements(tmp_path: Path) -> None:
     panel = _panel(tmp_path)
     controller = MeasurementPackageController(panel)
@@ -130,6 +193,200 @@ def test_one_explicit_session_contains_two_isolated_measurements(tmp_path: Path)
     session_root = tmp_path / "recordings" / session_id
     assert (session_root / "review.xlsx").is_file()
     assert verify_measurement_session(session_root).valid
+
+
+def test_measurement_start_creates_each_child_before_detection(tmp_path: Path) -> None:
+    panel = _panel(tmp_path)
+    controller = MeasurementPackageController(panel)
+    calls: list[object] = []
+    panel.measurement_package_snapshot = controller.measurement_package_snapshot
+    panel.begin_measurement = controller.begin_measurement
+    panel.begin_measurement_detection = controller.begin_measurement_detection
+    panel.start_automatic_session_recording = (
+        lambda: calls.append("recording.begin") or True
+    )
+    panel._start_camera_streams = (
+        lambda **kwargs: calls.append(("streams.begin", kwargs))
+    )
+
+    assert controller.begin_measurement_session(session_id="measurement-start-session")
+    assert panel._measurement_id == ""
+
+    camera = CameraStreamLifecycleController(panel)
+    assert camera.start_yolo() is None
+    assert panel._measurement_id == "m000001"
+    assert controller.measurement_package_snapshot()["detection_started"] is True
+    assert calls == [
+        "recording.begin",
+        ("streams.begin", {"enable_detection": True, "switch_to_depth": True}),
+    ]
+
+    assert controller.complete_measurement_detection()
+    _write_outputs(panel, valid_count=1)
+    assert controller.finalize_measurement_package()
+
+    calls.clear()
+    assert camera.start_yolo() is None
+    assert panel._measurement_id == "m000002"
+    assert controller.measurement_package_snapshot()["detection_started"] is True
+    assert calls == [
+        "recording.begin",
+        ("streams.begin", {"enable_detection": True, "switch_to_depth": True}),
+    ]
+
+
+def test_close_session_auto_seals_empty_measurement(tmp_path: Path) -> None:
+    panel = _panel(tmp_path)
+    controller = MeasurementPackageController(panel)
+    session_id = "20260822_181438_641156758"
+    assert controller.begin_measurement_session(session_id=session_id)
+    assert controller.begin_measurement()
+    assert controller.measurement_package_snapshot()["state"] == "COLLECTING"
+
+    panel.save_distance_history_csv = lambda: _write_outputs(panel, valid_count=0)
+
+    assert controller.close_measurement_session() is True
+    assert controller.measurement_package_snapshot()["state"] in {
+        "SEALED_COMPLETE",
+        "SEALED_INCOMPLETE",
+    }
+    assert controller.measurement_session_snapshot()["state"] == "SEALED"
+    assert verify_measurement_session(tmp_path / "recordings" / session_id).valid
+
+
+def test_close_session_auto_seals_recovered_empty_measurement(tmp_path: Path) -> None:
+    first_panel = _panel(tmp_path)
+    first_panel._measurement_app_run_id = "run-a"
+    first = MeasurementPackageController(first_panel)
+    session_id = "recovered-empty-close"
+    assert first.begin_measurement_session(session_id=session_id)
+    assert first.begin_measurement()
+    assert first.measurement_package_snapshot()["state"] == "COLLECTING"
+
+    restarted_panel = _panel(tmp_path)
+    restarted_panel._measurement_app_run_id = "run-b"
+    restarted = MeasurementPackageController(restarted_panel)
+    recovered = restarted.measurement_package_snapshot()
+    assert recovered["state"] == "RECOVERABLE"
+    assert recovered["detection_started"] is False
+    assert recovered["detection_completed"] is False
+
+    restarted_panel.save_distance_history_csv = lambda: _write_outputs(
+        restarted_panel,
+        valid_count=0,
+    )
+    assert restarted.close_measurement_session() is True
+    assert restarted.measurement_package_snapshot()["state"] in {
+        "SEALED_COMPLETE",
+        "SEALED_INCOMPLETE",
+    }
+    assert restarted.measurement_session_snapshot()["state"] == "SEALED"
+    assert verify_measurement_session(tmp_path / "recordings" / session_id).valid
+
+
+def test_close_session_still_requires_active_detection_to_stop(tmp_path: Path) -> None:
+    panel = _panel(tmp_path)
+    controller = MeasurementPackageController(panel)
+    assert controller.begin_measurement_session(session_id="active-detection-close")
+    assert controller.begin_measurement()
+    assert controller.begin_measurement_detection()
+
+    assert controller.close_measurement_session() is False
+    assert controller.measurement_session_snapshot()["state"] == "OPEN"
+    assert panel._measurement_session_close_requested is False
+    assert "Stop Detection before closing" in controller.measurement_package_snapshot()["detail"]
+
+
+def test_new_measurement_preserves_evidence_without_alignment_geometry(tmp_path: Path) -> None:
+    panel = _panel(tmp_path)
+    controller = MeasurementPackageController(panel)
+    assert controller.begin_measurement_session(session_id="20260822_150000_000000001")
+
+    assert controller.begin_measurement() is True
+    snapshot = controller.measurement_package_snapshot()
+    assert snapshot["state"] == "COLLECTING"
+    assert snapshot["measurement_id"] == "m000001"
+
+
+def test_measurement_snapshots_exact_session_alignment_and_rejects_foreign_paths(
+    tmp_path: Path,
+) -> None:
+    panel = _panel(tmp_path)
+    controller = MeasurementPackageController(panel)
+    session_id = "20260822_150000_000000009"
+    assert controller.begin_measurement_session(session_id=session_id)
+    alignment = tmp_path / "recordings" / session_id / "alignment" / "selections" / "selected.json"
+    alignment.parent.mkdir(parents=True, exist_ok=True)
+    payload = b'{"schema":"alignment-selection-test-v1","selection":"sentinel"}\n'
+    alignment.write_bytes(payload)
+    panel._active_alignment_snapshot_path = str(alignment)
+    panel._active_alignment_snapshot_sha256 = hashlib.sha256(payload).hexdigest()
+
+    assert controller.begin_measurement()
+    assert controller.begin_measurement_detection()
+
+    package = controller.measurement_package_snapshot()
+    row = next(
+        item
+        for item in package["artifacts"]
+        if item["role"] == "active_alignment_selection"
+    )
+    copied = Path(controller.package.root) / row["relative_path"]
+    assert copied.read_bytes() == payload
+    assert row["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert row["relative_path"].startswith("inputs/alignment/active/")
+
+    with pytest.raises(ValueError, match="escapes"):
+        controller._register_descriptor(
+            {
+                **row,
+                "relative_path": "../m000010/foreign.json",
+            }
+        )
+
+
+def test_yolo_model_is_not_copied_into_session_or_measurement_package(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from Workstation.workstation_core import package_provenance
+
+    model = tmp_path / "runtime-models" / "detector-sentinel.pt"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"runtime-owned-yolo-weights")
+    panel = _panel(tmp_path)
+    panel._measurement_package_collect_provenance = True
+    panel.settings = SimpleNamespace(yolo_weights_path=str(model))
+    panel.weights_edit = SimpleNamespace(text=lambda: str(model))
+    panel.yolo_kwargs = lambda: {
+        "weights": str(model),
+        "resolved_weights": str(model),
+    }
+    monkeypatch.setattr(
+        package_provenance,
+        "collect_software_provenance",
+        lambda *_args, **_kwargs: [],
+    )
+    controller = MeasurementPackageController(panel)
+    session_id = "no-yolo-model-copy"
+
+    assert controller.begin_measurement_session(session_id=session_id)
+    assert controller.begin_measurement()
+    assert controller.begin_measurement_detection()
+
+    session_root = tmp_path / "recordings" / session_id
+    measurement_root = session_root / "measurements" / "m000001"
+    snapshot = controller.measurement_package_snapshot()
+    assert not (session_root / "inputs" / "models").exists()
+    assert not (measurement_root / "inputs" / "models").exists()
+    assert not list(session_root.rglob("*.pt"))
+    assert "active_yolo_model" not in {
+        str(row.get("role") or "") for row in snapshot["artifacts"]
+    }
+    assert all(
+        "active_yolo_model" not in tuple(row.get("required_roles") or ())
+        for row in snapshot["source_expectations"]
+    )
 
 
 def test_new_measurement_freezes_method_fill_policy_in_child_metadata(tmp_path: Path) -> None:

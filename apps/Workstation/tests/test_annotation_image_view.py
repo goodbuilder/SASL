@@ -129,6 +129,40 @@ def test_mouse_input_uses_center_crop_transform_without_bars() -> None:
     view.close()
 
 
+def test_right_click_on_suggestion_emits_index_without_changing_manual_points() -> None:
+    view = AnnotationImageView()
+    view.resize(640, 480)
+    view.load_frozen_native_frame(
+        _native_image(640, 480),
+        frame_id="suggestion-click",
+        image_sha256="s" * 64,
+    )
+    view.set_mode(AnnotationMode.RIDGE)
+    view.add_source_point((30.0, 40.0))
+    view.set_suggestion_points(
+        ((100.0, 120.0), (300.0, 220.0)),
+        mode=AnnotationMode.RIDGE,
+        confidences=(0.9, 0.8),
+    )
+    emitted: list[tuple[str, int]] = []
+    view.suggestion_point_right_clicked.connect(
+        lambda mode, index: emitted.append((mode, index))
+    )
+    view.show()
+    QtWidgets.QApplication.processEvents()
+
+    point = view.source_pixel_to_widget((300.0, 220.0)).toPoint()
+    QtTest.QTest.mouseClick(view, QtCore.Qt.RightButton, pos=point)
+
+    assert emitted == [("ridge", 1)]
+    assert view.annotation_points(AnnotationMode.RIDGE) == (SourcePixel(30.0, 40.0),)
+    assert view.suggestion_points(AnnotationMode.RIDGE) == (
+        SourcePixel(100.0, 120.0),
+        SourcePixel(300.0, 220.0),
+    )
+    view.close()
+
+
 def test_camera_view_is_fixed_16_9_and_hover_reports_native_pixel_with_red_dot() -> None:
     view = AnnotationImageView()
     assert view.hasHeightForWidth()
@@ -291,6 +325,30 @@ def test_wheel_zoom_keeps_cursor_native_pixel_fixed() -> None:
     assert after.u == pytest.approx(before.u, abs=1.0e-9)
     assert after.v == pytest.approx(before.v, abs=1.0e-9)
     assert view.export_annotations().target_point == (before,)
+
+
+def test_plain_wheel_zoom_can_be_enabled_for_alignment_views() -> None:
+    view = AnnotationImageView(wheel_zoom_requires_control=False)
+    view.resize(800, 600)
+    view.load_frozen_native_frame(
+        _native_image(1600, 1200),
+        frame_id="plain-wheel-zoom",
+        image_sha256="p" * 64,
+    )
+    cursor = QtCore.QPoint(300, 220)
+    before = view.widget_to_source_pixel(cursor, clamp_to_edge_pixel=False)
+    assert before is not None
+
+    event = _WheelEvent(cursor, 120, modifiers=QtCore.Qt.NoModifier)
+    view.wheelEvent(event)  # type: ignore[arg-type]
+
+    assert event.accepted
+    assert view.wheel_zoom_requires_control is False
+    assert view.zoom_factor == pytest.approx(1.2)
+    after = view.widget_to_source_pixel(cursor, clamp_to_edge_pixel=False)
+    assert after is not None
+    assert after.u == pytest.approx(before.u, abs=1.0e-9)
+    assert after.v == pytest.approx(before.v, abs=1.0e-9)
 
 
 def test_wheel_zoom_out_to_min_recenters_with_no_gap() -> None:

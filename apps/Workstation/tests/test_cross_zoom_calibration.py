@@ -204,7 +204,9 @@ def test_extrinsics_only_worker_holds_selected_intrinsics_fixed(monkeypatch) -> 
     assert captured["right"] is selected.right
 
 
-def test_panel_apply_method_composes_cross_zoom_selection_without_validation_state() -> None:
+def test_panel_apply_method_composes_cross_zoom_selection_without_validation_state(
+    tmp_path: Path,
+) -> None:
     from Workstation import standalone_gui
 
     class ValueWidget:
@@ -246,9 +248,10 @@ def test_panel_apply_method_composes_cross_zoom_selection_without_validation_sta
         _set_combo_data=lambda combo, value: setattr(combo, "current", value),
         _refresh_camera_parameters_tab=lambda: None,
         _refresh_distance=lambda: None,
-        _refresh_optical_alignment_view=lambda: None,
-        _refresh_operation_header=lambda: None,
-    )
+            _refresh_optical_alignment_view=lambda: None,
+            _refresh_operation_header=lambda: None,
+            _calibration_dirs=lambda: (tmp_path, tmp_path / "left", tmp_path / "right"),
+        )
 
     standalone_gui.WirisStereoDistancePanel.apply_intrinsics_to_distance(panel)
 

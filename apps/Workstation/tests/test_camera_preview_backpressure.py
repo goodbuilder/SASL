@@ -47,6 +47,23 @@ def test_preview_inbox_replaces_only_stale_ui_frames_and_renders_latest() -> Non
     assert after["queued_latest"] is False
     pane.deleteLater()
 
+
+def test_hidden_camera_pane_retains_and_publishes_frame_without_pixmap_render() -> None:
+    _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    pane = CameraPane("left")
+    pane.hide()
+    delivered: list[int] = []
+    pane.frame_changed.connect(
+        lambda _side, _image, metadata: delivered.append(int(metadata["sequence"]))
+    )
+
+    pane._show_frame(_image(40), {"sequence": 4})
+
+    assert delivered == [4]
+    assert pane.current_image() is not None
+    assert pane.image_label.pixmap() is None or pane.image_label.pixmap().isNull()
+    pane.deleteLater()
+
 def test_preview_inbox_rejects_old_stream_generation() -> None:
     _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     pane = CameraPane("left")

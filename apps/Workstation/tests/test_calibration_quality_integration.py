@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,8 +16,10 @@ from Workstation.workstation_core.calibration import (
     StereoExtrinsics,
     StereoExtrinsicsProfile,
     StereoIntrinsicsResult,
+    compose_stereo_calibration,
     load_intrinsics_json,
     save_intrinsics_json,
+    save_stereo_extrinsics_json,
 )
 
 
@@ -107,7 +110,7 @@ def test_backend_quality_gate_blocks_fail_and_requires_warning_confirmation() ->
     assert panel.checkerboard_validation_summary["quality_override"]["confirmed"] is True
 
 
-def test_direct_intrinsics_apply_requires_warning_confirmation() -> None:
+def test_direct_intrinsics_apply_requires_warning_confirmation(tmp_path: Path) -> None:
     health: list[tuple[str, str]] = []
     focal_values: list[float] = []
     panel = SimpleNamespace(
@@ -127,6 +130,7 @@ def test_direct_intrinsics_apply_requires_warning_confirmation() -> None:
         _refresh_distance=lambda: None,
         _refresh_optical_alignment_view=lambda: None,
         _refresh_operation_header=lambda: None,
+        _calibration_dirs=lambda: (tmp_path, tmp_path / "left", tmp_path / "right"),
     )
     controller = CalibrationWorkflowController(panel)
 
@@ -136,11 +140,15 @@ def test_direct_intrinsics_apply_requires_warning_confirmation() -> None:
 
     assert controller.apply_intrinsics_to_distance(quality_warning_confirmed=True) is True
     assert panel.active_intrinsics is not None
+    assert Path(panel._active_intrinsics_profile_path).is_file()
+    assert Path(panel._active_intrinsics_profile_path).parent == tmp_path / "profiles" / "intrinsics"
     assert focal_values
     assert panel.checkerboard_validation_summary["quality_override"]["confirmed"] is True
 
 
-def test_direct_stereo_profile_save_cannot_bypass_warning_gate() -> None:
+def test_warning_stereo_profile_is_saved_as_attempt_without_promotion(
+    tmp_path: Path,
+) -> None:
     profile = StereoExtrinsicsProfile(
         extrinsics=StereoExtrinsics(
             rotation_left_to_right=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
@@ -154,12 +162,65 @@ def test_direct_stereo_profile_save_cannot_bypass_warning_gate() -> None:
         selected_extrinsics_profile=profile,
         last_calibration_result=_result("WARNING"),
         calibration_status_label=_Label(),
+        _extrinsics_storage_path=lambda _zoom=None: tmp_path / "extrinsics_zoom_08.json",
+        _ensure_calibration_session_root=lambda _purpose: tmp_path,
+        _log=lambda _message: None,
+        _refresh_operation_header=lambda: None,
     )
 
     saved = CalibrationWorkflowController(panel).save_stereo_extrinsics_profile()
 
-    assert saved is False
-    assert "WARNING requires confirmation" in panel.calibration_status_label.text_value
+    assert saved is True
+    attempt_path = Path(panel._last_calibration_attempt_path)
+    assert attempt_path.is_file()
+    assert attempt_path.parent == tmp_path / "attempts"
+    assert "warning" in attempt_path.name
+    assert not hasattr(panel, "_selected_extrinsics_profile_path")
+    assert "non-applicable" in panel.calibration_status_label.text_value
+
+
+@pytest.mark.parametrize("quality_state", ["FAIL", "WARNING"])
+def test_nonpass_intrinsics_are_saved_as_attempt_without_active_alias(
+    tmp_path: Path,
+    quality_state: str,
+) -> None:
+    health: list[tuple[str, str]] = []
+    official = tmp_path / "intrinsics_zoom_08.json"
+    base = tmp_path / "intrinsics.json"
+    panel = SimpleNamespace(
+        checkerboard_validation_result=_result(quality_state),
+        checkerboard_validation_summary={"quality_state": quality_state},
+        checkerboard_validation_status_label=_Label(),
+        checkerboard_validation_result_mode="checkerboard",
+        checkerboard_validation_result_saved=False,
+        last_calibration_zoom_level=8,
+        zoom_target_combo=SimpleNamespace(currentData=lambda: "both"),
+        _calibration_dirs=lambda: (tmp_path, tmp_path / "left", tmp_path / "right"),
+        _intrinsics_storage_path=lambda _zoom=None: official,
+        _intrinsics_storage_base_path=lambda: base,
+        _set_health_label=lambda _label, text, level: health.append((str(text), str(level))),
+        _refresh_operation_header=lambda: None,
+        _refresh_zoom_intrinsics_tab=lambda: None,
+        _add_zoom_intrinsics_comparison_path=lambda _path: pytest.fail(
+            "attempt must not be promoted into the approved comparison path"
+        ),
+        _save_current_settings=lambda: pytest.fail(
+            "attempt must not replace persisted active settings"
+        ),
+    )
+    controller = CalibrationWorkflowController(panel)
+    controller._ensure_calibration_session_root = lambda _purpose: tmp_path
+
+    controller.save_checkerboard_validation_result()
+
+    attempt = Path(panel._last_calibration_attempt_path)
+    assert attempt.is_file()
+    assert attempt.parent == tmp_path / "attempts"
+    assert quality_state.lower() in attempt.name
+    assert not official.exists()
+    assert not base.exists()
+    assert not hasattr(panel, "_active_intrinsics_profile_path")
+    assert health[-1][1] == ("bad" if quality_state == "FAIL" else "warn")
 
 
 def test_current_result_quality_snapshot_wins_over_stale_panel_snapshot() -> None:
@@ -254,11 +315,8 @@ def test_auto_capture_uses_native_raster_and_rejects_repeated_pose() -> None:
             )
 
     status = QtWidgets.QLabel()
-    target = QtWidgets.QSpinBox()
-    target.setValue(20)
     panel = SimpleNamespace(
         checkerboard_calibration_thread=None,
-        calibration_auto_target_spin=target,
         calibration_status_label=status,
         left_pane=Pane("left", 100.000),
         right_pane=Pane("right", 100.002),
@@ -386,3 +444,92 @@ def test_apply_blocks_profile_grid_that_differs_from_live_native_frame() -> None
 
     assert "differs from live native grid" in panel.calibration_status_label.text_value
     assert health[-1] == ("적용 차단: left native pixel grid mismatch", "bad")
+
+
+def test_full_checkerboard_apply_uses_its_own_rt_not_stale_selected_profile(
+    tmp_path: Path,
+) -> None:
+    old_extrinsics = StereoExtrinsics(
+        rotation_left_to_right=[
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        translation_left_to_right_m=[-0.3, 0.0, 0.0],
+        reprojection_error_px=0.4,
+        pair_count=12,
+    )
+    fresh_extrinsics = replace(
+        old_extrinsics,
+        translation_left_to_right_m=[-0.7, 0.02, -0.01],
+        reprojection_error_px=0.15,
+        pair_count=24,
+    )
+    old_profile = StereoExtrinsicsProfile(
+        extrinsics=old_extrinsics,
+        source_zoom_level=4,
+        method="checkerboard_external_only",
+        profile_id="stale-a",
+    )
+    old_path = tmp_path / "profiles" / "extrinsics" / "extrinsics-old.json"
+    old_path.parent.mkdir(parents=True)
+    save_stereo_extrinsics_json(old_path, old_profile)
+    fresh_result = replace(_result("PASS"), extrinsics=fresh_extrinsics)
+    health: list[tuple[str, str]] = []
+    distance_mode = SimpleNamespace(current=None)
+    panel = SimpleNamespace(
+        checkerboard_validation_result=fresh_result,
+        checkerboard_validation_result_mode="checkerboard",
+        checkerboard_validation_result_saved=False,
+        checkerboard_validation_summary={},
+        checkerboard_validation_status_label=_Label(),
+        last_calibration_result=fresh_result,
+        last_calibration_zoom_level=8,
+        selected_extrinsics_profile=old_profile,
+        active_extrinsics_profile=old_profile,
+        checkerboard_extrinsics_profile=old_profile,
+        optical_pose_extrinsics_profile=None,
+        active_intrinsics=compose_stereo_calibration(_result("PASS"), old_profile),
+        _candidate_intrinsics_profile_path="memory:fresh-full-result",
+        _active_intrinsics_profile_path="memory:old-intrinsics",
+        _active_intrinsics_profile_hash="a" * 64,
+        _active_intrinsics_source_zoom_level=4,
+        _selected_extrinsics_profile_path=str(old_path),
+        _selected_extrinsics_profile_hash=old_profile.content_sha256,
+        _active_extrinsics_profile_path=str(old_path),
+        _active_extrinsics_profile_hash=old_profile.content_sha256,
+        _active_extrinsics_source_zoom_level=4,
+        _active_calibration_selection_mode="manual_same_zoom",
+        distance_mode_combo=distance_mode,
+        left_pane=SimpleNamespace(),
+        right_pane=SimpleNamespace(),
+        focal_spin=SimpleNamespace(setValue=lambda _value: None),
+        manual_focal_checkbox=SimpleNamespace(setChecked=lambda _value: None),
+        calibration_status_label=_Label(),
+        _calibration_dirs=lambda: (tmp_path, tmp_path / "left", tmp_path / "right"),
+        _set_combo_data=lambda combo, value: setattr(combo, "current", value),
+        _set_health_label=lambda _label, text, level: health.append((str(text), str(level))),
+        _save_current_settings=lambda: None,
+        _refresh_camera_parameters_tab=lambda: None,
+        _refresh_distance=lambda: None,
+        _refresh_optical_alignment_view=lambda: None,
+        _refresh_operation_header=lambda: None,
+    )
+    controller = CalibrationWorkflowController(panel)
+    panel._calibration_quality_allows_action = controller._calibration_quality_allows_action
+    panel.apply_intrinsics_to_distance = controller.apply_intrinsics_to_distance
+
+    controller.apply_checkerboard_validation_result()
+
+    assert panel.active_intrinsics.extrinsics is fresh_extrinsics
+    assert panel.active_intrinsics.extrinsics is not old_extrinsics
+    assert panel.selected_extrinsics_profile.extrinsics is fresh_extrinsics
+    assert panel.active_extrinsics_profile is panel.selected_extrinsics_profile
+    assert panel.checkerboard_extrinsics_profile is panel.selected_extrinsics_profile
+    assert panel._active_extrinsics_profile_hash == (
+        panel.selected_extrinsics_profile.content_sha256
+    )
+    assert panel._active_extrinsics_profile_path != str(old_path)
+    assert Path(panel._active_extrinsics_profile_path).is_file()
+    assert distance_mode.current == "checkerboard"
+    assert health[-1][1] == "good"

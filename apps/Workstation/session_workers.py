@@ -25,6 +25,7 @@ class SessionSaveWorker(QtCore.QObject):
         px4_rows: dict[str, SpoolRows],
         gnss_base_rows: SpoolRows | None = None,
         extrinsics_comparison_rows: SpoolRows | None = None,
+        method_evaluation_bundle_rows: SpoolRows | None = None,
     ) -> None:
         super().__init__()
         self.output_dir = output_dir
@@ -34,6 +35,7 @@ class SessionSaveWorker(QtCore.QObject):
         self.px4_rows = px4_rows
         self.gnss_base_rows = gnss_base_rows
         self.extrinsics_comparison_rows = extrinsics_comparison_rows
+        self.method_evaluation_bundle_rows = method_evaluation_bundle_rows
 
     def _emit_if_alive(self, signal_name: str, *args: object) -> bool:
         """Drop a completed save notification only after Qt application teardown."""
@@ -55,6 +57,7 @@ class SessionSaveWorker(QtCore.QObject):
                 px4_rows=self.px4_rows,
                 gnss_base_rows=self.gnss_base_rows,
                 extrinsics_comparison_rows=self.extrinsics_comparison_rows,
+                method_evaluation_bundle_rows=self.method_evaluation_bundle_rows,
             )
         except Exception as exc:
             self._emit_if_alive("failed", str(exc))

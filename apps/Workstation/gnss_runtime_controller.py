@@ -89,6 +89,19 @@ class NtripCredentialResolution:
     source: str
 
 
+def _connect_gui_signal(signal, callback) -> None:
+    """Deliver a worker signal to a panel/UI callback on the Qt GUI thread.
+
+    Panel controller methods are installed dynamically as plain Python
+    delegates, so Qt's AutoConnection does not reliably infer the panel's
+    thread affinity.  Every worker-to-UI boundary in this controller uses an
+    explicit queued connection; the intentional DirectConnection adapters
+    below remain limited to locked queues that never touch widgets.
+    """
+
+    signal.connect(callback, QtCore.Qt.QueuedConnection)
+
+
 GNSS_RUNTIME_CONTROLLER_METHODS = [
     "_refresh_gnss_base_tab",
     "_gnss_selected_operation_mode",
@@ -263,20 +276,21 @@ class GnssRuntimeController:
         thread = QtCore.QThread(self.panel)
         worker = RtcmDataPlaneWorker(snapshot_interval_s=self.RTCM_UI_UPDATE_INTERVAL_S)
         worker.moveToThread(thread)
-        worker.snapshot_ready.connect(self.panel._apply_rtcm_pipeline_snapshot)
-        worker.evidence_started.connect(self.panel._handle_rtcm_pipeline_evidence_started)
+        _connect_gui_signal(worker.snapshot_ready, self.panel._apply_rtcm_pipeline_snapshot)
+        _connect_gui_signal(worker.evidence_started, self.panel._handle_rtcm_pipeline_evidence_started)
         drain_handler = getattr(
             self.panel,
             "_handle_measurement_rtcm_evidence_drained",
             None,
         )
         if callable(drain_handler):
-            worker.evidence_drained.connect(drain_handler)
-        worker.integrity_failed.connect(self.panel._handle_rtcm_pipeline_integrity_failed)
+            _connect_gui_signal(worker.evidence_drained, drain_handler)
+        _connect_gui_signal(worker.integrity_failed, self.panel._handle_rtcm_pipeline_integrity_failed)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(
-            lambda thread=thread, worker=worker: self._clear_rtcm_pipeline(thread, worker)
+        _connect_gui_signal(
+            thread.finished,
+            lambda thread=thread, worker=worker: self._clear_rtcm_pipeline(thread, worker),
         )
         thread.finished.connect(thread.deleteLater)
         self.panel.rtcm_pipeline_thread = thread
@@ -1114,6 +1128,39 @@ class GnssRuntimeController:
         self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], message, tone)
         self.panel._log(f"[GNSS] NTRIP 시작 거부: {message}")
 
+    def _prepare_ntrip_rtcm_route(self, route: RtcmRouteConfig) -> bool:
+        """Prepare optional Pixhawk delivery without gating NTRIP transport.
+
+        A direct Network RTK operation can still prove caster authentication and
+        receive/parse RTCM before a Pixhawk endpoint is available.  The missing
+        endpoint remains a delivery/readiness failure, but it is no longer a
+        reason to prevent the independent NTRIP worker from starting.
+        """
+
+        if not route.ntrip_targets:
+            return True
+        if self.panel.mavlink_pixhawk is None:
+            message = "NTRIP transport 시작 | MAVLink RTCM route 대기 중"
+            self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], message, "warn")
+            self.panel._log(f"[GNSS] {message}")
+            return True
+        if self._ensure_pixhawk_rtcm_worker() is None:
+            self._reject_ntrip_start("RTCM 주입 worker를 시작할 수 없습니다", "bad")
+            return False
+        return True
+
+    def _ntrip_route_pending(self) -> bool:
+        """Return whether a connected NTRIP stream lacks its Pixhawk route."""
+
+        try:
+            route = self._rtcm_route_config()
+        except (AttributeError, TypeError, ValueError):
+            # Lightweight status/test adapters may expose transport state
+            # without the full GNSS routing surface. Their connection status
+            # must retain the transport-only behavior.
+            return False
+        return bool(route.ntrip_targets and self.panel.mavlink_pixhawk is None)
+
     def start_gnss_network(self) -> None:
         if self.panel.gnss_network_thread is not None:
             return
@@ -1141,9 +1188,6 @@ class GnssRuntimeController:
             if base_sample is None or max(0.0, time.monotonic() - base_sample.timestamp_s) > 15.0:
                 self._reject_ntrip_start("Base WGS84 위치 샘플 대기 중입니다", "warn")
                 return
-        if config.operation_mode != GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE and self.panel.mavlink_pixhawk is None:
-            self._reject_ntrip_start("RTCM을 받을 MAVLink Pixhawk가 없습니다", "bad")
-            return
         try:
             credential = self._resolve_ntrip_credentials(config.network)
         except NtripCredentialError as exc:
@@ -1191,10 +1235,8 @@ class GnssRuntimeController:
         self.panel._refresh_ntrip_credential_status()
         pipeline = self._ensure_rtcm_pipeline()
         route = self._rtcm_route_config()
-        if route.ntrip_targets:
-            if self._ensure_pixhawk_rtcm_worker() is None:
-                self._reject_ntrip_start("RTCM 주입 worker를 시작할 수 없습니다", "bad")
-                return
+        if not self._prepare_ntrip_rtcm_route(route):
+            return
         self._sync_rtcm_pipeline_config(reset=True)
         self._sync_rtcm_evidence_context()
         thread = QtCore.QThread(self.panel)
@@ -1206,14 +1248,17 @@ class GnssRuntimeController:
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.connected.connect(self.panel._handle_gnss_network_connected)
+        _connect_gui_signal(worker.connected, self.panel._handle_gnss_network_connected)
         self._wire_rtcm_ntrip_source(worker, pipeline)
-        worker.reconnecting.connect(self.panel._handle_gnss_network_reconnecting)
-        worker.failed.connect(self.panel._handle_gnss_network_failed)
-        worker.diagnostic.connect(self.panel._handle_gnss_network_diagnostic)
+        _connect_gui_signal(worker.reconnecting, self.panel._handle_gnss_network_reconnecting)
+        _connect_gui_signal(worker.failed, self.panel._handle_gnss_network_failed)
+        _connect_gui_signal(worker.diagnostic, self.panel._handle_gnss_network_diagnostic)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(lambda: self.panel._clear_gnss_network_worker(thread))
+        _connect_gui_signal(
+            thread.finished,
+            lambda thread=thread: self.panel._clear_gnss_network_worker(thread),
+        )
         self.panel.gnss_network_thread = thread
         self.panel.gnss_network_worker = worker
         thread.start()
@@ -1309,7 +1354,18 @@ class GnssRuntimeController:
         current_state = self.panel.gnss_operation_manager.state
         if current_state in {GnssOperationState.INITIALIZING, GnssOperationState.NTRIP_CONNECTING}:
             self.panel._gnss_transition(GnssOperationState.NTRIP_ACTIVE, f"NTRIP active: {status_line}")
-        self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], f"{status_line} | RTCM 대기", "good")
+        if self._ntrip_route_pending():
+            self.panel._set_health_label(
+                self.panel.gnss_base_status_labels["network"],
+                f"{status_line} | RTCM 대기 | MAVLink route 대기",
+                "warn",
+            )
+        else:
+            self.panel._set_health_label(
+                self.panel.gnss_base_status_labels["network"],
+                f"{status_line} | RTCM 대기",
+                "good",
+            )
 
     def _handle_gnss_network_stats(self, stats: object) -> None:
         self.panel.gnss_network_stats = stats
@@ -1860,19 +1916,22 @@ class GnssRuntimeController:
         worker = GnssBaseSerialWorker(port=port, baud=baud, height_type=height_type)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.connected.connect(self.panel._handle_gnss_base_serial_connected)
-        worker.stats_changed.connect(self.panel._handle_gnss_base_serial_stats)
-        worker.survey_in_changed.connect(self.panel._handle_gnss_base_survey_in)
-        worker.satellite_count_changed.connect(self.panel._handle_gnss_base_satellite_count)
-        worker.satellite_quality_changed.connect(self.panel._handle_gnss_base_satellite_quality)
-        worker.position_changed.connect(self.panel._handle_gnss_base_position)
-        worker.ubx_message_received.connect(self.panel._handle_gnss_base_ubx_message)
-        worker.command_sent.connect(self.panel._handle_gnss_base_command_sent)
-        worker.failed.connect(self.panel._handle_gnss_base_serial_failed)
-        worker.disconnected.connect(self.panel._handle_gnss_base_serial_disconnected)
+        _connect_gui_signal(worker.connected, self.panel._handle_gnss_base_serial_connected)
+        _connect_gui_signal(worker.stats_changed, self.panel._handle_gnss_base_serial_stats)
+        _connect_gui_signal(worker.survey_in_changed, self.panel._handle_gnss_base_survey_in)
+        _connect_gui_signal(worker.satellite_count_changed, self.panel._handle_gnss_base_satellite_count)
+        _connect_gui_signal(worker.satellite_quality_changed, self.panel._handle_gnss_base_satellite_quality)
+        _connect_gui_signal(worker.position_changed, self.panel._handle_gnss_base_position)
+        _connect_gui_signal(worker.ubx_message_received, self.panel._handle_gnss_base_ubx_message)
+        _connect_gui_signal(worker.command_sent, self.panel._handle_gnss_base_command_sent)
+        _connect_gui_signal(worker.failed, self.panel._handle_gnss_base_serial_failed)
+        _connect_gui_signal(worker.disconnected, self.panel._handle_gnss_base_serial_disconnected)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(lambda: self.panel._clear_gnss_base_serial_worker(thread))
+        _connect_gui_signal(
+            thread.finished,
+            lambda thread=thread: self.panel._clear_gnss_base_serial_worker(thread),
+        )
         self.panel.gnss_base_serial_thread = thread
         self.panel.gnss_base_serial_worker = worker
         pipeline = self._ensure_rtcm_pipeline()
@@ -1972,11 +2031,14 @@ class GnssRuntimeController:
         worker = GnssBaseSerialDetectWorker(baud=self.panel.gnss_base_baud_spin.value())
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.detected.connect(self.panel._handle_gnss_base_candidates_detected)
-        worker.failed.connect(self.panel._handle_gnss_base_candidate_detect_failed)
+        _connect_gui_signal(worker.detected, self.panel._handle_gnss_base_candidates_detected)
+        _connect_gui_signal(worker.failed, self.panel._handle_gnss_base_candidate_detect_failed)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(lambda: self.panel._clear_gnss_base_detect_worker(thread))
+        _connect_gui_signal(
+            thread.finished,
+            lambda thread=thread: self.panel._clear_gnss_base_detect_worker(thread),
+        )
         self.panel.gnss_base_detect_thread = thread
         self.panel.gnss_base_detect_worker = worker
         thread.start()
@@ -2214,7 +2276,7 @@ class GnssRuntimeController:
         injection_parts: list[str] = []
         total_packets = 0
         total_fail = 0
-        for side, label in (("left", "L"), ("right", "R"), ("drone", "D")):
+        for side, label in (("left", "L"), ("right", "R"), ("drone", "T")):
             side_stats = injection.get(side) if isinstance(injection, dict) else None
             if not isinstance(side_stats, dict):
                 side_stats = {}
@@ -2551,11 +2613,12 @@ class GnssRuntimeController:
         worker.moveToThread(thread)
         worker.request.connect(worker.enqueue, QtCore.Qt.QueuedConnection)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(
+        _connect_gui_signal(
+            thread.finished,
             lambda thread=thread, worker=worker: self._clear_pixhawk_rtcm_worker(
                 thread,
                 worker,
-            )
+            ),
         )
         self.panel.pixhawk_rtcm_thread = thread
         self.panel.pixhawk_rtcm_worker = worker

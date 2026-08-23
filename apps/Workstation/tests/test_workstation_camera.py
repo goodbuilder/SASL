@@ -1,0 +1,1397 @@
+"""Workstation camera regression tests."""
+
+from __future__ import annotations
+
+from Workstation.tests.workstation_test_support import (
+    _FakeBackend,
+    json,
+    LifecycleCoordinator,
+    Path,
+    pytest,
+    QtCore,
+    QtWidgets,
+    SimpleNamespace,
+    StandalonePanelBackend,
+    threading,
+    time,
+    WorkstationMainWindow,
+)
+
+
+def test_visible_encoder_profile_settings_round_trip_and_clamp(tmp_path: Path) -> None:
+    from Workstation.workstation_core.settings import AppSettings, load_settings, save_settings
+
+    path = tmp_path / "settings.json"
+    save_settings(
+        AppSettings(
+            wiris_visible_encoder_bitrate=5,
+            wiris_visible_encoder_qp=17,
+            wiris_visible_encoder_gop=30,
+            wiris_visible_encoder_idr=1,
+        ),
+        path,
+    )
+    loaded = load_settings(path)
+    assert (
+        loaded.wiris_visible_encoder_bitrate,
+        loaded.wiris_visible_encoder_qp,
+        loaded.wiris_visible_encoder_gop,
+        loaded.wiris_visible_encoder_idr,
+    ) == (5, 17, 30, 1)
+
+    payload = json.loads(path.read_text())
+    payload.update(
+        wiris_visible_encoder_bitrate=-1,
+        wiris_visible_encoder_qp=99,
+        wiris_visible_encoder_gop=99999,
+        wiris_visible_encoder_idr=-2,
+    )
+    path.write_text(json.dumps(payload))
+    clamped = load_settings(path)
+    assert (
+        clamped.wiris_visible_encoder_bitrate,
+        clamped.wiris_visible_encoder_qp,
+        clamped.wiris_visible_encoder_gop,
+        clamped.wiris_visible_encoder_idr,
+    ) == (0, 51, 32767, 0)
+
+def test_workstation_camera_sync_readiness_uses_imported_finite_check() -> None:
+    from Workstation.camera_time_sync_controller import CameraTimeSyncController
+
+    metadata = {
+        "rtcp_sr_received_count": 2,
+        "rtcp_sr_age_s": 0.2,
+        "rtcp_camera_ntp_rate": 1.0001,
+        "rtcp_camera_media_rate": 0.9999,
+        "timestamp_s": 10.0,
+    }
+    panel = SimpleNamespace(
+        camera_connected=True,
+        camera_frame_metadata_history={},
+        _camera_name_ko=lambda camera: camera,
+        _camera_sync_required_sr_count=lambda: 2,
+        _camera_sync_max_sr_age_s=lambda: 7.0,
+        _camera_sync_max_clock_rate_error=lambda: 0.005,
+        _camera_sync_rtcp_pair_max_delta_s=lambda: 0.05,
+        _camera_sync_receive_pair_max_delta_s=lambda: 0.35,
+        _camera_sync_max_pc_offset_s=lambda: 0.1,
+        _clock_sync_pair_metadata=lambda **_kwargs: (dict(metadata), dict(metadata)),
+        _camera_time_sync_metrics=lambda *_args, **_kwargs: {
+            "pair_delta_s": 0.01,
+            "receive_pair_delta_s": 0.01,
+            "max_sr_pc_offset_ms": 20.0,
+        },
+    )
+
+    ready, reason = CameraTimeSyncController(panel)._camera_sync_readiness()
+
+    assert ready is True
+    assert "검증 완료" in reason
+
+def test_stus_reconnects_only_local_stream_for_fresh_sender_reports() -> None:
+    from Workstation.camera_time_sync_controller import (
+        CAMERA_SYNC_STATUS_RECONNECTING,
+        CameraTimeSyncController,
+    )
+
+    class Timer:
+        def __init__(self) -> None:
+            self.started = 0
+
+        def start(self) -> None:
+            self.started += 1
+
+    states: list[tuple[str, str]] = []
+    stream_starts: list[object] = []
+    timer = Timer()
+    panel = SimpleNamespace(
+        camera_connected=True,
+        camera_frame_metadata={
+            "left": {"rtcp_sr_received_count": 4},
+            "right": {"rtcp_sr_received_count": 7},
+        },
+        _camera_sync_stus_sr_baseline={},
+        _camera_sync_deadline_monotonic_s=None,
+        _camera_sync_transport_override="tcp",
+        _camera_sync_timer=timer,
+        yolo_enabled=True,
+        _session_recording_active=lambda: False,
+        _camera_sync_warmup_timeout_s=lambda: 30.0,
+        _start_camera_streams=lambda **kwargs: stream_starts.append(kwargs),
+        _set_camera_sync_state=lambda status, reason: states.append((status, reason)),
+    )
+
+    CameraTimeSyncController(panel)._begin_camera_sync_after_stus(
+        target="both",
+        result="success",
+    )
+
+    assert stream_starts == [{"enable_detection": True, "switch_to_depth": True}]
+    assert panel._camera_sync_stus_sr_baseline == {"left": 0, "right": 0}
+    assert panel._camera_sync_transport_override is None
+    assert timer.started == 1
+    assert states[-1][0] == CAMERA_SYNC_STATUS_RECONNECTING
+    assert "Ethernet Mode는 유지" in states[-1][1]
+
+def test_workstation_launcher_bypasses_stereowiris_runtime() -> None:
+    from Workstation import standalone_gui
+
+    repository = Path(__file__).resolve().parents[3]
+    launcher = (repository / "apps" / "Workstation" / "run.sh").read_text(encoding="utf-8")
+    entrypoint = (repository / "apps" / "Workstation" / "__main__.py").read_text(encoding="utf-8")
+    runtime_requirements = (repository / "requirements" / "runtime.txt").read_text(encoding="utf-8")
+
+    assert "StereoWIRIS" not in launcher
+    assert "Simulation" not in launcher
+    assert "-m Workstation" in launcher
+    assert "--start" not in launcher
+    assert "--ui" not in launcher
+    assert "WorkstationMainWindow" in entrypoint
+    assert "--no-start" in entrypoint
+    assert "legacy" not in entrypoint.lower()
+    assert "PyQt5" in runtime_requirements
+    assert "PyQt6" not in runtime_requirements
+    assert standalone_gui._parse_ui_mode(["workstation"])[0] == "workstation"
+    assert standalone_gui._parse_ui_mode(["workstation", "--ui", "workstation"])[1] == ["workstation"]
+    with pytest.raises(SystemExit):
+        standalone_gui._parse_ui_mode(["workstation", "--ui", "legacy"])
+    assert not hasattr(standalone_gui, "WirisStereoDistanceGui")
+    assert not hasattr(standalone_gui, "IntegratedWirisPixhawkConsole")
+
+def test_workstation_entrypoint_keeps_cameras_stopped_by_default_and_supports_explicit_start() -> None:
+    from Workstation.__main__ import _parser
+
+    assert _parser().parse_args([]).start is False
+    assert _parser().parse_args(["--no-start"]).start is False
+    assert _parser().parse_args(["--start"]).start is True
+
+def test_workstation_camera_defaults_prefer_reliable_receive_profile() -> None:
+    from Workstation.workstation_core.settings import AppSettings
+
+    settings = AppSettings()
+
+    assert settings.preview_width == 1280
+    assert settings.rtsp_latency_ms == 100
+    assert settings.rtsp_decoder == "auto"
+    assert settings.stream_backend == "gstreamer"
+    assert settings.rtsp_transport == "tcp"
+
+def test_class_gate_settings_are_forwarded_to_the_yolo_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from Workstation import standalone_gui
+
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_auto_load_intrinsics", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = standalone_gui.WirisStereoDistancePanel(app_root=tmp_path)
+    panel.yolo_gate_class_checkbox.setChecked(True)
+    panel.yolo_gate_class_edit.setText("person")
+
+    kwargs = panel.yolo_kwargs()
+
+    assert kwargs["class_gate_enabled"] is True
+    assert kwargs["class_gate"] == "person"
+    panel._shutdown_coordinator = LifecycleCoordinator([])
+    panel.close()
+    panel.deleteLater()
+    app.processEvents()
+
+def test_gstreamer_rtsp_worker_retries_transient_sdp_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    from Workstation.workstation_core import yolo_stream
+
+    attempts: list[int] = []
+    messages: list[object] = []
+
+    class OutputQueue:
+        def put(self, message: object) -> None:
+            messages.append(message)
+
+    def fake_run_once(*_args: object) -> bool:
+        attempts.append(len(attempts) + 1)
+        return len(attempts) >= 2
+
+    monkeypatch.setattr(yolo_stream, "_run_gstreamer_stream_once", fake_run_once)
+    monkeypatch.setattr(yolo_stream, "GST_RTSP_RECONNECT_DELAYS_S", (0.001,))
+
+    yolo_stream._run_gstreamer_stream(
+        {},
+        OutputQueue(),
+        threading.Event(),
+        None,
+        None,
+        False,
+    )
+
+    assert attempts == [1, 2]
+    assert any("RTSP 재연결 대기" in str(message[1]) for message in messages if isinstance(message, tuple))
+
+@pytest.mark.parametrize("full_control_scan", (True, False))
+def test_camera_auto_detect_result_records_full_control_scan_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    full_control_scan: bool,
+) -> None:
+    from Workstation import standalone_gui
+
+    emitted: list[dict[str, object]] = []
+    monkeypatch.setattr(standalone_gui, "discover_host_interface_candidates", lambda: [])
+    worker = standalone_gui.CameraAutoDetectWorker(
+        mode="auto_connect",
+        full_control_scan=full_control_scan,
+    )
+    worker._discover_wiris_control = lambda _reports: ([], [])
+    worker.detected.connect(emitted.append)
+
+    worker.run()
+
+    assert emitted and emitted[0]["full_control_scan"] is full_control_scan
+
+def test_auto_start_uses_wiris_activation_sequence_before_stream_start(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from Workstation import standalone_gui
+
+    initial_status = standalone_gui.WirisStereoDistancePanel._initial_status
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_auto_load_intrinsics", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = standalone_gui.WirisStereoDistancePanel(app_root=tmp_path)
+    panel.auto_start = True
+    monkeypatch.setattr(panel, "_start_interface_status_worker", lambda: None)
+    monkeypatch.setattr(panel, "_recover_retryable_recording_session", lambda: None)
+    startup_calls: list[str] = []
+    monkeypatch.setattr(panel, "_start_startup_camera_sequence", lambda: startup_calls.append("auto-connect"))
+
+    initial_status(panel)
+
+    assert startup_calls == ["auto-connect"]
+    panel._shutdown_coordinator = LifecycleCoordinator([])
+    panel.close()
+    panel.deleteLater()
+    app.processEvents()
+
+def test_startup_camera_sequence_uses_configured_hosts_before_full_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from Workstation import standalone_gui
+
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_auto_load_intrinsics", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = standalone_gui.WirisStereoDistancePanel(app_root=tmp_path)
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(panel, "_session_recording_active", lambda: False)
+    monkeypatch.setattr(
+        panel,
+        "_start_rtsp_enable_worker",
+        lambda **kwargs: calls.append(dict(kwargs)),
+    )
+    monkeypatch.setattr(panel, "_start_camera_detection", lambda *_args, **_kwargs: pytest.fail("full discovery ran"))
+
+    panel._start_startup_camera_sequence()
+
+    assert calls == [{"target_labels": ("left", "right"), "reactivate": False}]
+    assert panel.auto_wiris_connect_pending is True
+    assert panel._startup_camera_sequence_pending is True
+    panel.close()
+    panel.deleteLater()
+    app.processEvents()
+
+def test_startup_camera_failure_does_not_escalate_to_full_network_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from Workstation import standalone_gui
+
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_auto_load_intrinsics", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = standalone_gui.WirisStereoDistancePanel(app_root=tmp_path)
+    panel.auto_wiris_connect_pending = True
+    panel._startup_camera_sequence_pending = True
+    monkeypatch.setattr(panel, "_start_camera_detection", lambda *_args, **_kwargs: pytest.fail("full discovery ran"))
+
+    panel._schedule_auto_wiris_connect_retry("configured host timeout")
+
+    assert panel.auto_wiris_connect_pending is False
+    assert panel._startup_camera_sequence_pending is False
+    assert "connect cameras" in panel.camera_connection_label.text().lower()
+    panel.close()
+    panel.deleteLater()
+    app.processEvents()
+
+
+def test_manual_camera_connect_does_not_retry_the_same_endpoint_after_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from Workstation import standalone_gui
+
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_auto_load_intrinsics", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = standalone_gui.WirisStereoDistancePanel(app_root=tmp_path)
+    panel.auto_wiris_connect_pending = True
+    panel._startup_camera_sequence_pending = False
+    panel._camera_auto_connect_attempt = 1
+    scheduled: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        standalone_gui.QtCore.QTimer,
+        "singleShot",
+        lambda *args: scheduled.append(args),
+    )
+
+    panel._schedule_auto_wiris_connect_retry("configured WIRIS IP unavailable")
+
+    assert panel.auto_wiris_connect_pending is False
+    assert panel._startup_camera_sequence_pending is False
+    assert scheduled == []
+    assert "camera service unavailable" in panel.camera_connection_label.text().lower()
+    panel.close()
+    panel.deleteLater()
+    app.processEvents()
+
+
+@pytest.mark.parametrize(
+    ("startup_sequence", "expected_call"),
+    ((True, "start_yolo"), (False, "connect_cameras")),
+)
+def test_auto_wiris_completion_preserves_manual_preview_mode(
+    startup_sequence: bool,
+    expected_call: str,
+) -> None:
+    from Workstation import standalone_gui
+
+    calls: list[str] = []
+    panel = SimpleNamespace(
+        _startup_camera_sequence_pending=startup_sequence,
+        _cancel_auto_wiris_connect_retry=lambda: calls.append("cancel"),
+        _log=lambda _message: None,
+        start_yolo=lambda: calls.append("start_yolo"),
+        connect_cameras=lambda: calls.append("connect_cameras"),
+    )
+
+    standalone_gui.WirisStereoDistancePanel._finish_auto_wiris_connect(panel)
+
+    assert calls == ["cancel", expected_call]
+
+def test_detection_mode_switch_is_rejected_while_live_camera_is_recording(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from Workstation import standalone_gui
+
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_auto_load_intrinsics", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = standalone_gui.WirisStereoDistancePanel(app_root=tmp_path)
+    panel.distance_recording_enabled = True
+    panel.camera_connected = True
+    starts: list[tuple[bool, bool]] = []
+    monkeypatch.setattr(
+        panel,
+        "_start_camera_streams",
+        lambda *, enable_detection, switch_to_depth: starts.append((enable_detection, switch_to_depth)),
+    )
+
+    assert panel.toggle_yolo_detection() is False
+    assert starts == []
+    assert "세션 기록 중" in panel.camera_yolo_log.toPlainText()
+
+    panel.camera_connected = False
+    assert panel.toggle_yolo_detection() is None
+    assert starts == [(True, True)]
+
+    panel._shutdown_coordinator = LifecycleCoordinator([])
+    panel.close()
+    panel.deleteLater()
+    app.processEvents()
+
+def test_recording_owner_rejects_camera_swap_and_clock_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from Workstation import standalone_gui
+
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_auto_load_intrinsics", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = standalone_gui.WirisStereoDistancePanel(app_root=tmp_path)
+    panel.distance_recording_enabled = True
+    left_url = panel.left_url_edit.text()
+    right_url = panel.right_url_edit.text()
+
+    assert panel.swap_cameras() is False
+    assert panel.left_url_edit.text() == left_url
+    assert panel.right_url_edit.text() == right_url
+    assert panel.set_selected_wiris_time_from_pc() is False
+    assert panel.wiris_time_sync_thread is None
+    assert panel.swap_pixhawks() is False
+    assert panel.toggle_mavlink_connection() is False
+    assert panel.auto_connect_wiris() is False
+    assert panel.auto_wiris_connect_pending is False
+    panel._camera_candidate_rows = [{"kind": "RTSP", "address": "rtsp://candidate", "host": "10.0.0.50"}]
+    assert panel.apply_camera_candidate(0, "left") is False
+    panel.distance_recording_enabled = False
+    panel.auto_wiris_connect_pending = True
+    original_left_url = panel.left_url_edit.text()
+    retry_reasons: list[str] = []
+    monkeypatch.setattr(panel, "_schedule_auto_wiris_connect_retry", retry_reasons.append)
+    panel._apply_camera_detection({"mode": "auto_connect", "rtsp": [], "control": [], "verified_control": []})
+    assert panel.auto_wiris_connect_pending is True
+    assert retry_reasons == ["WIRIS 제어 포트가 아직 열리지 않음"]
+    assert panel.left_url_edit.text() == original_left_url
+    panel.distance_recording_enabled = True
+    panel._pixhawk_candidate_rows_by_source["mavlink"] = [
+        {"kind": "MAVLink", "value": "udpin:0.0.0.0:14550"}
+    ]
+    assert panel.apply_pixhawk_candidate("mavlink", 0, "left") is False
+
+    starts: list[tuple[bool, bool]] = []
+    monkeypatch.setattr(
+        panel,
+        "_start_camera_streams",
+        lambda *, enable_detection, switch_to_depth: starts.append((enable_detection, switch_to_depth)),
+    )
+    panel.camera_connected = True
+    panel._begin_camera_sync_after_stus(target="both", result="success")
+    assert starts == []
+    assert panel.camera_sync_status == standalone_gui.CAMERA_SYNC_STATUS_NOT_VERIFIED
+    panel.camera_connected = False
+
+    panel.distance_recording_enabled = False
+
+    panel.pixhawk_connection_thread = object()
+    assert panel._start_session_recording() is False
+    assert panel.recording_session_id == ""
+    panel.pixhawk_connection_thread = None
+
+    panel._shutdown_coordinator = LifecycleCoordinator([])
+    panel.close()
+    panel.deleteLater()
+    app.processEvents()
+
+def test_camera_workspace_uses_hidden_diagnostics_height_without_cropping_preview_contract() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    window = WorkstationMainWindow(backend=_FakeBackend())
+    window.resize(1600, 980)
+    window.diagnostics_dock.show()
+    window.show()
+    window.navigation.select_context("devices.cameras")
+    app.processEvents()
+    app.processEvents()
+
+    shown_height = window.camera.preview_splitter.height()
+    assert window.camera.workspace_splitter.orientation() == QtCore.Qt.Vertical
+    assert window.camera.preview_splitter.orientation() == QtCore.Qt.Horizontal
+
+    window.diagnostics_dock.hide()
+    app.processEvents()
+    app.processEvents()
+
+    assert window.camera.workspace_splitter.orientation() == QtCore.Qt.Horizontal
+    assert window.camera.preview_splitter.orientation() == QtCore.Qt.Vertical
+    assert window.camera.preview_splitter.height() > shown_height
+    image = window.camera.previews["left"].image
+    assert image.width() > 0
+    assert image.height() > 0
+    assert image.width() / image.height() == pytest.approx(16.0 / 9.0, abs=0.05)
+
+    window.diagnostics_dock.show()
+    app.processEvents()
+    app.processEvents()
+    assert window.camera.workspace_splitter.orientation() == QtCore.Qt.Vertical
+    assert window.camera.preview_splitter.orientation() == QtCore.Qt.Horizontal
+
+    window.close()
+    app.processEvents()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_devices_camera_status_shows_active_decoder_per_side_only() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    backend.panel.active_stream_decoders = {
+        "left": "nvh264dec",
+        "right": "avdec_h264",
+    }
+    window = WorkstationMainWindow(backend=backend)
+    window.status_adapter.stop()
+    window.show()
+    window.navigation.select_context("devices.cameras")
+    window.camera.refresh(window.status_adapter.model.snapshot())
+    app.processEvents()
+
+    assert window.camera.decoder_values["left"].value.text() == "nvh264dec"
+    assert window.camera.decoder_values["right"].value.text() == "avdec_h264"
+
+    backend.panel.active_stream_decoders = {"left": None, "right": None}
+    window.camera.refresh(window.status_adapter.model.snapshot())
+    assert window.camera.decoder_values["left"].value.text() == "--"
+    assert window.camera.decoder_values["right"].value.text() == "--"
+
+    window.close()
+    app.processEvents()
+    window.deleteLater()
+    app.processEvents()
+
+def test_wiris_control_probe_worker_keeps_socket_checks_off_ui_path(monkeypatch) -> None:
+    from Workstation import standalone_gui
+
+    calls: list[tuple[str, int, float]] = []
+
+    def fake_check(host: str, port: int, *, timeout: float) -> bool:
+        calls.append((host, port, timeout))
+        return host == "10.0.0.11"
+
+    monkeypatch.setattr(standalone_gui, "check_tcp_port", fake_check)
+    results: list[object] = []
+    worker = standalone_gui.WirisControlCheckWorker(
+        (("left", "10.0.0.11", 5000), ("right", "", 5001)),
+        timeout_s=2.5,
+    )
+    worker.checked.connect(results.append)
+    worker.run()
+
+    assert calls == [("10.0.0.11", 5000, 2.5)]
+    assert results == [[
+        {"label": "left", "host": "10.0.0.11", "port": 5000, "state": "control-open"},
+        {"label": "right", "host": "", "port": 5001, "state": "missing-host"},
+    ]]
+
+def test_wiris_rtsp_reactivation_worker_cycles_only_selected_camera(monkeypatch) -> None:
+    from Workstation import wiris_runtime_workers
+
+    sent: list[tuple[str, str]] = []
+
+    def fake_send(command) -> str:
+        sent.append((command.host, command.command))
+        return "TRUE" if command.command == "GETH" else "OK"
+
+    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
+    monkeypatch.setattr(wiris_runtime_workers, "check_tcp_port", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(wiris_runtime_workers, "RTSP_ENABLE_SETTLE_DELAY_MS", 0)
+    monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_COMMAND_SETTLE_MS", 0)
+
+    results: list[object] = []
+    worker = wiris_runtime_workers.WirisRtspEnableWorker(
+        hosts={"left": "10.0.0.11", "right": "10.0.0.12"},
+        candidate_ports={"left": [2240], "right": [2240]},
+        urls={
+            "left": "rtsp://10.0.0.11:8554/visible",
+            "right": "rtsp://10.0.0.12:8554/visible",
+        },
+        timeout_s=1.0,
+        target_labels=("left",),
+        reactivate=True,
+    )
+    worker.enabled.connect(results.append)
+    worker.run()
+
+    assert sent == [
+        ("10.0.0.11", "GETH"),
+        ("10.0.0.11", "SETH TRUE"),
+    ]
+    assert results[0]["mode"] == "reactivate"
+    assert results[0]["target_labels"] == ("left",)
+    assert results[0]["statuses"] == ["left=reactivated-sent"]
+    assert results[0]["should_check"] is True
+    assert "SETH FALSE는 전송하지 않음" in "\n".join(results[0]["logs"])
+
+def test_wiris_rtsp_enable_worker_skips_seth_and_unchanged_visible_encoder_profile(monkeypatch) -> None:
+    from Workstation import wiris_runtime_workers
+
+    sent: list[str] = []
+    responses = {
+        "GETH": "TRUE",
+        "GEBR VISIBLE": "5",
+        "GEQZ VISIBLE": "17",
+        "GEGS VISIBLE": "30",
+        "GEIR VISIBLE": "1",
+    }
+
+    def fake_send(command) -> str:
+        sent.append(command.command)
+        return responses[command.command]
+
+    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
+    monkeypatch.setattr(wiris_runtime_workers, "check_tcp_port", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(wiris_runtime_workers, "RTSP_ENABLE_SETTLE_DELAY_MS", 0)
+    monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_COMMAND_SETTLE_MS", 0)
+    results: list[object] = []
+    worker = wiris_runtime_workers.WirisRtspEnableWorker(
+        hosts={"left": "10.0.0.11"},
+        candidate_ports={"left": [2240]},
+        urls={"left": "rtsp://10.0.0.11:8554/visible"},
+        timeout_s=1.0,
+        target_labels=("left",),
+        visible_encoder_profile={"bitrate": 5, "qp": 17, "gop": 30, "idr": 1},
+    )
+    worker.enabled.connect(results.append)
+    worker.run()
+
+    assert sent == [
+        "GETH",
+        "GEBR VISIBLE",
+        "GEQZ VISIBLE",
+        "GEGS VISIBLE",
+        "GEIR VISIBLE",
+    ]
+    assert results[0]["statuses"] == ["left=enable-sent"]
+    assert results[0]["should_check"] is True
+    logs = "\n".join(results[0]["logs"])
+    assert "SETH TRUE 생략" in logs
+    assert "bitrate=5, qp=17, gop=30, idr=1" in logs
+    assert "changed=none (readback 일치; SET 생략)" in logs
+
+
+def test_wiris_rtsp_enable_worker_applies_only_changed_encoder_fields(monkeypatch) -> None:
+    from Workstation import wiris_runtime_workers
+
+    sent: list[str] = []
+    readbacks = {
+        "GEBR VISIBLE": iter(("4", "5")),
+        "GEQZ VISIBLE": iter(("17",)),
+        "GEGS VISIBLE": iter(("30",)),
+        "GEIR VISIBLE": iter(("1",)),
+    }
+
+    def fake_send(command) -> str:
+        sent.append(command.command)
+        if command.command == "GETH":
+            return "TRUE"
+        if command.command == "SEBR VISIBLE 5":
+            return "OK"
+        return next(readbacks[command.command])
+
+    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
+    monkeypatch.setattr(wiris_runtime_workers, "check_tcp_port", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(wiris_runtime_workers, "RTSP_ENABLE_SETTLE_DELAY_MS", 0)
+    monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_COMMAND_SETTLE_MS", 0)
+    results: list[object] = []
+    worker = wiris_runtime_workers.WirisRtspEnableWorker(
+        hosts={"left": "10.0.0.11"},
+        candidate_ports={"left": [2240]},
+        urls={"left": "rtsp://10.0.0.11:8554/visible"},
+        timeout_s=1.0,
+        target_labels=("left",),
+        visible_encoder_profile={"bitrate": 5, "qp": 17, "gop": 30, "idr": 1},
+    )
+    worker.enabled.connect(results.append)
+    worker.run()
+
+    assert sent == [
+        "GETH",
+        "GEBR VISIBLE",
+        "GEQZ VISIBLE",
+        "GEGS VISIBLE",
+        "GEIR VISIBLE",
+        "SEBR VISIBLE 5",
+        "GEBR VISIBLE",
+    ]
+    assert results[0]["statuses"] == ["left=enable-sent"]
+    assert "changed=bitrate" in "\n".join(results[0]["logs"])
+
+
+def test_wiris_rtsp_enable_worker_retries_transient_initial_readback_reset(monkeypatch) -> None:
+    from Workstation import wiris_runtime_workers
+
+    sent: list[str] = []
+    bitrate_attempts = iter((ConnectionResetError("reset"), "5"))
+
+    def fake_send(command) -> str:
+        sent.append(command.command)
+        if command.command == "GETH":
+            return "TRUE"
+        if command.command == "GEBR VISIBLE":
+            result = next(bitrate_attempts)
+            if isinstance(result, Exception):
+                raise result
+            return result
+        return {
+            "GEQZ VISIBLE": "17",
+            "GEGS VISIBLE": "30",
+            "GEIR VISIBLE": "1",
+        }[command.command]
+
+    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
+    monkeypatch.setattr(wiris_runtime_workers, "check_tcp_port", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(wiris_runtime_workers, "RTSP_ENABLE_SETTLE_DELAY_MS", 0)
+    monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_COMMAND_SETTLE_MS", 0)
+    monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_READBACK_RETRY_INTERVAL_MS", 0)
+    monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_READBACK_MAX_ATTEMPTS", 1)
+    results: list[object] = []
+    worker = wiris_runtime_workers.WirisRtspEnableWorker(
+        hosts={"left": "10.0.0.11"},
+        candidate_ports={"left": [2240]},
+        urls={"left": "rtsp://10.0.0.11:8554/visible"},
+        timeout_s=1.0,
+        target_labels=("left",),
+        visible_encoder_profile={"bitrate": 5, "qp": 17, "gop": 30, "idr": 1},
+    )
+    worker.enabled.connect(results.append)
+    worker.run()
+
+    assert sent.count("GEBR VISIBLE") == 2
+    assert results[0]["statuses"] == ["left=enable-sent"]
+    assert "changed=none" in "\n".join(results[0]["logs"])
+
+def test_wiris_rtsp_enable_worker_fails_closed_on_encoder_profile_readback_mismatch(monkeypatch) -> None:
+    from Workstation import wiris_runtime_workers
+
+    def fake_send(command) -> str:
+        if command.command == "GETH":
+            return "TRUE"
+        if command.command.startswith(("SEBR", "SEQZ", "SEGS", "SEIR")):
+            return "OK"
+        expected = {
+            "GEBR VISIBLE": "4",
+            "GEQZ VISIBLE": "17",
+            "GEGS VISIBLE": "30",
+            "GEIR VISIBLE": "1",
+        }
+        return expected[command.command]
+
+    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
+    monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_COMMAND_SETTLE_MS", 0)
+    monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_READBACK_MAX_ATTEMPTS", 0)
+    monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_READBACK_RETRY_INTERVAL_MS", 0)
+    results: list[object] = []
+    worker = wiris_runtime_workers.WirisRtspEnableWorker(
+        hosts={"left": "10.0.0.11"},
+        candidate_ports={"left": [2240]},
+        urls={"left": "rtsp://10.0.0.11:8554/visible"},
+        timeout_s=1.0,
+        target_labels=("left",),
+        visible_encoder_profile={"bitrate": 5, "qp": 17, "gop": 30, "idr": 1},
+    )
+    worker.enabled.connect(results.append)
+    worker.run()
+
+    assert results[0]["statuses"] == ["left=encoder-profile-failed"]
+    assert results[0]["should_check"] is False
+    assert "readback=4 expected=5" in "\n".join(results[0]["logs"])
+
+def test_wiris_control_sessions_are_serialized_per_camera(monkeypatch) -> None:
+    from Workstation.workstation_core import wiris_zoom
+
+    first_connection_entered = threading.Event()
+    release_first_connection = threading.Event()
+    connection_count = 0
+    count_lock = threading.Lock()
+
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def settimeout(self, _timeout: float) -> None:
+            return None
+
+        def sendall(self, _payload: bytes) -> None:
+            return None
+
+        def recv(self, _size: int) -> bytes:
+            return b"OK"
+
+    def fake_create_connection(_endpoint, *, timeout):
+        nonlocal connection_count
+        with count_lock:
+            connection_count += 1
+            current = connection_count
+        if current == 1:
+            first_connection_entered.set()
+            assert release_first_connection.wait(1.0)
+        return FakeSocket()
+
+    monkeypatch.setattr(wiris_zoom.socket, "create_connection", fake_create_connection)
+    command = wiris_zoom.build_wiris_command(
+        host="10.0.0.231",
+        port=2240,
+        command="HIWS",
+    )
+    responses: list[str] = []
+    first = threading.Thread(target=lambda: responses.append(wiris_zoom.send_tcp_line(command)))
+    second = threading.Thread(target=lambda: responses.append(wiris_zoom.send_tcp_line(command)))
+    first.start()
+    assert first_connection_entered.wait(1.0)
+    second.start()
+    time.sleep(0.05)
+    assert connection_count == 1
+    release_first_connection.set()
+    first.join(1.0)
+    second.join(1.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert connection_count == 2
+    assert responses == ["OK", "OK"]
+
+def test_camera_network_discovery_worker_keeps_nm_queries_off_ui_path(monkeypatch) -> None:
+    from Workstation import standalone_gui
+    from Workstation import device_runtime_workers
+
+    interface = SimpleNamespace(name="enx-camera", address="10.0.0.1/24")
+    candidate = SimpleNamespace(interface=interface, neighbor_hosts=("10.0.0.11",))
+    monkeypatch.setattr(
+        device_runtime_workers,
+        "discover_host_interface_candidates",
+        lambda **_kwargs: [candidate],
+    )
+    monkeypatch.setattr(
+        device_runtime_workers,
+        "resolve_nm_interface_address",
+        lambda _name, _hints: "10.0.0.1/24",
+    )
+    monkeypatch.setattr(device_runtime_workers, "nm_device_connection_name", lambda _name: "camera-profile")
+    monkeypatch.setattr(device_runtime_workers, "nm_connection_ipv4_addresses", lambda _name: ("10.0.0.1/24",))
+
+    results: list[object] = []
+    worker = standalone_gui.CameraNetworkDiscoveryWorker(
+        host_address="10.0.0.1/24",
+        host_hints=("10.0.0.11",),
+    )
+    worker.discovered.connect(results.append)
+    worker.run()
+
+    assert results[0]["candidates"] == (candidate,)
+    assert results[0]["resolved_address"] == "10.0.0.1/24"
+    assert results[0]["connection_name"] == "camera-profile"
+
+def test_wiris_clock_worker_keeps_stus_and_gdti_io_off_ui_path(monkeypatch) -> None:
+    from Workstation import standalone_gui
+    from Workstation import wiris_runtime_workers
+
+    sent: list[str] = []
+
+    def fake_send(command) -> str:
+        sent.append(str(command.command))
+        return "OK" if command.command.startswith("STUS ") else "2026/08/09 12:00:00"
+
+    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
+    monkeypatch.setattr(
+        standalone_gui.WirisClockCommandWorker,
+        "_measure_control_rtt",
+        lambda self, **_kwargs: {
+            "command": "HIWS",
+            "samples_s": [0.009, 0.010, 0.011],
+            "median_s": 0.010,
+            "errors": [],
+        },
+    )
+    target_infos = (
+        ("left", "10.0.0.11", 5000, 1.0),
+        ("right", "10.0.0.12", 5001, 1.0),
+    )
+    stus_results: list[object] = []
+    stus_worker = standalone_gui.WirisClockCommandWorker(
+        target_infos,
+        command_text="STUS",
+        shared_utc=True,
+    )
+    stus_worker.completed.connect(stus_results.append)
+    stus_worker.run()
+
+    gdti_results: list[object] = []
+    gdti_worker = standalone_gui.WirisClockCommandWorker(target_infos, command_text="GDTI")
+    gdti_worker.completed.connect(gdti_results.append)
+    gdti_worker.run()
+
+    assert len(sent) == 4
+    assert all(command.startswith("STUS ") for command in sent[:2])
+    assert stus_results[0]["results"]["left"]["response"] == "OK"
+    assert stus_results[0]["results"]["right"]["response"] == "OK"
+    assert stus_results[0]["compensation_method"] == "control-rtt-half-plus-parse-margin"
+    assert stus_results[0]["results"]["left"]["stus_rtt_median_s"] == pytest.approx(0.010)
+    assert stus_results[0]["results"]["left"]["stus_one_way_delay_s"] == pytest.approx(0.005)
+    assert stus_results[0]["results"]["left"]["stus_compensation_s"] == pytest.approx(0.007)
+    assert stus_results[0]["requested_utc_by_camera"] == stus_results[0]["command_times"]
+    assert gdti_results[0]["results"]["left"]["response"].startswith("2026/")
+
+def test_wiris_stus_compensation_rejects_invalid_rtt() -> None:
+    from Workstation import standalone_gui
+
+    assert standalone_gui.WirisClockCommandWorker._stus_one_way_delay_s(0.012) == pytest.approx(0.006)
+    assert standalone_gui.WirisClockCommandWorker._stus_compensation_s(0.012) == pytest.approx(0.008)
+    assert standalone_gui.WirisClockCommandWorker._stus_compensation_s(None) == 0.0
+    assert standalone_gui.WirisClockCommandWorker._stus_compensation_s(float("nan")) == 0.0
+    assert standalone_gui.WirisClockCommandWorker._stus_compensation_s(0.251) == 0.0
+
+def test_camera_network_address_worker_keeps_interface_apply_off_ui_path(monkeypatch) -> None:
+    from Workstation import standalone_gui
+    from Workstation import device_runtime_workers
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        device_runtime_workers,
+        "apply_interface_address",
+        lambda interface_name, address_text: calls.append((interface_name, address_text)) or (True, "applied"),
+    )
+    monkeypatch.setattr(device_runtime_workers, "interface_addresses", lambda interface_name: f"{interface_name} UP")
+    results: list[object] = []
+    worker = standalone_gui.CameraNetworkAddressApplyWorker(
+        interface_name="enx-camera",
+        address_text="10.0.0.1/24",
+    )
+    worker.applied.connect(results.append)
+    worker.run()
+
+    assert calls == [("enx-camera", "10.0.0.1/24")]
+    assert results == [
+        {
+            "ok": True,
+            "message": "applied",
+            "interface_name": "enx-camera",
+            "address_text": "10.0.0.1/24",
+            "addresses": "enx-camera UP",
+        }
+    ]
+
+def test_wiris_stip_worker_keeps_interface_and_tcp_io_off_ui_path(monkeypatch) -> None:
+    from Workstation import standalone_gui
+    from Workstation import wiris_runtime_workers
+
+    interface = SimpleNamespace(name="enx-camera", address="10.0.0.1/24")
+    candidate = SimpleNamespace(interface=interface, neighbor_hosts=())
+    sent: list[str] = []
+    monkeypatch.setattr(wiris_runtime_workers, "interface_link_exists", lambda _name: False)
+    monkeypatch.setattr(wiris_runtime_workers, "discover_host_interface_candidates", lambda **_kwargs: [candidate])
+    monkeypatch.setattr(wiris_runtime_workers, "resolve_nm_interface_address", lambda _name, _hints: None)
+    monkeypatch.setattr(wiris_runtime_workers, "interface_has_address", lambda _name, _address: True)
+
+    def fake_send(command) -> str:
+        sent.append(str(command.command))
+        return "OK"
+
+    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
+    results: list[object] = []
+    worker = standalone_gui.WirisStipWorker(
+        interface_name="enx-camera",
+        host_address="10.0.0.1/24",
+        host_hints=("10.0.0.11",),
+        current_host="10.0.0.11",
+        new_ip="10.0.0.21",
+        mask="255.255.255.0",
+        port=5000,
+        reboot=False,
+        timeout_s=1.0,
+    )
+    worker.completed.connect(results.append)
+    worker.run()
+
+    assert sent == [
+        "STIP 10.0.0.21",
+        "STMS 255.255.255.0",
+    ]
+    assert results[0]["state"] == "sent"
+    assert results[0]["interface_name"] == "enx-camera"
+
+def test_wiris_command_worker_reports_partial_timeout_without_ui_join(monkeypatch) -> None:
+    from Workstation import standalone_gui
+    from Workstation import wiris_runtime_workers
+
+    def fake_send(command) -> str:
+        if command.host.endswith("12"):
+            raise TimeoutError("right camera timeout")
+        return "OK"
+
+    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
+    results: list[object] = []
+    worker = standalone_gui.WirisCommandWorker(
+        (
+            ("left", "10.0.0.11", 5000, 1.0),
+            ("right", "10.0.0.12", 5001, 1.0),
+        ),
+        command_text="HIWS",
+        terminator=standalone_gui.LINE_TERMINATOR,
+    )
+    worker.completed.connect(results.append)
+    worker.run()
+
+    assert results[0]["statuses"]["left"] == "OK"
+    assert results[0]["statuses"]["right"] == "실패: right camera timeout"
+
+def test_workstation_uses_explicit_camera_coordinate_label() -> None:
+    source = (Path(__file__).resolve().parents[2] / "Workstation" / "standalone_gui.py").read_text(
+        encoding="utf-8"
+    )
+    assert "OpenCV optical RDF" in source
+    assert "ROS Optical Frame" not in source
+
+def test_camera_mode_switch_restarts_after_workers_stop_without_blocking(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from Workstation import standalone_gui
+
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_auto_load_intrinsics", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = standalone_gui.WirisStereoDistancePanel(app_root=tmp_path)
+    callbacks: list[object] = []
+    monkeypatch.setattr(
+        standalone_gui.QtCore.QTimer,
+        "singleShot",
+        lambda _delay_ms, callback: callbacks.append(callback),
+    )
+    stopped = {"value": False}
+    starts: list[tuple[str, bool]] = []
+    panel.left_pane.stop = lambda *, wait=False: stopped["value"]
+    panel.right_pane.stop = lambda *, wait=False: stopped["value"]
+    panel.left_pane.start_stream = (
+        lambda _url, *, enable_detection, **_kwargs: starts.append(("left", enable_detection)) or True
+    )
+    panel.right_pane.start_stream = (
+        lambda _url, *, enable_detection, **_kwargs: starts.append(("right", enable_detection)) or True
+    )
+
+    panel._start_camera_streams(enable_detection=True, switch_to_depth=True)
+    assert panel._pending_camera_start == (True, True)
+    assert starts == []
+    assert len(callbacks) == 1
+
+    stopped["value"] = True
+    callbacks.pop(0)()
+    assert panel._pending_camera_start is None
+    assert starts == [("left", True), ("right", True)]
+    assert panel.camera_connected is True
+    assert panel.yolo_enabled is True
+
+    panel._shutdown_coordinator = LifecycleCoordinator([])
+    panel.close()
+    panel.deleteLater()
+    app.processEvents()
+
+def test_camera_start_keeps_healthy_side_when_other_side_start_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from Workstation import standalone_gui
+
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_auto_load_intrinsics", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = standalone_gui.WirisStereoDistancePanel(app_root=tmp_path)
+    panel.left_pane.stop = lambda *, wait=False: True
+    panel.right_pane.stop = lambda *, wait=False: True
+    starts: list[str] = []
+    panel.left_pane.start_stream = lambda _url, **_kwargs: starts.append("left") or True
+    panel.right_pane.start_stream = lambda _url, **_kwargs: starts.append("right") or False
+    retries: list[tuple[bool, bool]] = []
+    monkeypatch.setattr(
+        panel,
+        "_schedule_camera_start_retry",
+        lambda enable_detection, switch_to_depth: retries.append((enable_detection, switch_to_depth)),
+    )
+
+    panel._start_camera_streams(enable_detection=False, switch_to_depth=False)
+
+    assert starts == ["left", "right"]
+    assert retries == []
+    assert panel._pending_camera_start is None
+    assert panel.camera_connected is True
+    assert panel.camera_connection_label.text() == "camera partial: left connected; right unavailable"
+    assert "실패한 카메라만 재활성화" in panel.wiris_log.toPlainText()
+    panel._shutdown_coordinator = LifecycleCoordinator([])
+    panel.close()
+    app.processEvents()
+    panel.deleteLater()
+    app.processEvents()
+
+def test_system_yolo_input_size_applies_to_runtime_owner() -> None:
+    from Workstation.settings_controller import WorkstationSettingsController
+
+    input_size = QtWidgets.QSpinBox()
+    input_size.setRange(160, 1920)
+    input_size.setValue(416)
+    panel = SimpleNamespace(
+        _workstation_setting_overrides={},
+        input_size_spin=input_size,
+        manual_focal_checkbox=QtWidgets.QCheckBox(),
+        _refresh_yolo_device_toggle=lambda: None,
+        _refresh_pixhawk_ethernet_mode_controls=lambda: None,
+        _set_focal_override_enabled=lambda _enabled: None,
+        _refresh_operation_header=lambda: None,
+        _log=lambda _message: None,
+    )
+
+    WorkstationSettingsController(panel).apply_workstation_system_settings(
+        {"yolo_input_size": 960}
+    )
+
+    assert input_size.value() == 960
+    assert panel._workstation_setting_overrides["yolo_input_size"] == 960
+    input_size.deleteLater()
+    panel.manual_focal_checkbox.deleteLater()
+
+def test_wiris_command_catalog_covers_official_workswell_sdk_opcodes() -> None:
+    from Workstation import standalone_gui
+    from Workstation.wiris_sdk_catalog import (
+        WIRIS_COMMAND_CATALOG,
+        WIRIS_SDK_MANUAL_FIRMWARE,
+        WIRIS_SDK_MANUAL_REVISION,
+        WIRIS_SDK_MANUAL_URL,
+    )
+
+    # Workstation only operates WIRIS Enterprise units, so opcodes the manual
+    # documents as exclusive to WIRIS AGRO (5.8, CWSI/crop stress), WIRIS
+    # Security (5.7), GIS 320 (5.11), or AGRO's Colourmap (5.13) are
+    # deliberately absent from the catalog and therefore from this set too.
+    expected_opcodes = set(
+        """
+        ACTV IACT SETH GETH SSDK SDLM GDLM HIWS GSRN GATN GFWV GTCU GTIC GTIN GFPW
+        MOVE GGPS STUT GTUT SRMD GRMD SRMM GRMM SRWC GRWC SREN GREN GREL
+        SLAY STTY SMCA GMCA
+        SGPI GGPI SZIN SZOT SZSM GZSM SZTN GZTV GZTL SZVN GZVV GZVL
+        GPTE SPTE SPTI GPTL GPLV CPTR ICPT RCRS
+        RCRF IRCR SPIC GPIC GGFT SGFT SBFL GBFL SEFL GEFL SCSB GCSB SALM GALM SALV
+        GALV SALC GALC GTEX GROT GOPT CUPD IUPD STEM GTEM STRT GTRT STAT GTAT STII
+        GTII STSC GTSC STCP GTCP GTSL GTSN IMCR SLEN GLEN GLEL SIRJ GIRJ SIRT GIRT
+        SICT GICT SISR GISR SISS GISS SIVI GIVI SIHR GIHR SVTH GVTH SVTE GVTE SVVI
+        GVVI SVHR GVHR SILC GILC SHRR GHRR SLRF GLRF GLRD SDTI GDTI STUS GMST GMSI
+        GMFR GMCP GTRC GVRC GEST CPST CPSS GTRE SEBR GEBR SEGS GEGS SEIR GEIR SEQZ
+        GEQZ STRG GTRG STIP STMS GTMS STGW GTGW SMGW GMGW SDST SHDW REBT
+        """.split()
+    )
+    actual_opcodes = {
+        record[2].split()[0]
+        for record in WIRIS_COMMAND_CATALOG
+        if record[2]
+    }
+
+    assert actual_opcodes == expected_opcodes
+    assert standalone_gui.WIRIS_COMMAND_CATALOG is WIRIS_COMMAND_CATALOG
+    assert WIRIS_SDK_MANUAL_REVISION == "241106EN"
+    assert WIRIS_SDK_MANUAL_FIRMWARE == "2.10.60+"
+    assert WIRIS_SDK_MANUAL_URL.startswith("https://my.workswell.eu/")
+
+def test_advanced_camera_control_displays_wiris_sdk_responses() -> None:
+    from Workstation.status_model import StatusModel
+    from Workstation.workspaces import AdvancedWorkspace
+
+    class ResponseBus(QtCore.QObject):
+        response = QtCore.pyqtSignal(object)
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    bus = ResponseBus()
+    backend.panel.wiris_command_response = bus.response
+    advanced = AdvancedWorkspace(backend, StatusModel())
+    assert "Status" not in {
+        group.title() for group in advanced.findChildren(QtWidgets.QGroupBox)
+    }
+    assert advanced.wiris_command_edit.text() == "HIWS"
+    assert advanced.wiris_status_label.text() == "Connection check"
+
+    bus.response.emit(
+        {
+            "phase": "completed",
+            "target": "both",
+            "command": "HIWS",
+            "status_text": "왼쪽: OK | 오른쪽: 실패: timeout",
+            "target_infos": (
+                ("left", "192.168.0.101", 2240, 1.0),
+                ("right", "192.168.0.102", 2240, 1.0),
+            ),
+            "statuses": {"left": "OK", "right": "실패: timeout"},
+            "command_logs": {
+                "left": "> left 192.168.0.101:2240 HIWS\nOK\n",
+            },
+        }
+    )
+    app.processEvents()
+
+    response_text = advanced.wiris_response_log.toPlainText()
+    assert advanced.wiris_response_log.isReadOnly()
+    assert "target=both command=HIWS" in response_text
+    assert "> left 192.168.0.101:2240 HIWS" in response_text
+    assert "right: 실패: timeout" in response_text
+    assert advanced.wiris_status_label.text() == "왼쪽: OK | 오른쪽: 실패: timeout"
+
+    advanced.wiris_response_clear_button.click()
+    assert advanced.wiris_response_log.toPlainText() == ""
+    advanced.deleteLater()
+    bus.deleteLater()
+    app.processEvents()
+
+def test_advanced_camera_control_sends_through_actual_panel_owner(monkeypatch) -> None:
+    from Workstation import wiris_runtime_workers
+
+    sent: list[tuple[str, int, str]] = []
+
+    def fake_send(command) -> str:
+        sent.append((command.host, command.port, command.command))
+        return "OK"
+
+    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    window = WorkstationMainWindow()
+    try:
+        window._select_context("tasks.advanced")
+        # Any startup/alignment LRF polling belongs to the window lifecycle,
+        # not to this raw WIRIS command assertion.
+        sent.clear()
+        window.advanced.wiris_command_edit.setText("HIWS")
+        window.advanced.wiris_send_button.click()
+        deadline = time.monotonic() + 2.0
+        while window.backend.panel.wiris_command_thread is not None and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(0.01)
+
+        assert window.backend.panel.wiris_command_thread is None
+        response_text = window.advanced.wiris_response_log.toPlainText()
+        assert len(sent) == 2
+        assert {item[2] for item in sent} == {"HIWS"}
+        assert "target=both command=HIWS" in response_text
+        assert response_text.count("OK") == 2
+        assert window.advanced.wiris_status_label.text().count("OK") == 2
+    finally:
+        window.backend.shutdown_for_close()
+        window.deleteLater()
+        app.processEvents()
+
+def test_wiris_controller_publishes_completed_command_payload() -> None:
+    from Workstation.wiris_control_controller import WirisControlController
+
+    class ResponseBus(QtCore.QObject):
+        response = QtCore.pyqtSignal(object)
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    bus = ResponseBus()
+    published: list[dict[str, object]] = []
+    bus.response.connect(published.append)
+    panel = SimpleNamespace(
+        wiris_command_response=bus.response,
+        wiris_command_status_label=QtWidgets.QLabel(),
+        _append_wiris_command_log=lambda _text: None,
+        _camera_name_ko=lambda label: {"left": "왼쪽", "right": "오른쪽"}.get(label, label),
+        _log=lambda _text: None,
+    )
+    controller = WirisControlController(panel)
+
+    controller._apply_wiris_command_result(
+        "both",
+        "HIWS",
+        {
+            "statuses": {"left": "OK", "right": "OK"},
+            "command_logs": {"left": "left OK", "right": "right OK"},
+            "send_times": {"left": 1.0, "right": 1.001},
+            "target_infos": (
+                ("left", "192.168.0.101", 2240, 1.0),
+                ("right", "192.168.0.102", 2240, 1.0),
+            ),
+        },
+    )
+    app.processEvents()
+
+    assert published[-1]["phase"] == "completed"
+    assert published[-1]["target"] == "both"
+    assert published[-1]["command"] == "HIWS"
+    assert published[-1]["statuses"] == {"left": "OK", "right": "OK"}
+    assert "전송 시각 차이 왼쪽→오른쪽: 1.000 ms" in str(published[-1]["status_text"])
+    bus.deleteLater()
+    panel.wiris_command_status_label.deleteLater()
+    app.processEvents()
+
+def test_diagnostics_ftp_tab_surfaces_the_ftp_lifecycle_log() -> None:
+    from Workstation.status_model import StatusModel
+    from Workstation.workspaces import DiagnosticsContent
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    diagnostics = DiagnosticsContent(_FakeBackend(), StatusModel())
+
+    assert diagnostics.tabs.tabText(5) == "FTP"
+    diagnostics.tabs.setCurrentIndex(5)
+    diagnostics.refresh({})
+
+    assert diagnostics.ftp_view.toPlainText() == "[fake] FTP source-backed log"
+    diagnostics.deleteLater()
+    app.processEvents()
+
+def test_standalone_backend_ftp_log_includes_the_current_ftp_status() -> None:
+    from Workstation.standalone_backend import StandalonePanelBackend
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = SimpleNamespace(
+        ftp_log_lines=["[캘리브레이션] WIRIS FTP Capture calib-1 left: ftp_downloaded=True"],
+        calibration_status_label=QtWidgets.QLabel("WIRIS FTP Capture calib-1: 좌/우 저장 완료"),
+    )
+    backend = StandalonePanelBackend(panel)
+
+    text = backend.ftp_diagnostic_text()
+    assert "ftp_downloaded=True" in text
+    assert "[status] WIRIS FTP Capture calib-1: 좌/우 저장 완료" in text
+
+def test_workstation_camera_pane_shutdown_is_cooperative_and_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from Workstation.workstation_core import camera_pane
+    from Workstation.workstation_core.camera_pane import CameraPane
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    pane = CameraPane("left")
+    calls: list[str] = []
+
+    class FakeThread:
+        def __init__(self) -> None:
+            self.running = True
+            self.wait_calls: list[int] = []
+
+        def wait(self, timeout: int) -> bool:
+            self.wait_calls.append(timeout)
+            return not self.running
+
+    thread = FakeThread()
+
+    class FakeWorker:
+        def request_stop(self) -> None:
+            calls.append("request_stop")
+
+        def stop(self) -> None:
+            calls.append("stop")
+            thread.running = False
+
+        def terminate_child_process(self) -> None:
+            calls.append("terminate")
+
+        def kill_child_process(self) -> None:
+            calls.append("kill")
+
+    worker = FakeWorker()
+    pane.worker = worker
+    pane.thread = thread
+
+    assert pane.stop(wait=True) is True
+    assert calls == ["request_stop", "stop"]
+    assert thread.wait_calls == [1500, 1500]
+    assert pane.worker is None
+    assert pane.thread is None
+
+    pane.worker = worker
+    pane.thread = thread
+    thread.running = True
+    calls.clear()
+    assert pane.stop(wait=False) is False
+    assert calls == ["request_stop"]
+    assert pane.worker is worker
+    assert pane.thread is thread
+
+    pane._stop_requested_monotonic_s = 10.0
+    monkeypatch.setattr(camera_pane.time, "monotonic", lambda: 11.6)
+    assert pane.stop(wait=False) is False
+    assert calls[-2:] == ["request_stop", "terminate"]
+    monkeypatch.setattr(camera_pane.time, "monotonic", lambda: 13.1)
+    assert pane.stop(wait=False) is False
+    assert calls[-2:] == ["request_stop", "kill"]
+
+    pane._clear_thread_if_current(1, thread)
+    assert pane.worker is None
+    assert pane.thread is None
+    pane.deleteLater()
+    app.processEvents()

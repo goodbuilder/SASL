@@ -160,6 +160,7 @@ class AnnotationImageView(QtWidgets.QWidget):
     mode_changed = QtCore.pyqtSignal(str)
     hover_changed = QtCore.pyqtSignal(object)
     zoom_changed = QtCore.pyqtSignal(float)
+    suggestion_point_right_clicked = QtCore.pyqtSignal(str, int)
 
     _COLORS = {
         AnnotationMode.HORIZON: QtGui.QColor(theme.WARNING),
@@ -179,7 +180,12 @@ class AnnotationImageView(QtWidgets.QWidget):
         AnnotationMode.TARGET: QtGui.QColor(theme.ACCENT_HOVER),
     }
 
-    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None = None,
+        *,
+        wheel_zoom_requires_control: bool = True,
+    ) -> None:
         super().__init__(parent)
         self.setObjectName("annotationImageView")
         self.setMinimumSize(240, 135)
@@ -211,9 +217,13 @@ class AnnotationImageView(QtWidgets.QWidget):
         self._suggestion_confidences: dict[AnnotationMode, list[float]] = {
             mode: [] for mode in AnnotationMode
         }
+        self._suggestion_polyline_visible: dict[AnnotationMode, bool] = {
+            mode: True for mode in AnnotationMode
+        }
         self._hover_source_pixel: SourcePixel | None = None
         self._zoom_factor = self.MIN_ZOOM_FACTOR
         self._view_center_source: SourcePixel | None = None
+        self._wheel_zoom_requires_control = bool(wheel_zoom_requires_control)
 
     def hasHeightForWidth(self) -> bool:  # noqa: N802 - Qt override.
         """Tell parent layouts that this camera viewport is fixed at 16:9."""
@@ -286,6 +296,12 @@ class AnnotationImageView(QtWidgets.QWidget):
         """Current display magnification; native annotations are unaffected."""
 
         return self._zoom_factor
+
+    @property
+    def wheel_zoom_requires_control(self) -> bool:
+        """Whether wheel zoom is gated behind the Control modifier."""
+
+        return self._wheel_zoom_requires_control
 
     def has_frozen_frame(self) -> bool:
         return self._image is not None and not self._image.isNull()
@@ -457,6 +473,50 @@ class AnnotationImageView(QtWidgets.QWidget):
             self._suggestion_confidences[parsed_mode].clear()
         if changed:
             self.update()
+
+    def set_suggestion_polyline_visible(
+        self,
+        visible: bool,
+        *,
+        mode: AnnotationMode | str,
+    ) -> None:
+        """Control only the line joining automatic points for one mode."""
+
+        parsed_mode = _parse_mode(mode)
+        visible = bool(visible)
+        if self._suggestion_polyline_visible[parsed_mode] == visible:
+            return
+        self._suggestion_polyline_visible[parsed_mode] = visible
+        self.update()
+
+    def suggestion_point_index_at(
+        self,
+        widget_point: QtCore.QPointF | QtCore.QPoint | Sequence[float],
+        *,
+        mode: AnnotationMode | str | None = None,
+        radius_px: float = 10.0,
+    ) -> int | None:
+        """Return the nearest automatic point within a widget-space radius."""
+
+        parsed_mode = self._mode if mode is None else _parse_mode(mode)
+        if isinstance(widget_point, (QtCore.QPointF, QtCore.QPoint)):
+            cursor = QtCore.QPointF(widget_point)
+        else:
+            if len(widget_point) != 2:
+                raise ValueError("a widget point must contain exactly (x, y)")
+            cursor = QtCore.QPointF(float(widget_point[0]), float(widget_point[1]))
+        radius_squared = max(0.0, float(radius_px)) ** 2
+        nearest: tuple[float, int] | None = None
+        for index, point in enumerate(self._suggestion_points[parsed_mode]):
+            if not self._source_contains(point):
+                continue
+            drawn = self.source_pixel_to_widget(point)
+            distance_squared = (drawn.x() - cursor.x()) ** 2 + (drawn.y() - cursor.y()) ** 2
+            if distance_squared <= radius_squared and (
+                nearest is None or distance_squared < nearest[0]
+            ):
+                nearest = (distance_squared, index)
+        return None if nearest is None else nearest[1]
 
     def replace_source_points(
         self,
@@ -672,13 +732,14 @@ class AnnotationImageView(QtWidgets.QWidget):
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:  # noqa: N802 - Qt API.
         """Zoom around the pointer while keeping the pointed native pixel fixed.
 
-        Only Ctrl+wheel zooms. Plain wheel scrolling must fall through to the
-        enclosing QScrollArea (e.g. on the Alignment page) instead of being
-        swallowed here -- otherwise scrolling the page while the cursor
-        happens to sit over a camera preview zoomed the image instead.
+        Views embedded in ordinary scrolling pages require Ctrl by default so
+        plain wheel input reaches the enclosing QScrollArea. Alignment opts
+        into plain-wheel zoom explicitly because its camera previews are the
+        intended wheel interaction target.
         """
 
-        if self._image is None or not (event.modifiers() & QtCore.Qt.ControlModifier):
+        control_pressed = bool(event.modifiers() & QtCore.Qt.ControlModifier)
+        if self._image is None or (self._wheel_zoom_requires_control and not control_pressed):
             super().wheelEvent(event)
             return
         cursor = QtCore.QPointF(event.pos())
@@ -750,9 +811,15 @@ class AnnotationImageView(QtWidgets.QWidget):
                     return
                 event.accept()
                 return
-        elif event.button() == QtCore.Qt.RightButton and self.undo_last_point():
-            event.accept()
-            return
+        elif event.button() == QtCore.Qt.RightButton:
+            suggestion_index = self.suggestion_point_index_at(event.localPos())
+            if suggestion_index is not None:
+                self.suggestion_point_right_clicked.emit(self._mode.value, suggestion_index)
+                event.accept()
+                return
+            if self.undo_last_point():
+                event.accept()
+                return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 - Qt API.
@@ -815,7 +882,11 @@ class AnnotationImageView(QtWidgets.QWidget):
         if not visible:
             return
         base_color = self._SUGGESTION_COLORS[mode]
-        show_polyline = mode in (AnnotationMode.HORIZON, AnnotationMode.RIDGE) and len(visible) >= 2
+        show_polyline = (
+            self._suggestion_polyline_visible[mode]
+            and mode in (AnnotationMode.HORIZON, AnnotationMode.RIDGE)
+            and len(visible) >= 2
+        )
         if show_polyline:
             line_pen = QtGui.QPen(base_color, 2.0)
             line_pen.setCosmetic(True)

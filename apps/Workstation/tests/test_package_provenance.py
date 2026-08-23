@@ -241,15 +241,15 @@ def test_atomic_json_snapshot_has_canonical_bytes_hash_and_no_absolute_path(tmp_
         write_atomic_json_snapshot(session, "../outside.json", {}, role="invalid")
 
 
-def test_active_input_snapshot_is_byte_exact_content_addressed_and_portable(tmp_path: Path) -> None:
-    source = tmp_path / "source" / "active-model.pt"
+def test_active_profile_snapshot_is_byte_exact_content_addressed_and_portable(tmp_path: Path) -> None:
+    source = tmp_path / "source" / "active-intrinsics.json"
     source.parent.mkdir()
-    payload = b"\x00\xffactive-model\nbytes\x00"
+    payload = b'{"schema":"active-intrinsics-test-v1"}\n'
     source.write_bytes(payload)
     session = tmp_path / "session"
 
-    first = snapshot_input_file(source, session, role="active_yolo_model")
-    second = snapshot_input_file(source, session, role="active_yolo_model")
+    first = snapshot_input_file(source, session, role="active_intrinsics_profile")
+    second = snapshot_input_file(source, session, role="active_intrinsics_profile")
     copied = session / str(first["relative_path"])
 
     assert set(first) == ARTIFACT_KEYS

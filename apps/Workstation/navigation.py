@@ -13,11 +13,12 @@ _CONTEXT_ALIASES = {
     "devices.pixhawk.p2": "devices.pixhawk",
     "processing.detection": "devices.cameras",
     "processing.synchronization": "devices.time",
-    # Session details is a local entry point into the canonical
-    # Recording / Sessions workspace, never a hidden navigation context.
-    "tasks.session_details": "tasks.recording",
-    "tasks.playback": "tasks.recording",
-    "tasks.export": "tasks.recording",
+    # Session lifecycle, evidence, and saved review share one visible
+    # workspace.  Legacy recording/review contexts remain valid deep links.
+    "tasks.session_details": "tasks.session",
+    "tasks.recording": "tasks.session",
+    "tasks.playback": "tasks.session",
+    "tasks.export": "tasks.session",
 }
 
 
@@ -70,14 +71,12 @@ class NavigationTree(QtWidgets.QTreeView):
         devices.appendRow(self._item("Time / Sync", "devices.time"))
         root.appendRow(devices)
 
-        # Calibration needs a connected camera to capture checkerboard images
-        # against, so it belongs after Devices, not before it.
+        # One Session owns the calibration, alignment, and repeated
+        # measurements performed during the current experiment run.
+        root.appendRow(self._item("Sessions", "tasks.session"))
         root.appendRow(self._item("Calibration", "tasks.calibration"))
-
         root.appendRow(self._item("Alignment", "processing.alignment"))
-        root.appendRow(self._item("Session", "tasks.session"))
         root.appendRow(self._item("Measurement", "processing.measurement"))
-        root.appendRow(self._item("Recording / Review", "tasks.recording"))
         root.appendRow(self._item("Advanced", "tasks.advanced"))
         root.appendRow(self._item("Settings", "tasks.settings"))
 

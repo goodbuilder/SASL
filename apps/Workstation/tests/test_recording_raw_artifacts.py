@@ -14,6 +14,7 @@ import pyarrow.parquet as pq
 from Workstation.recording_controller import RecordingController
 from Workstation.workstation_core import recording_session, session_parquet
 from Workstation.workstation_core.measurement_widgets import DistanceHistoryPoint
+from Workstation.workstation_core.measurement_methods import MEASUREMENT_METHOD_IDS
 from Workstation.workstation_core.recording_session import (
     SpoolRows,
     load_retryable_session,
@@ -186,7 +187,13 @@ def test_save_publishes_verified_parquet_and_one_session_review_before_discardin
         "px4_left.jsonl",
         "px4_right.jsonl",
         "stereo_measurements.jsonl",
+        "method_evaluation_bundles.jsonl",
+        "method_results",
     }
+    assert {
+        path.name
+        for path in (output_dir / "data" / "raw" / "method_results").iterdir()
+    } == {f"{method_id}.jsonl" for method_id in MEASUREMENT_METHOD_IDS}
     raw_pair_path = output_dir / "data" / "raw" / "stereo_measurements.jsonl"
     raw_pair_rows = [
         json.loads(line)

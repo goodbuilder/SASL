@@ -99,9 +99,11 @@ capture, FTP, and EXIF comparison remain Legacy-only.
 
 ## 15. Session and Measurement Workspaces
 
-Session is the top-level daily-work surface. It owns `Open Session`, `New Measurement`,
-`Seal Measurement`, and `Close Session`, shows the stable parent and ordered `mNNNNNN` children,
-and keeps lifecycle separate from the derived Evidence collection/Valid measurement readiness.
+Sessions is the top-level field-work surface. `Current` owns `Create Session Folder` and
+`Close Session` and shows the stable parent plus ordered `mNNNNNN` children. Measurement owns one
+`측정 시작`/`측정 종료` control: start creates the next child when needed and begins Detection;
+stop uses the automatic save/seal path. Lifecycle remains separate from the derived Evidence
+collection/Valid measurement readiness.
 The readiness table shows blockers only. Its compact method table always lists all eight categories;
 the selected-method detail shows actual rotation/translation inputs and preserves their PX4, GNSS
 NED, candidate virtual-FRD/NED, or OpenCV RDF contracts. The current next action is the only
@@ -135,13 +137,13 @@ stack vertically otherwise. Below them, promoted `Horizon`, `Mountain + GNSS`, `
 `Drone Rotation`, `Drone Multi-view`, `References`, and `Combine` tabs replace the former nested
 `R,t methods` structure. Candidate residuals/side-specific observability and immutable Apply/Revert
 remain in one common review area: right of the tabs at widths of at least 1200 px and below them on
-narrower screens. Measurement has a ready-only method selector; Settings owns the drag-reordered
-fallback priority. Alignment is not a second calibration owner.
+narrower screens. Overview shows eight read-only method cards and Measurement shows all frozen/live
+method details; Pixhawk/RTK remains the fixed representative. Alignment is not a second calibration owner.
 The Alignment evidence keeps raw RTK NED `[N,E,D]` and the separate P1 body-FRD
 `[F,R,D]` projection in adjacent groups so the operator can use the intuitive P1
 orientation without confusing it with camera optical RDF or public measurement output.
-Recording keeps Run setup (including Drone/UAM mode and camera identity), HR purpose/import
-events, and a PX4 ULog evidence table. Saved review uses a composite session/measurement key so
+Sessions keeps Target reference connectivity, HR purpose/import events, and a PX4 ULog evidence
+table. Saved review uses a composite session/measurement key so
 siblings remain independently selectable. UAM target telemetry is shown as deferred rather
 than erroneous; target Drone data is a separate receive-only source and never replaces P1/P2
 attitude, GNSS baseline, or nominal stereo geometry.

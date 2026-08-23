@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import hashlib
 import math
@@ -187,6 +188,8 @@ def _panel(tmp_path: Path):
         left_stabilization_state="disabled",
         right_stabilization_state="disabled",
         profile_id="exact-8x",
+        source_path=panel._active_intrinsics_profile_path,
+        source_content_sha256=panel._active_intrinsics_profile_hash,
         provenance={"test": "explicit exact operating K,D"},
     )
     panel._recording_session_dir = lambda session_id: tmp_path / session_id
@@ -202,6 +205,40 @@ def _panel(tmp_path: Path):
     panel.ensure_workstation_run_evidence = ensure
     panel.append_workstation_run_event = append
     return panel
+
+
+def _active_geometry_state(panel: object, controller: OpticalPoseController) -> dict[str, object]:
+    names = (
+        "selected_extrinsics_profile",
+        "active_extrinsics_profile",
+        "optical_pose_extrinsics_profile",
+        "active_intrinsics",
+        "_selected_extrinsics_profile_path",
+        "_selected_extrinsics_profile_hash",
+        "_active_extrinsics_profile_path",
+        "_active_extrinsics_profile_hash",
+        "_active_extrinsics_source_zoom_level",
+        "_active_calibration_selection_mode",
+        "_active_optical_pose_profile_hash",
+        "_active_optical_pose_selection_id",
+        "_active_optical_pose_effective_from_pair_sequence",
+        "_active_alignment_snapshot_path",
+        "_active_alignment_snapshot_sha256",
+        "_last_measurement_attempt_key",
+        "_last_measurement_attempt",
+        "_last_distance_history_key",
+    )
+    return copy.deepcopy(
+        {
+            "panel": {
+                name: (hasattr(panel, name), getattr(panel, name, None))
+                for name in names
+            },
+            "active_selection": controller._active_selection,
+            "active_poses": controller._active_poses,
+            "selection_history": tuple(controller._selection_history),
+        }
+    )
 
 
 def _annotations(snapshot: dict[str, object], *, horizon: bool = True):
@@ -225,7 +262,7 @@ def _annotations(snapshot: dict[str, object], *, horizon: bool = True):
     return result
 
 
-def test_horizon_candidate_becomes_measurement_ready_with_live_pixhawk_and_gnss_fill(
+def test_horizon_candidate_is_blocked_until_explicit_apply(
     tmp_path: Path,
 ) -> None:
     panel = _panel(tmp_path)
@@ -277,11 +314,24 @@ def test_horizon_candidate_becomes_measurement_ready_with_live_pixhawk_and_gnss_
         if row.method_id == HORIZON_HYBRID
     )
 
+    assert status.ready is False
+    assert "optical pose candidate not applied" in status.reasons
+    applied = pose.apply_workstation_optical_pose_candidate(
+        {
+            "candidate_id": status.candidate_id,
+            "dof": {"roll": True, "pitch": True},
+        }
+    )
+    status = next(
+        row
+        for row in measurement._measurement_method_statuses()
+        if row.profile_id == applied["selection_id"]
+    )
     assert status.ready is True
-    sources = dict(status.component_sources)
-    assert sources["left.roll_deg"].startswith("candidate:horizon-")
-    assert sources["left.yaw_deg"] == "live_pixhawk"
-    assert sources["right.north_m"] == "live_gnss"
+    assert all(
+        source.startswith("profile:")
+        for source in dict(status.component_sources).values()
+    )
     left_gps = GpsSnapshot.from_state(_gps_state("left", timestamp_s=now))
     right_gps = GpsSnapshot.from_state(
         _gps_state("right", timestamp_s=now, longitude_deg=127.987676321)
@@ -308,6 +358,107 @@ def test_horizon_candidate_becomes_measurement_ready_with_live_pixhawk_and_gnss_
     )
     assert repeated is not None
     assert repeated.extrinsics == result.extrinsics
+
+
+def test_optical_apply_missing_active_intrinsics_preserves_every_active_field(
+    tmp_path: Path,
+) -> None:
+    panel = _panel(tmp_path)
+    controller = OpticalPoseController(panel)
+    frozen = controller.capture_workstation_optical_pose_burst({})
+    solved = controller.solve_workstation_optical_pose_horizon(
+        {"annotations": _annotations(frozen)}
+    )
+    candidate_id = solved["candidates"][-1]["candidate_id"]
+    panel.active_intrinsics = None
+    panel._last_measurement_attempt_key = ("old",)
+    panel._last_measurement_attempt = {"state": "old"}
+    panel._last_distance_history_key = ("old-distance",)
+    before = _active_geometry_state(panel, controller)
+
+    with pytest.raises(RuntimeError, match="active exact K,D is required"):
+        controller.apply_workstation_optical_pose_candidate(
+            {
+                "candidate_id": candidate_id,
+                "dof": {"roll": True, "pitch": True},
+            }
+        )
+
+    assert _active_geometry_state(panel, controller) == before
+    assert candidate_id in controller._candidates
+    assert controller._profile_restore_stack == []
+
+
+def test_optical_apply_persistence_failure_rolls_back_complete_active_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    panel = _panel(tmp_path)
+    controller = OpticalPoseController(panel)
+    frozen = controller.capture_workstation_optical_pose_burst({})
+    solved = controller.solve_workstation_optical_pose_horizon(
+        {"annotations": _annotations(frozen)}
+    )
+    candidate_id = solved["candidates"][-1]["candidate_id"]
+    panel._last_measurement_attempt_key = ("old",)
+    panel._last_measurement_attempt = {"state": "old"}
+    panel._last_distance_history_key = ("old-distance",)
+    before = _active_geometry_state(panel, controller)
+    monkeypatch.setattr(
+        controller,
+        "_persist_session_alignment_snapshot",
+        lambda: (_ for _ in ()).throw(OSError("forced alignment persistence failure")),
+    )
+
+    with pytest.raises(OSError, match="forced alignment persistence failure"):
+        controller.apply_workstation_optical_pose_candidate(
+            {
+                "candidate_id": candidate_id,
+                "dof": {"roll": True, "pitch": True},
+            }
+        )
+
+    assert _active_geometry_state(panel, controller) == before
+    assert candidate_id in controller._candidates
+    assert controller._profile_restore_stack == []
+
+
+def test_optical_apply_changed_kd_identity_preserves_previous_active_state(
+    tmp_path: Path,
+) -> None:
+    panel = _panel(tmp_path)
+    controller = OpticalPoseController(panel)
+    frozen = controller.capture_workstation_optical_pose_burst({})
+    solved = controller.solve_workstation_optical_pose_horizon(
+        {"annotations": _annotations(frozen)}
+    )
+    candidate_id = solved["candidates"][-1]["candidate_id"]
+    panel._active_intrinsics_profile_path = "calibration/changed-zoom-08.json"
+    panel._active_intrinsics_profile_hash = "b" * 64
+    panel.operating_intrinsics_profile = OperatingIntrinsicsProfile.from_stereo_result(
+        panel.active_intrinsics,
+        source_zoom_index=8,
+        left_camera_serial="SERIAL-LEFT",
+        right_camera_serial="SERIAL-RIGHT",
+        left_stabilization_state="disabled",
+        right_stabilization_state="disabled",
+        profile_id="changed-exact-8x",
+        source_path=panel._active_intrinsics_profile_path,
+        source_content_sha256=panel._active_intrinsics_profile_hash,
+    )
+    before = _active_geometry_state(panel, controller)
+
+    with pytest.raises(RuntimeError, match="operating K,D changed"):
+        controller.apply_workstation_optical_pose_candidate(
+            {
+                "candidate_id": candidate_id,
+                "dof": {"roll": True, "pitch": True},
+            }
+        )
+
+    assert _active_geometry_state(panel, controller) == before
+    assert candidate_id in controller._candidates
+    assert controller._profile_restore_stack == []
 
 
 def test_capture_horizon_and_apply_create_next_pair_immutable_profile(tmp_path: Path) -> None:
@@ -345,6 +496,19 @@ def test_capture_horizon_and_apply_create_next_pair_immutable_profile(tmp_path: 
     assert panel.selected_extrinsics_profile is not base_profile
     assert base_profile.profile_id == "base-1x"
     assert panel.selected_extrinsics_profile.profile_id == applied["selection_id"]
+    assert panel.active_extrinsics_profile is panel.selected_extrinsics_profile
+    assert panel.optical_pose_extrinsics_profile is panel.selected_extrinsics_profile
+    assert panel._active_extrinsics_profile_path == (
+        f"memory:{applied['selection_id']}"
+    )
+    assert panel._active_extrinsics_profile_hash == (
+        panel.selected_extrinsics_profile.content_sha256
+    )
+    assert panel._active_optical_pose_profile_hash == (
+        panel.selected_extrinsics_profile.content_sha256
+    )
+    assert panel._active_optical_pose_selection_id == applied["selection_id"]
+    assert controller._active_selection.selection_id == applied["selection_id"]
     assert panel.active_intrinsics.extrinsics.translation_left_to_right_m == pytest.approx(
         [-25.0, 0.0, 0.0], abs=1e-9
     )

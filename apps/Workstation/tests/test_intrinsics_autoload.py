@@ -12,6 +12,7 @@ from Workstation.workstation_core.calibration import (
     CheckerboardConfig,
     StereoIntrinsicsResult,
     intrinsics_content_sha256,
+    load_intrinsics_json,
     save_intrinsics_json,
 )
 from Workstation.workstation_core.settings import AppSettings, load_settings, save_settings
@@ -115,8 +116,10 @@ def test_auto_load_prefers_exact_external_intrinsics_path(autoload_panel_factory
 
     assert panel.active_intrinsics == expected
     assert panel.last_calibration_zoom_level == 4
-    assert panel._active_intrinsics_profile_path == str(exact_path)
-    assert str(exact_path) in panel.zoom_intrinsics_path_label.text()
+    immutable = Path(panel._active_intrinsics_profile_path)
+    assert immutable.parent == storage_root / "profiles" / "intrinsics"
+    assert load_intrinsics_json(immutable) == expected
+    assert str(immutable) in panel.zoom_intrinsics_path_label.text()
     assert intrinsics_content_sha256(panel.active_intrinsics) == intrinsics_content_sha256(expected)
 
 
@@ -197,8 +200,10 @@ def test_auto_load_falls_back_from_missing_storage_alias_to_exact_zoom_file(
     auto_load()
 
     assert panel.active_intrinsics == expected
-    assert panel._active_intrinsics_profile_path == str(storage_profile)
-    assert str(storage_profile) in panel.zoom_intrinsics_path_label.text()
+    immutable = Path(panel._active_intrinsics_profile_path)
+    assert immutable.parent == storage_root / "profiles" / "intrinsics"
+    assert load_intrinsics_json(immutable) == expected
+    assert str(immutable) in panel.zoom_intrinsics_path_label.text()
 
 
 def test_auto_load_rejects_malformed_exact_profile_without_storage_fallback(
@@ -303,6 +308,9 @@ def test_manually_selected_external_profile_is_auto_loaded_after_restart(
         app_root=app_root,
         settings_path=settings_path,
     )
+    first._measurement_session_state = "OPEN"
+    first._measurement_session_id = "20260822_160000_000000001"
+    first.recording_session_id = first._measurement_session_id
     second = None
     try:
         first.load_intrinsics()
@@ -319,8 +327,10 @@ def test_manually_selected_external_profile_is_auto_loaded_after_restart(
         original_auto_load(second)
 
         assert second.active_intrinsics == expected
-        assert second._active_intrinsics_profile_path == str(imported_path)
-        assert str(imported_path) in second.zoom_intrinsics_path_label.text()
+        immutable = Path(second._active_intrinsics_profile_path)
+        assert immutable.parent == storage_root / "profiles" / "intrinsics"
+        assert load_intrinsics_json(immutable) == expected
+        assert str(immutable) in second.zoom_intrinsics_path_label.text()
     finally:
         for panel in (first, second):
             if panel is None:
@@ -357,7 +367,9 @@ def test_saving_new_calibration_replaces_previous_persisted_exact_profile(
 
     zoom_output = storage_root / "intrinsics_zoom_04.json"
     assert zoom_output.is_file()
-    assert load_settings(panel.settings_path).intrinsics_path == "calibration/intrinsics_zoom_04.json"
+    persisted = load_settings(panel.settings_path).intrinsics_path
+    assert persisted.startswith("calibration/profiles/intrinsics/intrinsics-")
+    assert persisted.endswith(".json")
 
     panel.last_calibration_result = None
     panel.last_calibration_zoom_level = None
@@ -366,7 +378,9 @@ def test_saving_new_calibration_replaces_previous_persisted_exact_profile(
     auto_load()
 
     assert panel.active_intrinsics is not None
-    assert panel._active_intrinsics_profile_path == str(zoom_output)
+    assert panel._active_intrinsics_profile_path == str(
+        panel.app_root / load_settings(panel.settings_path).intrinsics_path
+    )
 
 
 def test_save_intrinsics_rejects_external_calibration_root_without_writing(
@@ -388,6 +402,40 @@ def test_save_intrinsics_rejects_external_calibration_root_without_writing(
 
     assert not external_root.exists()
     assert "outside the portable data root" in panel.calibration_status_label.text()
+
+
+def test_save_intrinsics_keeps_active_matrix_and_provenance_until_apply(
+    autoload_panel_factory,
+    tmp_path: Path,
+) -> None:
+    panel, _auto_load = autoload_panel_factory(
+        AppSettings(
+            calibration_root="calibration",
+            calibration_validation_root="calibration",
+            calibration_zoom_level=4,
+        )
+    )
+    previous = _intrinsics_result(focal_px=800.0)
+    previous_path = tmp_path / "active-intrinsics.json"
+    _save_profile(previous_path, previous, zoom_level=4)
+    previous_hash = intrinsics_content_sha256(previous)
+    panel.active_intrinsics = previous
+    panel._active_intrinsics_profile_path = str(previous_path)
+    panel._active_intrinsics_profile_hash = previous_hash
+    panel._active_intrinsics_source_zoom_level = 4
+    panel.last_calibration_result = _intrinsics_result(focal_px=1500.0)
+    panel.last_calibration_zoom_level = 4
+
+    panel.save_intrinsics()
+
+    assert panel.active_intrinsics == previous
+    assert panel._active_intrinsics_profile_path == str(previous_path)
+    assert panel._active_intrinsics_profile_hash == previous_hash
+    assert panel._active_intrinsics_source_zoom_level == 4
+    candidate_path = Path(panel._candidate_intrinsics_profile_path)
+    assert candidate_path.is_file()
+    assert candidate_path != previous_path
+    assert load_intrinsics_json(candidate_path) == panel.last_calibration_result
 
 
 def test_auto_load_restores_previous_runtime_state_when_apply_gate_rejects(
@@ -414,6 +462,7 @@ def test_auto_load_restores_previous_runtime_state_when_apply_gate_rejects(
     panel.active_intrinsics = previous
     panel._active_intrinsics_profile_path = str(previous_path)
     panel._active_intrinsics_profile_hash = intrinsics_content_sha256(previous)
+    panel._candidate_intrinsics_profile_path = "memory:previous-candidate"
     monkeypatch.setattr(panel, "apply_intrinsics_to_distance", lambda: False)
 
     auto_load()
@@ -423,6 +472,7 @@ def test_auto_load_restores_previous_runtime_state_when_apply_gate_rejects(
     assert panel.active_intrinsics == previous
     assert panel._active_intrinsics_profile_path == str(previous_path)
     assert panel._active_intrinsics_profile_hash == intrinsics_content_sha256(previous)
+    assert panel._candidate_intrinsics_profile_path == "memory:previous-candidate"
 
 
 def test_auto_load_contains_unexpected_profile_resolution_exception(

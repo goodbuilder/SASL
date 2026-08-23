@@ -9,6 +9,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from Workstation.workstation_core.measurement_methods import MEASUREMENT_METHOD_IDS
+
 
 ROLE_SOURCES = {
     "raw/stereo_measurements": (
@@ -71,7 +73,21 @@ ROLE_SOURCES = {
         None,
         None,
     ),
+    "raw/method_evaluation_bundles": (
+        "method_evaluation_bundles",
+        None,
+        None,
+        None,
+    ),
 }
+
+for _method_id in MEASUREMENT_METHOD_IDS:
+    ROLE_SOURCES[f"raw/method_results/{_method_id}"] = (
+        f"method_result_{_method_id}",
+        None,
+        None,
+        None,
+    )
 
 LEGACY_PARQUET_SUFFIXES = {
     "raw/stereo_measurements": (

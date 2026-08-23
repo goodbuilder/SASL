@@ -53,6 +53,7 @@ def test_horizon_disables_yaw_and_manual_mountain_restores_it() -> None:
     # The automatic actions remain available for both manual annotation modes.
     assert pane.solver_buttons["alignment.pose.solve_horizon"].text() == "Solve Horizon Roll/Pitch"
     assert pane.solver_buttons["alignment.pose.solve_gnss_mountain"].text() == "Solve GNSS + Mountain R,t"
+    assert pane.mountain_hide_auto_lines_checkbox.isChecked()
     assert pane.capture_frozen_burst_button.text() == "Capture Live Pair"
     assert pane.annotation_clear_button.text() == "Clear"
     assert pane.import_frozen_burst_button.text() == "Import Pair"
@@ -124,6 +125,51 @@ def test_horizon_disables_yaw_and_manual_mountain_restores_it() -> None:
         "down": True,
     }
 
+    pane.deleteLater()
+    app.processEvents()
+
+
+def test_mountain_auto_point_exclusion_is_paired_and_sent_for_acceptance() -> None:
+    app = _app()
+    pane = OpticalPosePane()
+    image = QtGui.QImage(640, 480, QtGui.QImage.Format_RGB888)
+    image.fill(QtGui.QColor("#333333"))
+    for side in ("left", "right"):
+        pane.annotation_views[side].load_frozen_native_frame(
+            image,
+            frame_id=f"{side}-frame",
+            image_sha256=("1" if side == "left" else "2") * 64,
+        )
+        pane.annotation_views[side].set_mode("ridge")
+    suggestion = {
+        "suggestion_id": "mountain-1",
+        "mode": "mountain",
+        "state": "GOOD",
+        "eligible": True,
+        "sides": {
+            side: {
+                "points": [(10.0, 20.0), (30.0, 40.0), (50.0, 60.0), (70.0, 80.0), (90.0, 100.0)],
+                "point_confidences": [0.9, 0.8, 0.7, 0.6, 0.5],
+            }
+            for side in ("left", "right")
+        },
+    }
+    pane.set_auto_suggestions([suggestion])
+
+    pane._on_suggestion_point_right_clicked("left", "ridge", 1)
+
+    expected = tuple(
+        SourcePixel(*point)
+        for point in ((10.0, 20.0), (50.0, 60.0), (70.0, 80.0), (90.0, 100.0))
+    )
+    assert pane.annotation_views["left"].suggestion_points("ridge") == expected
+    assert pane.annotation_views["right"].suggestion_points("ridge") == expected
+    assert pane.command_payload("alignment.pose.use_suggestion")["excluded_point_indices"] == [1]
+    assert "excluded pairs 1" in pane.auto_suggestion_metrics_label.text()
+
+    # A periodic owner snapshot must not restore the operator-excluded pair.
+    pane.set_auto_suggestions([suggestion])
+    assert pane.annotation_views["left"].suggestion_points("ridge") == expected
     pane.deleteLater()
     app.processEvents()
 
@@ -400,6 +446,10 @@ def test_alignment_isolates_optical_pose_page_and_preserves_physical_index() -> 
     assert not hasattr(workspace, "lrf_indicators")
     assert workspace.findChild(QtWidgets.QGroupBox, "alignmentDevicePrerequisites") is None
     assert workspace.optical_pose_pane.method_tabs.count() == 7
+    assert all(
+        view.wheel_zoom_requires_control is False
+        for view in workspace.optical_pose_pane.annotation_views.values()
+    )
     workspace.select_tab_for_context("processing.alignment")
     assert workspace.operation_tabs.currentIndex() == 0
 

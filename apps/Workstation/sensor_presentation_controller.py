@@ -139,6 +139,12 @@ class SensorPresentationController:
         self.panel.latest_gps[camera] = gps
         if camera in {"left", "right"}:
             self.panel.gnss_monitor.update_position(camera, gps)
+        elif camera.endswith("_GPS2"):
+            # Keep the secondary receiver under its explicit side/source key
+            # so GNSSMonitor can honor a P1/P2 GPS2 selection.
+            side = camera.split("_", 1)[0]
+            if side in {"left", "right"}:
+                self.panel.gnss_monitor.update_position(camera, gps)
         if hasattr(self.panel, "baseline_gps_rate_history") and camera in self.panel.baseline_gps_rate_history:
             self.panel.baseline_gps_rate_history[camera].append(time.monotonic())
         raw = gps.raw
@@ -206,7 +212,9 @@ class SensorPresentationController:
         if gps.satellites_used is not None:
             accuracy_text.append(f"sats={gps.satellites_used}")
         if gps.eph_m is not None:
-            accuracy_text.append(f"eph={gps.eph_m:.2f}m")
+            accuracy_text.append(f"Hacc={gps.eph_m:.2f}m")
+        if gps.epv_m is not None:
+            accuracy_text.append(f"Vacc={gps.epv_m:.2f}m")
         if gps.heading_deg is not None:
             accuracy_text.append(f"gpsYaw={gps.heading_deg:.2f}°")
         extra = " ".join(accuracy_text)
@@ -473,7 +481,7 @@ class SensorPresentationController:
         if gps1.satellites_used is not None and gps2.satellites_used is not None:
             details.append(f"Δsats={abs(gps1.satellites_used - gps2.satellites_used)}")
         if gps1.eph_m is not None and gps2.eph_m is not None:
-            details.append(f"Δeph={abs(gps1.eph_m - gps2.eph_m):.2f}m")
+            details.append(f"ΔHacc={abs(gps1.eph_m - gps2.eph_m):.2f}m")
         details.append(f"skew={abs(gps1.timestamp_s - gps2.timestamp_s) * 1000.0:.0f}ms")
         details.append(f"src={self.panel._telemetry_source_label(gps1.topic)} / {self.panel._telemetry_source_label(gps2.topic)}")
         poor_fix = (gps1.fix_type is not None and gps1.fix_type < 3) or (
@@ -573,7 +581,7 @@ class SensorPresentationController:
 
     def _gps_position_summary_text(self, gps: GpsPositionState, *, age_ms: float) -> str:
         sats = f"sats={gps.satellites_used}" if gps.satellites_used is not None else "sats=waiting"
-        eph = f" | eph={gps.eph_m:.2f}m" if gps.eph_m is not None else ""
+        eph = f" | Hacc={gps.eph_m:.2f}m" if gps.eph_m is not None else ""
         return f"{sats}{eph} | age={age_ms:.0f}ms"
 
     def _gps_fix_level(self, fix_type: int | None, *, age_ms: float | None = None) -> str:
@@ -605,12 +613,12 @@ class SensorPresentationController:
             if getattr(state, "satellites_used", None) is not None
             else "sats=waiting"
         )
-        eph = f" | eph={getattr(state, 'eph_m'):.2f}m" if getattr(state, "eph_m", None) is not None else ""
+        eph = f" | Hacc={getattr(state, 'eph_m'):.2f}m" if getattr(state, "eph_m", None) is not None else ""
         epv = ""
         device = ""
         px4_time = ""
         if include_detail:
-            epv = f" | epv={getattr(state, 'epv_m'):.2f}m" if getattr(state, "epv_m", None) is not None else ""
+            epv = f" | Vacc={getattr(state, 'epv_m'):.2f}m" if getattr(state, "epv_m", None) is not None else ""
             device = f" | device={getattr(state, 'device_id')}" if getattr(state, "device_id", None) is not None else ""
             px4_time = (
                 f" | px4_t={getattr(state, 'px4_timestamp_s'):.3f}s"

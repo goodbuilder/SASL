@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PyQt5 import QtCore
@@ -152,3 +153,31 @@ def test_real_save_worker_failure_preserves_spool_and_sets_retry(
     assert panel._session_save_last_error == "injected persistence failure"
     assert spool.spool_path.read_bytes() == before
     assert "injected persistence failure" in panel.recording_status_label.text
+
+
+def test_recording_stop_waits_for_method_bundle_barrier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduled: list[tuple[int, object]] = []
+    monkeypatch.setattr(
+        QtCore.QTimer,
+        "singleShot",
+        lambda delay_ms, callback: scheduled.append((delay_ms, callback)),
+    )
+    owner = SimpleNamespace(method_evaluation_pending_count=lambda: 2)
+    panel = SimpleNamespace(
+        _camera_photo_capture_active=lambda: False,
+        _measurement_view_controller_owner=owner,
+        _method_evaluation_accepting=True,
+        _method_evaluation_stop_retry_scheduled=False,
+        recording_status_label=_WidgetState(),
+        distance_recording_enabled=True,
+    )
+
+    RecordingController(panel)._stop_session_recording(restart_streams=False)
+
+    assert panel.distance_recording_enabled is True
+    assert panel._method_evaluation_accepting is False
+    assert panel._method_evaluation_stop_retry_scheduled is True
+    assert "barrier" in panel.recording_status_label.text
+    assert scheduled and scheduled[0][0] == 100

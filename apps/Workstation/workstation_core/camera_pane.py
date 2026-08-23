@@ -334,6 +334,13 @@ class CameraPane(QtWidgets.QGroupBox):
         self._refresh_pixmap()
         super().resizeEvent(event)
 
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt override.
+        super().showEvent(event)
+        # Hidden panes still retain the latest QImage and publish frame
+        # evidence, but they deliberately skip QPixmap conversion/scaling.
+        # Render that latest frame once when the pane becomes observable.
+        self._refresh_pixmap()
+
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override.
         if not self.stop(wait=False):
             event.ignore()
@@ -689,7 +696,7 @@ class CameraPane(QtWidgets.QGroupBox):
         return key, image
 
     def _refresh_pixmap(self) -> None:
-        if self.latest_image is None:
+        if self.latest_image is None or not self.isVisible():
             return
         target_size = self.image_label.size()
         source_pixmap = QtGui.QPixmap.fromImage(self.latest_image)

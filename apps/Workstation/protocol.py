@@ -19,8 +19,6 @@ BACKEND_FACADE_METHODS = (
     "toggle_detection",
     "toggle_recording",
     "save_session",
-    "apply_run_setup",
-    "run_setup_snapshot",
     "begin_measurement_session",
     "measurement_session_snapshot",
     "measurement_package_snapshot",

@@ -70,6 +70,18 @@ Stateful commands have expected postconditions. Failure feedback should identify
 
 Save must have defined scope. Inspector values may be immediate, deferred-with-Apply/Revert, or read-only; avoid inconsistent mixtures.
 
+Calibration evidence preservation and runtime promotion are separate commands. A quality
+`WARNING` or `FAIL` calculation may be saved under the calibration `attempts/` evidence path, but
+that save never updates the active alias, persisted settings, or Measurement geometry. `WARNING`
+still requires explicit confirmation before Apply; `FAIL` cannot be applied. Structural validation
+of K,D/R,t and exact operating-profile applicability remain hard Apply gates.
+
+`측정 시작` creates a child when none is prepared and then starts Detection. Child creation is
+lifecycle-gated, not geometry-gated: it requires an open parent and no mutable prior child/producer,
+but does not require Alignment, exact K,D, GNSS, or a ready method. A Pre HR/OZ request may create
+the same draft first. Missing geometry blocks valid MeasurementAttempt creation while matched raw
+evidence is retained as a blocked pair.
+
 ## 14. Detection / Recording / Calibration Separation
 
 - Detection enable/disable → Command

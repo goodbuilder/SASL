@@ -5,7 +5,7 @@ from PyQt5 import QtCore, QtWidgets
 from Workstation.navigation import NavigationTree
 
 
-def test_navigation_exposes_protocol_and_recording_as_canonical_workspaces() -> None:
+def test_navigation_exposes_one_canonical_sessions_workspace() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     tree = NavigationTree()
     root = tree.model.item(0, 0)
@@ -14,11 +14,10 @@ def test_navigation_exposes_protocol_and_recording_as_canonical_workspaces() -> 
         "Overview",
         "Protocol",
         "Devices",
+        "Sessions",
         "Calibration",
         "Alignment",
-        "Session",
         "Measurement",
-        "Recording / Review",
         "Advanced",
         "Settings",
         "Diagnostics",
@@ -33,7 +32,7 @@ def test_navigation_exposes_protocol_and_recording_as_canonical_workspaces() -> 
     ]
     assert all(devices.child(row).rowCount() == 0 for row in range(devices.rowCount()))
 
-    diagnostics = root.child(10)
+    diagnostics = root.child(9)
     assert [diagnostics.child(row).text() for row in range(diagnostics.rowCount())] == [
         "System",
         "Camera",
@@ -51,10 +50,10 @@ def test_navigation_exposes_protocol_and_recording_as_canonical_workspaces() -> 
         "devices.pixhawk.p1": "devices.pixhawk",
         "processing.detection": "devices.cameras",
         "processing.synchronization": "devices.time",
-        "tasks.session_details": "tasks.recording",
-        "tasks.recording": "tasks.recording",
-        "tasks.playback": "tasks.recording",
-        "tasks.export": "tasks.recording",
+        "tasks.session_details": "tasks.session",
+        "tasks.recording": "tasks.session",
+        "tasks.playback": "tasks.session",
+        "tasks.export": "tasks.session",
         "processing.experiment": "processing.experiment",
     }.items():
         assert tree.select_context(legacy_id)

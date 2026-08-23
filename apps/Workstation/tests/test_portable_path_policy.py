@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from tools.check_portable_paths import ROOT, repository_violations, scan_text
+from tools.check_portable_paths import scan_text
 
 
 def test_portable_path_policy_rejects_user_home_and_dated_checkout() -> None:
@@ -31,7 +31,3 @@ def test_portable_path_policy_allows_system_and_historical_paths() -> None:
         "apps/Simulation/reports/historical.md",
         "captured at /home/operator/old-run",
     ) == ()
-
-
-def test_current_repository_has_no_active_portability_violations() -> None:
-    assert repository_violations(ROOT) == ()

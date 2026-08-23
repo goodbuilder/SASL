@@ -167,9 +167,17 @@ def test_pnp_worker_enables_hr_and_captures_both_cameras(monkeypatch) -> None:
     assert len(completed) == 1
     assert completed[0]["capture_id"] == "hr-001"
     assert completed[0]["ftp_downloaded"] is False
+    assert completed[0]["pair_time_basis"] == "host-cptr-dispatch-monotonic"
+    assert completed[0]["pair_request_delta_s"] is not None
+    assert completed[0]["camera_exposure_timestamp_known"] is False
     cameras = completed[0]["cameras"]
     assert cameras["left"]["stored_on_camera"] is True
     assert cameras["right"]["stored_on_camera"] is True
+    assert all(
+        item["capture_pairing_contract"]
+        == "same_capture_id_and_synchronized_cptr_dispatch_v1"
+        for item in cameras.values()
+    )
     for host in ("10.0.0.1", "10.0.0.2"):
         assert (host, "SIHR TRUE") in calls
         assert (host, "CPTR") in calls

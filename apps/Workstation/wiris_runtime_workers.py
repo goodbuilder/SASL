@@ -59,6 +59,9 @@ from Workstation.workstation_core.yolo_stream import (
 RTSP_ENABLE_SETTLE_DELAY_MS = 4000
 RTSP_ENABLE_PORT_WAIT_INTERVAL_MS = 1000
 RTSP_ENABLE_PORT_WAIT_MAX_ATTEMPTS = 12
+ENCODER_PROFILE_COMMAND_SETTLE_MS = 250
+ENCODER_PROFILE_READBACK_RETRY_INTERVAL_MS = 1000
+ENCODER_PROFILE_READBACK_MAX_ATTEMPTS = 30
 WIRIS_STUS_RTT_PROBE_COMMAND = "HIWS"
 WIRIS_STUS_RTT_PROBE_COUNT = 3
 WIRIS_STUS_MAX_VALID_RTT_S = 0.250
@@ -491,6 +494,7 @@ class WirisRtspEnableWorker(QtCore.QObject):
         timeout_s: float,
         target_labels: Sequence[str] = ("left", "right"),
         reactivate: bool = False,
+        visible_encoder_profile: dict[str, int] | None = None,
     ) -> None:
         super().__init__()
         self.hosts = hosts
@@ -499,6 +503,7 @@ class WirisRtspEnableWorker(QtCore.QObject):
         self.timeout_s = timeout_s
         self.target_labels = tuple(label for label in target_labels if label in {"left", "right"})
         self.reactivate = bool(reactivate)
+        self.visible_encoder_profile = dict(visible_encoder_profile or {})
 
     @QtCore.pyqtSlot()
     def run(self) -> None:
@@ -538,32 +543,49 @@ class WirisRtspEnableWorker(QtCore.QObject):
                     f"[카메라] {camera_name} Telnet port 자동 보정: "
                     f"{corrected} -> {port} ({GET_ETHERNET_MODE_COMMAND}={before})"
                 )
-            try:
-                set_command = build_wiris_command(
-                    host=host,
-                    port=port,
-                    command=SET_ETHERNET_MODE_COMMAND,
-                    timeout_s=self.timeout_s,
-                )
-                response = send_tcp_line(set_command)
-            except Exception as exc:
-                statuses.append(f"{label}=enable-failed")
-                logs.append(f"[카메라] {camera_name} RTSP/Ethernet Mode 활성화 실패: {exc}")
-                continue
-            if not self._set_ethernet_response_ok(response):
-                statuses.append(f"{label}=reactivate-rejected" if self.reactivate else f"{label}=enable-rejected")
-                logs.append(
-                    f"[카메라] {camera_name} RTSP/Ethernet Mode 활성화 실패: "
-                    f"{SET_ETHERNET_MODE_COMMAND} 응답={response or 'empty'}"
-                )
-                continue
+            ethernet_mode_already_enabled = before.strip().upper() == "TRUE"
+            skip_set_ethernet = ethernet_mode_already_enabled and not self.reactivate
+            response = "SKIPPED"
+            if not skip_set_ethernet:
+                try:
+                    set_command = build_wiris_command(
+                        host=host,
+                        port=port,
+                        command=SET_ETHERNET_MODE_COMMAND,
+                        timeout_s=self.timeout_s,
+                    )
+                    response = send_tcp_line(set_command)
+                except Exception as exc:
+                    statuses.append(f"{label}=enable-failed")
+                    logs.append(f"[카메라] {camera_name} RTSP/Ethernet Mode 활성화 실패: {exc}")
+                    continue
+                if not self._set_ethernet_response_ok(response):
+                    statuses.append(
+                        f"{label}=reactivate-rejected" if self.reactivate else f"{label}=enable-rejected"
+                    )
+                    logs.append(
+                        f"[카메라] {camera_name} RTSP/Ethernet Mode 활성화 실패: "
+                        f"{SET_ETHERNET_MODE_COMMAND} 응답={response or 'empty'}"
+                    )
+                    continue
             statuses.append(f"{label}=reactivated-sent" if self.reactivate else f"{label}=enable-sent")
-            logs.append(
-                f"[카메라] {camera_name} RTSP/Ethernet Mode "
-                f"{'재활성화' if self.reactivate else '활성화'}: "
-                f"{GET_ETHERNET_MODE_COMMAND}={before or 'n/a'}, {SET_ETHERNET_MODE_COMMAND} 응답={response or 'sent'}"
-                + (" (제어 서비스 보호를 위해 SETH FALSE는 전송하지 않음)" if self.reactivate else "")
-            )
+            if skip_set_ethernet:
+                logs.append(
+                    f"[카메라] {camera_name} RTSP/Ethernet Mode 이미 활성화됨: "
+                    f"{GET_ETHERNET_MODE_COMMAND}={before}; {SET_ETHERNET_MODE_COMMAND} 생략"
+                )
+            else:
+                logs.append(
+                    f"[카메라] {camera_name} RTSP/Ethernet Mode "
+                    f"{'재활성화' if self.reactivate else '활성화'}: "
+                    f"{GET_ETHERNET_MODE_COMMAND}={before or 'n/a'}, "
+                    f"{SET_ETHERNET_MODE_COMMAND} 응답={response or 'sent'}"
+                    + (" (제어 서비스 보호를 위해 SETH FALSE는 전송하지 않음)" if self.reactivate else "")
+                )
+            profile_error = self._apply_visible_encoder_profile(host, port, logs, camera_name)
+            if profile_error:
+                statuses[-1] = f"{label}=encoder-profile-failed"
+                logs.append(f"[카메라] {camera_name} visible encoder profile 적용 실패: {profile_error}")
 
         should_check = any(
             status.endswith("=enable-sent") or status.endswith("=reactivated-sent")
@@ -590,6 +612,96 @@ class WirisRtspEnableWorker(QtCore.QObject):
             "should_check": should_check,
             "closed": closed,
         }
+
+    def _apply_visible_encoder_profile(
+        self,
+        host: str,
+        port: int,
+        logs: list[str],
+        camera_name: str,
+    ) -> str:
+        if not self.visible_encoder_profile:
+            return ""
+        fields = (
+            ("bitrate", "SEBR VISIBLE", "GEBR VISIBLE"),
+            ("qp", "SEQZ VISIBLE", "GEQZ VISIBLE"),
+            ("gop", "SEGS VISIBLE", "GEGS VISIBLE"),
+            ("idr", "SEIR VISIBLE", "GEIR VISIBLE"),
+        )
+
+        def read_value(get_command: str, *, expected_value: int | None = None) -> int:
+            last_detail = "no readback"
+            for attempt in range(ENCODER_PROFILE_READBACK_MAX_ATTEMPTS + 1):
+                if attempt:
+                    QtCore.QThread.msleep(ENCODER_PROFILE_READBACK_RETRY_INTERVAL_MS)
+                try:
+                    response = send_tcp_line(
+                        build_wiris_command(
+                            host=host,
+                            port=port,
+                            command=get_command,
+                            timeout_s=self.timeout_s,
+                        )
+                    )
+                    value = int(response.strip())
+                except Exception as exc:
+                    last_detail = str(exc)
+                    continue
+                if expected_value is not None and value != expected_value:
+                    last_detail = str(value)
+                    continue
+                QtCore.QThread.msleep(ENCODER_PROFILE_COMMAND_SETTLE_MS)
+                return value
+            suffix = "" if expected_value is None else f" expected={expected_value}"
+            raise RuntimeError(f"readback={last_detail}{suffix}")
+
+        QtCore.QThread.msleep(ENCODER_PROFILE_COMMAND_SETTLE_MS)
+        expected: dict[str, int] = {}
+        initial: dict[str, int] = {}
+        for name, _set_prefix, get_command in fields:
+            if name not in self.visible_encoder_profile:
+                return f"missing {name}"
+            expected[name] = int(self.visible_encoder_profile[name])
+            try:
+                initial[name] = read_value(get_command)
+            except Exception as exc:
+                return f"{get_command} 초기 readback 실패: {exc}"
+
+        changed: list[str] = []
+        readback = dict(initial)
+        for name, set_prefix, get_command in fields:
+            value = expected[name]
+            if initial[name] == value:
+                continue
+            try:
+                response = send_tcp_line(
+                    build_wiris_command(
+                        host=host,
+                        port=port,
+                        command=f"{set_prefix} {value}",
+                        timeout_s=self.timeout_s,
+                    )
+                )
+            except Exception as exc:
+                return f"{set_prefix} {value} 전송 실패: {exc}"
+            if response.strip().upper() != "OK":
+                return f"{set_prefix} {value} 응답={response or 'empty'}"
+
+            QtCore.QThread.msleep(ENCODER_PROFILE_COMMAND_SETTLE_MS)
+            try:
+                actual = read_value(get_command, expected_value=value)
+            except Exception as exc:
+                return f"{get_command} readback 실패: {exc}"
+            readback[name] = actual
+            changed.append(name)
+
+        change_text = ",".join(changed) if changed else "none (readback 일치; SET 생략)"
+        logs.append(
+            f"[카메라] {camera_name} visible encoder profile 확인: "
+            f"bitrate={readback['bitrate']}, qp={readback['qp']}, "
+            f"gop={readback['gop']}, idr={readback['idr']}; changed={change_text}"
+        )
+        return ""
 
     def _resolve_ethernet_mode_port(self, camera: str, host: str) -> tuple[int | None, str, int | None, str]:
         failures = []
@@ -1155,6 +1267,11 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
     @QtCore.pyqtSlot()
     def run(self) -> None:
         results: dict[str, dict[str, object]] = {}
+        capture_barrier = (
+            threading.Barrier(len(self.target_infos))
+            if len(self.target_infos) >= 2
+            else None
+        )
 
         def capture_one(label: str, host: str, port: int, timeout_s: float) -> None:
             item: dict[str, object] = {
@@ -1216,8 +1333,16 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
                     self.image_enable_command
                 )
                 item[f"{self.capture_channel}_enabled"] = True
+                # CPTR is the closest timestamp the SDK exposes for a stored
+                # still. Synchronize the host dispatches, but never relabel
+                # this proxy as the unknown camera exposure timestamp.
+                if capture_barrier is not None:
+                    capture_barrier.wait(timeout=max(1.0, timeout_s))
                 item["capture_requested_monotonic_ns"] = time.monotonic_ns()
                 item["capture_requested_unix_ns"] = time.time_ns()
+                item["capture_pairing_contract"] = (
+                    "same_capture_id_and_synchronized_cptr_dispatch_v1"
+                )
                 item["capture_response"] = send_capture_command("CPTR")
                 deadline_s = time.monotonic() + self.completion_timeout_s
                 while True:
@@ -1349,12 +1474,25 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
                     },
                 )
             camera_items = list(results.values())
+            request_times = {
+                label: int(item["capture_requested_monotonic_ns"])
+                for label, item in results.items()
+                if item.get("capture_requested_monotonic_ns") is not None
+            }
+            request_delta_s = (
+                (request_times["right"] - request_times["left"]) * 1.0e-9
+                if {"left", "right"} <= set(request_times)
+                else None
+            )
             self.completed.emit(
                 {
                     "capture_id": self.capture_id,
                     "capture_channel": self.capture_channel,
                     "image_enable_command": self.image_enable_command,
                     "commands": (self.image_enable_command, "CPTR", "ICPT"),
+                    "pair_time_basis": "host-cptr-dispatch-monotonic",
+                    "pair_request_delta_s": request_delta_s,
+                    "camera_exposure_timestamp_known": False,
                     "cameras": results,
                     "stored_on_camera": bool(camera_items)
                     and all(item.get("stored_on_camera") for item in camera_items),

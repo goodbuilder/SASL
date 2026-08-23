@@ -174,6 +174,8 @@ class GpsSensorState:
     satellites_used: int | None = None
     eph_m: float | None = None
     epv_m: float | None = None
+    hdop: float | None = None
+    vdop: float | None = None
     px4_timestamp_s: float | None = None
     px4_timestamp_us: int | None = None
     px4_timestamp_sample_us: int | None = None
@@ -331,6 +333,8 @@ MAVLINK_RM3100_STREAM_REQUESTS = (
 )
 MAVLINK_MAX_MESSAGES_PER_TICK = 256
 MAVLINK_MAX_PROCESS_TIME_S = 0.020
+MAVLINK_STREAM_REQUEST_MAX_ATTEMPTS = 3
+MAVLINK_STREAM_REQUEST_RETRY_S = 2.0
 
 
 def camera_label_ko(camera: str) -> str:
@@ -520,6 +524,9 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         self._heartbeat_logged: set[str] = set()
         self._unrecognized_debug_vect_names: set[str] = set()
         self._mavlink_stream_requests_sent: set[str] = set()
+        self._mavlink_stream_request_attempts: dict[str, int] = {}
+        self._mavlink_stream_last_request_s: dict[str, float] = {}
+        self._sasl_can_mag_stream_confirmed: set[str] = set()
         self._mavlink_stream_config: dict[str, Any] | None = None
         self._mavlink_stream_configured: set[str] = set()
         self._latest_gnss_relative: dict[str, GnssRelativeState] = {}
@@ -632,6 +639,9 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 self.connections.pop(side, None)
             self._heartbeat_logged.discard(side)
             self._mavlink_stream_requests_sent.discard(side)
+            self._mavlink_stream_request_attempts.pop(side, None)
+            self._mavlink_stream_last_request_s.pop(side, None)
+            self._sasl_can_mag_stream_confirmed.discard(side)
             self._mavlink_stream_configured.discard(side)
             self._stream_setup_requests_sent.discard(side)
             self._latest_gnss_relative.pop(side, None)
@@ -725,8 +735,13 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         sysid = int(config["sysids"].get(camera, 1))
         command = (
             f"param set MAV_SYS_ID {sysid}\n"
-            f"mavlink start -x -u {int(port)} -t {host_ip} -o {int(port)} -r {rate} -m normal\n"
-            "mavlink status"
+            "param set MAV_2_CONFIG 1000\n"
+            "param set MAV_2_MODE 0\n"
+            "param set MAV_2_BROADCAST 1\n"
+            f"param set MAV_2_REMOTE_PRT {int(port)}\n"
+            f"param set MAV_2_UDP_PRT {int(port)}\n"
+            f"param set MAV_2_RATE {rate}\n"
+            "param save"
         )
         try:
             _send_mavlink_shell_command(connection, command)
@@ -736,13 +751,11 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         self._mavlink_stream_configured.add(camera)
         self._stream_setup_requests_sent.discard(camera)
         self.status_changed.emit(
-            f"{camera_label_ko(camera)} MAVLink stream 설정 명령 전송: sysid={sysid}, "
-            f"host={host_ip}, port={int(port)}"
+            f"{camera_label_ko(camera)} MAVLink 단일-instance 영구 설정 저장: sysid={sysid}, "
+            f"host={host_ip}, port={int(port)} (재부팅 후 적용)"
         )
 
     def _request_mavlink_sensor_streams(self, camera: str) -> None:
-        if camera in self._mavlink_stream_requests_sent:
-            return
         connection = self.connections.get(camera)
         if connection is None:
             return
@@ -753,10 +766,25 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         command_id = _mavlink_constant(mavlink, "MAV_CMD_SET_MESSAGE_INTERVAL", 511)
         target_system = int(getattr(connection, "target_system", 0) or 1)
         target_component = int(getattr(connection, "target_component", 0) or 1)
+        now_s = time.monotonic()
+        retry_only = camera in self._mavlink_stream_requests_sent
+        if retry_only:
+            if camera in self._sasl_can_mag_stream_confirmed:
+                return
+            attempts = self._mavlink_stream_request_attempts.get(camera, 1)
+            elapsed_s = now_s - self._mavlink_stream_last_request_s.get(camera, 0.0)
+            if attempts >= MAVLINK_STREAM_REQUEST_MAX_ATTEMPTS or elapsed_s < MAVLINK_STREAM_REQUEST_RETRY_S:
+                return
+            requests = (("SASL_CAN_MAG", 20.0),)
+        else:
+            attempts = 0
+            requests = MAVLINK_RM3100_STREAM_REQUESTS
         requested = []
         self._mavlink_stream_requests_sent.add(camera)
+        self._mavlink_stream_request_attempts[camera] = attempts + 1
+        self._mavlink_stream_last_request_s[camera] = now_s
         try:
-            for message_name, rate_hz in MAVLINK_RM3100_STREAM_REQUESTS:
+            for message_name, rate_hz in requests:
                 message_id = MAVLINK_MESSAGE_IDS[message_name]
                 interval_us = int(1_000_000 / float(rate_hz))
                 mav.command_long_send(
@@ -775,11 +803,19 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 requested.append(message_name)
         except Exception as exc:
             self._mavlink_stream_requests_sent.discard(camera)
+            self._mavlink_stream_request_attempts.pop(camera, None)
+            self._mavlink_stream_last_request_s.pop(camera, None)
             self.status_changed.emit(f"{camera_label_ko(camera)} MAVLink sensor stream 요청 실패: {exc}")
             return
-        self.status_changed.emit(
-            f"{camera_label_ko(camera)} MAVLink sensor stream 요청: {', '.join(requested)}"
-        )
+        if retry_only:
+            self.status_changed.emit(
+                f"{camera_label_ko(camera)} MAVLink SASL_CAN_MAG stream 재요청 "
+                f"({attempts + 1}/{MAVLINK_STREAM_REQUEST_MAX_ATTEMPTS})"
+            )
+        else:
+            self.status_changed.emit(
+                f"{camera_label_ko(camera)} MAVLink sensor stream 요청: {', '.join(requested)}"
+            )
 
     def send_shell_command(self, camera: str, command: str) -> None:
         connection = self.connections.get(camera)
@@ -937,11 +973,16 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 altitude_m=_mavlink_scaled_millimetres(getattr(message, "alt", None)),
                 fix_type=_optional_int(message, "fix_type"),
                 satellites_used=_optional_int(message, "satellites_visible"),
-                eph_m=_mavlink_scaled_centimetres(getattr(message, "eph", None)),
-                epv_m=_mavlink_scaled_centimetres(getattr(message, "epv", None)),
+                # PX4 GPS_RAW_INT.eph/epv are HDOP/VDOP ×100. The actual
+                # metre accuracies are carried by the h_acc/v_acc extensions.
+                eph_m=_mavlink_scaled_accuracy_mm(getattr(message, "h_acc", None)),
+                epv_m=_mavlink_scaled_accuracy_mm(getattr(message, "v_acc", None)),
                 heading_deg=_mavlink_heading_cdeg(getattr(message, "cog", None)),
                 raw=message,
                 gps_utc_us=gps_utc_us,
+                altitude_ellipsoid_m=_mavlink_scaled_millimetres(getattr(message, "alt_ellipsoid", None)),
+                hdop=_mavlink_scaled_dop(getattr(message, "eph", None)),
+                vdop=_mavlink_scaled_dop(getattr(message, "epv", None)),
                 time_source="mavlink_time_usec_epoch" if gps_utc_us is not None else "mavlink_time_usec_unresolved",
                 **provenance,
             )
@@ -977,6 +1018,8 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 self.mag_sensor_changed.emit(camera, replace(mag, **provenance))
             return
         if message_type in MAVLINK_CAN_MAG_MESSAGE_TYPES:
+            if message_type == "SASL_CAN_MAG":
+                self._sasl_can_mag_stream_confirmed.add(camera)
             mag = _can_mag_sensor_state_from_mavlink(camera, namespace, message, message_type, now_s)
             if mag is not None:
                 self.mag_sensor_changed.emit(camera, replace(mag, **provenance))
@@ -1318,8 +1361,10 @@ def _gps_sensor_state_from_mavlink(
         device_id=None,
         fix_type=_optional_int(message, "fix_type"),
         satellites_used=_optional_int(message, "satellites_visible"),
-        eph_m=_mavlink_scaled_centimetres(getattr(message, "eph", None)),
-        epv_m=_mavlink_scaled_centimetres(getattr(message, "epv", None)),
+        eph_m=_mavlink_scaled_accuracy_mm(getattr(message, "h_acc", None)),
+        epv_m=_mavlink_scaled_accuracy_mm(getattr(message, "v_acc", None)),
+        hdop=_mavlink_scaled_dop(getattr(message, "eph", None)),
+        vdop=_mavlink_scaled_dop(getattr(message, "epv", None)),
         px4_timestamp_s=None,
         gps_utc_us=gps_utc_us,
     )
@@ -1456,6 +1501,22 @@ def _mavlink_scaled_centimetres(value: Any) -> float | None:
     return float(value) * 1e-2
 
 
+def _mavlink_scaled_dop(value: Any) -> float | None:
+    """Decode PX4 GPS_RAW_INT eph/epv, which carry HDOP/VDOP multiplied by 100."""
+
+    if value is None or int(value) == 65535:
+        return None
+    return float(value) * 1e-2
+
+
+def _mavlink_scaled_accuracy_mm(value: Any) -> float | None:
+    """Decode GPS_RAW_INT h_acc/v_acc from millimetres to metres."""
+
+    if value is None or int(value) in {0, 4294967295}:
+        return None
+    return float(value) * 1e-3
+
+
 def _mavlink_heading_cdeg(value: Any) -> float | None:
     if value is None or int(value) == 65535:
         return None
@@ -1528,25 +1589,34 @@ def _send_mavlink_shell_command(
         ("respond+exclusive", respond_flag | exclusive_flag),
         ("respond", respond_flag),
     )
-    payload = (command.rstrip() + "\n").encode("utf-8")
-    selected_label, selected_flags = variants[-1]
-    probe_output = ""
-    for label, flags in variants:
-        # Opening the shell first matters on PX4 NSH links that only respond after a read request.
-        mav.serial_control_send(device, flags, 0, 0, 0, [0] * 70)
-        output = _read_mavlink_shell_output(connection, timeout_s=min(timeout_s, 0.25))
-        if output or label == variants[-1][0]:
-            selected_label = label
-            selected_flags = flags
-            probe_output = output
-            break
-    _send_mavlink_shell_payload(mav, device=device, flags=selected_flags, payload=payload)
-    command_output = _read_mavlink_shell_output(connection, timeout_s=timeout_s)
-    return MavlinkShellCommandResult(
-        command=command,
-        output=probe_output + command_output,
-        flag_label=selected_label,
-    )
+    try:
+        payload = (command.rstrip() + "\n").encode("utf-8")
+        selected_label, selected_flags = variants[-1]
+        probe_output = ""
+        for label, flags in variants:
+            # Opening the shell first matters on PX4 NSH links that only respond after a read request.
+            mav.serial_control_send(device, flags, 0, 0, 0, [0] * 70)
+            output = _read_mavlink_shell_output(connection, timeout_s=min(timeout_s, 0.25))
+            if output or label == variants[-1][0]:
+                selected_label = label
+                selected_flags = flags
+                probe_output = output
+                break
+        _send_mavlink_shell_payload(mav, device=device, flags=selected_flags, payload=payload)
+        command_output = _read_mavlink_shell_output(connection, timeout_s=timeout_s)
+        return MavlinkShellCommandResult(
+            command=command,
+            output=probe_output + command_output,
+            flag_label=selected_label,
+        )
+    finally:
+        # SERIAL_CONTROL_FLAG_EXCLUSIVE must be explicitly released. Closing
+        # the host-side serial descriptor alone does not hand the PX4 shell
+        # back and can leave later USB diagnostics with a dead-looking link.
+        try:
+            mav.serial_control_send(device, 0, 0, 0, 0, [0] * 70)
+        except Exception:
+            pass
 
 
 def _send_mavlink_rtcm_data(connection: Any, payload: bytes) -> int:

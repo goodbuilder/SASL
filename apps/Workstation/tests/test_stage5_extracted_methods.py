@@ -223,8 +223,8 @@ def test_apply_workstation_calibration_setup_applies_values_and_refreshes() -> N
         calib_square_spin=_ValueWidget(0.0),
         calib_min_images_spin=_ValueWidget(0),
         calib_calculation_pairs_spin=_ValueWidget(0),
+        calibration_pair_max_delta_spin=_ValueWidget(100.0),
         calibration_auto_interval_spin=_ValueWidget(0),
-        calibration_auto_target_spin=_ValueWidget(0),
         calib_dir_edit=_ValueWidget(""),
         checkerboard_validation_root_edit=_ValueWidget(""),
         checkerboard_validation_json_edit=_ValueWidget(""),
@@ -241,12 +241,22 @@ def test_apply_workstation_calibration_setup_applies_values_and_refreshes() -> N
     )
 
     WorkstationSettingsController(panel).apply_workstation_calibration_setup(
-        {"zoom_level": 7, "inner_cols": 9, "inner_rows": 6, "square_size_mm": 24.5}
+        {
+            "zoom_level": 7,
+            "inner_cols": 9,
+            "inner_rows": 6,
+            "square_size_mm": 24.5,
+            "pair_max_delta_ms": 37.5,
+            "calibration_root": "/data/photo-set-a",
+        }
     )
 
     assert panel.zoom_level_spin.value() == 7
     assert panel.calib_cols_spin.value() == 9
     assert panel.calib_rows_spin.value() == 6
+    assert panel.calibration_pair_max_delta_spin.value() == 37.5
+    assert panel.calib_dir_edit.text() == "/data/photo-set-a"
+    assert panel.checkerboard_validation_root_edit.text() == "/data/photo-set-a"
     assert "previews" in calls and "zoom_tab" in calls and "scan" in calls and "header" in calls
 
 

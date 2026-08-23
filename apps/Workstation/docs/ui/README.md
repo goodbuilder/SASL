@@ -46,13 +46,14 @@ validation 실행도 동일한 owner-backed facade로 제공합니다. Calibrati
 measurement tuning, playback/export와 실제 RTSP/Pixhawk/GNSS 장비·장시간 writer 종료는
 별도 조건입니다.
 
-Measurement 실행은 상위 세션과 개별 측정을 분리합니다. 최상위 `Session` 화면의
-`Open Session`은 날짜·시간 기반 당일 작업 폴더를 열고, `New Measurement`는 그 아래
-`measurements/mNNNNNN`을 생성합니다. Session 화면은 현재 child의 증거 수집/유효 측정
+Measurement 실행은 상위 세션과 개별 측정을 분리합니다. `Sessions > Current`의
+`Create Session Folder`는 날짜·시간 기반 작업 폴더를 열고, `Measurement > 측정 시작`은 그 아래
+`measurements/mNNNNNN`을 생성한 뒤 Detection을 시작합니다. Pre HR/OZ 요청이 먼저 있으면
+같은 child를 지연 생성하고 측정 시작이 재사용합니다. Measurement 화면은 현재 child의 증거 수집/유효 측정
 준비 상태를 차단 원인 중심으로 표시합니다. 모든 측정 방식은 항상 보이며, 선택한 방식의
 실제 입력값·출처·좌표계만 상세 영역에 표시합니다. Detection,
-spool, 영상, 캡처, 결과, revision은 현재 child에만 기록되며 `Seal Measurement` 뒤 같은
-세션에서 다음 child를 만들 수 있습니다. `Close Session`은 모든 child manifest SHA-256과
+spool, 영상, 캡처, 결과, revision은 현재 child에만 기록되며 `측정 종료`의 자동 저장·봉인 뒤 같은
+세션에서 다음 측정 시작이 새 child를 만듭니다. `Close Session`은 모든 child manifest SHA-256과
 세션 공통 증거를 상위 manifest에 봉인합니다. 저장 리뷰도 `(session_id, measurement_id)`를
 키로 사용합니다.
 

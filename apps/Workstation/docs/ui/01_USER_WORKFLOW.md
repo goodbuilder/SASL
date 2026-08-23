@@ -228,26 +228,23 @@ the right side may be supplied in the same object. A precomputed normalized ray 
 LOS may be supplied instead. These files are hashed into the candidate and are not promoted
 to live truth.
 
-### Measurement method readiness and fallback
+### Measurement method readiness and parallel evaluation
 
-Measurement shows only method categories that can resolve a complete stereo R,t with the exact
-operating K,D. A solved candidate is usable without first pressing Apply only when its method
-contract resolves a complete pose. Horizon combines observed Roll/Pitch with pair-frozen Pixhawk
+Measurement and Overview always show all eight method categories. At child creation the latest
+successful non-Pixhawk Draft and exact operating K,D are frozen as child-only inputs without
+changing global Alignment Active. Horizon combines observed Roll/Pitch with pair-frozen Pixhawk
 Yaw and GNSS Translation. Single-target Drone Rotation re-solves Yaw with pair-frozen Pixhawk
 Roll/Pitch; full Drone Rotation adds pair-frozen GNSS Translation. Mountain, Multi-view, Terrain,
 and Combined must already be full 6-DOF. Readiness is per method, so an unavailable GNSS-dependent
 method does not block an independent Checkerboard or full Multi-view/Terrain profile.
 
-The operator's Measurement selection is the preferred method. If it becomes unavailable, the
-runtime selects the first ready category in `Settings > Runtime / Calibration > Measurement
-fallback order`. While operating on a fallback, a recovered preferred or higher-ranked method
-must remain ready for one second before it is restored. Every switch takes effect only before a
-new matched pair is frozen; no existing MeasurementAttempt is rewritten. With no ready category,
-valid distance output is blocked while unresolved recording evidence remains append-only.
+Every matched pair fans out to all eight methods from one immutable snapshot. Pixhawk attitude +
+GNSS/RTK is always the representative result and is never replaced by a comparison method. Missing
+input, solver failure, timeout, and queue overflow remain explicit per-method terminal outcomes.
 The pair's attitude/GPS snapshots are selected before hybrid geometry is resolved, and the final
 R,t plus those exact snapshot values are covered by `measurement_geometry_sha256`.
-When no method is ready, the matched detections are stored as a blocked pair with a readiness
-snapshot hash rather than being discarded or represented by a fabricated MeasurementAttempt.
+When no method is ready, the matched detections/native references are retained and all eight
+method streams record BLOCKED rather than discarding the pair or fabricating R,t.
 Candidate details show left/right observability independently; Apply/Combine enables a common
 axis only when both sides observed it.
 
@@ -284,10 +281,11 @@ Changing camera parameters should not unnecessarily hide live image.
 
 ## 7. Measurement Operation
 
-The Workstation separates the parent field session from each measurement. The operator runs
-`Session > Open Session → New Measurement → Measurement > Detection → Post capture → Session >
-Seal Measurement`; a sealed child
-leaves the parent open for another `New Measurement`. `Close Session` is separate and is available
+The Workstation separates the parent field session from each measurement. The normal operator path is
+`Sessions > Current > Create Session Folder → Measurement > 측정 시작 → 측정 종료`; start creates
+the next child and starts Detection, while stop triggers its automatic save and seal. A sealed child
+leaves the parent open for another `측정 시작`. An optional Pre HR/OZ request lazily creates the
+same draft before Detection instead of requiring a separate New Measurement control. `Close Session` is separate and is available
 only when no child or producer is mutable. The parent ID remains fixed while child IDs advance as
 `m000001`, `m000002`, and so on. A revision adds evidence to one child and does not create another
 Detection interval.
@@ -295,8 +293,8 @@ Detection interval.
 The top-level Session workspace keeps lifecycle and readiness separate. `OPEN` describes the daily
 container; `Evidence collection` and `Valid measurement` are derived operator states for the current
 child. The readiness table contains blockers only. The compact method table always lists all eight
-method categories; missing candidates/profiles remain `BLOCKED` with their required inputs. Selecting
-one method reveals its fallback reason, live PX4 body-FRD to world-NED R/P/Y, P1→P2 GNSS NED
+method categories; missing candidates/profiles remain `BLOCKED` with their required inputs. Clicking
+one method navigates to read-only detail for its blocker, live PX4 body-FRD to world-NED R/P/Y, P1→P2 GNSS NED
 baseline, candidate virtual-FRD/world-NED values, or OpenCV left-to-right RDF `R,t` without merging
 those coordinate contracts.
 

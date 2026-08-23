@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
 
 from PyQt5 import QtCore, QtWidgets
 
+from Workstation.runtime_paths import (
+    WORKSTATION_DATA_ROOT,
+    import_workstation_asset_file,
+    portable_workstation_data_path_text,
+)
 from Workstation.wiris_ftp_browser import WirisFtpBrowserDialog
 from Workstation.workstation_core import ntrip_credentials
+from Workstation.workstation_core.gnss_operation import DEFAULT_NTRIP_SESSION_PASSWORD
 from Workstation.workstation_core.settings import AppSettings
 from Workstation.workstation_core.measurement_methods import (
     MEASUREMENT_METHOD_LABELS,
@@ -360,6 +367,28 @@ class SettingsWorkspace(QtWidgets.QWidget):
 
     def _build_yolo_tab(self) -> None:
         layout = self._tab("YOLO / RTSP")
+        weights_edit = self._text("yolo_weights_path")
+        weights_edit.setToolTip(
+            "YOLO model path relative to SASL_WORKSTATION_DATA_ROOT. "
+            "Apply takes effect at the next Detection start; Save persists it."
+        )
+        weights_row = QtWidgets.QWidget()
+        weights_layout = QtWidgets.QHBoxLayout(weights_row)
+        weights_layout.setContentsMargins(0, 0, 0, 0)
+        weights_layout.setSpacing(6)
+        weights_layout.addWidget(weights_edit, 1)
+        self.yolo_weights_browse_button = QtWidgets.QPushButton("파일 선택…")
+        self.yolo_weights_browse_button.setToolTip(
+            "Select .pt, .onnx, .engine, or .torchscript weights. External files are "
+            "copied into verified content-addressed Workstation model storage."
+        )
+        self.yolo_weights_browse_button.clicked.connect(self._browse_yolo_weights)
+        weights_layout.addWidget(self.yolo_weights_browse_button)
+        self.yolo_weights_selection_status = QtWidgets.QLabel(
+            "Apply 후 다음 Detection 시작부터 선택한 모델을 사용합니다."
+        )
+        self.yolo_weights_selection_status.setObjectName("statusStrip")
+        self.yolo_weights_selection_status.setWordWrap(True)
         yolo_input_size = self._integer("yolo_input_size", 160, 1920, " px")
         yolo_input_size.setToolTip(
             "Applied to the hidden YOLO runtime owner now and used from the next Detection start."
@@ -368,7 +397,8 @@ class SettingsWorkspace(QtWidgets.QWidget):
             self._group(
                 "YOLO runtime",
                 [
-                    ("Weights path", self._text("yolo_weights_path")),
+                    ("Weights path", weights_row),
+                    ("", self.yolo_weights_selection_status),
                     ("Inference device", self._combo("yolo_device", (("CPU", "cpu"), ("CUDA", "cuda:0")))),
                     ("YOLO input size", yolo_input_size),
                     ("Preview width", self._integer("preview_width", 320, 3840, " px")),
@@ -394,7 +424,76 @@ class SettingsWorkspace(QtWidgets.QWidget):
                 ],
             )
         )
+        encoder_bitrate = self._integer("wiris_visible_encoder_bitrate", 0, 1_000_000_000)
+        encoder_bitrate.setToolTip(
+            "WIRIS SEBR VISIBLE value. Zero enables constant-quality mode; nonzero disables QP control."
+        )
+        encoder_qp = self._integer("wiris_visible_encoder_qp", 0, 51)
+        encoder_qp.setToolTip("WIRIS SEQZ VISIBLE value; effective only when bitrate is zero.")
+        encoder_gop = self._integer("wiris_visible_encoder_gop", 0, 32767)
+        encoder_idr = self._integer("wiris_visible_encoder_idr", 0, 1_000_000_000)
+        layout.addWidget(
+            self._group(
+                "WIRIS visible encoder profile",
+                [
+                    ("Bitrate", encoder_bitrate),
+                    ("QP", encoder_qp),
+                    ("GOP size", encoder_gop),
+                    ("IDR interval", encoder_idr),
+                ],
+            )
+        )
         layout.addStretch(1)
+
+    def _workstation_data_root(self) -> Path:
+        owner = getattr(self.backend, "panel", self.backend)
+        configured = getattr(owner, "app_root", WORKSTATION_DATA_ROOT)
+        return Path(configured).expanduser().resolve()
+
+    def _browse_yolo_weights(self) -> None:
+        data_root = self._workstation_data_root()
+        weights_edit = self.settings_widgets["yolo_weights_path"]
+        current_text = weights_edit.text().strip()
+        current_path = Path(current_text).expanduser()
+        if not current_path.is_absolute():
+            current_path = data_root / current_path
+        model_root = data_root / "models"
+        start_dir = current_path.parent if current_path.parent.is_dir() else model_root
+        if not start_dir.is_dir():
+            start_dir = data_root
+        selected, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select YOLO weights",
+            str(start_dir),
+            "Model weights (*.pt *.onnx *.engine *.torchscript);;All files (*)",
+        )
+        if not selected:
+            return
+        try:
+            selected_path = Path(selected).expanduser().resolve(strict=True)
+            try:
+                selected_path.relative_to(data_root)
+                external_selection = False
+            except ValueError:
+                external_selection = True
+            imported = import_workstation_asset_file(
+                selected_path,
+                category="models",
+                data_root=data_root,
+            )
+            portable = portable_workstation_data_path_text(
+                imported,
+                data_root=data_root,
+                field_name="yolo_weights_path",
+            )
+        except (OSError, ValueError) as exc:
+            self.yolo_weights_selection_status.setText(
+                f"모델 가져오기 실패: {exc}"
+            )
+            return
+        weights_edit.setText(portable)
+        action = "가져오기 및 SHA-256 검증 완료" if external_selection else "모델 선택 완료"
+        self.yolo_weights_selection_status.setText(f"{action}: {portable}")
 
     def _build_pixhawk_tab(self) -> None:
         layout = self._tab("PX4 / MAVLink")
@@ -651,7 +750,10 @@ class SettingsWorkspace(QtWidgets.QWidget):
                 ],
             )
         )
-        self.gnss_network_password_edit = QtWidgets.QLineEdit()
+        # Deployment session default.  This masked widget remains outside
+        # settings_widgets/settings_payload(), so the password is never
+        # serialized even when the operator leaves the default unchanged.
+        self.gnss_network_password_edit = QtWidgets.QLineEdit(DEFAULT_NTRIP_SESSION_PASSWORD)
         self.gnss_network_password_edit.setEchoMode(QtWidgets.QLineEdit.Password)
         self.gnss_network_password_edit.setPlaceholderText("NTRIP password")
         self.gnss_network_credential_status_label = QtWidgets.QLabel("--")

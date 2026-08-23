@@ -647,7 +647,7 @@ class DeviceRuntimeController:
         self._set_pixhawk_usb_bootstrap_status(
             camera,
             "RUNNING",
-            "USB shell로 PX4 Ethernet MAVLink 시작 중",
+            "USB shell로 단일 Ethernet MAVLink 설정 저장·재부팅 중",
         )
         if camera == "left":
             usb_url = self.panel.left_pixhawk_bootstrap_url_edit.text().strip()
@@ -711,7 +711,7 @@ class DeviceRuntimeController:
         self._set_pixhawk_usb_bootstrap_status(
             camera,
             "RECOVERED",
-            "PX4 Ethernet MAVLink 시작 완료; UDP telemetry 확인 중",
+            "단일 Ethernet MAVLink 설정·재부팅 완료; UDP telemetry 확인 중",
         )
         self.panel._set_usb_bootstrap_baud(camera, selected_baud)
         output = str(data.get("output") or "").strip()
@@ -721,8 +721,8 @@ class DeviceRuntimeController:
                 f"({data.get('flag_label', '')}): {output[-800:]}"
             )
         self.panel._log(
-            f"[픽스호크] {self.panel._px4_mag_camera_label(camera)} USB {selected_baud} baud 부트스트랩 완료. "
-            "UDP MAVLink 수신을 다시 시작합니다."
+            f"[픽스호크] {self.panel._px4_mag_camera_label(camera)} USB {selected_baud} baud "
+            "단일-instance 설정·재부팅 명령 완료. UDP MAVLink 수신을 다시 시작합니다."
         )
         self.panel._save_current_settings()
         self.panel.connect_mavlink_pixhawk(camera)
@@ -758,16 +758,27 @@ class DeviceRuntimeController:
 
     def _ethernet_mavlink_bootstrap_command(self, camera: str, *, mode: str = "normal") -> str:
         setup = self.panel._persistent_pixhawk_eth_setup(camera)
-        mavlink_start_cmd = str(setup["mavlink_start_cmd"])
-        if mode == "onboard":
-            mavlink_start_cmd = mavlink_start_cmd.replace("-m normal", "-m onboard -n eth0")
+        if mode not in {"normal", "onboard"}:
+            raise ValueError(f"Unsupported Ethernet MAVLink bootstrap mode: {mode}")
+        extras = "/fs/microsd/etc/extras.txt"
+        net_cfg = "/fs/microsd/net.cfg"
+        extras_lines = list(setup["extras_lines"])
+        net_cfg_lines = list(setup["net_cfg_lines"])
+        # MAV_2_CONFIG is the sole owner of the Ethernet MAVLink instance.
+        # A second manual start can bind the same UDP port on NuttX and emit a
+        # duplicate unicast stream beside the parameter-owned broadcast stream.
+        # Persist the interface files and reboot so rc.serial creates exactly
+        # one instance; never stop or manually start one from recovery.
         return "\n".join(
             (
-                setup["ifup_cmd"],
-                setup["ifconfig_cmd"],
-                setup["mavlink_stop_cmd"],
-                mavlink_start_cmd,
-                "mavlink status",
+                "mkdir /fs/microsd/etc",
+                *setup["param_lines"],
+                "param save",
+                f"echo '{extras_lines[0]}' > {extras}",
+                *(f"echo '{line}' >> {extras}" for line in extras_lines[1:]),
+                f"echo '{net_cfg_lines[0]}' > {net_cfg}",
+                *(f"echo '{line}' >> {net_cfg}" for line in net_cfg_lines[1:]),
+                "reboot",
             )
         )
 
@@ -942,7 +953,8 @@ class DeviceRuntimeController:
             return
         thread.finished.connect(
             lambda camera=camera, force_setup=force_setup:
-            self.connect_mavlink_pixhawk(camera, force_setup=force_setup)
+            self.connect_mavlink_pixhawk(camera, force_setup=force_setup),
+            QtCore.Qt.QueuedConnection,
         )
 
     def disconnect_mavlink_pixhawk(self, camera: str | None = None) -> None:
@@ -957,6 +969,11 @@ class DeviceRuntimeController:
         if subscriber is None:
             self._finish_pixhawk_disconnect(camera, target_sides)
             return
+        if not getattr(subscriber, "connections", {}):
+            # No transport can block, so avoid creating a QThread that the
+            # retryable shutdown path would otherwise have to wait for.
+            self._finish_pixhawk_disconnect(camera, target_sides)
+            return
         # ``subscriber.stop()`` closes the underlying serial/socket connection,
         # which can block for as long as an in-flight shell/parameter worker
         # holds a concurrent blocking read on the same connection (they share
@@ -969,16 +986,21 @@ class DeviceRuntimeController:
         thread.started.connect(worker.run)
         worker.completed.connect(
             lambda _result, camera=camera, target_sides=target_sides:
-            self._finish_pixhawk_disconnect(camera, target_sides)
+            self._finish_pixhawk_disconnect(camera, target_sides),
+            QtCore.Qt.QueuedConnection,
         )
         worker.failed.connect(
             lambda error, camera=camera, target_sides=target_sides:
-            self._finish_pixhawk_disconnect(camera, target_sides, error=error)
+            self._finish_pixhawk_disconnect(camera, target_sides, error=error),
+            QtCore.Qt.QueuedConnection,
         )
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._clear_pixhawk_disconnection_worker)
+        thread.finished.connect(
+            self._clear_pixhawk_disconnection_worker,
+            QtCore.Qt.QueuedConnection,
+        )
         self.panel.pixhawk_disconnection_thread = thread
         self.panel.pixhawk_disconnection_worker = worker
         thread.start()
@@ -1205,25 +1227,19 @@ class DeviceRuntimeController:
 
     def _persistent_pixhawk_net_cfg_text(self, camera: str) -> str:
         setup = self.panel._persistent_pixhawk_eth_setup(camera)
-        return "\n".join(
-            (
-                "DEVICE=eth0",
-                "BOOTPROTO=static",
-                "NETMASK=255.255.255.0",
-                f"IPADDR={setup['eth_ip']}",
-                f"ROUTER={setup['host_ip']}",
-            )
-        ) + "\n"
+        return "\n".join(setup["net_cfg_lines"]) + "\n"
 
     def _persistent_pixhawk_eth_setup(self, camera: str) -> dict[str, object]:
         if camera == "left":
             eth_ip = self.panel.left_pixhawk_eth_ip_edit.text().strip()
             mavlink_url = self.panel.left_mavlink_url_edit.text().strip()
             mavlink_default_port = 14550
+            mavlink_system_id = 1
         elif camera == "right":
             eth_ip = self.panel.right_pixhawk_eth_ip_edit.text().strip()
             mavlink_url = self.panel.right_mavlink_url_edit.text().strip()
             mavlink_default_port = 14551
+            mavlink_system_id = 2
         else:
             raise ValueError(f"Unknown Pixhawk side: {camera}")
         host_ip = self.panel._pixhawk_host_ip_for_mavlink()
@@ -1233,25 +1249,34 @@ class DeviceRuntimeController:
         ifup_cmd = "ifup eth0"
         ifconfig_cmd = f"ifconfig eth0 {eth_ip} netmask 255.255.255.0 up"
         mavlink_port = self.panel._mavlink_stream_port(mavlink_url, default=mavlink_default_port)
-        mavlink_stop_cmd = f"mavlink stop -u {mavlink_port}"
-        mavlink_start_cmd = (
-            f"mavlink start -x -u {mavlink_port} -o {mavlink_port} "
-            f"-t {host_ip} -r {self.panel.mavlink_stream_rate_spin.value()} -m normal"
-        )
-        # Workstation owns only the Ethernet MAVLink path. PX4 starts the
-        # configured MAVLink instance from MAV_2_CONFIG after reboot; extras
-        # only brings the network interface up and assigns its static address.
-        param_lines = ["param set MAV_2_CONFIG 1000"]
+        mavlink_rate = self.panel.mavlink_stream_rate_spin.value()
+        param_lines = [
+            f"param set MAV_SYS_ID {mavlink_system_id}",
+            "param set MAV_2_CONFIG 1000",
+            "param set MAV_2_MODE 0",
+            "param set MAV_2_BROADCAST 1",
+            f"param set MAV_2_REMOTE_PRT {mavlink_port}",
+            f"param set MAV_2_UDP_PRT {mavlink_port}",
+            f"param set MAV_2_RATE {mavlink_rate}",
+        ]
+        # rc.serial owns the one MAVLink instance through MAV_2_CONFIG.
+        # extras.txt only establishes the board-specific Ethernet interface.
         extras_lines = [ifup_cmd, ifconfig_cmd]
+        net_cfg_lines = [
+            "DEVICE=eth0",
+            "BOOTPROTO=static",
+            "NETMASK=255.255.255.0",
+            f"IPADDR={eth_ip}",
+            f"ROUTER={host_ip}",
+        ]
         return {
             "eth_ip": eth_ip,
             "host_ip": host_ip,
             "ifup_cmd": ifup_cmd,
             "ifconfig_cmd": ifconfig_cmd,
-            "mavlink_stop_cmd": mavlink_stop_cmd,
-            "mavlink_start_cmd": mavlink_start_cmd,
             "param_lines": param_lines,
             "extras_lines": extras_lines,
+            "net_cfg_lines": net_cfg_lines,
         }
 
     def _start_pixhawk_shell_worker(

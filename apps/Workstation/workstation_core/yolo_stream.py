@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import multiprocessing
 import math
@@ -43,7 +44,7 @@ DEFAULT_CPU_WORKER_THREADS = 4
 DEFAULT_CUDA_WORKER_THREADS = 1
 DEFAULT_EVENT_QUEUE_SIZE = 128
 DEFAULT_FRAME_QUEUE_SIZE = 2
-DEFAULT_RTSP_FRAME_TIMEOUT_S = 5.0
+DEFAULT_RTSP_FRAME_TIMEOUT_S = 12.0
 YOLO_INPUT_SIZE_STRIDE = 32
 DECODER_AUTO = "auto"
 DECODER_NVIDIA = "nvidia"
@@ -71,6 +72,39 @@ MAX_RTCP_RATE_SAMPLES = 12
 DEFAULT_RECORD_VIDEO_QUEUE_SIZE = 300
 MAX_RTCP_SR_PC_OFFSET_S = 0.5
 GST_RTSP_RECONNECT_DELAYS_S = (1.0, 2.0, 4.0, 8.0)
+_LINUX_PR_SET_PDEATHSIG = 1
+
+
+def _arm_linux_parent_death_signal() -> bool:
+    """Terminate a camera child if its Workstation parent disappears.
+
+    Normal shutdown still uses the cooperative stop event. This Linux-only
+    guard covers Force Quit, SIGKILL, and crashes where Python cannot run the
+    QThread/multiprocessing cleanup path. The second getppid check closes the
+    race where the parent exits immediately before ``prctl`` is installed.
+    """
+
+    if not sys.platform.startswith("linux"):
+        return False
+    parent_pid = os.getppid()
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+        prctl.argtypes = (
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+        )
+        prctl.restype = ctypes.c_int
+        if prctl(_LINUX_PR_SET_PDEATHSIG, int(signal.SIGTERM), 0, 0, 0) != 0:
+            return False
+    except (AttributeError, OSError):
+        return False
+    if os.getppid() != parent_pid:
+        os._exit(128 + int(signal.SIGTERM))
+    return True
 
 
 @dataclass(frozen=True)
@@ -2393,6 +2427,7 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
 
 
 def _run_yolo_process(config: dict[str, Any], output_queue, stop_event) -> None:
+    _arm_linux_parent_death_signal()
     enable_detection = bool(config.get("enable_detection", True))
     thread_count = _worker_cpu_threads(config)
     _configure_worker_thread_environment(thread_count)

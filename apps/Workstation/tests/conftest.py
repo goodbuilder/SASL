@@ -22,6 +22,30 @@ APPS_ROOT = REPOSITORY_ROOT / "apps"
 STEREO_WIRIS_ROOT = APPS_ROOT / "StereoWIRIS"
 COMMON_PYTHON_ROOT = REPOSITORY_ROOT / "common" / "python"
 
+collect_ignore = []
+if os.environ.get("WORKSTATION_RUN_LOCAL_PHOTO_REGRESSION") != "1":
+    collect_ignore.append("test_optical_pose_mountain_real_photo_regression.py")
+
+_LOCAL_TEST_FILES = {
+    "test_optical_pose_mountain_real_photo_regression.py",
+}
+_INTEGRATION_NAME_PARTS = (
+    "_integration",
+    "_end_to_end",
+    "_ui",
+    "_workspace",
+    "_lifecycle",
+    "_review",
+    "_session_controller",
+    "_session_persistence",
+    "_owned_workflow",
+)
+_INTEGRATION_TEST_FILES = {
+    "test_panel_delegate_bindings.py",
+    "test_rtcm_pipeline_workers.py",
+    "test_runtime_closure.py",
+}
+
 for path in (REPOSITORY_ROOT, APPS_ROOT, COMMON_PYTHON_ROOT, STEREO_WIRIS_ROOT):
     path_text = str(path)
     if path_text not in sys.path:
@@ -29,6 +53,30 @@ for path in (REPOSITORY_ROOT, APPS_ROOT, COMMON_PYTHON_ROOT, STEREO_WIRIS_ROOT):
 
 
 _QAPPLICATION_REFERENCES: list[object] = []
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line("markers", "unit: isolated logic or component contract test")
+    config.addinivalue_line("markers", "integration: cross-layer, UI, persistence, or worker handoff test")
+    config.addinivalue_line("markers", "local: opt-in test requiring machine-local assets or capabilities")
+
+
+def _test_layer(path: Path) -> str:
+    name = path.name
+    if name in _LOCAL_TEST_FILES:
+        return "local"
+    if (
+        name.startswith("test_workstation_")
+        or name in _INTEGRATION_TEST_FILES
+        or any(part in name for part in _INTEGRATION_NAME_PARTS)
+    ):
+        return "integration"
+    return "unit"
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    for item in items:
+        item.add_marker(getattr(pytest.mark, _test_layer(Path(str(item.fspath)))))
 
 
 @pytest.fixture(scope="session", autouse=True)

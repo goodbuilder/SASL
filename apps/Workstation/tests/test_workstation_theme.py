@@ -16,11 +16,13 @@ def _is_neutral_or_red(value: str) -> bool:
     return saturation < 0.04 or hue < 0.04 or hue > 0.96
 
 
-def _hex_colors_under(*roots: Path) -> set[str]:
+def _hex_colors_under(root: Path) -> set[str]:
     return {
         match.group(0).lower()
-        for root in roots
         for source_path in root.rglob("*.py")
+        if not {"tests", "tools", ".venv", "__pycache__"}.intersection(
+            source_path.relative_to(root).parts
+        )
         for match in HEX_COLOR_RE.finditer(source_path.read_text(encoding="utf-8"))
     }
 
@@ -37,8 +39,8 @@ def test_workstation_theme_palette_is_neutral_or_red() -> None:
 
 
 def test_workstation_python_color_literals_are_neutral_or_red() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    colors = _hex_colors_under(repo_root / "Workstation", repo_root / "Workstation" / "workstation_core")
+    workstation_root = Path(__file__).resolve().parents[1]
+    colors = _hex_colors_under(workstation_root)
 
     assert colors
     assert all(_is_neutral_or_red(value) for value in colors), sorted(colors)

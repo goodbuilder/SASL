@@ -1,9 +1,8 @@
-"""Append-only run identity and session-owned evidence artifacts.
+"""Append-only session evidence and session-owned artifacts.
 
 This module owns no camera, MAVLink, or UI worker.  It provides the durable
 boundary those producers use so an external analysis application can join
-evidence by ``experiment_id``/``run_id``/``condition_id`` and verify the
-actual bytes by SHA-256.
+evidence by ``session_id`` and verify the actual bytes by SHA-256.
 
 Coordinate contract
 -------------------
@@ -22,7 +21,6 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -31,17 +29,12 @@ from Workstation.workstation_core.strict_jsonl import (
     prepare_jsonl_append,
 )
 
-RUN_SETUP_SCHEMA = "workstation-run-setup-v1"
-RUN_EVENT_SCHEMA = "workstation-run-event-v1"
+
+RUN_EVENT_SCHEMA = "workstation-run-event-v2"
 ARTIFACT_SCHEMA = "workstation-session-artifact-v1"
-SESSION_MANIFEST_SCHEMA = "session-manifest-v3"
+SESSION_MANIFEST_SCHEMA = "session-manifest-v4"
 
 _SAFE_COMPONENT = re.compile(r"[^A-Za-z0-9._-]+")
-
-
-class RunMode(str, Enum):
-    DRONE = "drone"
-    UAM = "uam"
 
 
 def _required_identifier(value: object, name: str) -> str:
@@ -97,73 +90,6 @@ def sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
 
 
 @dataclass(frozen=True)
-class RunSetup:
-    experiment_id: str
-    run_id: str
-    condition_id: str
-    mode: RunMode | str
-    condition: tuple[tuple[str, Any], ...] = ()
-    requested_zoom_left: int | None = None
-    requested_zoom_right: int | None = None
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "experiment_id", _required_identifier(self.experiment_id, "experiment_id"))
-        object.__setattr__(self, "run_id", _required_identifier(self.run_id, "run_id"))
-        object.__setattr__(self, "condition_id", _required_identifier(self.condition_id, "condition_id"))
-        object.__setattr__(self, "mode", RunMode(str(getattr(self.mode, "value", self.mode)).lower()))
-        condition = tuple(sorted((str(key), _json_safe(value)) for key, value in self.condition))
-        object.__setattr__(self, "condition", condition)
-        for name in ("requested_zoom_left", "requested_zoom_right"):
-            value = getattr(self, name)
-            if value is not None:
-                integer = int(value)
-                if integer < 0:
-                    raise ValueError(f"{name} must be >= 0")
-                object.__setattr__(self, name, integer)
-
-    @classmethod
-    def from_mapping(cls, values: Mapping[str, Any]) -> "RunSetup":
-        condition = values.get("condition")
-        if isinstance(condition, Mapping):
-            condition_items = tuple((str(key), value) for key, value in condition.items())
-        else:
-            condition_items = tuple(condition or ())
-        return cls(
-            experiment_id=str(values.get("experiment_id") or ""),
-            run_id=str(values.get("run_id") or ""),
-            condition_id=str(values.get("condition_id") or ""),
-            mode=str(values.get("mode") or ""),
-            condition=condition_items,
-            requested_zoom_left=values.get("requested_zoom_left"),
-            requested_zoom_right=values.get("requested_zoom_right"),
-        )
-
-    def to_mapping(self) -> dict[str, Any]:
-        return {
-            "schema": RUN_SETUP_SCHEMA,
-            "experiment_id": self.experiment_id,
-            "run_id": self.run_id,
-            "condition_id": self.condition_id,
-            "mode": self.mode.value,
-            "condition": {key: value for key, value in self.condition},
-            "requested_zoom_left": self.requested_zoom_left,
-            "requested_zoom_right": self.requested_zoom_right,
-            "condition_signature_sha256": self.condition_signature_sha256,
-        }
-
-    @property
-    def condition_signature_sha256(self) -> str:
-        payload = {
-            "condition_id": self.condition_id,
-            "mode": self.mode.value,
-            "condition": {key: value for key, value in self.condition},
-            "requested_zoom_left": self.requested_zoom_left,
-            "requested_zoom_right": self.requested_zoom_right,
-        }
-        return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
-
-
-@dataclass(frozen=True)
 class ArtifactRecord:
     artifact_id: str
     role: str
@@ -196,10 +122,9 @@ class RunEvidenceLedger:
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
-        self._setup_path = self.root / "run_setup.json"
+        self.session_id = _required_identifier(self.root.name, "session_id")
         self._events_path = self.root / "run_events.jsonl"
         self._artifacts_path = self.root / "artifacts.jsonl"
-        self._setup: RunSetup | None = self._load_setup()
         self._ledger_recovery = {
             "run_events": prepare_jsonl_append(self._events_path),
             "artifacts": prepare_jsonl_append(self._artifacts_path),
@@ -207,20 +132,8 @@ class RunEvidenceLedger:
         self._locked = self._events_path.exists() and self._events_path.stat().st_size > 0
 
     @property
-    def setup(self) -> RunSetup | None:
-        return self._setup
-
-    @property
     def locked(self) -> bool:
         return self._locked
-
-    def apply_setup(self, setup: RunSetup | Mapping[str, Any]) -> RunSetup:
-        if self._locked:
-            raise RuntimeError("run setup is locked after the first evidence event")
-        resolved = setup if isinstance(setup, RunSetup) else RunSetup.from_mapping(setup)
-        self._atomic_write_json(self._setup_path, resolved.to_mapping())
-        self._setup = resolved
-        return resolved
 
     def append_event(
         self,
@@ -231,18 +144,13 @@ class RunEvidenceLedger:
         source_timestamp_ns: int | None = None,
         coordinate_contract: str = "not_applicable",
     ) -> dict[str, Any]:
-        setup = self._require_setup()
         event_name = _required_identifier(event_type, "event_type")
         now_utc_ns = time.time_ns()
         event = {
             "schema": RUN_EVENT_SCHEMA,
             "event_id": str(uuid.uuid4()),
             "event_type": event_name,
-            "experiment_id": setup.experiment_id,
-            "run_id": setup.run_id,
-            "condition_id": setup.condition_id,
-            "mode": setup.mode.value,
-            "condition_signature_sha256": setup.condition_signature_sha256,
+            "session_id": self.session_id,
             "source": str(source),
             "source_timestamp_ns": None if source_timestamp_ns is None else int(source_timestamp_ns),
             "receive_utc_ns": now_utc_ns,
@@ -262,7 +170,6 @@ class RunEvidenceLedger:
         media_type: str = "application/octet-stream",
         metadata: Mapping[str, Any] | None = None,
     ) -> ArtifactRecord:
-        setup = self._require_setup()
         source = Path(source_path).expanduser().resolve(strict=True)
         if not source.is_file():
             raise ValueError("artifact source must be a regular file")
@@ -343,7 +250,6 @@ class RunEvidenceLedger:
         atomically sealed their output below this ledger's session root.
         """
 
-        self._require_setup()
         raw_path = Path(session_path).expanduser()
         candidate = raw_path if raw_path.is_absolute() else self.root / raw_path
         source = candidate.resolve(strict=True)
@@ -505,11 +411,10 @@ class RunEvidenceLedger:
         return tuple(records)
 
     def manifest_snapshot(self) -> dict[str, Any]:
-        setup = self._require_setup()
         artifacts = self.artifacts()
         return {
             "schema": SESSION_MANIFEST_SCHEMA,
-            "run_setup": setup.to_mapping(),
+            "session_id": self.session_id,
             "locked": self._locked,
             "event_log": {
                 "path": self._events_path.relative_to(self.root).as_posix(),
@@ -517,17 +422,6 @@ class RunEvidenceLedger:
             },
             "artifacts": [record.to_mapping() for record in artifacts],
         }
-
-    def _require_setup(self) -> RunSetup:
-        if self._setup is None:
-            raise RuntimeError("run setup must be applied before recording evidence")
-        return self._setup
-
-    def _load_setup(self) -> RunSetup | None:
-        if not self._setup_path.exists():
-            return None
-        with self._setup_path.open("r", encoding="utf-8") as handle:
-            return RunSetup.from_mapping(json.load(handle))
 
     @staticmethod
     def _append_json_line(path: Path, value: Mapping[str, Any]) -> None:
@@ -564,10 +458,7 @@ __all__ = [
     "ARTIFACT_SCHEMA",
     "ArtifactRecord",
     "RUN_EVENT_SCHEMA",
-    "RUN_SETUP_SCHEMA",
     "RunEvidenceLedger",
-    "RunMode",
-    "RunSetup",
     "SESSION_MANIFEST_SCHEMA",
     "canonical_json_bytes",
     "sha256_file",

@@ -95,6 +95,37 @@ def test_capture_purpose_and_host_request_delta_are_append_only(
         controller.capture_pnp_hr_photos("training")
 
 
+def test_pre_capture_lazily_prepares_measurement_but_post_does_not_create_one(
+    tmp_path: Path,
+) -> None:
+    panel = _panel(tmp_path, session_id="parent-session")
+    package = {"state": "IDLE"}
+    begin_calls: list[str] = []
+    panel._measurement_package_explicit_lifecycle = True
+    panel._measurement_id = ""
+    panel.measurement_package_snapshot = lambda: dict(package)
+
+    def begin_measurement() -> bool:
+        begin_calls.append("measurement.begin")
+        panel._measurement_id = "m000001"
+        package["state"] = "COLLECTING"
+        return True
+
+    panel.begin_measurement = begin_measurement
+    controller = RecordingController(panel)
+    panel._append_pnp_photo_capture_record = controller._append_pnp_photo_capture_record
+
+    # Missing camera hosts keep the test hardware-free after the ownership
+    # boundary has been created and recorded.
+    assert controller.capture_pnp_hr_photos("pre") is False
+    assert begin_calls == ["measurement.begin"]
+    assert panel.pnp_photo_capture_records[-1]["measurement_id"] == "m000001"
+
+    package["state"] = "SEALED_COMPLETE"
+    assert controller.capture_pnp_hr_photos("post") is False
+    assert begin_calls == ["measurement.begin"]
+
+
 def test_completed_capture_records_signed_right_minus_left_request_delta(
     tmp_path: Path,
 ) -> None:

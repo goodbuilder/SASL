@@ -51,6 +51,7 @@ def _gps_state(
     *,
     timestamp_s: float,
     longitude_deg: float = 127.0,
+    fix_type: int = 6,
 ) -> GpsPositionState:
     return GpsPositionState(
         camera=side,
@@ -60,7 +61,7 @@ def _gps_state(
         latitude_deg=37.0,
         longitude_deg=longitude_deg,
         altitude_m=100.0,
-        fix_type=6,
+        fix_type=fix_type,
     )
 
 
@@ -536,7 +537,7 @@ def test_field_live_readiness_accepts_same_measurement_stale_samples(monkeypatch
     assert "fix quality low" in advisories
 
 
-def test_field_live_readiness_rejects_samples_from_before_measurement(monkeypatch) -> None:
+def test_field_live_readiness_reuses_valid_gps_from_before_measurement(monkeypatch) -> None:
     monkeypatch.setattr("Workstation.measurement_view_controller.time.monotonic", lambda: 100.0)
     left_gps = _gps_state("left", timestamp_s=80.0)
     right_gps = _gps_state("right", timestamp_s=80.1, longitude_deg=127.00001)
@@ -552,13 +553,43 @@ def test_field_live_readiness_rejects_samples_from_before_measurement(monkeypatc
         gnss_operation_gate_active=False,
     )
 
-    pixhawk_ready, gnss_ready, hard, _advisories = MeasurementViewController(
+    pixhawk_ready, gnss_ready, hard, advisories = MeasurementViewController(
         panel
     )._measurement_live_readiness()
 
     assert pixhawk_ready is False
-    assert gnss_ready is False
-    assert any("not received in current Measurement" in reason for reason in hard)
+    assert gnss_ready is True
+    assert all("GNSS" not in reason for reason in hard)
+    assert any("latest valid 3D fix" in warning for warning in advisories)
+
+
+def test_measurement_gps_cache_updates_sides_independently_and_ignores_sub_3d_fix() -> None:
+    current = {
+        "left": _gps_state("left", timestamp_s=10.0),
+        "right": _gps_state(
+            "right", timestamp_s=10.0, longitude_deg=127.00001
+        ),
+    }
+    panel = SimpleNamespace(
+        _selected_baseline_gps_states=lambda: (current["left"], current["right"]),
+    )
+    controller = MeasurementViewController(panel)
+
+    first_left, first_right, first_reused = controller._cached_measurement_gps_states()
+    current["left"] = _gps_state("left", timestamp_s=11.0, longitude_deg=127.00002)
+    current["right"] = _gps_state(
+        "right",
+        timestamp_s=12.0,
+        longitude_deg=127.00003,
+        fix_type=2,
+    )
+    second_left, second_right, second_reused = controller._cached_measurement_gps_states()
+
+    assert first_reused == ()
+    assert second_left is current["left"]
+    assert second_right is first_right
+    assert second_left is not first_left
+    assert second_reused == ("right_gps",)
 
 
 def test_profile_sha_evidence_is_required_for_candidate_geometry() -> None:
@@ -574,11 +605,83 @@ def test_profile_sha_evidence_is_required_for_candidate_geometry() -> None:
         if row.instance_id == "candidate:mountain-1"
     )
 
-    assert status.ready is True
-    assert "candidate operating K,D profile SHA-256 missing" in status.warnings
+    assert status.ready is False
+    assert "optical pose candidate not applied" in status.reasons
+    assert "candidate operating K,D profile SHA-256 missing" in status.reasons
 
 
-def test_valid_exact_kd_keeps_cross_zoom_rt_geometry_ready() -> None:
+def test_unapplied_candidate_with_stale_kd_cannot_be_measurement_fallback() -> None:
+    controller = _method_readiness_controller(
+        geometry_allowed=True,
+        profile_hash="b" * 64,
+        candidate_profile_hash="a" * 64,
+    )
+
+    status = next(
+        row
+        for row in controller._measurement_method_statuses()
+        if row.instance_id == "candidate:mountain-1"
+    )
+
+    assert status.ready is False
+    assert "optical pose candidate not applied" in status.reasons
+    assert "candidate K,D differs from active K,D" in status.reasons
+    assert "candidate K,D differs from active K,D" not in status.warnings
+
+
+def test_applied_candidate_becomes_unready_if_active_kd_changes() -> None:
+    controller = _method_readiness_controller(
+        geometry_allowed=True,
+        profile_hash="b" * 64,
+        candidate_profile_hash="a" * 64,
+    )
+    owner = controller.panel._optical_pose_controller()
+    owner._active_selection = SimpleNamespace(
+        candidate_id="mountain-1",
+        selected_dofs=SimpleNamespace(
+            selected_names=(
+                "roll_deg",
+                "pitch_deg",
+                "yaw_deg",
+                "north_m",
+                "east_m",
+                "down_m",
+            )
+        ),
+    )
+
+    status = next(
+        row
+        for row in controller._measurement_method_statuses()
+        if row.instance_id == "candidate:mountain-1"
+    )
+
+    assert status.ready is False
+    assert "optical pose candidate not applied" not in status.reasons
+    assert "candidate K,D differs from active K,D" in status.reasons
+
+
+def test_unapplied_checkerboard_profile_is_not_measurement_ready() -> None:
+    controller = _method_readiness_controller(
+        geometry_allowed=True,
+        profile_hash="b" * 64,
+        candidate_profile_hash="b" * 64,
+    )
+    panel = controller.panel
+    panel.checkerboard_extrinsics_candidate_profile = panel.checkerboard_extrinsics_profile
+    panel.checkerboard_extrinsics_profile = None
+
+    status = next(
+        row
+        for row in controller._measurement_method_statuses()
+        if row.method_id == CHECKERBOARD_STEREO
+    )
+
+    assert status.ready is False
+    assert status.reasons == ("checkerboard stereo R,t candidate not applied",)
+
+
+def test_valid_exact_kd_keeps_only_applied_geometry_profiles_ready() -> None:
     profile_hash = "e" * 64
     controller = _method_readiness_controller(
         geometry_allowed=True,
@@ -596,8 +699,14 @@ def test_valid_exact_kd_keeps_cross_zoom_rt_geometry_ready() -> None:
     selected = [row for row in statuses if row.instance_id in expected_instances]
 
     assert {row.instance_id for row in selected} == expected_instances
-    assert all(row.ready is True for row in selected)
-    assert all(row.reasons == () for row in selected)
+    readiness = {row.instance_id: row for row in selected}
+    assert readiness["live:pixhawk-rtk"].ready is True
+    assert readiness["profile:checkerboard-3x"].ready is True
+    assert readiness["profile:optical-3x"].ready is True
+    assert readiness["candidate:mountain-1"].ready is False
+    assert readiness["candidate:mountain-1"].reasons == (
+        "optical pose candidate not applied",
+    )
     assert next(
         row for row in selected if row.instance_id == "profile:checkerboard-3x"
     ).geometry_sha256 != "c" * 64

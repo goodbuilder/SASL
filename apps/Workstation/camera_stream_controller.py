@@ -75,6 +75,42 @@ class CameraStreamLifecycleController:
     def _uses_explicit_package_lifecycle(self) -> bool:
         return bool(getattr(self.panel, "_measurement_package_explicit_lifecycle", False))
 
+    def _prepare_package_for_detection(self, state: str) -> bool:
+        """Create the next child lazily when the operator starts measuring."""
+
+        if state == "COLLECTING":
+            return True
+        if state not in {"IDLE", "SEALED_COMPLETE", "SEALED_INCOMPLETE"}:
+            return False
+        starter = getattr(self.panel, "begin_measurement", None)
+        if not callable(starter):
+            starter = getattr(self.panel, "begin_next_measurement", None)
+        if not callable(starter):
+            self.panel._log(
+                "[YOLO] 측정 시작이 차단되었습니다: Measurement 생성 owner를 사용할 수 없습니다."
+            )
+            return False
+        try:
+            started = starter()
+        except Exception as exc:
+            self.panel._log(f"[YOLO] 새 Measurement 생성 실패: {exc}")
+            return False
+        if started is False:
+            reader = getattr(self.panel, "measurement_package_snapshot", None)
+            try:
+                snapshot = reader() if callable(reader) else {}
+            except Exception:
+                snapshot = {}
+            detail = (
+                str(snapshot.get("error") or snapshot.get("detail") or "")
+                if isinstance(snapshot, Mapping)
+                else ""
+            )
+            suffix = f" · {detail}" if detail else ""
+            self.panel._log(f"[YOLO] 새 Measurement 생성이 거부되었습니다{suffix}")
+            return False
+        return self._measurement_package_state() == "COLLECTING"
+
     def _reserve_package_detection(self) -> bool:
         state = self._measurement_package_state()
         package_active = state != "IDLE"
@@ -89,9 +125,11 @@ class CameraStreamLifecycleController:
         if not self._uses_explicit_package_lifecycle() and not package_active:
             # Compatibility for bare controller callers and older automation.
             return True
+        if self._uses_explicit_package_lifecycle() and not self._prepare_package_for_detection(state):
+            return False
         starter = getattr(self.panel, "begin_measurement_detection", None)
         if not callable(starter):
-            self.panel._log("[YOLO] Start Session/New Measurement가 필요합니다: package controller unavailable")
+            self.panel._log("[YOLO] 측정 시작이 차단되었습니다: Detection owner를 사용할 수 없습니다.")
             return False
         return bool(starter())
 
@@ -124,7 +162,9 @@ class CameraStreamLifecycleController:
         if not self._detection_inputs_valid():
             return False
         if not self._reserve_package_detection():
-            self.panel._log("[YOLO] Detection 시작이 차단되었습니다. Start Session 후 New Measurement를 실행하세요.")
+            self.panel._log(
+                "[YOLO] 측정 시작이 차단되었습니다. Session 상태와 이전 Measurement 저장 상태를 확인하세요."
+            )
             return False
         if not self.panel._session_recording_active():
             try:
@@ -164,9 +204,8 @@ class CameraStreamLifecycleController:
         self.panel._log("[YOLO] 검출을 중지하고 카메라 프리뷰만 유지합니다.")
         self._complete_package_detection()
         if bool(getattr(self.panel, "_automatic_session_recording", False)):
-            # Detection stop closes writers and starts the existing session
-            # persistence flow, but package sealing remains a separate,
-            # explicit Finalize action after post evidence is collected.
+            # Measurement stop closes writers; the package controller's
+            # completion path owns automatic persistence and sealing.
             self.panel.stop_yolo_streams()
             if self.panel._session_recording_active():
                 return
@@ -404,6 +443,20 @@ class CameraStreamLifecycleController:
         pixhawk_stopped = self.panel._stop_pixhawk_operation_workers(wait=wait)
         if pixhawk_stopped and self.panel.mavlink_pixhawk is not None:
             self.panel.disconnect_mavlink_pixhawk()
+            # disconnect_mavlink_pixhawk() may complete synchronously when no
+            # transport is open.  Otherwise closeEvent must retry until the
+            # new disconnect worker and any retired RTCM worker are finished.
+            pixhawk_stopped = bool(
+                self.panel.mavlink_pixhawk is None
+                and self.panel.pixhawk_disconnection_thread is None
+                and self.panel.pixhawk_rtcm_thread is None
+            )
+        disconnection_thread = self.panel.pixhawk_disconnection_thread
+        if disconnection_thread is not None and disconnection_thread.isRunning():
+            pixhawk_stopped = False
+        rtcm_thread = self.panel.pixhawk_rtcm_thread
+        if rtcm_thread is not None and rtcm_thread.isRunning():
+            pixhawk_stopped = False
         preview_stopped = self.panel._stop_calibration_preview_worker(wait=wait)
         all_stopped = bool(camera_stopped and pixhawk_stopped and preview_stopped)
         for attr in (

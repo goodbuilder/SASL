@@ -21,6 +21,14 @@ import time
 from typing import Any, Mapping
 
 
+# Deployment defaults requested for the Workstation's NGII NTRIP account.
+# The username is ordinary settings data.  The password is imported only by
+# the two masked, session-memory UI fields; it is deliberately not a
+# NetworkConfig field and therefore cannot enter settings or evidence JSON.
+DEFAULT_NTRIP_USERNAME = "SASL"
+DEFAULT_NTRIP_SESSION_PASSWORD = "ngii"
+
+
 class GnssOperationMode(str, Enum):
     LOCAL_SURVEY_IN = "LOCAL_SURVEY_IN"
     NETWORK_ASSISTED_FIXED_BASE = "NETWORK_ASSISTED_FIXED_BASE"
@@ -226,7 +234,7 @@ class NetworkConfig:
     # The password never gets a field here -- it only ever lives in the OS
     # keyring (ntrip_credentials.py) or the current process's memory; see
     # gnss_runtime_controller._resolve_ntrip_credentials for the lookup order.
-    username: str = ""
+    username: str = DEFAULT_NTRIP_USERNAME
     # Legacy indirection: the *names* of OS environment variables holding
     # credentials, kept only so settings files written before the direct
     # Username/Password UI still authenticate. New configuration should leave
@@ -392,11 +400,12 @@ class GnssOperationConfig:
     def ngii_rts2_base_assisted(cls) -> "GnssOperationConfig":
         """Return the field profile for the NGII RTS2 Base-assisted workflow.
 
-        The profile contains only non-secret provider and routing metadata.
-        NTRIP credentials remain environment-variable references and are never
-        persisted in the settings JSON.  Readiness remains observable in the
-        GNSS UI, but it is deliberately not a measurement gate for this field
-        workflow.
+        The profile contains provider/routing metadata and the non-secret
+        deployment username.  The deployment password is supplied separately
+        as a masked session UI default and is never a NetworkConfig/settings
+        field.  Legacy credential environment-variable references remain
+        available.  Readiness remains observable in the GNSS UI, but it is
+        deliberately not a measurement gate for this field workflow.
         """
 
         return cls(

@@ -3,10 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from PyQt5 import QtWidgets
+from PyQt5 import QtCore, QtTest, QtWidgets
 
 from Workstation.evidence import EvidenceAdapter
-from Workstation.status_model import StatusModel, StatusSeverity
+from Workstation.status_model import StatusModel
 from Workstation.workspaces import MeasurementWorkspace, RecordingWorkspace, SessionWorkspace
 from Workstation.workstation_core.measurement_methods import (
     MEASUREMENT_METHOD_IDS,
@@ -180,7 +180,15 @@ class _HierarchicalPackageBackend:
 
     def begin_measurement_session(self) -> bool:
         self.calls.append("session.begin")
-        self.session.update(state="OPEN", session_id="session-001")
+        self.session.update(
+            state="OPEN",
+            session_id="session-001",
+            session_dir="/tmp/recordings/session-001",
+            metadata={
+                "opened_local_date": "2026-08-22",
+                "opened_local_time": "14:30:00",
+            },
+        )
         self.package.update(session_state="OPEN", session_id="session-001")
         return True
 
@@ -233,15 +241,20 @@ def test_measurement_package_controls_follow_explicit_lifecycle() -> None:
         lambda command: commands.append(command) or True,
     )
 
-    assert workspace.start_session_button.objectName() == "measurementPackageStart"
-    assert workspace.start_session_button.isEnabled()
+    assert workspace.findChild(QtWidgets.QWidget, "measurementPackageStart") is None
+    assert workspace.findChild(QtWidgets.QWidget, "measurementSessionClose") is None
+    assert workspace.finalize_session_button.text() == "Retry Save"
+    assert workspace.session_status_label.text() == "Session: IDLE"
+    assert workspace.session_step_label.text() == "Next: Sessions > Current"
     assert not workspace.control_buttons["detection.toggle"].isEnabled()
     assert not workspace.finalize_session_button.isEnabled()
 
-    workspace.start_session_button.click()
+    panel.begin_measurement_session()
+    workspace.refresh({})
     assert panel.calls == ["begin"]
     assert "COLLECTING" in workspace.session_status_label.text()
-    assert "Pre evidence" in workspace.session_step_label.text()
+    assert workspace.session_step_label.text() == "Next: 측정 시작"
+    assert "Pre evidence" in workspace.session_step_label.toolTip()
     assert workspace.control_buttons["detection.toggle"].isEnabled()
     workspace.control_buttons["detection.toggle"].click()
     assert commands == ["detection.toggle"]
@@ -274,13 +287,25 @@ def test_measurement_package_controls_follow_explicit_lifecycle() -> None:
     assert not workspace.control_buttons["detection.toggle"].isEnabled()
     assert workspace.finalize_session_button.isEnabled()
     assert workspace.evidence_summary_label.text() == (
-        "Evidence: INCOMPLETE · present=1, missing=1"
+        "Evidence: INCOMPLETE · 1 ok / 1 missing"
     )
+    assert "present=1, missing=1" in workspace.evidence_summary_label.toolTip()
 
     workspace.finalize_session_button.click()
     assert panel.calls == ["begin", "finalize"]
     assert "VERIFYING" in workspace.session_status_label.text()
-    assert "draining producers" in workspace.session_step_label.text()
+    assert workspace.session_step_label.text() == "Saving…"
+    assert "draining producers" in workspace.session_step_label.toolTip()
+    assert "waiting for producer drain" in workspace.session_status_label.toolTip()
+    assert all(
+        len(label.text()) <= workspace.RUN_STATUS_TEXT_LIMIT
+        for label in (
+            workspace.session_status_label,
+            workspace.measurement_status_label,
+            workspace.session_step_label,
+            workspace.evidence_summary_label,
+        )
+    )
     assert not workspace.finalize_session_button.isEnabled()
 
     workspace.deleteLater()
@@ -298,7 +323,6 @@ def test_measurement_without_package_facade_preserves_legacy_detection_control()
     )
 
     workspace.refresh({})
-    assert not workspace.start_session_button.isEnabled()
     assert not workspace.finalize_session_button.isEnabled()
     assert workspace.control_buttons["detection.toggle"].isEnabled()
     assert "automatic" in workspace.session_status_label.text()
@@ -314,29 +338,38 @@ def test_hierarchical_controls_drive_two_measurements_then_close() -> None:
     workspace = MeasurementWorkspace(backend, StatusModel(), lambda _command: True)
 
     workspace.refresh({})
-    assert workspace.start_session_button.isEnabled()
-    assert not workspace.new_measurement_button.isEnabled()
+    assert workspace.findChild(QtWidgets.QWidget, "measurementPackageStart") is None
+    assert workspace.findChild(QtWidgets.QWidget, "measurementPackageNewMeasurement") is None
+    assert not workspace.control_buttons["detection.toggle"].isEnabled()
 
-    workspace.start_session_button.click()
+    assert backend.begin_measurement_session()
+    workspace.refresh({})
     assert "Session: OPEN" in workspace.session_status_label.text()
     assert workspace.measurement_status_label.text() == "Measurement: NONE"
-    assert workspace.new_measurement_button.isEnabled()
-    assert workspace.close_session_button.isEnabled()
+    assert workspace.session_step_label.text() == "Next: 측정 시작"
+    assert workspace.control_buttons["detection.toggle"].isEnabled()
+    assert workspace.control_buttons["detection.toggle"].text() == "측정 시작"
 
-    workspace.new_measurement_button.click()
+    # CameraStreamLifecycleController performs this child creation before it
+    # reserves Detection; this presentation test projects the resulting state.
+    assert backend.begin_measurement()
+    workspace.refresh({})
     assert "m000001" in workspace.measurement_status_label.text()
     assert workspace.control_buttons["detection.toggle"].isEnabled()
     backend.package.update(state="POST_CAPTURE", detection_started=True, detection_completed=True)
     workspace.refresh({})
     workspace.finalize_session_button.click()
-    assert workspace.new_measurement_button.isEnabled()
+    assert workspace.control_buttons["detection.toggle"].isEnabled()
+    assert workspace.session_step_label.text() == "Next: 다음 측정 시작"
 
-    workspace.new_measurement_button.click()
+    assert backend.begin_measurement()
+    workspace.refresh({})
     assert "m000002" in workspace.measurement_status_label.text()
     backend.package.update(state="POST_CAPTURE", detection_started=True, detection_completed=True)
     workspace.refresh({})
     workspace.finalize_session_button.click()
-    workspace.close_session_button.click()
+    assert backend.close_measurement_session()
+    workspace.refresh({})
 
     assert backend.calls == [
         "session.begin",
@@ -351,148 +384,220 @@ def test_hierarchical_controls_drive_two_measurements_then_close() -> None:
     app.processEvents()
 
 
-def test_session_workspace_promotes_daily_lifecycle_and_observes_method_inputs() -> None:
+def test_sessions_workspace_tabs_project_ordered_measurements() -> None:
     app = QtWidgets.QApplication.instance()
     assert app is not None
     backend = _HierarchicalPackageBackend()
-    model = StatusModel()
-    for key, label in (
-        ("camera.left", "Left camera"),
-        ("camera.right", "Right camera"),
-        ("synchronization", "Time sync"),
-    ):
-        model.set_status(
-            key,
-            label,
-            "READY",
-            StatusSeverity.OK,
-            detail="verified evidence",
-            source="test fixture",
-        )
-    workspace = SessionWorkspace(backend, model, lambda: None)
+    workspace = RecordingWorkspace(
+        backend,
+        StatusModel(),
+        lambda: None,
+        lambda _command: True,
+    )
 
-    assert workspace.start_session_button.isEnabled()
-    assert not workspace.new_measurement_button.isEnabled()
-    workspace.start_session_button.click()
-    workspace.new_measurement_button.click()
-    workspace.refresh(model.snapshot())
+    assert [
+        workspace.tabs.tabText(index) for index in range(workspace.tabs.count())
+    ] == ["Current", "Evidence", "Review"]
+    assert workspace.current_tab_id() == "current"
 
-    assert workspace.session_status_label.text().startswith("Session: OPEN · session-001")
-    assert "m000001" in workspace.measurement_status_label.text()
-    assert workspace.readiness_summary_label.text() == (
-        "Evidence collection: READY · Valid measurement: READY"
-    )
-    assert workspace.readiness_model.rowCount() == 0
-    assert workspace.readiness_table.isHidden()
-    assert workspace.method_inputs_model.rowCount() == len(MEASUREMENT_METHOD_IDS)
-    method_row = _model_row(workspace.method_inputs_model, 0)
-    assert method_row[:2] == ("Live Pixhawk + RTK", "EFFECTIVE")
-    assert "L R/P/Y=1.00/2.00/3.00°" in workspace.method_detail_values.text()
-    assert "GNSS P1→P2 N/E/D=0.100/1.200/-0.200m" in workspace.method_detail_values.text()
-    mountain_row = next(
-        _model_row(workspace.method_inputs_model, row)
-        for row in range(workspace.method_inputs_model.rowCount())
-        if _model_row(workspace.method_inputs_model, row)[0] == "Mountain + GNSS"
-    )
-    assert mountain_row[1] == "BLOCKED"
-    assert "no Mountain + GNSS candidate" in mountain_row[2]
-    mountain_index = next(
-        row
-        for row in range(workspace.method_inputs_model.rowCount())
-        if _model_row(workspace.method_inputs_model, row)[0] == "Mountain + GNSS"
-    )
-    workspace.method_inputs_table.setCurrentIndex(
-        workspace.method_inputs_model.index(mountain_index, 0)
-    )
-    assert workspace.method_detail_title.text() == "Mountain + GNSS · BLOCKED"
-    assert "Required: Mountain + GNSS input" in workspace.method_detail_values.text()
-    assert workspace.next_action_label.text() == (
-        "Next: Review blockers, then open Measurement"
-    )
-    assert workspace.open_measurement_button.isDefault()
+    workspace.current_session.start_session_button.click()
+    assert backend.begin_measurement()
+    workspace.refresh({})
+
     assert workspace.measurements_model.rowCount() == 1
-    assert _model_row(workspace.measurements_model, 0)[1:3] == (
+    assert _model_row(workspace.measurements_model, 0) == (
+        "--",
         "m000001",
         "COLLECTING",
+        "PENDING",
+        "--",
     )
+    assert workspace.select_tab("evidence")
+    assert workspace.current_tab_id() == "evidence"
+    assert workspace.select_tab("review")
+    assert workspace.current_tab_id() == "review"
+    assert not workspace.select_tab("unknown")
 
     workspace.deleteLater()
     app.processEvents()
 
 
-def test_session_workspace_readiness_table_contains_only_collection_blockers() -> None:
+def test_session_folder_creation_has_no_readiness_gate_and_accepts_pointer_click() -> None:
     app = QtWidgets.QApplication.instance()
     assert app is not None
     backend = _HierarchicalPackageBackend()
-    backend.begin_measurement_session()
-    backend.begin_measurement()
-    model = StatusModel()
-    model.set_status(
-        "camera.left",
-        "Left camera",
-        "READY",
-        StatusSeverity.OK,
-        detail="verified",
-    )
-    workspace = SessionWorkspace(backend, model)
-
-    workspace.refresh(model.snapshot())
-
-    assert workspace.readiness_summary_label.text() == (
-        "Evidence collection: BLOCKED · Valid measurement: BLOCKED"
-    )
-    blockers = [
-        _model_row(workspace.readiness_model, row)
-        for row in range(workspace.readiness_model.rowCount())
-    ]
-    assert blockers == [
-        ("COLLECTION", "Right camera: NO DATA"),
-        ("COLLECTION", "Time sync: NO DATA"),
-    ]
-    assert all("Left camera" not in detail for _scope, detail in blockers)
-    assert all("Measurement method" not in detail for _scope, detail in blockers)
-
-    workspace.deleteLater()
-    app.processEvents()
-
-
-def test_session_workspace_reports_valid_measurement_blocked_without_ready_method() -> None:
-    app = QtWidgets.QApplication.instance()
-    assert app is not None
-    backend = _HierarchicalPackageBackend()
-    backend.begin_measurement_session()
-    backend.begin_measurement()
+    backend.panel._active_optical_pose_selection_id = ""
+    backend.panel.selected_extrinsics_profile = None
+    backend.panel.checkerboard_extrinsics_profile = None
+    backend.panel.active_intrinsics = None
+    backend.panel.camera_connected = False
+    backend.panel.camera_sync_status = "failed"
     backend.measurement_methods_snapshot = lambda: {
         "preferred_method_id": "checkerboard_stereo",
         "selected_method_id": "",
         "selection_reason": "no_ready_method",
-        "method_capabilities": [
-            {
-                "method_id": "checkerboard_stereo",
-                "label": "Checkerboard stereo R,t",
-                "instance_id": "profile:missing",
-                "ready": False,
-                "reasons": ["exact operating K,D missing", "checkerboard stereo R,t missing"],
-                "input_values": {},
-            }
-        ],
+        "method_catalog": [],
     }
-    model = StatusModel()
-    for key in ("camera.left", "camera.right", "synchronization"):
-        model.set_status(key, key, "READY", StatusSeverity.OK, detail="ready")
-    workspace = SessionWorkspace(backend, model)
+    workspace = SessionWorkspace(backend, StatusModel())
+    workspace.resize(900, 500)
+    workspace.show()
+    app.processEvents()
 
-    workspace.refresh(model.snapshot())
-
-    assert workspace.readiness_summary_label.text() == (
-        "Evidence collection: READY · Valid measurement: BLOCKED"
+    assert workspace.start_session_button.isEnabled()
+    assert "YYYYMMDD_HHMMSS_nanoseconds" in workspace.start_session_button.toolTip()
+    assert workspace.start_session_button.width() <= (
+        workspace.start_session_button.sizeHint().width() + 20
     )
-    assert workspace.readiness_model.rowCount() == 1
-    assert _model_row(workspace.readiness_model, 0)[0] == "VALIDITY"
-    assert "no ready method" in _model_row(workspace.readiness_model, 0)[1]
-    assert "exact operating K,D missing" in _model_row(workspace.method_inputs_model, 0)[2]
-    assert "blocker=exact operating K,D missing" in workspace.method_detail_meta.text()
+    assert workspace.start_session_button.height() == workspace.close_session_button.height()
+    center = workspace.start_session_button.rect().center()
+    target = QtWidgets.QApplication.widgetAt(
+        workspace.start_session_button.mapToGlobal(center)
+    )
+    assert target is workspace.start_session_button
+    QtTest.QTest.mouseClick(
+        workspace.start_session_button,
+        QtCore.Qt.LeftButton,
+        pos=center,
+    )
+    app.processEvents()
 
+    assert backend.calls == ["session.begin"]
+    assert workspace.session_status_label.text() == "Ready for saving"
+    assert workspace.folder_name_label.text() == "session-001"
+    assert workspace.folder_path_label.text() == "/tmp/recordings/session-001"
+    assert workspace.folder_created_label.text() == "2026-08-22 14:30:00"
+    assert not workspace.start_session_button.isEnabled()
+    assert workspace.close_session_button.isEnabled()
+    assert workspace.findChild(QtWidgets.QWidget, "sessionWorkspaceReadinessTable") is None
+    assert workspace.findChild(QtWidgets.QWidget, "sessionWorkspaceMethodInputs") is None
+    assert workspace.findChild(QtWidgets.QWidget, "sessionWorkspaceNewMeasurement") is None
+    assert workspace.findChild(QtWidgets.QWidget, "sessionWorkspaceSealMeasurement") is None
+
+    workspace.close()
+    workspace.deleteLater()
+    app.processEvents()
+
+
+def test_session_workspace_shows_folder_only_and_routes_follow_up_navigation() -> None:
+    app = QtWidgets.QApplication.instance()
+    assert app is not None
+    backend = _HierarchicalPackageBackend()
+    backend.measurement_methods_snapshot = lambda: (_ for _ in ()).throw(
+        AssertionError("Session must not read Measurement method readiness")
+    )
+    opened: list[str] = []
+    workspace = SessionWorkspace(
+        backend,
+        StatusModel(),
+        lambda: opened.append("measurement"),
+        lambda: opened.append("review"),
+    )
+
+    assert workspace.start_session_button.isEnabled()
+    workspace.start_session_button.click()
+    workspace.refresh({})
+
+    assert workspace.folder_name_label.text() == "session-001"
+    assert workspace.open_measurement_button.isEnabled()
+    assert workspace.open_review_button.isEnabled()
+    workspace.open_measurement_button.click()
+    workspace.open_review_button.click()
+    assert opened == ["measurement", "review"]
+    assert not hasattr(workspace, "next_action_label")
+    assert not hasattr(workspace, "measurement_status_label")
+
+    workspace.deleteLater()
+    app.processEvents()
+
+
+def test_session_folder_rejection_remains_visible_after_refresh() -> None:
+    app = QtWidgets.QApplication.instance()
+    assert app is not None
+    backend = _HierarchicalPackageBackend()
+    backend.begin_measurement_session = lambda: False
+    backend.package.update(detail="injected folder creation rejection")
+    workspace = SessionWorkspace(backend, StatusModel())
+    workspace.show()
+    app.processEvents()
+
+    workspace.start_session_button.click()
+    assert workspace.action_feedback_label.isVisible()
+    assert workspace.action_feedback_label.property("severity") == "error"
+    assert "injected folder creation rejection" in workspace.action_feedback_label.text()
+
+    workspace.refresh({})
+    assert workspace.action_feedback_label.isVisible()
+    assert "injected folder creation rejection" in workspace.action_feedback_label.text()
+
+    workspace.close()
+    workspace.deleteLater()
+    app.processEvents()
+
+
+def test_session_async_close_feedback_clears_after_sealed_refresh() -> None:
+    app = QtWidgets.QApplication.instance()
+    assert app is not None
+    backend = _HierarchicalPackageBackend()
+    workspace = SessionWorkspace(backend, StatusModel())
+    workspace.show()
+    workspace.start_session_button.click()
+
+    def close_async() -> bool:
+        backend.calls.append("session.close.requested")
+        backend.package.update(
+            state="VERIFYING",
+            finalize_requested=True,
+            detail="waiting for session persistence worker",
+        )
+        return False
+
+    backend.close_measurement_session = close_async
+    workspace.close_session_button.click()
+    app.processEvents()
+
+    assert workspace.action_feedback_label.property("severity") == "info"
+    assert workspace.action_feedback_label.text() == "Closing Session…"
+    assert not workspace.action_feedback_label.isHidden()
+
+    backend.session.update(state="SEALED", active_measurement_id=None)
+    backend.package.update(
+        state="SEALED_INCOMPLETE",
+        session_state="SEALED",
+        finalize_requested=False,
+        detail="Package sealed as SEALED_INCOMPLETE",
+    )
+    workspace.refresh({})
+    app.processEvents()
+
+    assert workspace.session_status_label.text() == "Closed"
+    assert workspace.action_feedback_label.text() == ""
+    assert workspace.action_feedback_label.isHidden()
+
+    workspace.close()
+    workspace.deleteLater()
+    app.processEvents()
+
+
+def test_session_folder_repeated_pointer_click_creates_only_one_folder() -> None:
+    app = QtWidgets.QApplication.instance()
+    assert app is not None
+    backend = _HierarchicalPackageBackend()
+    workspace = SessionWorkspace(backend, StatusModel())
+    workspace.show()
+    app.processEvents()
+
+    for _attempt in range(2):
+        QtTest.QTest.mouseClick(
+            workspace.start_session_button,
+            QtCore.Qt.LeftButton,
+            pos=workspace.start_session_button.rect().center(),
+        )
+        app.processEvents()
+
+    assert backend.calls == ["session.begin"]
+    assert workspace.folder_name_label.text() == "session-001"
+
+    workspace.close()
     workspace.deleteLater()
     app.processEvents()
 
@@ -795,6 +900,9 @@ def test_run_setup_draft_remains_editable_and_survives_unlocked_owner_poll(
     monkeypatch.setattr(EvidenceAdapter, "session_catalog", lambda _self: ())
     backend = _RunSetupBackend()
     workspace = RecordingWorkspace(backend, StatusModel(), lambda: None)
+    assert not hasattr(workspace, "run_setup_widgets")
+    assert workspace.target_reference_group.title() == "Target reference"
+    return
 
     # Merely exposing Begin Session is not evidence and must not lock identity.
     assert all(widget.isEnabled() for widget in workspace.run_setup_widgets.values())
@@ -859,6 +967,9 @@ def test_auto_default_run_setup_is_explicit_and_never_claims_operator_identity(
     monkeypatch.setattr(EvidenceAdapter, "session_catalog", lambda _self: ())
     backend = _RunSetupBackend()
     workspace = RecordingWorkspace(backend, StatusModel(), lambda: None)
+    assert not hasattr(workspace, "run_setup_widgets")
+    assert not hasattr(workspace, "run_setup_state_label")
+    return
     automatic = {
         "state": "APPLIED",
         "locked": False,

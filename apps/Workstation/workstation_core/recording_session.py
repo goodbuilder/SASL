@@ -11,7 +11,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -20,6 +20,11 @@ from typing import Iterable
 import pyarrow as pa
 import pyarrow.parquet as pq
 import xlsxwriter
+
+from Workstation.workstation_core.measurement_methods import (
+    MEASUREMENT_METHOD_IDS,
+    PIXHAWK_RTK_LIVE,
+)
 
 
 # Finalized structured records are canonical JSONL.  Typed Parquet tables and
@@ -365,7 +370,17 @@ AUTHORITATIVE_JSONL_STREAMS = {
         "raw/extrinsics_comparison",
         "data/raw/extrinsics_comparison.jsonl",
     ),
+    "method_evaluation_bundles": (
+        "raw/method_evaluation_bundles",
+        "data/raw/method_evaluation_bundles.jsonl",
+    ),
 }
+
+for _method_result_id in MEASUREMENT_METHOD_IDS:
+    AUTHORITATIVE_JSONL_STREAMS[f"method_result_{_method_result_id}"] = (
+        f"raw/method_results/{_method_result_id}",
+        f"data/raw/method_results/{_method_result_id}.jsonl",
+    )
 
 
 _SESSION_ID_LOCK = threading.Lock()
@@ -515,6 +530,9 @@ class RetryableSession:
     px4_rows: dict[str, "SpoolRows"]
     gnss_base_rows: "SpoolRows"
     extrinsics_comparison_rows: "SpoolRows"
+    method_evaluation_bundle_rows: "SpoolRows" = field(
+        default_factory=lambda: SpoolRows()
+    )
 
 
 class SpoolRows(Sequence[dict[str, object]]):
@@ -860,6 +878,48 @@ def _normalized_generic_rows(rows: Iterable[dict[str, object]]) -> list[dict[str
         {key: _serializable_value(value) for key, value in row.items()}
         for row in rows
     ]
+
+
+def _materialize_method_evaluation_rows(
+    rows: Iterable[dict[str, object]],
+) -> tuple[list[dict[str, object]], dict[str, list[dict[str, object]]]]:
+    """Validate atomic bundle rows and split them into eight method streams."""
+
+    from Workstation.workstation_core.method_evaluation import MethodEvaluationBundle
+
+    bundles: list[dict[str, object]] = []
+    method_rows = {method_id: [] for method_id in MEASUREMENT_METHOD_IDS}
+    seen: set[tuple[str, int]] = set()
+    last_sequence_by_measurement: dict[str, int] = {}
+    for raw_row in rows:
+        normalized = {
+            key: _serializable_value(value) for key, value in raw_row.items()
+        }
+        bundle = MethodEvaluationBundle.from_mapping(normalized)
+        identity = (bundle.pair_id, bundle.request_generation)
+        if identity in seen:
+            raise ValueError(f"duplicate method evaluation bundle: {bundle.pair_id}")
+        seen.add(identity)
+        previous_sequence = last_sequence_by_measurement.get(bundle.measurement_id, -1)
+        if bundle.pair_sequence <= previous_sequence:
+            raise ValueError(
+                "method evaluation bundles must have strictly increasing pair_sequence"
+            )
+        last_sequence_by_measurement[bundle.measurement_id] = bundle.pair_sequence
+        bundle_record = bundle.to_record()
+        bundles.append(bundle_record)
+        bundle_sha256 = str(bundle_record["method_evaluation_bundle_sha256"])
+        primary_sha256 = bundle.primary.canonical_sha256()
+        for outcome in bundle.outcomes:
+            method_rows[outcome.method_id].append(
+                {
+                    **outcome.to_record(),
+                    "method_evaluation_bundle_sha256": bundle_sha256,
+                    "primary_method_id": bundle.primary.method_id,
+                    "primary_outcome_sha256": primary_sha256,
+                }
+            )
+    return bundles, method_rows
 
 
 def _iter_normalized_generic_rows(
@@ -2380,6 +2440,12 @@ def load_retryable_session(output_dir: Path) -> RetryableSession:
     # Sessions recorded before this field existed have no extrinsics_comparison.jsonl;
     # open_existing() tolerates a missing path (empty rows, fresh append handle).
     extrinsics_comparison_rows.open_existing(spool_dir / "extrinsics_comparison.jsonl")
+    method_evaluation_bundle_rows = SpoolRows()
+    # Pre multi-method sessions have no bundle spool; an empty stream remains
+    # a valid recovery input and is materialized into eight empty method files.
+    method_evaluation_bundle_rows.open_existing(
+        spool_dir / "method_evaluation_bundles.jsonl"
+    )
     recovered_spools = {
         "pair": pair_rows,
         "camera_left": camera_rows["left"],
@@ -2388,6 +2454,7 @@ def load_retryable_session(output_dir: Path) -> RetryableSession:
         "px4_right": px4_rows["right"],
         "gnss_base": gnss_base_rows,
         "extrinsics_comparison": extrinsics_comparison_rows,
+        "method_evaluation_bundles": method_evaluation_bundle_rows,
     }
     if "drone" in px4_rows:
         recovered_spools["px4_drone"] = px4_rows["drone"]
@@ -2411,7 +2478,14 @@ def load_retryable_session(output_dir: Path) -> RetryableSession:
             "artifacts": recovery_artifacts,
         }
     return RetryableSession(
-        output_dir, metadata, pair_rows, camera_rows, px4_rows, gnss_base_rows, extrinsics_comparison_rows
+        output_dir,
+        metadata,
+        pair_rows,
+        camera_rows,
+        px4_rows,
+        gnss_base_rows,
+        extrinsics_comparison_rows,
+        method_evaluation_bundle_rows,
     )
 
 
@@ -2713,6 +2787,46 @@ def _validate_measurement_storage_identity(
     return session_id, raw_measurement_id
 
 
+_LEGACY_REVIEW_METHOD_SCHEMAS = frozenset(
+    {
+        "",
+        "stereowiris-paired-frame-v1",
+        "stereowiris-paired-frame-v2",
+    }
+)
+_LEGACY_REVIEW_METHOD_ALIASES = {
+    "pixhawk": "pixhawk_rtk_live",
+    "checkerboard": "checkerboard_stereo",
+    "calibration": "checkerboard_stereo",
+}
+
+
+def _review_row_is_explicitly_blocked(row: Mapping[str, object]) -> bool:
+    pair_status = str(row.get("pair_status") or "").strip().lower()
+    geometry_kind = str(row.get("measurement_geometry_kind") or "").strip().lower()
+    return bool(
+        row.get("blocked_pair_sha256")
+        or geometry_kind == "unresolved"
+        or "blocked" in pair_status
+        or "no_ready" in pair_status
+    )
+
+
+def _review_measurement_method_id(row: Mapping[str, object]) -> str:
+    """Resolve current and legacy method identity without truthiness fallback."""
+
+    if "measurement_method_id" in row:
+        return str(row.get("measurement_method_id") or "").strip()
+    if _review_row_is_explicitly_blocked(row):
+        return ""
+    schema = str(row.get("schema_version") or "").strip()
+    if schema not in _LEGACY_REVIEW_METHOD_SCHEMAS:
+        return ""
+    legacy = str(row.get("distance_mode") or "").strip().lower()
+    legacy = _LEGACY_REVIEW_METHOD_ALIASES.get(legacy, legacy)
+    return legacy if legacy in MEASUREMENT_METHOD_IDS else ""
+
+
 def _review_result_row(row: Mapping[str, object]) -> dict[str, object]:
     return {
         "pair_id": row.get("pair_id") or row.get("measurement_attempt_id"),
@@ -2723,7 +2837,12 @@ def _review_result_row(row: Mapping[str, object]) -> dict[str, object]:
         "forward_m": row.get("baseline_center_forward_m"),
         "right_m": row.get("baseline_center_right_m"),
         "down_m": row.get("baseline_center_down_m"),
-        "measurement_method_id": row.get("measurement_method_id") or row.get("distance_mode"),
+        "measurement_method_id": _review_measurement_method_id(row),
+        "measurement_method_instance_id": row.get("measurement_method_instance_id"),
+        "measurement_geometry_kind": row.get("measurement_geometry_kind"),
+        "measurement_geometry_sha256": row.get("measurement_geometry_sha256"),
+        "measurement_selection_reason": row.get("measurement_selection_reason"),
+        "measurement_component_sources": row.get("measurement_component_sources"),
         "valid": row.get("measurement_valid"),
         "warning_code": row.get("warning_code") or row.get("warnings"),
     }
@@ -2843,6 +2962,28 @@ def _measurement_review_mapping(
                 "raw/stereo_measurements",
             ).rows
         )
+        method_results: dict[str, list[dict[str, object]]] = {
+            method_id: [] for method_id in MEASUREMENT_METHOD_IDS
+        }
+        from Workstation.workstation_core.method_evaluation import (
+            MethodEvaluationOutcome,
+        )
+
+        for method_id in MEASUREMENT_METHOD_IDS:
+            artifact_key = f"method_result_{method_id}"
+            if not isinstance(declared_details.get(artifact_key), Mapping):
+                continue
+            method_rows = list(
+                read_measurement_stream(
+                    measurement_root,
+                    f"raw/method_results/{method_id}",
+                ).rows
+            )
+            for method_row in method_rows:
+                outcome = MethodEvaluationOutcome.from_mapping(method_row)
+                if outcome.method_id != method_id:
+                    raise ValueError("method result stream contains the wrong method")
+            method_results[method_id] = method_rows
         context_payload = json.loads(context_path.read_text(encoding="utf-8"))
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise OSError(
@@ -3009,7 +3150,7 @@ def _measurement_review_mapping(
         "measurement_id": measurement_id,
         "summary": {
             "status": "VALID" if valid_count else "NO_VALID_RESULT",
-            "method": calculation.get("measurement_method_id"),
+            "method": PIXHAWK_RTK_LIVE,
             "valid_pair_count": valid_count,
             "blocked_pair_count": len(rows) - valid_count,
             "warning_count": len(_review_warning_rows(rows)),
@@ -3021,6 +3162,7 @@ def _measurement_review_mapping(
         "captures": _review_capture_rows(metadata),
         "warnings": _review_warning_rows(rows),
         "artifacts": artifacts,
+        "method_results": method_results,
     }
 
 
@@ -3502,6 +3644,7 @@ def save_session_files(
     px4_rows: dict[str, Iterable[dict[str, object]]] | None = None,
     gnss_base_rows: Iterable[dict[str, object]] | None = None,
     extrinsics_comparison_rows: Iterable[dict[str, object]] | None = None,
+    method_evaluation_bundle_rows: Iterable[dict[str, object]] | None = None,
 ) -> SavedSessionFiles:
     """Finalize canonical JSONL plus derived Parquet in one generation.
 
@@ -3547,6 +3690,9 @@ def save_session_files(
     gnss_rows = _normalized_generic_rows(gnss_base_rows or ())
     geometry_rows = _normalized_generic_rows(
         extrinsics_comparison_rows or ()
+    )
+    method_bundle_rows, method_result_rows = _materialize_method_evaluation_rows(
+        method_evaluation_bundle_rows or ()
     )
     def jsonl_stream(
         artifact_key: str,
@@ -3599,7 +3745,20 @@ def save_session_files(
             time_sync_epoch_rows,
             "time_sync_epoch_record_v1",
         ),
+        jsonl_stream(
+            "method_evaluation_bundles",
+            method_bundle_rows,
+            "workstation-method-evaluation-bundle-v1",
+        ),
     ]
+    jsonl_streams.extend(
+        jsonl_stream(
+            f"method_result_{method_id}",
+            method_result_rows[method_id],
+            "workstation-method-evaluation-v1",
+        )
+        for method_id in MEASUREMENT_METHOD_IDS
+    )
     if "drone" in px4_full_rows:
         jsonl_streams.append(
             jsonl_stream(
@@ -3637,6 +3796,8 @@ def save_session_files(
             *px4_full_rows.values(),
             gnss_rows,
             geometry_rows,
+            method_bundle_rows,
+            *method_result_rows.values(),
         ):
             _apply_measurement_package_identity(
                 source_rows,
@@ -3755,6 +3916,11 @@ def save_session_files(
                 "raw_gnss_base",
                 "geometry_contexts",
                 "time_sync_epochs",
+                "method_evaluation_bundles",
+                *(
+                    f"method_result_{method_id}"
+                    for method_id in MEASUREMENT_METHOD_IDS
+                ),
             )
         ]
         generation_manifest = {
@@ -3900,6 +4066,7 @@ def save_session_files(
         *px4_sources.values(),
         gnss_base_rows,
         extrinsics_comparison_rows,
+        method_evaluation_bundle_rows,
     ):
         if isinstance(source_rows, SpoolRows):
             source_rows.discard_spool()

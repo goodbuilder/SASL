@@ -12,6 +12,7 @@ import time
 import csv
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -770,7 +771,6 @@ def _run_ledger_artifact_names(session_root: Path) -> set[str]:
     names = {
         name
         for name in (
-            "run_setup.json",
             "run_events.jsonl",
             "artifacts.jsonl",
             "native_frames.jsonl",
@@ -901,13 +901,24 @@ class EvidenceAdapter:
             **provenance,
         }
 
-    def gps(self, side: str, *, now_s: float | None = None) -> dict[str, object]:
+    def gps(
+        self,
+        side: str,
+        *,
+        now_s: float | None = None,
+        source: str = "GPS1",
+    ) -> dict[str, object]:
         now = time.monotonic() if now_s is None else float(now_s)
         states = getattr(self.panel, "latest_gps", {}) or {}
-        state = states.get(side) if isinstance(states, dict) else None
+        source = str(source or "GPS1").upper()
+        if source not in {"GPS1", "GPS2"}:
+            source = "GPS1"
+        state_key = side if source == "GPS1" else f"{side}_GPS2"
+        state = states.get(state_key) if isinstance(states, dict) else None
         if state is None:
             return {
                 "side": side,
+                "receiver_source": source,
                 "state": "NO DATA",
                 "source": "GpsPositionState / GPS receiver",
                 "position_contract": "WGS84 latitude/longitude degrees; altitude metres",
@@ -921,12 +932,17 @@ class EvidenceAdapter:
         rtk_label = str(getattr(state, "rtk_label", "UNKNOWN") or "UNKNOWN")
         return {
             "side": side,
+            "receiver_source": source,
             "state": rtk_label,
             "rtk_label": rtk_label,
             "fix_type": fix_type,
             "satellites": _integer(getattr(state, "satellites_used", None)),
             "eph_m": _number(getattr(state, "eph_m", None)),
             "epv_m": _number(getattr(state, "epv_m", None)),
+            "hdop": _number(getattr(state, "hdop", None)),
+            "vdop": _number(getattr(state, "vdop", None)),
+            "h_acc_m": _number(getattr(state, "eph_m", None)),
+            "v_acc_m": _number(getattr(state, "epv_m", None)),
             "latitude_deg": _number(getattr(state, "latitude_deg", None)),
             "longitude_deg": _number(getattr(state, "longitude_deg", None)),
             "altitude_m": _number(getattr(state, "altitude_m", None)),
@@ -1098,6 +1114,16 @@ class EvidenceAdapter:
         baseline = getattr(self.panel, "latest_rtk_baseline", None)
         projection = getattr(self.panel, "latest_p1_body_frd_baseline", None)
         quality = getattr(self.panel, "latest_baseline_quality", None)
+        selector = getattr(self.panel, "_selected_baseline_gps_states", None)
+        if callable(selector):
+            selected_left, selected_right = selector()
+        else:
+            latest = getattr(self.panel, "latest_gps", {}) or {}
+            selected_left = latest.get("left") if isinstance(latest, dict) else None
+            selected_right = latest.get("right") if isinstance(latest, dict) else None
+        source_reader = getattr(self.panel, "_pixhawk_gnss_source", None)
+        left_source = str(source_reader("left")) if callable(source_reader) else "GPS1"
+        right_source = str(source_reader("right")) if callable(source_reader) else "GPS1"
         quality_values: dict[str, object] = {
             "sample_count": _integer(getattr(quality, "sample_count", None)),
             "fixed_ratio": _number(getattr(quality, "rtk_fixed_ratio", None)),
@@ -1140,8 +1166,10 @@ class EvidenceAdapter:
                 "source": "RtkBaselineEstimate from left/right GpsPositionState",
                 "axis_contract": "NED = north / east / down; metres",
                 "quality": quality_values,
-                "left_fix_type": _integer(getattr((getattr(self.panel, "latest_gps", {}) or {}).get("left"), "fix_type", None)),
-                "right_fix_type": _integer(getattr((getattr(self.panel, "latest_gps", {}) or {}).get("right"), "fix_type", None)),
+                "left_source": left_source,
+                "right_source": right_source,
+                "left_fix_type": _integer(getattr(selected_left, "fix_type", None)),
+                "right_fix_type": _integer(getattr(selected_right, "fix_type", None)),
                 **projection_values,
             }
         return {
@@ -1157,8 +1185,10 @@ class EvidenceAdapter:
             "axis_contract": "NED = north / east / down; metres",
             "position_frame": "GPS/RTK WGS84 delta projected to local NED; not camera or FRD",
             "quality": quality_values,
-            "left_fix_type": _integer(getattr((getattr(self.panel, "latest_gps", {}) or {}).get("left"), "fix_type", None)),
-            "right_fix_type": _integer(getattr((getattr(self.panel, "latest_gps", {}) or {}).get("right"), "fix_type", None)),
+            "left_source": left_source,
+            "right_source": right_source,
+            "left_fix_type": _integer(getattr(selected_left, "fix_type", None)),
+            "right_fix_type": _integer(getattr(selected_right, "fix_type", None)),
             **projection_values,
         }
 
@@ -1177,7 +1207,7 @@ class EvidenceAdapter:
         injection = stats.get("injection", {})
         injection = injection if isinstance(injection, Mapping) else {}
         routes: dict[str, dict[str, object]] = {}
-        for side in ("left", "right"):
+        for side in ("left", "right", "drone"):
             route = injection.get(side, {})
             route = route if isinstance(route, Mapping) else {}
             last_delivery = _number(route.get("last_delivery_s"))
@@ -1769,6 +1799,12 @@ class EvidenceAdapter:
             "measurement_method_fallback_order": list(
                 setting("measurement_method_fallback_order", ()) or ()
             ),
+            "pixhawk_left_gnss_source": str(
+                setting("pixhawk_left_gnss_source", "GPS1")
+            ),
+            "pixhawk_right_gnss_source": str(
+                setting("pixhawk_right_gnss_source", "GPS1")
+            ),
             "yolo_input_size_px": _integer(
                 _widget_value(getattr(self.panel, "input_size_spin", None), setting("yolo_input_size"))
             ),
@@ -1874,6 +1910,11 @@ class EvidenceAdapter:
     def calibration_setup(self) -> dict[str, object]:
         """Project editable calibration setup fields without changing them."""
 
+        settings = getattr(self.panel, "settings", None)
+        pair_max_delta_s = _number(
+            getattr(settings, "calibration_pair_max_delta_s", 0.100),
+            0.100,
+        )
         return {
             "zoom_level": _integer(_widget_value(getattr(self.panel, "zoom_level_spin", None))),
             "inner_cols": _integer(_widget_value(getattr(self.panel, "calib_cols_spin", None))),
@@ -1883,11 +1924,14 @@ class EvidenceAdapter:
             "calculation_pair_count": _integer(
                 _widget_value(getattr(self.panel, "calib_calculation_pairs_spin", None))
             ),
+            "pair_max_delta_ms": _number(
+                _widget_value(
+                    getattr(self.panel, "calibration_pair_max_delta_spin", None),
+                    float(pair_max_delta_s or 0.0) * 1000.0,
+                )
+            ),
             "auto_interval_s": _number(
                 _widget_value(getattr(self.panel, "calibration_auto_interval_spin", None))
-            ),
-            "auto_target_pairs": _integer(
-                _widget_value(getattr(self.panel, "calibration_auto_target_spin", None))
             ),
             "calibration_root": _widget_text(getattr(self.panel, "calib_dir_edit", None)),
             "calibration_root_resolved": str(self.panel._calibration_dirs()[0])
@@ -2511,7 +2555,7 @@ class EvidenceAdapter:
     def calibration(self) -> dict[str, object]:
         active = getattr(self.panel, "active_intrinsics", None)
         latest = getattr(self.panel, "last_calibration_result", None)
-        result = active or latest
+        result = active if active is not None else latest
         calculation_active = getattr(self.panel, "checkerboard_calibration_thread", None) is not None
         calibration_status = _widget_text(getattr(self.panel, "calibration_status_label", None), "")
         calculation_status = _widget_text(
@@ -2519,16 +2563,38 @@ class EvidenceAdapter:
             "",
         )
         status_label = calculation_status if calculation_active and calculation_status else calibration_status
-        profile_path = str(getattr(self.panel, "_active_intrinsics_profile_path", "") or "")
+        active_profile_path = str(
+            getattr(self.panel, "_active_intrinsics_profile_path", "") or ""
+        )
+        candidate_profile_path = str(
+            getattr(self.panel, "_candidate_intrinsics_profile_path", "") or ""
+        )
+        profile_path = (
+            active_profile_path if active is not None else candidate_profile_path
+        )
         if not profile_path and result is not None:
-            profile_path = "memory/latest-calibration"
-        zoom = _integer(getattr(self.panel, "last_calibration_zoom_level", None))
+            profile_path = (
+                "memory/active-calibration"
+                if active is not None
+                else "memory/calibration-candidate"
+            )
+        zoom = (
+            _integer(getattr(self.panel, "_active_intrinsics_source_zoom_level", None))
+            if active is not None
+            else _integer(getattr(self.panel, "last_calibration_zoom_level", None))
+        )
         if zoom is None:
             zoom_widget = getattr(self.panel, "zoom_level_spin", None)
             zoom = _integer(_widget_value(zoom_widget))
-        selected_extrinsics_profile = getattr(
+        candidate_extrinsics_profile = getattr(
             self.panel, "selected_extrinsics_profile", None
         )
+        if active is not None and hasattr(self.panel, "active_extrinsics_profile"):
+            selected_extrinsics_profile = getattr(
+                self.panel, "active_extrinsics_profile", None
+            )
+        else:
+            selected_extrinsics_profile = candidate_extrinsics_profile
         extrinsics = None if result is None else getattr(result, "extrinsics", None)
         if extrinsics is None and selected_extrinsics_profile is not None:
             extrinsics = getattr(selected_extrinsics_profile, "extrinsics", None)
@@ -2617,7 +2683,14 @@ class EvidenceAdapter:
         for side in ("left", "right"):
             state = actual_zoom.get(side, {}) if isinstance(actual_zoom, dict) else {}
             index = state.get("index") if isinstance(state, dict) else None
-            actual_parts.append(f"{side}={index if index is not None else 'unknown'}")
+            ratio = _number(state.get("ratio")) if isinstance(state, dict) else None
+            if index is None:
+                readback = "unknown"
+            elif ratio is not None and math.isfinite(ratio) and ratio > 0.0:
+                readback = f"{index} ({ratio:g}×)"
+            else:
+                readback = str(index)
+            actual_parts.append(f"{side}={readback}")
         zoom_readback = ", ".join(actual_parts)
         capture_controller = getattr(self.panel, "_calibration_workflow_controller_owner", None)
         auto_capture_active = bool(getattr(capture_controller, "_auto_capture_active", False))
@@ -2680,6 +2753,12 @@ class EvidenceAdapter:
             "active": active is not None,
             "calculation_active": calculation_active,
             "profile_path": profile_path,
+            "active_profile_path": active_profile_path,
+            "candidate_profile_path": candidate_profile_path,
+            "candidate_available": latest is not None,
+            "extrinsics_candidate_profile_id": str(
+                getattr(candidate_extrinsics_profile, "profile_id", "") or ""
+            ),
             "intrinsics_profile_hash": str(
                 getattr(self.panel, "_active_intrinsics_profile_hash", "") or ""
             ),
@@ -2711,9 +2790,6 @@ class EvidenceAdapter:
             "valid_pair_count": valid_pair_count,
             "auto_capture_active": auto_capture_active,
             "auto_capture_saved_pairs": auto_capture_saved_pairs,
-            "auto_capture_target_pairs": _integer(
-                _widget_value(getattr(self.panel, "calibration_auto_target_spin", None))
-            ),
             "source": (
                 "checkerboard calculation worker + live auto-capture controller + "
                 "active_intrinsics/last_calibration_result"

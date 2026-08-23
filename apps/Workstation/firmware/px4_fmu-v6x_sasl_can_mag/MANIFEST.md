@@ -41,6 +41,8 @@ Source build record:
   - `msg/SaslCanMag.msg` (new), `msg/CMakeLists.txt`
   - `src/modules/mavlink/streams/SASL_CAN_MAG.hpp` (new)
   - `src/modules/mavlink/mavlink_messages.cpp`
+  - `src/modules/mavlink/mavlink_main.cpp` (null-slot guard for the MAVLink
+    signing callback's instance lookup)
   - `boards/px4/fmu-v6x/default.px4board`
   - (pre-existing, unrelated: `src/modules/uxrce_dds_client/*` DDS export patches)
 - Files changed in the `mavlink` submodule:
@@ -58,6 +60,10 @@ also captured as patches under `../patches/`:
 - `px4-v1.17-sasl-can-mag-mavlink-dialect.patch` -- the `common.xml` addition.
   Apply inside the `mavlink` submodule (`src/modules/mavlink/mavlink`), not
   the outer PX4-Autopilot tree.
+- `px4-v1.17-mavlink-signing-null-instance.patch` -- guards the MAVLink
+  signing callback's instance lookup against null slots left by instance
+  stop/start or startup failure. Without this guard, `mavlink_rcv_if*` can
+  hard-fault in `Mavlink::get_instance_for_status()`.
 - `px4-v1.17-sasl-can-mag-v6x-flash-fit.patch` -- the
   `CONFIG_MODULES_FW_AUTOTUNE_ATTITUDE_CONTROL` removal from
   `boards/px4/fmu-v6x/default.px4board`. **v6x only** -- see v6c's MANIFEST,
@@ -69,6 +75,7 @@ Apply from a PX4-Autopilot `v1.17.0-alpha1-1214-g7b1e54889d` checkout:
 SASL_ROOT=/path/to/SASL
 cd /path/to/PX4-Autopilot
 git apply "$SASL_ROOT/apps/Workstation/firmware/patches/px4-v1.17-sasl-can-mag-core.patch"
+git apply "$SASL_ROOT/apps/Workstation/firmware/patches/px4-v1.17-mavlink-signing-null-instance.patch"
 git apply "$SASL_ROOT/apps/Workstation/firmware/patches/px4-v1.17-sasl-can-mag-v6x-flash-fit.patch"
 (cd src/modules/mavlink/mavlink && git apply "$SASL_ROOT/apps/Workstation/firmware/patches/px4-v1.17-sasl-can-mag-mavlink-dialect.patch")
 make px4_fmu-v6x_default
@@ -77,10 +84,10 @@ make px4_fmu-v6x_default
 Integrity:
 
 ```text
-SHA256 70443e355a0c6d9219883766d9fe7decb38c37d84eb18ba5b91f38bc11cad069  px4_fmu-v6x_default.px4
+SHA256 3ef5736aabdaec9047cf97b0cd5eefa2cfc074672c3ae43776c3f0e12d2349ce  px4_fmu-v6x_default.px4
 ```
 
-Flash usage: 1,956,244 / 1,966,080 bytes (99.50%).
+Flash usage: 1,956,228 / 1,966,080 bytes (99.50%).
 
 QGroundControl upload:
 
@@ -102,6 +109,37 @@ Workstation-side counterpart:
   `_can_mag_sensor_state_from_mavlink` parser needed no changes; field names
   (`xmag`/`ymag`/`zmag`/`can_port`/`device_id`/`node_id`/`time_usec`) already
   matched.
+
+## 2026-08-23 MAVLink sparse-instance Hard Fault correction
+
+Seven P1 hard-fault records had the same signature: task
+`mavlink_rcv_if2`, PC `0x080efbea`, and `r4=0`. Symbolizing that PC against
+the matching v6X ELF resolved it to `Mavlink::get_instance_for_status()`;
+the faulting instruction dereferenced the null `Mavlink *` loaded from an
+empty `mavlink_module_instances` slot. PX4's MAVLink-signing callback added
+the lookup without the null check that the neighboring instance lookup
+functions already use.
+
+The tracked firmware now includes
+`px4-v1.17-mavlink-signing-null-instance.patch`, which skips null slots and
+compares the callback status directly with `inst->get_status()`. The matching
+Workstation USB recovery command no longer runs `mavlink stop`; stop/start can
+create a sparse instance array while another receiver remains live. Rebuilt
+machine code contains a `cbz` guard before the instance status address is
+formed.
+
+The 2026-08-24 field recurrence also exposed two competing startup owners:
+`MAV_2_CONFIG=1000` created the PX4 `rc.serial` Ethernet instance while SD-card
+`extras.txt` issued another manual `mavlink start`. Depending on boot timing,
+the second bind either failed or produced simultaneous unicast and broadcast
+copies. Workstation now treats `MAV_2_CONFIG` as the sole MAVLink-instance
+owner; `extras.txt` contains only `ifup`/`ifconfig`, and recovery persists that
+state then reboots. This operational correction does not change this firmware
+artifact or its SHA-256.
+
+This correction is build-verified. P1/P2 hardware verification must still
+prove: no new fault log, both Ethernet heartbeats remain fresh, and message
+180 reports independent `can_port=1` and `can_port=2` samples.
 
 ## 2026-08-18 Hardware Finding - Pixhawk 1 (left/P1)
 

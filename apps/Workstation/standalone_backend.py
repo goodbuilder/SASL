@@ -51,12 +51,6 @@ class StandalonePanelBackend(QtCore.QObject):
     def save_session(self) -> Any:
         return self._call("save_distance_history_csv")
 
-    def apply_run_setup(self, values: dict[str, object]) -> Any:
-        return self._call("apply_workstation_run_setup", dict(values))
-
-    def run_setup_snapshot(self) -> Any:
-        return self._call("workstation_run_setup_snapshot")
-
     def begin_measurement_session(self) -> Any:
         return self._call("begin_measurement_session")
 
@@ -393,11 +387,19 @@ class StandalonePanelBackend(QtCore.QObject):
             expected_sha256=payload.get("expected_sha256"),
         )
 
-    def calibration_run_intrinsic(self) -> Any:
-        return self._call("run_intrinsic_calibration")
+    def calibration_run_intrinsic(self, input_request: dict[str, object] | None = None) -> Any:
+        return (
+            self._call("run_intrinsic_calibration", dict(input_request))
+            if input_request is not None
+            else self._call("run_intrinsic_calibration")
+        )
 
-    def calibration_run_extrinsics(self) -> Any:
-        return self._call("run_stereo_extrinsics_calibration")
+    def calibration_run_extrinsics(self, input_request: dict[str, object] | None = None) -> Any:
+        return (
+            self._call("run_stereo_extrinsics_calibration", dict(input_request))
+            if input_request is not None
+            else self._call("run_stereo_extrinsics_calibration")
+        )
 
     def calibration_save_intrinsics(self, *, quality_warning_confirmed: bool = False) -> Any:
         return (

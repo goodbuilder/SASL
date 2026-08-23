@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from PyQt5 import QtGui, QtWidgets
 
 from Workstation.calibration_controller import CalibrationWorkflowController
+from Workstation.calibration_workers import CheckerboardCaptureWorker
 from Workstation.optical_pose_controller import OpticalPoseController
 
 
@@ -22,7 +23,17 @@ def _camera_records(tmp_path: Path, *, left_ok: bool = True, right_ok: bool = Tr
             return {"state": "timeout", "error": "ICPT completion timeout", "ftp_downloaded": False}
         path = tmp_path / f"{side}.png"
         _save_test_image(path)
-        return {"state": "completed", "ftp_downloaded": True, "ftp_local_path": str(path)}
+        offset_ns = 0 if side == "left" else 10_000_000
+        return {
+            "state": "completed",
+            "ftp_downloaded": True,
+            "ftp_local_path": str(path),
+            "capture_requested_monotonic_ns": 5_000_000_000 + offset_ns,
+            "capture_requested_unix_ns": 1_700_000_000_000_000_000 + offset_ns,
+            "capture_pairing_contract": (
+                "same_capture_id_and_synchronized_cptr_dispatch_v1"
+            ),
+        }
 
     return {"left": _one("left", left_ok), "right": _one("right", right_ok)}
 
@@ -131,6 +142,152 @@ def test_calibration_wiris_ftp_completion_saves_via_existing_capture_path(tmp_pa
     assert metadata["right"]["timestamp_reference"] == "unknown"
     assert metadata["left"]["capture_timestamp_known"] is False
     assert "timestamp_s" not in metadata["left"]
+
+
+def test_ftp_pair_uses_same_capture_cptr_dispatch_without_claiming_exposure_time(
+    tmp_path: Path,
+) -> None:
+    cameras = _camera_records(tmp_path)
+    frames = {
+        side: QtGui.QImage(str(cameras[side]["ftp_local_path"]))
+        for side in ("left", "right")
+    }
+    panel = _calibration_panel(
+        _camera_rtc_timestamp_s_from_metadata=lambda _metadata: None,
+    )
+    controller = CalibrationWorkflowController(panel)
+    metadata = controller._ftp_calibration_capture_metadata(
+        capture_id="ftp-pair-001",
+        cameras=cameras,
+        frames=frames,
+    )
+
+    ready, basis, delta_s, detail = controller._checkerboard_capture_pair_timing(
+        metadata,
+        maximum_delta_s=0.100,
+    )
+    evidence = controller._checkerboard_capture_pair_timing_evidence(
+        metadata,
+        maximum_delta_s=0.100,
+    )
+
+    assert ready is True
+    assert basis == "ftp-cptr-dispatch-monotonic"
+    assert delta_s == pytest.approx(0.010)
+    assert "exposure timestamps unknown" in detail
+    assert all(row["timestamp_reference"] == "unknown" for row in metadata.values())
+    assert all(row["capture_timestamp_known"] is False for row in metadata.values())
+    assert evidence.evidence_class == "HOST_DISPATCH_PROXY"
+    assert evidence.pair_persistence_allowed is True
+    assert evidence.precision_qualified is False
+    assert evidence.actual_exposure_verified is False
+
+
+def test_ftp_pair_with_large_cptr_dispatch_delta_is_rejected(tmp_path: Path) -> None:
+    cameras = _camera_records(tmp_path)
+    cameras["right"]["capture_requested_monotonic_ns"] = 5_250_000_000
+    frames = {
+        side: QtGui.QImage(str(cameras[side]["ftp_local_path"]))
+        for side in ("left", "right")
+    }
+    panel = _calibration_panel(
+        _camera_rtc_timestamp_s_from_metadata=lambda _metadata: None,
+    )
+    controller = CalibrationWorkflowController(panel)
+    metadata = controller._ftp_calibration_capture_metadata(
+        capture_id="ftp-pair-002",
+        cameras=cameras,
+        frames=frames,
+    )
+
+    ready, basis, delta_s, detail = controller._checkerboard_capture_pair_timing(
+        metadata,
+        maximum_delta_s=0.100,
+    )
+
+    assert ready is False
+    assert basis == "ftp-cptr-dispatch-monotonic"
+    assert delta_s == pytest.approx(0.250)
+    assert "exceeds" in detail
+    evidence = controller._checkerboard_capture_pair_timing_evidence(
+        metadata,
+        maximum_delta_s=0.100,
+    )
+    assert evidence.evidence_class == "HOST_DISPATCH_PROXY"
+    assert evidence.pair_persistence_allowed is False
+    assert evidence.precision_qualified is False
+
+
+def test_verified_exposure_timestamp_path_is_classified_separately() -> None:
+    panel = _calibration_panel(
+        _camera_rtc_timestamp_s_from_metadata=lambda _metadata: None,
+    )
+    controller = CalibrationWorkflowController(panel)
+    metadata = {
+        "left": {
+            "exposure_timestamp_verified": True,
+            "exposure_timestamp_unix_ns": 5_000_000_000,
+        },
+        "right": {
+            "exposure_timestamp_verified": True,
+            "exposure_timestamp_unix_ns": 5_010_000_000,
+        },
+    }
+
+    evidence = controller._checkerboard_capture_pair_timing_evidence(
+        metadata,
+        maximum_delta_s=0.100,
+    )
+
+    assert evidence.evidence_class == "EXPOSURE_TIMESTAMP_VERIFIED"
+    assert evidence.timestamp_reference == "camera-exposure"
+    assert evidence.pair_delta_s == pytest.approx(0.010)
+    assert evidence.pair_persistence_allowed is True
+    assert evidence.precision_qualified is True
+    assert evidence.actual_exposure_verified is True
+
+
+def test_ftp_pair_contract_promotes_both_stills_into_calculation_directories(
+    tmp_path: Path,
+) -> None:
+    cameras = _camera_records(tmp_path)
+    frames = {
+        side: QtGui.QImage(str(cameras[side]["ftp_local_path"]))
+        for side in ("left", "right")
+    }
+    panel = _calibration_panel(
+        _camera_rtc_timestamp_s_from_metadata=lambda _metadata: None,
+    )
+    controller = CalibrationWorkflowController(panel)
+    metadata = controller._ftp_calibration_capture_metadata(
+        capture_id="ftp-pair-save-001",
+        cameras=cameras,
+        frames=frames,
+    )
+    ready, basis, delta_s, detail = controller._checkerboard_capture_pair_timing(
+        metadata,
+        maximum_delta_s=0.100,
+    )
+    completed: list[dict[str, object]] = []
+    worker = CheckerboardCaptureWorker(
+        root=tmp_path / "calculation",
+        frames=frames,
+        stem="001",
+        config=None,
+        opencv_error="test fixture",
+        pair_timing_ok=ready,
+        pair_time_basis=basis,
+        pair_delta_s=delta_s,
+        pair_timing_detail=detail,
+        metadata_payload={"capture_origin": "ftp", "pair_time_basis": basis},
+    )
+    worker.completed.connect(completed.append)
+
+    worker.run()
+
+    assert completed[0]["saved_sides"] == ("left", "right")
+    assert (tmp_path / "calculation" / "left" / "left_001.png").is_file()
+    assert (tmp_path / "calculation" / "right" / "right_001.png").is_file()
 
 
 def test_missing_capture_zoom_metadata_never_falls_back_to_current_spinner(
@@ -418,11 +575,14 @@ def test_optical_pose_wiris_ftp_completion_with_one_camera_failed_does_not_impor
     assert imported == []
 
 
-def test_optical_pose_wiris_ftp_capture_failed_does_not_raise() -> None:
-    panel = _optical_pose_panel()
+def test_optical_pose_wiris_ftp_capture_failure_is_logged() -> None:
+    logs: list[str] = []
+    panel = _optical_pose_panel(_log=logs.append)
     controller = OpticalPoseController(panel)
 
     controller._handle_optical_pose_wiris_ftp_capture_failed("boom")
+
+    assert logs == ["[정렬] WIRIS FTP Capture 실패: boom"]
 
 
 def test_optical_pose_wiris_ftp_worker_cleared_on_finish() -> None:

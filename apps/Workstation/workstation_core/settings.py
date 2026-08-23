@@ -31,6 +31,12 @@ DEFAULT_INTRINSICS_PATH = "calibration/intrinsics.json"
 DEFAULT_YOLO_WEIGHTS_PATH = "models/yolov8m.pt"
 PIXHAWK_ETHERNET_MODES = ("mavlink",)
 DEFAULT_PIXHAWK_ETHERNET_MODE = "mavlink"
+PIXHAWK_GNSS_SOURCES = ("GPS1", "GPS2")
+
+
+def normalize_pixhawk_gnss_source(value: object, default: str = "GPS1") -> str:
+    source = str(value or default).strip().upper()
+    return source if source in PIXHAWK_GNSS_SOURCES else default
 
 
 def _default_path_with_legacy_read(
@@ -106,6 +112,13 @@ class AppSettings:
     right_control_port: int = 2240
     # The left camera's SDK can acknowledge read commands after roughly 2 s.
     wiris_control_timeout_s: float = 5.0
+    # Persist the field-tested visible-stream encoder profile.  The camera
+    # worker reapplies and reads back these values whenever Ethernet/RTSP mode
+    # is enabled or reactivated.
+    wiris_visible_encoder_bitrate: int = 1
+    wiris_visible_encoder_qp: int = 17
+    wiris_visible_encoder_gop: int = 30
+    wiris_visible_encoder_idr: int = 1
     # WIRIS Enterprise's onboard FTP server, reached over the same host as
     # the TCP command channel above (different port only). Used to retrieve
     # a captured HR/OZ still after the camera reports it stored.
@@ -152,8 +165,10 @@ class AppSettings:
     # Maximum number of matching stereo pairs used by the full calibration
     # calculation.  Zero means use every pair in the selected root.
     calibration_calculation_pair_count: int = 20
+    # Maximum absolute RTCP/NTP exposure-time delta accepted for one
+    # calibration stereo pair.  The Calibration UI presents this in ms.
+    calibration_pair_max_delta_s: float = 0.100
     calibration_auto_interval_s: float = 1.0
-    calibration_auto_target_pairs: int = 20
     calibration_root: str = DEFAULT_CALIBRATION_ROOT
     calibration_validation_mode: str = "pixhawk"
     calibration_validation_root: str = DEFAULT_CALIBRATION_ROOT
@@ -198,6 +213,8 @@ class AppSettings:
     mavlink_configure_streams: bool = True
     mavlink_stream_rate: int = 2_000_000
     pixhawk_ethernet_mode: str = DEFAULT_PIXHAWK_ETHERNET_MODE
+    pixhawk_left_gnss_source: str = "GPS1"
+    pixhawk_right_gnss_source: str = "GPS1"
     auto_load_intrinsics: bool = True
     manual_focal_override: bool = False
     use_triangulation: bool = True
@@ -343,6 +360,28 @@ def load_settings(
             payload.get("right_control_port", payload.get("wiris_control_port", AppSettings.right_control_port))
         ),
         wiris_control_timeout_s=float(payload.get("wiris_control_timeout_s", AppSettings.wiris_control_timeout_s)),
+        wiris_visible_encoder_bitrate=max(
+            0,
+            min(
+                2**32 - 1,
+                int(payload.get("wiris_visible_encoder_bitrate", AppSettings.wiris_visible_encoder_bitrate)),
+            ),
+        ),
+        wiris_visible_encoder_qp=max(
+            0,
+            min(51, int(payload.get("wiris_visible_encoder_qp", AppSettings.wiris_visible_encoder_qp))),
+        ),
+        wiris_visible_encoder_gop=max(
+            0,
+            min(32767, int(payload.get("wiris_visible_encoder_gop", AppSettings.wiris_visible_encoder_gop))),
+        ),
+        wiris_visible_encoder_idr=max(
+            0,
+            min(
+                2**32 - 1,
+                int(payload.get("wiris_visible_encoder_idr", AppSettings.wiris_visible_encoder_idr)),
+            ),
+        ),
         wiris_ftp_enabled=bool(payload.get("wiris_ftp_enabled", AppSettings.wiris_ftp_enabled)),
         wiris_ftp_port=int(payload.get("wiris_ftp_port", AppSettings.wiris_ftp_port)),
         wiris_ftp_user=str(payload.get("wiris_ftp_user", AppSettings.wiris_ftp_user)),
@@ -432,13 +471,21 @@ def load_settings(
                 ),
             ),
         ),
-        calibration_auto_interval_s=max(
-            0.5,
-            min(10.0, float(payload.get("calibration_auto_interval_s", AppSettings.calibration_auto_interval_s))),
+        calibration_pair_max_delta_s=max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    payload.get(
+                        "calibration_pair_max_delta_s",
+                        AppSettings.calibration_pair_max_delta_s,
+                    )
+                ),
+            ),
         ),
-        calibration_auto_target_pairs=max(
-            1,
-            min(200, int(payload.get("calibration_auto_target_pairs", AppSettings.calibration_auto_target_pairs))),
+        calibration_auto_interval_s=max(
+            0.1,
+            min(10.0, float(payload.get("calibration_auto_interval_s", AppSettings.calibration_auto_interval_s))),
         ),
         calibration_root=calibration_root,
         calibration_validation_mode=calibration_validation_mode,
@@ -548,6 +595,12 @@ def load_settings(
         ),
         mavlink_stream_rate=int(payload.get("mavlink_stream_rate", AppSettings.mavlink_stream_rate)),
         pixhawk_ethernet_mode=pixhawk_ethernet_mode,
+        pixhawk_left_gnss_source=normalize_pixhawk_gnss_source(
+            payload.get("pixhawk_left_gnss_source", AppSettings.pixhawk_left_gnss_source)
+        ),
+        pixhawk_right_gnss_source=normalize_pixhawk_gnss_source(
+            payload.get("pixhawk_right_gnss_source", AppSettings.pixhawk_right_gnss_source)
+        ),
         auto_load_intrinsics=bool(payload.get("auto_load_intrinsics", True)),
         manual_focal_override=bool(payload.get("manual_focal_override", False)),
         use_triangulation=bool(payload.get("use_triangulation", True)),

@@ -31,8 +31,7 @@ from .workspaces import (
     MeasurementWorkspace,
     OverviewWorkspace,
     PixhawkWorkspace,
-    RecordingWorkspace,
-    SessionWorkspace,
+    SessionsWorkspace,
     TelemetryWorkspace,
     TimeWorkspace,
 )
@@ -98,8 +97,8 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self.commands.register(
             CommandSpec(
                 "detection.toggle",
-                "Detection",
-                "Enable/disable YOLO detection through the existing stream path.",
+                "측정 시작",
+                "Create a Measurement and start Detection, or stop and automatically save the active Measurement.",
                 "detection",
                 self._toggle_detection,
                 shortcut="Ctrl+D",
@@ -246,14 +245,14 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             (
                 "pixhawk.recover_eth_mavlink.p1",
                 "P1 ETH MAV",
-                "Use the configured P1 USB control port to restart PX4 Ethernet MAVLink at runtime, then reconnect UDP telemetry.",
+                "Use the configured P1 USB control port to persist one parameter-owned Ethernet MAVLink instance, reboot PX4, then reconnect UDP telemetry.",
                 "device",
                 lambda: self._pixhawk_recover_eth_mavlink("left"),
             ),
             (
                 "pixhawk.recover_eth_mavlink.p2",
                 "P2 ETH MAV",
-                "Use the configured P2 USB control port to restart PX4 Ethernet MAVLink at runtime, then reconnect UDP telemetry.",
+                "Use the configured P2 USB control port to persist one parameter-owned Ethernet MAVLink instance, reboot PX4, then reconnect UDP telemetry.",
                 "device",
                 lambda: self._pixhawk_recover_eth_mavlink("right"),
             ),
@@ -447,7 +446,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             ),
             (
                 "calibration.sync_images_wiris_oz_ftp",
-                "FTP 접근",
+                "FTP 자동 전송",
                 "Download every OZ still accumulated on camera storage since the last "
                 "sync, pairing left/right by trigger order, not by camera clock.",
                 self._calibration_sync_images_wiris_oz_ftp,
@@ -685,30 +684,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 self._advanced_preview_refresh,
             ),
             (
-                "advanced.media.refresh",
-                "Refresh media artifacts",
-                "Refresh session and media artifact evidence.",
-                self._advanced_media_refresh,
-            ),
-            (
-                "advanced.media.preview",
-                "Preview selected table",
-                "Preview stored Parquet, CSV, or JSONL rows without coordinate or timestamp conversion.",
-                self._advanced_media_preview,
-            ),
-            (
-                "advanced.media.open_session",
-                "Open session folder",
-                "Open the selected session directory in the system file manager.",
-                self._advanced_media_open_session,
-            ),
-            (
-                "advanced.media.open_artifact",
-                "Open artifact",
-                "Open the selected saved artifact with its system association.",
-                self._advanced_media_open_artifact,
-            ),
-            (
                 "advanced.media.open_video",
                 "Open video",
                 "Open the selected recorded video with the system-associated player.",
@@ -774,10 +749,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             "advanced.px4.save_mag",
             "advanced.px4.reboot",
             "advanced.preview.refresh",
-            "advanced.media.refresh",
-            "advanced.media.preview",
-            "advanced.media.open_session",
-            "advanced.media.open_artifact",
             "advanced.media.open_video",
         ):
             self.commands.set_deferred_completion(command_id)
@@ -891,24 +862,27 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             self.status_adapter.model,
             self.commands.invoke,
             lambda: self._select_context("tasks.recording"),
-            begin_session_action=self._begin_measurement_session_with_run_setup,
         )
-        # Session lifecycle is a top-level daily-work process.  Keep the
-        # Measurement widget's legacy controls available to direct embedders,
-        # but remove them from the main application surface.
-        for button in (
-            self.measurement.start_session_button,
-            self.measurement.new_measurement_button,
-            self.measurement.finalize_session_button,
-            self.measurement.close_session_button,
-        ):
-            button.hide()
-        self.session = SessionWorkspace(
+        self.recording = SessionsWorkspace(
             self.backend,
             self.status_adapter.model,
-            lambda: self._select_context("processing.measurement"),
-            lambda: self._select_context("tasks.recording"),
-            begin_session_action=self._begin_measurement_session_with_run_setup,
+            lambda: self._select_context("tasks.advanced"),
+            self.commands.invoke,
+            open_measurement=lambda: self._select_context("processing.measurement"),
+        )
+        self.sessions = self.recording
+        self.session = self.recording.current_session
+        self.experiment.attach_run_preparation(
+            self.recording.preflight_group,
+            self.recording,
+        )
+        self.recording.hr_command_requested.connect(self._handle_hr_command)
+        self.recording.ulog_command_requested.connect(self._handle_ulog_command)
+        self.recording.inspection_requested.connect(
+            lambda selection: self._inspect_selection("tasks.session", selection)
+        )
+        self.session.inspection_requested.connect(
+            lambda selection: self._inspect_selection("tasks.session", selection)
         )
         self.pixhawk = PixhawkWorkspace(
             self.backend,
@@ -947,22 +921,11 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self.measurement.inspection_requested.connect(
             lambda selection: self._inspect_selection("processing.measurement", selection)
         )
-        self.session.inspection_requested.connect(
-            lambda selection: self._inspect_selection("tasks.session", selection)
-        )
         self.calibration = CalibrationWorkspace(
             self.backend,
             self._open_advanced_zoom,
             self.commands.invoke,
         )
-        self.recording = RecordingWorkspace(
-            self.backend,
-            self.status_adapter.model,
-            lambda: self._select_context("tasks.advanced"),
-            self.commands.invoke,
-        )
-        self.recording.hr_command_requested.connect(self._handle_hr_command)
-        self.recording.ulog_command_requested.connect(self._handle_ulog_command)
         self.advanced = AdvancedWorkspace(
             self.backend,
             self.status_adapter.model,
@@ -986,13 +949,12 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             ("camera", self.camera),
             ("time", self.time_workspace),
             ("measurement", self.measurement),
-            ("session", self.session),
+            ("sessions", self.sessions),
             ("pixhawk", self.pixhawk),
             ("telemetry", self.telemetry),
             ("base_gnss", self.base_gnss),
             ("alignment", self.alignment),
             ("calibration", self.calibration),
-            ("recording", self.recording),
             ("advanced", self.advanced),
             ("settings", self.settings_workspace),
         ):
@@ -1439,11 +1401,25 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             self.restoreState(bytes(state))
         context = str(self._ui_settings.value("last_context", "overview") or "overview")
         self.navigation.select_context(context)
+        if canonical_context_id(context) == "tasks.session":
+            review_contexts = {
+                "tasks.recording",
+                "tasks.session_details",
+                "tasks.playback",
+                "tasks.export",
+            }
+            saved_tab = str(
+                self._ui_settings.value("sessions_tab", "current") or "current"
+            )
+            self.sessions.select_tab(
+                "review" if context in review_contexts else saved_tab
+            )
 
     def _save_ui_state(self) -> None:
         self._ui_settings.setValue("geometry", self.saveGeometry())
         self._ui_settings.setValue("dock_state", self.saveState())
         self._ui_settings.setValue("last_context", self._current_context)
+        self._ui_settings.setValue("sessions_tab", self.sessions.current_tab_id())
         self._ui_settings.sync()
 
     def _apply_style(self) -> None:
@@ -1466,6 +1442,8 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             QLabel#statusStrip,
             QLabel#compactContract,
             QLabel#protocolCheck {{ color: {TEXT_MUTED}; }}
+            QLabel#sessionWorkspaceFeedback {{ color: {TEXT_MUTED}; }}
+            QLabel#sessionWorkspaceFeedback[severity="error"] {{ color: #641018; }}
             QFrame#cameraPreview {{ background: #161616; border: 1px solid #525252; }}
             QLabel#cameraPreviewTitle, QLabel#cameraPreviewMeta {{ color: #ffffff; }}
             QLabel#cameraPreviewImage {{ background: #262626; color: #c6c6c6; }}
@@ -1474,7 +1452,9 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         )
 
     def _select_context(self, context_id: str) -> None:
+        requested_context = str(context_id or "")
         context_id = canonical_context_id(context_id)
+        sessions_tab: str | None = None
         if context_id.startswith("diagnostics"):
             # Diagnostics is a dock-local view, not a replacement logical
             # workspace.  Preserve _current_context and the Inspector's
@@ -1495,9 +1475,17 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         elif context_id in {"processing.measurement"}:
             page = "measurement"
         elif context_id == "tasks.session":
-            page = "session"
-        elif context_id == "tasks.recording":
-            page = "recording"
+            page = "sessions"
+            review_contexts = {
+                "tasks.recording",
+                "tasks.session_details",
+                "tasks.playback",
+                "tasks.export",
+            }
+            sessions_tab = (
+                "review" if requested_context in review_contexts else "current"
+            )
+            self.sessions.select_tab(sessions_tab)
         elif context_id in {"devices.pixhawk", "devices.pixhawk.p1", "devices.pixhawk.p2"}:
             page = "pixhawk"
         elif context_id == "devices.telemetry":
@@ -1525,6 +1513,8 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self.inspector.refresh(context_id, self.status_adapter.model)
         if context_id not in {"overview"} and self.navigation.currentIndex().data(QtCore.Qt.UserRole) != context_id:
             self.navigation.select_context(context_id)
+        if sessions_tab is not None:
+            self.sessions.select_tab(sessions_tab)
 
     def _open_advanced_zoom(self) -> None:
         """Open the shared Advanced camera-control surface for physical zoom."""
@@ -1552,22 +1542,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
 
     def _save_session(self) -> object:
         return self.backend.save_session()
-
-    def _begin_measurement_session_with_run_setup(self) -> object:
-        """Start the session, then replace its unlocked fallback with the visible draft."""
-
-        draft = self.recording.validated_run_setup_payload(allow_auto_default=True)
-        result = self.backend.begin_measurement_session()
-        if result is False:
-            return False
-        if draft is None:
-            self.recording.refresh_run_setup_from_owner()
-            return result
-        applied = self.backend.apply_run_setup(draft)
-        if applied is False:
-            raise RuntimeError("run setup apply was rejected after Start Session")
-        self.recording.accept_run_setup_result(applied)
-        return result
 
     def _camera_discover_host_ip(self) -> object:
         return self.backend.camera_discover_host_ip()
@@ -1686,6 +1660,10 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         return self.backend.gnss_ntrip_forget_password()
 
     def _calibration_capture_images(self) -> object:
+        setup = self.calibration.setup_payload()
+        self.backend.calibration_apply_setup(
+            {"pair_max_delta_ms": setup.get("pair_max_delta_ms", 100.0)}
+        )
         return self.backend.calibration_capture_images()
 
     def _calibration_capture_images_wiris_ftp(self) -> object:
@@ -1713,14 +1691,18 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             return False
         if not getattr(self.calibration, "_last_calibration_session_apply_performed", False):
             self.backend.calibration_apply_setup(self.calibration.setup_payload())
-        return self.backend.calibration_run_intrinsic()
+        return self.backend.calibration_run_intrinsic(
+            self.calibration.calibration_input_request()
+        )
 
     def _calibration_run_extrinsics(self) -> object:
         if not self.calibration.apply_selected_calibration_session():
             return False
         if not getattr(self.calibration, "_last_calibration_session_apply_performed", False):
             self.backend.calibration_apply_setup(self.calibration.setup_payload())
-        return self.backend.calibration_run_extrinsics()
+        return self.backend.calibration_run_extrinsics(
+            self.calibration.calibration_input_request()
+        )
 
     def _calibration_save_intrinsics(self) -> object:
         confirmed = bool(
@@ -1879,19 +1861,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self.advanced.apply_preview_snapshot(result)
         return result
 
-    def _advanced_media_refresh(self) -> object:
-        self.advanced.refresh_media()
-        return True
-
-    def _advanced_media_preview(self) -> object:
-        return self.advanced.media_preview()
-
-    def _advanced_media_open_session(self) -> object:
-        return self.advanced.media_open_session()
-
-    def _advanced_media_open_artifact(self) -> object:
-        return self.advanced.media_open_artifact()
-
     def _advanced_media_open_video(self) -> object:
         return self.advanced.media_open_video()
 
@@ -2015,7 +1984,12 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         camera_state = snapshot.get("camera.left")
         self.commands.set_text("camera.toggle", "Stop preview" if camera_state and camera_state.state in {"LIVE", "STARTING"} else "Preview")
         detection = snapshot.get("detection")
-        self.commands.set_text("detection.toggle", "Stop detection" if detection and detection.state in {"RUNNING", "STARTING"} else "Detection")
+        self.commands.set_text(
+            "detection.toggle",
+            "측정 종료"
+            if detection and detection.state in {"RUNNING", "STARTING"}
+            else "측정 시작",
+        )
         self.commands.set_text(
             "recording.toggle",
             "Stop manual recording"

@@ -3,8 +3,8 @@
 The recording controller owns producers and their asynchronous save workers.
 This controller owns the higher-level operator contract:
 
-``Start Session -> New Measurement -> one Detection interval -> Post Capture
--> Seal Measurement``.  A sealed measurement leaves the parent session open
+``Start Session -> Start Measurement (create child + Detection) -> automatic
+save and seal on stop``.  A sealed measurement leaves the parent session open
 for another child; ``Close Session`` seals the aggregate child-manifest index.
 
 Finalization is deliberately resumable.  A click may move the package to
@@ -32,6 +32,7 @@ from Workstation.workstation_core.recording_session import (
     MEASUREMENT_STORAGE_SCHEMA,
     session_id_now,
 )
+from Workstation.workstation_core.measurement_methods import MEASUREMENT_METHOD_IDS
 
 
 MEASUREMENT_PACKAGE_METHODS = [
@@ -622,40 +623,18 @@ class MeasurementPackageController:
             return {}
         return dict(value) if isinstance(value, Mapping) else {}
 
-    def _apply_automatic_run_identity(self, session_id: str) -> None:
-        applier = getattr(self.panel, "apply_workstation_run_setup", None)
-        if not callable(applier):
-            return
-        mode = "drone"
-        platform_widget = getattr(self.panel, "run_platform_combo", None)
-        platform_reader = getattr(platform_widget, "currentData", None)
-        if callable(platform_reader):
-            mode = str(platform_reader() or mode)
-        try:
-            applier(
-                {
-                    "experiment_id": "unassigned",
-                    "run_id": session_id,
-                    "condition_id": "unspecified",
-                    "mode": mode,
-                    "condition": {
-                        "identity_source": "automatic_session_identity",
-                        "operator_metadata": "not_collected",
-                    },
-                }
-            )
-        except Exception as exc:
-            inventory_errors = getattr(self.panel, "_measurement_package_inventory_errors", [])
-            inventory_errors.append(f"automatic run identity: {exc}")
-
     def _initialize_measurement_package(
         self,
         package: object,
         *,
         session_id: str,
         measurement_id: str = "",
-        apply_run_identity: bool,
     ) -> None:
+        measurement_owner = getattr(
+            self.panel, "_measurement_view_controller_owner", None
+        )
+        if measurement_owner is not None:
+            measurement_owner.close_method_evaluation_workers()
         self.panel._measurement_package = package
         self.panel.recording_session_id = session_id
         if measurement_id:
@@ -668,6 +647,16 @@ class MeasurementPackageController:
         self.panel._measurement_package_finalize_requested = False
         self.panel._measurement_package_registered_paths = set()
         self.panel._measurement_package_inventory_errors = []
+        self.panel._last_frozen_measurement_pair = None
+        self.panel._method_evaluation_submitted = set()
+        self.panel._method_evaluation_committed = set()
+        self.panel._method_evaluation_accepting = True
+        self.panel._method_evaluation_stop_retry_scheduled = False
+        self.panel._last_method_evaluation_bundle = None
+        self.panel._measurement_method_result_counters = {
+            method_id: {"VALID": 0, "BLOCKED": 0, "FAILED": 0}
+            for method_id in MEASUREMENT_METHOD_IDS
+        }
         initial_core = self._core_snapshot()
         self.panel._measurement_package_revision = _revision_number(
             initial_core.get("revision_number", initial_core.get("revision")), 1
@@ -699,10 +688,9 @@ class MeasurementPackageController:
         self.panel.px4_recording_rows = {"left": [], "right": []}
         self.panel.gnss_base_recording_rows = []
         self.panel.extrinsics_comparison_recording_rows = []
+        self.panel.method_evaluation_bundle_rows = []
         self.panel.pnp_photo_capture_records = []
         self.panel.oz_photo_capture_records = []
-        if apply_run_identity:
-            self._apply_automatic_run_identity(session_id)
         detail_id = f"{session_id}/{measurement_id}" if measurement_id else session_id
         self._set_state("COLLECTING", f"Measurement {detail_id} is collecting pre evidence")
 
@@ -724,8 +712,59 @@ class MeasurementPackageController:
             "session.persistence",
             required_roles=("session/finalization_manifest",),
         )
+        self._write_frozen_measurement_method_inputs()
         if bool(getattr(self.panel, "_measurement_package_collect_provenance", True)):
             self._collect_begin_provenance()
+
+    def _write_frozen_measurement_method_inputs(self) -> None:
+        """Copy every method's Measurement-start input into its owned folder."""
+
+        from Workstation.workstation_core.package_provenance import (
+            write_atomic_json_snapshot,
+        )
+
+        frozen = getattr(
+            self.panel, "_measurement_frozen_comparison_inputs", {}
+        )
+        frozen = frozen if isinstance(frozen, Mapping) else {}
+        root = self._session_root()
+        for method_id in MEASUREMENT_METHOD_IDS:
+            method_input = frozen.get(method_id)
+            payload = {
+                "schema": "workstation-frozen-method-input-v1",
+                "measurement_id": str(
+                    getattr(self.panel, "_measurement_id", "") or ""
+                ),
+                "method_id": method_id,
+                "primary": method_id == "pixhawk_rtk_live",
+                "state": (
+                    "LIVE_AT_PAIR"
+                    if method_id == "pixhawk_rtk_live"
+                    else "BLOCKED_MISSING_DRAFT"
+                    if isinstance(method_input, Mapping)
+                    and bool(method_input.get("draft_missing", False))
+                    else "FROZEN_COMPARISON_INPUT"
+                    if isinstance(method_input, Mapping)
+                    else "BLOCKED_MISSING_DRAFT"
+                ),
+                "input": dict(method_input) if isinstance(method_input, Mapping) else None,
+            }
+            try:
+                descriptor = write_atomic_json_snapshot(
+                    root,
+                    f"inputs/methods/{method_id}/frozen_input.json",
+                    payload,
+                    role=f"measurement_method_input/{method_id}",
+                    source="workstation_measurement_start_freeze",
+                    data_schema="workstation-frozen-method-input-v1",
+                )
+                self._register_descriptor(descriptor)
+            except Exception as exc:
+                self._register_descriptor_failure(
+                    f"measurement_method_input/{method_id}",
+                    exc,
+                    "workstation_measurement_start_freeze",
+                )
 
     def begin_measurement_session(
         self,
@@ -734,6 +773,10 @@ class MeasurementPackageController:
         session_id: str | None = None,
     ) -> bool:
         current = _state_text(getattr(self.panel, "_measurement_package_state", "IDLE"))
+        # Opening a Session only allocates the parent evidence container.
+        # Device, synchronization, calibration, and method readiness are
+        # downstream workflow facts and must not prevent that container from
+        # being created before Calibration or Alignment begins.
         if self._hierarchy_enabled():
             existing_session = self.session
             existing_state = str(getattr(existing_session, "state", "") or "")
@@ -787,6 +830,9 @@ class MeasurementPackageController:
                 session_id=resolved_id,
                 metadata={
                     "initiator": "workstation_explicit_begin_session",
+                    "opened_local_date": time.strftime("%Y-%m-%d", time.localtime()),
+                    "opened_local_time": time.strftime("%H:%M:%S", time.localtime()),
+                    "directory_contract": "recordings/YYYYMMDD_HHMMSS_nanoseconds",
                     **dict(metadata or {}),
                 },
                 app_run_id=(
@@ -810,6 +856,13 @@ class MeasurementPackageController:
             self.panel._measurement_package_rtcm_drain_requested_token = ""
             self.panel._measurement_package_rtcm_drain_result = None
             self.panel._measurement_package_revision = 0
+            self.panel._calibration_session_root = None
+            self.panel._calibration_session_roots = {}
+            reset_alignment = getattr(
+                self.panel, "reset_workstation_optical_pose_session", None
+            )
+            if callable(reset_alignment):
+                reset_alignment()
             previous_rows = getattr(self.panel, "distance_recording_rows", None)
             closer = getattr(previous_rows, "close", None)
             if callable(closer):
@@ -819,13 +872,13 @@ class MeasurementPackageController:
             self.panel.px4_recording_rows = {"left": [], "right": []}
             self.panel.gnss_base_recording_rows = []
             self.panel.extrinsics_comparison_recording_rows = []
+            self.panel.method_evaluation_bundle_rows = []
             self.panel.pnp_photo_capture_records = []
             self.panel.oz_photo_capture_records = []
             self.panel.video_recording_paths = {}
             self.panel._pnp_session_prepared = False
             self.panel._session_save_finalized = False
             self.panel._session_save_retry_required = False
-            self._apply_automatic_run_identity(resolved_id)
             self._set_state(
                 "IDLE",
                 f"Session {resolved_id} is open; create a measurement",
@@ -840,7 +893,6 @@ class MeasurementPackageController:
             package,
             session_id=resolved_id,
             measurement_id=measurement_id,
-            apply_run_identity=True,
         )
         logger = getattr(self.panel, "_log", None)
         if callable(logger):
@@ -935,25 +987,29 @@ class MeasurementPackageController:
         return None
 
     def _active_input_paths(self) -> dict[str, Path]:
-        settings = getattr(self.panel, "settings", None)
-        weights_widget = getattr(self.panel, "weights_edit", None)
-        weights_text = getattr(weights_widget, "text", None)
-        weights = self._first_existing_path(
-            weights_text() if callable(weights_text) else None,
-            getattr(settings, "yolo_weights_path", None),
-        )
+        """Return active profile bytes that must be copied into the package.
+
+        Detector weights remain runtime-owned under the Workstation data root.
+        Their selected path may appear in the redacted settings snapshot, but
+        the model bytes are deliberately not copied into a Session or child
+        Measurement package.
+        """
+
         intrinsics = self._first_existing_path(
             getattr(self.panel, "_active_intrinsics_profile_path", None)
         )
         extrinsics = self._first_existing_path(
             getattr(self.panel, "_active_extrinsics_profile_path", None)
         )
+        alignment = self._first_existing_path(
+            getattr(self.panel, "_active_alignment_snapshot_path", None)
+        )
         return {
             role: path
             for role, path in (
-                ("active_yolo_model", weights),
                 ("active_intrinsics_profile", intrinsics),
                 ("active_extrinsics_profile", extrinsics),
+                ("active_alignment_selection", alignment),
             )
             if path is not None
         }
@@ -1024,7 +1080,11 @@ class MeasurementPackageController:
             )
 
         for role, source_path in self._active_input_paths().items():
-            destination = "inputs/models" if role == "active_yolo_model" else "inputs/calibration/active"
+            destination = (
+                "inputs/alignment/active"
+                if role == "active_alignment_selection"
+                else "inputs/calibration/active"
+            )
             try:
                 descriptor = snapshot_input_file(
                     source_path,
@@ -1040,14 +1100,12 @@ class MeasurementPackageController:
     def _ensure_measurement_input_evidence(self) -> None:
         paths = self._active_input_paths()
         expected_roles: list[str] = []
-        weights_widget = getattr(self.panel, "weights_edit", None)
-        weights_reader = getattr(weights_widget, "text", None)
-        if callable(weights_reader) and str(weights_reader() or "").strip():
-            expected_roles.append("active_yolo_model")
         if getattr(self.panel, "active_intrinsics", None) is not None:
             expected_roles.append("active_intrinsics_profile")
         if str(getattr(self.panel, "_active_extrinsics_profile_path", "") or "").strip():
             expected_roles.append("active_extrinsics_profile")
+        if str(getattr(self.panel, "_active_alignment_snapshot_path", "") or "").strip():
+            expected_roles.append("active_alignment_selection")
         if not expected_roles:
             return
         self.activate_measurement_package_source(
@@ -1067,7 +1125,11 @@ class MeasurementPackageController:
                     source="measurement.inputs",
                 )
                 continue
-            destination = "inputs/models" if role == "active_yolo_model" else "inputs/calibration/active"
+            destination = (
+                "inputs/alignment/active"
+                if role == "active_alignment_selection"
+                else "inputs/calibration/active"
+            )
             try:
                 self._register_descriptor(
                     snapshot_input_file(
@@ -1244,7 +1306,9 @@ class MeasurementPackageController:
             if callable(transition):
                 _call_supported(transition, "POST_CAPTURE")
         self._sync_measurement_session()
-        self._set_state("POST_CAPTURE", "Detection ended; collect post evidence, then Finalize")
+        self._set_state("POST_CAPTURE", "Detection ended; measurement persistence starts automatically")
+        if bool(getattr(self.panel, "_measurement_auto_finalize_enabled", False)):
+            self.finalize_measurement_package()
         return True
 
     # ------------------------------------------------------------------
@@ -2622,7 +2686,7 @@ class MeasurementPackageController:
             self._sync_measurement_session()
             package = session.begin_measurement(
                 metadata={
-                    "initiator": "workstation_explicit_next_measurement",
+                    "initiator": "workstation_measurement_boundary",
                     "recording_mode": "explicit_measurement_package",
                     **dict(metadata or {}),
                     **method_config,
@@ -2636,12 +2700,11 @@ class MeasurementPackageController:
             package,
             session_id=str(getattr(session, "session_id", "")),
             measurement_id=measurement_id,
-            apply_run_identity=False,
         )
         logger = getattr(self.panel, "_log", None)
         if callable(logger):
             logger(
-                f"[패키지] New Measurement: {session.session_id}/{measurement_id}"
+                f"[패키지] Measurement 준비: {session.session_id}/{measurement_id}"
             )
         return True
 

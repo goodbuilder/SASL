@@ -1,4 +1,4 @@
-"""Mountain auto-select regression guards against real photos.
+"""Opt-in Mountain auto-select regression guards against local real photos.
 
 Every earlier synthetic test for ``detect_mountain`` passed while the real
 bug (matching clouds/sky instead of the ridge) was still present, and each
@@ -7,10 +7,9 @@ mode on the next real photo. These tests pin the two real photos that
 exposed those failures so a future change to the sky/ground classifier or
 the boundary-band filter cannot silently regress back to either one.
 
-The source photos are not committed to the repository (they are personal
-downloads, not project assets); each test skips itself when its file is not
-present on the current machine, so this file is a no-op on any other
-checkout or in CI.
+The source photos are not committed to the repository. Set
+``WORKSTATION_RUN_LOCAL_PHOTO_REGRESSION=1`` to include these slow,
+machine-local checks; the default suite skips this module.
 """
 
 from __future__ import annotations

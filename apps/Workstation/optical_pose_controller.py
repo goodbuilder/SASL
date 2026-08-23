@@ -14,6 +14,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 import time
 import uuid
 from dataclasses import dataclass, fields as _dataclass_fields
@@ -25,6 +26,7 @@ from PyQt5 import QtCore, QtGui
 from Workstation.workstation_core.calibration import (
     StereoExtrinsics,
     StereoExtrinsicsProfile,
+    StereoIntrinsicsResult,
     compose_stereo_calibration,
 )
 from Workstation.workstation_core.native_frame_store import NativeFrameArtifact, NativeFrameStore
@@ -70,7 +72,6 @@ from Workstation.workstation_core.pose_solvers import (
     solve_pnp_ensemble,
     solve_spherical_horizon_roll_pitch,
 )
-from Workstation.workstation_core.recording_session import session_id_now
 from Workstation.workstation_core.run_evidence import canonical_json_bytes
 from Workstation.workstation_core.rtk_geometry import (
     GpsPositionState,
@@ -82,6 +83,7 @@ from Workstation.wiris_runtime_workers import WirisPnPPhotoCaptureWorker
 
 
 OPTICAL_POSE_CONTROLLER_METHODS = (
+    "reset_workstation_optical_pose_session",
     "workstation_optical_pose_snapshot",
     "register_workstation_optical_pose_candidate",
     "apply_workstation_optical_pose_candidate",
@@ -145,6 +147,16 @@ class OpticalPoseAutoSelectJob:
 
     def run(self) -> dict[str, Any]:
         return self.controller._compute_auto_selection(self.mode, self.payload)
+
+
+@dataclass(frozen=True)
+class _PreparedOpticalPoseApplication:
+    """Complete optical-pose active state prepared without mutating the owner."""
+
+    selection: OpticalPoseSelection
+    poses: tuple[CameraPoseNed, CameraPoseNed]
+    profile: StereoExtrinsicsProfile
+    active_intrinsics: Any
 
 
 def _mat_transpose(matrix: Sequence[Sequence[float]]) -> tuple[tuple[float, float, float], ...]:
@@ -502,6 +514,129 @@ class OpticalPoseController:
         # import_workstation_optical_pose_burst.
         self._pending_wiris_ftp_payload: dict[str, Any] = {}
 
+    def _require_open_session_id(self) -> str:
+        session_id = str(
+            getattr(self.panel, "_measurement_session_id", "")
+            or getattr(self.panel, "recording_session_id", "")
+            or ""
+        )
+        session_state = str(
+            getattr(self.panel, "_measurement_session_state", "IDLE") or "IDLE"
+        ).upper()
+        hierarchy_enabled = bool(
+            getattr(self.panel, "_measurement_session_hierarchy_enabled", False)
+        )
+        if not session_id or (hierarchy_enabled and session_state != "OPEN"):
+            raise RuntimeError("Open Session is required before Alignment capture")
+        return session_id
+
+    def reset_workstation_optical_pose_session(self) -> None:
+        """Clear prior-Session Alignment state before a new Session opens."""
+
+        self._candidates.clear()
+        self._candidate_priors.clear()
+        self._candidate_solver_context.clear()
+        self._candidate_drone_rotation_context.clear()
+        self._active_selection = None
+        self._active_poses = None
+        self._selection_history.clear()
+        self._profile_restore_stack.clear()
+        self._frozen_frames.clear()
+        self._frozen_intrinsics_profile = None
+        self._frozen_prior_poses = None
+        self._frozen_capture_monotonic_s = None
+        self._terrain_metadata = None
+        self._terrain_snapshot = None
+        self._auto_suggestions.clear()
+        self._last_accepted_auto_suggestion = None
+        self._annotation_review = None
+        self._drone_rtk_observations.clear()
+        self._pending_wiris_ftp_payload.clear()
+        setattr(self.panel, "selected_extrinsics_profile", None)
+        setattr(self.panel, "_active_optical_pose_selection_id", "")
+        setattr(self.panel, "_active_optical_pose_profile_hash", "")
+        setattr(self.panel, "_active_optical_pose_effective_from_pair_sequence", None)
+        setattr(self.panel, "_active_alignment_snapshot_path", "")
+        setattr(self.panel, "_active_alignment_snapshot_sha256", "")
+        self._invalidate_measurement_cache()
+
+    def _alignment_storage_context(self) -> tuple[str, Path]:
+        """Resolve the Session-owned persistence boundary without changing state."""
+
+        session_id = self._require_open_session_id()
+        resolver = getattr(self.panel, "_measurement_session_dir", None)
+        if not callable(resolver):
+            resolver = getattr(self.panel, "_recording_session_dir", None)
+        if not callable(resolver):
+            raise RuntimeError("measurement session directory owner is unavailable")
+        session_root = Path(resolver(session_id))
+        if session_root.exists() and not session_root.is_dir():
+            raise RuntimeError("measurement session storage owner is not a directory")
+        return session_id, session_root / "alignment"
+
+    def _persist_session_alignment_snapshot(self) -> Path:
+        """Version one immutable selection, then atomically update its pointer."""
+
+        session_id, alignment_dir = self._alignment_storage_context()
+        alignment_dir.mkdir(parents=True, exist_ok=True)
+        target = alignment_dir / "active_alignment.json"
+        version_payload = {
+            "schema": "workstation-session-alignment-snapshot-v1",
+            "session_id": session_id,
+            "updated_utc_ns": time.time_ns(),
+            "alignment": self.workstation_optical_pose_snapshot(include_frames=False),
+        }
+        version_bytes = canonical_json_bytes(version_payload) + b"\n"
+        version_sha256 = hashlib.sha256(version_bytes).hexdigest()
+        selections_dir = alignment_dir / "selections"
+        selections_dir.mkdir(parents=True, exist_ok=True)
+        version_path = selections_dir / f"alignment-{version_sha256}.json"
+        if version_path.exists():
+            if version_path.read_bytes() != version_bytes:
+                raise RuntimeError(
+                    f"immutable Alignment hash collision at {version_path}"
+                )
+        else:
+            version_temporary = version_path.with_name(
+                f".{version_path.name}.{uuid.uuid4().hex}.tmp"
+            )
+            try:
+                with version_temporary.open("xb") as handle:
+                    handle.write(version_bytes)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                try:
+                    os.link(version_temporary, version_path)
+                except FileExistsError:
+                    if version_path.read_bytes() != version_bytes:
+                        raise RuntimeError(
+                            f"immutable Alignment destination changed at {version_path}"
+                        )
+            finally:
+                version_temporary.unlink(missing_ok=True)
+        payload = {
+            **version_payload,
+            "selection_relative_path": version_path.relative_to(alignment_dir).as_posix(),
+            "selection_sha256": version_sha256,
+        }
+        temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(canonical_json_bytes(payload) + b"\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+            descriptor = os.open(alignment_dir, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        finally:
+            temporary.unlink(missing_ok=True)
+        setattr(self.panel, "_active_alignment_snapshot_path", str(version_path))
+        setattr(self.panel, "_active_alignment_snapshot_sha256", version_sha256)
+        return target
+
     def register_workstation_optical_pose_candidate(
         self,
         candidate: OpticalPoseCandidate,
@@ -537,21 +672,42 @@ class OpticalPoseController:
             current = latest_by_method.get(candidate.method)
             if current is None or candidate.created_utc_ns > current.created_utc_ns:
                 latest_by_method[candidate.method] = candidate
-        return tuple(
-            {
-                "candidate_id": candidate.candidate_id,
-                "method": candidate.method,
-                "left_pose_ned": candidate.left_pose_ned,
-                "right_pose_ned": candidate.right_pose_ned,
-                # Axes this solve actually optimized; every other axis in
-                # left/right_pose_ned is copied verbatim from the prior pose
-                # (see ``_resolve_prior_poses``), not measured by this
-                # candidate. Callers must not present inherited axes as if
-                # this method observed them.
-                "optimized_dofs": candidate.optimized_dofs.selected_names,
-            }
-            for candidate in latest_by_method.values()
+        active_candidate_id = (
+            "" if self._active_selection is None else self._active_selection.candidate_id
         )
+        rows: list[dict[str, Any]] = []
+        for candidate in latest_by_method.values():
+            candidate_payload = self._candidate_mapping_with_prior(
+                candidate,
+                self._candidate_priors[candidate.candidate_id],
+            )
+            rows.append(
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "method": candidate.method,
+                    "left_pose_ned": candidate.left_pose_ned,
+                    "right_pose_ned": candidate.right_pose_ned,
+                    # Axes this solve actually optimized; every other axis in
+                    # left/right_pose_ned is copied verbatim from the prior pose
+                    # (see ``_resolve_prior_poses``), not measured by this
+                    # candidate. Callers must not present inherited axes as if
+                    # this method observed them.
+                    "optimized_dofs": candidate.optimized_dofs.selected_names,
+                    "candidate_profile_hash": hashlib.sha256(
+                        canonical_json_bytes(candidate_payload)
+                    ).hexdigest(),
+                    "candidate_intrinsics_hash": str(
+                        dict(candidate.input_hashes).get(
+                            "operating_intrinsics_profile_sha256",
+                            "",
+                        )
+                    ),
+                    "candidate_quality": dict(candidate.quality_metrics),
+                    "candidate_warnings": list(candidate.warnings),
+                    "candidate_applied": candidate.candidate_id == active_candidate_id,
+                }
+            )
+        return tuple(rows)
 
     @staticmethod
     def _mask(payload: Mapping[str, Any]) -> PoseDofMask:
@@ -604,10 +760,21 @@ class OpticalPoseController:
             "",
         )
         active_profile_hash = str(applicability["applicability"]["profile_sha256"])
-        if expected_profile_hash and expected_profile_hash != active_profile_hash:
+        if not expected_profile_hash:
+            raise RuntimeError(
+                "candidate operating K,D profile SHA-256 is missing; capture/solve again"
+            )
+        if expected_profile_hash != active_profile_hash:
             raise RuntimeError(
                 "operating K,D changed after candidate creation; capture/solve again"
             )
+        current_intrinsics, operating_profile = self._active_intrinsics_for_apply(
+            applicability
+        )
+        # Resolve every non-I/O persistence precondition before any active or
+        # active-like owner field is changed. Actual write failures remain
+        # rollback-protected below.
+        self._alignment_storage_context()
         prior_left, prior_right = self._candidate_priors[candidate_id]
         left_parameters, right_parameters = self._apply_candidate_with_constraints(
             candidate,
@@ -617,7 +784,11 @@ class OpticalPoseController:
         )
         active = (left_parameters.to_camera_pose_ned(), right_parameters.to_camera_pose_ned())
         next_pair_sequence = len(getattr(self.panel, "distance_recording_rows", ()) or ())
-        previous_profile = getattr(self.panel, "selected_extrinsics_profile", None)
+        previous_profile = getattr(
+            self.panel,
+            "active_extrinsics_profile",
+            getattr(self.panel, "selected_extrinsics_profile", None),
+        )
         previous = str(getattr(previous_profile, "profile_id", "") or "")
         selection = OpticalPoseSelection(
             selection_id=f"pose-selection-{uuid.uuid4().hex}",
@@ -628,21 +799,31 @@ class OpticalPoseController:
             previous_profile_id=previous,
             quality_snapshot=candidate.quality_metrics,
         )
-        self._profile_restore_stack.append(self._capture_profile_state())
-        profile = self._install_selected_profile(
+        prepared = self._prepare_selected_profile(
             selection,
             candidate,
             active,
             applicability,
+            current_intrinsics=current_intrinsics,
+            operating_profile=operating_profile,
         )
-        self._active_poses = active
-        self._active_selection = selection
-        self._selection_history.append(selection)
-        self._invalidate_measurement_cache()
-        result = self._selection_mapping(selection, active)
-        result["selected_extrinsics_profile_id"] = profile.profile_id
-        result["selected_extrinsics_content_sha256"] = profile.content_sha256
-        result["effective_boundary"] = "next accepted pair (zero-based sequence equals current row count)"
+        previous_state = self._capture_profile_state()
+        self._profile_restore_stack.append(previous_state)
+        try:
+            self._commit_selected_profile(prepared)
+            self._invalidate_measurement_cache()
+            result = self._selection_mapping(selection, active)
+            result["selected_extrinsics_profile_id"] = prepared.profile.profile_id
+            result["selected_extrinsics_content_sha256"] = prepared.profile.content_sha256
+            result["effective_boundary"] = (
+                "next accepted pair (zero-based sequence equals current row count)"
+            )
+            alignment_path = self._persist_session_alignment_snapshot()
+        except Exception:
+            rollback_state = self._profile_restore_stack.pop()
+            self._restore_profile_state(rollback_state)
+            raise
+        result["session_alignment_path"] = str(alignment_path)
         self._append_event("pose_candidate_applied", result)
         return result
 
@@ -716,6 +897,7 @@ class OpticalPoseController:
             "previous_selection_id": "" if previous is None else previous.selection_id,
             "reverted_utc_ns": time.time_ns(),
         }
+        self._persist_session_alignment_snapshot()
         self._append_event("pose_selection_reverted", result)
         return result
 
@@ -816,10 +998,7 @@ class OpticalPoseController:
         """Persist one unannotated native frame per side and freeze its state."""
 
         values = dict(payload or {})
-        session_id = str(getattr(self.panel, "recording_session_id", "") or "")
-        if not session_id:
-            session_id = session_id_now()
-            setattr(self.panel, "recording_session_id", session_id)
+        session_id = self._require_open_session_id()
         resolver = getattr(self.panel, "_recording_session_dir", None)
         if not callable(resolver):
             raise RuntimeError("recording session directory owner is unavailable")
@@ -932,10 +1111,7 @@ class OpticalPoseController:
         target_infos = self.panel._camera_photo_target_infos()
         if len(target_infos) != 2:
             raise RuntimeError("WIRIS FTP capture failed: both WIRIS control hosts are required")
-        session_id = str(getattr(self.panel, "recording_session_id", "") or "")
-        if not session_id:
-            session_id = session_id_now()
-            setattr(self.panel, "recording_session_id", session_id)
+        session_id = self._require_open_session_id()
         resolver = getattr(self.panel, "_recording_session_dir", None)
         if not callable(resolver):
             raise RuntimeError("recording session directory owner is unavailable")
@@ -1091,10 +1267,7 @@ class OpticalPoseController:
         target_infos = self.panel._camera_photo_target_infos()
         if len(target_infos) != 2:
             raise RuntimeError("WIRIS FTP capture failed: both WIRIS control hosts are required")
-        session_id = str(getattr(self.panel, "recording_session_id", "") or "")
-        if not session_id:
-            session_id = session_id_now()
-            setattr(self.panel, "recording_session_id", session_id)
+        session_id = self._require_open_session_id()
         resolver = getattr(self.panel, "_recording_session_dir", None)
         if not callable(resolver):
             raise RuntimeError("recording session directory owner is unavailable")
@@ -1200,10 +1373,7 @@ class OpticalPoseController:
                 "import requires sources.left/right, each with a 'path': missing "
                 + ", ".join(missing_sides)
             )
-        session_id = str(getattr(self.panel, "recording_session_id", "") or "")
-        if not session_id:
-            session_id = session_id_now()
-            setattr(self.panel, "recording_session_id", session_id)
+        session_id = self._require_open_session_id()
         resolver = getattr(self.panel, "_recording_session_dir", None)
         if not callable(resolver):
             raise RuntimeError("recording session directory owner is unavailable")
@@ -3521,7 +3691,11 @@ class OpticalPoseController:
         actual_zoom = getattr(self.panel, "actual_visible_zoom", {}) or {}
         active_profile_id = "" if self._active_selection is None else self._active_selection.selection_id
         active_candidate_id = "" if self._active_selection is None else self._active_selection.candidate_id
-        selected_extrinsics = getattr(self.panel, "selected_extrinsics_profile", None)
+        selected_extrinsics = getattr(
+            self.panel,
+            "active_extrinsics_profile",
+            getattr(self.panel, "selected_extrinsics_profile", None),
+        )
         intrinsics = self._intrinsics_snapshot(use_frozen=False)
         geometry_allowed = bool(intrinsics["applicability"]["geometry_allowed"])
         current_profile_hash = str(intrinsics["applicability"]["profile_sha256"])
@@ -3698,7 +3872,11 @@ class OpticalPoseController:
             and all(isinstance(pose, CameraPoseNed) for pose in declared)
         ):
             return declared
-        profile = getattr(self.panel, "selected_extrinsics_profile", None)
+        profile = getattr(
+            self.panel,
+            "active_extrinsics_profile",
+            getattr(self.panel, "selected_extrinsics_profile", None),
+        )
         extrinsics = getattr(profile, "extrinsics", None)
         if extrinsics is None:
             active = getattr(self.panel, "active_intrinsics", None)
@@ -3763,32 +3941,11 @@ class OpticalPoseController:
         row = values.get(side, {}) if isinstance(values, Mapping) else {}
         return dict(row) if isinstance(row, Mapping) else {}
 
-    def _run_condition(self) -> dict[str, Any]:
-        snapshot = getattr(self.panel, "workstation_run_setup_snapshot", None)
-        if not callable(snapshot):
-            return {}
-        try:
-            value = snapshot()
-        except Exception:
-            return {}
-        condition = value.get("condition") if isinstance(value, Mapping) else None
-        return dict(condition) if isinstance(condition, Mapping) else {}
-
     def _declared_profile_value(self, side: str, kind: str) -> str | None:
         identities = getattr(self.panel, "operating_intrinsics_identity", {}) or {}
         row = identities.get(side, {}) if isinstance(identities, Mapping) else {}
         if isinstance(row, Mapping):
             value = row.get(kind)
-            if value not in (None, ""):
-                return str(value)
-        condition = self._run_condition()
-        aliases = (
-            f"{side}_{kind}",
-            f"{side}_camera_{kind}",
-            f"camera_{kind}_{side}",
-        )
-        for key in aliases:
-            value = condition.get(key)
             if value not in (None, ""):
                 return str(value)
         return None
@@ -3911,7 +4068,11 @@ class OpticalPoseController:
             if use_frozen and self._frozen_capture_monotonic_s is not None
             else time.monotonic()
         )
-        extrinsics = getattr(self.panel, "selected_extrinsics_profile", None)
+        extrinsics = getattr(
+            self.panel,
+            "active_extrinsics_profile",
+            getattr(self.panel, "selected_extrinsics_profile", None),
+        )
         result = evaluate_intrinsics_applicability(
             profile,
             left,
@@ -4110,6 +4271,8 @@ class OpticalPoseController:
 
     _PROFILE_ATTRIBUTE_NAMES = (
         "selected_extrinsics_profile",
+        "active_extrinsics_profile",
+        "optical_pose_extrinsics_profile",
         "active_intrinsics",
         "_selected_extrinsics_profile_path",
         "_selected_extrinsics_profile_hash",
@@ -4120,7 +4283,60 @@ class OpticalPoseController:
         "_active_optical_pose_profile_hash",
         "_active_optical_pose_selection_id",
         "_active_optical_pose_effective_from_pair_sequence",
+        "_active_alignment_snapshot_path",
+        "_active_alignment_snapshot_sha256",
     )
+    _MEASUREMENT_CACHE_ATTRIBUTE_NAMES = (
+        "_last_measurement_attempt_key",
+        "_last_measurement_attempt",
+        "_last_distance_history_key",
+    )
+
+    def _active_intrinsics_for_apply(
+        self,
+        intrinsics_snapshot: Mapping[str, Any],
+    ) -> tuple[StereoIntrinsicsResult, OperatingIntrinsicsProfile]:
+        """Require the applicable profile to be the exact current active K,D.
+
+        Measurement may deliberately use a ``NOMINAL_UNVERIFIED`` fallback,
+        but an optical-pose Apply is an active-state transition. It therefore
+        requires the existing active matrix, path, content hash, and profile
+        math to describe one identity before any R,t state is prepared.
+        """
+
+        current = getattr(self.panel, "active_intrinsics", None)
+        if not isinstance(current, StereoIntrinsicsResult):
+            raise RuntimeError("active exact K,D is required before optical pose Apply")
+        raw_profile = intrinsics_snapshot.get("profile")
+        if not isinstance(raw_profile, Mapping):
+            raise RuntimeError("active exact K,D profile identity is unavailable")
+        profile = OperatingIntrinsicsProfile.from_mapping(raw_profile)
+        active_path = str(
+            getattr(self.panel, "_active_intrinsics_profile_path", "") or ""
+        )
+        active_hash = str(
+            getattr(self.panel, "_active_intrinsics_profile_hash", "") or ""
+        )
+        if (
+            not active_path
+            or len(active_hash) != 64
+            or any(character not in "0123456789abcdef" for character in active_hash)
+        ):
+            raise RuntimeError("active exact K,D path/hash identity is incomplete")
+        if (
+            profile.source_path != active_path
+            or profile.source_content_sha256 != active_hash
+        ):
+            raise RuntimeError(
+                "applicable operating K,D is not the current active path/hash identity"
+            )
+        active_math = OperatingIntrinsicsProfile.from_stereo_result(
+            current,
+            source_zoom_index=None,
+        ).intrinsics_math_sha256
+        if active_math != profile.intrinsics_math_sha256:
+            raise RuntimeError("active K,D matrix/raster differs from its operating profile")
+        return current, profile
 
     def _capture_profile_state(self) -> dict[str, Any]:
         return {
@@ -4130,6 +4346,11 @@ class OpticalPoseController:
             },
             "active_selection": self._active_selection,
             "active_poses": self._active_poses,
+            "selection_history": tuple(self._selection_history),
+            "measurement_cache": {
+                name: (hasattr(self.panel, name), getattr(self.panel, name, None))
+                for name in self._MEASUREMENT_CACHE_ATTRIBUTE_NAMES
+            },
         }
 
     def _restore_profile_state(self, state: Mapping[str, Any]) -> None:
@@ -4143,16 +4364,34 @@ class OpticalPoseController:
                     delattr(self.panel, name)
         self._active_selection = state.get("active_selection")
         self._active_poses = state.get("active_poses")
+        self._selection_history[:] = list(state.get("selection_history") or ())
+        cache = state.get("measurement_cache")
+        if isinstance(cache, Mapping):
+            for name, row in cache.items():
+                existed, value = row
+                if existed:
+                    setattr(self.panel, name, value)
+                elif hasattr(self.panel, name):
+                    delattr(self.panel, name)
 
-    def _install_selected_profile(
+    def _prepare_selected_profile(
         self,
         selection: OpticalPoseSelection,
         candidate: OpticalPoseCandidate,
         poses: tuple[CameraPoseNed, CameraPoseNed],
         intrinsics_snapshot: Mapping[str, Any],
-    ) -> StereoExtrinsicsProfile:
+        *,
+        current_intrinsics: StereoIntrinsicsResult,
+        operating_profile: OperatingIntrinsicsProfile,
+    ) -> _PreparedOpticalPoseApplication:
+        """Validate and construct the complete next active state without mutation."""
+
         stereo = stereo_pose_from_absolute(*poses)
-        previous = getattr(self.panel, "selected_extrinsics_profile", None)
+        previous = getattr(
+            self.panel,
+            "active_extrinsics_profile",
+            getattr(self.panel, "selected_extrinsics_profile", None),
+        )
         previous_extrinsics = getattr(previous, "extrinsics", None)
         quality = dict(candidate.quality_metrics)
         reprojection_error = quality.get("reprojection_error_px")
@@ -4179,8 +4418,6 @@ class OpticalPoseController:
         )
         known_sources = {value for value in (rotation_zoom, translation_zoom) if value is not None}
         source_zoom = next(iter(known_sources)) if len(known_sources) == 1 else None
-        operating_profile = self.operating_intrinsics_profile_for_geometry()
-        assert operating_profile is not None
         extrinsics = StereoExtrinsics(
             rotation_left_to_right=[list(row) for row in stereo.rotation_right_from_left_rdf],
             translation_left_to_right_m=list(stereo.translation_right_from_left_rdf_m),
@@ -4206,7 +4443,23 @@ class OpticalPoseController:
                 "coordinate_contract": "OpenCV optical RDF; X_right=R_right_from_left*X_left+T metres",
             },
         )
+        active_intrinsics = compose_stereo_calibration(current_intrinsics, profile)
+        return _PreparedOpticalPoseApplication(
+            selection=selection,
+            poses=poses,
+            profile=profile,
+            active_intrinsics=active_intrinsics,
+        )
+
+    def _commit_selected_profile(
+        self,
+        prepared: _PreparedOpticalPoseApplication,
+    ) -> None:
+        """Commit one fully prepared optical-pose state; caller owns rollback."""
+
+        profile = prepared.profile
         setattr(self.panel, "selected_extrinsics_profile", profile)
+        setattr(self.panel, "active_extrinsics_profile", profile)
         # Kept separate from ``selected_extrinsics_profile`` (which a later
         # checkerboard load would overwrite) so the geometry-comparison
         # display can always show the last-applied PnP profile on its own.
@@ -4216,27 +4469,28 @@ class OpticalPoseController:
         setattr(self.panel, "_active_extrinsics_profile_path", f"memory:{profile.profile_id}")
         setattr(self.panel, "_active_extrinsics_profile_hash", profile.content_sha256)
         setattr(self.panel, "_active_optical_pose_profile_hash", profile.content_sha256)
-        setattr(self.panel, "_active_optical_pose_selection_id", selection.selection_id)
+        setattr(
+            self.panel,
+            "_active_optical_pose_selection_id",
+            prepared.selection.selection_id,
+        )
         setattr(
             self.panel,
             "_active_optical_pose_effective_from_pair_sequence",
-            selection.effective_from_pair_sequence,
+            prepared.selection.effective_from_pair_sequence,
         )
         setattr(self.panel, "_active_extrinsics_source_zoom_level", profile.source_zoom_level)
         setattr(
             self.panel,
             "_active_calibration_selection_mode",
-            "manual_independent_zoom" if source_zoom is None else "manual_same_zoom",
+            "manual_independent_zoom"
+            if profile.source_zoom_level is None
+            else "manual_same_zoom",
         )
-        current_intrinsics = getattr(self.panel, "active_intrinsics", None)
-        if current_intrinsics is None:
-            raise RuntimeError("active exact K,D disappeared before profile installation")
-        setattr(
-            self.panel,
-            "active_intrinsics",
-            compose_stereo_calibration(current_intrinsics, profile),
-        )
-        return profile
+        setattr(self.panel, "active_intrinsics", prepared.active_intrinsics)
+        self._active_poses = prepared.poses
+        self._active_selection = prepared.selection
+        self._selection_history.append(prepared.selection)
 
     def _selection_mapping(
         self,

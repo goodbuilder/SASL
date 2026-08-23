@@ -32,7 +32,10 @@ from Workstation.workstation_core.measurement_attempt import (
     MeasurementAttempt,
     StereoIntrinsicsSnapshot,
 )
-from Workstation.workstation_core.measurement_methods import CHECKERBOARD_STEREO
+from Workstation.workstation_core.measurement_methods import (
+    CHECKERBOARD_STEREO,
+    MEASUREMENT_METHOD_IDS,
+)
 from Workstation.workstation_core.dual_geometry import evaluate_nominal_active
 from Workstation.workstation_core.coordinate_contract import (
     BODY_FRAME,
@@ -373,7 +376,7 @@ class RecordingController:
             snapshot = snapshotter() if callable(snapshotter) else {}
             if not isinstance(snapshot, Mapping) or str(snapshot.get("state") or "") != "COLLECTING":
                 self.panel.recording_status_label.setText(
-                    "세션 기록: New Measurement/COLLECTING 상태가 필요합니다"
+                    "세션 기록: 측정 시작이 준비한 COLLECTING 상태가 필요합니다"
                 )
                 return False
         if bool(getattr(self.panel, "_session_save_retry_required", False)):
@@ -403,11 +406,12 @@ class RecordingController:
         self,
         *,
         final_clock_sync_snapshot: dict[str, object] | None = None,
+        restart_streams: bool = False,
     ) -> bool:
         """Stop producers and start legacy session persistence after Detection.
 
-        This does not seal the measurement package.  Post evidence remains
-        appendable until the operator invokes the separate Finalize action.
+        The Measurement controller requests sealing when Detection ends; the
+        asynchronous save callback resumes that fail-closed finalization.
         """
 
         if not bool(getattr(self.panel, "_automatic_session_recording", False)):
@@ -415,7 +419,7 @@ class RecordingController:
         if not self.panel._session_recording_active():
             self.panel._automatic_session_recording = False
             return True
-        stop_kwargs: dict[str, object] = {"restart_streams": False}
+        stop_kwargs: dict[str, object] = {"restart_streams": bool(restart_streams)}
         if final_clock_sync_snapshot is not None:
             stop_kwargs["final_clock_sync_snapshot"] = final_clock_sync_snapshot
         self._stop_session_recording(**stop_kwargs)
@@ -502,12 +506,16 @@ class RecordingController:
         }
         self.panel.gnss_base_recording_rows = SpoolRows()
         self.panel.extrinsics_comparison_recording_rows = SpoolRows()
+        self.panel.method_evaluation_bundle_rows = SpoolRows()
         for side, rows in self.panel.camera_recording_rows.items():
             rows.bind(spool_root / f"camera_{side}.jsonl")
         for side, rows in self.panel.px4_recording_rows.items():
             rows.bind(spool_root / f"px4_{side}.jsonl")
         self.panel.gnss_base_recording_rows.bind(spool_root / "gnss_base.jsonl")
         self.panel.extrinsics_comparison_recording_rows.bind(spool_root / "extrinsics_comparison.jsonl")
+        self.panel.method_evaluation_bundle_rows.bind(
+            spool_root / "method_evaluation_bundles.jsonl"
+        )
         self.panel._recording_pair_row_index.clear()
         self.panel._recovered_session_metadata = None
         self.panel._recovered_session_output_dir = None
@@ -542,6 +550,15 @@ class RecordingController:
         self.panel._measurement_attempt_counter = 0
         self.panel._last_measurement_attempt_key = None
         self.panel._last_measurement_attempt = None
+        self.panel._last_frozen_measurement_pair = None
+        self.panel._method_evaluation_submitted = set()
+        self.panel._method_evaluation_committed = set()
+        self.panel._method_evaluation_accepting = True
+        self.panel._method_evaluation_stop_retry_scheduled = False
+        self.panel._measurement_method_result_counters = {
+            method_id: {"VALID": 0, "BLOCKED": 0, "FAILED": 0}
+            for method_id in MEASUREMENT_METHOD_IDS
+        }
         self.panel._prepare_video_recording_paths()
         write_recovery_metadata(
             self.panel._recording_session_dir(self.panel.recording_session_id),
@@ -694,6 +711,7 @@ class RecordingController:
         self.panel.px4_recording_rows = recovered.px4_rows
         self.panel.gnss_base_recording_rows = recovered.gnss_base_rows
         self.panel.extrinsics_comparison_recording_rows = recovered.extrinsics_comparison_rows
+        self.panel.method_evaluation_bundle_rows = recovered.method_evaluation_bundle_rows
         # HR/OZ capture event_index/capture_id counters are derived from
         # len(pnp_photo_capture_records)/len(oz_photo_capture_records); without
         # restoring them here they would silently restart at 1 on top of a
@@ -738,6 +756,34 @@ class RecordingController:
         if self._camera_photo_capture_active():
             self.panel.recording_status_label.setText("세션 기록: HR/OZ still 캡처 완료 대기 중")
             return
+        measurement_owner = getattr(
+            self.panel, "_measurement_view_controller_owner", None
+        )
+        if measurement_owner is not None:
+            self.panel._method_evaluation_accepting = False
+            pending_method_pairs = measurement_owner.method_evaluation_pending_count()
+            if pending_method_pairs:
+                self.panel.recording_status_label.setText(
+                    f"세션 기록: method 결과 barrier 대기 ({pending_method_pairs} pairs)"
+                )
+                if not bool(
+                    getattr(
+                        self.panel,
+                        "_method_evaluation_stop_retry_scheduled",
+                        False,
+                    )
+                ):
+                    self.panel._method_evaluation_stop_retry_scheduled = True
+
+                    def retry_stop() -> None:
+                        self.panel._method_evaluation_stop_retry_scheduled = False
+                        self.panel._stop_session_recording(
+                            restart_streams=restart_streams,
+                            final_clock_sync_snapshot=final_clock_sync_snapshot,
+                        )
+
+                    QtCore.QTimer.singleShot(100, retry_stop)
+                return
         if final_clock_sync_snapshot is None:
             final_clock_sync_snapshot = (
                 self.panel._camera_time_sync_snapshot("last_observed_before_session_stop")
@@ -872,20 +918,16 @@ class RecordingController:
             raise ValueError(f"HR capture purpose must be one of: {allowed}") from exc
 
     def _prepare_camera_evidence_session(self, capture_channel: str) -> None:
-        """Prepare a session without pretending that distance recording started.
+        """Prepare camera evidence without pretending Detection started.
 
-        Deliberately does NOT open a fresh session just because the current
-        one already finalized (measurement stopped/saved) -- a photo taken
-        right after stopping (a "post" bookend shot) still belongs with that
-        measurement. The only thing that opens a genuinely new session is the
-        next ``_start_session_recording`` call with no pending prepared
-        session (see its ``_pnp_session_prepared`` check); that's the one
-        user action that unambiguously means "this is a new measurement."
+        The public capture method may lazily create a child only for ``Pre``.
+        Post/checkpoint capture never allocates a new child after sealing, so
+        evidence cannot silently cross a Measurement boundary.
         """
 
         if not self._measurement_package_capture_allowed():
             raise RuntimeError(
-                "Start Session and New Measurement are required before pre/post evidence capture"
+                "Create Session Folder is required before pre/post evidence capture"
             )
         if not self.panel.recording_session_id:
             self.panel.recording_session_id = session_id_now()
@@ -907,7 +949,7 @@ class RecordingController:
                 coordinate_contract="native raster u-right/v-down; OpenCV optical RDF",
             )
 
-    def _measurement_package_capture_allowed(self) -> bool:
+    def _measurement_package_capture_allowed(self, *, prepare_if_needed: bool = False) -> bool:
         """Keep legacy callers compatible while enforcing explicit UI sessions."""
 
         if not bool(getattr(self.panel, "_measurement_package_explicit_lifecycle", False)):
@@ -919,10 +961,31 @@ class RecordingController:
             snapshot = snapshotter()
         except Exception:
             return False
-        return isinstance(snapshot, Mapping) and str(snapshot.get("state") or "") in {
-            "COLLECTING",
-            "POST_CAPTURE",
-        }
+        if not isinstance(snapshot, Mapping):
+            return False
+        state = str(snapshot.get("state") or "").upper()
+        if state in {"COLLECTING", "POST_CAPTURE"}:
+            return True
+        if not prepare_if_needed or state not in {
+            "IDLE",
+            "SEALED_COMPLETE",
+            "SEALED_INCOMPLETE",
+        }:
+            return False
+        starter = getattr(self.panel, "begin_measurement", None)
+        if not callable(starter):
+            starter = getattr(self.panel, "begin_next_measurement", None)
+        if not callable(starter):
+            return False
+        try:
+            if starter() is False:
+                return False
+            prepared = snapshotter()
+        except Exception:
+            return False
+        return isinstance(prepared, Mapping) and str(
+            prepared.get("state") or ""
+        ).upper() == "COLLECTING"
 
     def _prepare_pnp_evidence_session(self) -> None:
         self._prepare_camera_evidence_session("hr")
@@ -1176,15 +1239,17 @@ class RecordingController:
         remains equivalent to ``purpose="unspecified"``.
         """
 
-        if not self._measurement_package_capture_allowed():
+        normalized_purpose = self._hr_capture_purpose(purpose)
+        if not self._measurement_package_capture_allowed(
+            prepare_if_needed=normalized_purpose is CapturePurpose.PRE
+        ):
             self.panel.recording_status_label.setText(
-                "Capture HR Still: 먼저 Begin Session을 실행하세요"
+                "Capture HR Still: 먼저 Session 폴더를 생성하세요"
             )
             return False
         if self._camera_photo_capture_active():
             self.panel.recording_status_label.setText("HR/OZ still 캡처가 이미 진행 중입니다")
             return False
-        normalized_purpose = self._hr_capture_purpose(purpose)
         self._prepare_pnp_evidence_session()
         capture_id = self._next_capture_id(self.panel.pnp_photo_capture_records, "hr")
         request = self._new_hr_request_context(capture_id, normalized_purpose)
@@ -1243,15 +1308,17 @@ class RecordingController:
         the RTSP/MP4 session recording and the visible-HR capture stream.
         """
 
-        if not self._measurement_package_capture_allowed():
+        normalized_purpose = self._hr_capture_purpose(purpose)
+        if not self._measurement_package_capture_allowed(
+            prepare_if_needed=normalized_purpose is CapturePurpose.PRE
+        ):
             self.panel.recording_status_label.setText(
-                "Capture OZ Still: 먼저 Begin Session을 실행하세요"
+                "Capture OZ Still: 먼저 Session 폴더를 생성하세요"
             )
             return False
         if self._camera_photo_capture_active():
             self.panel.recording_status_label.setText("HR/OZ still 캡처가 이미 진행 중입니다")
             return False
-        normalized_purpose = self._hr_capture_purpose(purpose)
         self._prepare_oz_evidence_session()
         capture_id = self._next_capture_id(
             getattr(self.panel, "oz_photo_capture_records", ()),
@@ -1840,12 +1907,16 @@ class RecordingController:
             if recovered_output is not None
             else self.panel._recording_session_dir(stamp)
         )
+        method_evaluation_bundle_rows = getattr(
+            self.panel, "method_evaluation_bundle_rows", None
+        )
         for rows in (
             self.panel.distance_recording_rows,
             *self.panel.camera_recording_rows.values(),
             *self.panel.px4_recording_rows.values(),
             self.panel.gnss_base_recording_rows,
             self.panel.extrinsics_comparison_recording_rows,
+            method_evaluation_bundle_rows,
         ):
             if isinstance(rows, SpoolRows):
                 rows.close()
@@ -1867,6 +1938,9 @@ class RecordingController:
                     ),
                     "gnss_base_sample_count": len(self.panel.gnss_base_recording_rows),
                     "extrinsics_comparison_sample_count": len(self.panel.extrinsics_comparison_recording_rows),
+                    "method_evaluation_bundle_count": len(
+                        self.panel.method_evaluation_bundle_rows
+                    ),
                     "finalization": {
                         "requested_unix_ns": time.time_ns(),
                         "recovered_retry": True,
@@ -1932,6 +2006,7 @@ class RecordingController:
             px4_rows=dict(self.panel.px4_recording_rows),
             gnss_base_rows=self.panel.gnss_base_recording_rows,
             extrinsics_comparison_rows=self.panel.extrinsics_comparison_recording_rows,
+            method_evaluation_bundle_rows=method_evaluation_bundle_rows,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -2224,7 +2299,6 @@ class RecordingController:
         """
 
         evidence_files = {
-            "run_setup": "run_setup.json",
             "run_events": "run_events.jsonl",
             "native_frames": "native_frames.jsonl",
             "native_frame_root": "frames/optical-pose-burst",
@@ -2377,6 +2451,9 @@ class RecordingController:
             "px4_drone_sample_count": len(self.panel.px4_recording_rows.get("drone", ())),
             "gnss_base_sample_count": len(self.panel.gnss_base_recording_rows),
             "extrinsics_comparison_sample_count": len(self.panel.extrinsics_comparison_recording_rows),
+            "method_evaluation_bundle_count": len(
+                self.panel.method_evaluation_bundle_rows
+            ),
             "device_timeline_contract": {
                 "camera_row": "one row per frame delivered to the GUI frame_changed callback",
                 "camera_not_guaranteed": "not a one-to-one index of encoded MP4 frames",
@@ -3252,29 +3329,56 @@ class RecordingController:
         return True
 
     def _append_extrinsics_comparison_snapshot(self, pair_sequence: int, timestamp_s: float) -> None:
-        """Snapshot the live per-method F/R/D/Range preview for one accepted pair.
+        """Snapshot analysis-only per-method previews for one accepted pair.
 
         ``geometry_comparison_rows`` is recomputed every ``_refresh_distance``
         tick; only the value at the exact moment a pair is accepted is worth
         persisting, so this is called once from ``_append_distance_history``
-        rather than on every tick.
+        rather than on every tick. These rows are a separate analysis namespace,
+        never an official Measurement result or MeasurementAttempt.
         """
 
         if not self.panel.distance_recording_enabled:
             return
         for comparison_row in getattr(self.panel, "geometry_comparison_rows", ()) or ():
-            self.panel.extrinsics_comparison_recording_rows.append(
-                {
-                    "pair_sequence": pair_sequence,
-                    "timestamp_s": self.panel._fmt_record_float(timestamp_s, 6),
-                    "method": str(comparison_row.get("method", "")),
-                    "forward_m": self.panel._fmt_record_float(comparison_row.get("forward_m"), 6),
-                    "right_m": self.panel._fmt_record_float(comparison_row.get("right_m"), 6),
-                    "down_m": self.panel._fmt_record_float(comparison_row.get("down_m"), 6),
-                    "range_m": self.panel._fmt_record_float(comparison_row.get("range_m"), 6),
-                    "status": str(comparison_row.get("status", "")),
-                }
-            )
+            record = {
+                "pair_sequence": pair_sequence,
+                "timestamp_s": self.panel._fmt_record_float(timestamp_s, 6),
+                "method": str(comparison_row.get("method", "")),
+                "forward_m": self.panel._fmt_record_float(
+                    comparison_row.get("forward_m"), 6
+                ),
+                "right_m": self.panel._fmt_record_float(
+                    comparison_row.get("right_m"), 6
+                ),
+                "down_m": self.panel._fmt_record_float(
+                    comparison_row.get("down_m"), 6
+                ),
+                "range_m": self.panel._fmt_record_float(
+                    comparison_row.get("range_m"), 6
+                ),
+                "status": str(comparison_row.get("status", "")),
+            }
+            for name in (
+                "schema_version",
+                "evidence_namespace",
+                "result_class",
+                "not_measurement_result",
+                "source_state",
+                "source_profile_id",
+                "source_profile_hash",
+                "candidate_profile_id",
+                "candidate_profile_hash",
+                "candidate_intrinsics_hash",
+                "active_intrinsics_hash",
+                "candidate_applied",
+                "candidate_applicability",
+                "candidate_quality",
+            ):
+                value = comparison_row.get(name)
+                if value is not None:
+                    record[name] = value
+            self.panel.extrinsics_comparison_recording_rows.append(record)
 
     def _distance_history_class_name(self, estimate) -> str | None:
         left_class_name = str(getattr(estimate.left, "class_name", "") or "").strip()

@@ -13,6 +13,7 @@ import json
 import math
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import asdict
 from math import isfinite
 
 from PyQt5 import QtCore
@@ -84,6 +85,15 @@ from Workstation.workstation_core.measurement_attempt import (
     detection_pair_key,
 )
 from Workstation.workstation_core.measurement_controller import calculate_measurement_geometry
+from Workstation.workstation_core.method_evaluation import (
+    FrozenMeasurementPairSnapshot,
+    MethodEvaluationBundle,
+    MethodEvaluationOutcome,
+    MethodEvaluationRequest,
+)
+from Workstation.workstation_core.method_evaluation_workers import (
+    MethodEvaluationCoordinator,
+)
 from Workstation.workstation_core.measurement_widgets import triangulation_3d_scene_points
 from Workstation.workstation_core.rtk_geometry import (
     GpsPairReadiness,
@@ -108,6 +118,9 @@ from Workstation.workstation_core.triangulation import (
     triangulate_pixels_with_pixhawk_mount_attempt,
     triangulate_pixels_with_relative_pose_attempt,
 )
+
+GEOMETRY_COMPARISON_ANALYSIS_SCHEMA = "workstation-geometry-comparison-analysis-v1"
+GEOMETRY_COMPARISON_ANALYSIS_NAMESPACE = "analysis/geometry_comparison"
 
 MEASUREMENT_VIEW_CONTROLLER_METHODS = [
     "workstation_measurement_methods_snapshot",
@@ -169,6 +182,34 @@ MEASUREMENT_VIEW_CONTROLLER_METHODS = [
 class MeasurementViewController:
     def __init__(self, panel):
         self.panel = panel
+        self._method_evaluation_coordinator: MethodEvaluationCoordinator | None = None
+        self._method_evaluation_timer: QtCore.QTimer | None = None
+
+    def _ensure_method_evaluation_coordinator(self) -> MethodEvaluationCoordinator:
+        coordinator = self._method_evaluation_coordinator
+        if coordinator is None:
+            coordinator = MethodEvaluationCoordinator()
+            self._method_evaluation_coordinator = coordinator
+        if self._method_evaluation_timer is None and QtCore.QCoreApplication.instance() is not None:
+            parent = self.panel if isinstance(self.panel, QtCore.QObject) else None
+            timer = QtCore.QTimer(parent)
+            timer.setInterval(20)
+            timer.timeout.connect(self._poll_method_evaluations)
+            timer.start()
+            self._method_evaluation_timer = timer
+        return coordinator
+
+    def close_method_evaluation_workers(self) -> bool:
+        timer = self._method_evaluation_timer
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+            self._method_evaluation_timer = None
+        coordinator = self._method_evaluation_coordinator
+        self._method_evaluation_coordinator = None
+        if coordinator is not None:
+            coordinator.close()
+        return True
 
     def _measurement_method_state(self) -> None:
         panel = self.panel
@@ -187,17 +228,21 @@ class MeasurementViewController:
                             metadata = dict(raw_metadata)
                 except Exception:
                     metadata = {}
+            settings = getattr(panel, "settings", None)
+            setting_reader = getattr(panel, "_workstation_setting", None)
+            if not callable(setting_reader):
+                setting_reader = lambda _name, default=None: default
             global_preferred = normalize_measurement_method_id(
-                panel._workstation_setting(
+                setting_reader(
                     "measurement_preferred_method",
-                    getattr(panel.settings, "measurement_preferred_method", PIXHAWK_RTK_LIVE),
+                    getattr(settings, "measurement_preferred_method", PIXHAWK_RTK_LIVE),
                 )
             )
             global_order = normalize_measurement_method_fallback_order(
-                panel._workstation_setting(
+                setting_reader(
                     "measurement_method_fallback_order",
                     getattr(
-                        panel.settings,
+                        settings,
                         "measurement_method_fallback_order",
                         DEFAULT_MEASUREMENT_METHOD_FALLBACK_ORDER,
                     ),
@@ -211,6 +256,13 @@ class MeasurementViewController:
             )
             panel._measurement_method_fill_policy = normalize_measurement_method_fill_policy(
                 metadata.get("measurement_method_fill_policy")
+            )
+            frozen_inputs = metadata.get("measurement_frozen_comparison_inputs")
+            panel._measurement_frozen_comparison_inputs_declared = (
+                "measurement_frozen_comparison_inputs" in metadata
+            )
+            panel._measurement_frozen_comparison_inputs = (
+                dict(frozen_inputs) if isinstance(frozen_inputs, Mapping) else {}
             )
             panel._measurement_method_config_token = config_token
         if not hasattr(panel, "_measurement_selected_method_id"):
@@ -240,11 +292,138 @@ class MeasurementViewController:
                 ),
             )
         )
+        owner = panel._optical_pose_controller()
+        try:
+            intrinsics_snapshot = owner._intrinsics_snapshot(use_frozen=False)
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+            intrinsics_snapshot = {}
+        intrinsics_snapshot = (
+            dict(intrinsics_snapshot)
+            if isinstance(intrinsics_snapshot, Mapping)
+            else {}
+        )
+        applicability = intrinsics_snapshot.get("applicability")
+        applicability = applicability if isinstance(applicability, Mapping) else {}
+        operating_intrinsics = {
+            "profile_sha256": str(applicability.get("profile_sha256") or ""),
+            "geometry_allowed": bool(applicability.get("geometry_allowed", False)),
+            "reasons": list(applicability.get("reasons") or ()),
+            "profile": (
+                dict(intrinsics_snapshot.get("profile"))
+                if isinstance(intrinsics_snapshot.get("profile"), Mapping)
+                else None
+            ),
+        }
+        frozen_intrinsics_result = getattr(panel, "active_intrinsics", None)
+        operating_profile_reader = getattr(
+            owner, "operating_intrinsics_profile_for_geometry", None
+        )
+        try:
+            operating_profile = (
+                operating_profile_reader()
+                if callable(operating_profile_reader)
+                else owner._operating_intrinsics_profile()
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            operating_profile = None
+        if (
+            operating_profile is not None
+            and operating_profile.provenance.get("quality")
+            == NOMINAL_INTRINSICS_QUALITY
+        ):
+            frozen_intrinsics_result = nominal_profile_to_stereo_result(
+                operating_profile
+            )
+        panel._pending_measurement_frozen_intrinsics_result = (
+            None
+            if frozen_intrinsics_result is None
+            else without_stereo_extrinsics(frozen_intrinsics_result)
+        )
+        panel._pending_measurement_frozen_intrinsics_path = str(
+            getattr(operating_profile, "source_path", "")
+            or getattr(panel, "_active_intrinsics_profile_path", "")
+            or ""
+        )
+        latest_candidates: dict[str, object] = {}
+        for candidate in getattr(owner, "_candidates", {}).values():
+            method_id = measurement_method_id_for_candidate(candidate.method)
+            if method_id is None:
+                continue
+            current = latest_candidates.get(method_id)
+            if current is None or int(candidate.created_utc_ns or 0) >= int(
+                getattr(current, "created_utc_ns", 0) or 0
+            ):
+                latest_candidates[method_id] = candidate
+        frozen_inputs: dict[str, object] = {
+            PIXHAWK_RTK_LIVE: {
+                "kind": "live_at_pair",
+                "instance_id": "live:pixhawk-rtk",
+                "operating_intrinsics": operating_intrinsics,
+                "live_inputs": ["left/right Pixhawk attitude", "P1/P2 GNSS"],
+            }
+        }
+        frozen_objects: dict[str, object] = {}
+        checkerboard_draft = getattr(
+            panel, "checkerboard_extrinsics_candidate_profile", None
+        )
+        if checkerboard_draft is not None:
+            frozen_inputs[CHECKERBOARD_STEREO] = {
+                "kind": "checkerboard_draft",
+                "instance_id": (
+                    f"frozen-draft:{checkerboard_draft.profile_id or checkerboard_draft.content_sha256}"
+                ),
+                "profile_id": checkerboard_draft.profile_id,
+                "content_sha256": checkerboard_draft.content_sha256,
+                "profile": asdict(checkerboard_draft),
+                "operating_intrinsics": operating_intrinsics,
+            }
+            frozen_objects[CHECKERBOARD_STEREO] = checkerboard_draft
+        for method_id, candidate in latest_candidates.items():
+            prior = getattr(owner, "_candidate_priors", {}).get(candidate.candidate_id)
+            mapper = getattr(owner, "_candidate_mapping_with_prior", None)
+            mapping = (
+                mapper(candidate, prior)
+                if callable(mapper) and isinstance(prior, tuple) and len(prior) == 2
+                else {
+                    "candidate_id": candidate.candidate_id,
+                    "method": candidate.method,
+                    "created_utc_ns": candidate.created_utc_ns,
+                }
+            )
+            frozen_inputs[method_id] = {
+                "kind": "optical_pose_draft",
+                "instance_id": f"frozen-draft:{candidate.candidate_id}",
+                "candidate_id": candidate.candidate_id,
+                "candidate": mapping,
+                "operating_intrinsics": operating_intrinsics,
+            }
+            frozen_objects[method_id] = candidate
+        for method_id in MEASUREMENT_METHOD_IDS[1:]:
+            frozen_inputs.setdefault(
+                method_id,
+                {
+                    "kind": "missing_draft",
+                    "instance_id": f"{method_id}:frozen-input-missing",
+                    "draft_missing": True,
+                    "operating_intrinsics": operating_intrinsics,
+                },
+            )
+        frozen_inputs = json.loads(
+            json.dumps(
+                frozen_inputs,
+                ensure_ascii=False,
+                allow_nan=False,
+                default=str,
+            )
+        )
+        panel._pending_measurement_frozen_comparison_objects = frozen_objects
+        panel._measurement_frozen_comparison_inputs = frozen_inputs
         return {
             "measurement_method_config_schema": "measurement-method-config-v1",
             "measurement_preferred_method": preferred,
             "measurement_method_fallback_order": list(order),
             "measurement_method_fill_policy": default_measurement_method_fill_policy(),
+            "measurement_frozen_comparison_inputs": frozen_inputs,
         }
 
     def _measurement_fill_policy(self) -> dict[str, dict[str, str]]:
@@ -284,30 +463,45 @@ class MeasurementViewController:
                 advisories.append(f"{side} Pixhawk attitude stale ({age_s:.3f}s)")
         pixhawk_hard = tuple(reason for reason in hard_reasons if "Pixhawk" in reason)
         pixhawk_ready = not pixhawk_hard
-        baseline = getattr(self.panel, "latest_rtk_baseline", None)
         gnss_ready = False
-        left_gps, right_gps = self.panel._selected_baseline_gps_states()
-        if baseline is None or left_gps is None or right_gps is None:
+        left_gps, right_gps, reused_gps = self._cached_measurement_gps_states()
+        if left_gps is None or right_gps is None:
             hard_reasons.append("live GNSS baseline missing")
-        elif measurement_start is not None and (
-            float(left_gps.timestamp_s) < float(measurement_start)
-            or float(right_gps.timestamp_s) < float(measurement_start)
-        ):
-            hard_reasons.append("GNSS samples not received in current Measurement")
         elif not left_gps.has_position or not right_gps.has_position or not all(
             math.isfinite(float(value))
             for sample in (left_gps, right_gps)
             for value in (sample.latitude_deg, sample.longitude_deg, sample.altitude_m)
         ):
             hard_reasons.append("GNSS position missing or non-finite")
-        elif not math.isfinite(float(baseline.baseline_m)) or baseline.baseline_m <= 0.0:
-            hard_reasons.append("GPS baseline length <= 0 or non-finite")
         else:
-            gnss_ready = True
-            advisories.extend(tuple(getattr(baseline, "warnings", ()) or ()))
-            usable, reason = self.panel._gps_baseline_usable_for_translation(baseline)
-            if not usable and reason:
-                advisories.append(str(reason))
+            ned = ned_delta_m(left_gps, right_gps)
+            baseline_m = (
+                float("nan")
+                if ned is None
+                else math.sqrt(sum(float(value) ** 2 for value in ned))
+            )
+            if not math.isfinite(baseline_m) or baseline_m <= 0.0:
+                hard_reasons.append("GPS baseline length <= 0 or non-finite")
+            else:
+                gnss_ready = True
+                baseline = getattr(self.panel, "latest_rtk_baseline", None)
+                advisories.extend(tuple(getattr(baseline, "warnings", ()) or ()))
+                usability = getattr(
+                    self.panel, "_gps_baseline_usable_for_translation", None
+                )
+                if baseline is not None and callable(usability):
+                    _usable, reason = usability(baseline)
+                    if reason and not _usable:
+                        advisories.append(str(reason))
+                for side, sample in (("left", left_gps), ("right", right_gps)):
+                    if int(getattr(sample, "fix_type", 0) or 0) != 6:
+                        advisories.append(
+                            f"{side} {getattr(sample, 'rtk_label', 'non-RTK-fixed')}"
+                        )
+                if reused_gps:
+                    advisories.append(
+                        "GNSS reused from latest valid 3D fix: " + ",".join(reused_gps)
+                    )
         if gnss_ready and bool(getattr(self.panel, "gnss_operation_gate_active", False)):
             manager = getattr(self.panel, "gnss_operation_manager", None)
             readiness = None if manager is None else manager.readiness()
@@ -398,10 +592,60 @@ class MeasurementViewController:
     def _measurement_method_statuses(self) -> tuple[MeasurementMethodStatus, ...]:
         """Project every geometry source into independent method readiness."""
 
+        self._measurement_method_state()
         owner = self.panel._optical_pose_controller()
+        frozen_inputs = getattr(
+            self.panel, "_measurement_frozen_comparison_inputs", {}
+        )
+        frozen_inputs = frozen_inputs if isinstance(frozen_inputs, Mapping) else {}
+        frozen_objects = getattr(
+            self.panel, "_pending_measurement_frozen_comparison_objects", {}
+        )
+        frozen_objects = frozen_objects if isinstance(frozen_objects, Mapping) else {}
+        measurement_active = bool(
+            str(getattr(self.panel, "_measurement_id", "") or "")
+            and bool(
+                getattr(
+                    self.panel,
+                    "_measurement_frozen_comparison_inputs_declared",
+                    False,
+                )
+            )
+        )
         _geometry_allowed, current_profile_hash, intrinsics_reasons = (
             self._operating_intrinsics_readiness(owner)
         )
+        if measurement_active:
+            primary_input = frozen_inputs.get(PIXHAWK_RTK_LIVE)
+            primary_input = (
+                primary_input if isinstance(primary_input, Mapping) else {}
+            )
+            frozen_kd = primary_input.get("operating_intrinsics")
+            frozen_kd = frozen_kd if isinstance(frozen_kd, Mapping) else {}
+            current_profile_hash = str(frozen_kd.get("profile_sha256") or "")
+            frozen_reasons: list[str] = []
+            if not bool(frozen_kd.get("geometry_allowed", False)):
+                frozen_reasons.append("frozen exact operating K,D not applicable")
+                frozen_reasons.extend(
+                    f"K,D applicability: {reason}"
+                    for reason in frozen_kd.get("reasons", ()) or ()
+                )
+            if not (
+                len(current_profile_hash) == 64
+                and all(
+                    character in "0123456789abcdef"
+                    for character in current_profile_hash
+                )
+            ):
+                frozen_reasons.append(
+                    "frozen exact operating K,D profile SHA-256 missing or invalid"
+                )
+                current_profile_hash = ""
+            if getattr(
+                self.panel, "_pending_measurement_frozen_intrinsics_result", None
+            ) is None:
+                frozen_reasons.append("frozen exact operating K,D values missing")
+            intrinsics_reasons = tuple(dict.fromkeys(frozen_reasons))
         pixhawk_ready, gnss_ready, live_hard_reasons, live_advisories = (
             self._measurement_live_readiness()
         )
@@ -434,17 +678,33 @@ class MeasurementViewController:
             )
         )
 
-        checkerboard_profile = getattr(self.panel, "checkerboard_extrinsics_profile", None)
+        checkerboard_row = frozen_inputs.get(CHECKERBOARD_STEREO)
+        checkerboard_row = checkerboard_row if isinstance(checkerboard_row, Mapping) else {}
+        checkerboard_profile = (
+            frozen_objects.get(CHECKERBOARD_STEREO)
+            if measurement_active
+            else getattr(self.panel, "checkerboard_extrinsics_profile", None)
+        )
         checkerboard_reasons = list(intrinsics_reasons)
         if checkerboard_profile is None:
-            checkerboard_reasons.append("checkerboard stereo R,t missing")
+            if measurement_active:
+                checkerboard_reasons.append("frozen checkerboard Draft missing")
+            elif getattr(
+                self.panel, "checkerboard_extrinsics_candidate_profile", None
+            ) is not None:
+                checkerboard_reasons.append("checkerboard stereo R,t candidate not applied")
+            else:
+                checkerboard_reasons.append("checkerboard stereo R,t missing")
         statuses.append(
             MeasurementMethodStatus(
                 method_id=CHECKERBOARD_STEREO,
                 instance_id=(
-                    "profile:checkerboard:missing"
+                    "frozen-draft:checkerboard:missing"
                     if checkerboard_profile is None
-                    else f"profile:{checkerboard_profile.profile_id or checkerboard_profile.content_sha256}"
+                    else str(
+                        checkerboard_row.get("instance_id")
+                        or f"profile:{checkerboard_profile.profile_id or checkerboard_profile.content_sha256}"
+                    )
                 ),
                 ready=not checkerboard_reasons,
                 reasons=tuple(checkerboard_reasons),
@@ -466,14 +726,45 @@ class MeasurementViewController:
             )
         )
 
+        active_selection = getattr(owner, "_active_selection", None)
+        active_candidate_id = str(
+            getattr(active_selection, "candidate_id", "") or ""
+        )
+        active_selected_dofs = set(
+            getattr(
+                getattr(active_selection, "selected_dofs", None),
+                "selected_names",
+                (),
+            )
+            or ()
+        )
         for candidate in getattr(owner, "_candidates", {}).values():
             method_id = measurement_method_id_for_candidate(candidate.method)
             if method_id is None:
                 continue
+            frozen_row = frozen_inputs.get(method_id)
+            frozen_row = frozen_row if isinstance(frozen_row, Mapping) else {}
+            frozen_candidate_id = str(frozen_row.get("candidate_id") or "")
+            if frozen_candidate_id and candidate.candidate_id != frozen_candidate_id:
+                continue
+            if not frozen_candidate_id and measurement_active:
+                continue
+            candidate_is_globally_active = candidate.candidate_id == active_candidate_id
+            candidate_is_frozen = candidate.candidate_id == frozen_candidate_id
+            candidate_is_active = candidate_is_globally_active or candidate_is_frozen
             observed_by_side = {
                 side: self._candidate_observed_dofs(candidate, side)
                 for side in ("left", "right")
             }
+            if candidate_is_globally_active:
+                observed_by_side = {
+                    side: tuple(
+                        name
+                        for name in observed_by_side[side]
+                        if name in active_selected_dofs
+                    )
+                    for side in ("left", "right")
+                }
             observed = tuple(
                 name
                 for name in POSE_DOF_NAMES
@@ -486,10 +777,16 @@ class MeasurementViewController:
             )
             reasons: list[str] = list(intrinsics_reasons)
             candidate_warnings = list(candidate.warnings)
+            if not candidate_is_active:
+                reasons.append(
+                    "frozen comparison Draft missing"
+                    if measurement_active
+                    else "optical pose candidate not applied"
+                )
             if not expected_profile_hash:
-                candidate_warnings.append("candidate operating K,D profile SHA-256 missing")
+                reasons.append("candidate operating K,D profile SHA-256 missing")
             elif expected_profile_hash != current_profile_hash:
-                candidate_warnings.append("candidate K,D differs from active K,D")
+                reasons.append("candidate K,D differs from active K,D")
             if method_id == HORIZON_HYBRID:
                 for side in ("left", "right"):
                     if not {"roll_deg", "pitch_deg"} <= set(observed_by_side[side]):
@@ -548,7 +845,10 @@ class MeasurementViewController:
             statuses.append(
                 MeasurementMethodStatus(
                     method_id=method_id,
-                    instance_id=f"candidate:{candidate.candidate_id}",
+                    instance_id=(
+                        str(frozen_row.get("instance_id") or "")
+                        or f"candidate:{candidate.candidate_id}"
+                    ),
                     ready=not reasons,
                     reasons=tuple(reasons),
                     candidate_id=candidate.candidate_id,
@@ -577,7 +877,11 @@ class MeasurementViewController:
             if loaded_profile is None
             else measurement_method_id_for_candidate(loaded_profile.method)
         )
-        if loaded_profile is not None and loaded_method_id is not None:
+        if (
+            not measurement_active
+            and loaded_profile is not None
+            and loaded_method_id is not None
+        ):
             loaded_instance = f"profile:{loaded_profile.profile_id or loaded_profile.content_sha256}"
             if not any(row.instance_id == loaded_instance for row in statuses):
                 reasons = list(intrinsics_reasons)
@@ -594,9 +898,9 @@ class MeasurementViewController:
                 )
                 loaded_warnings: list[str] = []
                 if not expected_profile_hash:
-                    loaded_warnings.append("loaded optical profile operating K,D SHA-256 missing")
+                    reasons.append("applied optical profile operating K,D SHA-256 missing")
                 elif expected_profile_hash != current_profile_hash:
-                    loaded_warnings.append("loaded optical profile K,D differs from active K,D")
+                    reasons.append("applied optical profile K,D differs from active K,D")
                 stable_reasons = tuple(dict.fromkeys(reasons))
                 statuses.append(
                     MeasurementMethodStatus(
@@ -979,7 +1283,20 @@ class MeasurementViewController:
 
     def workstation_measurement_methods_snapshot(self) -> dict[str, object]:
         self._measurement_method_state()
-        selected = self._select_measurement_method_for_attempt()
+        frozen_measurement = bool(
+            getattr(
+                self.panel,
+                "_measurement_frozen_comparison_inputs_declared",
+                False,
+            )
+        )
+        selected = (
+            latest_status_by_method(self._measurement_method_statuses()).get(
+                PIXHAWK_RTK_LIVE
+            )
+            if frozen_measurement
+            else self._select_measurement_method_for_attempt()
+        )
         statuses = self._measurement_method_statuses()
         latest = latest_status_by_method(statuses)
         ready = [row for row in latest.values() if row.ready]
@@ -996,13 +1313,19 @@ class MeasurementViewController:
             for method_id, row in latest.items()
         }
         method_catalog = []
+        last_bundle = getattr(self.panel, "_last_method_evaluation_bundle", None)
+        last_outcomes = (
+            {row.method_id: row for row in last_bundle.outcomes}
+            if isinstance(last_bundle, MethodEvaluationBundle)
+            else {}
+        )
+        counters = getattr(self.panel, "_measurement_method_result_counters", {})
         for method_id in MEASUREMENT_METHOD_IDS:
             capability = capability_rows.get(method_id)
             if capability is not None:
-                method_catalog.append(capability)
-                continue
-            method_catalog.append(
-                {
+                row = dict(capability)
+            else:
+                row = {
                     "method_id": method_id,
                     "label": MEASUREMENT_METHOD_LABELS[method_id],
                     "instance_id": "",
@@ -1022,7 +1345,40 @@ class MeasurementViewController:
                     "input_values": {},
                     "required_inputs": list(MEASUREMENT_METHOD_REQUIRED_INPUTS[method_id]),
                 }
+            outcome = last_outcomes.get(method_id)
+            if outcome is not None:
+                runtime_status = (
+                    "REUSED"
+                    if outcome.reused_inputs
+                    and outcome.status in {"VALID", "ESTIMATED"}
+                    else "ACTIVE"
+                    if outcome.status in {"VALID", "ESTIMATED"}
+                    else "BLOCKED"
+                    if outcome.status in {"BLOCKED", "BACKPRESSURE_BLOCKED"}
+                    else outcome.status
+                )
+                runtime_reasons = list(outcome.reasons)
+            else:
+                runtime_status = (
+                    "ACTIVE"
+                    if frozen_measurement and bool(row.get("ready"))
+                    else "READY"
+                    if bool(row.get("ready"))
+                    else "BLOCKED"
+                )
+                runtime_reasons = list(row.get("reasons") or ())
+            row["runtime_status"] = runtime_status
+            row["primary"] = method_id == PIXHAWK_RTK_LIVE
+            row["frozen_for_measurement"] = frozen_measurement
+            row["primary_blocker"] = runtime_reasons[0] if runtime_reasons else ""
+            row["additional_blocker_count"] = max(0, len(runtime_reasons) - 1)
+            row["result_counters"] = dict(
+                counters.get(
+                    method_id,
+                    {"VALID": 0, "BLOCKED": 0, "FAILED": 0},
+                )
             )
+            method_catalog.append(row)
         return {
             "schema": "measurement-method-snapshot-v1",
             "preferred_method_id": self.panel._measurement_preferred_method_id,
@@ -1076,21 +1432,54 @@ class MeasurementViewController:
         left_gps: GpsSnapshot | None = None,
         right_gps: GpsSnapshot | None = None,
     ) -> StereoIntrinsicsResult | None:
-        current = getattr(self.panel, "active_intrinsics", None)
         owner = self.panel._optical_pose_controller()
-        profile_reader = getattr(owner, "operating_intrinsics_profile_for_geometry", None)
-        profile = profile_reader() if callable(profile_reader) else owner._operating_intrinsics_profile()
-        if profile is None:
-            return None
-        if profile.provenance.get("quality") == NOMINAL_INTRINSICS_QUALITY:
-            current = nominal_profile_to_stereo_result(profile)
-        elif current is None:
-            return None
-        intrinsics_only = without_stereo_extrinsics(current)
+        if bool(
+            getattr(
+                self.panel,
+                "_measurement_frozen_comparison_inputs_declared",
+                False,
+            )
+        ):
+            intrinsics_only = getattr(
+                self.panel, "_pending_measurement_frozen_intrinsics_result", None
+            )
+            if intrinsics_only is None:
+                return None
+        else:
+            current = getattr(self.panel, "active_intrinsics", None)
+            profile_reader = getattr(
+                owner, "operating_intrinsics_profile_for_geometry", None
+            )
+            profile = (
+                profile_reader()
+                if callable(profile_reader)
+                else owner._operating_intrinsics_profile()
+            )
+            if profile is None:
+                return None
+            if profile.provenance.get("quality") == NOMINAL_INTRINSICS_QUALITY:
+                current = nominal_profile_to_stereo_result(profile)
+            elif current is None:
+                return None
+            intrinsics_only = without_stereo_extrinsics(current)
         if status.method_id == PIXHAWK_RTK_LIVE:
             return intrinsics_only
         if status.method_id == CHECKERBOARD_STEREO:
-            profile = getattr(self.panel, "checkerboard_extrinsics_profile", None)
+            frozen_objects = getattr(
+                self.panel, "_pending_measurement_frozen_comparison_objects", {}
+            )
+            profile = (
+                frozen_objects.get(CHECKERBOARD_STEREO)
+                if bool(
+                    getattr(
+                        self.panel,
+                        "_measurement_frozen_comparison_inputs_declared",
+                        False,
+                    )
+                )
+                and isinstance(frozen_objects, Mapping)
+                else getattr(self.panel, "checkerboard_extrinsics_profile", None)
+            )
             return intrinsics_only if profile is None else compose_stereo_calibration(intrinsics_only, profile)
         if status.profile_id and not status.candidate_id:
             profile = getattr(self.panel, "optical_pose_extrinsics_profile", None)
@@ -1412,8 +1801,15 @@ class MeasurementViewController:
         return True, "usable"
 
     def _rtk_fixed_status_text(self, baseline: RtkBaselineEstimate | None) -> str:
-        left = self.panel.latest_gps.get("left")
-        right = self.panel.latest_gps.get("right")
+        selector = getattr(self.panel, "_selected_baseline_gps_states", None)
+        if callable(selector):
+            left, right = selector()
+        else:
+            left = self.panel.latest_gps.get("left")
+            right = self.panel.latest_gps.get("right")
+        source_reader = getattr(self.panel, "_pixhawk_gnss_source", None)
+        left_source = str(source_reader("left")) if callable(source_reader) else "GPS1"
+        right_source = str(source_reader("right")) if callable(source_reader) else "GPS1"
 
         def side_text(label: str, state: GpsPositionState | None) -> str:
             if state is None:
@@ -1426,7 +1822,10 @@ class MeasurementViewController:
         usable, reason = self.panel._gps_baseline_usable_for_translation(baseline)
         fixed_text = "YES" if fixed else "NO"
         usability = "사용 가능" if usable else f"대기/차단: {reason}"
-        return f"RTK Fixed: {fixed_text} | GPS baseline 필수, {usability} | {side_text('P1', left)} | {side_text('P2', right)}"
+        return (
+            f"RTK Fixed: {fixed_text} | GPS baseline 필수, {usability} | "
+            f"{side_text(f'P1 {left_source}', left)} | {side_text(f'P2 {right_source}', right)}"
+        )
 
     def _refresh_rtk_baseline(self) -> RtkBaselineEstimate | None:
         left_gps, right_gps = self.panel._selected_baseline_gps_states()
@@ -1873,23 +2272,153 @@ class MeasurementViewController:
             overall_level,
         )
 
-    def _build_measurement_attempt(self, pair) -> MeasurementAttempt:
-        """Freeze pair inputs first, then resolve one immutable method geometry."""
+    @staticmethod
+    def _gps_state_is_valid_for_measurement_cache(state: object) -> bool:
+        if state is None or int(getattr(state, "fix_type", 0) or 0) < 3:
+            return False
+        values = (
+            getattr(state, "latitude_deg", None),
+            getattr(state, "longitude_deg", None),
+            getattr(state, "altitude_m", None),
+        )
+        try:
+            return all(value is not None and math.isfinite(float(value)) for value in values)
+        except (TypeError, ValueError):
+            return False
 
-        method_status = self._select_measurement_method_for_attempt()
-        if method_status is None:
-            raise ValueError("no ready measurement method")
-        method_id = method_status.method_id
-        triangulation_source = "pixhawk" if method_id == PIXHAWK_RTK_LIVE else "checkerboard"
-        geometry_kind = "live_pixhawk_mount" if method_id == PIXHAWK_RTK_LIVE else "relative_pose"
-        timestamp_basis = self.panel._effective_yolo_time_basis()
-        left_pairing_timestamp_s = self.panel._yolo_match_timestamp_s(pair.left)
-        right_pairing_timestamp_s = self.panel._yolo_match_timestamp_s(pair.right)
+    def _cached_measurement_gps_states(
+        self,
+    ) -> tuple[object | None, object | None, tuple[str, ...]]:
+        """Update each P1/P2 side independently and retain last valid 3D fixes."""
+
+        panel = self.panel
+        cache = getattr(panel, "_measurement_latest_valid_gps", None)
+        if not isinstance(cache, dict):
+            cache = {"left": None, "right": None}
+            panel._measurement_latest_valid_gps = cache
+        source_cache = getattr(panel, "_measurement_latest_valid_gps_source", None)
+        if not isinstance(source_cache, dict):
+            source_cache = {}
+            panel._measurement_latest_valid_gps_source = source_cache
+        current_left, current_right = panel._selected_baseline_gps_states()
+        current = {"left": current_left, "right": current_right}
+        measurement_start = getattr(panel, "_measurement_started_monotonic_s", None)
+        reused: list[str] = []
+        for side in ("left", "right"):
+            source_reader = getattr(panel, "_pixhawk_gnss_source", None)
+            source = (
+                str(source_reader(side))
+                if callable(source_reader)
+                else ("GPS2" if str(getattr(current[side], "topic", "")).endswith("GPS2_RAW") else "GPS1")
+            )
+            if source_cache.get(side) != source:
+                cache[side] = None
+                source_cache[side] = source
+            sample = current[side]
+            if self._gps_state_is_valid_for_measurement_cache(sample):
+                previous = cache.get(side)
+                previous_timestamp = float(getattr(previous, "timestamp_s", -1.0) or -1.0)
+                sample_timestamp = float(getattr(sample, "timestamp_s", -1.0) or -1.0)
+                if previous is None or sample_timestamp >= previous_timestamp:
+                    cache[side] = sample
+            selected = cache.get(side)
+            selected_timestamp = getattr(selected, "timestamp_s", None)
+            reused_from_before_measurement = bool(
+                selected is not None
+                and measurement_start is not None
+                and selected_timestamp is not None
+                and float(selected_timestamp) < float(measurement_start)
+            )
+            if selected is not None and (
+                selected is not sample or reused_from_before_measurement
+            ):
+                reused.append(f"{side}_gps")
+        return cache.get("left"), cache.get("right"), tuple(reused)
+
+    @staticmethod
+    def _ftp_command_round_sync(pair: object) -> dict[str, object]:
+        left_metadata = getattr(getattr(pair, "left", None), "timestamp_metadata", {}) or {}
+        right_metadata = getattr(getattr(pair, "right", None), "timestamp_metadata", {}) or {}
+        if not isinstance(left_metadata, Mapping) or not isinstance(right_metadata, Mapping):
+            return {}
+        left_capture = str(left_metadata.get("capture_id") or "")
+        right_capture = str(right_metadata.get("capture_id") or "")
+        left_round = str(
+            left_metadata.get("command_round")
+            or left_metadata.get("capture_round")
+            or ""
+        )
+        right_round = str(
+            right_metadata.get("command_round")
+            or right_metadata.get("capture_round")
+            or ""
+        )
+        def capture_ready(metadata: Mapping[str, object]) -> bool:
+            downloaded = bool(
+                metadata.get("ftp_downloaded", metadata.get("downloaded", False))
+            )
+            return bool(
+                metadata.get(
+                    "capture_command_sent",
+                    metadata.get("command_sent", True),
+                )
+                and metadata.get("stored", downloaded)
+                and downloaded
+                and metadata.get("decoded", False)
+            )
+
+        left_ready = capture_ready(left_metadata)
+        right_ready = capture_ready(right_metadata)
+        if not (
+            left_capture
+            and left_capture == right_capture
+            and left_round
+            and left_round == right_round
+            and left_ready
+            and right_ready
+        ):
+            return {}
+        return {
+            "capture_id": left_capture,
+            "command_round": left_round,
+            "time_basis": "command_round_assumed_sync",
+            "pair_delta_s": None,
+            "operator_approved_sync_assumption": True,
+            "warning": (
+                "FTP command-round simultaneity is operator-approved; "
+                "it is not a measured exposure timestamp"
+            ),
+        }
+
+    def _freeze_measurement_pair_inputs(self, pair: object) -> dict[str, object]:
+        """Persist native pixels, then freeze one shared, byte-free pair snapshot."""
+
+        panel = self.panel
+        timestamp_basis = panel._effective_yolo_time_basis()
+        left_pairing_timestamp_s = panel._yolo_match_timestamp_s(pair.left)
+        right_pairing_timestamp_s = panel._yolo_match_timestamp_s(pair.right)
         if left_pairing_timestamp_s is None or right_pairing_timestamp_s is None:
             raise ValueError("matched detection pair has no timestamp on its selected basis")
+        physical_key = detection_pair_key(
+            triangulation_source="all_methods",
+            timestamp_basis=timestamp_basis,
+            left=pair.left,
+            right=pair.right,
+            left_pairing_timestamp_s=left_pairing_timestamp_s,
+            right_pairing_timestamp_s=right_pairing_timestamp_s,
+        )
+        cached = getattr(panel, "_last_frozen_measurement_pair", None)
+        if (
+            isinstance(cached, Mapping)
+            and tuple(cached.get("physical_key", ())) == tuple(physical_key)
+        ):
+            return dict(cached)
 
-        created_monotonic_s = time.monotonic()
-        detection_midpoint_s = (float(pair.left.timestamp_s) + float(pair.right.timestamp_s)) / 2.0
+        created_monotonic_ns = time.monotonic_ns()
+        created_unix_ns = time.time_ns()
+        detection_midpoint_s = (
+            float(pair.left.timestamp_s) + float(pair.right.timestamp_s)
+        ) / 2.0
         left_detection = DetectionSnapshot.from_observation(
             pair.left,
             pairing_timestamp_basis=timestamp_basis,
@@ -1900,13 +2429,122 @@ class MeasurementViewController:
             pairing_timestamp_basis=timestamp_basis,
             pairing_timestamp_s=right_pairing_timestamp_s,
         )
-
-        left_nearest = self.panel.attitude_buffers["left"].nearest(float(pair.left.timestamp_s))
-        right_nearest = self.panel.attitude_buffers["right"].nearest(float(pair.right.timestamp_s))
+        left_nearest = panel.attitude_buffers["left"].nearest(float(pair.left.timestamp_s))
+        right_nearest = panel.attitude_buffers["right"].nearest(float(pair.right.timestamp_s))
         left_attitude = None if left_nearest is None else AttitudeSnapshot.from_state(left_nearest.sample)
         right_attitude = None if right_nearest is None else AttitudeSnapshot.from_state(right_nearest.sample)
-        left_attitude_age_s = None if left_nearest is None else left_nearest.age_s
-        right_attitude_age_s = None if right_nearest is None else right_nearest.age_s
+        measurement_start = getattr(panel, "_measurement_started_monotonic_s", None)
+        if measurement_start is not None:
+            if left_attitude is not None and left_attitude.timestamp_s < float(measurement_start):
+                left_attitude = None
+            if right_attitude is not None and right_attitude.timestamp_s < float(measurement_start):
+                right_attitude = None
+        selected_left_gps, selected_right_gps, reused_inputs = (
+            self._cached_measurement_gps_states()
+        )
+        left_gps = None if selected_left_gps is None else GpsSnapshot.from_state(selected_left_gps)
+        right_gps = None if selected_right_gps is None else GpsSnapshot.from_state(selected_right_gps)
+        pair_sequence = int(getattr(panel, "_measurement_attempt_counter", 0)) + 1
+        panel._measurement_attempt_counter = pair_sequence
+        generation_id = str(
+            getattr(panel, "_measurement_attempt_generation_id", "")
+            or getattr(panel, "_measurement_id", "")
+            or "measurement"
+        )
+        measurement_id = str(getattr(panel, "_measurement_id", "") or generation_id)
+        pair_id = f"{generation_id}:{pair_sequence:020d}"
+        native_fields: dict[str, object] = {}
+        persister = getattr(panel, "_persist_native_detection_pair", None)
+        if callable(persister):
+            native_fields = dict(
+                persister(
+                    left_detection=left_detection,
+                    right_detection=right_detection,
+                    pair_id=f"pair-{pair_sequence}",
+                    purpose="method-evaluation",
+                )
+                or {}
+            )
+        capture_sync = self._ftp_command_round_sync(pair)
+        if not capture_sync:
+            capture_sync = {
+                "time_basis": timestamp_basis,
+                "pair_delta_s": abs(
+                    float(left_pairing_timestamp_s) - float(right_pairing_timestamp_s)
+                ),
+                "operator_approved_sync_assumption": False,
+            }
+        snapshot = FrozenMeasurementPairSnapshot(
+            measurement_id=measurement_id,
+            pair_id=pair_id,
+            pair_sequence=pair_sequence,
+            created_monotonic_ns=created_monotonic_ns,
+            created_unix_ns=created_unix_ns,
+            timestamp_basis=timestamp_basis,
+            left_detection=asdict(left_detection),
+            right_detection=asdict(right_detection),
+            left_attitude=None if left_attitude is None else asdict(left_attitude),
+            right_attitude=None if right_attitude is None else asdict(right_attitude),
+            left_gps=None if left_gps is None else asdict(left_gps),
+            right_gps=None if right_gps is None else asdict(right_gps),
+            native_frames=native_fields,
+            capture_sync=capture_sync,
+            reused_inputs=reused_inputs,
+        )
+        frozen = {
+            "physical_key": tuple(physical_key),
+            "snapshot": snapshot,
+            "timestamp_basis": timestamp_basis,
+            "left_pairing_timestamp_s": float(left_pairing_timestamp_s),
+            "right_pairing_timestamp_s": float(right_pairing_timestamp_s),
+            "created_monotonic_s": created_monotonic_ns * 1.0e-9,
+            "created_wall_s": created_unix_ns * 1.0e-9,
+            "detection_midpoint_s": detection_midpoint_s,
+            "left_detection": left_detection,
+            "right_detection": right_detection,
+            "left_attitude": left_attitude,
+            "right_attitude": right_attitude,
+            "left_attitude_age_s": None if left_nearest is None else left_nearest.age_s,
+            "right_attitude_age_s": None if right_nearest is None else right_nearest.age_s,
+            "left_gps": left_gps,
+            "right_gps": right_gps,
+            "measurement_start": measurement_start,
+            "reused_inputs": reused_inputs,
+        }
+        panel._last_frozen_measurement_pair = frozen
+        return dict(frozen)
+
+    def _build_measurement_attempt(
+        self,
+        pair,
+        *,
+        method_status: MeasurementMethodStatus | None = None,
+        frozen_inputs: Mapping[str, object] | None = None,
+        use_cache: bool = True,
+    ) -> MeasurementAttempt:
+        """Resolve one method only from a previously frozen shared pair."""
+
+        method_status = method_status or self._select_measurement_method_for_attempt()
+        if method_status is None:
+            raise ValueError("no ready measurement method")
+        method_id = method_status.method_id
+        triangulation_source = "pixhawk" if method_id == PIXHAWK_RTK_LIVE else "checkerboard"
+        geometry_kind = "live_pixhawk_mount" if method_id == PIXHAWK_RTK_LIVE else "relative_pose"
+        frozen = dict(frozen_inputs or self._freeze_measurement_pair_inputs(pair))
+        snapshot = frozen.get("snapshot")
+        if not isinstance(snapshot, FrozenMeasurementPairSnapshot):
+            raise TypeError("frozen measurement pair snapshot missing")
+        timestamp_basis = str(frozen["timestamp_basis"])
+        left_pairing_timestamp_s = float(frozen["left_pairing_timestamp_s"])
+        right_pairing_timestamp_s = float(frozen["right_pairing_timestamp_s"])
+        created_monotonic_s = float(frozen["created_monotonic_s"])
+        detection_midpoint_s = float(frozen["detection_midpoint_s"])
+        left_detection = frozen["left_detection"]
+        right_detection = frozen["right_detection"]
+        left_attitude = frozen.get("left_attitude")
+        right_attitude = frozen.get("right_attitude")
+        left_attitude_age_s = frozen.get("left_attitude_age_s")
+        right_attitude_age_s = frozen.get("right_attitude_age_s")
         attitude_pair_delta_s = (
             None
             if left_attitude is None or right_attitude is None
@@ -1918,42 +2556,11 @@ class MeasurementViewController:
             else relative_attitude(left_attitude.quaternion_wxyz, right_attitude.quaternion_wxyz)
         )
 
-        selected_left_gps, selected_right_gps = self.panel._selected_baseline_gps_states()
-        measurement_start = getattr(self.panel, "_measurement_started_monotonic_s", None)
-        if measurement_start is not None:
-            if (
-                selected_left_gps is not None
-                and float(selected_left_gps.timestamp_s) < float(measurement_start)
-            ):
-                selected_left_gps = None
-            if (
-                selected_right_gps is not None
-                and float(selected_right_gps.timestamp_s) < float(measurement_start)
-            ):
-                selected_right_gps = None
-        left_gps = None if selected_left_gps is None else GpsSnapshot.from_state(selected_left_gps)
-        right_gps = None if selected_right_gps is None else GpsSnapshot.from_state(selected_right_gps)
-
-        attitude_for_geometry_left = (
-            left_attitude
-            if left_attitude is not None
-            and (
-                measurement_start is None
-                or left_attitude.timestamp_s >= float(measurement_start)
-            )
-            else None
-        )
-        attitude_for_geometry_right = (
-            right_attitude
-            if right_attitude is not None
-            and (
-                measurement_start is None
-                or right_attitude.timestamp_s >= float(measurement_start)
-            )
-            else None
-        )
-        left_attitude = attitude_for_geometry_left
-        right_attitude = attitude_for_geometry_right
+        left_gps = frozen.get("left_gps")
+        right_gps = frozen.get("right_gps")
+        measurement_start = frozen.get("measurement_start")
+        attitude_for_geometry_left = left_attitude
+        attitude_for_geometry_right = right_attitude
         measurement_result = self._measurement_intrinsics_result_for_method(
             method_status,
             left_attitude=attitude_for_geometry_left,
@@ -1967,15 +2574,29 @@ class MeasurementViewController:
                 dict(measurement_result.calibration_quality or {}).get("state")
                 == NOMINAL_INTRINSICS_QUALITY
             )
+            frozen_kd = bool(
+                getattr(
+                    self.panel,
+                    "_measurement_frozen_comparison_inputs_declared",
+                    False,
+                )
+            )
             operating_profile = (
-                self.panel._optical_pose_controller()._operating_intrinsics_profile()
+                None
+                if frozen_kd
+                else self.panel._optical_pose_controller()._operating_intrinsics_profile()
                 if nominal_quality
                 else None
             )
-            profile_path = (
-                operating_profile.source_path
-                if operating_profile is not None
-                else self.panel._active_intrinsics_profile_path
+            profile_path = str(
+                getattr(
+                    self.panel,
+                    "_pending_measurement_frozen_intrinsics_path",
+                    "",
+                )
+                if frozen_kd
+                else getattr(operating_profile, "source_path", "")
+                or getattr(self.panel, "_active_intrinsics_profile_path", "")
                 or f"memory:active-calibration:zoom-{self.panel.zoom_level_spin.value():02d}"
             )
             intrinsics = StereoIntrinsicsSnapshot.from_result(
@@ -2069,7 +2690,7 @@ class MeasurementViewController:
         )
         cached_attempt = (
             self.panel._last_measurement_attempt
-            if key == self.panel._last_measurement_attempt_key
+            if use_cache and key == self.panel._last_measurement_attempt_key
             else None
         )
         if cached_attempt is not None and cached_attempt.is_geometry_ready:
@@ -2091,13 +2712,16 @@ class MeasurementViewController:
             ),
             field_quality_gates_advisory=True,
         )
-        candidate_attempt_id = self.panel._measurement_attempt_counter + 1
+        candidate_attempt_id = snapshot.pair_sequence
         attempt = MeasurementAttempt(
             attempt_id=candidate_attempt_id,
-            attempt_session_id=self.panel._measurement_attempt_generation_id,
+            attempt_session_id=str(
+                getattr(self.panel, "_measurement_attempt_generation_id", "")
+                or snapshot.measurement_id
+            ),
             detection_pair_key=key,
             created_monotonic_s=created_monotonic_s,
-            created_wall_s=time.time(),
+            created_wall_s=float(frozen["created_wall_s"]),
             detection_midpoint_monotonic_s=detection_midpoint_s,
             timestamp_basis=timestamp_basis,
             triangulation_source=triangulation_source,
@@ -2135,9 +2759,9 @@ class MeasurementViewController:
             candidate_missing = set(attempt.missing_geometry_inputs)
             if not candidate_missing < previous_missing:
                 return cached_attempt
-        self.panel._measurement_attempt_counter = candidate_attempt_id
-        self.panel._last_measurement_attempt_key = key
-        self.panel._last_measurement_attempt = attempt
+        if use_cache:
+            self.panel._last_measurement_attempt_key = key
+            self.panel._last_measurement_attempt = attempt
         return attempt
 
     def _translation_right_in_left_m(
@@ -2263,21 +2887,45 @@ class MeasurementViewController:
         intrinsics = self.panel.active_intrinsics
         if intrinsics is None:
             return ()
+        optical_owner = self.panel._optical_pose_controller()
+        try:
+            intrinsics_snapshot = optical_owner._intrinsics_snapshot(use_frozen=False)
+            active_intrinsics_hash = str(
+                intrinsics_snapshot["applicability"].get("profile_sha256") or ""
+            )
+        except (AttributeError, KeyError, TypeError, ValueError):
+            active_intrinsics_hash = ""
         left_pixel = pair.left.center
         right_pixel = pair.right.center
         rows: list[dict[str, object]] = []
 
-        def add_row(label: str, attempt: object | None, *, provenance_note: str = "") -> None:
+        def add_row(
+            label: str,
+            attempt: object | None,
+            *,
+            provenance_note: str = "",
+            unavailable_status: str = "waiting for inputs",
+            metadata: Mapping[str, object] | None = None,
+        ) -> None:
             suffix = f" · {provenance_note}" if provenance_note else ""
+            base = {
+                "schema_version": GEOMETRY_COMPARISON_ANALYSIS_SCHEMA,
+                "evidence_namespace": GEOMETRY_COMPARISON_ANALYSIS_NAMESPACE,
+                "result_class": "analysis_only",
+                "not_measurement_result": True,
+                "active_intrinsics_hash": active_intrinsics_hash,
+                **dict(metadata or {}),
+            }
             if attempt is None:
                 rows.append(
                     {
+                        **base,
                         "method": label,
                         "forward_m": None,
                         "right_m": None,
                         "down_m": None,
                         "range_m": None,
-                        "status": f"waiting for inputs{suffix}",
+                        "status": f"{unavailable_status}{suffix}",
                     }
                 )
                 return
@@ -2285,6 +2933,7 @@ class MeasurementViewController:
             if result is None:
                 rows.append(
                     {
+                        **base,
                         "method": label,
                         "forward_m": None,
                         "right_m": None,
@@ -2297,6 +2946,7 @@ class MeasurementViewController:
             forward_m, right_m, down_m = result.point_m
             rows.append(
                 {
+                    **base,
                     "method": label,
                     "forward_m": forward_m,
                     "right_m": right_m,
@@ -2347,7 +2997,11 @@ class MeasurementViewController:
                     right_body_to_world_q=right_ext.q if right_ext is not None else left_ext.q,
                     translation_right_in_left_m=translation_right_in_left_m,
                 )
-        add_row("Pixhawk + RTK (live)", pixhawk_attempt)
+        add_row(
+            "Pixhawk + RTK (live)",
+            pixhawk_attempt,
+            metadata={"source_state": "live"},
+        )
 
         # 2) Checkerboard stereoCalibrate profile, kept in its own slot so a
         # later PnP apply cannot overwrite it here.
@@ -2360,7 +3014,19 @@ class MeasurementViewController:
                 checkerboard_profile.extrinsics.translation_left_to_right_m,
             )
         )
-        add_row("Checkerboard", checkerboard_attempt)
+        add_row(
+            "Checkerboard",
+            checkerboard_attempt,
+            metadata={
+                "source_state": "applied" if checkerboard_profile is not None else "missing",
+                "source_profile_id": ""
+                if checkerboard_profile is None
+                else checkerboard_profile.profile_id,
+                "source_profile_hash": ""
+                if checkerboard_profile is None
+                else checkerboard_profile.content_sha256,
+            },
+        )
 
         # 3) The last applied Optical Pose / PnP profile, kept in its own slot.
         applied_profile = getattr(self.panel, "optical_pose_extrinsics_profile", None)
@@ -2377,6 +3043,15 @@ class MeasurementViewController:
             if applied_profile is None
             else f"PnP active ({applied_profile.method})",
             applied_attempt,
+            metadata={
+                "source_state": "applied" if applied_profile is not None else "missing",
+                "source_profile_id": ""
+                if applied_profile is None
+                else applied_profile.profile_id,
+                "source_profile_hash": ""
+                if applied_profile is None
+                else applied_profile.content_sha256,
+            },
         )
 
         # 4) Every unapplied PnP candidate (latest solve per method), so an
@@ -2384,13 +3059,30 @@ class MeasurementViewController:
         # before deciding whether to apply one.
         candidate_poses = self.panel.workstation_optical_pose_candidate_poses()
         for candidate_row in candidate_poses:
+            if bool(candidate_row.get("candidate_applied")):
+                continue
+            candidate_intrinsics_hash = str(
+                candidate_row.get("candidate_intrinsics_hash") or ""
+            )
+            applicability_reasons: list[str] = []
+            if not candidate_intrinsics_hash:
+                applicability_reasons.append("candidate K,D identity missing")
+            elif not active_intrinsics_hash:
+                applicability_reasons.append("active K,D identity missing")
+            elif candidate_intrinsics_hash != active_intrinsics_hash:
+                applicability_reasons.append("candidate K,D differs from active K,D")
+            candidate_applicable = not applicability_reasons
             stereo = stereo_pose_from_absolute(
                 candidate_row["left_pose_ned"],
                 candidate_row["right_pose_ned"],
             )
-            attempt = relative_pose_attempt(
-                [list(row) for row in stereo.rotation_right_from_left_rdf],
-                list(stereo.translation_right_from_left_rdf_m),
+            attempt = (
+                relative_pose_attempt(
+                    [list(row) for row in stereo.rotation_right_from_left_rdf],
+                    list(stereo.translation_right_from_left_rdf_m),
+                )
+                if candidate_applicable
+                else None
             )
             # Horizon/Drone-yaw-style solves only optimize a subset of the 6
             # pose DOF; every unselected axis in left/right_pose_ned is a
@@ -2407,9 +3099,253 @@ class MeasurementViewController:
                     f"observed={observed_text} — Range/F/R/D는 prior 기준선 그대로 상속됨, "
                     "이 방식이 측정한 값 아님"
                 )
-            add_row(f"PnP candidate: {candidate_row['method']}", attempt, provenance_note=note)
+            applicability = {
+                "applicable": candidate_applicable,
+                "reasons": applicability_reasons,
+            }
+            add_row(
+                f"PnP candidate: {candidate_row['method']}",
+                attempt,
+                provenance_note=note,
+                unavailable_status=(
+                    "analysis blocked: " + "; ".join(applicability_reasons)
+                    if applicability_reasons
+                    else "waiting for inputs"
+                ),
+                metadata={
+                    "source_state": "candidate_unapplied",
+                    "candidate_profile_id": str(candidate_row.get("candidate_id") or ""),
+                    "candidate_profile_hash": str(
+                        candidate_row.get("candidate_profile_hash") or ""
+                    ),
+                    "candidate_intrinsics_hash": candidate_intrinsics_hash,
+                    "candidate_applied": False,
+                    "candidate_applicability": json.dumps(
+                        applicability,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    "candidate_quality": json.dumps(
+                        dict(candidate_row.get("candidate_quality") or {}),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                },
+            )
 
         return tuple(rows)
+
+    def _multi_method_measurement_active(self) -> bool:
+        return bool(
+            str(getattr(self.panel, "_measurement_id", "") or "")
+            and bool(getattr(self.panel, "distance_recording_enabled", False))
+            and bool(getattr(self.panel, "_method_evaluation_accepting", True))
+        )
+
+    def method_evaluation_pending_count(self) -> int:
+        self._poll_method_evaluations()
+        coordinator = self._method_evaluation_coordinator
+        return 0 if coordinator is None else coordinator.pending_pair_count
+
+    def _method_evaluation_requests_for_pair(
+        self,
+        pair: object,
+    ) -> tuple[MethodEvaluationRequest, ...]:
+        frozen = self._freeze_measurement_pair_inputs(pair)
+        snapshot = frozen.get("snapshot")
+        if not isinstance(snapshot, FrozenMeasurementPairSnapshot):
+            raise TypeError("frozen Measurement snapshot unavailable")
+        statuses = latest_status_by_method(self._measurement_method_statuses())
+        requests: list[MethodEvaluationRequest] = []
+        enqueued_ns = time.monotonic_ns()
+        for method_id in MEASUREMENT_METHOD_IDS:
+            status = statuses.get(method_id)
+            attempt_payload: Mapping[str, object] | None = None
+            reasons: tuple[str, ...]
+            instance_id = f"{method_id}:frozen-input-missing"
+            component_sources: tuple[tuple[str, str], ...] = ()
+            if status is None:
+                reasons = (MEASUREMENT_METHOD_MISSING_INSTANCE_REASONS[method_id],)
+            else:
+                instance_id = status.instance_id
+                component_sources = status.component_sources
+                reasons = tuple(status.reasons)
+                try:
+                    attempt = self._build_measurement_attempt(
+                        pair,
+                        method_status=status,
+                        frozen_inputs=frozen,
+                        use_cache=False,
+                    )
+                    attempt_payload = attempt.canonical_payload()
+                except (AttributeError, KeyError, RuntimeError, TypeError, ValueError) as exc:
+                    reasons = tuple(
+                        dict.fromkeys((*reasons, f"frozen method input error: {exc}"))
+                    )
+            uses_live_gnss = method_id == PIXHAWK_RTK_LIVE or "live_gnss" in dict(
+                component_sources
+            ).values()
+            reused_inputs = snapshot.reused_inputs if uses_live_gnss else ()
+            requests.append(
+                MethodEvaluationRequest(
+                    measurement_id=snapshot.measurement_id,
+                    pair_id=snapshot.pair_id,
+                    pair_sequence=snapshot.pair_sequence,
+                    snapshot_sha256=snapshot.canonical_sha256(),
+                    request_generation=snapshot.pair_sequence,
+                    method_id=method_id,
+                    method_instance_id=instance_id,
+                    snapshot_payload=snapshot.canonical_payload(),
+                    attempt_payload=attempt_payload,
+                    blocked_reasons=reasons,
+                    reused_inputs=reused_inputs,
+                    enqueued_monotonic_ns=enqueued_ns,
+                )
+            )
+        return tuple(requests)
+
+    def _submit_method_evaluations(self, pair: object) -> None:
+        requests = self._method_evaluation_requests_for_pair(pair)
+        first = requests[0]
+        submitted = getattr(self.panel, "_method_evaluation_submitted", None)
+        if not isinstance(submitted, set):
+            submitted = set()
+            self.panel._method_evaluation_submitted = submitted
+        identity = (first.pair_id, first.request_generation)
+        if identity in submitted:
+            return
+        submission = self._ensure_method_evaluation_coordinator().submit(requests)
+        submitted.add(identity)
+        if submission.backpressure_bundle is not None:
+            self._commit_method_evaluation_bundle(submission.backpressure_bundle)
+            self.panel._set_distance_text(
+                "거리: method worker queue 포화 (20 pairs)",
+                quality="WARNING",
+                detail="원본 pair와 BACKPRESSURE_BLOCKED 결과는 저장했습니다.",
+            )
+
+    def _display_primary_method_outcome(
+        self,
+        outcome: MethodEvaluationOutcome,
+        *,
+        waiting_for_barrier: bool,
+    ) -> None:
+        suffix = " · comparison barrier 대기" if waiting_for_barrier else ""
+        result = outcome.result if isinstance(outcome.result, Mapping) else {}
+        triangulated = result.get("triangulated")
+        if outcome.status in {"VALID", "ESTIMATED"} and isinstance(triangulated, Mapping):
+            distance_m = triangulated.get("range_m")
+            try:
+                distance_text = f"{float(distance_m):.2f} m"
+            except (TypeError, ValueError):
+                distance_text = "--"
+            reused = " · REUSED" if outcome.reused_inputs else ""
+            self.panel._set_distance_text(
+                f"거리: {distance_text} (Pixhawk attitude + GNSS/RTK worker){reused}{suffix}",
+                quality="ESTIMATED" if outcome.status == "ESTIMATED" else "GOOD",
+            )
+            return
+        reason = outcome.reasons[0] if outcome.reasons else outcome.status
+        self.panel._set_distance_text(
+            f"거리: Pixhawk + GNSS/RTK {outcome.status} · {reason}{suffix}",
+            quality="ERROR" if outcome.status == "FAILED" else "WARNING",
+        )
+
+    def _update_method_evaluation_counters(
+        self,
+        bundle: MethodEvaluationBundle,
+    ) -> None:
+        counters = getattr(self.panel, "_measurement_method_result_counters", None)
+        if not isinstance(counters, dict):
+            counters = {
+                method_id: {"VALID": 0, "BLOCKED": 0, "FAILED": 0}
+                for method_id in MEASUREMENT_METHOD_IDS
+            }
+            self.panel._measurement_method_result_counters = counters
+        for outcome in bundle.outcomes:
+            bucket = (
+                "VALID"
+                if outcome.status in {"VALID", "ESTIMATED"}
+                else "BLOCKED"
+                if outcome.status in {"BLOCKED", "BACKPRESSURE_BLOCKED"}
+                else "FAILED"
+            )
+            counters.setdefault(
+                outcome.method_id,
+                {"VALID": 0, "BLOCKED": 0, "FAILED": 0},
+            )[bucket] += 1
+
+    def _commit_method_evaluation_bundle(
+        self,
+        bundle: MethodEvaluationBundle,
+    ) -> None:
+        committed = getattr(self.panel, "_method_evaluation_committed", None)
+        if not isinstance(committed, set):
+            committed = set()
+            self.panel._method_evaluation_committed = committed
+        identity = (bundle.pair_id, bundle.request_generation)
+        if identity in committed:
+            return
+        rows = getattr(self.panel, "method_evaluation_bundle_rows", None)
+        if rows is not None and bool(getattr(self.panel, "distance_recording_enabled", False)):
+            rows.append(bundle.to_record())
+        committed.add(identity)
+        self.panel._last_method_evaluation_bundle = bundle
+        self._update_method_evaluation_counters(bundle)
+
+        primary = bundle.primary
+        attempt: MeasurementAttempt | None = None
+        if primary.attempt_payload:
+            try:
+                attempt = MeasurementAttempt.from_canonical_payload(primary.attempt_payload)
+            except (TypeError, ValueError):
+                attempt = None
+        if attempt is None:
+            self._display_primary_method_outcome(primary, waiting_for_barrier=False)
+            return
+        geometry = calculate_measurement_geometry(attempt)
+        if (
+            primary.status in {"VALID", "ESTIMATED"}
+            and geometry.match is not None
+            and geometry.triangulated is not None
+            and geometry.estimate is not None
+        ):
+            triangulated = geometry.triangulated
+            estimate = geometry.estimate
+            self.panel._append_distance_history(
+                estimate=estimate,
+                distance_m=triangulated.range_m,
+                method=f"{triangulated.method}-{PIXHAWK_RTK_LIVE}",
+                baseline_source=attempt.baseline_source,
+                baseline_m=attempt.baseline_m,
+                point_m=triangulated.point_m,
+                raw_point_m=triangulated.point_m,
+                raw_point_left_m=getattr(
+                    triangulated, "source_point_left_rdf_m", None
+                ),
+                measurement_attempt=attempt,
+            )
+        else:
+            self.panel._record_unresolved_pair(
+                attempt,
+                status=f"method_{primary.status.lower()}",
+                warnings=tuple(dict.fromkeys((*primary.reasons, *primary.warnings))),
+            )
+        self._display_primary_method_outcome(primary, waiting_for_barrier=False)
+
+    def _poll_method_evaluations(self) -> None:
+        coordinator = self._method_evaluation_coordinator
+        if coordinator is None:
+            return
+        polled = coordinator.poll()
+        for primary in polled.primary_outcomes:
+            self._display_primary_method_outcome(primary, waiting_for_barrier=True)
+        for bundle in polled.completed_bundles:
+            self._commit_method_evaluation_bundle(bundle)
 
     def _refresh_distance(self) -> None:
         self.panel.geometry_comparison_rows = ()
@@ -2439,6 +3375,20 @@ class MeasurementViewController:
             # A comparison-only preview must never block the official
             # measurement pipeline below it.
             self.panel.geometry_comparison_rows = ()
+        if self._multi_method_measurement_active():
+            if self.panel._measurement_display_mode() == "detection":
+                self.panel._show_measurement_pair(pair.left, pair.right)
+            else:
+                self.panel._clear_measurement_pair_display()
+            try:
+                self._submit_method_evaluations(pair)
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError) as exc:
+                self.panel._clear_triangulation_quality("method snapshot 생성 실패")
+                self.panel._set_distance_text(
+                    f"거리: method snapshot 생성 실패 | {exc}",
+                    quality="ERROR",
+                )
+            return
         selected_method_status = self._select_measurement_method_for_attempt()
         if selected_method_status is None:
             self._record_no_ready_measurement_pair(pair)

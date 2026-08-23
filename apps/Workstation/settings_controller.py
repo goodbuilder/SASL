@@ -122,6 +122,7 @@ class WorkstationSettingsController:
                 return
             panel._set_combo_data(getattr(panel, attribute), str(values[name] or default))
 
+
         # Keep an in-memory mirror until the next explicit Save.  This makes
         # navigating away and back in Workstation lossless while leaving the
         # JSON file unchanged until the user chooses Save.
@@ -372,6 +373,20 @@ class WorkstationSettingsController:
             if mode not in {"pixhawk", "checkerboard"}:
                 raise ValueError(f"unsupported distance mode: {mode}")
             panel._set_combo_data(panel.distance_mode_combo, mode)
+        source_setter = getattr(panel, "set_pixhawk_gnss_source", None)
+        if callable(source_setter):
+            if has("pixhawk_left_gnss_source"):
+                source_setter(
+                    "left",
+                    str(values["pixhawk_left_gnss_source"] or "GPS1"),
+                    persist=False,
+                )
+            if has("pixhawk_right_gnss_source"):
+                source_setter(
+                    "right",
+                    str(values["pixhawk_right_gnss_source"] or "GPS1"),
+                    persist=False,
+                )
 
         set_value("focal_px", "focal_spin")
         set_value("yolo_input_size_px", "input_size_spin")
@@ -434,12 +449,14 @@ class WorkstationSettingsController:
         set_value("square_size_mm", "calib_square_spin")
         set_value("min_images", "calib_min_images_spin")
         set_value("calculation_pair_count", "calib_calculation_pairs_spin")
+        set_value("pair_max_delta_ms", "calibration_pair_max_delta_spin")
         set_value("auto_interval_s", "calibration_auto_interval_spin")
-        set_value("auto_target_pairs", "calibration_auto_target_spin")
         if "calibration_root" in setup:
             panel._calibration_session_root = None
             panel._calibration_session_roots = {}
         set_text("calibration_root", "calib_dir_edit")
+        if "calibration_root" in setup and "validation_root" not in setup:
+            set_text("calibration_root", "checkerboard_validation_root_edit")
         if "validation_mode" in setup and setup["validation_mode"] is not None:
             panel._set_combo_data(
                 panel.checkerboard_validation_mode_combo,
@@ -454,10 +471,25 @@ class WorkstationSettingsController:
         panel._refresh_zoom_intrinsics_tab()
         panel.scan_checkerboard_validation_files()
         panel._refresh_operation_header()
+        pair_delta_widget = getattr(panel, "calibration_pair_max_delta_spin", None)
+        pair_delta_reader = getattr(pair_delta_widget, "value", None)
+        pair_max_delta_ms = (
+            float(pair_delta_reader())
+            if callable(pair_delta_reader)
+            else float(
+                getattr(
+                    getattr(panel, "settings", None),
+                    "calibration_pair_max_delta_s",
+                    0.100,
+                )
+            )
+            * 1000.0
+        )
         panel._log(
             "[캘리브레이션] Workstation setup 적용: "
             f"checkerboard={panel.calib_cols_spin.value()}x{panel.calib_rows_spin.value()}, "
             f"square={panel.calib_square_spin.value():.3f} mm, zoom={panel.zoom_level_spin.value():02d}; "
+            f"pair_max_delta={pair_max_delta_ms:.1f} ms; "
             "image geometry remains OpenCV optical RDF"
         )
 
@@ -538,6 +570,20 @@ class WorkstationSettingsController:
             left_control_port=panel.left_control_port_spin.value(),
             right_control_port=panel.right_control_port_spin.value(),
             wiris_control_timeout_s=panel.zoom_timeout_spin.value(),
+            wiris_visible_encoder_bitrate=int(
+                panel._workstation_setting(
+                    "wiris_visible_encoder_bitrate", panel.settings.wiris_visible_encoder_bitrate
+                )
+            ),
+            wiris_visible_encoder_qp=int(
+                panel._workstation_setting("wiris_visible_encoder_qp", panel.settings.wiris_visible_encoder_qp)
+            ),
+            wiris_visible_encoder_gop=int(
+                panel._workstation_setting("wiris_visible_encoder_gop", panel.settings.wiris_visible_encoder_gop)
+            ),
+            wiris_visible_encoder_idr=int(
+                panel._workstation_setting("wiris_visible_encoder_idr", panel.settings.wiris_visible_encoder_idr)
+            ),
             yolo_device=panel.device_edit.text().strip() or "cpu",
             yolo_input_size=panel.input_size_spin.value(),
             yolo_conf_threshold=panel.conf_spin.value(),
@@ -557,8 +603,14 @@ class WorkstationSettingsController:
             calibration_square_size_mm=panel.calib_square_spin.value(),
             calibration_min_images=panel.calib_min_images_spin.value(),
             calibration_calculation_pair_count=panel.calib_calculation_pairs_spin.value(),
+            calibration_pair_max_delta_s=(
+                panel.calibration_pair_max_delta_spin.value() / 1000.0
+                if hasattr(panel, "calibration_pair_max_delta_spin")
+                else float(
+                    getattr(panel.settings, "calibration_pair_max_delta_s", 0.100)
+                )
+            ),
             calibration_auto_interval_s=panel.calibration_auto_interval_spin.value(),
-            calibration_auto_target_pairs=panel.calibration_auto_target_spin.value(),
             calibration_root=portable_paths["calibration_root"],
             calibration_validation_mode=str(
                 panel.checkerboard_validation_mode_combo.currentData() or "pixhawk"
@@ -602,6 +654,8 @@ class WorkstationSettingsController:
             mavlink_configure_streams=panel.mavlink_configure_streams_checkbox.isChecked(),
             mavlink_stream_rate=panel.mavlink_stream_rate_spin.value(),
             pixhawk_ethernet_mode=panel._pixhawk_ethernet_mode(),
+            pixhawk_left_gnss_source=panel._pixhawk_gnss_source("left"),
+            pixhawk_right_gnss_source=panel._pixhawk_gnss_source("right"),
             auto_load_intrinsics=bool(
                 panel._workstation_setting("auto_load_intrinsics", panel.settings.auto_load_intrinsics)
             ),

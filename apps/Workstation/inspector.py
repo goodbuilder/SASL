@@ -21,9 +21,8 @@ _CONTEXT_LABELS = {
     "processing.experiment": "Protocol",
     "processing.measurement": "Measurement",
     "processing.alignment": "Alignment",
-    "tasks.session": "Session",
+    "tasks.session": "Sessions",
     "tasks.calibration": "Calibration",
-    "tasks.recording": "Recording / Review",
     "tasks.advanced": "Advanced",
     "tasks.settings": "Settings",
     "diagnostics.system": "Diagnostics · System",
@@ -69,16 +68,12 @@ _CONTEXT_LAYOUTS = {
         ("State", "Result / reason", "Timestamp", "Output contract", "Verdict"),
     ),
     "tasks.session": (
-        "Daily session",
-        ("Lifecycle", "Current measurement", "Readiness", "Method inputs", "Next action"),
+        "Sessions",
+        ("State", "Session / selection", "Created / samples", "Storage / contract", "Verdict"),
     ),
     "tasks.calibration": (
         "Calibration",
         ("Profile", "Result", "Image grid", "Frame contract", "Next check"),
-    ),
-    "tasks.recording": (
-        "Recording review",
-        ("Session", "Samples", "Finalization", "Output", "Verdict"),
     ),
     "tasks.advanced": (
         "Advanced tools",
@@ -289,7 +284,7 @@ class InspectorWidget(QtWidgets.QWidget):
             "devices.time": ("synchronization",),
             "processing.experiment": ("gnss", "synchronization", "measurement", "recording"),
             "processing.measurement": ("measurement",),
-            "tasks.recording": ("recording",),
+            "tasks.session": ("recording", "measurement"),
             "diagnostics.camera": ("camera.left", "camera.right"),
             "diagnostics.pixhawk": ("pixhawk.left", "pixhawk.right"),
             "diagnostics.gnss": ("gnss.base", "gnss.ntrip"),
@@ -328,7 +323,8 @@ class InspectorWidget(QtWidgets.QWidget):
             valid=valid,
         )
         self.source_value.set_value(detail_text, source=source_text)
-        self.output_section.setVisible(context_id in {"processing.measurement", "tasks.recording"})
+        self.output_section.setVisible(context_id in {"processing.measurement", "tasks.session"})
+        self.geometry_section.setVisible(context_id != "tasks.session")
         self.open_advanced_button.setVisible(context_id.startswith("diagnostics."))
         self._refresh_context_details(context_id)
         self._refresh_active_geometry()
@@ -348,6 +344,7 @@ class InspectorWidget(QtWidgets.QWidget):
         self._selection = dict(selection)
         self._configure_context_section(context_id)
         self.context_label.setText(_CONTEXT_LABELS.get(context_id, context_id.replace(".", " · ").title()))
+        self.geometry_section.setVisible(context_id != "tasks.session")
         self._refresh_context_details(context_id)
         self._refresh_active_geometry()
         self._refresh_mountain_margin_control(context_id)
@@ -664,6 +661,8 @@ class InspectorWidget(QtWidgets.QWidget):
         if not isinstance(evidence, EvidenceAdapter):
             evidence = EvidenceAdapter(getattr(self.backend, "panel", self.backend))
         values = {key: "--" for key in self.context_values}
+        self.context_row_labels["timing"].setVisible(True)
+        self.context_values["timing"].setVisible(True)
         source = "read-only source projection"
         frame = ""
         if self._selection is not None:
@@ -683,6 +682,9 @@ class InspectorWidget(QtWidgets.QWidget):
                 contract=selection.get("contract", "--"),
                 verdict=selection.get("verdict", "--"),
             )
+            hide_timing = bool(selection.get("hide_freshness", False))
+            self.context_row_labels["timing"].setVisible(not hide_timing)
+            self.context_values["timing"].setVisible(not hide_timing)
             source = str(selection.get("source", source) or source)
             frame = str(selection.get("contract", "") or "")
         elif context_id == "overview":
@@ -705,6 +707,53 @@ class InspectorWidget(QtWidgets.QWidget):
                 verdict="ERROR PRESENT" if bad_count else "CHECK WARNINGS" if warn_count else "NO ACTIVE ERROR",
             )
             source = "StatusModel + recording evidence"
+        elif context_id == "tasks.session":
+            snapshot_method = getattr(self.backend, "measurement_session_snapshot", None)
+            if not callable(snapshot_method):
+                snapshot_method = getattr(
+                    getattr(self.backend, "panel", self.backend),
+                    "measurement_session_snapshot",
+                    None,
+                )
+            try:
+                session = snapshot_method() if callable(snapshot_method) else {}
+            except Exception as exc:
+                session = {"state": "ERROR", "error": str(exc)}
+            session = session if isinstance(session, Mapping) else {}
+            metadata = session.get("metadata")
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            state = str(session.get("state") or "IDLE").upper()
+            session_id = str(session.get("session_id") or "")
+            measurements = session.get("measurements")
+            measurement_count = (
+                len(measurements) if isinstance(measurements, (tuple, list)) else 0
+            )
+            selected_measurement = str(
+                session.get("selected_measurement_id")
+                or session.get("active_measurement_id")
+                or ""
+            )
+            created = " ".join(
+                value
+                for value in (
+                    str(metadata.get("opened_local_date") or ""),
+                    str(metadata.get("opened_local_time") or ""),
+                )
+                if value
+            )
+            error = str(session.get("error") or "")
+            values.update(
+                primary="Ready for saving" if state == "OPEN" else "No folder" if state == "IDLE" else state,
+                secondary=(
+                    f"{session_id} / {selected_measurement}"
+                    if session_id and selected_measurement
+                    else session_id or "--"
+                ),
+                timing=f"{created or '--'} · measurements={measurement_count}",
+                contract=str(session.get("session_dir") or "--"),
+                verdict=error or state,
+            )
+            source = "measurement_session_snapshot"
         elif context_id == "tasks.settings":
             snapshot_method = getattr(self.backend, "workstation_settings_snapshot", None)
             try:
@@ -875,17 +924,6 @@ class InspectorWidget(QtWidgets.QWidget):
             )
             frame = str(alignment.get("coordinate_contract", ""))
             source = "Physical alignment evidence"
-        elif context_id in {"tasks.recording"}:
-            recording = evidence.recording()
-            counts = recording.get("sample_counts", {})
-            values.update(
-                primary=f"{recording.get('state', 'IDLE')} session={recording.get('session_id') or '--'}",
-                secondary=f"pairs={counts.get('pairs', 0) if isinstance(counts, dict) else '--'}",
-                timing=f"elapsed={recording.get('elapsed_s', '--')}s; retry={recording.get('retry_required', False)}",
-                contract=str(recording.get("output_dir") or "output directory unavailable"),
-                verdict="RETRY REQUIRED" if recording.get("retry_required") else str(recording.get("state", "IDLE")),
-            )
-            source = "recording session/save worker"
         elif context_id == "tasks.advanced":
             values.update(
                 primary="Advanced",

@@ -46,6 +46,14 @@ class AppLifecycleController:
         auto_capture_stopped = self.panel.stop_auto_calibration_capture()
         preview_stopped = self.panel._stop_calibration_preview_worker(wait=False)
         lrf_stopped = self.panel.stop_wiris_lrf_polling(wait=False)
+        measurement_owner = getattr(
+            self.panel, "_measurement_view_controller_owner", None
+        )
+        measurement_workers_stopped = (
+            True
+            if measurement_owner is None
+            else bool(measurement_owner.close_method_evaluation_workers())
+        )
         attrs = (
             "camera_auto_detect_thread",
             "wiris_control_check_thread",
@@ -76,7 +84,13 @@ class AppLifecycleController:
             "optical_pose_wiris_ftp_oz_thread",
         )
         results = [self.panel._shutdown_stop_thread(attr) for attr in attrs]
-        return bool(auto_capture_stopped and preview_stopped and lrf_stopped and all(results))
+        return bool(
+            auto_capture_stopped
+            and preview_stopped
+            and lrf_stopped
+            and measurement_workers_stopped
+            and all(results)
+        )
 
     def _shutdown_stop_gnss_base_serial(self) -> bool:
         self.panel.disconnect_gnss_base_serial()
