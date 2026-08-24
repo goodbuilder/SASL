@@ -58,6 +58,7 @@ from Workstation.workstation_core.calibration_timing import (
     HOST_DISPATCH_PROXY,
     UNKNOWN_TIMING_EVIDENCE,
     CalibrationTimingEvidence,
+    load_calibration_pair_usage,
 )
 from Workstation.workstation_core.calibration_selection import (
     CALIBRATION_IMAGE_SUFFIXES,
@@ -452,7 +453,15 @@ class CalibrationWorkflowController:
         right_by_id = indexed(self._calibration_image_paths_for_root(root, "right"), "right")
         common_keys = sorted(set(left_by_id) & set(right_by_id))
         if common_keys:
-            return [(key, left_by_id[key], right_by_id[key]) for key in common_keys]
+            return [
+                (key, left_by_id[key], right_by_id[key])
+                for key in common_keys
+                if self._calibration_pair_stereo_eligible(
+                    root,
+                    left_by_id[key],
+                    right_by_id[key],
+                )
+            ]
         left_paths = self._calibration_image_paths_for_root(root, "left")
         right_paths = self._calibration_image_paths_for_root(root, "right")
         if len(left_paths) == len(right_paths):
@@ -461,6 +470,26 @@ class CalibrationWorkflowController:
                 for index, (left, right) in enumerate(zip(left_paths, right_paths, strict=False))
             ]
         return []
+
+    @staticmethod
+    def _calibration_pair_stereo_eligible(
+        root: Path,
+        left_path: Path,
+        right_path: Path,
+    ) -> bool:
+        left_key = left_path.stem.removeprefix("left_")
+        right_key = right_path.stem.removeprefix("right_")
+        left_usage = load_calibration_pair_usage(
+            Path(root) / "capture_metadata" / f"capture_{left_key}.json"
+        )
+        if not left_usage.stereo_eligible:
+            return False
+        if left_key == right_key:
+            return True
+        right_usage = load_calibration_pair_usage(
+            Path(root) / "capture_metadata" / f"capture_{right_key}.json"
+        )
+        return right_usage.stereo_eligible
 
     def _checkerboard_validation_scan_counts(self) -> tuple[Path, list[Path], list[Path], list[tuple[str, Path, Path]]]:
         root = self.panel._checkerboard_validation_root()
@@ -3553,6 +3582,11 @@ class CalibrationWorkflowController:
             root=root,
             pair_limit=pair_limit,
         )
+        selected_pairs = [
+            pair
+            for pair in selected_pairs
+            if self._calibration_pair_stereo_eligible(root, pair[1], pair[2])
+        ]
         return left_paths, right_paths, selected_pairs, explicit_selection
 
     def _random_validation_inputs(
@@ -3910,11 +3944,6 @@ class CalibrationWorkflowController:
         pair_timing_ok, _pair_time_basis, _pair_delta_s, pair_timing_detail = (
             self.panel._checkerboard_capture_pair_timing(metadata_by_camera)
         )
-        if not pair_timing_ok:
-            self.panel.calibration_status_label.setText(
-                f"자동 촬영 대기: 좌·우 동기 pair가 아님 ({pair_timing_detail})"
-            )
-            return
 
         self._auto_capture_last_pair_key = pair_key
         self._auto_capture_last_attempt_s = now_s
@@ -3931,9 +3960,14 @@ class CalibrationWorkflowController:
             self._auto_capture_pending_pose_views = None
             self._auto_capture_pending_pose_novelty = None
             return
+        usage = (
+            "stereo pair 후보"
+            if pair_timing_ok
+            else f"intrinsics-only 후보 ({pair_timing_detail})"
+        )
         self.panel.calibration_status_label.setText(
-            f"자동 촬영 중: 유효 stereo pair {self._auto_capture_saved_pairs}개 | "
-            f"Capture worker가 보드 검증 중"
+            f"자동 촬영 중: {usage} | 유효 stereo pair "
+            f"{self._auto_capture_saved_pairs}개 | Capture worker가 보드 검증 중"
         )
 
     def _handle_checkerboard_capture_completed(self, result: object) -> None:
@@ -3985,14 +4019,33 @@ class CalibrationWorkflowController:
             return
         status = f"Captured {stem}: " + ", ".join(status_parts)
         pair_delta_s = result.get("pair_delta_s")
+        pair_saved = bool(
+            result.get(
+                "stereo_pair_saved",
+                bool(result.get("pair_timing_ok"))
+                and set(saved_sides) == {"left", "right"},
+            )
+        )
+        intrinsics_only_sides = tuple(
+            str(side)
+            for side in result.get(
+                "intrinsics_only_sides",
+                () if pair_saved else saved_sides,
+            )
+            or ()
+        )
         if (
-            bool(result.get("pair_timing_ok"))
+            pair_saved
             and isinstance(pair_delta_s, (int, float))
-            and set(saved_sides) == {"left", "right"}
         ):
             status += (
                 f"; pair_time_basis={result.get('pair_time_basis', 'rtcp-ntp')}, "
                 f"pair_delta_s={float(pair_delta_s):.6f}"
+            )
+        elif intrinsics_only_sides:
+            status += (
+                f"; intrinsics-only={','.join(intrinsics_only_sides)}; "
+                "excluded from stereo R,t"
             )
         self.panel.calibration_status_label.setText(status)
         session_root = getattr(self.panel, "_calibration_session_root", None)
@@ -4007,10 +4060,10 @@ class CalibrationWorkflowController:
         )
         if capture_origin == "auto":
             self._auto_capture_inflight_pair_key = None
-            pair_saved = bool(result.get("pair_timing_ok")) and set(saved_sides) == {"left", "right"}
             count_toward_auto_run = pair_saved and self._auto_capture_active
             if count_toward_auto_run:
                 self._auto_capture_saved_pairs += 1
+            if self._auto_capture_active:
                 pending_views = getattr(self, "_auto_capture_pending_pose_views", None)
                 if isinstance(pending_views, dict):
                     pose_views = getattr(
@@ -4018,7 +4071,7 @@ class CalibrationWorkflowController:
                         "_auto_capture_pose_views",
                         {"left": [], "right": []},
                     )
-                    for side in ("left", "right"):
+                    for side in saved_sides:
                         view = pending_views.get(side)
                         if isinstance(view, CalibrationViewGeometry):
                             pose_views.setdefault(side, []).append(view)
@@ -4027,13 +4080,22 @@ class CalibrationWorkflowController:
             self._auto_capture_pending_pose_novelty = None
             self._capture_origin = "manual"
             if self._auto_capture_active:
+                if pair_saved:
+                    self.panel.calibration_status_label.setText(
+                        f"자동 촬영 대기: 유효 stereo pair "
+                        f"{self._auto_capture_saved_pairs}개 저장됨 | Stop할 때까지 계속"
+                    )
+                else:
+                    self.panel.calibration_status_label.setText(
+                        f"자동 촬영 대기: Capture {stem} "
+                        f"{','.join(intrinsics_only_sides)} intrinsics-only 저장 | "
+                        f"유효 stereo pair {self._auto_capture_saved_pairs}개 | "
+                        "Stop할 때까지 계속"
+                    )
+            elif saved_sides:
+                usage = "stereo pair" if pair_saved else "intrinsics-only 이미지"
                 self.panel.calibration_status_label.setText(
-                    f"자동 촬영 대기: 유효 stereo pair "
-                    f"{self._auto_capture_saved_pairs}개 저장됨 | Stop할 때까지 계속"
-                )
-            elif pair_saved:
-                self.panel.calibration_status_label.setText(
-                    "자동 촬영은 중지됨: 진행 중이던 pair는 파일로 저장됐지만 "
+                    f"자동 촬영은 중지됨: 진행 중이던 {usage}는 파일로 저장됐지만 "
                     "중지된 자동 촬영 횟수에는 포함하지 않았습니다."
                 )
 

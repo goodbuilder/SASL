@@ -1027,6 +1027,115 @@ def test_checkerboard_capture_worker_saves_and_validates_optical_pixel_images(
     assert "OpenCV image pixels" in metadata["frame_contract"]
     assert metadata["pair_max_delta_s"] == pytest.approx(0.040)
     assert metadata["stereo_pair_saved"] is True
+    assert metadata["intrinsics_only_sides"] == []
+
+
+def test_checkerboard_capture_worker_preserves_timing_rejected_images_for_intrinsics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from Workstation import calibration_workers, standalone_gui
+    from Workstation.workstation_core.calibration import CheckerboardConfig
+
+    monkeypatch.setattr(
+        calibration_workers,
+        "detect_checkerboard",
+        lambda _path, _config: SimpleNamespace(found=True, corner_count=48, error=""),
+    )
+    frames = {}
+    for side in ("left", "right"):
+        image = standalone_gui.QtGui.QImage(
+            32,
+            24,
+            standalone_gui.QtGui.QImage.Format_RGB888,
+        )
+        image.fill(127)
+        frames[side] = image
+    worker = standalone_gui.CheckerboardCaptureWorker(
+        root=tmp_path,
+        frames=frames,
+        stem="002",
+        config=CheckerboardConfig(inner_cols=8, inner_rows=6, square_size_m=0.03),
+        opencv_error=None,
+        pair_timing_ok=False,
+        pair_time_basis="rtcp-ntp",
+        pair_delta_s=0.041,
+        pair_timing_detail="RTCP/NTP pair delta 41.0 ms exceeds 40.0 ms",
+        metadata_payload={
+            "pair_persistence_allowed": False,
+            "pair_max_delta_s": 0.040,
+        },
+    )
+    completed: list[object] = []
+    worker.completed.connect(completed.append)
+
+    worker.run()
+
+    assert len(completed) == 1
+    assert completed[0]["saved_sides"] == ("left", "right")
+    assert completed[0]["stereo_pair_saved"] is False
+    assert completed[0]["intrinsics_only_sides"] == ("left", "right")
+    assert all(
+        completed[0]["side_results"][side]["state"] == "saved_intrinsics_only"
+        for side in ("left", "right")
+    )
+    assert (tmp_path / "left" / "left_002.png").is_file()
+    assert (tmp_path / "right" / "right_002.png").is_file()
+    metadata = json.loads(
+        (tmp_path / "capture_metadata" / "capture_002.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metadata["saved_sides"] == ["left", "right"]
+    assert metadata["stereo_pair_saved"] is False
+    assert metadata["intrinsics_only_sides"] == ["left", "right"]
+
+
+def test_checkerboard_capture_worker_keeps_single_detected_side_for_intrinsics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from Workstation import calibration_workers, standalone_gui
+    from Workstation.workstation_core.calibration import CheckerboardConfig
+
+    monkeypatch.setattr(
+        calibration_workers,
+        "detect_checkerboard",
+        lambda path, _config: SimpleNamespace(
+            found=path.name.startswith("left_"),
+            corner_count=48 if path.name.startswith("left_") else 0,
+            error="",
+        ),
+    )
+    image = standalone_gui.QtGui.QImage(
+        32,
+        24,
+        standalone_gui.QtGui.QImage.Format_RGB888,
+    )
+    image.fill(127)
+    worker = standalone_gui.CheckerboardCaptureWorker(
+        root=tmp_path,
+        frames={"left": image, "right": image},
+        stem="004",
+        config=CheckerboardConfig(inner_cols=8, inner_rows=6, square_size_m=0.03),
+        opencv_error=None,
+        pair_timing_ok=True,
+        pair_time_basis="rtcp-ntp",
+        pair_delta_s=0.001,
+        pair_timing_detail="ok",
+        metadata_payload={"pair_persistence_allowed": True},
+    )
+    completed: list[object] = []
+    worker.completed.connect(completed.append)
+
+    worker.run()
+
+    assert completed[0]["saved_sides"] == ("left",)
+    assert completed[0]["stereo_pair_saved"] is False
+    assert completed[0]["intrinsics_only_sides"] == ("left",)
+    assert completed[0]["side_results"]["left"]["state"] == "saved_intrinsics_only"
+    assert (tmp_path / "left" / "left_004.png").is_file()
+    assert not (tmp_path / "right" / "right_004.png").exists()
 
 def test_checkerboard_auto_capture_uses_new_synchronized_detection_pairs() -> None:
     from Workstation.calibration_controller import CalibrationWorkflowController
@@ -1083,6 +1192,109 @@ def test_checkerboard_auto_capture_uses_new_synchronized_detection_pairs() -> No
     controller.stop_auto_calibration_capture()
     assert panel.capture_calibration_auto_button.text() == "자동 촬영 시작"
     app.processEvents()
+
+
+def test_checkerboard_auto_capture_saves_new_timing_rejected_pair_once() -> None:
+    from Workstation import standalone_gui
+    from Workstation.calibration_controller import CalibrationWorkflowController
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    image = standalone_gui.QtGui.QImage(32, 24, standalone_gui.QtGui.QImage.Format_RGB888)
+    image.fill(127)
+    now_s = time.monotonic()
+    panel = SimpleNamespace(
+        checkerboard_calibration_thread=None,
+        _allow_legacy_calibration_preview_fallback=True,
+        calibration_auto_interval_spin=QtWidgets.QDoubleSpinBox(),
+        calibration_status_label=QtWidgets.QLabel(),
+        capture_calibration_auto_button=QtWidgets.QPushButton(),
+        calibration_preview_detection_results={
+            side: {
+                "request_id": index,
+                "image": image,
+                "found": True,
+                "metadata": {
+                    "timestamp_s": now_s,
+                    "rtcp_frame_ntp_unix_s": 100.000 + index * 0.101,
+                },
+            }
+            for index, side in enumerate(("left", "right"), start=1)
+        },
+        _checkerboard_capture_pair_timing=lambda _metadata: (
+            False,
+            "rtcp-ntp",
+            0.101,
+            "RTCP/NTP pair delta 101.0 ms exceeds 100.0 ms",
+        ),
+    )
+    panel.calibration_auto_interval_spin.setRange(0.1, 10.0)
+    panel.calibration_auto_interval_spin.setValue(0.1)
+    controller = CalibrationWorkflowController(panel)
+    capture_calls: list[dict[str, object]] = []
+    controller.capture_calibration_images = lambda **kwargs: capture_calls.append(kwargs) or True
+
+    assert controller.start_auto_calibration_capture() is True
+    assert len(capture_calls) == 1
+    assert capture_calls[0]["capture_origin"] == "auto"
+    assert "intrinsics-only 후보" in panel.calibration_status_label.text()
+
+    controller._auto_calibration_capture_tick()
+    assert len(capture_calls) == 1
+    controller.stop_auto_calibration_capture()
+    app.processEvents()
+
+
+def test_auto_timing_rejected_completion_tracks_pose_without_counting_stereo() -> None:
+    from Workstation.calibration_controller import CalibrationWorkflowController
+    from Workstation.workstation_core.calibration_quality import CalibrationViewGeometry
+
+    def view(side: str) -> CalibrationViewGeometry:
+        return CalibrationViewGeometry(
+            view_id=side,
+            image_size=(32, 24),
+            corner_count=4,
+            center_normalized=(0.5, 0.5),
+            bbox_normalized=(0.2, 0.2, 0.8, 0.8),
+            bbox_extent_normalized=(0.6, 0.6),
+            coverage_fraction=0.36,
+            roll_deg=0.0,
+            top_bottom_ratio=1.0,
+            left_right_ratio=1.0,
+            scale=0.6,
+        )
+
+    panel = SimpleNamespace(
+        calibration_status_label=QtWidgets.QLabel(),
+        _calibration_session_root=None,
+        _log=lambda _message: None,
+    )
+    controller = CalibrationWorkflowController(panel)
+    controller._capture_origin = "auto"
+    controller._auto_capture_active = True
+    controller._auto_capture_saved_pairs = 0
+    controller._auto_capture_pose_views = {"left": [], "right": []}
+    controller._auto_capture_pending_pose_views = {
+        "left": view("left"),
+        "right": view("right"),
+    }
+
+    controller._handle_checkerboard_capture_completed(
+        {
+            "stem": "003",
+            "saved_sides": ("left", "right"),
+            "status_parts": ("left=intrinsics-only", "right=intrinsics-only"),
+            "pair_timing_ok": False,
+            "stereo_pair_saved": False,
+            "intrinsics_only_sides": ("left", "right"),
+            "pair_time_basis": "rtcp-ntp",
+            "pair_delta_s": 0.101,
+        }
+    )
+
+    assert controller._auto_capture_saved_pairs == 0
+    assert len(controller._auto_capture_pose_views["left"]) == 1
+    assert len(controller._auto_capture_pose_views["right"]) == 1
+    assert "intrinsics-only 저장" in panel.calibration_status_label.text()
 
 
 def test_checkerboard_auto_capture_continues_until_operator_stops() -> None:
@@ -2015,6 +2227,20 @@ def test_calibration_pair_picker_sync_is_cached_until_capture_directory_changes(
     image.fill(QtGui.QColor("black"))
     assert image.save(str(root / "left" / "left_001.png"))
     assert image.save(str(root / "right" / "right_001.png"))
+    metadata_dir = root / "capture_metadata"
+    metadata_dir.mkdir()
+    (metadata_dir / "capture_001.json").write_text(
+        json.dumps(
+            {
+                "stereo_pair_saved": False,
+                "calibration_timing_evidence": {
+                    "pair_persistence_allowed": False,
+                    "detail": "pair delta exceeds limit",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     evidence = SimpleNamespace(calibration_setup=lambda: {"calibration_root_resolved": str(root)})
     monkeypatch.setattr(workspaces_module, "_evidence", lambda _backend: evidence)
@@ -2038,6 +2264,10 @@ def test_calibration_pair_picker_sync_is_cached_until_capture_directory_changes(
     workspace._sync_calibration_pair_picker()
     assert workspace.calibration_pair_picker_list.count() == 1
     assert workspace.calibration_pair_picker_list.clear_calls == 1
+    rejected_item = workspace.calibration_pair_picker_list.item(0)
+    assert "INTRINSICS ONLY" in rejected_item.text()
+    assert not bool(rejected_item.flags() & QtCore.Qt.ItemIsUserCheckable)
+    assert "Stereo R,t: excluded" in rejected_item.toolTip()
 
     assert image.save(str(root / "left" / "left_002.png"))
     assert image.save(str(root / "right" / "right_002.png"))

@@ -7,6 +7,10 @@ from types import SimpleNamespace
 import pytest
 
 from Workstation.calibration_controller import CalibrationWorkflowController
+from Workstation.calibration_sessions import (
+    discover_calibration_sessions,
+    write_calibration_session_manifest,
+)
 from Workstation.calibration_workers import CheckerboardCalibrationWorker
 from Workstation.workstation_core.calibration import (
     CameraIntrinsics,
@@ -14,6 +18,13 @@ from Workstation.workstation_core.calibration import (
     StereoExtrinsics,
 )
 from Workstation.workstation_core.calibration_input import CalibrationInputSnapshot
+from Workstation.workstation_core.calibration_timing import (
+    INTRINSICS_ONLY,
+    INVALID_METADATA,
+    LEGACY_UNVERIFIED,
+    classify_calibration_pair_usage,
+    load_calibration_pair_usage,
+)
 
 
 def _photo_root(base: Path, name: str, count: int = 5) -> Path:
@@ -52,6 +63,122 @@ def _controller(tmp_path: Path, hidden_root: Path) -> CalibrationWorkflowControl
         _log=messages.append,
     )
     return CalibrationWorkflowController(panel)
+
+
+def test_pair_usage_is_fail_closed_for_explicit_rejection_and_legacy_compatible(
+    tmp_path: Path,
+) -> None:
+    missing = load_calibration_pair_usage(tmp_path / "capture_missing.json")
+    assert missing.state == LEGACY_UNVERIFIED
+    assert missing.stereo_eligible is True
+
+    rejected = classify_calibration_pair_usage(
+        {
+            "stereo_pair_saved": True,
+            "calibration_timing_evidence": {
+                "pair_persistence_allowed": False,
+                "pair_delta_s": 0.101,
+                "maximum_delta_s": 0.100,
+                "detail": "pair delta exceeds limit",
+            },
+        }
+    )
+    assert rejected.state == INTRINSICS_ONLY
+    assert rejected.stereo_eligible is False
+    assert rejected.pair_delta_s == pytest.approx(0.101)
+    assert rejected.maximum_delta_s == pytest.approx(0.100)
+    assert "conflicting allow fields" in rejected.detail
+
+    malformed = tmp_path / "capture_bad.json"
+    malformed.write_text("{bad-json", encoding="utf-8")
+    invalid = load_calibration_pair_usage(malformed)
+    assert invalid.state == INVALID_METADATA
+    assert invalid.stereo_eligible is False
+
+
+def test_intrinsics_only_capture_stays_in_kd_inputs_but_not_stereo_snapshot(
+    tmp_path: Path,
+) -> None:
+    root = _photo_root(tmp_path, "mixed", count=4)
+    for index in range(1, 5):
+        metadata_path = root / "capture_metadata" / f"capture_{index:03d}.json"
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        allowed = index != 4
+        payload.update(
+            {
+                "stereo_pair_saved": allowed,
+                "intrinsics_only_sides": [] if allowed else ["left", "right"],
+                "calibration_timing_evidence": {
+                    "schema": "workstation-calibration-timing-evidence-v1",
+                    "evidence_class": "CAMERA_TIMESTAMP_VERIFIED",
+                    "pair_persistence_allowed": allowed,
+                    "precision_qualified": allowed,
+                    "actual_exposure_verified": False,
+                    "timestamp_reference": "rtcp-ntp",
+                    "pair_delta_s": 0.010 if allowed else 0.101,
+                    "maximum_delta_s": 0.100,
+                    "detail": "ok" if allowed else "pair delta exceeds limit",
+                },
+            }
+        )
+        metadata_path.write_text(json.dumps(payload), encoding="utf-8")
+    sidecar = root / "calibration_pair_selection.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "schema": "workstation-calibration-file-selection-v2",
+                "root": ".",
+                "manual_mode": True,
+                "included_keys": ["001", "002", "003", "004"],
+                "left_paths": [f"left/left_{index:03d}.png" for index in range(1, 5)],
+                "right_paths": [f"right/right_{index:03d}.png" for index in range(1, 5)],
+                "excluded_left_paths": [],
+                "excluded_right_paths": [],
+                "excluded_pair_keys": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    controller = _controller(tmp_path, root)
+
+    snapshot, source_pair_count, explicit = controller._calibration_input_snapshot(
+        {"root": str(root), "mode": "checkerboard", "pair_limit": 0}
+    )
+
+    assert explicit is True
+    assert source_pair_count == 3
+    assert len(snapshot.left_paths) == 4
+    assert len(snapshot.right_paths) == 4
+    assert snapshot.left_paths[-1].name == "left_004.png"
+    assert snapshot.right_paths[-1].name == "right_004.png"
+    assert [key for key, _left, _right in snapshot.pair_paths] == ["001", "002", "003"]
+    assert snapshot.precision_timing_qualified is True
+    assert snapshot.timing_evidence_classes == ("CAMERA_TIMESTAMP_VERIFIED",)
+    assert any(item.relative_path.endswith("capture_004.json") for item in snapshot.zoom_evidence)
+    assert controller._calibration_pair_stereo_eligible(
+        root,
+        root / "left" / "left_004.png",
+        root / "right" / "right_001.png",
+    ) is False
+
+
+def test_calibration_session_pair_count_excludes_intrinsics_only_capture(
+    tmp_path: Path,
+) -> None:
+    root = _photo_root(tmp_path, "session", count=2)
+    rejected_metadata = root / "capture_metadata" / "capture_002.json"
+    payload = json.loads(rejected_metadata.read_text(encoding="utf-8"))
+    payload["stereo_pair_saved"] = False
+    payload["pair_persistence_allowed"] = False
+    rejected_metadata.write_text(json.dumps(payload), encoding="utf-8")
+
+    manifest_path = write_calibration_session_manifest(root)
+    sessions = discover_calibration_sessions(tmp_path)
+
+    assert len(sessions) == 1
+    assert sessions[0].pair_count == 1
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["pair_count"] == 1
 
 
 def test_visible_root_snapshot_overrides_hidden_root_and_freezes_selection_hashes(

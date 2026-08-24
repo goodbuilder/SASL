@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import pytest
 from pathlib import Path
 from types import SimpleNamespace
@@ -288,6 +289,67 @@ def test_ftp_pair_contract_promotes_both_stills_into_calculation_directories(
     assert completed[0]["saved_sides"] == ("left", "right")
     assert (tmp_path / "calculation" / "left" / "left_001.png").is_file()
     assert (tmp_path / "calculation" / "right" / "right_001.png").is_file()
+
+
+def test_ftp_pair_over_dispatch_gate_is_saved_for_intrinsics_only(
+    tmp_path: Path,
+) -> None:
+    cameras = _camera_records(tmp_path)
+    cameras["right"]["capture_requested_monotonic_ns"] = 5_250_000_000
+    frames = {
+        side: QtGui.QImage(str(cameras[side]["ftp_local_path"]))
+        for side in ("left", "right")
+    }
+    panel = _calibration_panel(
+        _camera_rtc_timestamp_s_from_metadata=lambda _metadata: None,
+    )
+    controller = CalibrationWorkflowController(panel)
+    metadata = controller._ftp_calibration_capture_metadata(
+        capture_id="ftp-pair-intrinsics-001",
+        cameras=cameras,
+        frames=frames,
+    )
+    evidence = controller._checkerboard_capture_pair_timing_evidence(
+        metadata,
+        maximum_delta_s=0.100,
+    )
+    completed: list[dict[str, object]] = []
+    worker = CheckerboardCaptureWorker(
+        root=tmp_path / "calculation",
+        frames=frames,
+        stem="002",
+        config=None,
+        opencv_error="test fixture",
+        pair_timing_ok=evidence.pair_persistence_allowed,
+        pair_time_basis=evidence.timestamp_reference,
+        pair_delta_s=evidence.pair_delta_s,
+        pair_timing_detail=evidence.detail,
+        metadata_payload={
+            "capture_origin": "ftp",
+            "pair_persistence_allowed": evidence.pair_persistence_allowed,
+            "calibration_timing_evidence": evidence.to_mapping(),
+        },
+        timing_evidence=evidence.to_mapping(),
+    )
+    worker.completed.connect(completed.append)
+
+    worker.run()
+
+    assert completed[0]["saved_sides"] == ("left", "right")
+    assert completed[0]["stereo_pair_saved"] is False
+    assert completed[0]["intrinsics_only_sides"] == ("left", "right")
+    assert (tmp_path / "calculation" / "left" / "left_002.png").is_file()
+    assert (tmp_path / "calculation" / "right" / "right_002.png").is_file()
+    capture_metadata = json.loads(
+        (
+            tmp_path
+            / "calculation"
+            / "capture_metadata"
+            / "capture_002.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert capture_metadata["stereo_pair_saved"] is False
+    assert capture_metadata["intrinsics_only_sides"] == ["left", "right"]
 
 
 def test_missing_capture_zoom_metadata_never_falls_back_to_current_spinner(

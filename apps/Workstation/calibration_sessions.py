@@ -13,6 +13,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from Workstation.workstation_core.calibration_timing import load_calibration_pair_usage
+
 
 SESSION_MANIFEST_NAME = "calibration_session.json"
 
@@ -39,7 +41,13 @@ def _pair_count(root: Path) -> int:
         path.stem.removeprefix("right_")
         for path in (root / "right").glob("right_*.png")
     }
-    return len(left & right)
+    return sum(
+        1
+        for key in left & right
+        if load_calibration_pair_usage(
+            root / "capture_metadata" / f"capture_{key}.json"
+        ).stereo_eligible
+    )
 
 
 def discover_calibration_sessions(base_root: str | Path) -> tuple[CalibrationSession, ...]:

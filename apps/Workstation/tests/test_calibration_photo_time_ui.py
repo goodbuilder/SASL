@@ -156,3 +156,52 @@ def test_compute_photo_table_displays_left_and_right_times_and_refreshes_for_met
     table.deleteLater()
     workspace.calibration_file_selection_summary.deleteLater()
     _app.processEvents()
+
+
+def test_compute_photo_table_marks_timing_rejected_pair_as_intrinsics_only(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import Workstation.workspaces as workspaces_module
+
+    _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    _write_pair(tmp_path)
+    metadata_dir = tmp_path / "capture_metadata"
+    metadata_dir.mkdir()
+    (metadata_dir / "capture_001.json").write_text(
+        json.dumps(
+            {
+                "capture_origin": "auto",
+                "stereo_pair_saved": False,
+                "intrinsics_only_sides": ["left", "right"],
+                "capture_recorded_unix_ns": 1_700_000_010_000_000_000,
+                "calibration_timing_evidence": {
+                    "pair_persistence_allowed": False,
+                    "pair_delta_s": 0.101,
+                    "maximum_delta_s": 0.100,
+                    "detail": "RTCP/NTP pair delta exceeds limit",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    evidence = SimpleNamespace(
+        calibration_setup=lambda: {"calibration_root_resolved": str(tmp_path)}
+    )
+    monkeypatch.setattr(workspaces_module, "_evidence", lambda _backend: evidence)
+    workspace = CalibrationWorkspace.__new__(CalibrationWorkspace)
+    workspace.backend = SimpleNamespace()
+    workspace.calibration_selected_files_table = QtWidgets.QTableWidget(0, 6)
+    workspace.calibration_file_selection_summary = QtWidgets.QLabel()
+    workspace._calibration_file_picker_signature = None
+    workspace._calibration_session_explicit_root = str(tmp_path)
+
+    workspace._sync_calibration_file_selection()
+
+    state = workspace.calibration_selected_files_table.item(0, 5)
+    assert state.text() == "INTRINSICS ONLY"
+    assert "K,D input: allowed" in state.toolTip()
+    assert "Stereo R,t: excluded" in state.toolTip()
+    workspace.calibration_selected_files_table.deleteLater()
+    workspace.calibration_file_selection_summary.deleteLater()
+    _app.processEvents()

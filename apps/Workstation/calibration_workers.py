@@ -201,6 +201,9 @@ class CheckerboardCaptureWorker(QtCore.QObject):
         status_parts: list[str] = []
         side_results: dict[str, dict[str, object]] = {}
         pair_candidate = self.frames.get("left") is not None and self.frames.get("right") is not None
+        timing_rejected = pair_candidate and not self.pair_timing_ok
+        stereo_pair_saved = False
+        intrinsics_only_sides: tuple[str, ...] = ()
         try:
             directories = {
                 "left": self.root / "left",
@@ -208,8 +211,10 @@ class CheckerboardCaptureWorker(QtCore.QObject):
             }
             for directory in directories.values():
                 directory.mkdir(parents=True, exist_ok=True)
-            if pair_candidate and not self.pair_timing_ok:
-                status_parts.append(f"pair=rejected ({self.pair_timing_detail})")
+            if timing_rejected:
+                status_parts.append(
+                    f"pair=intrinsics-only; stereo rejected ({self.pair_timing_detail})"
+                )
             for side in ("left", "right"):
                 image = self.frames.get(side)
                 if image is None:
@@ -226,26 +231,6 @@ class CheckerboardCaptureWorker(QtCore.QObject):
                             "side": side,
                             "state": "no_frame",
                             "response": "no frame",
-                        }
-                    )
-                    continue
-                if pair_candidate and not self.pair_timing_ok:
-                    detail = f"not saved as stereo pair ({self.pair_timing_detail})"
-                    status_parts.append(
-                        f"{side}={detail}"
-                    )
-                    side_results[side] = {
-                        "state": "pair_rejected",
-                        "response": detail,
-                        "path": "",
-                    }
-                    self.progress.emit(
-                        {
-                            "source": "calibration",
-                            "phase": "side_result",
-                            "side": side,
-                            "state": "pair_rejected",
-                            "response": detail,
                         }
                     )
                     continue
@@ -271,10 +256,18 @@ class CheckerboardCaptureWorker(QtCore.QObject):
                 if self.config is None:
                     saved_sides.append(side)
                     detail = f": {self.opencv_error}" if self.opencv_error else ""
-                    status_parts.append(f"{side}=saved (OpenCV unavailable{detail})")
+                    usage = " for intrinsics only" if timing_rejected else ""
+                    status_parts.append(
+                        f"{side}=saved{usage} (OpenCV unavailable{detail})"
+                    )
                     side_results[side] = {
-                        "state": "saved",
-                        "response": f"saved; OpenCV unavailable{detail}",
+                        "state": "saved_intrinsics_only" if timing_rejected else "saved",
+                        "response": (
+                            f"saved for intrinsics only; stereo rejected "
+                            f"({self.pair_timing_detail}); OpenCV unavailable{detail}"
+                            if timing_rejected
+                            else f"saved; OpenCV unavailable{detail}"
+                        ),
                         "path": str(path),
                         "checkerboard_found": None,
                     }
@@ -283,9 +276,7 @@ class CheckerboardCaptureWorker(QtCore.QObject):
                             "source": "calibration",
                             "phase": "side_result",
                             "side": side,
-                            "state": "saved",
-                            "response": f"saved; OpenCV unavailable{detail}",
-                            "path": str(path),
+                            **side_results[side],
                         }
                     )
                     continue
@@ -293,10 +284,19 @@ class CheckerboardCaptureWorker(QtCore.QObject):
                 encoded_bytes = path.read_bytes()
                 if detection.found:
                     saved_sides.append(side)
-                    status_parts.append(f"{side}=OK saved ({detection.corner_count})")
+                    usage = " for intrinsics only" if timing_rejected else ""
+                    status_parts.append(
+                        f"{side}=OK saved{usage} ({detection.corner_count})"
+                    )
                     side_results[side] = {
-                        "state": "saved",
-                        "response": f"checkerboard found; corners={detection.corner_count}",
+                        "state": "saved_intrinsics_only" if timing_rejected else "saved",
+                        "response": (
+                            f"checkerboard found; corners={detection.corner_count}; "
+                            f"saved for intrinsics only; stereo rejected "
+                            f"({self.pair_timing_detail})"
+                            if timing_rejected
+                            else f"checkerboard found; corners={detection.corner_count}"
+                        ),
                         "path": str(path),
                         "checkerboard_found": True,
                         "corner_count": detection.corner_count,
@@ -328,6 +328,19 @@ class CheckerboardCaptureWorker(QtCore.QObject):
                         **side_results[side],
                     }
                 )
+            stereo_pair_saved = self.pair_timing_ok and set(saved_sides) == {"left", "right"}
+            intrinsics_only_sides = (
+                () if stereo_pair_saved else tuple(saved_sides)
+            )
+            for side in intrinsics_only_sides:
+                detail = side_results.get(side)
+                if not isinstance(detail, dict) or detail.get("state") != "saved":
+                    continue
+                detail["state"] = "saved_intrinsics_only"
+                detail["response"] = (
+                    f"{detail.get('response', 'saved')}; saved for intrinsics only; "
+                    "stereo pair incomplete"
+                )
             if saved_sides:
                 metadata_dir = self.root / "capture_metadata"
                 metadata_dir.mkdir(parents=True, exist_ok=True)
@@ -336,7 +349,8 @@ class CheckerboardCaptureWorker(QtCore.QObject):
                     {
                         "capture_id": self.stem,
                         "saved_sides": saved_sides,
-                        "stereo_pair_saved": set(saved_sides) == {"left", "right"},
+                        "stereo_pair_saved": stereo_pair_saved,
+                        "intrinsics_only_sides": list(intrinsics_only_sides),
                     }
                 )
                 (metadata_dir / f"capture_{self.stem}.json").write_text(
@@ -354,6 +368,8 @@ class CheckerboardCaptureWorker(QtCore.QObject):
                     "pair_timing_ok": self.pair_timing_ok,
                     "pair_time_basis": self.pair_time_basis,
                     "pair_delta_s": self.pair_delta_s,
+                    "stereo_pair_saved": stereo_pair_saved,
+                    "intrinsics_only_sides": intrinsics_only_sides,
                     "calibration_timing_evidence": dict(self.timing_evidence),
                     "side_results": side_results,
                 }

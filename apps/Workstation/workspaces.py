@@ -50,6 +50,12 @@ from Workstation.workstation_core.calibration_selection import (
     portable_calibration_selection_paths,
     resolve_calibration_selection_paths,
 )
+from Workstation.workstation_core.calibration_timing import (
+    INTRINSICS_ONLY,
+    INVALID_METADATA,
+    LEGACY_UNVERIFIED,
+    load_calibration_pair_usage,
+)
 from Workstation.calibration_sessions import discover_calibration_sessions
 
 from .components import EngineeringValue, StatusIndicator, WorkspaceHeader
@@ -8723,8 +8729,9 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                 button = self._register_capture_button(command_id, label)
                 if command_id == "calibration.auto_capture":
                     button.setToolTip(
-                        "Capture only new left/right checkerboard detections whose "
-                        "RTCP/NTP timestamps differ by no more than Max Live pair Δt."
+                        "Capture each new left/right checkerboard detection. Pairs over "
+                        "Max Live pair Δt are retained per camera for K,D and excluded "
+                        "from stereo R,t."
                     )
             actions.addWidget(button, index // 4, index % 4)
             if command_id == "calibration.capture_images":
@@ -8737,8 +8744,10 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         pair_timing = QtWidgets.QHBoxLayout()
         pair_timing_label = QtWidgets.QLabel("Max Live pair Δt")
         pair_timing_label.setToolTip(
-            "Maximum absolute left/right RTCP/NTP exposure-time difference "
-            "accepted for a calibration stereo pair."
+            "Maximum absolute left/right timing difference accepted for a calibration "
+            "stereo pair. Live capture uses RTCP/NTP frame timestamps; FTP capture "
+            "uses the synchronized CPTR host-dispatch proxy and does not prove exposure "
+            "simultaneity. Captures over the limit remain available per camera for K,D only."
         )
         pair_max_delta = QtWidgets.QDoubleSpinBox()
         pair_max_delta.setObjectName("calibrationPairMaxDeltaMs")
@@ -8759,7 +8768,9 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         pair_timing.addWidget(pair_timing_label)
         pair_timing.addWidget(pair_max_delta)
         pair_timing.addWidget(
-            QtWidgets.QLabel("RTCP/NTP exposure timestamps · applies to manual and auto Live capture")
+            QtWidgets.QLabel(
+                "Live: RTCP/NTP frame time · FTP: CPTR dispatch proxy · manual/auto/FTP"
+            )
         )
         pair_timing.addStretch(1)
         layout.addLayout(pair_timing)
@@ -10537,21 +10548,36 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                 or (right_path is not None and str(right_path) in excluded_right)
                 or (left_key and left_key == right_key and left_key in excluded_pair_keys)
             )
+            pair_usage = (
+                load_calibration_pair_usage(
+                    root / "capture_metadata" / f"capture_{left_key}.json"
+                )
+                if left_key and left_key == right_key
+                else None
+            )
+            if is_excluded:
+                usage_state = "EXCLUDED"
+            elif pair_usage is not None and not pair_usage.stereo_eligible:
+                usage_state = (
+                    "INTRINSICS ONLY"
+                    if pair_usage.state == INTRINSICS_ONLY
+                    else "INVALID METADATA"
+                )
+            elif pair_usage is not None and pair_usage.state == LEGACY_UNVERIFIED:
+                usage_state = "matched · timing unverified"
+            elif left_path is not None and right_path is not None and left_key == right_key:
+                usage_state = "matched"
+            elif left_path is not None and right_path is not None:
+                usage_state = "same row"
+            else:
+                usage_state = "incomplete"
             values = (
                 str(index + 1),
                 left_path.name if left_path is not None else "--",
                 right_path.name if right_path is not None else "--",
                 self._calibration_file_info(left_path) if left_path is not None else "--",
                 self._calibration_file_info(right_path) if right_path is not None else "--",
-                "EXCLUDED"
-                if is_excluded
-                else "matched"
-                if left_path is not None
-                and right_path is not None
-                and left_key == right_key
-                else "same row"
-                if left_path is not None and right_path is not None
-                else "incomplete",
+                usage_state,
             )
             for column, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(value)
@@ -10562,11 +10588,18 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                     if column in {2, 4}
                     else None
                 )
-                item.setToolTip(
-                    self._calibration_file_tooltip(tooltip_path)
-                    if tooltip_path is not None
-                    else value
-                )
+                if tooltip_path is not None:
+                    tooltip = self._calibration_file_tooltip(tooltip_path)
+                elif column == 5 and pair_usage is not None:
+                    usage_contract = (
+                        "K,D input: allowed\nStereo R,t: excluded"
+                        if not pair_usage.stereo_eligible
+                        else "K,D input: allowed\nStereo R,t: allowed"
+                    )
+                    tooltip = f"{pair_usage.detail}\n{usage_contract}"
+                else:
+                    tooltip = value
+                item.setToolTip(tooltip)
                 table.setItem(index, column, item)
         table.resizeRowsToContents()
         if manual:
@@ -10797,6 +10830,7 @@ class CalibrationWorkspace(QtWidgets.QWidget):
             for key in keys:
                 origin = "manual"
                 metadata_path = metadata_dir / f"capture_{key}.json"
+                pair_usage = load_calibration_pair_usage(metadata_path)
                 if metadata_path.exists():
                     try:
                         metadata_payload = json.loads(
@@ -10816,20 +10850,45 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                 )
                 left_time = self._format_calibration_file_capture_time(left_ns, left_source)
                 right_time = self._format_calibration_file_capture_time(right_ns, right_source)
+                usage_suffix = (
+                    " · INTRINSICS ONLY"
+                    if pair_usage.state == INTRINSICS_ONLY
+                    else " · INVALID METADATA"
+                    if pair_usage.state == INVALID_METADATA
+                    else " · LEGACY TIMING UNVERIFIED"
+                    if pair_usage.state == LEGACY_UNVERIFIED
+                    else ""
+                )
                 item = QtWidgets.QListWidgetItem(
-                    f"{key} · {origin} · L {left_time} · R {right_time}"
+                    f"{key} · {origin}{usage_suffix} · L {left_time} · R {right_time}"
+                )
+                usage_contract = (
+                    "K,D input: allowed\nStereo R,t: excluded"
+                    if not pair_usage.stereo_eligible
+                    else "K,D input: allowed\nStereo R,t: allowed"
                 )
                 item.setToolTip(
                     "Left\n"
                     + self._calibration_file_tooltip(left_path)
                     + "\n\nRight\n"
                     + self._calibration_file_tooltip(right_path)
+                    + f"\n\nPair usage\n{pair_usage.detail}\n{usage_contract}"
                 )
                 item.setData(QtCore.Qt.UserRole, key)
-                item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
-                item.setCheckState(
-                    QtCore.Qt.Checked if not included or key in included else QtCore.Qt.Unchecked
-                )
+                if pair_usage.stereo_eligible:
+                    item.setFlags(
+                        item.flags()
+                        | QtCore.Qt.ItemIsUserCheckable
+                        | QtCore.Qt.ItemIsEnabled
+                    )
+                    item.setCheckState(
+                        QtCore.Qt.Checked
+                        if not included or key in included
+                        else QtCore.Qt.Unchecked
+                    )
+                else:
+                    item.setCheckState(QtCore.Qt.Unchecked)
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemIsUserCheckable)
                 picker.addItem(item)
                 self._calibration_pair_picker_items[key] = item
                 thumbnail_paths.append((key, left_path))

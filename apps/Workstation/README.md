@@ -148,8 +148,10 @@ source values, and their PX4 FRD/NED, GNSS NED, candidate virtual-FRD/NED, or Op
 remain in Measurement/Alignment projections and persisted pair evidence.
 
 For checkerboard calibration, select the calibration zoom, command both cameras to that
-zoom, confirm the actual zoom readback, capture synchronized pairs, and calculate/save the
-required intrinsics or stereo `R,t` profile. At measurement time, load the `K,D` profile for
+zoom, confirm the actual zoom readback, and capture checkerboard observations. A capture over
+`Max Live pair Δt` is retained per camera for independent `K,D` but is never passed to stereo
+`R,t`; timing-eligible captures remain stereo candidates. Calculate and save the required
+intrinsics or stereo `R,t` profile. At measurement time, load the `K,D` profile for
 the intended operating zoom and independently load the chosen `R,t` profile, then apply the
 bundle. This primary workflow uses independent K,D and R,t candidates. The Advanced validation
 action `Apply result` is narrower: in Checkerboard mode it applies that full result's own embedded
@@ -673,14 +675,18 @@ python3 tools/check_portable_paths.py
   zoom, source-intrinsics provenance, pair count, and reprojection error.
 - The transform contract is
   `X_right = R_left_to_right X_left + T_left_to_right_m` in OpenCV optical RDF frames.
-- Calibration images are synchronized left/right checkerboard pairs under the active calibration
-  root. Before `Create Session Folder`, the configured reusable root is used directly. While a Session is
+- Calibration images are per-camera checkerboard observations grouped by capture ID under the
+  active calibration root. Timing-eligible matching observations form stereo pairs; an over-limit
+  capture remains in the independent left/right `K,D` inputs with `stereo_pair_saved=false` and
+  `intrinsics_only_sides`, and is excluded from `R,t`. Before `Create Session Folder`, the configured
+  reusable root is used directly. While a Session is
   open, manual/FTP runs use `<session-id>/calibration/<timestamp>`, while Auto capture uses that
   run's `calib_capture/AutoCapture` child. JSON profile paths are selected independently in the
   Calibration UI. `calibration_pair_selection.json` v2 stores only Photo-set-relative paths;
   unresolved legacy paths block calculation and are never replaced by an all-photo fallback.
 - Each capture metadata record identifies the exact source frame, source/native dimensions,
-  preview dimensions, saved dimensions, crop/scale contract, overlay state, and SHA-256. A live
+  preview dimensions, saved dimensions, crop/scale contract, overlay state, SHA-256, timing gate,
+  `stereo_pair_saved`, and `intrinsics_only_sides`. A live
   CameraPane capture fails closed when a fresh native frame cannot be matched. Preview fallback is
   disabled by default and exists only behind an explicit compatibility flag for lightweight tests.
 - Calibration photo-time display reads `left_rtcp_frame_ntp_unix_s` and
@@ -809,11 +815,17 @@ python3 tools/check_portable_paths.py
 - `Capture Live Pair` selects the newest decoded native left/right frames from the live RTSP
   pipelines. It preserves RTP/RTCP timing metadata when available but does not capture raw RTP
   packets. Camera-native `CPTR` stills remain separate `Capture HR Still`/`Capture OZ Still`
-  actions, with `(FTP)` appended only when the still is downloaded immediately.
+  actions, with `(FTP)` appended only when the still is downloaded immediately. Manual, Auto,
+  and FTP captures over `Max Live pair Δt` still save every side whose checkerboard validation
+  succeeds, mark those files `INTRINSICS ONLY`, and exclude them from stereo `R,t`. Auto capture
+  consumes each new frame identity once and counts only timing-eligible two-sided captures as
+  valid stereo pairs. Calibration session/manifest `pair_count` uses the same R,t-eligibility
+  rule; K,D-only files remain visible in the selected Photo set without inflating that count.
 - FTP calibration pairing never borrows the current RTSP preview clock. Both cameras must report
   the same capture ID, the synchronized-CPTR-dispatch contract, and per-camera dispatch timestamps;
   the absolute dispatch delta must satisfy the configured pair gate. These host timestamps prove
-  trigger proximity only. Metadata continues to mark the camera exposure time as unknown.
+  trigger proximity only. Metadata continues to mark the camera exposure time as unknown. An FTP
+  capture outside the dispatch gate is retained for per-camera `K,D` only.
 - `Sessions > Current > Create Session Folder` has no device, synchronization, Calibration,
   Methods, or Alignment readiness gate. It only allocates the parent and is constrained by lifecycle
   conflicts such as an already-open parent, active measurement/recording work, or an unfinished
@@ -946,9 +958,11 @@ python3 tools/check_portable_paths.py
 
 - Intrinsics are solved independently from the selected left and right image sets. Stereo `R,t`
   uses only timestamp pairs whose left and right observations both survived detection and
-  near-duplicate-pose filtering; excluding one side does not silently exclude the other side's
-  intrinsic observation. The configured calculation-pair limit is applied once, after this
-  usable stereo intersection is formed.
+  near-duplicate-pose filtering and whose capture metadata does not explicitly reject stereo
+  persistence. Excluding a pair for timing or excluding one side does not silently exclude either
+  surviving intrinsic observation. A manual selection cannot promote an explicit timing rejection
+  back into `R,t`. The configured calculation-pair limit is applied once, after this usable stereo
+  intersection is formed.
 - The visible Photo set is the calculation root. Setup sends the same value to the owner validation
   root before Run. Sidecar v2 paths are root-relative; a legacy path is accepted only after bounded
   rebase beneath the current root. Any unresolved selected or excluded path blocks calculation and
@@ -1166,6 +1180,12 @@ select an existing profile whose metadata declares the same zoom. Disabling `aut
 only suppresses startup loading; it does not make measurement geometry ready. Never rename a
 different-zoom profile to satisfy the filename convention.
 
+Older/imported calibration metadata without timing-decision fields remains a
+`LEGACY_UNVERIFIED` stereo candidate for compatibility; this is not proof of synchronized exposure.
+An explicit `stereo_pair_saved=false` or `pair_persistence_allowed=false` always wins and keeps the
+matching images K,D-only. Malformed capture metadata is not silently promoted and the existing
+zoom/evidence gate blocks calculation until it is repaired.
+
 `review.xlsx` intentionally contains operator-sized summaries rather than every high-rate camera,
 Pixhawk, or GNSS sample. Use typed Parquet for high-rate analysis, canonical `row_json` replay, and
 `data/raw/method_results/*.jsonl` for complete per-method outcomes. Parquet readers must preserve
@@ -1345,6 +1365,13 @@ live on the panel at solve time -- a later live-GPS change cannot silently retar
 frozen Mountain image.
 
 ## Change Log
+
+- 2026-08-24: Preserved timing-rejected manual, Auto, and FTP checkerboard captures as independent
+  per-camera K,D observations. Capture metadata and UI now identify `INTRINSICS ONLY` files, Auto
+  retains each new pose without increasing its valid-stereo counter, and both full calibration and
+  `R,t only` filter explicit timing rejections after automatic or manual selection. Legacy photo
+  sets without timing-decision fields remain compatible as `LEGACY_UNVERIFIED`. Full Workstation
+  suite: `1134 passed, 1 skipped`.
 
 - 2026-08-24: Hardened Workstation runtime isolation and shutdown across Qt, Pixhawk/GNSS, WIRIS,
   camera children, Measurement evaluators, and evidence storage. Added a non-aborting Qt exception

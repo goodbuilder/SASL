@@ -194,20 +194,31 @@ rig transform이 유지됨을 증명하지 않으므로 실제 사용할 조합�
 SHA-256, RTCP/NTP timestamp/delta와 detection 결과가 기록된다. resized preview를 calibration
 원본으로 쓰지 않는다.
 
+수동 Live, Auto와 FTP 촬영 모두 `Max Live pair Δt`를 적용한다. Live는 각 native frame에 결합된
+RTCP/NTP 시각을 사용하고, FTP는 실제 노출 시각이 아닌 synchronized CPTR host-dispatch proxy를
+사용한다. 제한을 초과해도 체커보드가 검출된 각 side 이미지는 `K,D`용으로 저장하며 metadata의
+`stereo_pair_saved=false`, `intrinsics_only_sides`와 timing 거부 사유를 기록한다. Auto는 같은 새
+frame identity를 한 번만 저장하고, 이 이미지를 카메라별 pose novelty 이력에는 포함하지만 유효
+stereo pair 수에는 포함하지 않는다.
+
 ### 7.4 이미지 선택과 계산
 
 1. Calibration 공통 입력 영역에서 calibration run을 선택한다.
 2. 좌·우 사진과 표시된 촬영 시각의 출처를 확인한다.
 3. `Intrinsics > Compute`에서 좌·우 이미지 집합을 각각 계산한다.
-4. Stereo에는 같은 capture ID이며 양쪽 detection, 동기화와 near-duplicate filter를 통과한
-   pair만 사용한다.
+4. Stereo에는 같은 capture ID이며 양쪽 detection, timing gate와 near-duplicate filter를 통과한
+   pair만 사용한다. `INTRINSICS ONLY` 표시는 좌·우 `K,D` 입력에는 남지만 `R,t`에서는 제외됨을
+   뜻한다.
 5. `K,D`, calibrated raster, `R,t`, reprojection/view error, effective pose, 3×3 coverage,
    scale/perspective 다양성, uncertainty와 subset 안정성을 확인한다.
 
 한쪽 detection이 실패한 사진은 성공한 쪽 intrinsics에는 남을 수 있지만 stereo 교집합에는
-들어가지 않는다. Stereo 계산에는 최소 3 pair가 필요하지만 정밀한 결과에는 충분히 다양한
-pose가 필요하다. Random stereo-pair validation은 seeded subset으로 focal, baseline과 rotation의
-안정성을 검사하며 ground truth가 아니다.
+들어가지 않는다. Δt 초과 사진도 같은 방식으로 각 카메라 intrinsics에는 남지만, 명시적 timing
+거부는 수동 selection으로도 stereo에 다시 포함할 수 없다. Timing 판정 필드가 없는 기존/import
+사진은 호환을 위해 `LEGACY_UNVERIFIED` stereo 후보로 유지되며 동시 노출 증거로 해석하지 않는다.
+Stereo 계산에는 최소 3 pair가 필요하지만 정밀한 결과에는 충분히 다양한 pose가 필요하다. Random
+stereo-pair validation은 seeded subset으로 focal, baseline과 rotation의 안정성을 검사하며 ground
+truth가 아니다.
 
 `calibration_pair_selection.json`이 없으면 자동 선택 정책을 사용한다. 파일이 존재하면 지원되는
 v1/v2 schema와 경로·pair identity를 모두 검증한다. JSON 손상, unknown schema, 복구 불가능한

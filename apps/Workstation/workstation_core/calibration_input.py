@@ -291,8 +291,16 @@ def build_calibration_input_snapshot(
         for path in zoom_paths
         if path.is_file()
     )
+    stereo_metadata_paths: list[Path] = []
+    for key, left_path, right_path in stereo_pairs:
+        left_key = Path(left_path).stem.removeprefix("left_")
+        right_key = Path(right_path).stem.removeprefix("right_")
+        capture_key = left_key if left_key and left_key == right_key else str(key)
+        stereo_metadata_paths.append(
+            resolved_root / "capture_metadata" / f"capture_{capture_key}.json"
+        )
     timing_rows: list[dict[str, object]] = []
-    for path in zoom_paths:
+    for path in stereo_metadata_paths:
         if not path.is_file():
             continue
         try:
@@ -322,7 +330,7 @@ def build_calibration_input_snapshot(
     timing_classes = tuple(
         sorted({str(row.get("evidence_class") or "UNKNOWN") for row in timing_rows})
     )
-    expected_timing_rows = len({key for key, _left, _right in stereo_pairs})
+    expected_timing_rows = len(stereo_pairs)
     precision_timing_qualified = bool(
         mode == "checkerboard"
         and expected_timing_rows > 0

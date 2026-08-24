@@ -2910,7 +2910,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.calibration_pair_max_delta_spin.setSuffix(" ms")
         self.calibration_pair_max_delta_spin.setToolTip(
             "좌·우 원본 frame의 RTCP/NTP 촬영 시각 차이가 이 값 이하인 pair만 "
-            "calibration stereo pair로 저장합니다."
+            "calibration stereo R,t에 사용합니다. 초과 이미지는 카메라별 K,D용으로 저장합니다."
         )
         self.calibration_auto_interval_spin = QtWidgets.QDoubleSpinBox()
         self.calibration_auto_interval_spin.setRange(0.1, 10.0)
@@ -3774,9 +3774,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             ),
             self.calib_dir_edit: "보정 이미지와 intrinsics.json / intrinsics_zoom_##.json을 저장/로드할 디렉터리입니다.",
             self.capture_calibration_button: "현재 좌/우 카메라 프레임 중 체커보드가 검출된 쪽만 내부 파라미터 보정 이미지로 저장합니다.",
-            self.calibration_pair_max_delta_spin: "좌·우 Live 원본 frame의 RTCP/NTP 촬영 시각 차이 허용치입니다. 수동/자동 Live pair에 모두 적용됩니다.",
-            self.calibration_auto_interval_spin: "자동 촬영 시도 간격입니다. 보드 검출·좌우 시각 동기·중복 검사를 통과한 pair만 저장합니다.",
-            self.capture_calibration_auto_button: "좌·우 모두 체커보드가 검출되고 RTCP/NTP 시각 차이가 설정된 최대 pair Δt 이하인 pair를 Stop할 때까지 자동으로 저장합니다.",
+            self.calibration_pair_max_delta_spin: "좌·우 timing 차이 허용치입니다. Live는 RTCP/NTP frame 시각, FTP는 노출 시각이 아닌 CPTR host-dispatch proxy를 사용하며 초과 이미지는 K,D용으로만 저장됩니다.",
+            self.calibration_auto_interval_spin: "자동 촬영 시도 간격입니다. 새 보드 pose는 저장하고, 좌우 시각 차이 초과분은 K,D용으로만 분류합니다.",
+            self.capture_calibration_auto_button: "좌·우 모두 체커보드가 검출된 새 pose를 Stop할 때까지 저장합니다. 최대 pair Δt 초과분은 K,D용이며 stereo R,t에서는 제외됩니다.",
             self.run_calibration_button: "캡처된 체커보드 이미지로 OpenCV 내부 파라미터 보정을 실행합니다.",
             self.calibration_progress_bar: "내부 파라미터 및 stereo 계산에서 실제 검사한 이미지/pair 기준 진행률입니다.",
             self.save_intrinsics_button: "촬영 당시 양쪽 카메라 GZVV readback으로 확인된 줌 레벨의 내부 파라미터를 intrinsics_zoom_##.json으로 저장하고 latest alias intrinsics.json도 갱신합니다.",
