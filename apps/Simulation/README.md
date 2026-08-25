@@ -34,93 +34,110 @@ the target.
 
 ## PX4 Auto attitude calibration sweep
 
+### Purpose
+
 `run_auto.sh` remains the normal forward-only, FOV-guarded mission. It does
 not create CSV or MP4 files by itself; an operator starts those recordings
 from rqt with `Save CSV` or `Save MP4`.
 
-For repeatable calibration data, use
-`./run_auto_attitude_sweep.sh -- --quick` only as a smoke test, or omit
-`--quick` for the normal mission. The runner always includes a zero-degree
-baseline, then restarts the complete Gazebo/PX4/operator stack for each
-right-camera optical-RDF case. The default axes are `roll,pitch,yaw,combined`;
-`combined` applies the same angle to roll, pitch, and yaw simultaneously in one
-case so coupled multi-axis error is sampled too, not only one-factor-at-a-time.
-The default values are `-1.0` to `1.0` degrees in `0.1` steps (0 excluded, it is
-the baseline). `--repetitions N` repeats each non-zero case. Every
-baseline-before/condition pair cycles one shared entry from `--altitudes-m`
-(default `20,30,40`) and one from `--lateral-biases-m` (default `-5,0,5`, a
-constant lateral offset the approach controller holds the target away from
-image-center) by condition index, so elevation-angle and off-boresight
-geometry are sampled across the campaign without multiplying it by a full
-cross-product. The baseline and its paired condition always share the same
-altitude/lateral-bias draw, so their difference isolates the attitude-only
-effect instead of also confounding a geometry change; passing an explicit
-`--altitude-m`/`--lateral-bias-m` after `--` opts a run out of that per-case
-cycling. On top of the per-case lateral bias, every case also runs a
-continuous triangle-wave lateral sweep (`--lateral-sweep-amplitude-m`,
-default `10`, period `--lateral-sweep-period-s`, default `24`) during its
-approach, so a single flight actively samples a range of off-boresight
-offsets within the safe-FOV margin instead of holding one fixed value; the
-safe-FOV guard is unchanged and still freezes all motion if a bbox nears the
-margin. With the full default grid the sweep runs 161 cases (80 non-zero
-attitude conditions x2 baselines, plus 1); narrow `--axes`/`--values-deg` for a
-shorter campaign. The non-zero conditions are randomized by default using a
-recorded seed; a 0-degree baseline is run before each condition and once after
-the final condition. Use `--ordered` to disable randomization. RViz and
-`rqt_gui` stay visible for every case (no `--headless`), so a full default
-sweep keeps a display busy for its whole duration. Every case writes its own
-`operator.log`, readiness/Auto logs, case contract, S2 `pair_records.csv`, and
-an `operator-recording/` full session under `apps/Simulation/recordings/` by
-default (or a user-specified output directory). The case directory also
-contains `effective_config.json`. Its canonical payload records the actual
-right-camera optical-RDF perturbation, observation mode, camera rate,
-coordinate/quaternion contracts, Gazebo reference link, the per-case
-`geometry_altitude_m`/`geometry_lateral_bias_m`/`geometry_lateral_sweep_amplitude_m`/
-`geometry_lateral_sweep_period_s`, output paths, and repository
-provenance. Its `effective_config_sha256` is copied to
-`run_metadata.json`, the sweep manifest, and every S2 pair row. `session_id`
-identifies one sweep and `attempt_id` identifies one case execution. The
-full session waits for the first valid left/right bbox pair, then writes
-telemetry CSV and left/right overlay MP4 from that detection onward. The parent
-`sweep_manifest.tsv`
-records execution order and pass/fail status.
-An individual case passes only when PX4 readiness and Auto exit successfully
-and the research recording has `RUN_FINALIZED_VALID`, `run_valid=true`, and
-`pair_records.csv`; otherwise it is marked FAIL even if the flight itself
-completed.
+### Current run flow
+
+The current deterministic campaign is launched with
+`./run_auto_attitude_sweep.sh --ordered --keep-going`. It runs two shared
+trajectories (`center`, `zigzag`). Each trajectory has one zero-error baseline
+and nine right-camera optical-RDF OFAT cases: roll, pitch, and yaw offsets
+`0.2,0.5,1.0` degrees. The default campaign therefore has exactly 20 cases.
+RViz and `rqt_gui` remain visible; the Gazebo 3D GUI is not opened.
+
+### Inputs, outputs, and interfaces
+
+Mission points use baseline-center world-aligned RFU (Right, Front, Up), not
+the pitched `baseline_center_frd` measurement frame. The eight configured RFU
+points are preserved in input order even after they leave the camera FOV. The
+center path retains their configured Right value. The zigzag path alternates
+sign and uses 40% of each point's nominal horizontal stereo-overlap half-width,
+so lateral movement tapers to zero when the 25 m baseline has no 8x overlap.
+The generator records the source RFU, World ENU, PX4 local-NED conversion,
+predicted pixels, overlap width, and nominal visibility in each waypoint CSV.
+
+### Operational rules
+
+Every case uses the camera-independent PX4 waypoint follower and stops for five
+seconds at every configured point. The sweep default is
+`SWEEP_GUIDANCE_MODE=velocity_only`: transit commands activate only local-NED
+velocity, while required holds switch to position-only. This prevents a
+distant final position from driving PX4's position P-controller to its global
+12 m/s horizontal and 5 m/s vertical limits. The diagnostic legacy modes
+`position_velocity_final_target` and `position_only_final_target` remain
+available through `--guidance-mode`, but are not the campaign default.
+
+`waypoint_stability.jsonl` records transit/reached/hold/analysis boundaries.
+Each hold's last three seconds is tagged
+`waypoint_###_hold_analysis` in the authoritative pair records and must have
+3D position-error p95 at most 1 m and absolute roll/pitch at most 15 degrees.
+`guidance_trace.jsonl` independently records every active setpoint field,
+MAVLink type mask, navigation target, velocity command, and PX4 local-position
+readback. The first valid dual-camera observation must occur at world-aligned
+Front >= 400 m.
+
+The primary per-waypoint attitude-error metric is
+`nominal_pose_range_m - gt_range_m`. Case validation reports signed/absolute
+error distributions for each hold. Sweep validation subtracts the matching
+trajectory baseline median and writes both `sweep_validation.json` and the
+flat `waypoint_attitude_distance_errors.csv`. Every configured waypoint must
+contain a finite nominal-pose/GT analysis sample. A point outside either
+camera is therefore a failed measurement waypoint even when the PX4 mission
+reaches and holds it successfully.
+
+The Full operator recorder starts immediately by default for this sweep, so
+telemetry and `left_overlay.mp4`/`right_overlay.mp4` include startup and the
+whole flight rather than beginning at the first bbox. Case validation requires
+both videos to be non-empty and decodable by `ffprobe`, the operator progress
+state to be finalized, the strict waypoint events to pass, and the research
+recorder to produce `RUN_FINALIZED_VALID`, `run_valid=true`, and non-empty
+`pair_records.csv`. `effective_config.json` and `sweep_manifest.tsv` bind each
+case to the source target-model SDF SHA-256 and a separate protected-geometry
+hash; all accepted campaign cases must use one SDF hash.
+
+Use `--plan-only --output-dir /tmp/<new-dir>` before flight to generate both
+paths and confirm `trajectories=2`, `conditions=9`, and `cases=20` without
+starting ROS, Gazebo, or PX4.
 
 ### Sweep environment variables
 
 The defaults are stored in `config/simulation.env`. An explicitly exported
 environment variable overrides that file, and a CLI option overrides both.
 
-- `SWEEP_AXES`: attitude axes to test, such as `roll,pitch,yaw,combined`.
-  `combined` perturbs roll, pitch, and yaw together in one case.
+- `SWEEP_AXES`: attitude axes to test. The campaign default is
+  `roll,pitch,yaw`.
 - `SWEEP_VALUES_DEG`: comma-separated optical-RDF angle values in degrees,
   such as `-1,0,1`. Zero is the baseline and is not used as a perturbation.
 - `SWEEP_REPETITIONS`: number of repetitions for each non-zero axis/value
   condition.
-- `SWEEP_ALTITUDES_M`: comma-separated takeoff altitudes (m), one shared per
-  baseline-before/condition pair, for elevation-angle diversity.
-  `--altitudes-m` is the CLI equivalent.
-- `SWEEP_LATERAL_BIASES_M`: comma-separated constant lateral offsets (m), one
-  shared per baseline-before/condition pair, so the target sits off
-  image-center for some pairs. `--lateral-biases-m` is the CLI equivalent.
-- `SWEEP_LATERAL_SWEEP_AMPLITUDE_M`/`SWEEP_LATERAL_SWEEP_PERIOD_S`: amplitude
-  (m) and period (s) of a continuous triangle-wave lateral sweep every case
-  runs during its approach, on top of the lateral bias above. `0` amplitude
-  disables it. `--lateral-sweep-amplitude-m`/`--lateral-sweep-period-s` are
-  the CLI equivalents.
+- `SWEEP_TRAJECTORIES`: comma-separated `center,zigzag` path set.
+- `SWEEP_WAYPOINTS_RFU_M`: semicolon-separated world-aligned
+  `right,front,up` points relative to the baseline center.
+- `SWEEP_ZIGZAG_OVERLAP_RATIO`: fraction of the nominal horizontal
+  stereo-overlap half-width used as zigzag amplitude; default `0.40`.
+- `SWEEP_PIXEL_MARGIN_PX`: image-edge margin used for nominal overlap and
+  visibility diagnostics.
+- `SWEEP_ENTRY_MIN_WORLD_FRONT_M`: minimum world-aligned Front at the first
+  valid dual observation.
+- `SWEEP_RECORD_WAIT_FOR_BBOX`: `false` starts Full CSV/MP4 recording
+  immediately; `true` retains the legacy first-bbox gate.
+- `SWEEP_STABILITY_WINDOW_S`, `SWEEP_STABILITY_POSITION_P95_MAX_M`, and
+  `SWEEP_STABILITY_ATTITUDE_MAX_DEG`: waypoint hold evidence window and strict
+  position/attitude limits.
+- `SWEEP_GUIDANCE_MODE`: transit setpoint contract. The accepted default is
+  `velocity_only`; the final waypoint position remains inactive until hold.
 - `SWEEP_OUTPUT_DIR`: directory for logs, manifests, contracts, and research
   recordings. The default is `apps/Simulation/recordings/`; repository paths other
   than that directory are rejected.
 - `SWEEP_WAIT_S`: maximum seconds to wait for PX4 readiness per case.
 - `SWEEP_CAMERA_UPDATE_RATE_HZ`: camera and measurement sampling rate used
-  only by the strict S2 sweep. Default `2.0` keeps accepted pair production
-  below the measured YOLO processing capacity, so every accepted row can be
-  finalized without queue overrun. It does not change normal operator runs.
-- `SWEEP_YOLO_TARGET_HZ`: YOLO processing target used only by the sweep.
-  Default `2.0` matches the sweep camera rate.
+  only by the strict sweep. The current campaign requests `20.0` Hz.
+- `SWEEP_YOLO_TARGET_HZ`: YOLO processing target used only by the sweep. The
+  current campaign requests `20.0` Hz on the isolated CUDA runtime.
 - `SWEEP_SEED`: randomization seed. Empty uses the current epoch seconds; set
   it to reproduce the same condition order.
 - `SWEEP_RANDOMIZE`: `true` randomizes conditions; `false` preserves the
@@ -137,19 +154,22 @@ environment variable overrides that file, and a CLI option overrides both.
 
 When Auto finishes, Stop waits for both the standalone operator recorder and
 the S2 research recorder in the ROS launch tree to finalize before escalating
-cleanup. A valid case therefore requires the final research marker, not only
-the flight's `Landed` message.
+cleanup. Long velocity-limited runs can exceed 9,000 telemetry rows, so the
+standalone recorder gets up to 180 seconds to finish MP4/XLSX and publish
+`progress.json` state `finalized`. A valid case therefore requires finalized
+operator evidence and the final research marker, not only mission completion.
 
 `PX4_DIR` selects the PX4 checkout and `SIM_CONFIG` selects the configuration
-file. Per-flight values such as `--quick`, `--target-distance-m`, and
-`--speed-mps` remain CLI arguments after `--` because they commonly change per
-experiment.
+file. Per-flight mission options such as `--speed-mps`, `--ramp-s`, and
+`--vertical-ramp-s` remain CLI arguments after `--` because they commonly
+change per experiment. Sweep-level guidance is selected with
+`--guidance-mode` before `--`.
 
 The research recorder is intentionally enabled only by this explicit sweep;
 it is not a change to normal rqt recording semantics. Each pair row preserves
-`mission_phase` (`preflight`, `takeoff`, `hover_before_approach`, `approach`,
-`hover_after_approach`, `landing`, or `complete`) when the Auto mission phase
-topic is available. It also preserves the UAM raw-GPS reference status, its
+`mission_phase`, including `waypoint_###_transit`,
+`waypoint_###_hold_settle`, and `waypoint_###_hold_analysis`, when the mission
+phase topic is available. It also preserves the UAM raw-GPS reference status, its
 public Forward/Right/Down result, World-ENU point, GPS ages, GPS-pair skew, and
 Eph values. These are reference inputs for later analysis, not a fitted
 calibration result. Rows may include startup samples, so downstream analysis
@@ -164,6 +184,51 @@ correction must use Operational Ray and UAM raw GPS reference, not GT.
 Because the actual camera pose is generated in the Gazebo world at launch and
 the geometry parameters are immutable during a run, changing a ROS parameter
 inside one Auto flight would not create a valid physical attitude sweep.
+
+### Waypoint attitude-distance smoke
+
+Use one waypoint list for the baseline and every optical attitude case. The
+following bounded smoke uses the six currently dual-visible center points,
+the solved velocity-only guidance, and one right-camera pitch perturbation:
+
+```bash
+SWEEP_MIN_OVERLAY_HZ=10 ./run_auto_attitude_sweep.sh \
+  --axes pitch --values-deg 0.2 --repetitions 1 \
+  --trajectories center --waypoint-count 6 \
+  --waypoints-rfu-m '0,415,154;0,365,137;0,315,121;0,265,104;0,215,88;0,165,71' \
+  --ordered --guidance-mode velocity_only \
+  --camera-hz 20 --yolo-hz 20 --overlay-hz 20 \
+  --output-dir recordings/<new-smoke-dir> \
+  -- --ramp-s 1.0 --vertical-ramp-s 2.5
+```
+
+`SWEEP_MIN_OVERLAY_HZ=10` is a diagnostic-only gate for the currently observed
+unique camera-source rate; it does not satisfy the final 15 Hz campaign gate.
+Read `waypoint_attitude_distance_errors.csv` for one row per case/waypoint.
+`attitude_induced_error_delta_m` is the case signed-error median minus its
+trajectory baseline signed-error median.
+
+### Known limitations and workarounds
+
+The current eight-point default has no finite dual-camera nominal-pose samples
+at its last two holds; the six-point smoke above is the accepted bounded
+workaround until the final all-visible waypoint set is chosen. The observed
+unique camera-source rate is also about 11--13 Hz under 20 Hz requests, so the
+diagnostic 10 Hz overlay gate must not be presented as final 15 Hz evidence.
+Neither limitation changes the confirmed velocity-only guidance result.
+
+### Target SDF stability and protected size
+
+Tune `stereo_ground_sim/models/x500_2m/model.sdf` only after a center-baseline
+smoke demonstrates unstable waypoint tracking. Allowed dynamics are mass,
+inertia, motor time constants and velocity, thrust/moment constants, rotor
+drag, rolling moment, and rotor slowdown. Mesh scale, all visual/collision
+dimensions, rotor/link/joint poses and arm lengths, model identifiers, and the
+`vehicle_reference_link` contract are protected. `scripts/sdf_contract.py`
+computes both the full SDF hash and the protected-geometry hash. Edit the source
+SDF and rebuild; never patch the generated install copy. If the full SDF changes
+after an accepted case, retain that evidence but start a new campaign instead
+of mixing hashes.
 
 ## Atomic pair-level research recording (S2-R2)
 
@@ -6194,6 +6259,13 @@ WAYPOINT_RECORD_FULL=true
 ./run_px4_waypoint_mission.sh
 ```
 
+일반 waypoint runner의 호환 기본은 기존 final-position 방식이지만, 자세
+sweep는 `SWEEP_GUIDANCE_MODE=velocity_only`를 명시적으로 전달합니다.
+`--guidance-mode velocity_only`에서는 이동 중 position 필드를 무시하고
+`--speed-mps` 크기의 local-NED velocity만 보내며, waypoint 도착 후에는
+position-only hold로 전환합니다. `--event-log`는 hold 경계를,
+`--guidance-log`는 전송 type-mask와 PX4 readback을 JSONL로 기록합니다.
+
 이 명령은 기본적으로 lite CSV도 함께 저장합니다. 저장 위치는 `Recordings/waypoint_YYYYmmdd_HHMMSS_lite`이고, `telemetry.csv`에는 실제 Forward/Right/Down/GroundTruth, 스테레오 3D 추정값, 거리/오차/YOLO bbox/confidence 같은 수치 로그가 기록됩니다. 저장 위치를 바꾸거나 끄려면:
 
 ```bash
@@ -6674,12 +6746,27 @@ python3 apps/Simulation/scripts/check_non_alias_selector_deployment_readiness.py
   `/stereo/respawn_drone` Trigger service를 호출해 Gazebo target model을
   launch-time `target_spawn_x/y/z/yaw` pose로 되돌립니다. 이는 Gazebo 모델
   재배치 기능이며 PX4 estimator 재부팅까지 수행하지는 않습니다.
+- 2026-08-25: 20-case attitude sweep을 baseline-center world RFU 필수
+  waypoint, overlap-scaled zigzag, strict hold stability, 즉시 Full MP4,
+  first-dual-observation Front gate, target SDF/protected-geometry hash로
+  고정했습니다.
+- 2026-08-26: waypoint transit의 먼 final-position P항이 PX4를 수평/수직
+  `12/5 m/s` 한계로 포화시키는 원인을 E01 ramp-only와 E02 position-only
+  negative control로 분리했습니다. `velocity_only`에서 실측 수평 p95
+  `1.95~1.97 m/s`, 구간 이탈 `0.14~0.24 m`를 확인해 sweep 기본으로
+  승격했습니다. 각 hold의 `nominal_pose_range_m - gt_range_m`와 baseline
+  차이를 `waypoint_attitude_distance_errors.csv`로 내보내며, 긴 recording
+  종료는 `progress.json=finalized`까지 최대 180초 기다립니다. Launcher는
+  세 PX4 instance 시작 readiness를 확인한 뒤 lifecycle `wait -n`으로 진입합니다. 검증 artifact는
+  `recordings/vertical-solved-attitude-smoke-20260826_attempt01`의 center
+  baseline/pitch 0.2° 2-case PASS입니다.
 ### Sweep runtime workaround
 
 `run_auto_attitude_sweep.sh` keeps rqt/RViz and the optional
 `detection_overlay_node` enabled so the full operator recorder writes its
-required left/right MP4 artifacts. The strict sweep's default 2 Hz camera/YOLO
-sampling bounds overlay load; normal operator rates remain unchanged. YOLO
+required left/right MP4 artifacts. The strict campaign requests 20 Hz
+camera/YOLO/overlay rates on the fail-closed CUDA runtime; normal operator
+rates remain independently configurable. YOLO
 detection, the operator recorder's CSV/MP4 outputs, and the research recorder's
 Gazebo GT/UAM GPS/Operational Ray records remain enabled. During Stop/Auto completion, the operator waits up to
 180 seconds for `RUN_FINALIZED_VALID`; it sends the research node `SIGINT`

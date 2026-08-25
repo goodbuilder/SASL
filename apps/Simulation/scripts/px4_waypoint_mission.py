@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import json
 import math
 import sys
 import time
@@ -9,6 +10,7 @@ from pathlib import Path
 from pymavlink import mavutil
 
 from px4_auto_mission import (
+    ActualDistanceMonitor,
     GcsHeartbeat,
     arm,
     command_long,
@@ -23,6 +25,16 @@ from px4_auto_mission import (
     wait_heartbeat,
     wait_landed,
     wait_local_position,
+)
+
+
+STABILITY_SCHEMA_VERSION = "px4_waypoint_stability_v2"
+GUIDANCE_SCHEMA_VERSION = "px4_waypoint_guidance_v1"
+DEFAULT_GUIDANCE_MODE = "position_velocity_final_target"
+GUIDANCE_MODES = (
+    "position_velocity_final_target",
+    "position_only_final_target",
+    "velocity_only",
 )
 
 
@@ -122,6 +134,19 @@ def build_parser():
     )
     parser.add_argument("--path-file", help="Read waypoints from CSV/text file.")
     parser.add_argument("--speed-mps", type=positive_float, default=12.0)
+    parser.add_argument(
+        "--guidance-mode",
+        choices=GUIDANCE_MODES,
+        default=DEFAULT_GUIDANCE_MODE,
+        help=(
+            "Transit setpoint contract. position_velocity_final_target sends "
+            "the final position plus velocity feed-forward; "
+            "position_only_final_target removes only that feed-forward for a "
+            "controlled diagnostic comparison; velocity_only ignores the far "
+            "final position during transit and sends only the pure-pursuit "
+            "local-NED velocity."
+        ),
+    )
     parser.add_argument(
         "--mpc-z-vel-max-up-mps",
         type=positive_float,
@@ -234,6 +259,34 @@ def build_parser():
     )
     parser.add_argument("--land-timeout-s", type=positive_float, default=90.0)
     parser.add_argument("--setpoint-hz", type=positive_float, default=20.0)
+    parser.add_argument("--event-log", type=Path, default=None)
+    parser.add_argument(
+        "--guidance-log",
+        type=Path,
+        default=None,
+        help=(
+            "Write every transit/hold setpoint and its LOCAL_POSITION_NED "
+            "readback as JSONL evidence."
+        ),
+    )
+    parser.add_argument(
+        "--stability-window-s",
+        type=positive_float,
+        default=3.0,
+        help="Tail window of each waypoint hold used for stability metrics.",
+    )
+    parser.add_argument(
+        "--stability-position-p95-max-m",
+        type=positive_float,
+        default=None,
+        help="Fail a hold when its tail-window 3D position-error p95 exceeds this value.",
+    )
+    parser.add_argument(
+        "--stability-attitude-max-deg",
+        type=positive_float,
+        default=None,
+        help="Fail a hold when absolute roll or pitch exceeds this value in the tail window.",
+    )
     parser.add_argument("--heartbeat-timeout-s", type=positive_float, default=30.0)
     parser.add_argument(
         "--land-after",
@@ -295,14 +348,298 @@ def distance_3d(pos, waypoint):
     )
 
 
-def send_position_velocity_setpoint(master, boot_time, x, y, z, vx, vy, vz):
-    type_mask = (
+def _percentile_nearest_rank(values, percentile):
+    if not values:
+        return math.nan
+    ordered = sorted(float(value) for value in values)
+    index = max(0, min(len(ordered) - 1, math.ceil(percentile * len(ordered)) - 1))
+    return ordered[index]
+
+
+def _append_event(path, payload, *, create=False):
+    if path is None:
+        return
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = "x" if create else "a"
+    with path.open(mode, encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def _event_clock():
+    return {
+        "event_time_unix_s": time.time(),
+        "event_time_monotonic_s": time.monotonic(),
+    }
+
+
+def _waypoint_phase(index, state):
+    return f"waypoint_{int(index):03d}_{state}"
+
+
+def _publish_phase(phase_monitor, phase):
+    if phase_monitor is not None:
+        phase_monitor.publish_phase(phase)
+
+
+def _message_vector(message, names):
+    if message is None:
+        return None
+    values = []
+    for name in names:
+        try:
+            value = float(getattr(message, name))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        values.append(value if math.isfinite(value) else None)
+    return values
+
+
+def _position_only_type_mask():
+    return (
+        mavutil.mavlink.POSITION_TARGET_TYPEMASK_VX_IGNORE
+        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_VY_IGNORE
+        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_VZ_IGNORE
+        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE
+        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE
+        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE
+        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_IGNORE
+        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
+    )
+
+
+def _position_velocity_type_mask():
+    return (
         mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE
         | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE
         | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE
         | mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_IGNORE
         | mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
     )
+
+
+def _velocity_only_type_mask():
+    return (
+        mavutil.mavlink.POSITION_TARGET_TYPEMASK_X_IGNORE
+        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_Y_IGNORE
+        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_Z_IGNORE
+        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE
+        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE
+        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE
+        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_IGNORE
+        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
+    )
+
+
+class GuidanceTrace:
+    def __init__(self, path):
+        self.path = Path(path) if path is not None else None
+        self.handle = None
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.handle = self.path.open("x", encoding="utf-8")
+
+    def append(self, payload):
+        if self.handle is None:
+            return
+        self.handle.write(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+
+    def close(self):
+        if self.handle is not None:
+            self.handle.flush()
+            self.handle.close()
+            self.handle = None
+
+
+def _trace_setpoint(
+    trace,
+    *,
+    guidance_mode,
+    phase,
+    index,
+    total,
+    active_fields,
+    target_position,
+    target_velocity,
+    actual_position,
+    remaining_distance_m=None,
+    horizontal_ramp=None,
+    vertical_ramp=None,
+):
+    if trace is None:
+        return
+    payload = {
+        "schema_version": GUIDANCE_SCHEMA_VERSION,
+        "event": "setpoint_sent",
+        "guidance_mode": guidance_mode,
+        "mission_phase": phase,
+        "waypoint_index": int(index),
+        "waypoint_total": int(total),
+        "frame": "MAV_FRAME_LOCAL_NED",
+        "active_fields": list(active_fields),
+        "type_mask": (
+            _position_velocity_type_mask()
+            if "position" in active_fields and "velocity" in active_fields
+            else _velocity_only_type_mask()
+            if "velocity" in active_fields
+            else _position_only_type_mask()
+        ),
+        "navigation_target_local_ned_m": [float(value) for value in target_position],
+        # Compatibility alias: this is the navigation goal, not necessarily
+        # an active MAVLink position field (see active_fields and the raw
+        # mavlink_position_fields_local_ned_m evidence below).
+        "target_position_local_ned_m": [float(value) for value in target_position],
+        "mavlink_position_fields_local_ned_m": (
+            [float(value) for value in target_position]
+            if "position" in active_fields
+            else [0.0, 0.0, 0.0]
+        ),
+        "target_velocity_local_ned_m_s": (
+            None
+            if target_velocity is None
+            else [float(value) for value in target_velocity]
+        ),
+        "actual_position_local_ned_m": _message_vector(
+            actual_position, ("x", "y", "z")
+        ),
+        "actual_velocity_local_ned_m_s": _message_vector(
+            actual_position, ("vx", "vy", "vz")
+        ),
+        "remaining_distance_m": (
+            None if remaining_distance_m is None else float(remaining_distance_m)
+        ),
+        "horizontal_ramp": None if horizontal_ramp is None else float(horizontal_ramp),
+        "vertical_ramp": None if vertical_ramp is None else float(vertical_ramp),
+        **_event_clock(),
+    }
+    trace.append(payload)
+
+
+def hold_waypoint(
+    master,
+    boot_time,
+    args,
+    waypoint,
+    hold_s,
+    index,
+    total,
+    *,
+    phase_monitor=None,
+    guidance_trace=None,
+):
+    period_s = 1.0 / args.setpoint_hz
+    start = time.monotonic()
+    start_wall = time.time()
+    tail_start = max(0.0, float(hold_s) - float(args.stability_window_s))
+    position_errors = []
+    abs_roll_deg = []
+    abs_pitch_deg = []
+    analysis_started_wall = None
+    analysis_started_monotonic = None
+    _append_event(
+        args.event_log,
+        {
+            "schema_version": STABILITY_SCHEMA_VERSION,
+            "event": "waypoint_hold_started",
+            "waypoint_index": index,
+            "waypoint_total": total,
+            "target_local_ned_m": [float(value) for value in waypoint[:3]],
+            "hold_s": float(hold_s),
+            "stability_window_s": min(float(hold_s), float(args.stability_window_s)),
+            **_event_clock(),
+        },
+    )
+    while time.monotonic() - start < hold_s:
+        send_position_setpoint(master, boot_time, waypoint[0], waypoint[1], waypoint[2])
+        elapsed = time.monotonic() - start
+        analysis_active = elapsed >= tail_start
+        phase = _waypoint_phase(
+            index, "hold_analysis" if analysis_active else "hold_settle"
+        )
+        _publish_phase(phase_monitor, phase)
+        pos = master.recv_match(type="LOCAL_POSITION_NED", blocking=False)
+        attitude = master.recv_match(type="ATTITUDE", blocking=False)
+        _trace_setpoint(
+            guidance_trace,
+            guidance_mode=args.guidance_mode,
+            phase=phase,
+            index=index,
+            total=total,
+            active_fields=("position",),
+            target_position=waypoint[:3],
+            target_velocity=None,
+            actual_position=pos,
+            remaining_distance_m=(distance_3d(pos, waypoint) if pos is not None else None),
+        )
+        if analysis_active:
+            if analysis_started_wall is None:
+                analysis_started_wall = time.time()
+                analysis_started_monotonic = time.monotonic()
+                _append_event(
+                    args.event_log,
+                    {
+                        "schema_version": STABILITY_SCHEMA_VERSION,
+                        "event": "waypoint_hold_analysis_started",
+                        "waypoint_index": index,
+                        "waypoint_total": total,
+                        "target_local_ned_m": [float(value) for value in waypoint[:3]],
+                        **_event_clock(),
+                    },
+                )
+            if pos is not None:
+                position_errors.append(distance_3d(pos, waypoint))
+            if attitude is not None:
+                abs_roll_deg.append(abs(math.degrees(float(attitude.roll))))
+                abs_pitch_deg.append(abs(math.degrees(float(attitude.pitch))))
+        time.sleep(period_s)
+
+    metrics = {
+        "schema_version": STABILITY_SCHEMA_VERSION,
+        "event": "waypoint_hold_complete",
+        "waypoint_index": index,
+        "waypoint_total": total,
+        "target_local_ned_m": [float(waypoint[0]), float(waypoint[1]), float(waypoint[2])],
+        "hold_s": float(hold_s),
+        "stability_window_s": min(float(hold_s), float(args.stability_window_s)),
+        "position_sample_count": len(position_errors),
+        "attitude_sample_count": min(len(abs_roll_deg), len(abs_pitch_deg)),
+        "position_error_p95_m": _percentile_nearest_rank(position_errors, 0.95),
+        "max_abs_roll_deg": max(abs_roll_deg, default=math.nan),
+        "max_abs_pitch_deg": max(abs_pitch_deg, default=math.nan),
+        "hold_started_unix_s": start_wall,
+        "hold_completed_unix_s": time.time(),
+        "analysis_started_unix_s": analysis_started_wall,
+        "analysis_started_monotonic_s": analysis_started_monotonic,
+        **_event_clock(),
+    }
+    failures = []
+    if args.stability_position_p95_max_m is not None:
+        if not position_errors:
+            failures.append("missing_position_samples")
+        elif metrics["position_error_p95_m"] > args.stability_position_p95_max_m:
+            failures.append("position_error_p95_exceeded")
+    if args.stability_attitude_max_deg is not None:
+        if not abs_roll_deg or not abs_pitch_deg:
+            failures.append("missing_attitude_samples")
+        elif (
+            metrics["max_abs_roll_deg"] > args.stability_attitude_max_deg
+            or metrics["max_abs_pitch_deg"] > args.stability_attitude_max_deg
+        ):
+            failures.append("attitude_limit_exceeded")
+    metrics["stability_pass"] = not failures
+    metrics["stability_failures"] = failures
+    _append_event(args.event_log, metrics)
+    if failures:
+        raise RuntimeError(
+            f"Waypoint {index} stability gate failed: {','.join(failures)}"
+        )
+    return metrics
+
+
+def send_position_velocity_setpoint(master, boot_time, x, y, z, vx, vy, vz):
+    type_mask = _position_velocity_type_mask()
     master.mav.set_position_target_local_ned_send(
         now_ms(boot_time),
         master.target_system,
@@ -323,7 +660,17 @@ def send_position_velocity_setpoint(master, boot_time, x, y, z, vx, vy, vz):
     )
 
 
-def wait_waypoint(master, boot_time, args, waypoint, index, total):
+def wait_waypoint(
+    master,
+    boot_time,
+    args,
+    waypoint,
+    index,
+    total,
+    *,
+    phase_monitor=None,
+    guidance_trace=None,
+):
     x, y, z = waypoint[:3]
     period_s = 1.0 / args.setpoint_hz
     start = time.monotonic()
@@ -350,10 +697,29 @@ def wait_waypoint(master, boot_time, args, waypoint, index, total):
         f"Waypoint {index}/{total}: north={x:.1f}, east={y:.1f}, altitude={-z:.1f} m",
         flush=True,
     )
+    transit_phase = _waypoint_phase(index, "transit")
+    _append_event(
+        args.event_log,
+        {
+            "schema_version": STABILITY_SCHEMA_VERSION,
+            "event": "waypoint_transit_started",
+            "guidance_mode": args.guidance_mode,
+            "waypoint_index": index,
+            "waypoint_total": total,
+            "target_local_ned_m": [float(value) for value in waypoint[:3]],
+            "requested_speed_mps": float(args.speed_mps),
+            "horizontal_ramp_s": float(args.ramp_s),
+            "vertical_ramp_s": float(args.vertical_ramp_s),
+            **_event_clock(),
+        },
+    )
     while time.monotonic() < deadline:
+        _publish_phase(phase_monitor, transit_phase)
         pos = master.recv_match(type="LOCAL_POSITION_NED", blocking=False)
         if pos is not None:
             remaining = distance_3d(pos, waypoint)
+            h_ramp = 1.0
+            v_ramp = 1.0
             if remaining > 0.001:
                 speed = min(args.speed_mps, remaining)
                 elapsed = time.monotonic() - start
@@ -368,26 +734,98 @@ def wait_waypoint(master, boot_time, args, waypoint, index, total):
                 vz = (z - float(pos.z)) / remaining * speed * v_ramp
             else:
                 vx = vy = vz = 0.0
-            send_position_velocity_setpoint(master, boot_time, x, y, z, vx, vy, vz)
+            if args.guidance_mode == "position_only_final_target":
+                send_position_setpoint(master, boot_time, x, y, z)
+                active_fields = ("position",)
+                traced_velocity = None
+            elif args.guidance_mode == "velocity_only":
+                send_local_velocity_setpoint(master, boot_time, vx, vy, vz)
+                active_fields = ("velocity",)
+                traced_velocity = (vx, vy, vz)
+            else:
+                send_position_velocity_setpoint(master, boot_time, x, y, z, vx, vy, vz)
+                active_fields = ("position", "velocity")
+                traced_velocity = (vx, vy, vz)
+            _trace_setpoint(
+                guidance_trace,
+                guidance_mode=args.guidance_mode,
+                phase=transit_phase,
+                index=index,
+                total=total,
+                active_fields=active_fields,
+                target_position=(x, y, z),
+                target_velocity=traced_velocity,
+                actual_position=pos,
+                remaining_distance_m=remaining,
+                horizontal_ramp=h_ramp,
+                vertical_ramp=v_ramp,
+            )
             if time.monotonic() - last_report > 2.0:
                 print(f"  remaining={remaining:.1f} m", flush=True)
                 last_report = time.monotonic()
             if remaining <= args.acceptance_radius_m:
                 print(f"Waypoint {index} reached.", flush=True)
+                _append_event(
+                    args.event_log,
+                    {
+                        "schema_version": STABILITY_SCHEMA_VERSION,
+                        "event": "waypoint_reached",
+                        "waypoint_index": index,
+                        "waypoint_total": total,
+                        "target_local_ned_m": [float(value) for value in waypoint[:3]],
+                        "actual_local_ned_m": _message_vector(pos, ("x", "y", "z")),
+                        "actual_velocity_local_ned_m_s": _message_vector(
+                            pos, ("vx", "vy", "vz")
+                        ),
+                        "remaining_distance_m": float(remaining),
+                        **_event_clock(),
+                    },
+                )
                 return
         else:
             send_position_setpoint(master, boot_time, x, y, z)
+            _trace_setpoint(
+                guidance_trace,
+                guidance_mode=args.guidance_mode,
+                phase=transit_phase,
+                index=index,
+                total=total,
+                active_fields=("position",),
+                target_position=(x, y, z),
+                target_velocity=None,
+                actual_position=None,
+            )
         time.sleep(period_s)
     raise RuntimeError(f"Waypoint {index} timed out.")
 
 
 def run(args):
     waypoints = collect_waypoints(args)
+    guidance_trace = GuidanceTrace(args.guidance_log)
+    if args.event_log is not None:
+        _append_event(
+            args.event_log,
+            {
+                "schema_version": STABILITY_SCHEMA_VERSION,
+                "event": "mission_started",
+                "waypoint_count": len(waypoints),
+                "guidance_mode": args.guidance_mode,
+                "requested_speed_mps": float(args.speed_mps),
+                "horizontal_ramp_s": float(args.ramp_s),
+                "vertical_ramp_s": float(args.vertical_ramp_s),
+                **_event_clock(),
+            },
+            create=True,
+        )
     master = mavutil.mavlink_connection(args.connect, autoreconnect=True)
     wait_heartbeat(master, args.heartbeat_timeout_s)
     heartbeat = GcsHeartbeat(master)
     heartbeat.start()
+    phase_monitor = ActualDistanceMonitor()
+    phase_monitor.start()
+    _publish_phase(phase_monitor, "preflight")
     pos = wait_local_position(master)
+    completed = False
     try:
         if args.check_connection:
             print(
@@ -396,6 +834,7 @@ def run(args):
                 flush=True,
             )
             print("Connection check complete. No mission command was sent.", flush=True)
+            completed = True
             return
 
         if args.mpc_z_vel_max_up_mps is not None:
@@ -435,17 +874,31 @@ def run(args):
         arm(master)
 
         for index, waypoint in enumerate(waypoints, start=1):
-            wait_waypoint(master, boot_time, args, waypoint, index, len(waypoints))
+            wait_waypoint(
+                master,
+                boot_time,
+                args,
+                waypoint,
+                index,
+                len(waypoints),
+                phase_monitor=phase_monitor,
+                guidance_trace=guidance_trace,
+            )
             hold_s = waypoint[3] if waypoint[3] is not None else args.hold_s
-            stream_for(
+            hold_waypoint(
+                master,
+                boot_time,
+                args,
+                waypoint,
                 hold_s,
-                args.setpoint_hz,
-                lambda waypoint=waypoint: send_position_setpoint(
-                    master, boot_time, waypoint[0], waypoint[1], waypoint[2]
-                ),
+                index,
+                len(waypoints),
+                phase_monitor=phase_monitor,
+                guidance_trace=guidance_trace,
             )
 
         print("Final hover ...", flush=True)
+        _publish_phase(phase_monitor, "final_hover")
         last = waypoints[-1]
         stream_for(
             args.final_hover_s,
@@ -473,8 +926,23 @@ def run(args):
                 args.setpoint_hz,
                 lambda: send_position_setpoint(master, boot_time, last[0], last[1], last[2]),
             )
+        _append_event(
+            args.event_log,
+            {
+                "schema_version": STABILITY_SCHEMA_VERSION,
+                "event": "mission_completed",
+                "waypoint_count": len(waypoints),
+                **_event_clock(),
+            },
+        )
+        _publish_phase(phase_monitor, "complete")
+        completed = True
     finally:
+        if not completed:
+            _publish_phase(phase_monitor, "interrupted")
+        phase_monitor.stop()
         heartbeat.stop()
+        guidance_trace.close()
 
 
 def main():

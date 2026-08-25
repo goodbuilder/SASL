@@ -220,6 +220,7 @@ def _write_distance_node_params(context, *, camera_oracle_generated_sdf_sha256="
         "enable_rviz_rays",
         "rviz_live_latest_only",
         "measurement_latest_only",
+        "yolo_allow_cpu_fallback",
     }
     names = [
         "scenario_name",
@@ -288,6 +289,7 @@ def _write_distance_node_params(context, *, camera_oracle_generated_sdf_sha256="
         "yolo_class_name",
         "yolo_confidence",
         "yolo_device",
+        "yolo_allow_cpu_fallback",
         "yolo_target_hz",
         "measurement_queue_capacity",
         "measurement_latest_only",
@@ -972,6 +974,7 @@ def generate_launch_description():
             DeclareLaunchArgument("yolo_class_name", default_value="drone"),
             DeclareLaunchArgument("yolo_confidence", default_value="0.25"),
             DeclareLaunchArgument("yolo_device", default_value="cuda:0"),
+            DeclareLaunchArgument("yolo_allow_cpu_fallback", default_value="true"),
             DeclareLaunchArgument("yolo_target_hz", default_value="40.0"),
             DeclareLaunchArgument("yolo_imgsz", default_value="1280"),
             DeclareLaunchArgument("observation_mode", default_value="bbox_yolo"),

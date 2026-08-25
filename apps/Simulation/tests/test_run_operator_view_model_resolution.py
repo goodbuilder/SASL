@@ -44,11 +44,74 @@ def test_operator_recorder_video_fps_matches_the_overlay_publish_rate() -> None:
     )
 
 
+def test_operator_launcher_can_request_an_isolated_yolo_runtime() -> None:
+    source = (Path(__file__).resolve().parents[1] / "run_operator_view.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "YOLO_VENV_ISOLATED" in source
+    assert "ensure_yolo_args+=(--isolated)" in source
+
+
+def test_resolved_launch_rates_are_exported_to_recording_provenance() -> None:
+    source = (Path(__file__).resolve().parents[1] / "run_operator_view.sh").read_text(
+        encoding="utf-8"
+    )
+
+    for name, launch_name in (
+        ("CAMERA_UPDATE_RATE_HZ", "camera_update_rate_hz"),
+        ("YOLO_TARGET_HZ", "yolo_target_hz"),
+        ("YOLO_IMGSZ", "yolo_imgsz"),
+        ("YOLO_DEVICE", "yolo_device"),
+        ("OVERLAY_PUBLISH_HZ", "overlay_publish_hz"),
+    ):
+        assert f'export {name}="$(get_launch_arg_value {launch_name}' in source
+
+
+def test_operator_launcher_exposes_overlay_rate_as_a_first_class_cli_option() -> None:
+    source = (Path(__file__).resolve().parents[1] / "run_operator_view.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "--overlay-hz VALUE" in source
+    assert '--overlay-hz)' in source
+    assert 'DEFAULT_OVERLAY_HZ="${2:?missing value for --overlay-hz}"' in source
+
+
+def test_operator_launcher_fails_closed_when_requested_yolo_runtime_is_unavailable() -> None:
+    source = (Path(__file__).resolve().parents[1] / "run_operator_view.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "refusing an unverified CPU/system-Python fallback" in source
+    failed_prepare = source.index("error: failed to prepare the requested YOLO runtime")
+    assert "exit 2" in source[failed_prepare : failed_prepare + 400]
+
+
+def test_operator_recorder_is_not_coupled_to_the_isolated_yolo_python() -> None:
+    source = (Path(__file__).resolve().parents[1] / "run_operator_view.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "resolve_operator_recorder_python" in source
+    assert "'import cv2, xlsxwriter'" in source
+    assert source.index("/usr/bin/python3") < source.index('"$ROOT_DIR/.venv/bin/python"', source.index("resolve_operator_recorder_python"))
+
+
 def test_cleanup_kills_rqt_process_group_even_after_its_wrapper_exits() -> None:
     source = (Path(__file__).resolve().parents[1] / "run_operator_view.sh").read_text(encoding="utf-8")
 
     assert "Signal the recorded process group even if that original wrapper PID has" in source
     assert 'kill -KILL "-$pid" >/dev/null 2>&1 || kill -KILL "$pid"' in source
+
+
+def test_cleanup_waits_for_long_operator_recording_finalization() -> None:
+    source = (Path(__file__).resolve().parents[1] / "run_operator_view.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "for _ in {1..180}; do" in source
+    assert '"state"[[:space:]]*:[[:space:]]*"finalized"' in source
+    assert '"${record_dir}/progress.json"' in source
 
 
 def test_mission_launcher_selects_a_pymavlink_capable_python() -> None:

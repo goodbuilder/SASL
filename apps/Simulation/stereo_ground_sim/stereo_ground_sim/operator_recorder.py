@@ -999,6 +999,47 @@ def _stamp_to_float(stamp):
     return float(stamp.sec) + float(stamp.nanosec) * 1e-9
 
 
+def _stamp_to_ns(stamp):
+    return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
+
+def _observed_rate_hz(count, first_elapsed_sec, last_elapsed_sec):
+    try:
+        count = int(count)
+        elapsed = float(last_elapsed_sec) - float(first_elapsed_sec)
+    except (TypeError, ValueError):
+        return None
+    if count < 2 or not math.isfinite(elapsed) or elapsed <= 0.0:
+        return None
+    return float(count - 1) / elapsed
+
+
+def _video_stream_progress(stats):
+    stats = stats or {}
+    frame_count = int(stats.get("frame_count", 0))
+    unique_count = int(stats.get("unique_source_frame_count", 0))
+    callback_hz = _observed_rate_hz(
+        frame_count,
+        stats.get("first_elapsed_sec"),
+        stats.get("last_elapsed_sec"),
+    )
+    unique_source_hz = _observed_rate_hz(
+        unique_count,
+        stats.get("first_unique_elapsed_sec"),
+        stats.get("last_unique_elapsed_sec"),
+    )
+    return {
+        "frame_count": frame_count,
+        "first_elapsed_sec": stats.get("first_elapsed_sec"),
+        "last_elapsed_sec": stats.get("last_elapsed_sec"),
+        "observed_callback_hz": callback_hz,
+        "unique_source_frame_count": unique_count,
+        "first_unique_elapsed_sec": stats.get("first_unique_elapsed_sec"),
+        "last_unique_elapsed_sec": stats.get("last_unique_elapsed_sec"),
+        "unique_source_observed_hz": unique_source_hz,
+    }
+
+
 def _finite_or_empty(value):
     if value is None:
         return ""
@@ -1639,6 +1680,18 @@ class OperatorRecorder(Node):
         self.csv_file = None
         self.csv_writer = None
         self.video_writers = {}
+        self.video_stream_stats = {
+            name: {
+                "frame_count": 0,
+                "first_elapsed_sec": None,
+                "last_elapsed_sec": None,
+                "unique_source_frame_count": 0,
+                "first_unique_elapsed_sec": None,
+                "last_unique_elapsed_sec": None,
+                "last_source_stamp_ns": None,
+            }
+            for name in ("left_overlay", "right_overlay")
+        }
         self.auto_stop_requested = False
         self.bag_process = None
         self.bag_storage = (
@@ -2405,6 +2458,10 @@ class OperatorRecorder(Node):
             "recording_timestamp": getattr(self, "recording_timestamp", ""),
             "csv": getattr(getattr(self, "csv_path", None), "name", "telemetry.csv"),
             "xlsx": getattr(getattr(self, "xlsx_path", None), "name", "session.xlsx"),
+            "video_streams": {
+                name: _video_stream_progress(stats)
+                for name, stats in getattr(self, "video_stream_stats", {}).items()
+            },
         }
         progress_path = self.session_dir / "progress.json"
         temporary_path = self.session_dir / "progress.json.tmp"
@@ -2431,6 +2488,22 @@ class OperatorRecorder(Node):
                 return
             self.video_writers[name] = writer
         writer.write(image)
+        now_elapsed_sec = time.monotonic() - self.start_monotonic
+        stats = self.video_stream_stats[name]
+        stats["frame_count"] += 1
+        if stats["first_elapsed_sec"] is None:
+            stats["first_elapsed_sec"] = now_elapsed_sec
+        stats["last_elapsed_sec"] = now_elapsed_sec
+        try:
+            source_stamp_ns = _stamp_to_ns(msg.header.stamp)
+        except (AttributeError, TypeError, ValueError):
+            source_stamp_ns = None
+        if source_stamp_ns is not None and source_stamp_ns != stats["last_source_stamp_ns"]:
+            stats["last_source_stamp_ns"] = source_stamp_ns
+            stats["unique_source_frame_count"] += 1
+            if stats["first_unique_elapsed_sec"] is None:
+                stats["first_unique_elapsed_sec"] = now_elapsed_sec
+            stats["last_unique_elapsed_sec"] = now_elapsed_sec
 
     def _msg_to_bgr(self, msg):
         encoding = msg.encoding.lower()

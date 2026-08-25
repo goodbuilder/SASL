@@ -27,6 +27,7 @@ from stereo_ground_sim.coordinate_frames import (  # noqa: E402
 
 
 PX4_WAYPOINT_FRAME = "px4_local_ned_setpoint:north,east,altitude_agl_m"
+WORLD_RFU_FRAME = "baseline_center_world_rfu:right,front,up"
 WORLD_TO_PX4_WAYPOINT_CONTRACT = (
     "simulation_px4_mission_contract: Gazebo world ENU minus the PX4 home "
     "world ENU origin maps to local NED north/east/down; mission altitude_agl_m "
@@ -60,6 +61,40 @@ def parse_args() -> argparse.Namespace:
             "interval, overriding --calibration-count/--validation-count as "
             "a count (their nonzero-ness still selects whether that phase "
             "runs)."
+        ),
+    )
+    parser.add_argument(
+        "--range-count", type=int, default=None,
+        help=(
+            "If set with --range-step-m omitted, generate this many evenly "
+            "spaced boresight/zigzag range points including both endpoints. "
+            "The count must be at least 2."
+        ),
+    )
+    parser.add_argument(
+        "--lateral-pattern", choices=("center", "zigzag"), default="center",
+        help="Use a centered boresight path or an alternating lateral path.",
+    )
+    parser.add_argument(
+        "--zigzag-amplitude-m", type=float, default=2.0,
+        help="Absolute lateral offset for the zigzag pattern, in metres.",
+    )
+    parser.add_argument(
+        "--waypoints-rfu-m",
+        default="",
+        help=(
+            "Semicolon-separated baseline-center world-aligned Right,Front,Up "
+            "waypoints. Explicit points preserve input order and are retained "
+            "even when outside one or both camera images."
+        ),
+    )
+    parser.add_argument(
+        "--zigzag-overlap-ratio",
+        type=float,
+        default=0.4,
+        help=(
+            "For explicit RFU zigzag paths, use this fraction of the nominal "
+            "symmetric horizontal stereo-overlap half-width."
         ),
     )
     parser.add_argument("--camera-baseline-m", type=float, default=25.0)
@@ -151,6 +186,115 @@ def inside_pixel_margin(
         margin_px <= u <= float(width_px) - margin_px
         and margin_px <= v <= float(height_px) - margin_px
     )
+
+
+def parse_rfu_waypoints(value: str) -> list[tuple[float, float, float]]:
+    points: list[tuple[float, float, float]] = []
+    for index, entry in enumerate(str(value).split(";"), start=1):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = [part.strip() for part in entry.split(",")]
+        if len(parts) != 3:
+            raise ValueError(
+                f"RFU waypoint {index} must be right,front,up; got: {entry}"
+            )
+        point = tuple(float(part) for part in parts)
+        if not all(math.isfinite(component) for component in point):
+            raise ValueError(f"RFU waypoint {index} must be finite")
+        if point[1] <= 0.0:
+            raise ValueError(f"RFU waypoint {index} Front must be positive")
+        points.append(point)  # type: ignore[arg-type]
+    return points
+
+
+def _project_rfu_point(
+    point_rfu_m: tuple[float, float, float],
+    *,
+    baseline_origin_world_enu_m: tuple[float, float, float],
+    camera,
+    fx_px: float,
+    fy_px: float,
+    image_width_px: int,
+    image_height_px: int,
+) -> tuple[float, float] | None:
+    right_m, front_m, up_m = point_rfu_m
+    world = (
+        baseline_origin_world_enu_m[0] + right_m,
+        baseline_origin_world_enu_m[1] + front_m,
+        baseline_origin_world_enu_m[2] + up_m,
+    )
+    return project_world_point_to_pixel(
+        world,
+        camera,
+        fx_px=fx_px,
+        fy_px=fy_px,
+        cx_px=float(image_width_px) * 0.5,
+        cy_px=float(image_height_px) * 0.5,
+    )
+
+
+def horizontal_stereo_overlap_half_width_m(
+    base_point_rfu_m: tuple[float, float, float],
+    *,
+    baseline_origin_world_enu_m: tuple[float, float, float],
+    left_camera,
+    right_camera,
+    fx_px: float,
+    fy_px: float,
+    image_width_px: int,
+    image_height_px: int,
+    pixel_margin_px: float,
+) -> float:
+    """Return the symmetric nominal horizontal overlap around the input R.
+
+    Vertical visibility is deliberately excluded: explicit mission points are
+    retained after they leave the vertical FOV, while the lateral zigzag still
+    tapers according to the remaining horizontal stereo overlap.
+    """
+
+    base_right_m, front_m, up_m = base_point_rfu_m
+
+    def visible(offset_m: float) -> bool:
+        point = (base_right_m + offset_m, front_m, up_m)
+        for camera in (left_camera, right_camera):
+            pixel = _project_rfu_point(
+                point,
+                baseline_origin_world_enu_m=baseline_origin_world_enu_m,
+                camera=camera,
+                fx_px=fx_px,
+                fy_px=fy_px,
+                image_width_px=image_width_px,
+                image_height_px=image_height_px,
+            )
+            if pixel is None:
+                return False
+            if not pixel_margin_px <= pixel[0] <= float(image_width_px) - pixel_margin_px:
+                return False
+        return True
+
+    if not visible(0.0):
+        return 0.0
+
+    def limit(sign: float) -> float:
+        low = 0.0
+        high = 1.0
+        maximum_search_m = max(1000.0, abs(front_m) * 4.0)
+        while high < maximum_search_m and visible(sign * high):
+            low = high
+            high *= 2.0
+        high = min(high, maximum_search_m)
+        if visible(sign * high):
+            return high
+        for _ in range(64):
+            midpoint = (low + high) * 0.5
+            if visible(sign * midpoint):
+                low = midpoint
+            else:
+                high = midpoint
+        return low
+
+    return min(limit(-1.0), limit(1.0))
 
 
 def sample_one(
@@ -253,6 +397,112 @@ def sample_one(
     raise RuntimeError(f"could not sample {phase} waypoint {index} inside FOV after {max_attempts} attempts")
 
 
+def build_explicit_rfu_row(
+    *,
+    index: int,
+    requested_rfu_m: tuple[float, float, float],
+    applied_right_m: float,
+    overlap_half_width_m: float,
+    overlap_ratio: float,
+    frame,
+    left_camera,
+    right_camera,
+    fx_px: float,
+    fy_px: float,
+    image_width_px: int,
+    image_height_px: int,
+    pixel_margin_px: float,
+    px4_origin_world_enu_m: tuple[float, float, float],
+) -> dict[str, float | int | str | bool]:
+    _, front_m, up_m = requested_rfu_m
+    applied_rfu_m = (applied_right_m, front_m, up_m)
+    origin = frame.origin_world_enu_m
+    world = (
+        origin[0] + applied_right_m,
+        origin[1] + front_m,
+        origin[2] + up_m,
+    )
+    baseline_forward_m, baseline_right_m, baseline_down_m = frame.point_from_world(world)
+    left_pixel = _project_rfu_point(
+        applied_rfu_m,
+        baseline_origin_world_enu_m=origin,
+        camera=left_camera,
+        fx_px=fx_px,
+        fy_px=fy_px,
+        image_width_px=image_width_px,
+        image_height_px=image_height_px,
+    )
+    right_pixel = _project_rfu_point(
+        applied_rfu_m,
+        baseline_origin_world_enu_m=origin,
+        camera=right_camera,
+        fx_px=fx_px,
+        fy_px=fy_px,
+        image_width_px=image_width_px,
+        image_height_px=image_height_px,
+    )
+    left_visible = inside_pixel_margin(
+        left_pixel,
+        width_px=image_width_px,
+        height_px=image_height_px,
+        margin_px=pixel_margin_px,
+    )
+    right_visible = inside_pixel_margin(
+        right_pixel,
+        width_px=image_width_px,
+        height_px=image_height_px,
+        margin_px=pixel_margin_px,
+    )
+    altitude_agl_m = world[2] - px4_origin_world_enu_m[2]
+    if altitude_agl_m < 0.0:
+        raise ValueError(
+            f"RFU waypoint {index + 1} maps below the PX4 local origin: "
+            f"altitude_agl_m={altitude_agl_m}"
+        )
+    baseline_range_m = math.sqrt(
+        baseline_forward_m * baseline_forward_m
+        + baseline_right_m * baseline_right_m
+        + baseline_down_m * baseline_down_m
+    )
+    return {
+        "phase": "validation",
+        "index": index,
+        "source_order": index,
+        "source_frame": WORLD_RFU_FRAME,
+        "px4_waypoint_frame": PX4_WAYPOINT_FRAME,
+        "world_frame": WORLD_FRAME,
+        "baseline_frame": BASELINE_CENTER_FRD_FRAME,
+        "world_to_px4_waypoint_contract": WORLD_TO_PX4_WAYPOINT_CONTRACT,
+        "requested_rfu_right_m": requested_rfu_m[0],
+        "requested_rfu_front_m": front_m,
+        "requested_rfu_up_m": up_m,
+        "world_rfu_right_m": applied_right_m,
+        "world_rfu_front_m": front_m,
+        "world_rfu_up_m": up_m,
+        "zigzag_overlap_half_width_m": overlap_half_width_m,
+        "zigzag_overlap_ratio": overlap_ratio,
+        "north_m": world[1] - px4_origin_world_enu_m[1],
+        "east_m": world[0] - px4_origin_world_enu_m[0],
+        "altitude_agl_m": altitude_agl_m,
+        "world_x_m": world[0],
+        "world_y_m": world[1],
+        "world_z_m": world[2],
+        "baseline_forward_m": baseline_forward_m,
+        "baseline_right_m": baseline_right_m,
+        "baseline_down_m": baseline_down_m,
+        "baseline_range_m": baseline_range_m,
+        "horizontal_angle_rad": math.atan2(baseline_right_m, baseline_forward_m),
+        "vertical_angle_rad": math.atan2(baseline_down_m, baseline_forward_m),
+        "left_u_px": math.nan if left_pixel is None else left_pixel[0],
+        "left_v_px": math.nan if left_pixel is None else left_pixel[1],
+        "right_u_px": math.nan if right_pixel is None else right_pixel[0],
+        "right_v_px": math.nan if right_pixel is None else right_pixel[1],
+        "nominal_left_visible": left_visible,
+        "nominal_right_visible": right_visible,
+        "nominal_stereo_visible": left_visible and right_visible,
+    }
+
+
 def build_stepped_range_values(min_range_m: float, max_range_m: float, step_m: float) -> list[float]:
     if step_m <= 0.0:
         raise ValueError("range step must be positive")
@@ -264,6 +514,23 @@ def build_stepped_range_values(min_range_m: float, max_range_m: float, step_m: f
         n += 1
         value = min_range_m + n * step_m
     return values
+
+
+def build_range_count_values(min_range_m: float, max_range_m: float, count: int) -> list[float]:
+    if count < 2:
+        raise ValueError("range count must be at least 2")
+    step_m = (max_range_m - min_range_m) / float(count - 1)
+    return [min_range_m + index * step_m for index in range(count)]
+
+
+def lateral_offset_m(args: argparse.Namespace, index: int) -> float:
+    pattern = getattr(args, "lateral_pattern", "center")
+    if pattern == "center":
+        return 0.0
+    amplitude = float(getattr(args, "zigzag_amplitude_m", 2.0))
+    if amplitude < 0.0 or not math.isfinite(amplitude):
+        raise ValueError("zigzag amplitude must be finite and non-negative")
+    return amplitude if index % 2 == 0 else -amplitude
 
 
 def generate_waypoints(
@@ -278,6 +545,28 @@ def generate_waypoints(
     if args.min_range_m <= 0.0 or args.max_range_m <= args.min_range_m:
         raise ValueError("range bounds must be positive and increasing")
     range_step_m = getattr(args, "range_step_m", None)
+    range_count = getattr(args, "range_count", None)
+    explicit_rfu_points = parse_rfu_waypoints(getattr(args, "waypoints_rfu_m", ""))
+    selected_modes = sum(
+        value is not None and value != []
+        for value in (range_step_m, range_count, explicit_rfu_points)
+    )
+    if selected_modes > 1:
+        raise ValueError(
+            "range-step-m, range-count, and waypoints-rfu-m are mutually exclusive"
+        )
+    if range_count is not None and range_count < 2:
+        raise ValueError("range count must be at least 2")
+    zigzag_overlap_ratio = float(getattr(args, "zigzag_overlap_ratio", 0.4))
+    if not math.isfinite(zigzag_overlap_ratio) or not 0.0 <= zigzag_overlap_ratio <= 1.0:
+        raise ValueError("zigzag overlap ratio must be between 0 and 1")
+    if explicit_rfu_points:
+        if args.calibration_count != 0:
+            raise ValueError("explicit RFU waypoints require calibration-count=0")
+        if args.validation_count not in (0, len(explicit_rfu_points)):
+            raise ValueError(
+                "validation-count must be 0 or match the explicit RFU waypoint count"
+            )
     rng = random.Random(args.seed)
     nominal_left, nominal_right = nominal_camera_poses(args.camera_baseline_m, args.camera_height_m)
     # nominal_camera_poses() is always level (roll=pitch=0); rotate it to the
@@ -315,28 +604,13 @@ def generate_waypoints(
         float(args.px4_origin_world_up_m),
     )
 
-    calibration_range_values = (
-        build_stepped_range_values(args.min_range_m, args.max_range_m, range_step_m)
-        if range_step_m is not None and args.calibration_count > 0
-        else None
-    )
-    calibration_total = len(calibration_range_values) if calibration_range_values is not None else args.calibration_count
-
-    calibration: list[dict[str, float | int | str]] = []
-    for index in range(calibration_total):
-        calibration.append(
-            sample_one(
-                rng,
-                phase="calibration",
-                index=index,
-                existing_other_set=(),
-                min_set_separation_m=0.0,
-                min_range_m=args.min_range_m,
-                max_range_m=args.max_range_m,
-                horizontal_fov_rad=args.horizontal_fov_rad,
-                vertical_fov=v_fov,
-                fov_margin_rad=args.fov_margin_rad,
-                frame=frame,
+    calibration: list[dict[str, object]] = []
+    validation: list[dict[str, object]] = []
+    if explicit_rfu_points:
+        for index, requested_rfu_m in enumerate(explicit_rfu_points):
+            overlap_half_width_m = horizontal_stereo_overlap_half_width_m(
+                requested_rfu_m,
+                baseline_origin_world_enu_m=frame.origin_world_enu_m,
                 left_camera=left_camera,
                 right_camera=right_camera,
                 fx_px=fx_px,
@@ -344,50 +618,107 @@ def generate_waypoints(
                 image_width_px=args.image_width_px,
                 image_height_px=args.image_height_px,
                 pixel_margin_px=args.pixel_margin_px,
-                max_attempts=args.max_attempts,
-                px4_origin_world_enu_m=px4_origin_world_enu_m,
-                forced_forward_m=calibration_range_values[index] if calibration_range_values is not None else None,
-                forced_right_m=0.0 if calibration_range_values is not None else None,
-                forced_down_m=0.0 if calibration_range_values is not None else None,
             )
-        )
-
-    validation_range_values = (
-        build_stepped_range_values(args.min_range_m, args.max_range_m, range_step_m)
-        if range_step_m is not None and args.validation_count > 0
-        else None
-    )
-    validation_total = len(validation_range_values) if validation_range_values is not None else args.validation_count
-
-    validation: list[dict[str, float | int | str]] = []
-    for index in range(validation_total):
-        validation.append(
-            sample_one(
-                rng,
-                phase="validation",
-                index=index,
-                existing_other_set=calibration,
-                min_set_separation_m=args.min_set_separation_m,
-                min_range_m=args.min_range_m,
-                max_range_m=args.max_range_m,
-                horizontal_fov_rad=args.horizontal_fov_rad,
-                vertical_fov=v_fov,
-                fov_margin_rad=args.fov_margin_rad,
-                frame=frame,
-                left_camera=left_camera,
-                right_camera=right_camera,
-                fx_px=fx_px,
-                fy_px=fy_px,
-                image_width_px=args.image_width_px,
-                image_height_px=args.image_height_px,
-                pixel_margin_px=args.pixel_margin_px,
-                max_attempts=args.max_attempts,
-                px4_origin_world_enu_m=px4_origin_world_enu_m,
-                forced_forward_m=validation_range_values[index] if validation_range_values is not None else None,
-                forced_right_m=0.0 if validation_range_values is not None else None,
-                forced_down_m=0.0 if validation_range_values is not None else None,
+            applied_right_m = requested_rfu_m[0]
+            if getattr(args, "lateral_pattern", "center") == "zigzag":
+                sign = 1.0 if index % 2 == 0 else -1.0
+                applied_right_m += sign * zigzag_overlap_ratio * overlap_half_width_m
+            validation.append(
+                build_explicit_rfu_row(
+                    index=index,
+                    requested_rfu_m=requested_rfu_m,
+                    applied_right_m=applied_right_m,
+                    overlap_half_width_m=overlap_half_width_m,
+                    overlap_ratio=(
+                        zigzag_overlap_ratio
+                        if getattr(args, "lateral_pattern", "center") == "zigzag"
+                        else 0.0
+                    ),
+                    frame=frame,
+                    left_camera=left_camera,
+                    right_camera=right_camera,
+                    fx_px=fx_px,
+                    fy_px=fy_px,
+                    image_width_px=args.image_width_px,
+                    image_height_px=args.image_height_px,
+                    pixel_margin_px=args.pixel_margin_px,
+                    px4_origin_world_enu_m=px4_origin_world_enu_m,
+                )
             )
+    else:
+        calibration_range_values = (
+            build_stepped_range_values(args.min_range_m, args.max_range_m, range_step_m)
+            if range_step_m is not None and args.calibration_count > 0
+            else build_range_count_values(args.min_range_m, args.max_range_m, range_count)
+            if range_count is not None and args.calibration_count > 0
+            else None
         )
+        calibration_total = len(calibration_range_values) if calibration_range_values is not None else args.calibration_count
+        for index in range(calibration_total):
+            calibration.append(
+                sample_one(
+                    rng,
+                    phase="calibration",
+                    index=index,
+                    existing_other_set=(),
+                    min_set_separation_m=0.0,
+                    min_range_m=args.min_range_m,
+                    max_range_m=args.max_range_m,
+                    horizontal_fov_rad=args.horizontal_fov_rad,
+                    vertical_fov=v_fov,
+                    fov_margin_rad=args.fov_margin_rad,
+                    frame=frame,
+                    left_camera=left_camera,
+                    right_camera=right_camera,
+                    fx_px=fx_px,
+                    fy_px=fy_px,
+                    image_width_px=args.image_width_px,
+                    image_height_px=args.image_height_px,
+                    pixel_margin_px=args.pixel_margin_px,
+                    max_attempts=args.max_attempts,
+                    px4_origin_world_enu_m=px4_origin_world_enu_m,
+                    forced_forward_m=calibration_range_values[index] if calibration_range_values is not None else None,
+                    forced_right_m=lateral_offset_m(args, index) if calibration_range_values is not None else None,
+                    forced_down_m=0.0 if calibration_range_values is not None else None,
+                )
+            )
+
+        validation_range_values = (
+            build_stepped_range_values(args.min_range_m, args.max_range_m, range_step_m)
+            if range_step_m is not None and args.validation_count > 0
+            else build_range_count_values(args.min_range_m, args.max_range_m, range_count)
+            if range_count is not None and args.validation_count > 0
+            else None
+        )
+        validation_total = len(validation_range_values) if validation_range_values is not None else args.validation_count
+        for index in range(validation_total):
+            validation.append(
+                sample_one(
+                    rng,
+                    phase="validation",
+                    index=index,
+                    existing_other_set=calibration,
+                    min_set_separation_m=args.min_set_separation_m,
+                    min_range_m=args.min_range_m,
+                    max_range_m=args.max_range_m,
+                    horizontal_fov_rad=args.horizontal_fov_rad,
+                    vertical_fov=v_fov,
+                    fov_margin_rad=args.fov_margin_rad,
+                    frame=frame,
+                    left_camera=left_camera,
+                    right_camera=right_camera,
+                    fx_px=fx_px,
+                    fy_px=fy_px,
+                    image_width_px=args.image_width_px,
+                    image_height_px=args.image_height_px,
+                    pixel_margin_px=args.pixel_margin_px,
+                    max_attempts=args.max_attempts,
+                    px4_origin_world_enu_m=px4_origin_world_enu_m,
+                    forced_forward_m=validation_range_values[index] if validation_range_values is not None else None,
+                    forced_right_m=lateral_offset_m(args, index) if validation_range_values is not None else None,
+                    forced_down_m=0.0 if validation_range_values is not None else None,
+                )
+            )
 
     manifest = {
         "contract": "Calibration.md waypoint generation contract",
@@ -421,6 +752,20 @@ def generate_waypoints(
         "range_min_m": args.min_range_m,
         "range_max_m": args.max_range_m,
         "range_step_m": range_step_m,
+        "range_count": range_count,
+        "waypoint_mode": (
+            "explicit_baseline_center_world_rfu"
+            if explicit_rfu_points
+            else "sampled_or_boresight"
+        ),
+        "waypoints_rfu_m": [list(point) for point in explicit_rfu_points],
+        "world_rfu_frame": WORLD_RFU_FRAME,
+        "lateral_pattern": getattr(args, "lateral_pattern", "center"),
+        "zigzag_amplitude_m": float(getattr(args, "zigzag_amplitude_m", 2.0)),
+        "zigzag_overlap_ratio": zigzag_overlap_ratio,
+        "nominal_stereo_visible_count": sum(
+            bool(row.get("nominal_stereo_visible")) for row in validation
+        ) if explicit_rfu_points else len(validation),
     }
     return calibration, validation, manifest
 
@@ -445,7 +790,10 @@ def write_mission_path(path: Path, rows: Sequence[Mapping[str, object]]) -> None
     sequenced into an approach instead of a scatter.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    ordered = sorted(rows, key=lambda row: float(row["baseline_forward_m"]), reverse=True)
+    if rows and all("source_order" in row for row in rows):
+        ordered = sorted(rows, key=lambda row: int(row["source_order"]))
+    else:
+        ordered = sorted(rows, key=lambda row: float(row["baseline_forward_m"]), reverse=True)
     with path.open("w", encoding="utf-8") as handle:
         handle.write("north,east,altitude_agl_m\n")
         for row in ordered:

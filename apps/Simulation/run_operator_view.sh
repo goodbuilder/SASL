@@ -42,7 +42,6 @@ PX4_UXRCE_DDS_AGENT_LOG="${PX4_UXRCE_DDS_AGENT_LOG:-/dev/null}"
 PX4_UXRCE_DDS_LIBRARY_PATH="${PX4_UXRCE_DDS_LIBRARY_PATH:-}"
 export GZ_SIM_RESOURCE_PATH="$ROOT_DIR/install/stereo_ground_sim/share/stereo_ground_sim/models:${GZ_SIM_RESOURCE_PATH:-}"
 RQT_PYTHONPATH="$ROOT_DIR/python_patches:$ROOT_DIR/stereo_ground_sim${PYTHONPATH:+:$PYTHONPATH}"
-DEFAULT_OVERLAY_HZ="${DEFAULT_OVERLAY_HZ:-5.0}"
 DEFAULT_PLOT_HZ="${DEFAULT_PLOT_HZ:-30.0}"
 DEFAULT_PLOT_WINDOW_S="${DEFAULT_PLOT_WINDOW_S:-30.0}"
 DEFAULT_BBOX_CENTER_ADJUSTMENT_PATH="${DEFAULT_BBOX_CENTER_ADJUSTMENT_PATH:-$INTEGRATION_ROOT/ref/Stereo_Camera_3D_Position_DKL/Cent_Bbox_Adj_Mtrx.csv}"
@@ -55,6 +54,7 @@ SIM_SCENARIO_CONFIG="${SIM_SCENARIO_CONFIG:-}"
 SIM_EXPLICIT_NAMES=(
   CAMERA_BASELINE_M CAMERA_HEIGHT_M CAMERA_HORIZONTAL_FOV_RAD
   CAMERA_IMAGE_WIDTH_PX CAMERA_IMAGE_HEIGHT_PX CAMERA_UPDATE_RATE_HZ
+  OVERLAY_PUBLISH_HZ
   CAMERA_CLIP_NEAR_M CAMERA_CLIP_FAR_M
   CAM_L_MAG_NOISE_X_GAUSS CAM_L_MAG_NOISE_Y_GAUSS CAM_L_MAG_NOISE_Z_GAUSS
   CAM_R_MAG_NOISE_X_GAUSS CAM_R_MAG_NOISE_Y_GAUSS CAM_R_MAG_NOISE_Z_GAUSS
@@ -88,12 +88,17 @@ SIM_EXPLICIT_NAMES=(
   DRONE_LAND_TIMEOUT_S DRONE_SETPOINT_HZ
   YOLO_MODEL_PATH YOLO_CLASS_NAME YOLO_CONFIDENCE YOLO_DEVICE YOLO_TARGET_HZ
   YOLO_IMGSZ YOLO_BACKEND YOLO_TENSORRT_ENGINE_PATH MEASUREMENT_QUEUE_CAPACITY
-  YOLO_PYTHON YOLO_PYTHONPATH
+  YOLO_ALLOW_CPU_FALLBACK
+  YOLO_PYTHON YOLO_PYTHONPATH YOLO_VENV_ISOLATED YOLO_TORCH_BACKEND
+  YOLO_TORCH_CUDA_INDEX_URL YOLO_TORCH_VERSION YOLO_TORCHVISION_VERSION
+  YOLO_TORCHAUDIO_VERSION YOLO_ULTRALYTICS_VERSION
   BBOX_CENTER_ADJUSTMENT_ENABLE BBOX_CENTER_ADJUSTMENT_PATH
 )
 # shellcheck disable=SC1091
 source "$ROOT_DIR/scripts/load_sim_config.sh"
 load_sim_config_preserving_env "${SIM_EXPLICIT_NAMES[@]}"
+
+DEFAULT_OVERLAY_HZ="${DEFAULT_OVERLAY_HZ:-${OVERLAY_PUBLISH_HZ:-5.0}}"
 
 # Fallback for SIM_CONFIG files that predate this variable.
 PX4_GZ_MODEL_NAME="${PX4_GZ_MODEL_NAME:-x500_15m}"
@@ -177,6 +182,19 @@ resolve_executable() {
     fi
     resolved="$(command -v "$candidate" 2>/dev/null || true)"
     if [[ -n "$resolved" && -x "$resolved" ]]; then
+      printf '%s\n' "$resolved"
+      return 0
+    fi
+  done
+  return 1
+}
+
+resolve_operator_recorder_python() {
+  local candidate resolved
+  for candidate in "$@"; do
+    resolved="$(resolve_executable "$candidate" || true)"
+    [[ -n "$resolved" ]] || continue
+    if "$resolved" -c 'import cv2, xlsxwriter' >/dev/null 2>&1; then
       printf '%s\n' "$resolved"
       return 0
     fi
@@ -285,7 +303,8 @@ Options:
   --yolo-class NAME      Target class name in the .pt model. Default: UAV.
   --yolo-conf VALUE      YOLO confidence threshold. Default: 0.10.
   --yolo-device DEVICE   YOLO device. Default: cuda:0, with CPU fallback if unavailable.
-  --yolo-hz VALUE        YOLO scheduler target in Hz. Default: 40.0 to keep measured output above 20 Hz.
+  --yolo-hz VALUE        YOLO scheduler target in Hz. Default from config/simulation.env.
+  --overlay-hz VALUE     Per-eye detection overlay and MP4 target FPS. Default from config.
   --yolo-imgsz PIXELS    YOLO inference image size. Default from config/simulation.env.
   --yolo-backend NAME    tensorrt (default) or pytorch. TensorRT uses a local FP16 engine.
   --yolo-python FILE     Python used for the YOLO distance node. Default: local .venv or python3.
@@ -533,6 +552,10 @@ while (($#)); do
       ;;
     --yolo-hz)
       launch_input+=("yolo_target_hz:=${2:?missing value for --yolo-hz}")
+      shift 2
+      ;;
+    --overlay-hz)
+      DEFAULT_OVERLAY_HZ="${2:?missing value for --overlay-hz}"
       shift 2
       ;;
     --yolo-imgsz)
@@ -801,17 +824,28 @@ elif [[ -z "$DEFAULT_YOLO_MODEL" ]]; then
   printf '%s\n' "warning: YOLO model is not configured; stereo YOLO distance estimation will stay disabled." >&2
 fi
 if [[ "$yolo_enabled" == true && -n "$DEFAULT_YOLO_MODEL" ]]; then
-  if DEFAULT_YOLO_PYTHON="$(bash "$ROOT_DIR/scripts/ensure_yolo_runtime.sh" \
-    --venv-dir "$ROOT_DIR/.venv" \
+  ensure_yolo_args=(
+    --venv-dir "$ROOT_DIR/.venv"
     --preferred-python "$YOLO_BOOTSTRAP_PREFERRED_PYTHON"
-  )"; then
+  )
+  case "${YOLO_VENV_ISOLATED:-false}" in
+    true|TRUE|1|yes|YES) ensure_yolo_args+=(--isolated) ;;
+  esac
+  if DEFAULT_YOLO_PYTHON="$(bash "$ROOT_DIR/scripts/ensure_yolo_runtime.sh" "${ensure_yolo_args[@]}")"; then
     local_site_packages="$(find "$ROOT_DIR/.venv" -maxdepth 3 -type d -name site-packages 2>/dev/null | head -n 1 || true)"
     if [[ -n "$local_site_packages" && -d "$local_site_packages" ]]; then
       export PYTHONPATH="$local_site_packages${PYTHONPATH:+:$PYTHONPATH}"
     fi
+    if [[ -f "$DEFAULT_YOLO_MODEL" ]]; then
+      printf 'YOLO model sha256: %s  %s\n' \
+        "$(sha256sum "$DEFAULT_YOLO_MODEL" | awk '{print $1}')" \
+        "$DEFAULT_YOLO_MODEL"
+    fi
   else
-    printf '%s\n' "warning: failed to prepare YOLO Python runtime; stereo YOLO distance estimation may stay disabled." >&2
-    DEFAULT_YOLO_PYTHON="$(resolve_executable "$DEFAULT_YOLO_PYTHON" python3 || true)"
+    printf '%s\n' \
+      "error: failed to prepare the requested YOLO runtime; refusing an unverified CPU/system-Python fallback." \
+      "Use --no-yolo for an explicitly detection-free launch." >&2
+    exit 2
   fi
 fi
 if [[ "$yolo_enabled" == true && -z "$DEFAULT_YOLO_PYTHON" ]]; then
@@ -852,7 +886,16 @@ if [[ "$yolo_enabled" == true ]]; then
 fi
 export YOLO_BACKEND="$DEFAULT_YOLO_BACKEND"
 export YOLO_MODEL_PATH="$DEFAULT_YOLO_MODEL"
-OPERATOR_RECORDER_PYTHON="${OPERATOR_RECORDER_PYTHON:-${DEFAULT_YOLO_PYTHON:-$(command -v python3 2>/dev/null || true)}}"
+if ! OPERATOR_RECORDER_PYTHON="$(resolve_operator_recorder_python \
+  "${OPERATOR_RECORDER_PYTHON:-}" \
+  /usr/bin/python3 \
+  python3 \
+  "$ROOT_DIR/.venv/bin/python"
+)"; then
+  printf '%s\n' \
+    "error: operator recorder requires a Python runtime with cv2 and xlsxwriter." >&2
+  exit 2
+fi
 
 if [[ "$GAZEBO_MAJOR_VERSION" -ge 7 ]] && ! command -v gz >/dev/null 2>&1; then
   printf '%s\n' \
@@ -869,6 +912,8 @@ source "$PX4_MSGS_PACKAGE_SETUP"
 set -u
 
 children=()
+px4_supervisor_state_dir=""
+px4_ready_file=""
 start_uxrce_dds_agent() {
   local port="$1"
   local existing_pid agent_binary agent_prefix candidate_library_path agent_library_path agent_pid agent_log
@@ -1022,12 +1067,17 @@ cleanup() {
       kill -TERM "-$pid" >/dev/null 2>&1 || kill "$pid" >/dev/null 2>&1 || true
     fi
   done
-  # The recorder flushes CSV/MP4/XLSX and writes its final validity marker on
-  # SIGTERM.  Give it a bounded grace period before the generic child cleanup
-  # escalates to SIGKILL; otherwise Stop can leave RUN_INCOMPLETE despite a
-  # completed Auto mission.
+  # The recorder flushes CSV/MP4/XLSX and writes its final progress state on
+  # SIGTERM. Long 2 m/s waypoint runs can exceed 9,000 telemetry rows, for
+  # which XLSX generation takes longer than the old 15-second grace period.
+  # Wait for the explicit finalized state (or process exit) before the generic
+  # child cleanup escalates to SIGKILL.
   if [[ -n "$recording_pid" ]]; then
-    for _ in {1..15}; do
+    for _ in {1..180}; do
+      if [[ -f "${record_dir:-}/progress.json" ]] \
+        && rg -q '"state"[[:space:]]*:[[:space:]]*"finalized"' "${record_dir}/progress.json"; then
+        break
+      fi
       kill -0 "$recording_pid" >/dev/null 2>&1 || break
       sleep 1
     done
@@ -1053,6 +1103,12 @@ cleanup() {
   terminate_matching KILL "^gz sim server$"
   terminate_matching KILL "^gz sim gui$"
   terminate_gz_sim_processes KILL
+  if [[ -n "${px4_ready_file:-}" ]]; then
+    /bin/rm -f -- "$px4_ready_file" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${px4_supervisor_state_dir:-}" ]]; then
+    /bin/rmdir -- "$px4_supervisor_state_dir" >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup EXIT INT TERM
 cleanup_previous_run
@@ -1200,6 +1256,7 @@ if [[ -n "$DEFAULT_YOLO_MODEL" ]]; then
   add_default_launch_arg yolo_class_name "$DEFAULT_YOLO_CLASS" "${launch_input[@]}"
   add_default_launch_arg yolo_confidence "$DEFAULT_YOLO_CONFIDENCE" "${launch_input[@]}"
   add_default_launch_arg yolo_device "$DEFAULT_YOLO_DEVICE" "${launch_input[@]}"
+  add_default_launch_arg yolo_allow_cpu_fallback "${YOLO_ALLOW_CPU_FALLBACK:-true}" "${launch_input[@]}"
   add_default_launch_arg yolo_target_hz "$DEFAULT_YOLO_HZ" "${launch_input[@]}"
   add_default_launch_arg yolo_imgsz "$DEFAULT_YOLO_IMGSZ" "${launch_input[@]}"
   add_default_launch_arg measurement_queue_capacity "${MEASUREMENT_QUEUE_CAPACITY:-4096}" "${launch_input[@]}"
@@ -1238,6 +1295,11 @@ if ! has_launch_arg enable_rviz_rays "${launch_input[@]}"; then
   launch_args+=("enable_rviz_rays:=true")
 fi
 launch_args+=("${launch_input[@]}")
+export CAMERA_UPDATE_RATE_HZ="$(get_launch_arg_value camera_update_rate_hz "${launch_args[@]}" || printf '%s' "${CAMERA_UPDATE_RATE_HZ:-}")"
+export YOLO_TARGET_HZ="$(get_launch_arg_value yolo_target_hz "${launch_args[@]}" || printf '%s' "${YOLO_TARGET_HZ:-}")"
+export YOLO_IMGSZ="$(get_launch_arg_value yolo_imgsz "${launch_args[@]}" || printf '%s' "${YOLO_IMGSZ:-}")"
+export YOLO_DEVICE="$(get_launch_arg_value yolo_device "${launch_args[@]}" || printf '%s' "${YOLO_DEVICE:-}")"
+export OVERLAY_PUBLISH_HZ="$(get_launch_arg_value overlay_publish_hz "${launch_args[@]}" || printf '%s' "${OVERLAY_PUBLISH_HZ:-}")"
 research_output_dir="$(get_launch_arg_value research_output_dir "${launch_args[@]}" || true)"
 rqt_yolo_model_path="${DEFAULT_YOLO_MODEL:-}"
 explicit_yolo_model_path="$(get_launch_arg_value yolo_model_path "${launch_args[@]}" || true)"
@@ -1310,6 +1372,8 @@ start_uxrce_dds_agent "$CAM_R_PX4_UXRCE_DDS_PORT"
 if [[ "$PX4_CONSOLE_LOG" != "/dev/null" ]]; then
   mkdir -p "$(dirname "$PX4_CONSOLE_LOG")"
 fi
+px4_supervisor_state_dir="$(mktemp -d /tmp/sasl-px4-supervisor.XXXXXX)"
+px4_ready_file="$px4_supervisor_state_dir/instances-started"
 setsid bash -c '
     set -euo pipefail
     px4_dir="$1"
@@ -1331,6 +1395,7 @@ setsid bash -c '
     cam_r_sim_gps_used="${17}"
     left_uxrce_dds_port="${18}"
     right_uxrce_dds_port="${19}"
+    ready_file="${20}"
     cd "$px4_dir"
     export DISPLAY="$display_value"
     if [[ -x "$px4_python" ]]; then
@@ -1425,6 +1490,7 @@ setsid bash -c '
     start_px4_instance 0 "$target_model" "" target 4001 "$target_uxrce_dds_port"
     start_px4_instance "$left_instance" "$left_model" "$left_namespace" camera-left 4090 "$left_uxrce_dds_port" "$cam_l_sim_gps_used"
     start_px4_instance "$right_instance" "$right_model" "$right_namespace" camera-right 4090 "$right_uxrce_dds_port" "$cam_r_sim_gps_used"
+    : > "$ready_file"
     wait -n "${pids[@]}"
   ' _ \
     "$PX4_DIR" \
@@ -1445,9 +1511,27 @@ setsid bash -c '
     "${CAM_L_SIM_GPS_USED:-10}" \
     "${CAM_R_SIM_GPS_USED:-10}" \
     "$CAM_L_PX4_UXRCE_DDS_PORT" \
-    "$CAM_R_PX4_UXRCE_DDS_PORT" &
+    "$CAM_R_PX4_UXRCE_DDS_PORT" \
+    "$px4_ready_file" &
 px4_supervisor_pid="$!"
 children+=("$px4_supervisor_pid")
+
+# A short-lived ROS launch must not win the parent wait before the PX4
+# supervisor has completed its build and spawned all three instances. The
+# supervisor writes this readiness file only after all start calls return.
+while [[ ! -f "$px4_ready_file" ]]; do
+  if ! kill -0 "$px4_supervisor_pid" >/dev/null 2>&1; then
+    if wait "$px4_supervisor_pid"; then
+      px4_start_status=0
+    else
+      px4_start_status=$?
+    fi
+    printf '%s\n' \
+      "error: PX4 instance supervisor exited unexpectedly; operator view is stopping." >&2
+    exit "$px4_start_status"
+  fi
+  /bin/sleep 0.05
+done
 printf '%s\n' \
   "Target PX4 instance 0: model=$PX4_GZ_MODEL_NAME namespace=/fmu port=$PX4_UXRCE_DDS_PORT" \
   "Camera_Left PX4 instance ${CAM_L_PX4_INSTANCE:-1}: model=${CAM_L_PX4_MODEL_NAME:-left_stereo_camera} namespace=/${CAM_L_PX4_DDS_NAMESPACE:-camera_left}/fmu port=$CAM_L_PX4_UXRCE_DDS_PORT" \
@@ -1575,6 +1659,9 @@ if [[ "$run_mission" == true ]]; then
   setsid bash -c 'delay="$1"; root="$2"; shift 2; sleep "$delay"; exec "$root/run_mission.sh" "$@"' _ "$mission_delay_s" "$ROOT_DIR" "${mission_args[@]}" &
   children+=("$!")
   printf '%s\n' "PX4 mission will start after ${mission_delay_s}s."
+  # Let the mission wrapper enter its delay before a simultaneously
+  # short-lived ROS child can win wait -n and trigger cleanup.
+  /bin/sleep 0.1
 fi
 
 printf '%s\n' "Operator view started."

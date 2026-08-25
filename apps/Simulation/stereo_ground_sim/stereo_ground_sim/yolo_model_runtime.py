@@ -206,6 +206,10 @@ class YoloModelRuntime:
             f"precision={backend_precision}."
         )
         if requested_cuda and not verified_cuda_fp16:
+            if not getattr(self.node, "yolo_allow_cpu_fallback", True):
+                raise RuntimeError(
+                    f"{message} CUDA FP16 was required and CPU/FP32 fallback is disabled."
+                )
             self.node.get_logger().warning(message)
         else:
             self.node.get_logger().info(message)
@@ -390,6 +394,10 @@ class YoloModelRuntime:
         if str(requested_device).startswith("cuda") and not (
             str(backend_device).startswith("cuda") and backend_precision == "fp16"
         ):
+            if not getattr(self.node, "yolo_allow_cpu_fallback", True):
+                raise RuntimeError(
+                    f"{message} CUDA FP16 was required and CPU/FP32 fallback is disabled."
+                )
             self.node.get_logger().warning(message)
         else:
             self.node.get_logger().info(message)
@@ -485,6 +493,11 @@ class YoloModelRuntime:
                 if torch.cuda.is_available():
                     self.node.yolo_cpu_fallback = False
                     return self.node._log_cuda_device("cuda:0", torch)
+                if not getattr(self.node, "yolo_allow_cpu_fallback", True):
+                    raise RuntimeError(
+                        "YOLO device is auto, CUDA is unavailable, and CPU fallback is disabled. "
+                        + self.node._cuda_status_message(torch)
+                    )
                 if not self.node.yolo_device_warning_logged:
                     self.node.get_logger().warning(
                         "YOLO device is auto, but CUDA is not available; using CPU. "
@@ -493,6 +506,10 @@ class YoloModelRuntime:
                     self.node.yolo_device_warning_logged = True
                 self.node.yolo_cpu_fallback = True
             except Exception as exc:
+                if not getattr(self.node, "yolo_allow_cpu_fallback", True):
+                    raise RuntimeError(
+                        f"YOLO auto-device CUDA check failed while CPU fallback is disabled: {exc}"
+                    ) from exc
                 if not self.node.yolo_device_warning_logged:
                     self.node.get_logger().warning(
                         f"YOLO device is auto, but torch CUDA check failed: {exc}; using CPU."
@@ -508,6 +525,10 @@ class YoloModelRuntime:
                     self.node.yolo_cpu_fallback = False
                     return self.node._log_cuda_device(device, torch)
             except Exception as exc:
+                if not getattr(self.node, "yolo_allow_cpu_fallback", True):
+                    raise RuntimeError(
+                        f"Requested YOLO device '{device}' failed its CUDA check and CPU fallback is disabled: {exc}"
+                    ) from exc
                 if not self.node.yolo_device_warning_logged:
                     self.node.get_logger().warning(
                         f"Requested YOLO device '{device}', but torch CUDA check failed: {exc}; "
@@ -516,6 +537,11 @@ class YoloModelRuntime:
                     self.node.yolo_device_warning_logged = True
                 self.node.yolo_cpu_fallback = True
                 return "cpu"
+            if not getattr(self.node, "yolo_allow_cpu_fallback", True):
+                raise RuntimeError(
+                    f"Requested YOLO device '{device}', but CUDA is unavailable and CPU fallback is disabled. "
+                    + self.node._cuda_status_message(torch)
+                )
             if not self.node.yolo_device_warning_logged:
                 self.node.get_logger().warning(
                     f"Requested YOLO device '{device}', but CUDA is not available; falling back to CPU. "
@@ -597,6 +623,12 @@ class YoloModelRuntime:
             return device
         except Exception as exc:
             self.node.yolo_load_error = f"YOLO model move to {device} failed: {exc}"
+            if device.startswith("cuda") and not getattr(
+                self.node, "yolo_allow_cpu_fallback", True
+            ):
+                raise RuntimeError(
+                    f"{self.node.yolo_load_error}; CPU fallback is disabled"
+                ) from exc
             if device.startswith("cuda") and not self.node.yolo_device_warning_logged:
                 self.node.get_logger().warning(
                     f"Could not move YOLO model to '{device}'; falling back to CPU: {exc}"

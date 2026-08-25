@@ -1,6 +1,7 @@
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+import sys
 
 import numpy as np
 
@@ -119,6 +120,26 @@ def test_prediction_backend_verification_warns_on_cuda_fp32_mismatch():
     ]
 
 
+def test_prediction_backend_mismatch_fails_when_fallback_is_disabled():
+    logger = _Logger()
+    node = SimpleNamespace(
+        yolo_allow_cpu_fallback=False,
+        get_logger=lambda: logger,
+    )
+    runtime = YoloModelRuntime(node)
+    backend = SimpleNamespace(device="cpu", fp16=False)
+    model = SimpleNamespace(predictor=SimpleNamespace(model=backend))
+
+    try:
+        runtime._verify_prediction_backend(model, "cuda:0")
+    except RuntimeError as exc:
+        assert "CUDA FP16 was required" in str(exc)
+    else:
+        raise AssertionError("backend mismatch must fail closed")
+
+    assert logger.warning_messages == []
+
+
 def test_prediction_kwargs_filter_before_nms_and_retain_one_box_per_camera():
     node = SimpleNamespace(yolo_confidence=0.1, yolo_imgsz=736)
     runtime = YoloModelRuntime(node)
@@ -167,6 +188,33 @@ def test_cuda_process_isolation_defaults_on_and_can_be_disabled(monkeypatch):
 
     monkeypatch.setenv("SASL_YOLO_PROCESS_ISOLATION", "false")
     assert YoloModelRuntime._use_yolo_process("cuda:0") is False
+
+
+def test_explicit_cuda_request_fails_closed_when_cpu_fallback_is_disabled(monkeypatch):
+    logger = _Logger()
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(is_available=lambda: False, device_count=lambda: 1),
+        version=SimpleNamespace(cuda="13.2"),
+        __version__="2.12.0+cu132",
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    node = SimpleNamespace(
+        yolo_device="cuda:0",
+        yolo_allow_cpu_fallback=False,
+        yolo_device_warning_logged=False,
+        get_logger=lambda: logger,
+        _cuda_status_message=lambda torch: "torch_cuda=13.2 device_count=1",
+    )
+    runtime = YoloModelRuntime(node)
+
+    try:
+        runtime._resolve_yolo_device()
+    except RuntimeError as exc:
+        assert "CPU fallback is disabled" in str(exc)
+    else:
+        raise AssertionError("CUDA unavailability must fail closed")
+
+    assert runtime.yolo_cpu_fallback is False
 
 
 def test_process_backend_verification_records_cuda_fp16_once():

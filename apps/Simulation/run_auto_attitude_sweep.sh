@@ -31,13 +31,22 @@ SIM_CONFIG="${SIM_CONFIG:-$ROOT_DIR/config/simulation.env}"
 SIM_SCENARIO_CONFIG="${SIM_SCENARIO_CONFIG:-}"
 SIM_EXPLICIT_NAMES=(
   SWEEP_AXES SWEEP_VALUES_DEG SWEEP_REPETITIONS SWEEP_OUTPUT_DIR
+  SWEEP_TRAJECTORIES SWEEP_WAYPOINT_COUNT SWEEP_WAYPOINT_HOLD_S SWEEP_FINAL_HOVER_S
+  SWEEP_ZIGZAG_AMPLITUDE_M SWEEP_WAYPOINTS_RFU_M SWEEP_ZIGZAG_OVERLAP_RATIO
+  SWEEP_PIXEL_MARGIN_PX SWEEP_ENTRY_MIN_WORLD_FRONT_M SWEEP_RECORD_WAIT_FOR_BBOX
+  SWEEP_STABILITY_WINDOW_S SWEEP_STABILITY_POSITION_P95_MAX_M
+  SWEEP_STABILITY_ATTITUDE_MAX_DEG
+  SWEEP_GUIDANCE_MODE
   SWEEP_WAIT_S SWEEP_SEED SWEEP_RANDOMIZE SWEEP_SKIP_COLCON_BUILD
   SWEEP_SKIP_PX4_BUILD
   SWEEP_KEEP_GOING SWEEP_FORCE_EXISTING_SIM SWEEP_CAMERA_UPDATE_RATE_HZ
-  SWEEP_YOLO_TARGET_HZ
+  SWEEP_YOLO_TARGET_HZ SWEEP_OVERLAY_PUBLISH_HZ
+  SWEEP_PERFORMANCE_WARMUP_S SWEEP_PERFORMANCE_MIN_STEADY_S
+  SWEEP_MIN_YOLO_UPDATE_HZ SWEEP_MAX_YOLO_INFERENCE_P95_MS
+  SWEEP_MIN_OVERLAY_HZ SWEEP_BASELINE_ONLY
   CAM_L_OPTICAL_ROLL_DEG CAM_L_OPTICAL_PITCH_DEG CAM_L_OPTICAL_YAW_DEG
   CAM_R_OPTICAL_ROLL_DEG CAM_R_OPTICAL_PITCH_DEG CAM_R_OPTICAL_YAW_DEG
-  WAYPOINT_SPEED_MPS WAYPOINT_TIMEOUT_S WAYPOINT_LAND_AFTER WAYPOINT_STOP_AFTER_HOVER
+  WAYPOINT_SPEED_MPS WAYPOINT_HOLD_S WAYPOINT_TIMEOUT_S WAYPOINT_LAND_AFTER WAYPOINT_STOP_AFTER_HOVER
   DRONE_TARGET_DISTANCE_M DRONE_SPAWN_Y_M DRONE_MOVE_DISTANCE_M AUTO_WAYPOINT_RANGE_STEP_M
 )
 # shellcheck disable=SC1091
@@ -63,29 +72,40 @@ Options:
                            yaw simultaneously in one case.
   --values-deg LIST        Comma-separated degrees. Default: -1.0..1.0 in 0.1 steps.
   --repetitions N          Repeat every non-zero attitude case. Default: 1.
+  --trajectories LIST      Comma-separated paths: center,zigzag. Default: center,zigzag.
+  --waypoint-count N       Waypoints per path, including both range endpoints. Default: 8.
+  --zigzag-amplitude-m N   Zigzag lateral amplitude. Default: 2.0 m.
+  --waypoints-rfu-m LIST   Explicit baseline-center world RFU waypoints.
+  --zigzag-overlap-ratio N Fraction of horizontal stereo-overlap half-width.
+  --final-hover-s N        Additional hover after the final waypoint. Default: 0.
+  --pixel-margin-px N      FOV generator edge margin. Default: 32 px.
   --output-dir DIR         Evidence directory. Default: apps/Simulation/recordings/auto-attitude-sweep-....
   --px4-dir DIR            PX4 checkout passed to run_operator_view.sh.
   --skip-colcon-build      Reuse the existing ROS install for every case.
   --skip-px4-build         Reuse the existing PX4 SITL build for every case.
   --wait-s N               PX4 readiness timeout per case. Default: 120.
-  --camera-hz N            Camera/measurement sampling Hz per sweep case. Default: 2.
+  --camera-hz N            Camera/measurement sampling Hz per sweep case. Default from config.
   --yolo-hz N              YOLO target Hz per sweep case. Default: camera Hz.
+  --overlay-hz N           Per-eye overlay publication/MP4 FPS. Default: camera Hz.
+  --baseline-only          Run only the zero-error baseline for each trajectory.
+  --guidance-mode MODE     Waypoint transit contract. Default: velocity_only.
   --seed N                 Randomization seed. Default: current epoch seconds.
   --ordered                Keep axis/value order instead of randomizing it.
   --keep-going             Continue after a failed case.
   --force-existing-sim     Allow cleanup of an existing operator session.
+  --plan-only              Generate paths/contracts and exit before launching PX4.
   --help, -h               Show this help.
 
-The non-zero attitude cases are randomized by default. A single 0 deg
-baseline case runs once up front as the reference every condition is
-compared against, so case count is axes x values + 1.
+The non-zero attitude cases are randomized by default. Each trajectory gets
+one 0 deg baseline case followed by one case per non-zero axis/value
+condition, so case count is trajectories x (axes x values + 1).
 RViz and rqt_gui stay visible for every case; each case launches its own
 window set, so a long default sweep keeps a display busy throughout.
 
 This explicit research mode also starts a full telemetry/MP4 recorder per case.
-It stays armed but writes no CSV rows or MP4 frames until the first valid
-left/right bbox pair is detected. Normal run_auto.sh behavior is unchanged:
-interactive Auto still records only after rqt Save CSV or Save MP4 is pressed.
+SWEEP_RECORD_WAIT_FOR_BBOX controls whether it waits for the first valid
+left/right bbox pair or records from the first published frame. Normal
+run_auto.sh behavior is unchanged.
 Defaults are loaded from SIM_CONFIG (normally config/simulation.env); CLI
 options override SWEEP_* environment values.
 
@@ -111,6 +131,20 @@ normalize_bool() {
 axes_csv="${SWEEP_AXES:-roll,pitch,yaw,combined}"
 values_csv="${SWEEP_VALUES_DEG:--1.0,-0.9,-0.8,-0.7,-0.6,-0.5,-0.4,-0.3,-0.2,-0.1,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0}"
 repetitions="${SWEEP_REPETITIONS:-1}"
+trajectories_csv="${SWEEP_TRAJECTORIES:-center,zigzag}"
+waypoint_count="${SWEEP_WAYPOINT_COUNT:-${AUTO_WAYPOINT_COUNT:-8}}"
+waypoint_hold_s="${SWEEP_WAYPOINT_HOLD_S:-${WAYPOINT_HOLD_S:-5.0}}"
+final_hover_s="${SWEEP_FINAL_HOVER_S:-0.0}"
+zigzag_amplitude_m="${SWEEP_ZIGZAG_AMPLITUDE_M:-2.0}"
+waypoints_rfu_m="${SWEEP_WAYPOINTS_RFU_M:-}"
+zigzag_overlap_ratio="${SWEEP_ZIGZAG_OVERLAP_RATIO:-0.4}"
+pixel_margin_px="${SWEEP_PIXEL_MARGIN_PX:-32.0}"
+entry_min_world_front_m="${SWEEP_ENTRY_MIN_WORLD_FRONT_M:-}"
+record_wait_for_bbox="$(normalize_bool SWEEP_RECORD_WAIT_FOR_BBOX "${SWEEP_RECORD_WAIT_FOR_BBOX:-true}")"
+stability_window_s="${SWEEP_STABILITY_WINDOW_S:-3.0}"
+stability_position_p95_max_m="${SWEEP_STABILITY_POSITION_P95_MAX_M:-}"
+stability_attitude_max_deg="${SWEEP_STABILITY_ATTITUDE_MAX_DEG:-}"
+guidance_mode="${SWEEP_GUIDANCE_MODE:-velocity_only}"
 output_dir="${SWEEP_OUTPUT_DIR:-}"
 px4_dir="${PX4_DIR:-}"
 skip_colcon_build="$(normalize_bool SWEEP_SKIP_COLCON_BUILD "${SWEEP_SKIP_COLCON_BUILD:-false}")"
@@ -118,10 +152,18 @@ skip_px4_build="$(normalize_bool SWEEP_SKIP_PX4_BUILD "${SWEEP_SKIP_PX4_BUILD:-f
 wait_s="${SWEEP_WAIT_S:-120}"
 camera_update_rate_hz="${SWEEP_CAMERA_UPDATE_RATE_HZ:-2.0}"
 yolo_target_hz="${SWEEP_YOLO_TARGET_HZ:-$camera_update_rate_hz}"
+overlay_publish_hz="${SWEEP_OVERLAY_PUBLISH_HZ:-$camera_update_rate_hz}"
+performance_warmup_s="${SWEEP_PERFORMANCE_WARMUP_S:-15.0}"
+performance_min_steady_s="${SWEEP_PERFORMANCE_MIN_STEADY_S:-10.0}"
+min_yolo_update_hz="${SWEEP_MIN_YOLO_UPDATE_HZ:-15.0}"
+max_yolo_inference_p95_ms="${SWEEP_MAX_YOLO_INFERENCE_P95_MS:-66.7}"
+min_overlay_hz="${SWEEP_MIN_OVERLAY_HZ:-15.0}"
 seed="${SWEEP_SEED:-$(date +%s)}"
 randomize="$(normalize_bool SWEEP_RANDOMIZE "${SWEEP_RANDOMIZE:-true}")"
 keep_going="$(normalize_bool SWEEP_KEEP_GOING "${SWEEP_KEEP_GOING:-false}")"
 force_existing_sim="$(normalize_bool SWEEP_FORCE_EXISTING_SIM "${SWEEP_FORCE_EXISTING_SIM:-false}")"
+baseline_only="$(normalize_bool SWEEP_BASELINE_ONLY "${SWEEP_BASELINE_ONLY:-false}")"
+plan_only=false
 auto_args=()
 
 while (($#)); do
@@ -134,6 +176,13 @@ while (($#)); do
     --axes) axes_csv="${2:?missing value for --axes}"; shift 2 ;;
     --values-deg) values_csv="${2:?missing value for --values-deg}"; shift 2 ;;
     --repetitions) repetitions="${2:?missing value for --repetitions}"; shift 2 ;;
+    --trajectories) trajectories_csv="${2:?missing value for --trajectories}"; shift 2 ;;
+    --waypoint-count) waypoint_count="${2:?missing value for --waypoint-count}"; shift 2 ;;
+    --zigzag-amplitude-m) zigzag_amplitude_m="${2:?missing value for --zigzag-amplitude-m}"; shift 2 ;;
+    --waypoints-rfu-m) waypoints_rfu_m="${2:?missing value for --waypoints-rfu-m}"; shift 2 ;;
+    --zigzag-overlap-ratio) zigzag_overlap_ratio="${2:?missing value for --zigzag-overlap-ratio}"; shift 2 ;;
+    --final-hover-s) final_hover_s="${2:?missing value for --final-hover-s}"; shift 2 ;;
+    --pixel-margin-px) pixel_margin_px="${2:?missing value for --pixel-margin-px}"; shift 2 ;;
     --output-dir) output_dir="${2:?missing value for --output-dir}"; shift 2 ;;
     --px4-dir) px4_dir="${2:?missing value for --px4-dir}"; shift 2 ;;
     --skip-colcon-build) skip_colcon_build=true; shift ;;
@@ -141,10 +190,14 @@ while (($#)); do
     --wait-s) wait_s="${2:?missing value for --wait-s}"; shift 2 ;;
     --camera-hz) camera_update_rate_hz="${2:?missing value for --camera-hz}"; shift 2 ;;
     --yolo-hz) yolo_target_hz="${2:?missing value for --yolo-hz}"; shift 2 ;;
+    --overlay-hz) overlay_publish_hz="${2:?missing value for --overlay-hz}"; shift 2 ;;
+    --baseline-only) baseline_only=true; shift ;;
+    --guidance-mode) guidance_mode="${2:?missing value for --guidance-mode}"; shift 2 ;;
     --seed) seed="${2:?missing value for --seed}"; shift 2 ;;
     --ordered) randomize=false; shift ;;
     --keep-going) keep_going=true; shift ;;
     --force-existing-sim) force_existing_sim=true; shift ;;
+    --plan-only) plan_only=true; shift ;;
     --help|-h) usage; exit 0 ;;
     *) printf 'error: unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
@@ -165,14 +218,65 @@ if [[ ! "$repetitions" =~ ^[1-9][0-9]*$ ]]; then
   printf '%s\n' 'error: --repetitions must be a positive integer' >&2
   exit 2
 fi
+if [[ ! "$waypoint_count" =~ ^[2-9][0-9]*$ ]]; then
+  printf '%s\n' 'error: --waypoint-count must be an integer of at least 2' >&2
+  exit 2
+fi
+if ! awk -v value="$waypoint_hold_s" 'BEGIN { exit !(value == value && value >= 0) }'; then
+  printf '%s\n' 'error: waypoint hold must be a non-negative number' >&2
+  exit 2
+fi
+if ! awk -v value="$final_hover_s" 'BEGIN { exit !(value == value && value >= 0) }'; then
+  printf '%s\n' 'error: final hover must be a non-negative number' >&2
+  exit 2
+fi
+if ! awk -v value="$zigzag_amplitude_m" 'BEGIN { exit !(value == value && value >= 0) }'; then
+  printf '%s\n' 'error: zigzag amplitude must be a non-negative number' >&2
+  exit 2
+fi
+if ! awk -v value="$zigzag_overlap_ratio" 'BEGIN { exit !(value == value && value >= 0 && value <= 1) }'; then
+  printf '%s\n' 'error: zigzag overlap ratio must be between 0 and 1' >&2
+  exit 2
+fi
+if ! awk -v value="$pixel_margin_px" 'BEGIN { exit !(value == value && value >= 0) }'; then
+  printf '%s\n' 'error: pixel margin must be a non-negative number' >&2
+  exit 2
+fi
+if [[ -n "$entry_min_world_front_m" ]] \
+  && ! awk -v value="$entry_min_world_front_m" 'BEGIN { exit !(value == value && value > 0) }'; then
+  printf '%s\n' 'error: entry minimum world Front must be a positive number' >&2
+  exit 2
+fi
+for stability_name in stability_window_s stability_position_p95_max_m stability_attitude_max_deg; do
+  stability_value="${!stability_name}"
+  if [[ -n "$stability_value" ]] \
+    && ! awk -v value="$stability_value" 'BEGIN { exit !(value == value && value > 0) }'; then
+    printf 'error: %s must be a positive number\n' "$stability_name" >&2
+    exit 2
+  fi
+done
 if ! awk -v value="$wait_s" 'BEGIN { exit !(value == value && value > 0) }'; then
   printf '%s\n' 'error: --wait-s must be a positive number' >&2
   exit 2
 fi
-for rate_name in camera_update_rate_hz yolo_target_hz; do
+case "$guidance_mode" in
+  position_velocity_final_target|position_only_final_target|velocity_only) ;;
+  *)
+    printf 'error: unsupported guidance mode: %s\n' "$guidance_mode" >&2
+    exit 2
+    ;;
+esac
+for rate_name in camera_update_rate_hz yolo_target_hz overlay_publish_hz min_yolo_update_hz min_overlay_hz; do
   rate_value="${!rate_name}"
   if ! awk -v value="$rate_value" 'BEGIN { exit !(value == value && value > 0) }'; then
     printf 'error: %s must be a positive number\n' "$rate_name" >&2
+    exit 2
+  fi
+done
+for performance_name in performance_warmup_s performance_min_steady_s max_yolo_inference_p95_ms; do
+  performance_value="${!performance_name}"
+  if ! awk -v value="$performance_value" 'BEGIN { exit !(value == value && value > 0) }'; then
+    printf 'error: %s must be a positive number\n' "$performance_name" >&2
     exit 2
   fi
 done
@@ -192,6 +296,18 @@ for axis in "${axes[@]}"; do
   case "$axis" in
     roll|pitch|yaw|combined) ;;
     *) printf 'error: unsupported axis %s; use roll,pitch,yaw,combined\n' "$axis" >&2; exit 2 ;;
+  esac
+done
+IFS=',' read -r -a trajectories <<< "$trajectories_csv"
+if ((${#trajectories[@]} == 0)); then
+  printf '%s\n' 'error: --trajectories must not be empty' >&2
+  exit 2
+fi
+for trajectory in "${trajectories[@]}"; do
+  trajectory="${trajectory//[[:space:]]/}"
+  case "$trajectory" in
+    center|zigzag) ;;
+    *) printf 'error: unsupported trajectory %s; use center,zigzag\n' "$trajectory" >&2; exit 2 ;;
   esac
 done
 IFS=',' read -r -a values <<< "$values_csv"
@@ -238,49 +354,67 @@ if [[ "$force_existing_sim" != true ]]; then
   fi
 fi
 
-# Every case must fly the exact same physical trajectory so that recorded
-# differences are attributable to attitude error alone, not to a different
-# flight path -- so the shared waypoint path is generated once, here, from
-# the *baseline* (unperturbed) camera attitude, and reused by every case.
-# Mirrors run_auto.sh's own generation call (min/max range derived from the
-# target drone's own spawn/approach geometry) so this is byte-identical to
-# what a baseline-only run_auto.sh run would generate today.
+# Every attitude case within one trajectory must fly the exact same physical
+# path, so recorded differences are attributable to attitude error alone. One
+# shared path is generated for each requested trajectory from the baseline
+# camera attitude and reused by every case in that trajectory.
 shared_waypoints_dir="$output_dir/shared_waypoints"
 drone_spawn_y_m="${DRONE_SPAWN_Y_M:-2000}"
 drone_move_distance_m="${DRONE_MOVE_DISTANCE_M:-0}"
 shared_waypoint_max_range_m="$(awk -v v="$drone_spawn_y_m" 'BEGIN { printf "%.6f", v }')"
 shared_waypoint_min_range_m="$(awk -v spawn="$drone_spawn_y_m" -v move="$drone_move_distance_m" \
   'BEGIN { v = spawn - move; if (v < 1.0) v = 1.0; printf "%.6f", v }')"
-shared_waypoint_range_step_m="${AUTO_WAYPOINT_RANGE_STEP_M:-5.0}"
-shared_pixel_margin_px="$(awk -v w="${CAMERA_IMAGE_WIDTH_PX:-1280}" -v r="${AUTO_FOV_MARGIN_RATIO:-0.05}" 'BEGIN { printf "%.6f", w * r }')"
-printf '%s\n' "Generating the shared waypoint path (every ${shared_waypoint_range_step_m} m Front," \
-  "range ${shared_waypoint_min_range_m}-${shared_waypoint_max_range_m} m) from baseline attitude" \
-  "L=(${CAM_L_OPTICAL_ROLL_DEG:-0},${CAM_L_OPTICAL_PITCH_DEG:-0},${CAM_L_OPTICAL_YAW_DEG:-0})" \
-  "R=(${CAM_R_OPTICAL_ROLL_DEG:-0},${CAM_R_OPTICAL_PITCH_DEG:-0},${CAM_R_OPTICAL_YAW_DEG:-0}) deg -> $shared_waypoints_dir"
-python3 "$ROOT_DIR/scripts/generate_fov_constrained_waypoints.py" \
-  --output-dir "$shared_waypoints_dir" \
-  --seed "${AUTO_WAYPOINT_SEED:-20260729}" \
-  --calibration-count 0 \
-  --validation-count "${AUTO_WAYPOINT_COUNT:-8}" \
-  --min-range-m "$shared_waypoint_min_range_m" \
-  --max-range-m "$shared_waypoint_max_range_m" \
-  --range-step-m "$shared_waypoint_range_step_m" \
-  --camera-baseline-m "${CAMERA_BASELINE_M:-25.0}" \
-  --camera-height-m "${CAMERA_HEIGHT_M:-0.1}" \
-  --px4-origin-world-east-m "${DRONE_SPAWN_X_M:-0.0}" \
-  --px4-origin-world-north-m "${DRONE_SPAWN_Y_M:-0.0}" \
-  --px4-origin-world-up-m "${DRONE_SPAWN_Z_M:-0.0}" \
-  --cam-l-optical-roll-deg "${CAM_L_OPTICAL_ROLL_DEG:-0.0}" \
-  --cam-l-optical-pitch-deg "${CAM_L_OPTICAL_PITCH_DEG:-0.0}" \
-  --cam-l-optical-yaw-deg "${CAM_L_OPTICAL_YAW_DEG:-0.0}" \
-  --cam-r-optical-roll-deg "${CAM_R_OPTICAL_ROLL_DEG:-0.0}" \
-  --cam-r-optical-pitch-deg "${CAM_R_OPTICAL_PITCH_DEG:-0.0}" \
-  --cam-r-optical-yaw-deg "${CAM_R_OPTICAL_YAW_DEG:-0.0}" \
-  --horizontal-fov-rad "${CAMERA_HORIZONTAL_FOV_RAD:-0.154997710698}" \
-  --image-width-px "${CAMERA_IMAGE_WIDTH_PX:-1280}" \
-  --image-height-px "${CAMERA_IMAGE_HEIGHT_PX:-720}" \
-  --pixel-margin-px "$shared_pixel_margin_px"
-shared_path_file="$shared_waypoints_dir/validation_mission.csv"
+shared_pixel_margin_px="$pixel_margin_px"
+declare -A shared_path_files=()
+for trajectory in "${trajectories[@]}"; do
+  trajectory="${trajectory//[[:space:]]/}"
+  trajectory_dir="$shared_waypoints_dir/$trajectory"
+  shared_path_files["$trajectory"]="$trajectory_dir/validation_mission.csv"
+  printf '%s\n' "Generating $trajectory waypoint path (${waypoint_count} points, hold ${waypoint_hold_s} s) from baseline attitude" \
+    "L=(${CAM_L_OPTICAL_ROLL_DEG:-0},${CAM_L_OPTICAL_PITCH_DEG:-0},${CAM_L_OPTICAL_YAW_DEG:-0})" \
+    "R=(${CAM_R_OPTICAL_ROLL_DEG:-0},${CAM_R_OPTICAL_PITCH_DEG:-0},${CAM_R_OPTICAL_YAW_DEG:-0}) deg -> $trajectory_dir"
+  generator_cmd=(python3 "$ROOT_DIR/scripts/generate_fov_constrained_waypoints.py" \
+    --output-dir "$trajectory_dir" \
+    --seed "${AUTO_WAYPOINT_SEED:-20260729}" \
+    --calibration-count 0 \
+    --validation-count "$waypoint_count" \
+    --lateral-pattern "$trajectory" \
+    --zigzag-amplitude-m "$zigzag_amplitude_m" \
+    --min-range-m "$shared_waypoint_min_range_m" \
+    --max-range-m "$shared_waypoint_max_range_m" \
+    --camera-baseline-m "${CAMERA_BASELINE_M:-25.0}" \
+    --camera-height-m "${CAMERA_HEIGHT_M:-0.1}" \
+    --px4-origin-world-east-m "${DRONE_SPAWN_X_M:-0.0}" \
+    --px4-origin-world-north-m "${DRONE_SPAWN_Y_M:-0.0}" \
+    --px4-origin-world-up-m "${DRONE_SPAWN_Z_M:-0.0}" \
+    --cam-l-optical-roll-deg "${CAM_L_OPTICAL_ROLL_DEG:-0.0}" \
+    --cam-l-optical-pitch-deg "${CAM_L_OPTICAL_PITCH_DEG:-0.0}" \
+    --cam-l-optical-yaw-deg "${CAM_L_OPTICAL_YAW_DEG:-0.0}" \
+    --cam-r-optical-roll-deg "${CAM_R_OPTICAL_ROLL_DEG:-0.0}" \
+    --cam-r-optical-pitch-deg "${CAM_R_OPTICAL_PITCH_DEG:-0.0}" \
+    --cam-r-optical-yaw-deg "${CAM_R_OPTICAL_YAW_DEG:-0.0}" \
+    --horizontal-fov-rad "${CAMERA_HORIZONTAL_FOV_RAD:-0.154997710698}" \
+    --image-width-px "${CAMERA_IMAGE_WIDTH_PX:-1280}" \
+    --image-height-px "${CAMERA_IMAGE_HEIGHT_PX:-720}" \
+    --pixel-margin-px "$shared_pixel_margin_px")
+  if [[ -n "$waypoints_rfu_m" ]]; then
+    generator_cmd+=(
+      --waypoints-rfu-m "$waypoints_rfu_m"
+      --zigzag-overlap-ratio "$zigzag_overlap_ratio"
+    )
+  else
+    generator_cmd+=(--range-count "$waypoint_count")
+  fi
+  "${generator_cmd[@]}"
+done
+
+target_model_sdf_path="$ROOT_DIR/stereo_ground_sim/models/${PX4_GZ_MODEL_NAME:-x500_15m}/model.sdf"
+if [[ ! -f "$target_model_sdf_path" ]]; then
+  printf '%s\n' "error: target model SDF not found: $target_model_sdf_path" >&2
+  exit 2
+fi
+target_model_sdf_sha256="$(python3 "$ROOT_DIR/scripts/sdf_contract.py" --sdf "$target_model_sdf_path" --field sha256)"
+target_model_protected_geometry_sha256="$(python3 "$ROOT_DIR/scripts/sdf_contract.py" --sdf "$target_model_sdf_path" --field protected_geometry_sha256)"
 
 branch="$(git -C "$REPO_ROOT" branch --show-current 2>/dev/null || true)"
 commit_sha="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
@@ -291,7 +425,7 @@ git_remote_url="$(git -C "$REPO_ROOT" config --get remote.origin.url 2>/dev/null
 session_id="auto-attitude-sweep-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 run_id="auto-attitude-sweep"
 manifest="$output_dir/sweep_manifest.tsv"
-printf 'execution_order\tcase_id\taxis\tangle_deg\trepetition\tstatus\trecording_dir\teffective_config_sha256\n' > "$manifest"
+printf 'execution_order\ttrajectory\tcase_id\taxis\tangle_deg\trepetition\tstatus\trecording_dir\teffective_config_sha256\ttarget_model_sdf_sha256\n' > "$manifest"
 printf '%s\n' \
   "output_dir=$output_dir" \
   "session_id=$session_id" \
@@ -307,24 +441,56 @@ printf '%s\n' \
   "truth_source=Gazebo Target GT (offline calibration/validation only)" \
   "camera_update_rate_hz=$camera_update_rate_hz" \
   "yolo_target_hz=$yolo_target_hz" \
-  "shared_waypoint_path=$shared_path_file" \
+  "overlay_publish_hz=$overlay_publish_hz" \
+  "performance_warmup_s=$performance_warmup_s" \
+  "performance_min_steady_s=$performance_min_steady_s" \
+  "min_yolo_update_hz=$min_yolo_update_hz" \
+  "max_yolo_inference_p95_ms=$max_yolo_inference_p95_ms" \
+  "min_overlay_hz=$min_overlay_hz" \
+  "baseline_only=$baseline_only" \
+  "trajectories=$(IFS=,; echo "${trajectories[*]}")" \
+  "trajectory_count=${#trajectories[@]}" \
+  "waypoint_count=$waypoint_count" \
+  "waypoint_hold_s=$waypoint_hold_s" \
+  "final_hover_s=$final_hover_s" \
+  "zigzag_amplitude_m=$zigzag_amplitude_m" \
+  "waypoints_rfu_m=$waypoints_rfu_m" \
+  "zigzag_overlap_ratio=$zigzag_overlap_ratio" \
+  "pixel_margin_px=$pixel_margin_px" \
+  "entry_min_world_front_m=$entry_min_world_front_m" \
+  "record_wait_for_bbox=$record_wait_for_bbox" \
+  "guidance_mode=$guidance_mode" \
+  "stability_window_s=$stability_window_s" \
+  "stability_position_p95_max_m=$stability_position_p95_max_m" \
+  "stability_attitude_max_deg=$stability_attitude_max_deg" \
+  "target_model_sdf_path=$target_model_sdf_path" \
+  "target_model_sdf_sha256=$target_model_sdf_sha256" \
+  "target_model_protected_geometry_sha256=$target_model_protected_geometry_sha256" \
   "shared_waypoint_baseline_cam_l_optical_deg=${CAM_L_OPTICAL_ROLL_DEG:-0.0},${CAM_L_OPTICAL_PITCH_DEG:-0.0},${CAM_L_OPTICAL_YAW_DEG:-0.0}" \
   "shared_waypoint_baseline_cam_r_optical_deg=${CAM_R_OPTICAL_ROLL_DEG:-0.0},${CAM_R_OPTICAL_PITCH_DEG:-0.0},${CAM_R_OPTICAL_YAW_DEG:-0.0}" \
   > "$output_dir/sweep_contract.txt"
 
 write_effective_config() {
-  local config_path="$1" case_id="$2" axis="$3" angle="$4" repetition="$5"
-  local roll="$6" pitch="$7" yaw="$8"
-  local left_roll="$9" left_pitch="${10}" left_yaw="${11}"
-  local recording_dir="${12}" operator_recording_dir="${13}"
-  python3 - "$config_path" "$session_id" "$run_id" "$case_id" "$axis" "$angle" "$repetition" "$observation_mode" \
+  local config_path="$1" trajectory="$2" case_id="$3" axis="$4" angle="$5" repetition="$6"
+  local roll="$7" pitch="$8" yaw="$9"
+  local left_roll="${10}" left_pitch="${11}" left_yaw="${12}"
+  local recording_dir="${13}" operator_recording_dir="${14}"
+  local shared_path_file="${15}"
+  python3 - "$config_path" "$trajectory" "$session_id" "$run_id" "$case_id" "$axis" "$angle" "$repetition" "$observation_mode" "$guidance_mode" \
     "$roll" "$pitch" "$yaw" "$left_roll" "$left_pitch" "$left_yaw" \
-    "$seed" "$camera_update_rate_hz" "$yolo_target_hz" \
+    "$seed" "$camera_update_rate_hz" "$yolo_target_hz" "$overlay_publish_hz" \
+    "$performance_warmup_s" "$performance_min_steady_s" "$min_yolo_update_hz" \
+    "$max_yolo_inference_p95_ms" "$min_overlay_hz" \
     "${CAMERA_BASELINE_M:-25.0}" "${CAMERA_HEIGHT_M:-30.0}" "${CAMERA_HORIZONTAL_FOV_RAD:-0.154997710698}" \
     "${CAMERA_IMAGE_WIDTH_PX:-1280}" "${CAMERA_IMAGE_HEIGHT_PX:-720}" \
     "$SIM_CONFIG" "$REPO_ROOT" "$branch" "$commit_sha" "$git_status" \
     "$git_status_short" "$git_remote_url" \
     "$recording_dir" "$operator_recording_dir" "$auto_args_serialized" \
+    "$shared_path_file" "$waypoint_count" "$waypoint_hold_s" "$final_hover_s" "$zigzag_amplitude_m" "$pixel_margin_px" \
+    "$waypoints_rfu_m" "$zigzag_overlap_ratio" "$entry_min_world_front_m" "$record_wait_for_bbox" \
+    "$stability_window_s" "$stability_position_p95_max_m" "$stability_attitude_max_deg" \
+    "$target_model_sdf_path" "$target_model_sdf_sha256" "$target_model_protected_geometry_sha256" \
+    "${DRONE_SPAWN_X_M:-0.0}" "${DRONE_SPAWN_Y_M:-0.0}" "${DRONE_SPAWN_Z_M:-0.0}" \
     "${PX4_GZ_MODEL_NAME:-x500_15m}" <<'PY'
 import hashlib
 import json
@@ -332,12 +498,35 @@ import math
 import sys
 from pathlib import Path
 
-(path, session_id, run_id, case_id, axis, angle, repetition, observation_mode, roll, pitch, yaw,
+(path, trajectory, session_id, run_id, case_id, axis, angle, repetition, observation_mode, guidance_mode, roll, pitch, yaw,
  left_roll, left_pitch, left_yaw,
- seed, camera_hz, yolo_hz, baseline_m, camera_height_m, fov_rad, image_width, image_height,
+ seed, camera_hz, yolo_hz, overlay_hz,
+ performance_warmup_s, performance_min_steady_s, min_yolo_update_hz,
+ max_yolo_inference_p95_ms, min_overlay_hz,
+ baseline_m, camera_height_m, fov_rad, image_width, image_height,
  sim_config, repo_root, branch, commit_sha, git_status, git_status_short, git_remote_url,
  recording_dir, operator_recording_dir, auto_args_serialized,
+ shared_path_file, waypoint_count, waypoint_hold_s, final_hover_s, zigzag_amplitude_m, pixel_margin_px,
+ waypoints_rfu_m, zigzag_overlap_ratio, entry_min_world_front_m, record_wait_for_bbox,
+ stability_window_s, stability_position_p95_max_m, stability_attitude_max_deg,
+ target_model_sdf_path, target_model_sdf_sha256, target_model_protected_geometry_sha256,
+ drone_spawn_x_m, drone_spawn_y_m, drone_spawn_z_m,
  px4_gz_model_name) = sys.argv[1:]
+rfu_waypoints = [
+    [float(component.strip()) for component in item.split(",")]
+    for item in waypoints_rfu_m.split(";")
+    if item.strip()
+]
+entry_min_world_front = (
+    float(entry_min_world_front_m) if entry_min_world_front_m else None
+)
+record_wait = record_wait_for_bbox.lower() == "true"
+stability_position_limit = (
+    float(stability_position_p95_max_m) if stability_position_p95_max_m else None
+)
+stability_attitude_limit = (
+    float(stability_attitude_max_deg) if stability_attitude_max_deg else None
+)
 intrinsic_contract = {
     "image_width_px": int(image_width),
     "image_height_px": int(image_height),
@@ -384,7 +573,47 @@ payload = {
         "random_seed": float(seed),
         "application_mode": "right_optical_combined" if axis == "combined" else "right_optical_ofat",
         "observation_mode": observation_mode,
-        "trajectory_id": "px4_waypoint_mission_shared_baseline_path",
+        "guidance_mode": guidance_mode,
+        "trajectory_id": f"px4_waypoint_mission_{trajectory}",
+        "trajectory": trajectory,
+        "shared_waypoint_path": str(Path(shared_path_file).resolve()),
+        "waypoint_count": int(waypoint_count),
+        "waypoint_hold_s": float(waypoint_hold_s),
+        "final_hover_s": float(final_hover_s),
+        "zigzag_amplitude_m": float(zigzag_amplitude_m),
+        "waypoint_frame": "baseline_center_world_rfu",
+        "waypoints_rfu_m": rfu_waypoints,
+        "zigzag_overlap_ratio": float(zigzag_overlap_ratio),
+        "pixel_margin_px": float(pixel_margin_px),
+        "entry_min_world_front_m": entry_min_world_front,
+        "record_wait_for_bbox": record_wait,
+        "require_operator_full_recording": True,
+        "stability_window_s": float(stability_window_s),
+        "stability_position_p95_max_m": stability_position_limit,
+        "stability_attitude_max_deg": stability_attitude_limit,
+        "waypoint_distance_analysis": {
+            "required": float(waypoint_hold_s) > 0.0,
+            "phase_pattern": "waypoint_{index:03d}_hold_analysis",
+            "analysis_window_s": min(float(waypoint_hold_s), float(stability_window_s)),
+            "primary_estimate_field": "nominal_pose_range_m",
+            "ground_truth_field": "gt_range_m",
+            "signed_error_contract": "estimate_minus_ground_truth_m",
+            "control_estimate_fields": [
+                "corrected_range_m",
+                "operational_range_m",
+                "attitude_ray_range_m",
+            ],
+        },
+        "performance_acceptance": {
+            "warmup_s": float(performance_warmup_s),
+            "min_steady_duration_s": float(performance_min_steady_s),
+            "min_yolo_update_hz": float(min_yolo_update_hz),
+            "max_yolo_inference_p95_ms": float(max_yolo_inference_p95_ms),
+            "min_overlay_hz": float(min_overlay_hz),
+        },
+        "spawn_world_enu_m": [
+            float(drone_spawn_x_m), float(drone_spawn_y_m), float(drone_spawn_z_m)
+        ],
         "mission_runner_args": [item for item in auto_args_serialized.split("\x1f") if item],
     },
     "attitude_injection": {
@@ -401,6 +630,7 @@ payload = {
         "camera_height_m": float(camera_height_m),
         "camera_update_rate_hz": float(camera_hz),
         "yolo_target_hz": float(yolo_hz),
+        "overlay_publish_hz": float(overlay_hz),
         "intrinsic_profile_id": "simulation_pinhole_from_horizontal_fov",
         "intrinsic_profile_sha256": intrinsic_sha256,
         "pixel_origin": "top_left",
@@ -427,6 +657,8 @@ payload = {
         "angle_unit": "deg",
         "px4_quaternion_order": "wxyz",
         "gazebo_quaternion_order": "xyzw",
+        "world_rfu": "baseline_center_world_aligned_right_front_up",
+        "world_rfu_origin_world_enu_m": [0.0, 0.0, float(camera_height_m)],
     },
     "ground_truth": {
         "source": "gazebo",
@@ -444,6 +676,9 @@ payload = {
         "git_status_short": git_status_short.splitlines(),
         "git_remote_url": git_remote_url,
         "simulation_env_sha256": env_sha256,
+        "target_model_sdf_path": str(Path(target_model_sdf_path).resolve()),
+        "target_model_sdf_sha256": target_model_sdf_sha256,
+        "target_model_protected_geometry_sha256": target_model_protected_geometry_sha256,
     },
     "outputs": {
         "recording_dir": recording_dir,
@@ -455,6 +690,11 @@ payload = {
         "summary": str(Path(recording_dir) / "run_summary.json"),
         "case_result": str(Path(path).parent / "case_result.json"),
         "data_validation": str(Path(path).parent / "data_validation.json"),
+        "operator_progress": str(Path(operator_recording_dir) / "progress.json"),
+        "left_overlay_mp4": str(Path(operator_recording_dir) / "left_overlay.mp4"),
+        "right_overlay_mp4": str(Path(operator_recording_dir) / "right_overlay.mp4"),
+        "waypoint_stability_events": str(Path(path).parent / "waypoint_stability.jsonl"),
+        "waypoint_guidance_trace": str(Path(path).parent / "guidance_trace.jsonl"),
     },
 }
 canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -555,16 +795,18 @@ compute_offset_attitude() {
 }
 
 condition_specs=()
-for axis in "${axes[@]}"; do
-  axis="${axis//[[:space:]]/}"
-  for value in "${values[@]}"; do
-    value="${value//[[:space:]]/}"
-    if awk -v value="$value" 'BEGIN { exit !(value + 0 == 0) }'; then continue; fi
-    for ((repetition = 1; repetition <= repetitions; repetition++)); do
-      condition_specs+=("$axis|$value|$repetition")
+if [[ "$baseline_only" != true ]]; then
+  for axis in "${axes[@]}"; do
+    axis="${axis//[[:space:]]/}"
+    for value in "${values[@]}"; do
+      value="${value//[[:space:]]/}"
+      if awk -v value="$value" 'BEGIN { exit !(value + 0 == 0) }'; then continue; fi
+      for ((repetition = 1; repetition <= repetitions; repetition++)); do
+        condition_specs+=("$axis|$value|$repetition")
+      done
     done
   done
-done
+fi
 
 condition_order=()
 if [[ "$randomize" == true && ${#condition_specs[@]} -gt 1 ]]; then
@@ -586,8 +828,18 @@ for condition_index in "${condition_order[@]}"; do
   printf 'execution_condition_%03d=%s\n' "$condition_sequence" "${condition_specs[$condition_index]}" >> "$output_dir/sweep_contract.txt"
 done
 
+expected_case_count=$(( ${#trajectories[@]} * (${#condition_specs[@]} + 1) ))
+printf 'expected_case_count=%s\n' "$expected_case_count" >> "$output_dir/sweep_contract.txt"
+if [[ "$plan_only" == true ]]; then
+  printf '%s\n' \
+    "Plan only: trajectories=${#trajectories[@]} conditions=${#condition_specs[@]} cases=$expected_case_count" \
+    "shared_waypoints=$shared_waypoints_dir" \
+    "manifest=$manifest"
+  exit 0
+fi
+
 run_case() {
-  local axis="$1" angle="$2" repetition="$3"
+  local trajectory="$1" axis="$2" angle="$3" repetition="$4"
   local operator_status=0 auto_status=0
   local left_roll left_pitch left_yaw roll pitch yaw
   local failure_stage="" failure_reason=""
@@ -597,25 +849,41 @@ run_case() {
   execution_order=$((execution_order + 1))
   compute_offset_attitude "$axis" "$angle"
   local case_id
-  case_id="case-$(printf '%03d' "$case_index")_$(attitude_token L "$left_roll" "$left_pitch" "$left_yaw")_$(attitude_token R "$roll" "$pitch" "$yaw")_repetition$(printf '%02d' "$repetition")"
+  case_id="case-${trajectory}-$(printf '%03d' "$case_index")_$(attitude_token L "$left_roll" "$left_pitch" "$left_yaw")_$(attitude_token R "$roll" "$pitch" "$yaw")_repetition$(printf '%02d' "$repetition")"
   local case_dir="$output_dir/$case_id"
   local effective_config_path="$case_dir/effective_config.json"
   local recording_dir="$case_dir/recording"
   local operator_recording_dir="$case_dir/operator-recording"
   local operator_log="$case_dir/operator.log" readiness_log="$case_dir/readiness.log" auto_log="$case_dir/auto.log"
   local validation_log="$case_dir/data_validation.log" validation_report="$case_dir/data_validation.json"
+  local stability_event_log="$case_dir/waypoint_stability.jsonl"
+  local guidance_trace_log="$case_dir/guidance_trace.jsonl"
   local case_auto_args=("${auto_args[@]}")
+  local case_stability_args=(--event-log "$stability_event_log" --stability-window-s "$stability_window_s")
+  if [[ -n "$stability_position_p95_max_m" ]]; then
+    case_stability_args+=(--stability-position-p95-max-m "$stability_position_p95_max_m")
+  fi
+  if [[ -n "$stability_attitude_max_deg" ]]; then
+    case_stability_args+=(--stability-attitude-max-deg "$stability_attitude_max_deg")
+  fi
+  local shared_path_file="${shared_path_files[$trajectory]}"
   mkdir -p "$case_dir"
   local effective_config_sha256
-  effective_config_sha256="$(write_effective_config "$effective_config_path" "$case_id" "$axis" "$angle" "$repetition" "$roll" "$pitch" "$yaw" "$left_roll" "$left_pitch" "$left_yaw" "$recording_dir" "$operator_recording_dir")"
+  effective_config_sha256="$(write_effective_config "$effective_config_path" "$trajectory" "$case_id" "$axis" "$angle" "$repetition" "$roll" "$pitch" "$yaw" "$left_roll" "$left_pitch" "$left_yaw" "$recording_dir" "$operator_recording_dir" "$shared_path_file")"
   printf '%s\n' \
-    "case_id=$case_id" "axis=$axis" "angle_deg=$angle" "repetition=$repetition" \
+    "case_id=$case_id" "trajectory=$trajectory" "axis=$axis" "angle_deg=$angle" "repetition=$repetition" \
     "session_id=$session_id" "run_id=$run_id" "attempt_id=$case_id" \
     "effective_config_sha256=$effective_config_sha256" \
     "attitude_frame=camera_optical_rdf" \
     "cam_l_optical_roll_deg=$left_roll" "cam_l_optical_pitch_deg=$left_pitch" "cam_l_optical_yaw_deg=$left_yaw" \
     "cam_r_optical_roll_deg=$roll" \
     "cam_r_optical_pitch_deg=$pitch" "cam_r_optical_yaw_deg=$yaw" \
+    "shared_waypoint_path=$shared_path_file" "waypoint_count=$waypoint_count" "waypoint_hold_s=$waypoint_hold_s" "final_hover_s=$final_hover_s" \
+    "entry_min_world_front_m=$entry_min_world_front_m" "record_wait_for_bbox=$record_wait_for_bbox" \
+    "stability_event_log=$stability_event_log" "stability_window_s=$stability_window_s" \
+    "stability_position_p95_max_m=$stability_position_p95_max_m" "stability_attitude_max_deg=$stability_attitude_max_deg" \
+    "target_model_sdf_sha256=$target_model_sdf_sha256" \
+    "target_model_protected_geometry_sha256=$target_model_protected_geometry_sha256" \
     "output_frame=baseline_center_frd[forward,right,down]" \
     "truth_source=Gazebo Target GT (offline calibration/validation only)" \
     "operator_recording_dir=$operator_recording_dir" \
@@ -625,8 +893,8 @@ run_case() {
   operator_cmd=(
     "$ROOT_DIR/run_operator_view.sh"
     --record-full "$operator_recording_dir"
-    --record-wait-for-bbox
   )
+  if [[ "$record_wait_for_bbox" == true ]]; then operator_cmd+=(--record-wait-for-bbox); fi
   if [[ "$skip_colcon_build" == true || -n "${completed_case:-}" ]]; then operator_cmd+=(--skip-colcon-build); fi
   if [[ "$skip_px4_build" == true ]]; then operator_cmd+=(--skip-px4-build); fi
   if [[ -n "$px4_dir" ]]; then operator_cmd+=(--px4-dir "$px4_dir"); fi
@@ -644,8 +912,9 @@ run_case() {
     "cam_l_optical_roll_deg:=$left_roll" "cam_l_optical_pitch_deg:=$left_pitch" "cam_l_optical_yaw_deg:=$left_yaw"
     "cam_r_optical_roll_deg:=$roll" "cam_r_optical_pitch_deg:=$pitch" "cam_r_optical_yaw_deg:=$yaw"
     "camera_update_rate_hz:=$camera_update_rate_hz" "yolo_target_hz:=$yolo_target_hz"
-    # At the sweep's bounded 2 Hz default, retain overlay publication so the
-    # full operator recorder produces its required left/right MP4 artifacts.
+    "overlay_publish_hz:=$overlay_publish_hz"
+    # Retain overlay publication so the full operator recorder produces its
+    # required left/right MP4 artifacts at the explicitly qualified rate.
     "enable_detection_overlay:=true"
   )
   SIM_CONFIG="$SIM_CONFIG" "${operator_cmd[@]}" > "$operator_log" 2>&1 &
@@ -661,9 +930,13 @@ run_case() {
     setsid env SIM_CONFIG="$SIM_CONFIG" "$ROOT_DIR/run_px4_waypoint_mission.sh" \
       --path-file "$shared_path_file" \
       --no-record \
-      --hold-s 0 \
+      --hold-s "$waypoint_hold_s" \
+      --final-hover-s "$final_hover_s" \
       --ramp-s 0 \
       --vertical-ramp-s 0 \
+      --guidance-mode "$guidance_mode" \
+      --guidance-log "$guidance_trace_log" \
+      "${case_stability_args[@]}" \
       "${case_auto_args[@]}" > "$auto_log" 2>&1 &
     auto_pid="$!"
     # Unlike px4_auto_mission.py's FOV-guard success path (which holds
@@ -755,37 +1028,41 @@ Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", enco
 PY
   if ((operator_status == 0)); then
     printf '%s\n' "PASS $case_id"
-    printf '%s\t%s\t%s\t%s\t%s\tPASS\t%s\t%s\n' "$execution_order" "$case_id" "$axis" "$angle" "$repetition" "$recording_dir" "$effective_config_sha256" >> "$manifest"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\tPASS\t%s\t%s\t%s\n' "$execution_order" "$trajectory" "$case_id" "$axis" "$angle" "$repetition" "$recording_dir" "$effective_config_sha256" "$target_model_sdf_sha256" >> "$manifest"
     return 0
   fi
   printf '%s\n' "FAIL $case_id"
-  printf '%s\t%s\t%s\t%s\t%s\tFAIL\t%s\t%s\n' "$execution_order" "$case_id" "$axis" "$angle" "$repetition" "$recording_dir" "$effective_config_sha256" >> "$manifest"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\tFAIL\t%s\t%s\t%s\n' "$execution_order" "$trajectory" "$case_id" "$axis" "$angle" "$repetition" "$recording_dir" "$effective_config_sha256" "$target_model_sdf_sha256" >> "$manifest"
   return 1
 }
 
 case_index=0 failures=0 execution_order=0 completed_case=""
 
-# Baseline (zero error) runs once, up front, as the reference the whole
-# sweep is compared against -- not once per condition.
-case_index=$((case_index + 1))
-if ! run_case baseline 0 0; then
-  failures=$((failures + 1)); [[ "$keep_going" == true ]] || exit 1
-fi
-completed_case=baseline
-
-for condition_index in "${condition_order[@]}"; do
-  case_spec="${condition_specs[$condition_index]}"
-  IFS='|' read -r axis value repetition <<< "$case_spec"
-
+for trajectory in "${trajectories[@]}"; do
+  trajectory="${trajectory//[[:space:]]/}"
+  # Each trajectory has its own zero-error reference because the path itself
+  # changes, while the attitude conditions remain identical across paths.
   case_index=$((case_index + 1))
-  if ! run_case "$axis" "$value" "$repetition"; then
+  if ! run_case "$trajectory" baseline 0 0; then
     failures=$((failures + 1)); [[ "$keep_going" == true ]] || exit 1
   fi
+  completed_case=baseline
+
+  for condition_index in "${condition_order[@]}"; do
+    case_spec="${condition_specs[$condition_index]}"
+    IFS='|' read -r axis value repetition <<< "$case_spec"
+
+    case_index=$((case_index + 1))
+    if ! run_case "$trajectory" "$axis" "$value" "$repetition"; then
+      failures=$((failures + 1)); [[ "$keep_going" == true ]] || exit 1
+    fi
+  done
 done
 
 if ((failures == 0)); then
   if python3 "$ROOT_DIR/scripts/validate_attitude_sweep_output.py" \
     --sweep-dir "$output_dir" --report "$output_dir/sweep_validation.json" \
+    --waypoint-report "$output_dir/waypoint_attitude_distance_errors.csv" \
     > "$output_dir/sweep_validation.log" 2>&1; then
     touch "$output_dir/SWEEP_FINALIZED_VALID"
   else

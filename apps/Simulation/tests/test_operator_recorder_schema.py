@@ -382,6 +382,24 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
         recorder.row_count = 25
         recorder.last_elapsed_sec = 1.25
         recorder.valid_row_counts = {field: 20 for field in module.PROGRESS_VALIDITY_FIELDS}
+        recorder.video_stream_stats = {
+            "left_overlay": {
+                "frame_count": 31,
+                "first_elapsed_sec": 2.0,
+                "last_elapsed_sec": 4.0,
+                "unique_source_frame_count": 31,
+                "first_unique_elapsed_sec": 2.0,
+                "last_unique_elapsed_sec": 4.0,
+            },
+            "right_overlay": {
+                "frame_count": 30,
+                "first_elapsed_sec": 2.0,
+                "last_elapsed_sec": 4.0,
+                "unique_source_frame_count": 21,
+                "first_unique_elapsed_sec": 2.0,
+                "last_unique_elapsed_sec": 4.0,
+            },
+        }
         with tempfile.TemporaryDirectory() as tmpdir:
             recorder.session_dir = Path(tmpdir)
 
@@ -395,6 +413,9 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
         self.assertEqual(payload["mode"], "full")
         self.assertEqual(payload["row_count"], 25)
         self.assertEqual(payload["valid_row_counts"]["ground_truth_m"], 20)
+        self.assertEqual(payload["video_streams"]["left_overlay"]["observed_callback_hz"], 15.0)
+        self.assertEqual(payload["video_streams"]["left_overlay"]["unique_source_observed_hz"], 15.0)
+        self.assertEqual(payload["video_streams"]["right_overlay"]["unique_source_observed_hz"], 10.0)
 
     def test_progress_sidecar_identifies_timestamped_primary_artifacts(self) -> None:
         module = load_module()

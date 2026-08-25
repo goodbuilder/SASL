@@ -471,6 +471,7 @@ class StereoDistanceNode(Node):
         self.declare_parameter("yolo_class_name", "drone")
         self.declare_parameter("yolo_confidence", 0.25)
         self.declare_parameter("yolo_device", "cuda:0")
+        self.declare_parameter("yolo_allow_cpu_fallback", True)
         self.declare_parameter(
             "yolo_target_hz",
             40.0,
@@ -601,6 +602,7 @@ class StereoDistanceNode(Node):
         self.yolo_class_name = str(self.get_parameter("yolo_class_name").value)
         self.yolo_confidence = self._float_param("yolo_confidence")
         self.yolo_device = str(self.get_parameter("yolo_device").value)
+        self.yolo_allow_cpu_fallback = self._bool_param("yolo_allow_cpu_fallback")
         self.yolo_target_hz = self._float_param("yolo_target_hz")
         self.yolo_imgsz = int(self.get_parameter("yolo_imgsz").value)
         self.observation_mode = self._validate_observation_mode(

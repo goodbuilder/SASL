@@ -133,6 +133,127 @@ class GenerateFovConstrainedWaypointTests(unittest.TestCase):
         self.assertIn("baseline_center_frd", manifest)
         self.assertIn("px4_local_ned_setpoint", manifest)
 
+    def test_range_count_includes_endpoints_and_zigzags_inside_fov(self) -> None:
+        module = load_waypoint_module()
+        args = type(
+            "Args",
+            (),
+            {
+                "output_dir": Path("unused"),
+                "seed": 42,
+                "calibration_count": 0,
+                "validation_count": 8,
+                "min_range_m": 200.0,
+                "max_range_m": 400.0,
+                "range_count": 8,
+                "range_step_m": None,
+                "lateral_pattern": "zigzag",
+                "zigzag_amplitude_m": 2.0,
+                "camera_baseline_m": 25.0,
+                "camera_height_m": 0.1,
+                "px4_origin_world_east_m": 0.0,
+                "px4_origin_world_north_m": 400.0,
+                "px4_origin_world_up_m": 6.0,
+                "cam_l_optical_roll_deg": 0.0,
+                "cam_l_optical_pitch_deg": 20.0,
+                "cam_l_optical_yaw_deg": 0.0,
+                "cam_r_optical_roll_deg": 0.0,
+                "cam_r_optical_pitch_deg": 20.0,
+                "cam_r_optical_yaw_deg": 0.0,
+                "horizontal_fov_rad": 0.154997710698,
+                "image_width_px": 1280,
+                "image_height_px": 720,
+                "fov_margin_rad": 0.01,
+                "pixel_margin_px": 32.0,
+                "min_set_separation_m": 10.0,
+                "max_attempts": 10000,
+            },
+        )()
+
+        _, validation, manifest = module.generate_waypoints(args)
+
+        self.assertEqual(len(validation), 8)
+        self.assertEqual(float(validation[0]["baseline_forward_m"]), 200.0)
+        self.assertEqual(float(validation[-1]["baseline_forward_m"]), 400.0)
+        self.assertEqual(
+            [float(row["baseline_right_m"]) for row in validation],
+            [2.0, -2.0, 2.0, -2.0, 2.0, -2.0, 2.0, -2.0],
+        )
+        self.assertEqual(manifest["range_count"], 8)
+        self.assertEqual(manifest["lateral_pattern"], "zigzag")
+
+    def test_explicit_world_rfu_waypoints_are_preserved_and_overlap_scaled(self) -> None:
+        module = load_waypoint_module()
+        args = type(
+            "Args",
+            (),
+            {
+                "output_dir": Path("unused"),
+                "seed": 42,
+                "calibration_count": 0,
+                "validation_count": 8,
+                "min_range_m": 1.0,
+                "max_range_m": 2.0,
+                "range_count": None,
+                "range_step_m": None,
+                "waypoints_rfu_m": "0,415,154;0,365,137;0,315,121;0,265,104;0,215,88;0,165,71;0,115,55;0,65,38",
+                "lateral_pattern": "zigzag",
+                "zigzag_amplitude_m": 2.0,
+                "zigzag_overlap_ratio": 0.4,
+                "camera_baseline_m": 25.0,
+                "camera_height_m": 0.1,
+                "px4_origin_world_east_m": 0.0,
+                "px4_origin_world_north_m": 415.0,
+                "px4_origin_world_up_m": 6.0,
+                "cam_l_optical_roll_deg": 0.0,
+                "cam_l_optical_pitch_deg": 20.0,
+                "cam_l_optical_yaw_deg": 0.0,
+                "cam_r_optical_roll_deg": 0.0,
+                "cam_r_optical_pitch_deg": 20.0,
+                "cam_r_optical_yaw_deg": 0.0,
+                "horizontal_fov_rad": 0.154997710698,
+                "image_width_px": 1280,
+                "image_height_px": 720,
+                "fov_margin_rad": 0.01,
+                "pixel_margin_px": 32.0,
+                "min_set_separation_m": 10.0,
+                "max_attempts": 10000,
+            },
+        )()
+
+        calibration, validation, manifest = module.generate_waypoints(args)
+
+        self.assertEqual(calibration, [])
+        self.assertEqual(len(validation), 8)
+        self.assertEqual(
+            [float(row["world_rfu_front_m"]) for row in validation],
+            [415.0, 365.0, 315.0, 265.0, 215.0, 165.0, 115.0, 65.0],
+        )
+        self.assertEqual(
+            [round(float(row["world_rfu_right_m"]), 3) for row in validation],
+            [8.062, -6.504, 4.956, -3.398, 1.85, -0.292, 0.0, 0.0],
+        )
+        self.assertEqual(
+            [round(float(row["north_m"]), 3) for row in validation],
+            [0.0, -50.0, -100.0, -150.0, -200.0, -250.0, -300.0, -350.0],
+        )
+        self.assertEqual(
+            [round(float(row["altitude_agl_m"]), 3) for row in validation],
+            [148.1, 131.1, 115.1, 98.1, 82.1, 65.1, 49.1, 32.1],
+        )
+        self.assertEqual(
+            [bool(row["nominal_stereo_visible"]) for row in validation],
+            [True, True, True, True, True, False, False, False],
+        )
+        self.assertEqual(manifest["waypoint_mode"], "explicit_baseline_center_world_rfu")
+        self.assertEqual(manifest["nominal_stereo_visible_count"], 5)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            module.write_mission_path(Path(tmpdir) / "mission.csv", validation)
+            lines = (Path(tmpdir) / "mission.csv").read_text().splitlines()
+        self.assertEqual(lines[1].split(",")[0], "0.000000")
+        self.assertEqual(lines[-1].split(",")[0], "-350.000000")
+
 
 if __name__ == "__main__":
     unittest.main()

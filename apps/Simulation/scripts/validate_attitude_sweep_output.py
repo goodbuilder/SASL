@@ -9,13 +9,41 @@ import hashlib
 import json
 import math
 import re
+import statistics
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
+from sdf_contract import sdf_contract
+
 
 EXPECTED_RECORD_SCHEMA = "s2_atomic_pair_v11"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+WAYPOINT_DISTANCE_CSV_FIELDS = (
+    "trajectory",
+    "case_id",
+    "axis",
+    "value_deg",
+    "is_baseline",
+    "waypoint_index",
+    "primary_estimate_field",
+    "ground_truth_field",
+    "sample_count",
+    "ground_truth_median_m",
+    "estimate_median_m",
+    "signed_error_mean_m",
+    "signed_error_median_m",
+    "signed_error_p05_m",
+    "signed_error_p95_m",
+    "absolute_error_median_m",
+    "absolute_error_p95_m",
+    "absolute_error_max_m",
+    "rmse_m",
+    "baseline_case_id",
+    "baseline_signed_error_median_m",
+    "attitude_induced_error_delta_m",
+)
 
 ALWAYS_REQUIRED_COLUMNS = {
     "schema_version",
@@ -216,6 +244,682 @@ def _load_json(path: Path, validation: Validation) -> dict[str, Any]:
     return value
 
 
+def _ratio_float(value: Any) -> float:
+    text = str(value or "").strip()
+    if "/" in text:
+        numerator, denominator = text.split("/", 1)
+        denominator_value = float(denominator)
+        if denominator_value == 0.0:
+            return math.nan
+        return float(numerator) / denominator_value
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return math.nan
+
+
+def _percentile(values: list[float], fraction: float) -> float:
+    ordered = sorted(float(value) for value in values if math.isfinite(float(value)))
+    if not ordered:
+        return math.nan
+    if len(ordered) == 1:
+        return ordered[0]
+    position = max(0.0, min(1.0, float(fraction))) * (len(ordered) - 1)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _observed_rate_hz(count: Any, first_elapsed_sec: Any, last_elapsed_sec: Any) -> float:
+    try:
+        count_value = int(count)
+        elapsed = float(last_elapsed_sec) - float(first_elapsed_sec)
+    except (TypeError, ValueError):
+        return math.nan
+    if count_value < 2 or not math.isfinite(elapsed) or elapsed <= 0.0:
+        return math.nan
+    return float(count_value - 1) / elapsed
+
+
+def _probe_mp4(path: Path, validation: Validation) -> dict[str, Any]:
+    result: dict[str, Any] = {"path": str(path.resolve()), "valid": False}
+    if not path.is_file():
+        validation.errors.append(f"missing MP4: {path}")
+        return result
+    size_bytes = path.stat().st_size
+    result["size_bytes"] = size_bytes
+    validation.require(size_bytes > 0, f"empty MP4: {path}")
+    try:
+        completed = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,width,height,duration,avg_frame_rate,r_frame_rate,nb_frames:format=duration",
+                "-of",
+                "json",
+                str(path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15.0,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        validation.errors.append(f"ffprobe failed for {path}: {exc}")
+        return result
+    if completed.returncode != 0:
+        validation.errors.append(
+            f"ffprobe rejected {path}: {completed.stderr.strip()}"
+        )
+        return result
+    try:
+        payload = json.loads(completed.stdout)
+        stream = payload.get("streams", [])[0]
+        width = int(stream.get("width"))
+        height = int(stream.get("height"))
+    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        validation.errors.append(f"invalid ffprobe result for {path}: {exc}")
+        return result
+    duration = math.nan
+    for candidate in (stream.get("duration"), payload.get("format", {}).get("duration")):
+        try:
+            parsed = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(parsed):
+            duration = parsed
+            break
+    validation.require(math.isfinite(duration) and duration > 0.0, f"MP4 duration is not positive: {path}")
+    validation.require(width > 0 and height > 0, f"MP4 dimensions are invalid: {path}")
+    encoded_average_hz = _ratio_float(stream.get("avg_frame_rate"))
+    try:
+        frame_count = int(stream.get("nb_frames"))
+    except (TypeError, ValueError):
+        frame_count = 0
+    actual_average_hz = (
+        float(frame_count) / duration
+        if frame_count > 0 and math.isfinite(duration) and duration > 0.0
+        else math.nan
+    )
+    validation.require(
+        math.isfinite(encoded_average_hz) and encoded_average_hz > 0.0,
+        f"MP4 average frame rate is invalid: {path}",
+    )
+    validation.require(frame_count > 0, f"MP4 frame count is not positive: {path}")
+    validation.require(
+        math.isfinite(actual_average_hz) and actual_average_hz > 0.0,
+        f"MP4 actual average frame rate is invalid: {path}",
+    )
+    result.update(
+        {
+            "valid": (
+                math.isfinite(duration)
+                and duration > 0.0
+                and width > 0
+                and height > 0
+                and math.isfinite(encoded_average_hz)
+                and encoded_average_hz > 0.0
+                and frame_count > 0
+                and math.isfinite(actual_average_hz)
+                and actual_average_hz > 0.0
+            ),
+            "codec_name": stream.get("codec_name", ""),
+            "duration_s": duration,
+            "width": width,
+            "height": height,
+            "encoded_average_frame_rate_hz": encoded_average_hz,
+            "frame_count": frame_count,
+            "actual_average_frame_rate_hz": actual_average_hz,
+        }
+    )
+    return result
+
+
+def _validate_steady_yolo_performance(
+    operator_dir: Path,
+    progress: dict[str, Any],
+    acceptance: dict[str, Any],
+    validation: Validation,
+) -> dict[str, Any]:
+    warmup_s = float(acceptance["warmup_s"])
+    min_steady_s = float(acceptance["min_steady_duration_s"])
+    min_update_hz = float(acceptance["min_yolo_update_hz"])
+    max_inference_p95_ms = float(acceptance["max_yolo_inference_p95_ms"])
+    csv_name = str(progress.get("csv", ""))
+    csv_path = operator_dir / csv_name
+    update_samples: list[float] = []
+    inference_samples: list[float] = []
+    steady_times: list[float] = []
+    if not csv_path.is_file():
+        validation.errors.append(f"missing operator telemetry CSV: {csv_path}")
+    else:
+        try:
+            with csv_path.open(encoding="utf-8", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    try:
+                        time_sec = float(row.get("time_sec", ""))
+                    except (TypeError, ValueError):
+                        continue
+                    if not math.isfinite(time_sec) or time_sec < warmup_s:
+                        continue
+                    steady_times.append(time_sec)
+                    for field, target in (
+                        ("yolo_update_hz", update_samples),
+                        ("yolo_inference_ms", inference_samples),
+                    ):
+                        try:
+                            value = float(row.get(field, ""))
+                        except (TypeError, ValueError):
+                            continue
+                        if math.isfinite(value):
+                            target.append(value)
+        except (OSError, csv.Error) as exc:
+            validation.errors.append(f"invalid operator telemetry CSV {csv_path}: {exc}")
+    steady_duration_s = (
+        max(steady_times) - warmup_s if steady_times else 0.0
+    )
+    update_median_hz = (
+        statistics.median(update_samples) if update_samples else math.nan
+    )
+    inference_p95_ms = _percentile(inference_samples, 0.95)
+    validation.require(
+        steady_duration_s >= min_steady_s,
+        "operator telemetry steady interval is shorter than the configured minimum",
+    )
+    validation.require(
+        math.isfinite(update_median_hz) and update_median_hz >= min_update_hz,
+        "steady YOLO update median is below the configured minimum",
+    )
+    validation.require(
+        math.isfinite(inference_p95_ms)
+        and inference_p95_ms <= max_inference_p95_ms,
+        "steady YOLO inference p95 exceeds the configured maximum",
+    )
+    return {
+        "warmup_s": warmup_s,
+        "steady_duration_s": steady_duration_s,
+        "update_sample_count": len(update_samples),
+        "inference_sample_count": len(inference_samples),
+        "yolo_update_median_hz": update_median_hz,
+        "yolo_inference_p95_ms": inference_p95_ms,
+        "min_yolo_update_hz": min_update_hz,
+        "max_yolo_inference_p95_ms": max_inference_p95_ms,
+    }
+
+
+def _validate_video_runtime_rate(
+    name: str,
+    progress: dict[str, Any],
+    probe: dict[str, Any],
+    min_hz: float,
+    validation: Validation,
+) -> dict[str, Any]:
+    stats = progress.get("video_streams", {}).get(name, {})
+    frame_count = int(stats.get("frame_count", 0) or 0)
+    unique_count = int(stats.get("unique_source_frame_count", 0) or 0)
+    callback_hz = _observed_rate_hz(
+        frame_count,
+        stats.get("first_elapsed_sec"),
+        stats.get("last_elapsed_sec"),
+    )
+    unique_source_hz = _observed_rate_hz(
+        unique_count,
+        stats.get("first_unique_elapsed_sec"),
+        stats.get("last_unique_elapsed_sec"),
+    )
+    actual_mp4_hz = float(probe.get("actual_average_frame_rate_hz", math.nan))
+    validation.require(
+        frame_count == int(probe.get("frame_count", -1)),
+        f"{name} recorder/MP4 frame counts differ",
+    )
+    validation.require(
+        math.isfinite(callback_hz) and callback_hz >= min_hz,
+        f"{name} observed callback rate is below the configured minimum",
+    )
+    validation.require(
+        math.isfinite(unique_source_hz) and unique_source_hz >= min_hz,
+        f"{name} unique camera-source rate is below the configured minimum",
+    )
+    validation.require(
+        math.isfinite(actual_mp4_hz) and actual_mp4_hz >= min_hz,
+        f"{name} ffprobe actual average frame rate is below the configured minimum",
+    )
+    return {
+        "frame_count": frame_count,
+        "unique_source_frame_count": unique_count,
+        "observed_callback_hz": callback_hz,
+        "unique_source_observed_hz": unique_source_hz,
+        "ffprobe_actual_average_frame_rate_hz": actual_mp4_hz,
+        "minimum_hz": min_hz,
+    }
+
+
+def _validate_operator_recording(
+    case_dir: Path, config: dict[str, Any], validation: Validation
+) -> dict[str, Any]:
+    experiment = config.get("experiment", {})
+    if experiment.get("require_operator_full_recording") is not True:
+        return {"required": False}
+    operator_dir = case_dir / "operator-recording"
+    progress = _load_json(operator_dir / "progress.json", validation)
+    validation.require(progress.get("state") == "finalized", "operator recorder did not finalize")
+    validation.require(progress.get("mode") == "full", "operator recorder mode is not full")
+    left = _probe_mp4(operator_dir / "left_overlay.mp4", validation)
+    right = _probe_mp4(operator_dir / "right_overlay.mp4", validation)
+    acceptance = experiment.get("performance_acceptance")
+    performance: dict[str, Any] = {"required": False}
+    video_rates: dict[str, Any] = {"required": False}
+    backend_evidence = ""
+    if isinstance(acceptance, dict):
+        required_fields = {
+            "warmup_s",
+            "min_steady_duration_s",
+            "min_yolo_update_hz",
+            "max_yolo_inference_p95_ms",
+            "min_overlay_hz",
+        }
+        validation.require(
+            required_fields <= set(acceptance),
+            "performance acceptance contract is incomplete",
+        )
+        if required_fields <= set(acceptance):
+            performance = {
+                "required": True,
+                **_validate_steady_yolo_performance(
+                    operator_dir, progress, acceptance, validation
+                ),
+            }
+            min_overlay_hz = float(acceptance["min_overlay_hz"])
+            video_rates = {
+                "required": True,
+                "left": _validate_video_runtime_rate(
+                    "left_overlay", progress, left, min_overlay_hz, validation
+                ),
+                "right": _validate_video_runtime_rate(
+                    "right_overlay", progress, right, min_overlay_hz, validation
+                ),
+            }
+            operator_log = case_dir / "operator.log"
+            if not operator_log.is_file():
+                validation.errors.append(f"missing operator runtime log: {operator_log}")
+            else:
+                log_text = operator_log.read_text(encoding="utf-8", errors="replace")
+                match = re.search(
+                    r"YOLO (?:process |prediction )?backend verified: "
+                    r"requested=cuda[^,]*, actual=(cuda[^,]*), precision=(fp16)",
+                    log_text,
+                )
+                validation.require(
+                    match is not None,
+                    "operator log does not prove an actual CUDA FP16 YOLO backend",
+                )
+                if match is not None:
+                    backend_evidence = match.group(0)
+    return {
+        "required": True,
+        "progress_state": progress.get("state"),
+        "left": left,
+        "right": right,
+        "performance": performance,
+        "video_rates": video_rates,
+        "backend_evidence": backend_evidence,
+    }
+
+
+def _validate_waypoint_stability(
+    case_dir: Path, config: dict[str, Any], validation: Validation
+) -> dict[str, Any]:
+    experiment = config.get("experiment", {})
+    position_limit = experiment.get("stability_position_p95_max_m")
+    attitude_limit = experiment.get("stability_attitude_max_deg")
+    if position_limit is None and attitude_limit is None:
+        return {"required": False}
+    path = case_dir / "waypoint_stability.jsonl"
+    events: list[dict[str, Any]] = []
+    if not path.is_file():
+        validation.errors.append(f"missing waypoint stability event log: {path}")
+        return {"required": True, "events": events}
+    try:
+        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise ValueError(f"line {line_number} is not an object")
+            events.append(value)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        validation.errors.append(f"invalid waypoint stability event log: {exc}")
+        return {"required": True, "events": events}
+
+    holds = [event for event in events if event.get("event") == "waypoint_hold_complete"]
+    expected_count = int(experiment.get("waypoint_count", 0))
+    validation.require(
+        len(holds) == expected_count,
+        f"waypoint stability hold count mismatch: expected {expected_count}, got {len(holds)}",
+    )
+    validation.require(
+        [event.get("waypoint_index") for event in holds]
+        == list(range(1, expected_count + 1)),
+        "waypoint stability indices are incomplete or out of order",
+    )
+    validation.require(
+        any(event.get("event") == "mission_completed" for event in events),
+        "waypoint stability log lacks mission_completed",
+    )
+    for event in holds:
+        index = event.get("waypoint_index")
+        validation.require(
+            event.get("stability_pass") is True,
+            f"waypoint {index} stability gate did not pass",
+        )
+        if position_limit is not None:
+            value = event.get("position_error_p95_m")
+            validation.require(
+                isinstance(value, (int, float))
+                and math.isfinite(float(value))
+                and float(value) <= float(position_limit),
+                f"waypoint {index} position-error p95 exceeds limit",
+            )
+        if attitude_limit is not None:
+            for name in ("max_abs_roll_deg", "max_abs_pitch_deg"):
+                value = event.get(name)
+                validation.require(
+                    isinstance(value, (int, float))
+                    and math.isfinite(float(value))
+                    and float(value) <= float(attitude_limit),
+                    f"waypoint {index} {name} exceeds limit",
+                )
+    return {"required": True, "event_count": len(events), "hold_count": len(holds)}
+
+
+def _range_error_statistics(
+    rows: list[dict[str, str]], estimate_field: str, ground_truth_field: str
+) -> dict[str, Any]:
+    estimates: list[float] = []
+    ground_truth: list[float] = []
+    signed_errors: list[float] = []
+    for row in rows:
+        if not _finite(row.get(estimate_field, "")) or not _finite(
+            row.get(ground_truth_field, "")
+        ):
+            continue
+        estimate = float(row[estimate_field])
+        truth = float(row[ground_truth_field])
+        estimates.append(estimate)
+        ground_truth.append(truth)
+        signed_errors.append(estimate - truth)
+    absolute_errors = [abs(value) for value in signed_errors]
+    return {
+        "estimate_field": estimate_field,
+        "ground_truth_field": ground_truth_field,
+        "signed_error_contract": "estimate_minus_ground_truth_m",
+        "sample_count": len(signed_errors),
+        "estimate_median_m": (
+            statistics.median(estimates) if estimates else math.nan
+        ),
+        "ground_truth_median_m": (
+            statistics.median(ground_truth) if ground_truth else math.nan
+        ),
+        "signed_error_mean_m": (
+            statistics.mean(signed_errors) if signed_errors else math.nan
+        ),
+        "signed_error_median_m": (
+            statistics.median(signed_errors) if signed_errors else math.nan
+        ),
+        "signed_error_p05_m": _percentile(signed_errors, 0.05),
+        "signed_error_p95_m": _percentile(signed_errors, 0.95),
+        "absolute_error_median_m": (
+            statistics.median(absolute_errors) if absolute_errors else math.nan
+        ),
+        "absolute_error_p95_m": _percentile(absolute_errors, 0.95),
+        "absolute_error_max_m": max(absolute_errors, default=math.nan),
+        "rmse_m": (
+            math.sqrt(statistics.mean(value * value for value in signed_errors))
+            if signed_errors
+            else math.nan
+        ),
+    }
+
+
+def _validate_waypoint_distance_analysis(
+    config: dict[str, Any],
+    rows: list[dict[str, str]],
+    validation: Validation,
+) -> dict[str, Any]:
+    experiment = config.get("experiment", {})
+    contract = experiment.get("waypoint_distance_analysis")
+    if not isinstance(contract, dict):
+        return {"required": False}
+    required = contract.get("required") is True
+    if not required:
+        return {"required": False, "contract": contract}
+
+    expected_count = int(experiment.get("waypoint_count", 0))
+    phase_pattern = str(
+        contract.get("phase_pattern", "waypoint_{index:03d}_hold_analysis")
+    )
+    primary_field = str(contract.get("primary_estimate_field", ""))
+    ground_truth_field = str(contract.get("ground_truth_field", ""))
+    control_fields = [
+        str(value) for value in contract.get("control_estimate_fields", [])
+    ]
+    validation.require(
+        primary_field == "nominal_pose_range_m",
+        "waypoint distance primary field is not nominal_pose_range_m",
+    )
+    validation.require(
+        ground_truth_field == "gt_range_m",
+        "waypoint distance ground-truth field is not gt_range_m",
+    )
+
+    waypoint_results: list[dict[str, Any]] = []
+    for index in range(1, expected_count + 1):
+        try:
+            phase = phase_pattern.format(index=index)
+        except (KeyError, ValueError) as exc:
+            validation.errors.append(
+                f"invalid waypoint distance phase pattern: {exc}"
+            )
+            break
+        phase_rows = [row for row in rows if row.get("mission_phase") == phase]
+        primary = _range_error_statistics(
+            phase_rows, primary_field, ground_truth_field
+        )
+        validation.require(
+            primary["sample_count"] > 0,
+            f"waypoint {index} has no finite nominal-pose/GT hold-analysis samples",
+        )
+        controls = {
+            field: _range_error_statistics(phase_rows, field, ground_truth_field)
+            for field in control_fields
+        }
+        waypoint_results.append(
+            {
+                "waypoint_index": index,
+                "mission_phase": phase,
+                "phase_row_count": len(phase_rows),
+                "primary": primary,
+                "controls": controls,
+            }
+        )
+
+    return {
+        "required": True,
+        "primary_metric": f"{primary_field} - {ground_truth_field}",
+        "signed_error_contract": "estimate_minus_ground_truth_m",
+        "expected_waypoint_count": expected_count,
+        "waypoints": waypoint_results,
+    }
+
+
+def _validate_guidance_trace(
+    case_dir: Path, config: dict[str, Any], validation: Validation
+) -> dict[str, Any]:
+    contract = config.get("experiment", {}).get("waypoint_distance_analysis")
+    if not isinstance(contract, dict) or contract.get("required") is not True:
+        return {"required": False}
+    path = case_dir / "guidance_trace.jsonl"
+    if not path.is_file():
+        validation.errors.append(f"missing waypoint guidance trace: {path}")
+        return {"required": True, "setpoint_count": 0}
+    events: list[dict[str, Any]] = []
+    try:
+        for line_number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise ValueError(f"line {line_number} is not an object")
+            events.append(value)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        validation.errors.append(f"invalid waypoint guidance trace: {exc}")
+        return {"required": True, "setpoint_count": len(events)}
+
+    expected_count = int(config.get("experiment", {}).get("waypoint_count", 0))
+    expected_guidance_mode = str(
+        config.get("experiment", {}).get(
+            "guidance_mode", "position_velocity_final_target"
+        )
+    )
+    validation.require(
+        expected_guidance_mode
+        in (
+            "position_velocity_final_target",
+            "position_only_final_target",
+            "velocity_only",
+        ),
+        "unsupported waypoint guidance mode in effective config",
+    )
+    setpoints = [event for event in events if event.get("event") == "setpoint_sent"]
+    validation.require(bool(setpoints), "waypoint guidance trace has no setpoints")
+    transit_indices: set[int] = set()
+    analysis_indices: set[int] = set()
+    position_velocity_count = 0
+    position_only_count = 0
+    transit_position_velocity_count = 0
+    transit_position_only_count = 0
+    transit_velocity_only_count = 0
+    readback_count = 0
+    for event in setpoints:
+        validation.require(
+            event.get("schema_version") == "px4_waypoint_guidance_v1",
+            "waypoint guidance trace schema mismatch",
+        )
+        validation.require(
+            event.get("guidance_mode") == expected_guidance_mode,
+            "waypoint guidance mode mismatch",
+        )
+        validation.require(
+            event.get("frame") == "MAV_FRAME_LOCAL_NED",
+            "waypoint guidance frame mismatch",
+        )
+        index = event.get("waypoint_index")
+        phase = str(event.get("mission_phase", ""))
+        if isinstance(index, int) and phase == f"waypoint_{index:03d}_transit":
+            transit_indices.add(index)
+        if isinstance(index, int) and phase == f"waypoint_{index:03d}_hold_analysis":
+            analysis_indices.add(index)
+        active_fields = event.get("active_fields")
+        if active_fields == ["position", "velocity"]:
+            position_velocity_count += 1
+            if phase.endswith("_transit"):
+                transit_position_velocity_count += 1
+            validation.require(
+                event.get("type_mask") == 3520,
+                "position+velocity guidance type mask mismatch",
+            )
+        elif active_fields == ["position"]:
+            position_only_count += 1
+            if phase.endswith("_transit"):
+                transit_position_only_count += 1
+            validation.require(
+                event.get("type_mask") == 3576,
+                "position-only guidance type mask mismatch",
+            )
+        elif active_fields == ["velocity"]:
+            if phase.endswith("_transit"):
+                transit_velocity_only_count += 1
+            validation.require(
+                event.get("type_mask") == 3527,
+                "velocity-only guidance type mask mismatch",
+            )
+        else:
+            validation.errors.append("waypoint guidance active-fields contract mismatch")
+        position = event.get("target_position_local_ned_m")
+        validation.require(
+            isinstance(position, list)
+            and len(position) == 3
+            and all(isinstance(value, (int, float)) and math.isfinite(float(value)) for value in position),
+            "waypoint guidance target position is invalid",
+        )
+        if event.get("actual_position_local_ned_m") is not None:
+            readback_count += 1
+
+    expected_indices = set(range(1, expected_count + 1))
+    validation.require(
+        transit_indices == expected_indices,
+        "waypoint guidance transit indices are incomplete",
+    )
+    validation.require(
+        analysis_indices == expected_indices,
+        "waypoint guidance hold-analysis indices are incomplete",
+    )
+    if expected_guidance_mode == "position_velocity_final_target":
+        validation.require(
+            transit_position_velocity_count > 0,
+            "waypoint guidance trace lacks position+velocity transit commands",
+        )
+    elif expected_guidance_mode == "position_only_final_target":
+        validation.require(
+            transit_position_only_count > 0,
+            "waypoint guidance trace lacks position-only transit commands",
+        )
+        validation.require(
+            transit_position_velocity_count == 0,
+            "position-only mode unexpectedly sent velocity feed-forward",
+        )
+    elif expected_guidance_mode == "velocity_only":
+        validation.require(
+            transit_velocity_only_count > 0,
+            "waypoint guidance trace lacks velocity-only transit commands",
+        )
+        validation.require(
+            transit_position_velocity_count == 0,
+            "velocity-only mode unexpectedly sent active position+velocity transit commands",
+        )
+    validation.require(
+        position_only_count > 0,
+        "waypoint guidance trace lacks position-only hold commands",
+    )
+    validation.require(
+        readback_count > 0,
+        "waypoint guidance trace lacks LOCAL_POSITION_NED readback",
+    )
+    return {
+        "required": True,
+        "schema_version": "px4_waypoint_guidance_v1",
+        "guidance_mode": expected_guidance_mode,
+        "setpoint_count": len(setpoints),
+        "position_velocity_setpoint_count": position_velocity_count,
+        "position_only_setpoint_count": position_only_count,
+        "transit_position_velocity_setpoint_count": transit_position_velocity_count,
+        "transit_position_only_setpoint_count": transit_position_only_count,
+        "transit_velocity_only_setpoint_count": transit_velocity_only_count,
+        "local_position_readback_count": readback_count,
+        "transit_waypoint_indices": sorted(transit_indices),
+        "hold_analysis_waypoint_indices": sorted(analysis_indices),
+    }
+
+
 def _bool(value: str) -> bool | None:
     normalized = str(value).strip().lower()
     if normalized == "true":
@@ -347,6 +1051,35 @@ def _validate_effective_config(
     validation.require(ground_truth.get("source") == "gazebo", "effective config GT source is not Gazebo")
     validation.require(ground_truth.get("link") == "vehicle_reference_link", "effective config GT link mismatch")
     validation.require(ground_truth.get("runtime_feature_allowed") is False, "Gazebo GT is not marked label-only")
+
+    provenance = config.get("provenance", {})
+    sdf_path_value = provenance.get("target_model_sdf_path")
+    expected_sdf_hash = provenance.get("target_model_sdf_sha256")
+    expected_geometry_hash = provenance.get("target_model_protected_geometry_sha256")
+    if sdf_path_value or expected_sdf_hash or expected_geometry_hash:
+        validation.require(bool(sdf_path_value), "target model SDF path is missing")
+        validation.require(
+            bool(SHA256_RE.fullmatch(str(expected_sdf_hash or ""))),
+            "target model SDF hash is invalid",
+        )
+        validation.require(
+            bool(SHA256_RE.fullmatch(str(expected_geometry_hash or ""))),
+            "target model protected geometry hash is invalid",
+        )
+        if sdf_path_value:
+            try:
+                actual_sdf = sdf_contract(Path(str(sdf_path_value)))
+            except (OSError, ValueError) as exc:
+                validation.errors.append(f"cannot validate target model SDF: {exc}")
+            else:
+                validation.require(
+                    actual_sdf["sha256"] == expected_sdf_hash,
+                    "target model SDF hash changed after effective config capture",
+                )
+                validation.require(
+                    actual_sdf["protected_geometry_sha256"] == expected_geometry_hash,
+                    "target model protected geometry hash mismatch",
+                )
     return config, stored_hash
 
 
@@ -444,6 +1177,14 @@ def validate_case(case_dir: Path) -> dict[str, Any]:
     valid_count = 0
     operational_count = 0
     observation_count = 0
+    first_dual_observation_world_front_m: float | None = None
+    world_rfu_origin = config.get("coordinate_contract", {}).get(
+        "world_rfu_origin_world_enu_m", [0.0, 0.0, 0.0]
+    )
+    try:
+        world_rfu_origin_north_m = float(world_rfu_origin[1])
+    except (TypeError, ValueError, IndexError):
+        world_rfu_origin_north_m = math.nan
     expected_injection = config.get("attitude_injection", {})
     left_injected = expected_injection.get("left_applied_deg", {})
     right_injected = expected_injection.get("right_applied_deg", {})
@@ -490,6 +1231,17 @@ def validate_case(case_dir: Path) -> dict[str, Any]:
         right_observed = _bool(row.get("right_observation_valid", "")) is True
         if left_observed or right_observed:
             observation_count += 1
+        if (
+            first_dual_observation_world_front_m is None
+            and left_observed
+            and right_observed
+            and row.get("gt_valid") == "true"
+            and _finite(row.get("gt_world_enu_y_m", ""))
+            and math.isfinite(world_rfu_origin_north_m)
+        ):
+            first_dual_observation_world_front_m = (
+                float(row["gt_world_enu_y_m"]) - world_rfu_origin_north_m
+            )
         if left_observed:
             validation.require(not _nonempty(row, {"left_u_px", "left_v_px", "left_confidence"}), f"{prefix}: left observation incomplete")
         if right_observed:
@@ -576,6 +1328,28 @@ def validate_case(case_dir: Path) -> dict[str, Any]:
     validation.require(observation_count > 0, "run contains no observations")
     validation.require(summary.get("eligible_sample_count") == eligible_count, "eligible sample count mismatch")
 
+    entry_min_world_front_m = config.get("experiment", {}).get(
+        "entry_min_world_front_m"
+    )
+    if entry_min_world_front_m is not None:
+        validation.require(
+            first_dual_observation_world_front_m is not None,
+            "run contains no dual observation for the world Front entry gate",
+        )
+        if first_dual_observation_world_front_m is not None:
+            validation.require(
+                first_dual_observation_world_front_m + 1.0e-6
+                >= float(entry_min_world_front_m),
+                "first dual observation occurred below the minimum world Front",
+            )
+
+    operator_recording = _validate_operator_recording(case_dir, config, validation)
+    waypoint_stability = _validate_waypoint_stability(case_dir, config, validation)
+    waypoint_guidance = _validate_guidance_trace(case_dir, config, validation)
+    waypoint_distance_error = _validate_waypoint_distance_analysis(
+        config, rows, validation
+    )
+
     case_result_path = case_dir / "case_result.json"
     if case_result_path.is_file():
         case_result = _load_json(case_result_path, validation)
@@ -603,6 +1377,20 @@ def validate_case(case_dir: Path) -> dict[str, Any]:
     return {
         "valid": not validation.errors,
         "case_id": case_id,
+        "trajectory": config.get("experiment", {}).get("trajectory", ""),
+        "attitude_condition": {
+            "axis": config.get("experiment", {}).get("sweep_axis", ""),
+            "value_deg": config.get("experiment", {}).get("sweep_value_deg"),
+            "is_baseline": config.get("experiment", {}).get(
+                "is_baseline_case", False
+            ),
+            "left_applied_deg": config.get("attitude_injection", {}).get(
+                "left_applied_deg", {}
+            ),
+            "right_applied_deg": config.get("attitude_injection", {}).get(
+                "right_applied_deg", {}
+            ),
+        },
         "record_schema": EXPECTED_RECORD_SCHEMA,
         "effective_config_sha256": config_hash,
         "sample_count": len(rows),
@@ -610,6 +1398,17 @@ def validate_case(case_dir: Path) -> dict[str, Any]:
         "valid_sample_count": valid_count,
         "operational_ray_count": operational_count,
         "observation_count": observation_count,
+        "first_dual_observation_world_front_m": first_dual_observation_world_front_m,
+        "target_model_sdf_sha256": config.get("provenance", {}).get(
+            "target_model_sdf_sha256", ""
+        ),
+        "target_model_protected_geometry_sha256": config.get("provenance", {}).get(
+            "target_model_protected_geometry_sha256", ""
+        ),
+        "operator_recording": operator_recording,
+        "waypoint_stability": waypoint_stability,
+        "waypoint_guidance": waypoint_guidance,
+        "waypoint_distance_error": waypoint_distance_error,
         "errors": validation.errors,
         "warnings": validation.warnings,
     }
@@ -628,6 +1427,193 @@ def _condition_count(sweep_dir: Path) -> int | None:
     return None
 
 
+def _contract_int(sweep_dir: Path, key: str) -> int | None:
+    contract = sweep_dir / "sweep_contract.txt"
+    if not contract.is_file():
+        return None
+    for line in contract.read_text(encoding="utf-8").splitlines():
+        if line.startswith(f"{key}="):
+            try:
+                return int(line.split("=", 1)[1])
+            except ValueError:
+                return None
+    return None
+
+
+def _waypoint_primary_map(result: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    analysis = result.get("waypoint_distance_error", {})
+    if analysis.get("required") is not True:
+        return {}
+    mapped: dict[int, dict[str, Any]] = {}
+    for waypoint in analysis.get("waypoints", []):
+        try:
+            index = int(waypoint["waypoint_index"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        primary = waypoint.get("primary")
+        if isinstance(primary, dict):
+            mapped[index] = primary
+    return mapped
+
+
+def _attitude_distance_comparisons(
+    results: list[dict[str, Any]], errors: list[str]
+) -> list[dict[str, Any]]:
+    comparisons: list[dict[str, Any]] = []
+    trajectories = sorted(
+        {str(result.get("trajectory", "")) for result in results if result.get("trajectory")}
+    )
+    for trajectory in trajectories:
+        trajectory_results = [
+            result for result in results if result.get("trajectory") == trajectory
+        ]
+        baselines = [
+            result
+            for result in trajectory_results
+            if result.get("attitude_condition", {}).get("is_baseline") is True
+        ]
+        if len(baselines) != 1:
+            errors.append(
+                f"trajectory {trajectory} does not have exactly one attitude baseline"
+            )
+            continue
+        baseline = baselines[0]
+        baseline_waypoints = _waypoint_primary_map(baseline)
+        for result in trajectory_results:
+            condition = result.get("attitude_condition", {})
+            if condition.get("is_baseline") is True:
+                continue
+            case_waypoints = _waypoint_primary_map(result)
+            waypoint_comparisons: list[dict[str, Any]] = []
+            for index in sorted(set(baseline_waypoints) | set(case_waypoints)):
+                baseline_primary = baseline_waypoints.get(index)
+                case_primary = case_waypoints.get(index)
+                if baseline_primary is None or case_primary is None:
+                    errors.append(
+                        f"missing waypoint {index} distance evidence for attitude comparison: "
+                        f"{result.get('case_id', '')}"
+                    )
+                    continue
+                baseline_error = baseline_primary.get("signed_error_median_m")
+                case_error = case_primary.get("signed_error_median_m")
+                if not isinstance(baseline_error, (int, float)) or not isinstance(
+                    case_error, (int, float)
+                ) or not math.isfinite(float(baseline_error)) or not math.isfinite(
+                    float(case_error)
+                ):
+                    errors.append(
+                        f"nonfinite waypoint {index} median error in attitude comparison: "
+                        f"{result.get('case_id', '')}"
+                    )
+                    continue
+                waypoint_comparisons.append(
+                    {
+                        "waypoint_index": index,
+                        "baseline_signed_error_median_m": float(baseline_error),
+                        "case_signed_error_median_m": float(case_error),
+                        "attitude_induced_error_delta_m": float(case_error)
+                        - float(baseline_error),
+                        "case_absolute_error_p95_m": case_primary.get(
+                            "absolute_error_p95_m"
+                        ),
+                        "case_sample_count": case_primary.get("sample_count"),
+                    }
+                )
+            comparisons.append(
+                {
+                    "trajectory": trajectory,
+                    "baseline_case_id": baseline.get("case_id", ""),
+                    "case_id": result.get("case_id", ""),
+                    "axis": condition.get("axis", ""),
+                    "value_deg": condition.get("value_deg"),
+                    "left_applied_deg": condition.get("left_applied_deg", {}),
+                    "right_applied_deg": condition.get("right_applied_deg", {}),
+                    "waypoints": waypoint_comparisons,
+                }
+            )
+    return comparisons
+
+
+def _waypoint_distance_csv_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
+    cases = result.get("cases")
+    if not isinstance(cases, list):
+        cases = [result]
+    comparison_lookup: dict[tuple[str, int], dict[str, Any]] = {}
+    for comparison in result.get("attitude_distance_comparisons", []):
+        case_id = str(comparison.get("case_id", ""))
+        for waypoint in comparison.get("waypoints", []):
+            try:
+                index = int(waypoint["waypoint_index"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            comparison_lookup[(case_id, index)] = {
+                **waypoint,
+                "baseline_case_id": comparison.get("baseline_case_id", ""),
+            }
+
+    rows: list[dict[str, Any]] = []
+    for case in cases:
+        condition = case.get("attitude_condition", {})
+        case_id = str(case.get("case_id", ""))
+        is_baseline = condition.get("is_baseline") is True
+        analysis = case.get("waypoint_distance_error", {})
+        for waypoint in analysis.get("waypoints", []):
+            primary = waypoint.get("primary", {})
+            try:
+                index = int(waypoint["waypoint_index"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            comparison = comparison_lookup.get((case_id, index), {})
+            signed_median = primary.get("signed_error_median_m")
+            rows.append(
+                {
+                    "trajectory": case.get("trajectory", ""),
+                    "case_id": case_id,
+                    "axis": condition.get("axis", ""),
+                    "value_deg": condition.get("value_deg"),
+                    "is_baseline": is_baseline,
+                    "waypoint_index": index,
+                    "primary_estimate_field": primary.get("estimate_field", ""),
+                    "ground_truth_field": primary.get("ground_truth_field", ""),
+                    "sample_count": primary.get("sample_count"),
+                    "ground_truth_median_m": primary.get("ground_truth_median_m"),
+                    "estimate_median_m": primary.get("estimate_median_m"),
+                    "signed_error_mean_m": primary.get("signed_error_mean_m"),
+                    "signed_error_median_m": signed_median,
+                    "signed_error_p05_m": primary.get("signed_error_p05_m"),
+                    "signed_error_p95_m": primary.get("signed_error_p95_m"),
+                    "absolute_error_median_m": primary.get("absolute_error_median_m"),
+                    "absolute_error_p95_m": primary.get("absolute_error_p95_m"),
+                    "absolute_error_max_m": primary.get("absolute_error_max_m"),
+                    "rmse_m": primary.get("rmse_m"),
+                    "baseline_case_id": (
+                        case_id if is_baseline else comparison.get("baseline_case_id", "")
+                    ),
+                    "baseline_signed_error_median_m": (
+                        signed_median
+                        if is_baseline
+                        else comparison.get("baseline_signed_error_median_m")
+                    ),
+                    "attitude_induced_error_delta_m": (
+                        0.0
+                        if is_baseline
+                        else comparison.get("attitude_induced_error_delta_m")
+                    ),
+                }
+            )
+    return rows
+
+
+def _write_waypoint_distance_csv(path: Path, result: dict[str, Any]) -> int:
+    rows = _waypoint_distance_csv_rows(result)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=WAYPOINT_DISTANCE_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    return len(rows)
+
+
 def validate_sweep(sweep_dir: Path) -> dict[str, Any]:
     errors: list[str] = []
     manifest_path = sweep_dir / "sweep_manifest.tsv"
@@ -638,9 +1624,12 @@ def validate_sweep(sweep_dir: Path) -> dict[str, Any]:
         with manifest_path.open(encoding="utf-8", newline="") as handle:
             manifest_rows = list(csv.DictReader(handle, delimiter="\t"))
     condition_count = _condition_count(sweep_dir)
-    # One baseline case runs once up front, followed by one case per
-    # condition (see run_auto_attitude_sweep.sh's main loop).
-    expected_case_count = None if condition_count is None else condition_count + 1
+    # A trajectory-specific baseline runs once up front, followed by one case
+    # per non-zero condition for that trajectory. New sweeps record the exact
+    # expected count; old one-trajectory sweeps retain the legacy fallback.
+    expected_case_count = _contract_int(sweep_dir, "expected_case_count")
+    if expected_case_count is None:
+        expected_case_count = None if condition_count is None else condition_count + 1
     if expected_case_count is None:
         errors.append("condition_count is missing from sweep_contract.txt")
     elif len(manifest_rows) != expected_case_count:
@@ -659,8 +1648,30 @@ def validate_sweep(sweep_dir: Path) -> dict[str, Any]:
         results.append(result)
         if not result["valid"]:
             errors.append(f"case validation failed: {case_id}")
+        manifest_trajectory = row.get("trajectory", "")
+        if manifest_trajectory and manifest_trajectory != result.get("trajectory"):
+            errors.append(f"manifest trajectory mismatch: {case_id}")
         if row.get("effective_config_sha256") != result.get("effective_config_sha256"):
             errors.append(f"manifest config hash mismatch: {case_id}")
+        if row.get("target_model_sdf_sha256") and row.get(
+            "target_model_sdf_sha256"
+        ) != result.get("target_model_sdf_sha256"):
+            errors.append(f"manifest target model SDF hash mismatch: {case_id}")
+    sdf_hashes = {
+        str(result.get("target_model_sdf_sha256"))
+        for result in results
+        if result.get("target_model_sdf_sha256")
+    }
+    if len(sdf_hashes) > 1:
+        errors.append("cases were recorded with different target model SDF hashes")
+    protected_geometry_hashes = {
+        str(result.get("target_model_protected_geometry_sha256"))
+        for result in results
+        if result.get("target_model_protected_geometry_sha256")
+    }
+    if len(protected_geometry_hashes) > 1:
+        errors.append("cases were recorded with different protected geometry hashes")
+    attitude_distance_comparisons = _attitude_distance_comparisons(results, errors)
     return {
         "valid": not errors,
         "sweep_directory": str(sweep_dir.resolve()),
@@ -670,6 +1681,12 @@ def validate_sweep(sweep_dir: Path) -> dict[str, Any]:
         "total_sample_count": sum(int(result.get("sample_count", 0)) for result in results),
         "total_eligible_sample_count": sum(int(result.get("eligible_sample_count", 0)) for result in results),
         "total_valid_sample_count": sum(int(result.get("valid_sample_count", 0)) for result in results),
+        "target_model_sdf_sha256": next(iter(sdf_hashes), ""),
+        "target_model_protected_geometry_sha256": next(
+            iter(protected_geometry_hashes), ""
+        ),
+        "primary_waypoint_distance_metric": "nominal_pose_range_m - gt_range_m",
+        "attitude_distance_comparisons": attitude_distance_comparisons,
         "errors": errors,
         "cases": results,
     }
@@ -681,12 +1698,19 @@ def main() -> int:
     group.add_argument("--case-dir", type=Path)
     group.add_argument("--sweep-dir", type=Path)
     parser.add_argument("--report", type=Path)
+    parser.add_argument("--waypoint-report", type=Path)
     args = parser.parse_args()
     result = (
         validate_case(args.case_dir.resolve())
         if args.case_dir is not None
         else validate_sweep(args.sweep_dir.resolve())
     )
+    if args.waypoint_report is not None:
+        row_count = _write_waypoint_distance_csv(args.waypoint_report, result)
+        result["waypoint_distance_csv"] = {
+            "path": str(args.waypoint_report.resolve()),
+            "row_count": row_count,
+        }
     rendered = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     if args.report is not None:
         args.report.parent.mkdir(parents=True, exist_ok=True)

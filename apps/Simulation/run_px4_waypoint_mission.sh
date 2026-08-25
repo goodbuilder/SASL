@@ -74,6 +74,8 @@ Waypoint format:
 Options:
   --waypoint X,Y,ALT     Add one waypoint. Repeatable.
   --path-file FILE       Read waypoints from CSV/text file.
+  --guidance-mode MODE   position_velocity_final_target, position_only_final_target,
+                         or velocity_only.
   --speed-mps N          Horizontal speed limit.
   --mpc-z-vel-max-up-mps N
                          Override PX4 MPC_Z_VEL_MAX_UP (climb limit) before the mission.
@@ -96,6 +98,13 @@ Options:
   --final-hover-s N      Hover time before optional landing. 0 disables the hover.
   --land-timeout-s N     Landing timeout.
   --setpoint-hz N        PX4 offboard setpoint rate.
+  --event-log FILE       Write waypoint hold/stability events as JSONL.
+  --guidance-log FILE    Write sent setpoints and local-position readback as JSONL.
+  --stability-window-s N Tail window of each hold used for stability checks.
+  --stability-position-p95-max-m N
+                         Fail when hold position-error p95 exceeds N metres.
+  --stability-attitude-max-deg N
+                         Fail when hold roll or pitch exceeds N degrees.
   --land-after           Land after the final waypoint. Default from config.
   --no-land              Do not land after the final waypoint.
   --stop-after-hover     With --no-land: exit once --final-hover-s elapses instead of
@@ -137,7 +146,7 @@ while (($#)); do
       record_full=false
       shift
       ;;
-    --waypoint|--path-file|--waypoints-xy-alt|--speed-mps|--mpc-z-vel-max-up-mps|--mpc-z-vel-max-dn-mps|--mpc-tiltmax-air-deg|--mc-rollrate-p|--mc-pitchrate-p|--mc-roll-p|--mc-pitch-p|--mpc-xy-vel-p-acc|--mpc-acc-hor-max|--acceptance-radius-m|--waypoint-timeout-s|--hold-s|--ramp-s|--vertical-ramp-s|--final-hover-s|--land-timeout-s|--setpoint-hz|--connect)
+    --waypoint|--path-file|--waypoints-xy-alt|--speed-mps|--guidance-mode|--mpc-z-vel-max-up-mps|--mpc-z-vel-max-dn-mps|--mpc-tiltmax-air-deg|--mc-rollrate-p|--mc-pitchrate-p|--mc-roll-p|--mc-pitch-p|--mpc-xy-vel-p-acc|--mpc-acc-hor-max|--acceptance-radius-m|--waypoint-timeout-s|--hold-s|--ramp-s|--vertical-ramp-s|--final-hover-s|--land-timeout-s|--setpoint-hz|--event-log|--guidance-log|--stability-window-s|--stability-position-p95-max-m|--stability-attitude-max-deg|--connect)
       mission_cli+=("$1=${2:?missing value for $1}")
       shift 2
       ;;

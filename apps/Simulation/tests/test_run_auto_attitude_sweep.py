@@ -19,6 +19,7 @@ def test_auto_attitude_sweep_help_is_available_without_ros_runtime():
     assert "baseline_center_frd" in result.stdout
     assert "--seed" in result.stdout
     assert "--ordered" in result.stdout
+    assert "--baseline-only" in result.stdout
 
 
 def test_auto_attitude_sweep_preserves_interactive_auto_recording_contract():
@@ -44,6 +45,10 @@ def test_auto_attitude_sweep_preserves_interactive_auto_recording_contract():
     assert 'Operator stack exited during the mission' in source
     assert "validate_attitude_sweep_output.py" in source
     assert "SWEEP_FINALIZED_VALID" in source
+    assert 'if [[ "$record_wait_for_bbox" == true ]]' in source
+    assert 'operator_cmd+=(--record-wait-for-bbox)' in source
+    assert '"require_operator_full_recording": True' in source
+    assert "target_model_protected_geometry_sha256" in source
     # The --quick/--target-distance-m shim existed only to patch around
     # run_mission.sh --quick's stop distance conflicting with FOV-guard;
     # irrelevant now that the mission runner has no FOV concept at all.
@@ -52,27 +57,30 @@ def test_auto_attitude_sweep_preserves_interactive_auto_recording_contract():
 
 
 def test_auto_attitude_sweep_flies_one_shared_deterministic_waypoint_path():
-    # Every case must fly the identical physical trajectory so recorded
-    # differences are attributable to attitude error alone -- not to a
-    # different flight path (generate_fov_constrained_waypoints.py is
-    # attitude-dependent) or to FOV-guard velocity gating (which could
-    # deadlock: drone stops -> view doesn't change -> stays gated forever).
+    # Every attitude case within one trajectory must fly the identical
+    # physical trajectory; center and zigzag are generated once each.
     source = RUNNER.read_text(encoding="utf-8")
-    # Path generated exactly once, from baseline attitude, before any case
-    # (including the baseline case itself) runs.
+    # Each trajectory is generated from baseline attitude before its cases.
     assert source.count("scripts/generate_fov_constrained_waypoints.py") == 1
-    generate_pos = source.index("scripts/generate_fov_constrained_waypoints.py")
-    baseline_run_pos = source.index('run_case baseline 0 0')
-    assert generate_pos < baseline_run_pos
-    assert 'shared_path_file="$shared_waypoints_dir/validation_mission.csv"' in source
+    assert 'for trajectory in "${trajectories[@]}"; do' in source
+    assert 'shared_path_files["$trajectory"]' in source
+    assert '"$trajectory_dir/validation_mission.csv"' in source
+    assert '--range-count "$waypoint_count"' in source
+    assert '--lateral-pattern "$trajectory"' in source
     # Per-case invocation: the deterministic, camera/FOV-independent MAVLink
     # waypoint follower -- no --fov-guard concept exists for it to take.
     assert '"$ROOT_DIR/run_px4_waypoint_mission.sh"' in source
     assert '--path-file "$shared_path_file"' in source
     assert "--no-record" in source
-    assert "--hold-s 0" in source
+    assert '--hold-s "$waypoint_hold_s"' in source
     assert "--ramp-s 0" in source
     assert "--vertical-ramp-s 0" in source
+    assert '--guidance-log "$guidance_trace_log"' in source
+    assert '--guidance-mode "$guidance_mode"' in source
+    assert '"phase_pattern": "waypoint_{index:03d}_hold_analysis"' in source
+    assert '"primary_estimate_field": "nominal_pose_range_m"' in source
+    assert '"ground_truth_field": "gt_range_m"' in source
+    assert 'guidance_mode="${SWEEP_GUIDANCE_MODE:-velocity_only}"' in source
     assert "--fov-guard" not in source
     assert '"$ROOT_DIR/run_auto.sh"' not in source
     assert '"$ROOT_DIR/run_px4_waypoint_mission.sh" --check-connection' in source
@@ -118,9 +126,28 @@ def test_auto_attitude_sweep_supports_combined_axis():
 
 def test_auto_attitude_sweep_run_case_takes_no_geometry_index():
     source = RUNNER.read_text(encoding="utf-8")
-    assert 'local axis="$1" angle="$2" repetition="$3"' in source
-    assert 'run_case baseline 0 0' in source
-    assert 'run_case "$axis" "$value" "$repetition"' in source
+    assert 'local trajectory="$1" axis="$2" angle="$3" repetition="$4"' in source
+    assert 'run_case "$trajectory" baseline 0 0' in source
+    assert 'run_case "$trajectory" "$axis" "$value" "$repetition"' in source
+
+
+def test_auto_attitude_sweep_can_limit_rate_smoke_to_baselines():
+    source = RUNNER.read_text(encoding="utf-8")
+    assert 'baseline_only="$(normalize_bool SWEEP_BASELINE_ONLY' in source
+    assert '--baseline-only) baseline_only=true' in source
+    assert 'if [[ "$baseline_only" != true ]]; then' in source
+    assert '"baseline_only=$baseline_only"' in source
+
+
+def test_auto_attitude_sweep_wires_measured_rate_acceptance_into_each_case():
+    source = RUNNER.read_text(encoding="utf-8")
+
+    assert 'overlay_publish_hz="${SWEEP_OVERLAY_PUBLISH_HZ:-$camera_update_rate_hz}"' in source
+    assert '"overlay_publish_hz:=$overlay_publish_hz"' in source
+    assert '"performance_acceptance": {' in source
+    assert '"min_yolo_update_hz": float(min_yolo_update_hz)' in source
+    assert '"max_yolo_inference_p95_ms": float(max_yolo_inference_p95_ms)' in source
+    assert '"min_overlay_hz": float(min_overlay_hz)' in source
 
 
 def test_auto_attitude_sweep_case_id_encodes_absolute_camera_attitude():
@@ -139,27 +166,20 @@ def test_auto_attitude_sweep_case_id_encodes_absolute_camera_attitude():
     )
     assert "compute_offset_attitude() {" in source
     assert (
-        'case_id="case-$(printf \'%03d\' "$case_index")_$(attitude_token L "$left_roll" "$left_pitch" "$left_yaw")_'
+        'case_id="case-${trajectory}-$(printf \'%03d\' "$case_index")_$(attitude_token L "$left_roll" "$left_pitch" "$left_yaw")_'
         '$(attitude_token R "$roll" "$pitch" "$yaw")_repetition$(printf \'%02d\' "$repetition")"' in source
     )
     assert "format_value" not in source  # superseded by format_deg/attitude_token
 
 
 def test_auto_attitude_sweep_baseline_runs_once_up_front():
-    # Corrected design: a single 0 deg baseline runs once, before the
-    # per-condition loop -- not once per condition (baseline-before) plus a
-    # closing baseline-after.
+    # Each trajectory has exactly one 0 deg baseline before its conditions.
     source = RUNNER.read_text(encoding="utf-8")
-    assert source.count('run_case baseline 0 0') == 1
+    assert source.count('run_case "$trajectory" baseline 0 0') == 1
     assert "completed_case=baseline" in source
-    # There are two "for condition_index in ...condition_order..." loops: an
-    # earlier one that only logs sweep_contract.txt provenance, and the real
-    # execution loop. Anchor on the main-loop counter init (unique) so this
-    # doesn't accidentally match the earlier, unrelated loop.
-    main_loop_start = source.index('case_index=0 failures=0 execution_order=0 completed_case=""')
-    baseline_pos = source.index('run_case baseline 0 0', main_loop_start)
-    loop_pos = source.index('for condition_index in "${condition_order[@]}"; do', main_loop_start)
-    assert main_loop_start < baseline_pos < loop_pos
+    assert 'expected_case_count=%s' in source
+    assert 'for trajectory in "${trajectories[@]}"; do' in source
+    assert source.count('for condition_index in "${condition_order[@]}"; do') >= 2
 
 
 def test_auto_mission_still_supports_lateral_sweep_for_the_straight_line_path():
@@ -212,6 +232,19 @@ def test_auto_attitude_sweep_exposes_stable_defaults_through_simulation_config()
         "SWEEP_AXES",
         "SWEEP_VALUES_DEG",
         "SWEEP_REPETITIONS",
+        "SWEEP_TRAJECTORIES",
+        "SWEEP_WAYPOINT_COUNT",
+        "SWEEP_WAYPOINT_HOLD_S",
+        "SWEEP_FINAL_HOVER_S",
+        "SWEEP_WAYPOINTS_RFU_M",
+        "SWEEP_ZIGZAG_OVERLAP_RATIO",
+        "SWEEP_PIXEL_MARGIN_PX",
+        "SWEEP_ENTRY_MIN_WORLD_FRONT_M",
+        "SWEEP_RECORD_WAIT_FOR_BBOX",
+        "SWEEP_STABILITY_WINDOW_S",
+        "SWEEP_STABILITY_POSITION_P95_MAX_M",
+        "SWEEP_STABILITY_ATTITUDE_MAX_DEG",
+        "SWEEP_GUIDANCE_MODE",
         "SWEEP_OUTPUT_DIR",
         "SWEEP_WAIT_S",
         "SWEEP_CAMERA_UPDATE_RATE_HZ",

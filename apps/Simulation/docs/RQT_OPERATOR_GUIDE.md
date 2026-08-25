@@ -130,6 +130,57 @@ Do not use interactive operator parameters as deterministic sweep, freeze, or
 sealed-evaluation inputs. Atomic sealed execution and the sealed runner remain
 R4-B work.
 
+## 20-case RFU attitude sweep
+
+Run `./run_auto_attitude_sweep.sh --plan-only --ordered --output-dir /tmp/<new>`
+first. The plan must report two trajectories, nine non-zero attitude
+conditions, 20 total cases, and eight waypoints per trajectory. Mission source
+points are baseline-center world-aligned RFU `(Right, Front, Up)`. They are
+converted to World ENU and then PX4 local NED; the measurement output remains
+the distinct pitched `baseline_center_frd` contract.
+
+The center path uses the configured R values. Zigzag alternates sign and uses
+40% of the nominal horizontal stereo-overlap half-width, so its lateral offset
+tapers at close range. All explicit mission points remain in the path even
+when the 25 m baseline and WIRIS 8x views no longer overlap. rqt/RViz stay
+visible, but the open-loop waypoint mission does not stop when detections
+disappear.
+
+The sweep transit default is `SWEEP_GUIDANCE_MODE=velocity_only`. Only the
+local-NED velocity fields are active while moving; each required waypoint then
+switches to a position-only hold. Do not use the diagnostic
+`position_velocity_final_target` or `position_only_final_target` modes for an
+accepted campaign: the distant final position drives PX4 to its global speed
+limits even when the requested velocity and ramps are smaller.
+
+The sweep's Full recorder starts immediately when
+`SWEEP_RECORD_WAIT_FOR_BBOX=false`. Each case directory must finalize
+`operator-recording/progress.json`, `left_overlay.mp4`, `right_overlay.mp4`,
+the research `pair_records.csv`, `waypoint_stability.jsonl`, and
+`guidance_trace.jsonl`. The first
+valid dual observation must satisfy the configured world Front gate. Every
+five-second waypoint hold is checked over its last three seconds; the current
+strict limits are position-error p95 <= 1 m and absolute roll/pitch <= 15
+degrees. The same interval is tagged `waypoint_###_hold_analysis`; it must
+contain finite `nominal_pose_range_m` and `gt_range_m` samples at every
+configured waypoint. MP4 files are part of qualification and must pass
+`ffprobe`.
+
+Case reports summarize `nominal_pose_range_m - gt_range_m`. Sweep validation
+subtracts the corresponding trajectory baseline median and writes
+`waypoint_attitude_distance_errors.csv` with
+`attitude_induced_error_delta_m`. The current eight-point path loses dual
+measurements at its last two holds, so use the verified six-point visible smoke
+or choose a new all-visible waypoint set before launching the full 20 cases.
+Diagnostic unique camera-source rates currently require a 10 Hz gate; this is
+not final evidence for the 15 Hz campaign requirement.
+
+Before a full campaign, run one center-baseline smoke. If motion is unstable,
+only source `x500_2m/model.sdf` dynamics may be tuned. Visual/collision size,
+mesh scale, rotor/link/joint poses, arm length, model identity, and the GT
+reference frame are protected. A changed SDF requires a rebuild and a new
+campaign; accepted cases with different SDF hashes cannot be combined.
+
 ## GUI를 유지한 baseline CSV 기록
 
 `Setup` 탭의 `Save CSV`는 Lite 기록을, `Save MP4`는 Full 기록을, `Save Debug`는
