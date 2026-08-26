@@ -120,8 +120,8 @@ emitted zero NAL5, so the current-frame gate blocked round two; R3 remains CRITI
   application ten-minute gate are resolved. Remaining R4 work is cold-boot/final 60-minute
   qualification.
 - Root pytest import-name collision and a StereoWIRIS native Qt order crash remain visible. The
-  repository portability audit now passes; same-host fresh checkout/venv launch checks pass, while a
-  separate clean Ubuntu OS/VM remains unverified.
+  repository portability audit now passes. Same-host fresh checkout/venv launch checks and a
+  separate official Ubuntu 22.04.5 KVM exact-commit recreation both pass, closing R10.
 - Workstation startup/Auto/Enable/Reactivate hardware evidence proves zero automatic encoder SET.
   The operator later approved only `SEIR VISIBLE 0 -> 1`; exact live readback is now `0/1/30/1` on
   both cameras. Sequential reboots proved the IDR value is not persistent; restoring/reapplying it

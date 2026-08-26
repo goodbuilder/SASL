@@ -16,6 +16,9 @@
 - Session credential entry enabled a definitive isolated NTRIP Stop/reconnect run: HTTP 200,
   120 valid GGA, station/MSM content and 636.5 seconds of dual injection failure zero. The secret
   remains unsaved and must be re-entered after a future process restart.
+- R10 clean-host reproduction is now complete in a separate official Ubuntu 22.04.5 KVM guest:
+  exact pushed source, manifest-only runtime installation, package closure, both launchers and
+  isolated HOME all pass.
 
 ## Verifiable now, severity order
 
@@ -48,5 +51,4 @@ one run, but NTRIP and camera A/B remain separate until each independent branch 
 | remote-reboot profile rearm on the same host socket | needs named-side physical power cycle or approved reboot action |
 | three independent cold boots | needs user physical power cycles after every short gate passes |
 | corruption-free result on current known-defective sender | prior camera-origin RTP omission/non-IDR evidence; successful resolution needs vendor/fixed sender plus motion |
-| clean-host manifest-only reproduction | needs another clean Ubuntu host/VM acceptable as deployment evidence |
 | final 60-minute integrated acceptance | blocked until all short gates pass, NTRIP credential is available and physical cold boots complete |

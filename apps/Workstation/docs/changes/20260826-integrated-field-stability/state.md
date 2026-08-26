@@ -5,7 +5,7 @@ status: implementing
 mode: backend-coupled
 updated: 2026-08-27
 baseline_ref: 1198689fafed1ef392d395e11437352431312ac8
-last_completed: "R10 same-host fresh checkout/venv passed both launchers; portability findings reduced 12 to 0 and setuptools 77-79 compatibility is manifest-owned"
+last_completed: "R10 separate clean Ubuntu 22.04 KVM passed exact pushed source, manifest installation, package closure, both launchers and isolated HOME"
 next_question: "Provide a Workswell firmware/vendor fix or approve a separately designed alternate encoding path; then complete RTK open-sky, cold boots and the final integrated soak"
 read_next:
   - docs/changes/20260826-integrated-field-stability/approval-summary.md
@@ -120,5 +120,8 @@ The latest complete Workstation suite is 1466 passed, 1 skipped.
 Repository portability now passes with zero findings. A same-host fresh checkout plus new canonical
 venv installed the runtime manifest and passed deployment, execution, Workstation and Legacy checks
 under an isolated HOME. The recreation exposed and fixed an unconstrained setuptools 84/colcon
-conflict by owning `>=77,<80`; fresh resolution selected 79.0.1. A different clean Ubuntu OS/VM is
-still required and is not substituted by this evidence.
+conflict by owning `>=77,<80`; fresh resolution selected 79.0.1. R10 now also passes in a separate
+official Ubuntu 22.04.5 KVM guest using exact pushed commit `132c185`: all 2,679 archived files
+matched, package closure and both launchers passed twice, including isolated HOME. That clean guest
+exposed and closed missing `python3-cairo` ownership and the previously untracked/undocumented
+Legacy model provisioning contract.

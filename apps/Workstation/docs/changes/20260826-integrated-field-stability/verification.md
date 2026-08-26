@@ -13,7 +13,7 @@
 | R7 | dual MP4 finalization and usable bitstream | size/sample/decode/IDR/frame-number/timing evidence | Workstation and blank-start Legacy dual creation/EOS PASS but portable integrity FIELD FAIL; latest Legacy files also have zero IDR, decode loss, frame gaps and final stts=0 |
 | R8 | exact evidence identity | FrameKey plus durable readback hash | FIELD PASS: independent no-product-import audit verified 88 real pairs/176 PNGs/487.5MB, run-scoped descriptor reconstruction, PNG CRC/decode, byte/path/ACK hashes, failure0 |
 | R9 | bounded GUI/resources | time-series RSS/queues/GPU/latency/cleanup | GUI/Recv-Q PASS; 315-callback NaN log storm fixed; real SIGKILL tracker cleanup and strict orphan-startup sweep PASS; final long-load cleanup pending |
-| R10 | canonical reproducible runtime | doctor/launchers/root venv | CURRENT HOST + fresh checkout/venv PASS; portability 12→0 PASS; separate clean Ubuntu OS/VM still pending |
+| R10 | canonical reproducible runtime | doctor/launchers/root venv | PASS: portability 12→0, same-host fresh venv, and separate official Ubuntu 22.04.5 KVM exact-commit recreation; package closure, both launchers and isolated HOME pass |
 | R11 | final integrated acceptance | 3 cold boots + 60-minute full load + failure isolation | NOT_RUN |
 | R12 | method-specific readiness without global Start gate | current-zoom K,D/R,t, correspondence, attitude/GNSS/STUS permutations | FIELD/SW PASS: real all-blocked run admitted 44 pairs and persisted 352 BLOCKED outcomes; six-case UI matrix kept Start enabled without promoting validity |
 | R13 | no unapproved camera setting mutation | code-path audit + pre/post readback for each hardware app | FIELD PASS: Workstation and Legacy automatic paths sent no encoder SET; Legacy all-path TCP/2240 pcap contained 0 packets, final device readback remained 0/1/30/1 |
@@ -167,9 +167,29 @@
   colcon `<80`. The manifest now owns `setuptools>=77,<80`, also satisfying Torch 2.13 `>=77`; fresh
   resolution selected 79.0.1.
 - Deployment, execution, Workstation and Legacy checks all exited zero inside the fresh checkout.
-  Workstation and Legacy also passed again under isolated HOME/config/cache. This is same-host fresh
-  checkout/venv evidence; a separate clean Ubuntu OS/VM remains pending. Full artifact:
+  Workstation and Legacy also passed again under isolated HOME/config/cache. This same-host evidence
+  was later independently repeated and closed on a separate clean Ubuntu VM. Full initial artifact:
   `evidence/fresh-runtime-portability-20260827.md`.
+
+### Separate clean Ubuntu VM closure
+
+- Official Ubuntu Jammy image SHA-256 matched its published checksum. A clean Ubuntu 22.04.5 KVM
+  guest booted with cloud-init errors 0 and no `.git` or inherited installed runtime.
+- Exact pushed commit `132c18544158368fc89ac98dc457b8e7a1341f9c` was exported; all 2,679 tracked
+  files matched their independent archive hashes inside the guest. Both intentionally external
+  YOLO files matched their tracked manifests.
+- RED 1: system PyGObject left `pycairo` unsatisfied. `python3-cairo` is now in the Ubuntu manifest;
+  final `pip check` reports no broken requirements.
+- RED 2: Legacy's ignored model was not actually bundled. It now has a tracked size/SHA-256
+  manifest, explicit provisioning, and fail-closed default-model validation. Same-size tampering
+  failed the real checker; restoring approved bytes passed.
+- Deployment Software, execution Software, Workstation Auto and Legacy Auto/MAVLink-only all passed.
+  Both launchers passed again under a new isolated HOME/config/cache. Auto truthfully selected
+  `avdec_h264` because no NVIDIA device was passed through.
+- Local regressions: Legacy non-monolithic **421 passed**; Workstation **1466 passed, 1 skipped**;
+  new/adjacent runtime/model contract **34 passed**; portable path policy PASS.
+- Full artifact: `evidence/clean-ubuntu-vm-runtime-20260827.md`. R10 is closed; this does not promote
+  any hardware requirement.
 
 ### Legacy expected-video finalization
 
@@ -344,7 +364,8 @@ The first runtime audit found user-site dependency leakage and a broken NVIDIA b
 host has since been repaired: isolated `PYTHONNOUSERSITE=1` imports, both launcher
 checks, all GStreamer factories, CUDA and NVIDIA driver 595.84 pass. A later same-host fresh
 checkout/venv recreated the manifest and both launchers, and portability now passes with zero
-findings. R10 still awaits a different clean Ubuntu OS/VM.
+findings. A later official Ubuntu 22.04.5 KVM recreation passed exact pushed source, dependency
+closure, both launchers and isolated HOME, closing R10.
 
 SASL/NGII authentication-only gate: the Workstation process retained an established TCP connection
 to `210.117.198.83:2101`, sent/acked 153 bytes, received `ICY 200 OK` and showed
@@ -404,4 +425,4 @@ MP4 remain blocked by zero-IDR; full integrated NTRIP/cold-boot/60-minute accept
 
 The confirmed FW 2.18.72 zero-IDR sender is the common CRITICAL blocker for R1/R2/R3/R7. PX4
 MAVLink passes isolated-NIC short and ten-minute gates, while the internal shared-L2 stall mechanism
-remains unproven. Camera reboot approval, NTRIP credential/RTK, cold boots and final 60 minutes remain.
+remains unproven. Open-sky RTK Fixed, three independent cold boots and final 60 minutes remain.

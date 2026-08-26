@@ -236,3 +236,15 @@ Append accepted decisions chronologically. Supersede entries rather than deletin
   not replace a different clean Ubuntu OS/VM. Preserve that distinction in R10.
 - Historical calibration/change evidence may retain captured absolute paths. Active configuration,
   scripts and operator examples may not; the repository portability gate must report zero.
+
+## 2026-08-27 — External operator models remain untracked and manifest-verified
+
+- Decision: Keep both approved YOLO model binaries outside Git. Track their filename, byte count,
+  SHA-256 and provisioning contract, and make each application runtime check fail closed when its
+  default model is missing or does not match.
+- Reason: Repository policy explicitly excludes large downloaded model files, but a relative path
+  alone falsely implied that Legacy's ignored `yolov8n_uav.pt` was bundled. A clean commit archive
+  proved the bytes were absent.
+- Consequence: A clean deployment must explicitly provision Workstation and Legacy model artifacts.
+  Custom Legacy model selections preserve their existing presence-only contract; the approved
+  default is the hash-locked reproducible path.

@@ -4,7 +4,8 @@
 
 This is a current-host fresh-checkout/fresh-venv qualification, not evidence from a different clean
 Ubuntu machine. Docker exists but the operator user cannot access its root-owned daemon and
-passwordless sudo is unavailable, so the separate clean-OS/VM gate remains open.
+passwordless sudo is unavailable, so the separate clean-OS/VM gate was open at the time of this
+run. It was later closed by `clean-ubuntu-vm-runtime-20260827.md` using direct user-authorized KVM.
 
 ## Repository portability
 
@@ -77,9 +78,9 @@ hashes and text inventories below were captured; the listed `/tmp` logs remain.
 - Runtime manifest:
   `8e0729347151eb7052373179579290f9fe7ba43e26fdebee3ebc264909cf17de`.
 
-## Remaining R10 boundary
+## R10 boundary at the time of this run
 
-Manifest recreation is now proven in a fresh checkout/venv on the current Ubuntu 22.04.5 host, and
-the repository portability gate is clean. A genuinely separate clean Ubuntu host/VM is still
-required to prove that no unlisted OS state contributed. It must not be replaced by this same-host
-result.
+Manifest recreation was proven in a fresh checkout/venv on the current Ubuntu 22.04.5 host, and
+the repository portability gate was clean. A genuinely separate clean Ubuntu host/VM was still
+required to prove that no unlisted OS state contributed. This same-host result was not used as that
+substitute; the later clean Ubuntu KVM evidence independently closes the boundary.
