@@ -438,15 +438,25 @@ class SettingsWorkspace(QtWidgets.QWidget):
         )
         encoder_bitrate = self._integer("wiris_visible_encoder_bitrate", 0, 1_000_000_000)
         encoder_bitrate.setToolTip(
-            "WIRIS SEBR VISIBLE value. Zero enables constant-quality mode; nonzero disables QP control."
+            "Manual-reference WIRIS SEBR VISIBLE value. RTSP enable and Auto-Connect do not apply it. "
+            "Zero enables constant-quality mode; nonzero disables QP control."
         )
         encoder_qp = self._integer("wiris_visible_encoder_qp", 0, 51)
-        encoder_qp.setToolTip("WIRIS SEQZ VISIBLE value; effective only when bitrate is zero.")
+        encoder_qp.setToolTip(
+            "Manual-reference WIRIS SEQZ VISIBLE value; RTSP enable and Auto-Connect do not apply it. "
+            "Effective only when bitrate is zero."
+        )
         encoder_gop = self._integer("wiris_visible_encoder_gop", 0, 32767)
+        encoder_gop.setToolTip(
+            "Manual-reference WIRIS SEGS VISIBLE value; RTSP enable and Auto-Connect do not apply it."
+        )
         encoder_idr = self._integer("wiris_visible_encoder_idr", 0, 1_000_000_000)
+        encoder_idr.setToolTip(
+            "Manual-reference WIRIS SEIR VISIBLE value; RTSP enable and Auto-Connect do not apply it."
+        )
         layout.addWidget(
             self._group(
-                "WIRIS visible encoder profile",
+                "WIRIS visible encoder reference (manual only)",
                 [
                     ("Bitrate", encoder_bitrate),
                     ("QP", encoder_qp),

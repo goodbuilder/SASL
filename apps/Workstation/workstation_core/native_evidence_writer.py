@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import queue
 import threading
@@ -31,6 +32,7 @@ class RingFrameRequest:
     key: FrameKey
     lease: NativeFrameLease
     metadata: dict[str, Any]
+    pinned_descriptor_sha256: str
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,104 @@ class RingPairJob:
     purpose: str
     frames: tuple[RingFrameRequest, ...]
     context: dict[str, object]
+
+
+class RingPairReservation:
+    """Single-owner lease bundle transferred from pairer to writer.
+
+    The pair coordinator owns a new reservation until the GUI consumes its
+    result.  ``transfer`` moves the already-pinned leases to exactly one writer
+    job; ``release`` is idempotent and only releases leases that were not
+    transferred.  This keeps GUI polling latency outside the ring overwrite
+    window without sharing mutable GUI objects with the writer thread.
+    """
+
+    def __init__(self, frames: Sequence[RingFrameRequest]) -> None:
+        self.frames = tuple(frames)
+        self._lock = threading.Lock()
+        self._state = "owned"
+
+    @property
+    def active(self) -> bool:
+        with self._lock:
+            return self._state == "owned"
+
+    @property
+    def frame_keys(self) -> tuple[FrameKey, ...]:
+        return tuple(frame.key for frame in self.frames)
+
+    def transfer(self) -> tuple[RingFrameRequest, ...] | None:
+        with self._lock:
+            if self._state != "owned":
+                return None
+            self._state = "transferred"
+            return self.frames
+
+    def release(self) -> bool:
+        with self._lock:
+            if self._state != "owned":
+                return False
+            self._state = "released"
+        released = True
+        for frame in self.frames:
+            released = frame.ring.release(frame.lease) and released
+        return released
+
+
+def reserve_ring_pair(
+    frames: Sequence[
+        tuple[str, SharedNativeFrameRing, FrameKey, Mapping[str, Any]]
+    ],
+) -> RingPairReservation | None:
+    """Pin every exact frame atomically from the caller's point of view."""
+
+    requested = tuple(frames)
+    if len(requested) != 2 or {str(item[0]) for item in requested} != {
+        "left",
+        "right",
+    }:
+        raise ValueError("native pair reservation requires one left and one right frame")
+    pinned: list[RingFrameRequest] = []
+    try:
+        for side, ring, key, metadata in requested:
+            if str(side) != key.camera_id or ring.camera_id != key.camera_id:
+                raise ValueError("native pair side, ring, and FrameKey must agree")
+            lease = ring.pin(key)
+            if lease is None:
+                for frame in pinned:
+                    frame.ring.release(frame.lease)
+                return None
+            try:
+                descriptor = ring.descriptor(key)
+                if descriptor is None:
+                    ring.release(lease)
+                    for frame in pinned:
+                        frame.ring.release(frame.lease)
+                    return None
+                descriptor_sha256 = str(
+                    descriptor.to_mapping().get("frame_descriptor_sha256") or ""
+                )
+                request = RingFrameRequest(
+                    side=str(side),
+                    ring=ring,
+                    key=key,
+                    lease=lease,
+                    metadata=dict(metadata),
+                    pinned_descriptor_sha256=descriptor_sha256,
+                )
+            except Exception:
+                ring.release(lease)
+                raise
+            pinned.append(request)
+    except Exception:
+        for frame in pinned:
+            frame.ring.release(frame.lease)
+        raise
+    if len(pinned) != len(requested):
+        for frame in pinned:
+            frame.ring.release(frame.lease)
+        return None
+    return RingPairReservation(pinned)
 
 
 def _safe_token(value: object, fallback: str) -> str:
@@ -143,7 +243,6 @@ class AsyncNativeEvidenceWriter(QtCore.QObject):
         context: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         request = str(request_id)
-        pinned: list[RingFrameRequest] = []
         with self._lock:
             if self._closed:
                 return {
@@ -164,30 +263,76 @@ class AsyncNativeEvidenceWriter(QtCore.QObject):
                     ),
                     "evidence_state": "FAILED",
                 }
+        try:
+            reservation = reserve_ring_pair(frames)
+        except (TypeError, ValueError) as exc:
+            with self._lock:
+                self._metrics["frame_unavailable"] += 1
+            return {
+                "native_pair_status": EVIDENCE_FRAME_UNAVAILABLE,
+                "native_pair_error": f"{type(exc).__name__}: {exc}",
+                "evidence_state": "REJECTED",
+            }
+        if reservation is None:
+            with self._lock:
+                self._metrics["frame_unavailable"] += 1
+            return {
+                "native_pair_status": EVIDENCE_FRAME_UNAVAILABLE,
+                "native_pair_error": "one or more exact native frames are unavailable",
+                "evidence_state": "REJECTED",
+            }
+        return self.enqueue_reserved_pair(
+            request_id=request_id,
+            pair_id=pair_id,
+            purpose=purpose,
+            reservation=reservation,
+            context=context,
+        )
 
-            for side, ring, key, metadata in frames:
-                lease = ring.pin(key)
-                if lease is None:
-                    self._release_requests(pinned)
-                    self._metrics["frame_unavailable"] += 1
-                    return {
-                        "native_pair_status": EVIDENCE_FRAME_UNAVAILABLE,
-                        "native_pair_error": (
-                            f"exact native frame unavailable: {key.text}"
-                        ),
-                        "native_pair_missing_sides": str(side),
-                        "evidence_state": "REJECTED",
-                    }
-                pinned.append(
-                    RingFrameRequest(
-                        side=str(side),
-                        ring=ring,
-                        key=key,
-                        lease=lease,
-                        metadata=dict(metadata),
-                    )
-                )
+    def enqueue_reserved_pair(
+        self,
+        *,
+        request_id: str,
+        pair_id: str,
+        purpose: str,
+        reservation: RingPairReservation,
+        context: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        """Consume one pre-pinned pair reservation and schedule its writer job."""
 
+        request = str(request_id)
+        with self._lock:
+            if self._closed:
+                reservation.release()
+                return {
+                    "native_pair_status": "writer_closed",
+                    "evidence_state": "FAILED",
+                }
+            if request in self._pending:
+                reservation.release()
+                return {
+                    "native_pair_status": "duplicate_request",
+                    "evidence_state": "FAILED",
+                }
+            if len(self._pending) >= self.max_pending:
+                reservation.release()
+                self._metrics["queue_full"] += 1
+                return {
+                    "native_pair_status": "queue_full",
+                    "native_pair_error": (
+                        f"native evidence queue limit {self.max_pending} reached"
+                    ),
+                    "evidence_state": "FAILED",
+                }
+
+            pinned = reservation.transfer()
+            if pinned is None:
+                self._metrics["frame_unavailable"] += 1
+                return {
+                    "native_pair_status": EVIDENCE_FRAME_UNAVAILABLE,
+                    "native_pair_error": "native pair reservation is no longer owned",
+                    "evidence_state": "REJECTED",
+                }
             stored_pair_id = str(pair_id)
             if self.timestamp_filenames:
                 stored_pair_id = (
@@ -228,7 +373,7 @@ class AsyncNativeEvidenceWriter(QtCore.QObject):
         }
         identifier = _safe_token(stored_pair_id, "frame")
         purpose_value = _safe_token(purpose, "unspecified")
-        for frame in pinned:
+        for frame in job.frames:
             scheduled.update(
                 {
                     f"native_{frame.side}_frame_id": identifier,
@@ -242,6 +387,39 @@ class AsyncNativeEvidenceWriter(QtCore.QObject):
             )
         return scheduled
 
+    @staticmethod
+    def _validate_pinned_snapshot(frame: RingFrameRequest, snapshot) -> None:
+        descriptor = snapshot.descriptor
+        if frame.side != frame.key.camera_id:
+            raise ValueError("native evidence side differs from pinned FrameKey camera")
+        if descriptor.key != frame.key or descriptor.channels != 3:
+            raise ValueError("pinned native descriptor identity mismatch")
+        if len(snapshot.data) != descriptor.byte_length:
+            raise ValueError("pinned native descriptor byte length mismatch")
+
+        incoming_key = FrameKey.from_mapping(frame.metadata)
+        if incoming_key != frame.key:
+            raise ValueError("incoming native frame identity differs from pinned frame")
+        incoming_sha256 = str(
+            frame.metadata.get("frame_descriptor_sha256") or ""
+        ).strip().lower()
+        current_sha256 = str(
+            descriptor.to_mapping().get("frame_descriptor_sha256") or ""
+        ).strip().lower()
+        pinned_sha256 = str(frame.pinned_descriptor_sha256 or "").strip().lower()
+        if not incoming_sha256 or not hmac.compare_digest(
+            incoming_sha256,
+            pinned_sha256,
+        ):
+            raise ValueError(
+                "incoming native frame descriptor hash differs from pinned descriptor"
+            )
+        if not current_sha256 or not hmac.compare_digest(
+            current_sha256,
+            pinned_sha256,
+        ):
+            raise ValueError("pinned native frame descriptor changed after reservation")
+
     def _persist(self, job: RingPairJob) -> dict[str, object]:
         if self._store is None:
             self._store = NativeFrameStore(self.root)
@@ -251,13 +429,24 @@ class AsyncNativeEvidenceWriter(QtCore.QObject):
         }
         ack_rows: list[dict[str, object]] = []
         failed: list[str] = []
+        snapshots: list[tuple[RingFrameRequest, object]] = []
         try:
             for frame in job.frames:
                 try:
                     snapshot = frame.ring.read(frame.lease)
+                    self._validate_pinned_snapshot(frame, snapshot)
+                    snapshots.append((frame, snapshot))
+                except Exception as exc:  # noqa: BLE001 - pair validation fails closed.
+                    failed.append(frame.side)
+                    fields[f"native_{frame.side}_error"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
+            # Descriptor/key validation is an all-pair preflight. Never write
+            # the other side when one incoming identity is contradictory.
+            if not failed:
+                for frame, snapshot in snapshots:
                     descriptor = snapshot.descriptor
-                    if descriptor.key != frame.key or descriptor.channels != 3:
-                        raise ValueError("pinned native descriptor identity mismatch")
                     image = _qimage_from_bgr(
                         snapshot.data,
                         width=descriptor.width,
@@ -272,42 +461,47 @@ class AsyncNativeEvidenceWriter(QtCore.QObject):
                             "overlay_applied": False,
                         }
                     )
-                    artifact = self._store.persist(
-                        side=frame.side,
-                        purpose=job.purpose,
-                        frame_id=job.pair_id,
-                        image=image,
-                        metadata=metadata,
-                    )
-                except Exception as exc:  # noqa: BLE001 - each side stays explicit.
-                    failed.append(frame.side)
-                    fields[f"native_{frame.side}_error"] = (
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                    continue
-                row = {
-                    "side": frame.side,
-                    "source_frame_key": frame.key.text,
-                    "relative_path": artifact.relative_path,
-                    "size_bytes": artifact.size_bytes,
-                    "sha256": artifact.sha256,
-                    "timestamp_s": artifact.timestamp_s,
-                    "source_timestamp_s": artifact.source_timestamp_s,
-                }
-                ack_rows.append(row)
-                fields.update(
-                    {
-                        f"native_{frame.side}_frame_id": artifact.frame_id,
-                        f"native_{frame.side}_source_frame_id": frame.key.text,
-                        f"native_{frame.side}_png_path": artifact.relative_path,
-                        f"native_{frame.side}_png_sha256": artifact.sha256,
-                        f"native_{frame.side}_width_px": artifact.width,
-                        f"native_{frame.side}_height_px": artifact.height,
-                        f"native_{frame.side}_timestamp_reference": (
-                            artifact.timestamp_reference
-                        ),
+                    try:
+                        artifact = self._store.persist(
+                            side=frame.side,
+                            purpose=job.purpose,
+                            frame_id=job.pair_id,
+                            image=image,
+                            metadata=metadata,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - each side stays explicit.
+                        failed.append(frame.side)
+                        fields[f"native_{frame.side}_error"] = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        continue
+                    row = {
+                        "side": frame.side,
+                        "source_frame_key": frame.key.text,
+                        "frame_descriptor_sha256": frame.pinned_descriptor_sha256,
+                        "relative_path": artifact.relative_path,
+                        "size_bytes": artifact.size_bytes,
+                        "sha256": artifact.sha256,
+                        "timestamp_s": artifact.timestamp_s,
+                        "source_timestamp_s": artifact.source_timestamp_s,
                     }
-                )
+                    ack_rows.append(row)
+                    fields.update(
+                        {
+                            f"native_{frame.side}_frame_id": artifact.frame_id,
+                            f"native_{frame.side}_source_frame_id": frame.key.text,
+                            f"native_{frame.side}_frame_descriptor_sha256": (
+                                frame.pinned_descriptor_sha256
+                            ),
+                            f"native_{frame.side}_png_path": artifact.relative_path,
+                            f"native_{frame.side}_png_sha256": artifact.sha256,
+                            f"native_{frame.side}_width_px": artifact.width,
+                            f"native_{frame.side}_height_px": artifact.height,
+                            f"native_{frame.side}_timestamp_reference": (
+                                artifact.timestamp_reference
+                            ),
+                        }
+                    )
         finally:
             self._release_requests(job.frames)
 
@@ -404,4 +598,6 @@ __all__ = [
     "EVIDENCE_FRAME_UNAVAILABLE",
     "RingFrameRequest",
     "RingPairJob",
+    "RingPairReservation",
+    "reserve_ring_pair",
 ]

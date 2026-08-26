@@ -268,7 +268,7 @@ content process 합계 약 100% CPU였다.
 완료 기준은 위 `2026-08-26 20-run 자세오차 측정 실행 조건`의 20/20 PASS,
 120-row CSV, 18 comparisons, velocity-only/hold/finalization/CUDA 증거를 그대로 유지한다.
 
-이 문서는 `/home/moontaehyung/바탕화면/SASL-20260821/apps/Simulation`에서
+이 문서는 현재 checkout의 `apps/Simulation`에서
 재부팅 직후 새 Goal의 objective로 사용한다.
 
 ## 재개 명령
@@ -396,7 +396,8 @@ env \
 모델과 기존 성공 run의 실제 MP4를 사용한다.
 
 ```bash
-MODEL=/home/moontaehyung/바탕화면/SASL-20260821/.local/legacy/Simulation/yolov8n_uav.pt
+SASL_ROOT="$(git rev-parse --show-toplevel)"
+MODEL="$SASL_ROOT/.local/legacy/Simulation/yolov8n_uav.pt"
 SOURCE=recordings/goal-attitude-sweep-20260825_025133/case-center-001_Lr0p20y0_Rr0p20y0_repetition00/operator-recording
 OUT=recordings/goal-yolo-vertical-$(date +%Y%m%d_%H%M%S)
 mkdir -p "$OUT"

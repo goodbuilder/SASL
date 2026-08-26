@@ -548,10 +548,14 @@ class Rtcm3StreamParser:
             if len(self._buffer) < frame_len:
                 break
             frame = bytes(self._buffer[:frame_len])
-            del self._buffer[:frame_len]
             if _crc24q(frame[:-3]) != int.from_bytes(frame[-3:], "big"):
-                # Sync byte landed on corrupted/misaligned data; drop this
-                # candidate frame and keep scanning for the next 0xD3.
+                # A corrupt length field can make this candidate encompass a
+                # complete valid frame that follows the false sync byte.  Drop
+                # only that sync byte so the next pass can rescan every
+                # remaining byte for 0xD3; deleting ``frame_len`` bytes here
+                # would silently discard the enclosed valid correction.
+                del self._buffer[0]
                 continue
+            del self._buffer[:frame_len]
             frames.append(frame)
         return frames

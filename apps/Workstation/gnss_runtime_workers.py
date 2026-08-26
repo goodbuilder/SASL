@@ -1060,6 +1060,10 @@ class NtripNetworkWorker(QtCore.QObject):
                 except Exception as exc:
                     if self._stop_event.is_set():
                         break
+                    error_text = str(exc)
+                    if "401" in error_text or "unauthorized" in error_text.lower():
+                        self.failed.emit(error_text)
+                        break
                     consecutive_failures += 1
                     if consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
                         self.failed.emit(str(exc))

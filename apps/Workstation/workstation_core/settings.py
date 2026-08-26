@@ -98,7 +98,11 @@ class AppSettings:
     intrinsics_path: str = DEFAULT_INTRINSICS_PATH
     yolo_weights_path: str = DEFAULT_YOLO_WEIGHTS_PATH
     interface_name: str = "enx588694fce07e"
-    camera_host_address: str = "10.0.0.10/24"
+    # Camera traffic is isolated from the Pixhawk NIC, which owns
+    # 10.0.0.10/24.  The /32 address relies on the explicit .231/.232 host
+    # routes and prevents a second connected 10.0.0.0/24 from recreating the
+    # shared-L2 MAVLink stall trigger.
+    camera_host_address: str = "10.0.0.11/32"
     left_rtsp_url: str = "rtsp://10.0.0.231:8554/visible"
     right_rtsp_url: str = "rtsp://10.0.0.232:8554/visible"
     left_control_host: str = "10.0.0.231"
@@ -112,9 +116,8 @@ class AppSettings:
     right_control_port: int = 2240
     # The left camera's SDK can acknowledge read commands after roughly 2 s.
     wiris_control_timeout_s: float = 5.0
-    # Persist the field-validated visible-stream encoder profile. The camera
-    # worker reapplies and reads back these values whenever Ethernet/RTSP mode
-    # is enabled or reactivated.
+    # Stored reference values for explicit/manual encoder commands. Automatic
+    # RTSP enable, startup, Auto-Connect, and reactivation never apply them.
     wiris_visible_encoder_bitrate: int = 0
     wiris_visible_encoder_qp: int = 1
     wiris_visible_encoder_gop: int = 90

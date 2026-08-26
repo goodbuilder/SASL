@@ -2,9 +2,13 @@
 
 ## Approval status
 
-Awaiting explicit approval. `implementation_allowed: false`.
+Not approved. Device-view grouping interview reopened after the user corrected the filter-first
+interpretation. `implementation_allowed: false`.
 
 ## Slices and dependencies
+
+The S1–S7 draft below must be revised after the device group list and the treatment of shared/all
+events are confirmed. It is not an approval-ready implementation plan.
 
 ### S1 — Event contract and classifier (`NOT_RUN`)
 

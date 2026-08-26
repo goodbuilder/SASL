@@ -968,7 +968,7 @@ its generated path, telemetry, XLSX, compact CSVs, and left/right MP4 together.
 - The obsolete minimum-bounding-box controls are not exposed or persisted; the remaining detection-gate controls are unchanged.
 - The UI does not synthesize telemetry. Runtime values remain empty or UNKNOWN until a backend updates the shared state.
 - Changes to the Legacy UI are not automatically propagated to the standalone Workstation copy; update and test both copies deliberately until the remaining migration is complete.
-- Do not commit venvs, ROS build/install/log trees, runtime recordings, profiler output, downloaded models, or generated experiment runs. Machine-local state is grouped under ignored `.local/`; audit the checkout with `python3 tools/check_repository_policy.py`. `--allow-existing-debt` is only for reporting historical tracked artifacts pending cleanup.
+- Do not commit venvs, ROS build/install/log trees, runtime recordings, profiler output, downloaded models, or generated experiment runs. Machine-local state is grouped under ignored `.local/`; audit the checkout with `python3 tools/check_repository_policy.py` and `python3 tools/check_portable_paths.py`. Historical calibration/change evidence retains captured provenance through explicit policy classification; active paths must pass with zero findings.
 - Run the targeted tests first. The repository-wide test configuration in `pyproject.toml` excludes generated overlays, PX4 source, reports, and recordings from collection.
 - Regenerate an Auto path after changing `DRONE_SPAWN_X_M`,
   `DRONE_SPAWN_Y_M`, or `DRONE_SPAWN_Z_M`; do not reuse a mission CSV made for

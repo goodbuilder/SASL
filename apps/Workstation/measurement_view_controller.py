@@ -98,6 +98,11 @@ from Workstation.workstation_core.detection_pair_coordinator import (
     DetectionPairCoordinator,
     PairingPolicy,
 )
+from Workstation.workstation_core.native_evidence_writer import (
+    RingPairReservation,
+    reserve_ring_pair,
+)
+from Workstation.workstation_core.native_frame_ring import FrameKey
 from Workstation.workstation_core.preview_measurement_worker import (
     PreviewMeasurementCoordinator,
     PreviewMeasurementResult,
@@ -129,6 +134,7 @@ from Workstation.workstation_core.triangulation import (
 
 GEOMETRY_COMPARISON_ANALYSIS_SCHEMA = "workstation-geometry-comparison-analysis-v1"
 GEOMETRY_COMPARISON_ANALYSIS_NAMESPACE = "analysis/geometry_comparison"
+DETECTION_PAIR_MAX_OBSERVATION_AGE_S = 1.0
 
 MEASUREMENT_VIEW_CONTROLLER_METHODS = [
     "workstation_measurement_methods_snapshot",
@@ -247,6 +253,10 @@ class MeasurementViewController:
             if detection_coordinator is None
             else detection_coordinator.close()
         )
+        self._release_detection_pair_reservation(
+            getattr(self.panel, "_coordinated_detection_pair_reservation", None)
+        )
+        self.panel._coordinated_detection_pair_reservation = None
         preview_timer = self._preview_measurement_timer
         if preview_timer is not None:
             preview_timer.stop()
@@ -1752,10 +1762,57 @@ class MeasurementViewController:
         )
         self.panel._record_blocked_measurement_pair(blocked)
 
+    @staticmethod
+    def _release_detection_pair_reservation(reservation: object | None) -> None:
+        release = getattr(reservation, "release", None)
+        if callable(release):
+            release()
+
+    def _exact_pair_reservation_supported(self) -> bool:
+        return all(
+            callable(
+                getattr(
+                    getattr(self.panel, f"{side}_pane", None),
+                    "native_ring_for_frame_key",
+                    None,
+                )
+            )
+            for side in ("left", "right")
+        )
+
+    @staticmethod
+    def _reserve_detection_pair(
+        pair: object,
+        sources: Mapping[str, object | None],
+    ) -> RingPairReservation | None:
+        frames = []
+        for side, observation in (("left", pair.left), ("right", pair.right)):
+            metadata = getattr(observation, "timestamp_metadata", {})
+            if not isinstance(metadata, Mapping):
+                raise ValueError(f"{side} frame metadata is unavailable")
+            key = FrameKey.from_mapping(metadata)
+            if (
+                key.camera_id != side
+                or key.stream_generation <= 0
+                or key.frame_id <= 0
+            ):
+                raise ValueError(f"{side} exact FrameKey is invalid")
+            ring = sources.get(side)
+            if ring is None:
+                raise ValueError(f"{side} exact native ring is unavailable")
+            frames.append((side, ring, key, metadata))
+        return reserve_ring_pair(frames)
+
     def _ensure_detection_pair_coordinator(self) -> DetectionPairCoordinator:
         coordinator = self._detection_pair_coordinator
         if coordinator is None:
-            coordinator = DetectionPairCoordinator()
+            coordinator = DetectionPairCoordinator(
+                reservation_factory=(
+                    self._reserve_detection_pair
+                    if self._exact_pair_reservation_supported()
+                    else None
+                )
+            )
             self._detection_pair_coordinator = coordinator
         if (
             self._detection_pair_timer is None
@@ -1784,6 +1841,7 @@ class MeasurementViewController:
             max_delta_s=token[1],
             max_vertical_delta_px=token[2],
             allow_app_fallback=True,
+            max_observation_age_s=DETECTION_PAIR_MAX_OBSERVATION_AGE_S,
             revision=self._pairing_policy_revision,
         )
 
@@ -1794,14 +1852,32 @@ class MeasurementViewController:
         result = coordinator.poll_latest()
         if result is None:
             return
+        previous_reservation = getattr(
+            self.panel,
+            "_coordinated_detection_pair_reservation",
+            None,
+        )
+        if previous_reservation is not result.reservation:
+            self._release_detection_pair_reservation(previous_reservation)
+        self.panel._coordinated_detection_pair_reservation = result.reservation
         self.panel._detection_pair_coordinator_active = True
         self.panel._coordinated_detection_pair = result.pair
         self.panel._last_correspondence_rejection_reason = result.rejection_reason
         self.panel._last_pair_advisories = result.advisories
         self.panel._runtime_pair_uses_app_fallback = result.uses_app_fallback
         self.panel._detection_pair_metrics = coordinator.metrics()
-        self.panel._refresh_distance()
-        self.panel._refresh_optical_alignment_view()
+        try:
+            self.panel._refresh_distance()
+            self.panel._refresh_optical_alignment_view()
+        finally:
+            current_reservation = getattr(
+                self.panel,
+                "_coordinated_detection_pair_reservation",
+                None,
+            )
+            if current_reservation is result.reservation:
+                self._release_detection_pair_reservation(current_reservation)
+                self.panel._coordinated_detection_pair_reservation = None
 
     def reset_detection_pair_coordinator(self) -> None:
         coordinator = self._detection_pair_coordinator
@@ -1810,6 +1886,10 @@ class MeasurementViewController:
             coordinator.close()
         self.panel._detection_pair_coordinator_active = False
         self.panel._coordinated_detection_pair = None
+        self._release_detection_pair_reservation(
+            getattr(self.panel, "_coordinated_detection_pair_reservation", None)
+        )
+        self.panel._coordinated_detection_pair_reservation = None
         self.panel._detection_pair_metrics = {}
         preview_coordinator = self._preview_measurement_coordinator
         self._preview_measurement_coordinator = None
@@ -1914,10 +1994,22 @@ class MeasurementViewController:
             self.panel.latest_right = detection
         if detection is not None:
             self.panel.detection_buffers[camera].add(detection)
-        self._ensure_detection_pair_coordinator().submit(
+        coordinator = self._ensure_detection_pair_coordinator()
+        reservation_source = None
+        if detection is not None and self._exact_pair_reservation_supported():
+            try:
+                frame_key = FrameKey.from_mapping(detection.timestamp_metadata)
+            except (TypeError, ValueError):
+                frame_key = None
+            pane = getattr(self.panel, f"{camera}_pane", None)
+            resolver = getattr(pane, "native_ring_for_frame_key", None)
+            if frame_key is not None and callable(resolver):
+                reservation_source = resolver(frame_key)
+        coordinator.submit(
             camera,
             detection,
             self._pairing_policy_snapshot(),
+            reservation_source=reservation_source,
         )
 
     def _checkerboard_translation_right_in_left_m(self) -> tuple[float, float, float] | None:
@@ -2636,6 +2728,13 @@ class MeasurementViewController:
             isinstance(cached, Mapping)
             and tuple(cached.get("physical_key", ())) == tuple(physical_key)
         ):
+            reservation = getattr(
+                panel,
+                "_coordinated_detection_pair_reservation",
+                None,
+            )
+            self._release_detection_pair_reservation(reservation)
+            panel._coordinated_detection_pair_reservation = None
             return dict(cached)
 
         created_monotonic_ns = time.monotonic_ns()
@@ -2679,16 +2778,31 @@ class MeasurementViewController:
         pair_id = f"{generation_id}:{pair_sequence:020d}"
         native_fields: dict[str, object] = {}
         persister = getattr(panel, "_persist_native_detection_pair", None)
+        pair_reservation = getattr(
+            panel,
+            "_coordinated_detection_pair_reservation",
+            None,
+        )
+        if not isinstance(pair_reservation, RingPairReservation):
+            pair_reservation = None
         if callable(persister):
-            native_fields = dict(
-                persister(
-                    left_detection=left_detection,
-                    right_detection=right_detection,
-                    pair_id=f"pair-{pair_sequence}",
-                    purpose="method-evaluation",
+            try:
+                native_fields = dict(
+                    persister(
+                        left_detection=left_detection,
+                        right_detection=right_detection,
+                        pair_id=f"pair-{pair_sequence}",
+                        purpose="method-evaluation",
+                        reservation=pair_reservation,
+                    )
+                    or {}
                 )
-                or {}
-            )
+            except Exception:
+                self._release_detection_pair_reservation(pair_reservation)
+                panel._coordinated_detection_pair_reservation = None
+                raise
+        if pair_reservation is not None and not pair_reservation.active:
+            panel._coordinated_detection_pair_reservation = None
         if native_fields.get("native_pair_status") == "EVIDENCE_FRAME_UNAVAILABLE":
             raise ValueError(
                 "EVIDENCE_FRAME_UNAVAILABLE: exact selected native frame is no longer available"

@@ -7,8 +7,9 @@ decoder and prefers NVIDIA only when driver and element probes both pass.
 
 ## State, ownership, and concurrency
 
-Camera worker owns actual pipeline. Panel stores per-side active decoder and a bounded fallback
-reason/state projection. UI cannot infer success from requested mode.
+Camera worker owns actual pipeline. Panel stores per-side active decoder, process-local override and
+bounded fallback reason/state projection. UI cannot infer success from requested mode or from
+`set_state(PLAYING)`: only a decoded frame with the current pane generation activates a decoder.
 
 ## Worker resource budgets, scheduling, and backpressure
 
@@ -22,8 +23,12 @@ frame/stall, and current active pipeline status.
 
 ## Results, errors, timeout, retry, and cancellation
 
-Factory/start/5-second first-frame/3-second decoded-frame failures retain current rules. Auto may
-fallback once; explicit NVIDIA fails. Stop/close clears active decoder evidence.
+RTSP/source/parser, MP4 mux/filesink, decoder-health and generic-pipeline failures are distinct.
+Only direct NVDEC health, or the 30-second decoded-output timeout while RTP input remains current,
+may authorize Auto fallback. Preview-only fallback restarts the failed side inside its worker;
+recording fallback finalizes/stops that side and records an override for the next side start. The
+healthy side is never restarted. Explicit NVIDIA fails closed. Candidate, crash, terminal exit,
+stop and close clear only the affected side's active evidence.
 
 ## Persistence, restart, and shutdown
 

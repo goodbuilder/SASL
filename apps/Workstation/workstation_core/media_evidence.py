@@ -26,6 +26,11 @@ from enum import Enum
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from Workstation.workstation_core.mp4_integrity import (
+    H264_MP4_INTEGRITY_SCHEMA,
+    validate_h264_copy_mp4_integrity,
+)
+
 
 PRODUCER = "workstation.media_evidence"
 VIDEO_EVIDENCE_SCHEMA = "workstation-video-evidence-v1"
@@ -152,8 +157,12 @@ def verify_video_evidence(
     classification: str = "raw",
     required: bool = True,
     full_decode: bool = False,
+    h264_copy_integrity_required: bool = False,
+    recording_finalization_evidence: Mapping[str, Any] | None = None,
     probe_runner: Runner | None = None,
     decode_runner: Runner | None = None,
+    integrity_probe_runner: Runner | None = None,
+    integrity_trace_runner: Runner | None = None,
     ffprobe_binary: str = "ffprobe",
     ffmpeg_binary: str = "ffmpeg",
     probe_timeout_seconds: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
@@ -181,10 +190,11 @@ def verify_video_evidence(
     probe_timeout = _positive_timeout(probe_timeout_seconds, "probe_timeout_seconds")
     decode_timeout = (
         _positive_timeout(decode_timeout_seconds, "decode_timeout_seconds")
-        if full_decode
+        if full_decode or h264_copy_integrity_required
         else None
     )
     provenance = _portable_json_value(encoding_provenance or {})
+    finalization_evidence = dict(recording_finalization_evidence or {})
     base_metadata: dict[str, Any] = {
         "recording_backend": backend_text,
         "encoding_provenance": provenance,
@@ -201,6 +211,17 @@ def verify_video_evidence(
             "status": "not_run" if full_decode else "not_requested",
             "timeout_seconds": decode_timeout if full_decode else None,
         },
+        "h264_copy_integrity": {
+            "required": bool(h264_copy_integrity_required),
+            "integrity_validation_status": (
+                "NOT_RUN" if h264_copy_integrity_required else "NOT_REQUIRED"
+            ),
+            "recording_usable": False if h264_copy_integrity_required else None,
+            "recording_integrity_verified": False,
+        },
+        "recording_finalization_evidence": _portable_json_value(
+            finalization_evidence
+        ),
     }
 
     try:
@@ -318,6 +339,116 @@ def verify_video_evidence(
             metadata=base_metadata,
         )
     base_metadata.update(probe_metadata or {})
+
+    if h264_copy_integrity_required:
+        duration_seconds = float(base_metadata.get("duration_seconds") or 0.0)
+        integrity_decode_timeout = min(
+            900.0,
+            max(float(decode_timeout), duration_seconds * 0.10 + 30.0),
+        )
+        integrity_trace_timeout = min(
+            180.0,
+            max(probe_timeout, duration_seconds * 0.03 + 10.0),
+        )
+        finalization_path = str(finalization_evidence.get("path") or "")
+        try:
+            finalization_path_matches = bool(
+                finalization_path
+                and Path(finalization_path).expanduser().absolute()
+                == source_path.absolute()
+            )
+        except (OSError, ValueError):
+            finalization_path_matches = False
+        try:
+            live_metric_failure = any(
+                int(finalization_evidence.get(key, 0) or 0) > 0
+                for key in (
+                    "integrity_gap_events",
+                    "integrity_missing_packets",
+                    "integrity_suppressed_decoded_frames",
+                )
+            )
+        except (TypeError, ValueError, OverflowError):
+            live_metric_failure = True
+        finalization_boundary_valid = bool(
+            finalization_evidence
+            and finalization_path_matches
+            and finalization_evidence.get("container_finalization_success") is True
+            and not str(finalization_evidence.get("integrity_terminal_failure") or "")
+            and not live_metric_failure
+        )
+        base_metadata["recording_finalization_boundary_valid"] = (
+            finalization_boundary_valid
+        )
+        integrity = dict(
+            validate_h264_copy_mp4_integrity(
+                source_path,
+                probe_runner=integrity_probe_runner,
+                trace_runner=integrity_trace_runner,
+                ffprobe_binary=ffprobe_binary,
+                ffmpeg_binary=ffmpeg_binary,
+                decode_timeout_seconds=integrity_decode_timeout,
+                probe_timeout_seconds=probe_timeout,
+                trace_timeout_seconds=integrity_trace_timeout,
+            )
+        )
+        if integrity.get("integrity_schema") != H264_MP4_INTEGRITY_SCHEMA:
+            reasons = list(integrity.get("integrity_failure_reasons", ()) or ())
+            reasons.append("integrity_validation_schema_invalid")
+            integrity.update(
+                integrity_validation_status="FAIL",
+                integrity_failure_reasons=list(dict.fromkeys(reasons)),
+                recording_usable=False,
+                recording_integrity_verified=False,
+            )
+        base_metadata["h264_copy_integrity"] = integrity
+        if not _path_matches_stat(source_path, initial):
+            return _descriptor(
+                status="failed",
+                reason="video_file_changed_during_verification",
+                relative_path=portable_relative,
+                role=role_text,
+                source=source_text,
+                classification=classification_text,
+                required=required,
+                media_type=_media_type(source_path),
+                size_bytes=size_bytes,
+                sha256=digest,
+                metadata=base_metadata,
+            )
+        base_metadata["integrity_validation_status"] = str(
+            integrity.get("integrity_validation_status") or "FAIL"
+        )
+        integrity_pass = bool(
+            integrity.get("integrity_schema") == H264_MP4_INTEGRITY_SCHEMA
+            and integrity.get("integrity_validation_status") == "PASS"
+            and integrity.get("recording_usable") is True
+            and integrity.get("recording_integrity_verified") is True
+        )
+        base_metadata["recording_usable"] = integrity_pass
+        base_metadata["recording_integrity_verified"] = integrity_pass
+        if not integrity_pass or not finalization_boundary_valid:
+            reasons = tuple(integrity.get("integrity_failure_reasons", ()) or ())
+            return _descriptor(
+                status="failed",
+                reason=(
+                    "video_live_integrity_finalization_failed"
+                    if not finalization_boundary_valid
+                    else
+                    str(reasons[0])
+                    if reasons
+                    else "video_h264_copy_integrity_failed"
+                ),
+                relative_path=portable_relative,
+                role=role_text,
+                source=source_text,
+                classification=classification_text,
+                required=required,
+                media_type=_media_type(source_path),
+                size_bytes=size_bytes,
+                sha256=digest,
+                metadata=base_metadata,
+            )
 
     if full_decode:
         decode_record, decode_reason = _decode_video(

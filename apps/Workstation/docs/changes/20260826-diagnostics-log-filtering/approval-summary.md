@@ -2,6 +2,9 @@
 
 This document explains the proposed modification in plain language. Technical detail remains in the other packet documents.
 
+> 이 문서는 현재 승인 요청 문서가 아닙니다. 사용자가 filter-first 해석을 바로잡아 장비별
+> 고정 Log view 구성으로 다시 작성 중입니다.
+
 ## What changes and what stays the same
 
 Diagnostics의 `Log`를 시간순 표로 바꾸고 Source, Device, Level, 검색어 필터를 추가합니다.
@@ -53,4 +56,4 @@ NTRIP 오분류 회귀, FTP/Workspace/Inspector/recording/shutdown 회귀를 차
 이 문서와 `implementation-plan.md`의 S1–S7만 승인 대상입니다. 다른 활성 변경 패킷,
 디스크 로그 schema, 장비 protocol, 전체 logging framework 재작성은 포함하지 않습니다.
 
-현재 상태: 승인 요청 중. 소스 수정은 아직 허용되지 않았습니다.
+현재 상태: 장비 grouping 확인 중. 소스 수정은 아직 허용되지 않았습니다.

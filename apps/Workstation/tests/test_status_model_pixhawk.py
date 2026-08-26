@@ -164,3 +164,36 @@ def test_pixhawk_liveness_projection_distinguishes_qualification_attitude_stall_
     recovering = adapter.model.record("pixhawk.left")
     assert recovering.state == "RECOVERING"
     assert "qualification=00:00 / 10:00" in recovering.detail
+
+
+def test_pixhawk_status_projects_initial_heartbeat_timeout_with_peer_and_reason(monkeypatch) -> None:
+    from Workstation.workstation_core import pixhawk_attitude
+    from Workstation.workstation_core.pixhawk_attitude import DualPixhawkMavlinkSubscriber
+
+    clock = {"value": 0.0}
+    monkeypatch.setattr(pixhawk_attitude.time, "monotonic", lambda: clock["value"])
+    subscriber = DualPixhawkMavlinkSubscriber(
+        left_url="udpin:0.0.0.0:14550",
+        right_url="",
+        peer_hosts={"left": "10.0.0.2"},
+    )
+    subscriber.connections["left"] = object()
+    subscriber._ensure_liveness_listener("left")
+    panel = SimpleNamespace(
+        _mavlink_open_sides=lambda: ("left",),
+        pixhawk_attitude_times={"left": []},
+        mavlink_pixhawk=subscriber,
+        latest_extrinsics={},
+    )
+    adapter = BackendStatusAdapter(SimpleNamespace(panel=panel))
+
+    clock["value"] = 10.0
+    adapter._refresh_pixhawk(panel, "left", "P1", now_s=10.0)
+
+    status = adapter.model.record("pixhawk.left")
+    assert status is not None
+    assert status.state == "MAVLINK INITIAL RX TIMEOUT"
+    assert status.severity == StatusSeverity.BAD
+    assert "peer=10.0.0.2" in status.detail
+    assert "listener=10.0s" in status.detail
+    assert "expected-sysid HEARTBEAT not received" in status.detail

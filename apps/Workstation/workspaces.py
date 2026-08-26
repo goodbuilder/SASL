@@ -1508,11 +1508,16 @@ class CameraWorkspace(QtWidgets.QWidget):
             else getattr(getattr(panel, "settings", None), "rtsp_decoder", "auto")
         )
         fallback_reasons = getattr(panel, "decoder_fallback_reasons", {}) or {}
+        runtime_overrides = getattr(panel, "_runtime_decoder_overrides", {}) or {}
         for side, value in self.decoder_values.items():
             decoder = decoder_presentation(
                 requested_mode=requested_decoder,
                 active_decoder=active_decoders.get(side),
-                runtime_override=getattr(panel, "_runtime_decoder_override", None),
+                runtime_override=(
+                    runtime_overrides.get(side)
+                    if isinstance(runtime_overrides, Mapping) and side in runtime_overrides
+                    else getattr(panel, "_runtime_decoder_override", None)
+                ),
                 fallback_reason=(fallback_reasons.get(side) if isinstance(fallback_reasons, Mapping) else ""),
             )
             value.set_value(
@@ -1829,11 +1834,10 @@ class TimeWorkspace(QtWidgets.QWidget):
     def refresh(self, _snapshot: dict[str, RuntimeStatus]) -> None:
         panel = getattr(self.backend, "panel", self.backend)
         # The Workstation owns a separate visible Time workspace while the
-        # source panel (and its legacy time tab) stays hidden.  Once the
-        # finite STUS verification timer reaches verified/failed, frame-path
-        # refreshes therefore no longer update the source labels.  Recompute
-        # the source-backed summary at the bounded 4 Hz workspace poll while
-        # this page is visible, then mirror the resulting widgets below.
+        # source panel (and its legacy time tab) stays hidden.  The STUS
+        # controller continues a low-rate health poll after initial VERIFIED;
+        # this bounded 4 Hz workspace refresh mirrors that source-backed state
+        # without creating a second timing owner.
         update_clock_sync = getattr(panel, "_update_clock_sync_display", None)
         if callable(update_clock_sync):
             update_clock_sync()
@@ -12244,6 +12248,14 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         manual_active = bool(
             recording and recording.state == "ACTIVE" and not automatic
         )
+        stus_operation = getattr(panel, "_camera_sync_stus_operation", None)
+        clock_change_active = (
+            getattr(panel, "wiris_time_sync_thread", None) is not None
+            or (
+                isinstance(stus_operation, dict)
+                and bool(stus_operation.get("active"))
+            )
+        )
         button = self.operation_buttons.get("recording.toggle")
         if button is not None:
             button.setText(
@@ -12253,8 +12265,13 @@ class AdvancedWorkspace(QtWidgets.QWidget):
                 not automatic
                 and (
                     manual_active
-                    or recording is None
-                    or recording.state in {"IDLE", "SAVED"}
+                    or (
+                        not clock_change_active
+                        and (
+                            recording is None
+                            or recording.state in {"IDLE", "SAVED"}
+                        )
+                    )
                 )
             )
 
@@ -14246,6 +14263,7 @@ class DiagnosticsContent(QtWidgets.QWidget):
         selection = getattr(panel, "decoder_selection_status", {}) or {}
         active_decoders = getattr(panel, "active_stream_decoders", {}) or {}
         fallback_reasons = getattr(panel, "decoder_fallback_reasons", {}) or {}
+        runtime_overrides = getattr(panel, "_runtime_decoder_overrides", {}) or {}
         requested = selection.get("requested") or getattr(
             getattr(panel, "settings", None), "rtsp_decoder", "auto"
         )
@@ -14268,7 +14286,11 @@ class DiagnosticsContent(QtWidgets.QWidget):
             presentation = decoder_presentation(
                 requested_mode=requested,
                 active_decoder=(active_decoders.get(side) if isinstance(active_decoders, Mapping) else None),
-                runtime_override=getattr(panel, "_runtime_decoder_override", None),
+                runtime_override=(
+                    runtime_overrides.get(side)
+                    if isinstance(runtime_overrides, Mapping) and side in runtime_overrides
+                    else getattr(panel, "_runtime_decoder_override", None)
+                ),
                 fallback_reason=(fallback_reasons.get(side) if isinstance(fallback_reasons, Mapping) else ""),
             )
             lines.append(f"{label}: {presentation.value_text} | {presentation.detail}")

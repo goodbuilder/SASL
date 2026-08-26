@@ -10,6 +10,9 @@ from Workstation.evidence import EvidenceAdapter
 from Workstation.status_model import RuntimeStatus, StatusModel, StatusSeverity
 from Workstation.workstation_core.px4_calibration_groups import PX4_CALIBRATION_GROUPS
 from Workstation.workstation_core.px4_mag_manager import (
+    MAG_CAL_PARAM_NAMES,
+    MAG_PARAM_NAMES,
+    MAG_SLOTS,
     mag_priority_display,
 )
 from Workstation.workspaces import PixhawkWorkspace
@@ -219,6 +222,19 @@ def test_px4_priority_labels_keep_px4_raw_values_and_custom_values() -> None:
     assert mag_priority_display(0) == "Disabled (0)"
     assert mag_priority_display(50) == "Medium (50)"
     assert mag_priority_display(90) == "Custom (90)"
+
+
+def test_px4_v117_stock_magnetometer_refresh_uses_only_slots_zero_through_three() -> None:
+    from Workstation.workstation_core.px4_attitude_cal_manager import (
+        ATTITUDE_CAL_PARAM_NAMES,
+    )
+
+    assert MAG_SLOTS == (0, 1, 2, 3)
+    assert len(MAG_CAL_PARAM_NAMES) == 72
+    assert len(MAG_PARAM_NAMES) == 75
+    assert len(MAG_PARAM_NAMES) + len(ATTITUDE_CAL_PARAM_NAMES) == 124
+    assert "CAL_MAG3_ZCOMP" in MAG_PARAM_NAMES
+    assert not any(name.startswith("CAL_MAG4_") for name in MAG_PARAM_NAMES)
 
 
 def test_pixhawk_workspace_renders_qgc_calibration_parameter_group() -> None:

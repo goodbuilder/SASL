@@ -68,6 +68,20 @@ def test_raw_video_artifact_validation_ignores_camera_without_frames(tmp_path) -
     ) == ()
 
 
+def test_raw_video_artifact_validation_requires_expected_side_before_first_frame(
+    tmp_path,
+) -> None:
+    errors = raw_video_artifact_errors(
+        {"left": tmp_path / "missing.mp4"},
+        {"left": 0, "right": 0},
+        expected_cameras=("left",),
+    )
+
+    assert len(errors) == 1
+    assert "left MP4 파일 없음" in errors[0]
+    assert "frames=0" in errors[0]
+
+
 def test_compact_px4_timeline_preserves_mag_samples_and_slot_status() -> None:
     rows = compact_px4_timeline_rows(
         [

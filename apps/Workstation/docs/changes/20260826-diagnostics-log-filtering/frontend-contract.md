@@ -1,14 +1,15 @@
 # Frontend Contract
 
+> Status: grouping interview reopened. The previous filter-first contract is superseded where it
+> conflicts with device-specific fixed Log views.
+
 ## Controls and inputs
 
-- Source: All, Camera, Pixhawk, GNSS/RTK, Detection, Measurement, Storage, FTP,
-  Calibration, Alignment, System, Other.
-- Device: All, Left WIRIS, Right WIRIS, P1, P2, Base GNSS, NTRIP, Drone,
-  Shared/Unassigned.
-- Level: All, Info, Warning, Error.
-- Search: message/source/device/code에 대한 case-insensitive substring.
-- Pause view/Resume, Follow latest. 이벤트 삭제 버튼은 두지 않는다.
+- Primary control: 장비별 고정 view. 권장안은 Log 내부 compact sub-tabs이다.
+- Proposed grouping pending confirmation: 전체, WIRIS Left, WIRIS Right, P1, P2,
+  Base GNSS/NTRIP, Drone, 공용.
+- Level/search/pause/follow는 장비 view 안의 보조 기능으로만 검토한다.
+- 이벤트 삭제 버튼은 두지 않는다.
 
 ## Payloads and commands
 
@@ -17,7 +18,7 @@ backend mutation을 보내지 않는다.
 
 ## Visible states and transitions
 
-- 진입 기본값: All/All/All, 빈 search, running/follow latest.
+- 진입 기본값은 grouping 확정 후 정한다.
 - 새 event: bottom이면 append+follow; 위를 읽는 중이면 scroll 유지+new count.
 - Pause: rows 동결, pending count 증가; Resume: sequence 순으로 반영.
 - overflow: 만료된 event 수를 명시하고 남은 event를 계속 표시.

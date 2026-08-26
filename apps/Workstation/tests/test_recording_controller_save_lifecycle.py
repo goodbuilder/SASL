@@ -155,15 +155,7 @@ def test_real_save_worker_failure_preserves_spool_and_sets_retry(
     assert "injected persistence failure" in panel.recording_status_label.text
 
 
-def test_recording_stop_waits_for_method_bundle_barrier(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    scheduled: list[tuple[int, object]] = []
-    monkeypatch.setattr(
-        QtCore.QTimer,
-        "singleShot",
-        lambda delay_ms, callback: scheduled.append((delay_ms, callback)),
-    )
+def test_recording_stop_waits_for_method_bundle_barrier() -> None:
     owner = SimpleNamespace(method_evaluation_pending_count=lambda: 2)
     panel = SimpleNamespace(
         _camera_photo_capture_active=lambda: False,
@@ -180,7 +172,10 @@ def test_recording_stop_waits_for_method_bundle_barrier(
     assert panel._method_evaluation_accepting is False
     assert panel._method_evaluation_stop_retry_scheduled is True
     assert "barrier" in panel.recording_status_label.text
-    assert scheduled and scheduled[0][0] == 100
+    assert panel._recording_stop_retry_timer.isSingleShot()
+    assert panel._recording_stop_retry_timer.interval() == 100
+    assert panel._recording_stop_retry_request["barrier"] == "method_evaluation"
+    panel._recording_stop_retry_timer.stop()
 
 
 def test_recording_stop_rejects_target_artifact_failure_result() -> None:
@@ -231,6 +226,7 @@ def test_recording_stop_rejects_target_artifact_failure_result() -> None:
 def test_sessionless_manual_stop_releases_owner_and_never_waits_for_save() -> None:
     calls: list[str] = []
     events: list[tuple[str, dict[str, object]]] = []
+    video_path = Path("/tmp/unvalidated-sessionless.mp4")
     panel = SimpleNamespace(
         _measurement_session_hierarchy_enabled=False,
         _method_evaluation_accepting=True,
@@ -246,7 +242,16 @@ def test_sessionless_manual_stop_releases_owner_and_never_waits_for_save() -> No
         gnss_base_recording_rows=[],
         extrinsics_comparison_recording_rows=[],
         method_evaluation_bundle_rows=[],
-        video_recording_paths={},
+        video_recording_paths={"left": video_path},
+        stream_backend_combo=SimpleNamespace(currentData=lambda: "gstreamer"),
+        left_pane=SimpleNamespace(
+            recording_finalizations={
+                str(video_path): {
+                    "success": True,
+                    "detail": "EOS received; mp4mux finalized",
+                }
+            }
+        ),
         record_button=_WidgetState(),
         camera_connected=False,
         append_workstation_data=lambda stream, payload, **_kwargs: events.append(
@@ -270,6 +275,19 @@ def test_sessionless_manual_stop_releases_owner_and_never_waits_for_save() -> No
         stream == "events" and payload["event_type"] == "recording_stopped"
         for stream, payload in events
     )
+    video_closed = next(
+        payload
+        for stream, payload in events
+        if stream == "artifacts" and payload["event_type"] == "video_closed"
+    )
+    assert video_closed["container_finalization_success"] is True
+    assert video_closed["finalization_state"] == "failed"
+    assert video_closed["integrity_validation_status"] == "FAIL"
+    assert video_closed["recording_integrity_verified"] is False
+    assert video_closed["recording_usable"] is False
+    assert video_closed["integrity_failure_reasons"] == [
+        "integrity_validation_schema_invalid"
+    ]
 
 
 def test_sessionless_row_setup_falls_back_to_memory_when_writer_setup_fails() -> None:

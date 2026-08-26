@@ -11,6 +11,8 @@ Open, Close, Finalize, Seal, recovery, completeness, or package gate before a Me
 start. `Measurement` owns only the transient states `IDLE`, `QUEUED`, `STARTING`, `RUNNING`,
 `STOPPING`, and `ERROR`. Persisted data never owns admission to those states. An old open or
 recoverable Session directory is inert historical data and cannot disable `측정 시작`.
+After an abnormal process exit, restart likewise leaves the incomplete run as inert append-only
+history and creates a new runtime generation only when the operator presses `측정 시작` again.
 
 Structured records append to fixed, type-owned files beneath one relative
 `measurement_data_root`. Videos, still images, native PNGs, and ULogs use their own creation-time
@@ -52,12 +54,21 @@ tools/check_operator_runtime.sh --execution
 ./apps/Workstation/run.sh
 ```
 
+The Workstation/Legacy launchers and common runtime doctor start from a closed operator
+environment: user-site packages and ambient Python, loader, GI and GStreamer plugin/system/scanner
+paths are cleared before the canonical repository paths are added. Deployment checks can bootstrap
+with `/usr/bin/python3 -S` before the venv or third-party `packaging` module exists; version parsing
+is loaded only by the execution check after the interpreter gate.
+
 The launcher accepts only repository `.venv/bin/python`; app-local, Simulation, system Python,
 manual `dist-packages` `.pth`, and arbitrary `PYTHON_BIN` fallback are unsupported. `--check`
 validates the interpreter, declared dependency versions, Workstation imports/settings/model,
 Gst/GstRtp typelibs, required pipeline element find/make, and the selected decoder. It prints
 `PASS/WARN/FAIL`, selected/effective decoder, missing elements, Ubuntu packages, and recovery
-commands before returning the shared `0/1/2` exit contract.
+commands before returning the shared `0/1/2` exit contract. Both launchers force
+`PYTHONNOUSERSITE=1`, use only explicit repository/common Python paths, and remove implicit
+`~/.local/bin`, `~/.local/lib`, and ambient `PYTHONPATH` dependency. A package visible only through
+the user site therefore fails the doctor instead of making this machine appear reproducible.
 Use `--no-start` to open without camera discovery or preview and `--start-pixhawk` to connect the
 configured Pixhawk endpoints after launch.
 
@@ -82,19 +93,37 @@ Save each board's Ethernet profile over USB once, reboot it, then verify both he
 removed. The exact parameters, SD-card files, recovery sequence, and field checks are recorded in
 [`Pixhawk.md`](Pixhawk.md).
 
-At runtime Workstation identifies itself on both Ethernet links as MAVLink GCS `255/190` and sends
-at most one GCS heartbeat per side per second after the expected peer is observed. A new or rebooted
+The current field wiring isolates camera and Pixhawk Layer-2 traffic on separate NICs. Cameras use
+`enx588694fce07e` with `10.0.0.11/32` and preferred-source host routes to `.231/.232`; P1/P2 use
+the replacement RTL8156B `enx0023a40a2e39` with `10.0.0.10/24` and `.2/.3` routes. Neither device
+profile supplies a default route. Do not move camera and Pixhawk traffic back onto one broadcast
+domain: that topology reproduced a persistent dual-PX4 MAVLink service stall under RTSP load.
+Both Workstation and Legacy defaults now preserve this split; a clean or reset settings file no
+longer proposes the Pixhawk NIC's `.10/24` address for the camera interface.
+
+At runtime Workstation identifies itself on both Ethernet links as MAVLink GCS `255/190`. Connect
+immediately seeds each configured peer with one GCS heartbeat to break PX4's pre-identity broadcast
+deadlock, then sends at most one heartbeat per side per second. A new or rebooted
 P1/P2 link remains `QUALIFYING` until expected-system HEARTBEAT and ATTITUDE stay continuously fresh
 for 10 minutes. `ATTITUDE STALE` means other MAVLink traffic is still arriving; `ETH MAVLINK RX
 STALLED` means all expected-system traffic has been silent for 10 seconds. Only `LIVE` passes the
 Pixhawk readiness gate.
 
+Pixhawk Connect opens transport on its worker, but status, completion, failure, cleanup and receive-
+timer work that touches Qt is queued to the GUI owner. Progress cannot restyle topology buttons
+before completion starts the 20 ms receive timer. Dynamic button state keeps authoritative text and
+the `role` property without synchronous QStyle unpolish/polish. Successful RTCM progress is logged
+at most once per side every five seconds; exact frame/packet/byte/failure counters and errors remain
+unthrottled in their owning status surfaces.
+
 Camera Preview uses the persisted H.264 decoder mode. The supported field default is `Auto`: when
-the NVIDIA driver and GStreamer `nvh264dec` element are both usable, Auto starts NVDEC first; if
-that decoder fails its launch/first-frame/live-frame checks, Workstation finalizes the current
-output and performs one bounded `avdec_h264` software restart. The Camera workspace reports the
-observed per-side result as `GPU · nvh264dec`, `CPU · avdec_h264 (selected)`, or
-`CPU fallback · avdec_h264`; requested mode alone is never success evidence.
+the NVIDIA driver and GStreamer `nvh264dec` element are both usable, Auto requests NVDEC first.
+`PLAYING` and decoder status text remain candidate evidence; only a decoded frame carrying the
+pane's current stream generation makes that side `GPU · nvh264dec`. A classified NVDEC launch or
+decoder-health failure records a side-specific software override and reason. Preview-only fallback
+restarts only that side inside its worker and becomes `CPU fallback · avdec_h264` only after its
+software-decoded frame arrives. RTSP/source, parser, mux, and filesink errors never authorize CPU
+fallback.
 
 Runtime state defaults to `.local/workstation_data` at the repository root. To keep it on another
 volume, set an absolute data root before both checking and launching; relative overrides are
@@ -119,12 +148,11 @@ settings profile uses PyAV:
 .venv/bin/python -m pip install -r requirements/optional-pyav.txt
 ```
 
-Keep the persisted WIRIS visible-stream encoder profile at bitrate `0`, QP `17`, GOP `30`,
-and IDR interval `1`. Bitrate `0` selects the camera's constant-quality mode so QP is active;
-any nonzero bitrate disables QP control and can make the Live RTSP image visibly blocky. Whenever
-the Workstation enables or reactivates Ethernet/RTSP mode, it sends that profile to each selected
-camera and verifies all four SDK readbacks before probing the stream. Edit the profile under
-`Settings > YOLO / RTSP > WIRIS visible encoder profile`.
+Persisted WIRIS visible-stream encoder fields are manual-reference values only. Normal startup,
+Auto-Connect, RTSP Enable and Reactivate never send `SEBR/SEQZ/SEGS/SEIR`. They read `GETH`, send
+`SETH TRUE` only when Ethernet mode is actually disabled, and then probe the stream. Do not infer
+the physical bitrate/QP/GOP/IDR from the saved JSON; use explicit readback, and change an encoder
+field only through a separately approved manual command path.
 
 Choose `Settings > Storage > Data folder` before field work. The value must be relative to
 `SASL_WORKSTATION_DATA_ROOT`; the default is `measurement_data`. `Data > Status` shows every fixed
@@ -160,6 +188,9 @@ Manual recording remains under `Advanced > Files`. It uses the same fixed struct
 timestamped binary paths. Starting Measurement stops Manual record and does not resume it after the
 Measurement. Explicit HR/OZ capture, ULog import, and Alignment actions remain available from
 `Data > Capture` even outside a Measurement and always append their own event records.
+Once application shutdown begins, a new Manual record request is rejected. If any recording-start
+step raises before commit, Workstation restores the exact preceding session flags, row owners,
+timestamps, video paths, and UI state, and releases only resources allocated by that failed attempt.
 
 For checkerboard calibration, select the calibration zoom, command both cameras to that
 zoom, confirm the actual zoom readback, and capture checkerboard observations. A capture over
@@ -748,15 +779,57 @@ python3 tools/check_portable_paths.py
 
 - Camera Preview defaults to RTSP TCP with Auto decoder. Auto uses `nvh264dec` only when its
   factory can be created and `nvidia-smi` confirms a working driver; otherwise it reports WARN and
-  starts with mandatory `avdec_h264`. If NVIDIA later hits a launch error, five-second first-frame
-  timeout, or three-second live-frame stall, Auto switches once after the active MP4 is finalized;
-  the same output path is never reopened. Explicit `NVIDIA` has no software fallback and camera
-  start is rejected until the operator selects Auto/Software or repairs the NVIDIA runtime.
+  starts with mandatory `avdec_h264`. A direct NVDEC element/health failure, or a 30-second decoded
+  first-frame/stall timeout while RTP input remains current, may authorize one software fallback.
+  RTSP/source/parser and MP4 mux/filesink failures retain their own error class and never trigger a
+  decoder change. Explicit `NVIDIA` has no software fallback.
+- Decoder fallback ownership is per side. Preview-only fallback restarts only the failed side and
+  leaves the healthy side's decoder/worker running. During MP4 recording, the failed side finalizes
+  and stops; its software override applies on the next side start because reopening the same MP4
+  path is forbidden. The healthy side's recording worker is not restarted. A terminal child exit
+  is not treated as a restartable crash.
 - Read decoder state in `Devices > Cameras` first. `Decoder LEFT/RIGHT` is the primary actual
   pipeline evidence; compact CAM L/R tooltips include the same actual/fallback state, while
   `Diagnostics > Performance` shows GPU model/driver, NVDEC availability, requested/effective
   candidates, and per-side detail. `CUDA` shown for YOLO inference is a separate resource decision
   and does not prove that H.264 decode uses NVDEC.
+- A camera QThread/process launch is only a `STARTING` request. Workstation sets a side LIVE only
+  after a decoded frame carrying that pane's current stream generation reaches the GUI boundary.
+  Measurement remains `STARTING` until every accepted side has that frame ACK. After 35 seconds, a
+  side without an ACK is stopped; a verified opposite side may continue as an explicit partial
+  Measurement, while no verified side rolls the attempt back to `ERROR`. A later Measurement Start
+  remains available.
+- MP4 readiness is independent from Measurement readiness. The recording projection reports
+  `video=STARTING` until each allocated side-specific path exists and grows beyond its allocation
+  size, then reports provisional `RUNNING`; one failed side is `PARTIAL`, and no growing side is
+  `FAILED`. EOS/container completion remains provisional until the asynchronous finalized-file
+  validator checks first-VCL IDR, sample/decoded equality, reference continuity, sample timing and
+  rate.
+  Video failure never turns a frame-ready Measurement back from `RUNNING`, but Workstation does not
+  claim video recording is active and preserves the per-side failure evidence.
+- Before a real soak, run the strict synthetic queue/evidence/cleanup gate from the SASL root:
+
+  ```bash
+  PYTHONPATH=apps:common/python .venv/bin/python -m Workstation.qualify_camera_backpressure \
+    --duration 600 --gui-stall 2
+  ```
+
+  Its exit status is nonzero for exact-frame loss, insufficient durable pairs, missing ACKs,
+  writer/child/shared-memory cleanup failures, queue/ring violations, Stop latency, or configured
+  RSS growth/high-water/slope violations. It does not instantiate the real Qt preview and therefore
+  does not replace the dual-camera GUI/hardware qualification.
+
+- Audit persisted real native evidence independently from the producer implementation with:
+
+  ```bash
+  PYTHONPATH=apps:common/python .venv/bin/python -m Workstation.qualify_native_evidence \
+    --data-root .local/workstation_data/measurement_data \
+    --runtime-generation run-<exact-runtime-id>
+  ```
+
+  The verifier imports no Workstation ring/writer/store code. It checks run-scoped FrameKey and
+  descriptor canonical bytes, PNG CRC/IDAT/RGB8 structure, file size/SHA/path, origin request and
+  pair ACK. Nonzero exit means the runtime cannot be claimed as exact native evidence.
 
 - Never issue `mavlink stop` as part of USB Ethernet recovery or persistent startup. On affected
   PX4 v1.17 custom firmware, stopping and restarting a live instance can leave a sparse instance
@@ -773,6 +846,16 @@ python3 tools/check_portable_paths.py
   worker and retry. If heartbeat remains current but `ATTITUDE` becomes stale, leave the connection
   open while the bounded interval re-request runs and inspect its recovery/failure log before
   power-cycling the Pixhawk.
+- Workstation seeds each fixed P1/P2 peer on the same exclusive bound `udpin` socket and sends GCS
+  heartbeat `255/190` immediately, before any inbound packet. This avoids the startup deadlock in
+  which PX4 waits for a known GCS peer while Workstation waits for the first packet. Only an
+  expected-sysid `HEARTBEAT` verifies identity; other expected-sysid telemetry remains transport
+  evidence but cannot unlock commands. No expected heartbeat within 10 seconds is shown as
+  `MAVLINK INITIAL RX TIMEOUT`/`NO HB`, with peer and listener age.
+- Treat Pixhawk Connect progress as transport setup, not as permission to synchronously repaint
+  Connect/Disconnect roles. Worker callbacks are queued to the GUI thread, the receive timer must
+  run on its QObject owner, and button text remains the primary state cue. A live status callback
+  must not call QStyle `unpolish()`/`polish()`.
 - Treat `ETH MAVLINK RX STALLED` as a remote PX4-side service failure, not as proof that the NIC,
   ping, or host UDP socket is down. Workstation keeps only the 1 Hz GCS recovery probe, blocks new
   RTCM/stream/parameter traffic to that side, and leaves the other side running. Re-pressing Connect
@@ -786,8 +869,10 @@ python3 tools/check_portable_paths.py
 - USB Ethernet profile persistence and runtime stall recovery are separate operations. The verified
   recovery command writes no PX4 parameter/config/file and never flashes firmware. Automatic reboot
   is not supported.
-- While Workstation performs the automatic PX4 calibration-parameter readback after a side's first
-  heartbeat, that side's normal ATTITUDE/GNSS receive loop is intentionally reserved. Its status
+- Workstation does not start the automatic PX4 calibration-parameter readback at the first packet
+  or heartbeat. It waits until that side completes the continuous 10-minute qualification and
+  reaches `LIVE`; manual refresh remains available. During a parameter read, that side's normal
+  ATTITUDE/GNSS receive loop is intentionally reserved. Its status
   shows `PARAM SYNC` with detail `PX4 파라미터 조회 중 (정상)` instead of falsely reporting
   `STALE` or `DISCONNECTED`. Nonmatching ATTITUDE/GPS messages consumed by the blocking PARAM or
   shell receive path are deferred and replayed through the normal handler after the reservation;
@@ -878,6 +963,9 @@ python3 tools/check_portable_paths.py
   backpressure within the RTCM worker rather than the GUI. The separate Pixhawk delivery queue is
   latest-relevant and bounded: a replaced correction returns its exact pipeline sequence as an
   explicit stale drop, while the original received bytes remain in evidence.
+- An invalid RTCM CRC never authorizes the parser to discard the corrupt candidate's declared
+  length. A false length may enclose a later valid frame, so CRC failure drops only the false `0xD3`
+  sync byte and rescans the remaining bytes. Only independently CRC-valid RTCM frames enter routing.
 - An RTCM correction older than two seconds at the injection boundary is not sent to Pixhawk. Its
   bytes, source timestamp, hash, sequence, targets, age, and `stale-before-injection` outcome remain
   observable. Evidence-write, recovery-index, and unconfirmed-delivery failures remain diagnostics;
@@ -890,13 +978,31 @@ python3 tools/check_portable_paths.py
   are limited to documented lock/queue adapters that never access widgets.
 - Shutdown stops NTRIP and Base producers first, drains RTCM ingress, waits for every
   Pixhawk injection outcome (or records the exact unconfirmed sequences after the bounded timeout),
-  and only then disconnects MAVLink/runtime workers and closes the data writer. Window close remains
-  non-blocking and retryable during the cooperative phase. A five-second process-wide close
-  deadline then flushes evidence, terminates any remaining camera child, requests interruption on
-  outstanding `QThread`s, and bounds the final forced wait to one additional second.
+  and only then disconnects MAVLink/runtime workers. Window close remains non-blocking and retryable
+  during the cooperative phase. Each camera keeps its full 12-second cooperative-stop window,
+  including the nine-second GStreamer MP4 EOS wait, even when an earlier shutdown step delayed the
+  camera stop request. Session-save and both HR/OZ capture threads are explicit shutdown gates.
+  Camera success or synthesized failure finalization evidence, native-ring lease cleanup, and a
+  thread/process/socket/shared-memory resource report must be accepted before settings are flushed;
+  `DataStorage` closes last. After the cooperative deadline, escalation requests terminate/kill at
+  the camera's existing 12/20-second thresholds and waits at most one second per forced pass, but a
+  surviving resource keeps the window close pending instead of being reported as clean success.
+- Native camera rings use owner-identifying `sasl_ws_native_<pid>_<token>` names. Normal Quit unlinks
+  them explicitly, multiprocessing tracker EOF reclaims them after a typical `SIGKILL`, and the next
+  startup provides a strict fallback for same-UID rings whose embedded owner PID is dead. Startup
+  never sweeps arbitrary `psm_*` objects or rings belonging to a live process.
 - Preview replacement applies only to resized UI frames. Native measurement/calibration frames,
   detection events, recording streams, command results, and RTCM evidence do not use the preview
   inbox and cannot be inferred from a skipped display frame.
+- Detection pairing expires buffered observations after one monotonic second, clears a side
+  immediately on an explicit no-detection update, and rejects a delayed older stream generation.
+  Once a left/right pair is accepted, both exact `FrameKey` slots are leased before the result is
+  exposed to the GUI; a replaced/unconsumed result releases those leases. The native writer accepts
+  that single-owner reservation, verifies each incoming `frame_descriptor_sha256` against the pinned
+  descriptor before writing either side, and fails the whole pair without nearest-frame substitution
+  when any compact/component key or descriptor hash disagrees.
+  Frozen detection metadata retains every descriptor-hash input, including app-receive
+  `timestamp_s`, so a later audit can recompute the digest rather than only compare copied values.
 - Raw camera frames update the latest calibration snapshot without broadcasting a duplicate
   calibration-preview signal. Hidden legacy/advanced preview widgets do not render those frames;
   checkerboard overlays remain available through the throttled overlay path or explicit Refresh.
@@ -907,13 +1013,22 @@ python3 tools/check_portable_paths.py
   tee branch is independently `leaky=downstream` with a five-second time bound, preventing disk
   stalls from growing memory without limit. `decoded_hz` uses a five-second rolling window and
   returns to zero after a genuine gap.
+- Each GStreamer side starts fail-closed and, after any RTP sequence omission, resumes only when
+  the normalized Annex-B access unit contains an H.264 IDR slice (NAL type 5) and the decoder
+  returns that exact PTS. A parser `non-delta` flag or a later dependent decoded frame is not a
+  recovery boundary. The encoded recording tee remains blocked until the parsed IDR; native
+  evidence, Preview, and YOLO remain blocked until that IDR's exact decoded PTS is observed. After
+  the 30-second integrity deadline, the side becomes explicitly unavailable and does not
+  auto-reconnect; the healthy peer remains live. Correct the sender so it emits IDRs, then reconnect
+  manually. Workstation does not change GOP/IDR or any other camera encoder setting automatically.
 - Linux camera child processes arm a parent-death signal. A Workstation crash or Force Quit
   therefore terminates its decode children instead of leaving CPU-consuming orphan workers for
   the next launch; normal shutdown still uses the cooperative stop/drain path. Unexpected child
   death is supervised separately from RTSP reconnect and receives bounded automatic restart.
-- Keep `wiris_visible_encoder_bitrate=0` for both WIRIS cameras. Confirm camera readback as
-  `GEBR VISIBLE=0` and `GEQZ VISIBLE=17` after RTSP enable/reactivation; a nonzero bitrate makes
-  QP ineffective and is not the approved Workstation Live-preview profile.
+- Keep `wiris_visible_encoder_bitrate=0` for both WIRIS cameras. The 2026-08-27 field readback was
+  bitrate/QP/GOP/IDR `0/1/30/1`; only IDR `0 -> 1` was operator-approved, and Workstation does not
+  apply that profile automatically. A nonzero bitrate makes QP ineffective. Always use live SDK
+  readback rather than the saved JSON as the hardware oracle.
 - Changing `YOLO input size` does not resize an already-running detector. Stop Detection, Apply or
   Save the Settings value, and start Detection again; the next worker uses the updated size.
 - Changing `Weights path` also does not hot-swap an already-running detector. Use `파일 선택…`
@@ -970,6 +1085,18 @@ python3 tools/check_portable_paths.py
   `command_round_assumed_sync` basis for R,t; it records `pair_delta_s=null` and an explicit warning
   that simultaneous exposure was assumed, not measured. Other FTP/import evidence remains
   `SYNC_UNVERIFIED` rather than borrowing a live-preview timestamp.
+- A dual-camera `Set camera clock` operation sends Left STUS first and sends Right only after Left
+  returns an exact `OK` ACK. Only STUS mutation responses may wait up to 15 seconds; generic SDK and
+  HIWS retain their configured timeout. One action permits at most two rounds within 90 seconds and
+  uses fresh replacement-generation SR feedback for the second round. During recording the
+  operation is disabled and the controller also rejects direct requests. After RTSP reconnect and
+  fresh-SR warmup reaches `VERIFIED`, Workstation
+  continues a 1 Hz health check; it immediately changes to `FAILED` on a current-frame/SR loss or
+  regression, RTCP/NTP pair delta over 50 ms, SR-PC offset over 100 ms, SR age over the configured
+  target (7 s by default), or NTP/RTP clock-rate error over 0.5%. The limit stays configurable; an
+  older saved 10 s value is not silently changed, so Apply 7.0 s before the approved field
+  qualification and retain that effective value in its evidence. Stored per-frame SR age is advanced
+  using the current monotonic and wall-clock observations, so two frozen streams cannot remain green.
 - Calibration zoom A and operating zoom B are arbitrary supported zoom levels. The system
   does not prescribe 1×, 8×, or any particular A→B combination.
 - Cross-zoom application uses `K,D` from operating zoom B and `R,t` estimated at calibration
@@ -1001,9 +1128,12 @@ python3 tools/check_portable_paths.py
   must supply its own values before starting.
 - An untouched NTRIP UI uses Username `SASL` and an empty masked Password. An explicit runtime edit
   has highest priority; otherwise a saved keyring credential and then configured legacy environment
-  credentials are resolved. A Password changed or cleared in `Settings > GNSS` takes effect only after
-  `Apply` or `Save`. On `HTTP/1.1 401 Unauthorized`, verify the selected host/mountpoint/username
-  and which credential source was intended instead of assuming a transport or RTCM fault.
+  credentials are resolved. A session password is bound to the host/mountpoint/username visible when
+  `Apply` or `Save` is pressed; changing that account cannot silently reuse the old session value.
+  A newly typed password is saved to the keyring only after a caster `200` response. A
+  `HTTP/1.1 401 Unauthorized` fails immediately as `HTTP_AUTH_FAILED` without retrying the same
+  credential three times; verify the displayed credential source and account instead of assuming a
+  transport or RTCM fault.
 - A caster HTTP response is not proof that corrections are usable. Check `RTCM_ACTIVE`, the
   last chunk/RTCM ages, and the P1/P2 RTCM distribution rows before starting a measurement.
 - NTRIP monitoring reports color/state and retains the error in the evidence projection; it
@@ -1071,12 +1201,9 @@ production and supersedes the earlier statement that P2 still required the patch
 Stock firmware does not emit private `SASL_CAN_MAG`, and this short observation is not a
 USB-removed or long-duration field soak; per-CAN identity display therefore remains unavailable
 and sustained link qualification is still required.
-The 2026-08-26 runtime-stall investigation instead captured actual P1/P2 boot evidence identifying
-PX4 1.14.3 (`1dacb4cdef2d7145754fc788fa8dc482eed74b40`). At the implementation resume point both
-boards answered ping but returned no Ethernet MAVLink heartbeat and no USB device was present, so
-their current firmware could not be re-read. The untracked `firmware/stock/` v1.17.0 bundle is not
-installation evidence. Re-read `AUTOPILOT_VERSION`, sysids, and `MAV_2_*` values after safe recovery
-before hardware qualification.
+The later real USB `AUTOPILOT_VERSION` and parameter readback supersede older file/boot artifacts:
+both boards run PX4 1.17.0 with system IDs 1/2, intended `MAV_2_*` Ethernet ports and 2,000,000 rate.
+Repository firmware bundles remain provenance only, not installation evidence.
 
 The observed reboot-only recovery, alive host network/USB evidence, valid RTCM frames, and repeatable
 roughly 5.5-minute all-RX silence match the still-open PX4 issue
@@ -1084,6 +1211,13 @@ roughly 5.5-minute all-RX silence match the still-open PX4 issue
 `MavlinkReceiver`/IOB exhaustion deadlock under high traffic. This remains a high-confidence cause
 inference, not an onboard stack-trace proof. The Workstation changes mitigate load, detect/isolate
 the failure, and provide a guarded recovery; they do not patch PX4 firmware.
+
+Desktop accessibility remains supported and must not be disabled as a Workstation workaround. On
+the 2026-08-26 qualification host, an already-running Orca process and AT-SPI destination queue were
+severely saturated; the pre-fix Pixhawk Connect path then blocked inside synchronous QStyle polish
+before its receive timer started. Workstation removes that synchronous critical-path call and
+throttles successful RTCM progress text. Diagnose an independently runaway screen reader as a
+system resource fault rather than turning off accessibility or treating it as PX4 packet loss.
 The earlier captured receiver state also showed P1 GPS1/P2 GPS1 MSL altitudes near `108.30/100.29 m`
 (`~8.01 m` difference) while P2 GPS1/GPS2 differed by `~8.83 m`. This is receiver-solution or
 physical antenna/configuration evidence, not a Workstation datum conversion; verify antenna mapping,
@@ -1096,12 +1230,26 @@ collection still require bench and field soak verification with the intended har
 MAVLink send result is transport evidence, not proof that the remote receiver accepted and used the
 correction.
 
+A clean shutdown resource report proves only the Workstation-owned thread/process/socket/shared-
+memory postconditions that the application can inspect. It does not prove an MP4 is usable;
+`ffprobe` plus strict full software decode are necessary but not sufficient because both passed the
+defective real field files. Final acceptance also requires first-VCL IDR, MP4 sample/software-decode
+equality, supported reference-frame continuity, contiguous positive sample timing including the
+final sample, and sane frame-rate metadata. OS `SIGKILL`, power
+loss, or a machine reset bypasses the cooperative EOS path, so the resulting MP4 may remain
+incomplete even though Linux parent-death handling prevents a camera decode child from surviving.
+
 Synthetic NVIDIA qualification on the current RTX 4050/driver 595.84 decoded 1920x1080@30 H.264
 through `nvh264dec` with CUDA-memory output. An unconstrained fast-loop stress drove the dedicated
 decoder engine to 78–100%; this is deliberately not a normal realtime workload, not whole-GPU
 utilization, and not an operating ceiling. Real Left/Right WIRIS RTSP decoder utilization,
 first-frame latency, sustained frame rate, drops, thermal behavior, and fallback recovery remain
 the field acceptance evidence.
+
+The decoder truth/failure-isolation tests use fake GStreamer boundaries and spawned local workers.
+They prove current-generation gating, error routing, per-side override, terminal-exit suppression,
+and UI projection in software; they do not prove that a physical WIRIS/NVDEC failure will recover
+within the field timing limits. Keep that item open until dual-camera hardware qualification.
 
 Camera JSONL rows describe GUI-delivered frame observations, while MP4 may be encoded pass-through
 or decoded-frame recording. No exact 1:1 frame index is currently proven;
@@ -1118,10 +1266,10 @@ table. When automatic selection is unsuitable, a quality result is `WARNING`/`FA
 must approve a warning, expand `고급 캘리브레이션` and complete the existing detailed workflow;
 the simple surface does not provide an override.
 
-The operational bitrate `0`, QP `17`, GOP `30`, IDR `1` profile uses constant-quality mode to avoid
-the visible macroblocking observed with bitrate `1`. Constant-quality mode can increase bandwidth,
-especially during fast full-frame motion, so the current dual-camera 720p stream still requires
-field qualification for sustained FPS and network stability.
+Historical encoder-profile experiments are not an automatic operating contract. Constant-quality
+mode can increase bandwidth, especially during fast full-frame motion, and saved reference values
+may differ from physical readback. The current dual-camera 720p stream requires pre-run readback and
+field qualification; RTSP connection actions deliberately do not reconcile or mutate those fields.
 
 The five-second decoded-rate window stabilizes the operator value; it is not a substitute for a
 throughput test. If the value remains low after warm-up, inspect the status/log for the active
@@ -1129,6 +1277,24 @@ GStreamer decoder and test the selected RTSP transport independently. UDP can lo
 the camera link, while TCP can expose camera-side RTSP service resets or startup codec-header gaps;
 changing transport alone is not an approved performance fix. Restart the Workstation after changing
 the decoder, transport, or pipeline code so existing child processes do not retain the prior setup.
+
+A sender that never emits H.264 IDR NAL units has no software-recoverable random-access boundary.
+Workstation can prevent its dependent or concealment frames from reaching Preview, YOLO, native
+evidence, and the encoded recording tee, but it cannot reconstruct missing reference pictures or
+turn a non-IDR intra picture into an independently decodable frame. Such a side remains unavailable
+after the bounded integrity wait; inspect the camera's encoder readback and correct it outside the
+automatic RTSP connection path.
+
+On 2026-08-27, an operator-approved exact `GEIR VISIBLE=1` readback on both FW 2.18.72 cameras still
+produced zero type-5 NAL units in 15-second elementary captures: Left had 206 AUs with nine NAL1
+intra AUs, Right had 112 AUs with three NAL1 intra AUs, and `ffprobe` marked every frame
+`key_frame=0`. Sequential SDK reboots were later completed. Left rebooted with IDR reset to 0;
+Right rebooted with Ethernet mode off and profile `0/17/16/0`, then was restored to the approved
+`GETH=TRUE`, `0/1/30/1` state. On both models, fresh streams and an additional `SEIR VISIBLE 1`
+issued while RTSP was active still produced zero NAL5. That sender output remains unrecoverable by
+this software gate and now requires Workswell firmware/vendor correction. Zero IDR also blocks the current-generation frame evidence needed
+for STUS round two, so camera output, clock convergence and portable MP4 remain one shared CRITICAL
+hardware blocker.
 
 The type-owned append model deliberately provides no transactional “all evidence for one
 Measurement” package. A power loss or queue overload can leave some streams present and others
@@ -1152,8 +1318,10 @@ or convert them automatically.
 The launcher's `--check` intentionally rejects an interpreter outside the repository `.venv` and
 an installed environment outside `requirements/runtime.txt`. On a host with NumPy 1.25+ or
 pyqtgraph 0.14+, back up and recreate the canonical venv with the supported constraints (currently
-NumPy 1.23.5–1.24.x and pyqtgraph 0.13.x) instead of bypassing the check. PyAV is optional and must
+NumPy 1.23.5–1.24.x, OpenCV 4.8–4.11, and pyqtgraph 0.13.x) instead of bypassing the check. PyAV is optional and must
 be installed from root `requirements/optional-pyav.txt` only when that backend is selected.
+The manifest also fixes setuptools to 77–79: Torch 2.13 requires at least 77 while the supported
+Ubuntu/ROS system-site `colcon-core` requires a version below 80.
 
 A clean checkout does not download model weights. Copy the approved `yolov8m.pt` into
 `.local/workstation_data/models/` (or the selected data root's `models/` directory) and require
@@ -1232,8 +1400,11 @@ There is no automatic manifest hash chain, electronic signature, organization PK
 bundled source tree, virtual environment, or container image for the new append streams. Record
 hashes remain useful for local artifact identification, not legal non-repudiation.
 
-Video files are closed by their camera writer and inventoried best-effort; Measurement stop does
-not wait for `ffprobe` or full-stream decode. Validate sustained RSS, blocked removable storage,
+Video files are closed by their camera writer without putting full validation inside the bounded
+EOS/child-stop budget. A background package worker consumes the immutable recording backend and live
+integrity evidence, hashes the stable bytes and runs duration-aware bounded MP4/H.264 validation;
+until it passes, the recording is not usable. Measurement stop and the next run do not wait for the
+full probe. Validate sustained RSS, blocked removable storage,
 USB serial timeout, dual-camera recovery, camera FTP, and automatic ULog collection with actual
 field hardware before treating those boundaries as field-qualified.
 
@@ -1347,6 +1518,114 @@ frozen Mountain image.
 
 ## Change Log
 
+- 2026-08-27: Added the implementation-independent native evidence qualifier and retained
+  descriptor `timestamp_s` in canonical detection snapshots. A real 88-pair/176-PNG audit verified
+  487,531,968 bytes with zero failures; K,D/zoom/R,t/correspondence/telemetry/STUS BLOCKED states
+  were also verified not to disable global Measurement Start.
+
+- 2026-08-27: Updated both application camera-interface defaults to isolated `10.0.0.11/32` so a
+  settings reset cannot recreate the Pixhawk NIC's `.10/24` subnet on the camera NIC. Legacy
+  automatic startup/receive/Preview/restart/recording captured zero SDK control packets.
+
+- 2026-08-27: Closed the 12-item repository portability residual and reproduced both launchers from
+  a fresh same-host checkout/new venv under isolated HOME. Added the explicit setuptools 77–79
+  intersection discovered by that recreation. A separate clean Ubuntu OS/VM remains required.
+
+- 2026-08-27: Normalized PX4 `NaN`/infinite optional telemetry to JSON `null` with exact
+  `nonfinite_source_fields` evidence, preventing Measurement-start callback traceback storms while
+  retaining strict storage validation. Full Pixhawk disconnect now stops its GUI-owned receive
+  timer on the GUI thread before worker transport closure, eliminating the shutdown
+  `QObject::killTimer` warning.
+
+- 2026-08-27: Made GStreamer camera startup and RTP-loss recovery fail closed on a parsed H.264
+  IDR NAL plus its exact decoded PTS. Non-IDR/non-delta AUs cannot reopen the encoded recording
+  tee, and decoder concealment cannot reopen Preview, YOLO, or native evidence. Zero-IDR senders
+  terminate once as unavailable without an automatic reconnect storm, and a post-LIVE failure
+  clears only that side while preserving the healthy peer. No encoder setting is mutated.
+
+- 2026-08-27: Made recording start transactional, blocked new Manual record admission during
+  shutdown, and routed direct panel `deleteLater()` through the normal bounded lifecycle so an
+  active interface-worker `QThread` cannot be destroyed with its parent. RTSP reactivation, eth0
+  probe timeout, and legacy recording-barrier retries now use panel-owned generation-guarded timers.
+
+- 2026-08-27: Removed a Pixhawk Connect GUI-freeze path exposed by a saturated desktop
+  accessibility service. MAVLink worker/status/completion callbacks are explicitly queued to the
+  GUI owner, progress cannot repolish topology buttons before completion, receive-timer start is
+  owner-thread guarded, and dynamic roles no longer force synchronous QStyle unpolish/polish.
+  Successful RTCM progress logs are side-throttled to one per five seconds while exact counters and
+  errors remain unchanged.
+
+- 2026-08-27: Hardened RTCM resynchronization after a corrupt length/CRC candidate so a valid frame
+  enclosed later in the same byte stream is recovered instead of discarded with the false frame.
+
+- 2026-08-27: Made native-frame shared memory recoverable across abnormal termination. Rings retain
+  shared tracker ownership and carry a Workstation/PID name; startup reclaims only strict same-UID
+  dead-owner entries. A real active-Measurement `SIGKILL`/restart left no child/socket/ring, did not
+  adopt the old run, kept `측정 시작` enabled, and created a distinct new run ID.
+
+- 2026-08-27: Closed the launcher/runtime environment against ambient Python, ROS loader, GI and
+  GStreamer plugin/system/scanner paths, and made the deployment doctor importable before the
+  canonical venv's third-party requirement parser exists.
+
+- 2026-08-26: Made both launchers disable Python user-site packages and ambient Python/library
+  paths. The runtime doctor now validates requirement version ranges as well as presence, and the
+  OpenCV range is capped below 4.12 to preserve the calibrated NumPy 1.24 stack.
+
+- 2026-08-26: Aligned application close with the camera's 12-second cooperative-stop and
+  nine-second MP4 EOS windows. Session-save and OZ capture now gate close, per-side finalization
+  evidence must enqueue before the data writer closes, released retired native rings are swept,
+  and forced cleanup reports verified thread/process/socket/shared-memory survivors instead of
+  returning unconditional success. Settings flush precedes the final DataStorage close barrier.
+
+- 2026-08-26: Made decoder activity current-frame evidence instead of a `PLAYING`/status inference.
+  Added RTSP/source, recording-output, decoder-health and generic-pipeline error classes; only direct
+  NVDEC health authorizes Auto CPU fallback. Runtime overrides/reasons are per side, preview fallback
+  leaves the healthy worker running, recording fallback stops only the failed side without reopening
+  its MP4, and intentional terminal child exits are no longer respawned as crashes.
+
+- 2026-08-26: Closed the exact-frame GUI-delay window. Detection pairing now expires stale and
+  no-detection state, rejects stream-generation rollback, and reserves both selected native ring
+  slots before GUI polling. Native evidence validates redundant `FrameKey` fields and the incoming
+  descriptor hash against the pinned descriptor before either PNG is written; tampering, writer
+  failure, result replacement, stop, and reconnect paths release their leases fail-closed.
+
+- 2026-08-26: Serialized dual-camera STUS as Left exact-OK ACK then Right, retained the recording
+  interlock, and replaced one-shot RTCP/NTP verification with continuous 1 Hz health reevaluation.
+  Current frame/SR age, SR counter regression, 50 ms pair delta, 100 ms SR-PC offset, 7 s default SR
+  age, and 0.5% clock-rate limits now fail the visible sync state instead of leaving stale green.
+
+- 2026-08-26: Fixed dual-Pixhawk Ethernet startup by seeding the named peer on each exclusive
+  `udpin` socket and sending GCS `255/190` heartbeat before inbound identity. Identity now requires
+  the expected-sysid HEARTBEAT, missing identity has a bounded 10-second `NO HB` state, and automatic
+  bulk PARAM refresh waits for LIVE qualification. A real current-boot dual-Pixhawk run crossed the
+  prior 5.5-minute failure interval and reached LIVE at 610 seconds.
+
+- 2026-08-26: Rearmed the per-side Stock MAVLink stream profile after a physical/remote PX4 reboot
+  that leaves the Workstation UDP socket open. Two increasing `ATTITUDE.time_boot_ms` samples at
+  more than 2 seconds behind the prior epoch confirm a reboot; regressions up to 2 seconds and uint32
+  wrap do not. This also covers a rapid reboot before the prior boot clock reaches 10 seconds.
+  The same host-listener generation is retained, old-boot identity/qualification is invalidated,
+  and the next expected-sysid HEARTBEAT sends one side-locked profile burst for only that Pixhawk.
+  Delayed prior-boot ATTITUDE is not published downstream. No reboot, shell, parameter, or persistent
+  `MAV_2_*` setup command is introduced by this recovery path.
+
+- 2026-08-26: Bound session NTRIP credentials to one caster/mountpoint/username, delayed keyring
+  persistence until HTTP 200, made 401 an immediate `HTTP_AUTH_FAILED`, and exposed the selected
+  credential source without recording the secret.
+
+- 2026-08-26: Made camera backpressure qualification fail closed on missing exact frames, writer
+  ACK/close failure, child/shared-memory leaks, queue/ring violations, Stop latency, and RSS
+  growth/high-water/slope thresholds. The report now preserves its threshold/check matrix and raw
+  RSS samples; this synthetic harness remains separate from the required real Qt/dual-camera soak.
+
+- 2026-08-26: Replaced camera-thread launch success with a current-generation first-decoded-frame
+  readiness gate. Added bounded dual/partial/no-frame rollback and independent per-side MP4
+  `STARTING/RUNNING/PARTIAL/FAILED` evidence based on positive file growth.
+
+- 2026-08-26: Removed automatic WIRIS encoder-profile writes from startup, Auto-Connect, Enable and
+  Reactivate. These paths now send `SETH TRUE` only after a `GETH=FALSE` readback; stored encoder
+  values remain manual-reference data and cannot silently mutate a connected camera.
+
 - 2026-08-26: Made Auto the approved GPU-first Camera Preview policy and exposed requested versus
   actual H.264 decode truth without a new dashboard. Existing Camera `Decoder LEFT/RIGHT` now
   distinguishes GPU NVDEC, explicitly selected CPU, and CPU fallback; CAM status detail/tooltip
@@ -1362,8 +1641,8 @@ frozen Mountain image.
   operator-confirmed unique-sysid USB reboot with immediate worker revalidation. Hardware
   3-cycle/60-minute/isolation/recovery acceptance remains pending; `Pixhawk.md` is intentionally
   unchanged. Root-venv verification passed 275 focused tests and the full Workstation suite
-  (`1224 passed, 1 skipped`). The repository portability check still reports the same 12
-  pre-existing violations outside this change; the changed ETH packet introduces none.
+  (`1224 passed, 1 skipped`). Those 12 historical portability findings were later resolved or
+  correctly classified by the 2026-08-27 R10 audit; the current policy reports PASS.
 
 - 2026-08-26: Removed the operational Measurement Session/package lifecycle. Measurement now uses
   transient `IDLE/QUEUED/STARTING/RUNNING/STOPPING/ERROR` state and never consults prior Session or

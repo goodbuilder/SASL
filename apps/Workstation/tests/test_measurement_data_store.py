@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import re
 import threading
 import time
@@ -148,6 +149,81 @@ def test_bulk_overload_drops_bulk_without_consuming_reserved_result_queue(tmp_pa
     assert store.close(timeout_s=2.0)
     rows = [json.loads(line) for line in (tmp_path / "measurements.jsonl").read_text().splitlines()]
     assert rows[-1]["result"] == "VALID"
+
+
+def test_concurrent_bulk_refill_drops_losing_producer_without_raising(tmp_path: Path) -> None:
+    store = MeasurementDataStore(
+        tmp_path,
+        priority_capacity=1,
+        bulk_capacity=1,
+        fsync_interval_s=1.0,
+    )
+    writer_entered = threading.Event()
+    writer_release = threading.Event()
+    original_write = store._write
+
+    def blocked_write(item):
+        writer_entered.set()
+        writer_release.wait(timeout=2.0)
+        original_write(item)
+
+    store._write = blocked_write
+    assert store.enqueue("events", {"hold_writer": True}, priority=True)
+    assert writer_entered.wait(timeout=1.0)
+
+    evicted = threading.Event()
+    admit_loser = threading.Event()
+
+    class PausingQueue(queue.Queue):
+        def get_nowait(self):
+            item = super().get_nowait()
+            if threading.current_thread().name == "bulk-losing-producer":
+                evicted.set()
+                admit_loser.wait(timeout=2.0)
+            return item
+
+    store._bulk = PausingQueue(maxsize=1)
+    assert store.enqueue("camera.left", {"frame": "oldest"}, priority=False)
+
+    results: dict[str, bool] = {}
+    errors: dict[str, BaseException] = {}
+
+    def enqueue(name: str, stream: str) -> None:
+        try:
+            results[name] = store.enqueue(stream, {"producer": name}, priority=False)
+        except BaseException as exc:  # pragma: no cover - regression oracle
+            errors[name] = exc
+
+    losing = threading.Thread(
+        target=enqueue,
+        name="bulk-losing-producer",
+        args=("losing", "camera.right"),
+    )
+    losing.start()
+    assert evicted.wait(timeout=1.0)
+
+    winner = threading.Thread(
+        target=enqueue,
+        name="bulk-winning-producer",
+        args=("winning", "gnss.base"),
+    )
+    winner.start()
+    winner.join(timeout=1.0)
+    assert not winner.is_alive()
+
+    admit_loser.set()
+    losing.join(timeout=1.0)
+    assert not losing.is_alive()
+    writer_release.set()
+    assert store.close(timeout_s=2.0)
+
+    assert errors == {}
+    assert results == {"winning": True, "losing": False}
+    streams = store.snapshot()["streams"]
+    assert streams["camera.left"]["dropped_records"] == 1
+    assert streams["camera.right"]["dropped_records"] == 1
+    assert streams["gnss.base"]["dropped_records"] == 0
+    assert streams["gnss.base"]["written_records"] == 1
 
 
 def test_live_rows_keep_current_preview_and_persist_replacements_as_new_events(tmp_path: Path) -> None:

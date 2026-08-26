@@ -24,6 +24,7 @@ DEFAULT_RTSP_PATHS = ("visible", "stream1", "stream2", "live", "h264", "video", 
 DEFAULT_RTSP_SCAN_WORKERS = 64
 DEFAULT_TCP_PORT_SCAN_WORKERS = 256
 PKEXEC_TIMEOUT_SECONDS = 15.0
+INTERFACE_STATUS_TIMEOUT_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -639,12 +640,19 @@ def resolve_nm_interface_address(interface_name: str, host_hints: Iterable[str])
 
 
 def interface_addresses(interface_name: str) -> str:
-    result = subprocess.run(
-        ["ip", "-br", "addr", "show", "dev", interface_name],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["ip", "-br", "addr", "show", "dev", interface_name],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=INTERFACE_STATUS_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"Timed out reading {interface_name} after "
+            f"{INTERFACE_STATUS_TIMEOUT_SECONDS:.1f}s"
+        ) from exc
     output = (result.stdout or result.stderr).strip()
     if result.returncode != 0:
         return output or f"Unable to read {interface_name}"

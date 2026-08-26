@@ -5,16 +5,25 @@
 | Slice | Evidence | Status |
 |---|---|---|
 | canonical prefix / venv config / manual `.pth` rejection | pure temp-venv tests plus real `--execution` | PASS |
-| Ubuntu manifest / recreation readiness | real dpkg/GI/GStreamer deployment doctor | PASS (expected deployment FAIL) |
+| Ubuntu manifest / recreation readiness | real dpkg/GI/GStreamer deployment doctor | CURRENT HOST PASS; clean-host recreation NOT RUN |
 | gi, Gst/GstRtp, element find+make | fake missing/make failures and real factories | PASS |
 | Auto/NVIDIA/Software policy | pure matrix, driver unavailable, app camera-start tests | PASS |
 | launcher exit 0/1/2 and no fallback | copied-repository launcher tests and real commands | PASS |
 | direct entry / child interpreter | real app/Simulation venv rejection and fake spawn contexts | PASS |
 | app settings/model/import checks | real app-only checks and Workstation runtime unit boundary | PASS |
 | existing camera/lifecycle/recording behavior | app regressions below | PASS with harness residual |
-| real dual-camera NVIDIA/software sustained run | target hardware | NOT RUN |
+| real dual-camera NVIDIA/software sustained run | target hardware | short dual NVIDIA PASS; software/sustained recording NOT RUN |
 
 ## Focused test evidence
+
+- 2026-08-27 environment-closure follow-up: runtime focused **53 passed**, expanded StereoWIRIS
+  runtime **117 passed**, and Workstation runtime/recovery **33 passed**. Tests inject ambient
+  user-site/Python/loader/GI/GStreamer variables and verify doctor/deployment/Workstation/Legacy
+  boundaries still exit zero. `/usr/bin/python3 -S` imports the deployment doctor before
+  third-party `packaging` exists. `pip check`, shellcheck, Python compilation and diff check pass.
+- The current system GStreamer factories, including `nvh264dec`, resolve to dpkg-owned
+  `/usr/lib/.../gstreamer-1.0` artifacts with RTX 4050 driver 595.84. The later R10 audit reduced the
+  repository portability result from 12 findings to PASS without rewriting historical evidence.
 
 - Automated fake/real mix:
   `QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest -p no:cacheprovider -q
@@ -49,9 +58,12 @@
 
 ## Performance, load, and target-hardware evidence
 
-No worker count, queue, thread budget, reconnect schedule, or preview/inference rate changed.
-Software tests prove selection and lifecycle only; no CPU/GPU utilization or sustained dual-stream
-measurement was collected in this environment.
+No worker count, queue, thread budget, reconnect schedule, or preview/inference rate changed by
+this runtime slice. On the repaired host, both real WIRIS panes reached current-frame LIVE with
+`nvh264dec` selected by Auto; the observed combined run used roughly 315/313 MiB RSS for the camera
+children and about 102 MiB GPU memory per child. This is short-path evidence only. Sustained
+software-decoder, recording/MP4 and cleanup measurements remain open, and the later combined field
+failure was PX4 MAVLink wire silence rather than a decoder/runtime-selection failure.
 
 ## Feature isolation and contract evidence
 
@@ -68,28 +80,38 @@ camera-start tests verify explicit NVIDIA refusal and Auto software status text.
 
 ## Visual and hardware/manual evidence
 
-- Real deployment doctor on 2026-08-26: exit **1** because `python3.10-venv` is not installed;
-  other declared Ubuntu packages are installed.
-- Real GStreamer factory check: all mandatory elements pass find/make; `nvh264dec` factory find
-  succeeds but make returns no element. `nvidia-smi` cannot communicate with the driver. Auto is
-  therefore an allowed WARN with effective `avdec_h264`.
-- Real `--execution` and both launcher `--check` commands correctly exit **1** for the existing
-  `include-system-site-packages=false` venv and manual
-  `workstation-system-dist-packages.pth`. Help exits **0** without those dependencies.
-- Actual WIRIS left/right TCP RTSP, NVIDIA decode, software decode, sustained two-camera software
-  Preview, GUI responsiveness, MP4 output, and orphan-process inspection: **NOT RUN** until the
-  documented operator migration and NVIDIA repair are complete.
+The first 2026-08-26 baseline correctly failed: `python3.10-venv` was absent, the old venv exposed a
+manual system-package `.pth`, and NVIDIA driver communication failed. That evidence is retained as
+the pre-repair baseline rather than the current state.
+
+Current-host repair evidence on 2026-08-26:
+
+- `PYTHONNOUSERSITE=1` imports resolve wholly inside the canonical root venv: OpenCV 4.11.0,
+  Torch 2.13.0+cu130 with CUDA available, Ultralytics 8.4.82, PyYAML 6.0.3, PyArrow 23.0.1,
+  pymavlink 2.4.49 and packaging 26.3. `pip check` reports no broken requirements.
+- `PYTHONNOUSERSITE=1 apps/Workstation/run.sh --check` exits **0**. GI/Gst/GstRtp, every mandatory
+  GStreamer element, `nvh264dec`, NVIDIA GeForce RTX 4050 Laptop GPU driver 595.84, Auto decoder
+  selection, app imports and declared distribution ranges all pass.
+- `PYTHONNOUSERSITE=1 apps/StereoWIRIS/run.sh --check --mavlink-only` exits **0** with the same
+  canonical interpreter and runtime boundary.
+- The large CUDA payload needed for this host repair was copied by hard-link from a complete local
+  package payload after repeated CDN transfers stopped at 137.3 MiB. This is a local recovery fact,
+  not the documented clean-install method; the standard manifest remains authoritative and a
+  clean-host recreation is still required.
+- Both actual WIRIS RTSP streams reached current-frame LIVE with Auto selecting real `nvh264dec`.
+  Real software decode, sustained dual Preview/recording, strict MP4 decode and orphan inspection
+  remain **NOT RUN**.
 
 ## Residual conditions
 
-1. Install `python3.10-venv`, back up/recreate root `.venv`, install root pip requirements, and
-   require deployment/execution/app checks to pass.
-2. Repair/confirm the NVIDIA driver before testing explicit NVIDIA.
-3. Run both real cameras separately with NVIDIA and software, then sustained dual software Preview;
+1. Recreate the canonical runtime once on a clean host using only the documented manifests; do not
+   treat the local CUDA hard-link recovery as the deployment procedure.
+2. Run both real cameras separately with NVIDIA and software, then sustained dual software Preview;
    verify UI responsiveness, Auto/NVIDIA/Software visible state, MP4 finalization, and no orphan
    camera/ffmpeg process after close.
-4. The repository portability audit still reports 10 pre-existing dated absolute paths in user
-   calibration JSON, `Simulation/goal.md`, and the existing StereoWIRIS settings file; none was
-   introduced by this change.
-5. The root pytest import-name collision and StereoWIRIS native Qt test-order crash remain harness
+3. **Closed 2026-08-27:** active Simulation examples and the Legacy model setting are portable;
+   calibration/change evidence is explicitly historical. The audit reports zero findings. A
+   same-host fresh checkout/new venv installed the manifest and passed both launchers under isolated
+   HOME. It exposed the now-owned `setuptools>=77,<80` Torch/colcon intersection.
+4. The root pytest import-name collision and StereoWIRIS native Qt test-order crash remain harness
    issues outside this approved runtime slice.

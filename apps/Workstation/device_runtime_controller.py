@@ -41,6 +41,18 @@ from Workstation.workstation_core.px4_calibration_groups import px4_calibration_
 # use the 10-second expected-system packet-silence state instead.
 _MAVLINK_STALE_TIMEOUT_S = 5.0
 
+
+def _connect_gui_signal(signal, callback) -> None:
+    """Queue worker/subscriber callbacks onto the panel's Qt owner thread.
+
+    Panel controller methods are installed dynamically as Python delegates.
+    Keep the worker-to-widget boundary explicit instead of relying on PyQt's
+    callable inference for ``AutoConnection``.
+    """
+
+    signal.connect(callback, QtCore.Qt.QueuedConnection)
+
+
 DEVICE_RUNTIME_CONTROLLER_METHODS = [
     "toggle_mavlink_connection",
     "_stop_pixhawk_operation_workers",
@@ -66,6 +78,8 @@ DEVICE_RUNTIME_CONTROLLER_METHODS = [
     "_sync_mavlink_subscriber_settings",
     "_ensure_mavlink_subscriber",
     "_handle_mavlink_status_changed",
+    "_schedule_mavlink_status_ui_refresh",
+    "_flush_mavlink_status_ui_refresh",
     "_configured_mavlink_sides",
     "_mavlink_setup_target_sides",
     "_apply_mavlink_pixhawk_setup",
@@ -529,6 +543,13 @@ class DeviceRuntimeController:
         if hasattr(self.panel.mavlink_pixhawk, "baudrates"):
             self.panel.mavlink_pixhawk.baudrates["left"] = self.panel.left_mavlink_baud_spin.value()
             self.panel.mavlink_pixhawk.baudrates["right"] = self.panel.right_mavlink_baud_spin.value()
+        if hasattr(self.panel.mavlink_pixhawk, "peer_hosts"):
+            self.panel.mavlink_pixhawk.peer_hosts["left"] = (
+                self.panel.left_pixhawk_eth_ip_edit.text().strip()
+            )
+            self.panel.mavlink_pixhawk.peer_hosts["right"] = (
+                self.panel.right_pixhawk_eth_ip_edit.text().strip()
+            )
 
     def _ensure_mavlink_subscriber(self) -> DualPixhawkMavlinkSubscriber:
         if self.panel.mavlink_pixhawk is None:
@@ -538,6 +559,10 @@ class DeviceRuntimeController:
                 left_baud=self.panel.left_mavlink_baud_spin.value(),
                 right_baud=self.panel.right_mavlink_baud_spin.value(),
                 custom_watches=tuple(self.panel.custom_watch_specs),
+                peer_hosts={
+                    "left": self.panel.left_pixhawk_eth_ip_edit.text().strip(),
+                    "right": self.panel.right_pixhawk_eth_ip_edit.text().strip(),
+                },
             )
             self.panel.mavlink_pixhawk.extrinsic_changed.connect(self.panel._update_extrinsic)
             self.panel.mavlink_pixhawk.gps_changed.connect(self.panel._update_gps)
@@ -551,27 +576,68 @@ class DeviceRuntimeController:
             stream_setup_required = getattr(self.panel.mavlink_pixhawk, "stream_setup_required", None)
             if stream_setup_required is not None:
                 stream_setup_required.connect(self.panel._handle_mavlink_stream_setup_required)
-            self.panel.mavlink_pixhawk.shell_output.connect(self.panel._append_px4_shell_output)
-            self.panel.mavlink_pixhawk.status_changed.connect(self.panel._handle_mavlink_status_changed)
+            _connect_gui_signal(
+                self.panel.mavlink_pixhawk.shell_output,
+                self.panel._append_px4_shell_output,
+            )
+            _connect_gui_signal(
+                self.panel.mavlink_pixhawk.status_changed,
+                self.panel._handle_mavlink_status_changed,
+            )
         else:
             self.panel._sync_mavlink_subscriber_settings()
         return self.panel.mavlink_pixhawk
 
     def _handle_mavlink_status_changed(self, text: str) -> None:
         self.panel._log(f"[픽스호크] {text}")
-        self.panel._refresh_session_toggle_buttons()
-        self.panel._refresh_mavlink_side_actions()
-        self._auto_refresh_px4_calibration_params_on_heartbeat()
+        # The connect worker emits progress after inserting its socket but
+        # before its completion callback starts the GUI-owned receive timer.
+        # Generic status must not repaint topology buttons in that window: a
+        # synchronous QStyle repolish can block completion and leave the UDP
+        # receive queue undrained. Topology owners refresh those buttons.
+        self.panel._schedule_mavlink_status_ui_refresh()
 
-    def _auto_refresh_px4_calibration_params_on_heartbeat(self) -> None:
-        # Fires once per side, right when that side's first heartbeat is
-        # logged (status_changed emits that message exactly once -- see
-        # DualPixhawkMavlinkSubscriber._handle_mavlink_message). Without
-        # this, the Pixhawk Parameters group sits at "readback 대기 중"
-        # until the operator manually presses "QGC 결과 새로고침".
+    def _schedule_mavlink_status_ui_refresh(self) -> None:
+        if bool(getattr(self.panel, "_mavlink_status_ui_refresh_pending", False)):
+            return
+        self.panel._mavlink_status_ui_refresh_pending = True
+        QtCore.QTimer.singleShot(0, self.panel._flush_mavlink_status_ui_refresh)
+
+    def _flush_mavlink_status_ui_refresh(self) -> None:
+        self.panel._mavlink_status_ui_refresh_pending = False
+        self.panel._refresh_mavlink_side_actions()
+        self._auto_refresh_px4_calibration_params_when_live()
+
+    def _auto_refresh_px4_calibration_params_when_live(self) -> None:
+        """Run the one-shot automatic PARAM read only after qualification.
+
+        The first heartbeat establishes identity but does not prove the link
+        can sustain the field failure interval. Starting the 124-value
+        calibration read at that point used to add command traffic while the
+        side was still QUALIFYING and could obscure an initial RX outage.
+        Manual refresh remains available through the existing controls.
+        """
+
+        subscriber = self.panel.mavlink_pixhawk
+        health_reader = getattr(subscriber, "mavlink_health_snapshot", None)
+        if not callable(health_reader):
+            return
         auto_refreshed = self.panel._px4_calibration_auto_refreshed_sides
-        for side in self.panel._mavlink_connected_sides():
+        for side in ("left", "right"):
             if side in auto_refreshed:
+                continue
+            try:
+                health = health_reader(side)
+            except Exception:
+                continue
+            state = str(
+                getattr(
+                    getattr(health, "state", None),
+                    "value",
+                    getattr(health, "state", ""),
+                )
+            )
+            if state != "LIVE":
                 continue
             auto_refreshed.add(side)
             self.panel._start_pixhawk_parameter_worker(side, "calibration_refresh")
@@ -1030,19 +1096,24 @@ class DeviceRuntimeController:
         worker = PixhawkConnectionWorker(subscriber, camera)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.completed.connect(
+        _connect_gui_signal(
+            worker.completed,
             lambda _result, camera=camera, force_setup=force_setup, target_sides=target_sides:
-            self.panel._apply_pixhawk_connection_result(camera, force_setup, target_sides)
+            self.panel._apply_pixhawk_connection_result(camera, force_setup, target_sides),
         )
-        worker.failed.connect(
+        _connect_gui_signal(
+            worker.failed,
             lambda error, camera=camera, target_sides=target_sides: self.panel._pixhawk_connection_failed(
                 camera, target_sides, error
-            )
+            ),
         )
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self.panel._clear_pixhawk_connection_worker)
+        _connect_gui_signal(
+            thread.finished,
+            self.panel._clear_pixhawk_connection_worker,
+        )
         self.panel.pixhawk_connection_thread = thread
         self.panel.pixhawk_connection_worker = worker
         self.panel.pixhawk_connection_label.setText(f"픽스호크 MAVLink: {label} 연결 중...")
@@ -1201,6 +1272,15 @@ class DeviceRuntimeController:
             # retryable shutdown path would otherwise have to wait for.
             self._finish_pixhawk_disconnect(camera, target_sides)
             return
+        open_sides = set(getattr(subscriber, "connections", {}))
+        if open_sides.issubset(set(target_sides)):
+            # The disconnect worker owns only the potentially blocking
+            # transport close.  Quiesce the QTimer synchronously on its GUI
+            # owner before that worker can empty the final connection set, so
+            # no receive callback can arrive after full-disconnect begins.
+            stop_receive_timer = getattr(subscriber, "stop_receive_timer", None)
+            if callable(stop_receive_timer):
+                stop_receive_timer()
         # ``subscriber.stop()`` closes the underlying serial/socket connection,
         # which can block for as long as an in-flight shell/parameter worker
         # holds a concurrent blocking read on the same connection (they share

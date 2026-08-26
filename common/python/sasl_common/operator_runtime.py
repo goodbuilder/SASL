@@ -11,6 +11,7 @@ import argparse
 import importlib
 import os
 import re
+import site
 import shutil
 import subprocess
 import sys
@@ -551,22 +552,80 @@ def _requirement_names(path: Path) -> tuple[str, ...]:
     return tuple(dict.fromkeys(names))
 
 
+def _runtime_requirements(path: Path) -> tuple[object, ...]:
+    # Deployment diagnostics run with /usr/bin/python3 before the canonical
+    # venv is guaranteed to exist.  Keep the third-party requirement parser
+    # off that bootstrap import path; execution checks load it only after the
+    # official interpreter gate has passed.
+    from packaging.requirements import InvalidRequirement, Requirement
+
+    requirements: list[object] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ()
+    for raw_line in lines:
+        line = raw_line.partition("#")[0].strip()
+        if not line or line.startswith("-"):
+            continue
+        try:
+            requirement = Requirement(line)
+        except InvalidRequirement:
+            continue
+        if requirement.marker is None or requirement.marker.evaluate():
+            requirements.append(requirement)
+    return tuple(requirements)
+
+
 def check_python_distributions(
     *,
     root: Path | None = None,
     version_lookup: Callable[[str], str] = metadata.version,
+    user_site_enabled: bool | None = None,
 ) -> tuple[Diagnostic, ...]:
     selected_root = (root or repository_root()).resolve()
     manifest = selected_root / "requirements" / "runtime.txt"
-    names = _requirement_names(manifest)
-    if not names:
+    try:
+        requirements = _runtime_requirements(manifest)
+    except ImportError as exc:
+        return (
+            Diagnostic(
+                "FAIL",
+                "python.requirement_parser",
+                f"runtime requirement parser is unavailable: {exc}",
+                recovery=(
+                    f"{canonical_python(selected_root)} -m pip install -r {selected_root / 'requirements.txt'}",
+                ),
+            ),
+        )
+    if not requirements:
         return (Diagnostic("FAIL", "python.manifest", f"runtime manifest is missing or empty: {manifest}"),)
+    if bool(site.ENABLE_USER_SITE if user_site_enabled is None else user_site_enabled):
+        return (
+            Diagnostic(
+                "FAIL",
+                "python.user_site",
+                "Python user-site packages are enabled; the root runtime is not self-contained",
+                recovery=(
+                    "export PYTHONNOUSERSITE=1",
+                    f"{canonical_python(selected_root)} -m pip install -r {selected_root / 'requirements.txt'}",
+                ),
+            ),
+        )
     missing: list[str] = []
-    for name in names:
+    incompatible: list[str] = []
+    for requirement in requirements:
+        name = requirement.name
         try:
-            version_lookup(name)
+            version = version_lookup(name)
         except Exception:  # noqa: BLE001 - injected/version metadata boundary.
             missing.append(name)
+            continue
+        if requirement.specifier and not requirement.specifier.contains(
+            version,
+            prereleases=True,
+        ):
+            incompatible.append(f"{name}=={version} not in {requirement.specifier}")
     if missing:
         return (
             Diagnostic(
@@ -578,8 +637,23 @@ def check_python_distributions(
                 ),
             ),
         )
+    if incompatible:
+        return (
+            Diagnostic(
+                "FAIL",
+                "python.distributions.version",
+                "incompatible runtime distributions: " + "; ".join(incompatible),
+                recovery=(
+                    f"{canonical_python(selected_root)} -m pip install -r {selected_root / 'requirements.txt'}",
+                ),
+            ),
+        )
     return (
-        Diagnostic("PASS", "python.distributions", f"root runtime distributions installed ({len(names)})"),
+        Diagnostic(
+            "PASS",
+            "python.distributions",
+            f"root runtime distributions installed ({len(requirements)}) with declared versions",
+        ),
     )
 
 

@@ -391,8 +391,23 @@ class _FakeBackend:
     def apply_workstation_system_settings(self, settings: dict[str, object]) -> None:
         self.calls.append(("settings_apply", dict(settings)))
 
-    def set_gnss_ntrip_session_password(self, password: str) -> None:
-        self.calls.append(("set_gnss_ntrip_session_password", password))
+    def set_gnss_ntrip_session_password(
+        self,
+        password: str,
+        *,
+        caster_host: str | None = None,
+        mountpoint: str | None = None,
+        username: str | None = None,
+    ) -> None:
+        self.calls.append(
+            (
+                "set_gnss_ntrip_session_password",
+                password,
+                caster_host,
+                mountpoint,
+                username,
+            )
+        )
 
     def save_workstation_system_settings(self) -> None:
         self.calls.append("settings_save")

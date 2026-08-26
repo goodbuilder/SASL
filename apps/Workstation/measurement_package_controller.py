@@ -135,6 +135,7 @@ class _VideoEvidenceVerificationWorker(QtCore.QObject):
         full_decode: bool,
         probe_runner: object = None,
         decode_runner: object = None,
+        finalization_evidence: Mapping[str, Mapping[str, object]] | None = None,
         result_box: dict[str, object],
     ) -> None:
         super().__init__()
@@ -144,6 +145,11 @@ class _VideoEvidenceVerificationWorker(QtCore.QObject):
         self.full_decode = bool(full_decode)
         self.probe_runner = probe_runner
         self.decode_runner = decode_runner
+        self.finalization_evidence = {
+            str(side): dict(value)
+            for side, value in dict(finalization_evidence or {}).items()
+            if isinstance(value, Mapping)
+        }
         self.result_box = result_box
 
     @QtCore.pyqtSlot()
@@ -156,21 +162,37 @@ class _VideoEvidenceVerificationWorker(QtCore.QObject):
             descriptors = []
             for side in ("left", "right"):
                 path = self.root / "video" / f"raw_{side}.mp4"
+                finalization = dict(self.finalization_evidence.get(side, {}))
+                recording_backend = str(
+                    finalization.get("stream_backend") or self.backend
+                )
+                h264_copy_integrity_required = (
+                    str(finalization.get("recording_encoding_mode") or "")
+                    == "h264_copy_integrity_gated"
+                    or recording_backend.strip().lower() in {"gst", "gstreamer"}
+                )
                 descriptors.append(
                     verify_video_evidence(
                         path,
                         session_root=self.root,
                         role=f"video/{side}/raw",
                         source=f"camera.{side}",
-                        recording_backend=self.backend,
+                        recording_backend=recording_backend,
                         encoding_provenance={
                             "decoder": self.decoder,
+                            "recording_encoding_mode": (
+                                "h264_copy_integrity_gated"
+                                if h264_copy_integrity_required
+                                else "decoded_reencode_unverified"
+                            ),
                             "contract": (
                                 "continuous MP4 plus exact evaluated-pair native PNG; "
                                 "MP4 may be encoded pass-through or decoded-frame recording"
                             ),
                         },
                         full_decode=self.full_decode,
+                        h264_copy_integrity_required=h264_copy_integrity_required,
+                        recording_finalization_evidence=finalization,
                         probe_runner=self.probe_runner,
                         decode_runner=self.decode_runner,
                     )
@@ -203,6 +225,7 @@ class MeasurementPackageController:
             "_measurement_package_calibration_collected": False,
             "_measurement_package_video_observations": None,
             "_measurement_package_video_descriptors": None,
+            "_measurement_package_video_finalization_evidence": {},
             "_measurement_media_verification_thread": None,
             "_measurement_media_verification_worker": None,
             "_measurement_media_verification_result": None,
@@ -725,6 +748,7 @@ class MeasurementPackageController:
         self.panel._measurement_package_calibration_collected = False
         self.panel._measurement_package_video_observations = None
         self.panel._measurement_package_video_descriptors = None
+        self.panel._measurement_package_video_finalization_evidence = {}
         self.panel._measurement_package_rtcm_drain_requested_token = ""
         self.panel._measurement_package_rtcm_drain_result = None
         # Pre-capture belongs to the newly prepared measurement.  The
@@ -1493,6 +1517,11 @@ class MeasurementPackageController:
                     self.panel,
                     "_measurement_package_video_decode_runner",
                     None,
+                ),
+                finalization_evidence=getattr(
+                    self.panel,
+                    "_measurement_package_video_finalization_evidence",
+                    {},
                 ),
                 result_box=result_box,
             )

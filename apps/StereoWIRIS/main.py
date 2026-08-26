@@ -57,7 +57,7 @@ def _mavlink_only_requested(argv: list[str]) -> bool:
     if mode_override:
         return mode_override == "mavlink"
 
-    settings_path = SASL_ROOT / "StereoWIRIS" / "stereo_distance_settings.json"
+    settings_path = Path(__file__).with_name("stereo_distance_settings.json")
     try:
         payload = json.loads(settings_path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):

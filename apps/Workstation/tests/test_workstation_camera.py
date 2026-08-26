@@ -71,12 +71,16 @@ def test_default_visible_encoder_profile_matches_field_validated_wiris_profile()
 def test_workstation_camera_sync_readiness_uses_imported_finite_check() -> None:
     from Workstation.camera_time_sync_controller import CameraTimeSyncController
 
+    now_monotonic_s = time.monotonic()
     metadata = {
         "rtcp_sr_received_count": 2,
         "rtcp_sr_age_s": 0.2,
+        "rtcp_sr_received_wall_s": time.time() - 0.2,
+        "rtcp_sr_arrival_basis": "rtcp-pad-probe",
+        "rtcp_sr_pc_offset_s": 0.020,
         "rtcp_camera_ntp_rate": 1.0001,
         "rtcp_camera_media_rate": 0.9999,
-        "timestamp_s": 10.0,
+        "timestamp_s": now_monotonic_s,
     }
     panel = SimpleNamespace(
         camera_connected=True,
@@ -479,6 +483,62 @@ def test_measurement_start_queues_while_camera_resource_is_busy(
     assert len(timers) == 1
 
 
+def test_measurement_start_treats_stus_warmup_as_camera_resource_busy() -> None:
+    from Workstation.camera_stream_controller import CameraStreamLifecycleController
+
+    panel = SimpleNamespace(
+        _camera_sync_stus_operation={
+            "active": True,
+            "attempts_started": 1,
+            "max_attempts": 2,
+        },
+        _rtsp_reactivation_side=None,
+        auto_wiris_connect_pending=False,
+    )
+
+    reason = CameraStreamLifecycleController(panel)._camera_busy_reason()
+
+    assert "closed-loop" in reason
+    assert "1/2" in reason
+
+
+def test_queued_stus_measurement_retry_cannot_restart_during_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from Workstation.camera_stream_controller import CameraStreamLifecycleController
+
+    callbacks: list[object] = []
+    starts: list[str] = []
+    panel = SimpleNamespace(
+        _pending_measurement_run_start=False,
+        _shutdown_in_progress=False,
+        _manual_recording_active=False,
+        _camera_sync_stus_operation={
+            "active": True,
+            "attempts_started": 1,
+            "max_attempts": 2,
+        },
+        _rtsp_reactivation_side=None,
+        auto_wiris_connect_pending=False,
+        queue_measurement_start=lambda _reason: True,
+        start_yolo=lambda: starts.append("started"),
+    )
+    monkeypatch.setattr(
+        QtCore.QTimer,
+        "singleShot",
+        lambda _delay, callback: callbacks.append(callback),
+    )
+    controller = CameraStreamLifecycleController(panel)
+
+    controller._queue_measurement_start("STUS closed-loop")
+    panel._shutdown_in_progress = True
+    panel._camera_sync_stus_operation["active"] = False
+    callbacks.pop(0)()
+
+    assert panel._pending_measurement_run_start is False
+    assert starts == []
+
+
 def test_recording_owner_rejects_camera_swap_and_clock_reconnect(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -532,6 +592,15 @@ def test_recording_owner_rejects_camera_swap_and_clock_reconnect(
     panel.camera_connected = False
 
     panel.distance_recording_enabled = False
+
+    panel._camera_sync_stus_operation = {
+        "active": True,
+        "attempts_started": 1,
+        "max_attempts": 2,
+    }
+    assert panel._start_session_recording(start_camera_streams=False) is False
+    assert "폐루프" in panel.recording_status_label.text()
+    panel._camera_sync_stus_operation = None
 
     panel.pixhawk_connection_thread = object()
     assert panel._start_session_recording() is False
@@ -710,7 +779,7 @@ def test_wiris_control_probe_worker_keeps_socket_checks_off_ui_path(monkeypatch)
         {"label": "right", "host": "", "port": 5001, "state": "missing-host"},
     ]]
 
-def test_wiris_rtsp_reactivation_worker_cycles_only_selected_camera(monkeypatch) -> None:
+def test_wiris_rtsp_reactivation_skips_redundant_seth_for_enabled_camera(monkeypatch) -> None:
     from Workstation import wiris_runtime_workers
 
     sent: list[tuple[str, str]] = []
@@ -739,31 +808,22 @@ def test_wiris_rtsp_reactivation_worker_cycles_only_selected_camera(monkeypatch)
     worker.enabled.connect(results.append)
     worker.run()
 
-    assert sent == [
-        ("10.0.0.11", "GETH"),
-        ("10.0.0.11", "SETH TRUE"),
-    ]
+    assert sent == [("10.0.0.11", "GETH")]
     assert results[0]["mode"] == "reactivate"
     assert results[0]["target_labels"] == ("left",)
     assert results[0]["statuses"] == ["left=reactivated-sent"]
     assert results[0]["should_check"] is True
-    assert "SETH FALSE는 전송하지 않음" in "\n".join(results[0]["logs"])
+    assert "SETH TRUE 생략" in "\n".join(results[0]["logs"])
 
-def test_wiris_rtsp_enable_worker_skips_seth_and_unchanged_visible_encoder_profile(monkeypatch) -> None:
+
+def test_wiris_rtsp_enable_ignores_stale_persisted_encoder_profile(monkeypatch) -> None:
     from Workstation import wiris_runtime_workers
 
     sent: list[str] = []
-    responses = {
-        "GETH": "TRUE",
-        "GEBR VISIBLE": "5",
-        "GEQZ VISIBLE": "17",
-        "GEGS VISIBLE": "30",
-        "GEIR VISIBLE": "1",
-    }
 
     def fake_send(command) -> str:
         sent.append(command.command)
-        return responses[command.command]
+        return {"GETH": "TRUE"}[command.command]
 
     monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
     monkeypatch.setattr(wiris_runtime_workers, "check_tcp_port", lambda *_args, **_kwargs: True)
@@ -776,27 +836,59 @@ def test_wiris_rtsp_enable_worker_skips_seth_and_unchanged_visible_encoder_profi
         urls={"left": "rtsp://10.0.0.11:8554/visible"},
         timeout_s=1.0,
         target_labels=("left",),
-        visible_encoder_profile={"bitrate": 5, "qp": 17, "gop": 30, "idr": 1},
+        visible_encoder_profile={"bitrate": 0, "qp": 1, "gop": 90, "idr": 1},
     )
     worker.enabled.connect(results.append)
     worker.run()
 
-    assert sent == [
-        "GETH",
-        "GEBR VISIBLE",
-        "GEQZ VISIBLE",
-        "GEGS VISIBLE",
-        "GEIR VISIBLE",
-    ]
+    assert sent == ["GETH"]
     assert results[0]["statuses"] == ["left=enable-sent"]
     assert results[0]["should_check"] is True
     logs = "\n".join(results[0]["logs"])
     assert "SETH TRUE 생략" in logs
-    assert "bitrate=5, qp=17, gop=30, idr=1" in logs
-    assert "changed=none (readback 일치; SET 생략)" in logs
+    assert "자동 적용하지 않음" in logs
+    assert "SEBR/SEQZ/SEGS/SEIR" in logs
 
 
-def test_wiris_rtsp_enable_worker_applies_only_changed_encoder_fields(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("reactivate", "expected_status"),
+    ((False, "left=enable-sent"), (True, "left=reactivated-sent")),
+)
+def test_wiris_rtsp_enable_sends_seth_only_when_disabled_without_encoder_mutation(
+    monkeypatch,
+    reactivate: bool,
+    expected_status: str,
+) -> None:
+    from Workstation import wiris_runtime_workers
+
+    sent: list[str] = []
+
+    def fake_send(command) -> str:
+        sent.append(command.command)
+        return "FALSE" if command.command == "GETH" else "OK"
+
+    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
+    monkeypatch.setattr(wiris_runtime_workers, "check_tcp_port", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(wiris_runtime_workers, "RTSP_ENABLE_SETTLE_DELAY_MS", 0)
+    results: list[object] = []
+    worker = wiris_runtime_workers.WirisRtspEnableWorker(
+        hosts={"left": "10.0.0.11"},
+        candidate_ports={"left": [2240]},
+        urls={"left": "rtsp://10.0.0.11:8554/visible"},
+        timeout_s=1.0,
+        target_labels=("left",),
+        reactivate=reactivate,
+        visible_encoder_profile={"bitrate": 0, "qp": 1, "gop": 90, "idr": 1},
+    )
+    worker.enabled.connect(results.append)
+    worker.run()
+
+    assert sent == ["GETH", "SETH TRUE"]
+    assert results[0]["statuses"] == [expected_status]
+    assert results[0]["should_check"] is True
+
+
+def test_explicit_encoder_profile_helper_applies_only_changed_fields(monkeypatch) -> None:
     from Workstation import wiris_runtime_workers
 
     sent: list[str] = []
@@ -809,17 +901,12 @@ def test_wiris_rtsp_enable_worker_applies_only_changed_encoder_fields(monkeypatc
 
     def fake_send(command) -> str:
         sent.append(command.command)
-        if command.command == "GETH":
-            return "TRUE"
         if command.command == "SEBR VISIBLE 5":
             return "OK"
         return next(readbacks[command.command])
 
     monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
-    monkeypatch.setattr(wiris_runtime_workers, "check_tcp_port", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(wiris_runtime_workers, "RTSP_ENABLE_SETTLE_DELAY_MS", 0)
     monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_COMMAND_SETTLE_MS", 0)
-    results: list[object] = []
     worker = wiris_runtime_workers.WirisRtspEnableWorker(
         hosts={"left": "10.0.0.11"},
         candidate_ports={"left": [2240]},
@@ -828,11 +915,15 @@ def test_wiris_rtsp_enable_worker_applies_only_changed_encoder_fields(monkeypatc
         target_labels=("left",),
         visible_encoder_profile={"bitrate": 5, "qp": 17, "gop": 30, "idr": 1},
     )
-    worker.enabled.connect(results.append)
-    worker.run()
+    logs: list[str] = []
+    error = worker._apply_visible_encoder_profile(
+        "10.0.0.11",
+        2240,
+        logs,
+        "왼쪽",
+    )
 
     assert sent == [
-        "GETH",
         "GEBR VISIBLE",
         "GEQZ VISIBLE",
         "GEGS VISIBLE",
@@ -840,11 +931,11 @@ def test_wiris_rtsp_enable_worker_applies_only_changed_encoder_fields(monkeypatc
         "SEBR VISIBLE 5",
         "GEBR VISIBLE",
     ]
-    assert results[0]["statuses"] == ["left=enable-sent"]
-    assert "changed=bitrate" in "\n".join(results[0]["logs"])
+    assert error == ""
+    assert "changed=bitrate" in "\n".join(logs)
 
 
-def test_wiris_rtsp_enable_worker_retries_transient_initial_readback_reset(monkeypatch) -> None:
+def test_explicit_encoder_profile_helper_retries_transient_initial_readback_reset(monkeypatch) -> None:
     from Workstation import wiris_runtime_workers
 
     sent: list[str] = []
@@ -852,8 +943,6 @@ def test_wiris_rtsp_enable_worker_retries_transient_initial_readback_reset(monke
 
     def fake_send(command) -> str:
         sent.append(command.command)
-        if command.command == "GETH":
-            return "TRUE"
         if command.command == "GEBR VISIBLE":
             result = next(bitrate_attempts)
             if isinstance(result, Exception):
@@ -866,12 +955,9 @@ def test_wiris_rtsp_enable_worker_retries_transient_initial_readback_reset(monke
         }[command.command]
 
     monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
-    monkeypatch.setattr(wiris_runtime_workers, "check_tcp_port", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(wiris_runtime_workers, "RTSP_ENABLE_SETTLE_DELAY_MS", 0)
     monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_COMMAND_SETTLE_MS", 0)
     monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_READBACK_RETRY_INTERVAL_MS", 0)
     monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_READBACK_MAX_ATTEMPTS", 1)
-    results: list[object] = []
     worker = wiris_runtime_workers.WirisRtspEnableWorker(
         hosts={"left": "10.0.0.11"},
         candidate_ports={"left": [2240]},
@@ -880,19 +966,22 @@ def test_wiris_rtsp_enable_worker_retries_transient_initial_readback_reset(monke
         target_labels=("left",),
         visible_encoder_profile={"bitrate": 5, "qp": 17, "gop": 30, "idr": 1},
     )
-    worker.enabled.connect(results.append)
-    worker.run()
+    logs: list[str] = []
+    error = worker._apply_visible_encoder_profile(
+        "10.0.0.11",
+        2240,
+        logs,
+        "왼쪽",
+    )
 
     assert sent.count("GEBR VISIBLE") == 2
-    assert results[0]["statuses"] == ["left=enable-sent"]
-    assert "changed=none" in "\n".join(results[0]["logs"])
+    assert error == ""
+    assert "changed=none" in "\n".join(logs)
 
-def test_wiris_rtsp_enable_worker_fails_closed_on_encoder_profile_readback_mismatch(monkeypatch) -> None:
+def test_explicit_encoder_profile_helper_fails_closed_on_readback_mismatch(monkeypatch) -> None:
     from Workstation import wiris_runtime_workers
 
     def fake_send(command) -> str:
-        if command.command == "GETH":
-            return "TRUE"
         if command.command.startswith(("SEBR", "SEQZ", "SEGS", "SEIR")):
             return "OK"
         expected = {
@@ -907,7 +996,6 @@ def test_wiris_rtsp_enable_worker_fails_closed_on_encoder_profile_readback_misma
     monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_COMMAND_SETTLE_MS", 0)
     monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_READBACK_MAX_ATTEMPTS", 0)
     monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_READBACK_RETRY_INTERVAL_MS", 0)
-    results: list[object] = []
     worker = wiris_runtime_workers.WirisRtspEnableWorker(
         hosts={"left": "10.0.0.11"},
         candidate_ports={"left": [2240]},
@@ -916,12 +1004,14 @@ def test_wiris_rtsp_enable_worker_fails_closed_on_encoder_profile_readback_misma
         target_labels=("left",),
         visible_encoder_profile={"bitrate": 5, "qp": 17, "gop": 30, "idr": 1},
     )
-    worker.enabled.connect(results.append)
-    worker.run()
+    error = worker._apply_visible_encoder_profile(
+        "10.0.0.11",
+        2240,
+        [],
+        "왼쪽",
+    )
 
-    assert results[0]["statuses"] == ["left=encoder-profile-failed"]
-    assert results[0]["should_check"] is False
-    assert "readback=4 expected=5" in "\n".join(results[0]["logs"])
+    assert "readback=4 expected=5" in error
 
 def test_wiris_control_sessions_are_serialized_per_camera(monkeypatch) -> None:
     from Workstation.workstation_core import wiris_zoom
@@ -1160,9 +1250,56 @@ def test_wiris_stus_compensation_rejects_invalid_rtt() -> None:
 
     assert standalone_gui.WirisClockCommandWorker._stus_one_way_delay_s(0.012) == pytest.approx(0.006)
     assert standalone_gui.WirisClockCommandWorker._stus_compensation_s(0.012) == pytest.approx(0.008)
+    assert standalone_gui.WirisClockCommandWorker._stus_compensation_s(0.515) == pytest.approx(0.2595)
     assert standalone_gui.WirisClockCommandWorker._stus_compensation_s(None) == 0.0
     assert standalone_gui.WirisClockCommandWorker._stus_compensation_s(float("nan")) == 0.0
-    assert standalone_gui.WirisClockCommandWorker._stus_compensation_s(0.251) == 0.0
+    assert standalone_gui.WirisClockCommandWorker._stus_compensation_s(2.001) == 0.0
+
+
+def test_raw_stus_sdk_command_is_blocked_in_favor_of_interlocked_workflow() -> None:
+    from Workstation.wiris_control_controller import WirisControlController
+
+    statuses: list[str] = []
+    mutations: list[object] = []
+    panel = SimpleNamespace(
+        wiris_command_edit=SimpleNamespace(text=lambda: "STUS 123 456"),
+        wiris_command_status_label=SimpleNamespace(setText=statuses.append),
+        _start_wiris_command_worker=lambda **payload: mutations.append(payload),
+    )
+
+    WirisControlController(panel).send_selected_wiris_command()
+
+    assert mutations == []
+    assert statuses and "Raw STUS is blocked" in statuses[-1]
+
+
+def test_stus_and_generic_camera_control_reject_shutdown_or_active_action() -> None:
+    from Workstation.wiris_control_controller import WirisControlController
+
+    statuses: list[str] = []
+    logs: list[str] = []
+    panel = SimpleNamespace(
+        _shutdown_in_progress=True,
+        _camera_sync_stus_operation=None,
+        wiris_command_status_label=SimpleNamespace(setText=statuses.append),
+        _log=logs.append,
+    )
+    controller = WirisControlController(panel)
+
+    assert controller.set_selected_wiris_time_from_pc("both") is False
+    assert getattr(panel, "wiris_time_sync_thread", None) is None
+    assert panel._camera_sync_stus_operation is None
+
+    panel._shutdown_in_progress = False
+    panel._camera_sync_stus_operation = {
+        "active": True,
+        "attempts_started": 1,
+        "max_attempts": 2,
+    }
+    panel.wiris_command_edit = SimpleNamespace(text=lambda: "HIWS")
+    controller.send_selected_wiris_command()
+
+    assert "STUS closed-loop owns" in statuses[-1]
 
 def test_camera_network_address_worker_keeps_interface_apply_off_ui_path(monkeypatch) -> None:
     from Workstation import standalone_gui
@@ -1331,6 +1468,21 @@ def test_camera_mode_switch_restarts_after_workers_stop_without_blocking(
     callbacks.pop(0)()
     assert panel._pending_camera_start is None
     assert starts == [("left", True), ("right", True)]
+    assert panel.camera_connected is False
+    assert panel.yolo_enabled is False
+    from PyQt5 import QtGui
+
+    image = QtGui.QImage(16, 9, QtGui.QImage.Format_RGB888)
+    panel._camera_stream_frame_ready(
+        "left",
+        image,
+        {"stream_generation": panel.left_pane.stream_generation},
+    )
+    panel._camera_stream_frame_ready(
+        "right",
+        image,
+        {"stream_generation": panel.right_pane.stream_generation},
+    )
     assert panel.camera_connected is True
     assert panel.yolo_enabled is True
 
@@ -1358,10 +1510,15 @@ def test_camera_disconnect_watchdog_retries_wedged_stop_until_it_exits(
     stopped = {"value": False}
     panel.left_pane.stop = lambda *, wait=False: stopped["value"]
     panel.right_pane.stop = lambda *, wait=False: stopped["value"]
+    panel._last_wiris_pc_utc_sync = {
+        "command": "STUS",
+        "result": "success",
+    }
 
     # A worker that does not exit on the first cooperative stop must not be
     # abandoned in "종료 대기 중" forever; a watchdog keeps retrying it.
     assert panel.stop_yolo_streams(wait=False) is False
+    assert panel._last_wiris_pc_utc_sync["result"] == "revoked"
     assert len(callbacks) == 1
 
     callbacks.pop(0)()
@@ -1449,9 +1606,17 @@ def test_camera_start_keeps_healthy_side_when_other_side_start_fails(
     assert starts == ["left", "right"]
     assert retries == []
     assert panel._pending_camera_start is None
+    assert panel.camera_connected is False
+    from PyQt5 import QtGui
+
+    panel._camera_stream_frame_ready(
+        "left",
+        QtGui.QImage(16, 9, QtGui.QImage.Format_RGB888),
+        {"stream_generation": panel.left_pane.stream_generation},
+    )
     assert panel.camera_connected is True
-    assert panel.camera_connection_label.text() == "camera partial: left connected; right unavailable"
-    assert "실패한 카메라만 재활성화" in panel.wiris_log.toPlainText()
+    assert panel.camera_connection_label.text() == "camera partial: left LIVE; right unavailable"
+    assert "current-generation frame 확인" in panel.wiris_log.toPlainText()
     panel._shutdown_coordinator = LifecycleCoordinator([])
     panel.close()
     app.processEvents()
@@ -1751,26 +1916,61 @@ def test_workstation_camera_pane_shutdown_is_cooperative_and_retryable(
     app.processEvents()
 
 
-def test_runtime_decoder_fallback_stops_recording_and_restarts_software_preview(monkeypatch) -> None:
-    from types import SimpleNamespace
+def test_retired_native_ring_is_swept_after_pinned_lease_releases() -> None:
+    from Workstation.workstation_core.camera_pane import CameraPane
 
-    from PyQt5 import QtCore
+    class Ring:
+        active_leases = 1
+
+        def __init__(self) -> None:
+            self.closed = False
+            self.unlinked = False
+
+        def metrics(self) -> dict[str, int]:
+            return {"active_leases": self.active_leases}
+
+        def close(self) -> None:
+            self.closed = True
+
+        def unlink(self) -> None:
+            self.unlinked = True
+
+    ring = Ring()
+    pane = SimpleNamespace(_retired_native_frame_rings=[])
+
+    CameraPane._retire_native_frame_ring(pane, ring)
+    assert pane._retired_native_frame_rings == [ring]
+    assert ring.closed is False
+    assert ring.unlinked is False
+
+    ring.active_leases = 0
+    assert CameraPane.sweep_retired_native_frame_rings(pane) is True
+    assert pane._retired_native_frame_rings == []
+    assert ring.closed is True
+    assert ring.unlinked is True
+
+
+def test_recording_decoder_fallback_isolated_to_failed_side() -> None:
+    from types import SimpleNamespace
 
     from Workstation.standalone_gui import WirisStereoDistancePanel
 
     events = []
     panel = SimpleNamespace(
         _runtime_decoder_override=None,
+        _runtime_decoder_overrides={"left": None, "right": None},
         decoder_fallback_reasons={"left": "", "right": ""},
         decoder_combo=SimpleNamespace(currentData=lambda: "auto"),
-        _session_recording_active=lambda: True,
-        yolo_enabled=True,
+        active_stream_decoders={"left": "nvh264dec", "right": "nvh264dec"},
+        _measurement_run_state=lambda: "RUNNING",
+        _camera_stream_start_status=lambda side, state: events.append(
+            ("start-status", side, state)
+        ),
         _camera_name_ko=lambda _camera: "왼쪽",
         _log=lambda text: events.append(("log", text)),
         stop_yolo_streams=lambda: events.append(("stop",)),
         _start_camera_streams=lambda **kwargs: events.append(("start", kwargs)),
     )
-    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _delay, callback: callback())
 
     WirisStereoDistancePanel._handle_runtime_decoder_fallback(
         panel,
@@ -1778,11 +1978,13 @@ def test_runtime_decoder_fallback_stops_recording_and_restarts_software_preview(
         "DECODER_FALLBACK_REQUIRED: nvh264dec first-frame timeout",
     )
 
-    assert panel._runtime_decoder_override == "software"
+    assert panel._runtime_decoder_override is None
+    assert panel._runtime_decoder_overrides == {"left": "software", "right": None}
     assert "first-frame timeout" in panel.decoder_fallback_reasons["left"]
-    assert panel.decoder_fallback_reasons["left"] == panel.decoder_fallback_reasons["right"]
-    assert ("stop",) in events
-    assert ("start", {"enable_detection": False, "switch_to_depth": False}) in events
+    assert panel.decoder_fallback_reasons["right"] == ""
+    assert panel.active_stream_decoders == {"left": None, "right": "nvh264dec"}
+    assert not any(event[0] in {"stop", "start"} for event in events)
+    assert any(event[0] == "start-status" and event[1] == "left" for event in events)
 
 
 def test_decoder_start_policy_records_requested_effective_and_capability(monkeypatch) -> None:

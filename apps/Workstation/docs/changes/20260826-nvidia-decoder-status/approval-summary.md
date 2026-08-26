@@ -15,9 +15,12 @@ Measurement 흐름은 그대로입니다.
 
 ## Success, delay, rejection, failure, overload, and recovery
 
-- 성공: 실제 first frame이 `nvh264dec`에서 나오고 `GPU · nvh264dec`가 표시됩니다.
-- GPU 실패: Auto는 기존처럼 현재 output을 닫고 software로 한 번 재시작하며
-  `CPU fallback`과 이유를 표시합니다.
+- 성공: 현재 stream generation의 실제 first frame이 `nvh264dec`에서 나오고 나서만
+  `GPU · nvh264dec`가 표시됩니다. `PLAYING`은 candidate입니다.
+- GPU 실패: decoder-health로 분류된 경우에만 Auto가 해당 side에 software override와
+  이유를 남깁니다. Preview-only는 해당 side만 재시작하고, 녹화 중이면 해당 MP4를
+  종료한 뒤 다음 side start에 적용합니다. 정상인 반대쪽 worker/MP4는 유지합니다.
+- RTSP/source/parser와 mux/filesink 오류는 decoder fallback으로 위장하지 않습니다.
 - strict NVIDIA를 operator가 직접 선택하면 fallback 없이 ERROR입니다.
 - 새 worker/queue/rate/quality 변경은 없습니다.
 

@@ -31,3 +31,15 @@ def test_portable_path_policy_allows_system_and_historical_paths() -> None:
         "apps/Simulation/reports/historical.md",
         "captured at /home/operator/old-run",
     ) == ()
+    assert scan_text(
+        "apps/StereoWIRIS/calibration_captures/intrinsics_zoom_08.json",
+        '"calibration_root":"/home/operator/original-capture"',
+    ) == ()
+    assert scan_text(
+        "apps/StereoWIRIS/docs/changes/change/evidence/capture.md",
+        "captured at /home/operator/original-run",
+    ) == ()
+    assert scan_text(
+        "apps/Workstation/intrinsics_zoom_08.json",
+        '"calibration_root":"/home/operator/original-capture"',
+    ) == ()

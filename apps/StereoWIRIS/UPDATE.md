@@ -1,5 +1,33 @@
 # 업데이트 기록
 
+## v2.3.2 — 2026-08-27 — Legacy 빈 녹화 방지와 NIC 분리 기본값
+
+- 변경:
+  - Workstation/Legacy 카메라 NIC 기본 주소를 `10.0.0.11/32`로 맞춰 Pixhawk 전용
+    `10.0.0.10/24` subnet을 카메라 NIC에 다시 만들지 않도록 했다.
+  - Legacy YOLO model 설정을 checkout 절대경로에서 앱 상대 `yolov8n_uav.pt`로 바꿨다.
+  - 공통 runtime manifest가 Torch 2.13/colcon 호환 교집합인 setuptools 77–79를 직접 소유한다.
+  - Preview 미연결 상태에서 `세션 기록 시작`을 누르면 양쪽 record-capable RTSP worker를 즉시
+    시작한다. 양쪽 MP4를 첫 GUI frame 전부터 expected artifact로 고정한다.
+  - camera start 요청이 즉시 거부되면 기록 flag/button을 원복하고 retryable failure를 남긴다.
+- 이유:
+  - Preview 없이 Record를 누르면 UI/session spool만 active가 되고 worker·socket·MP4가 전혀 없는
+    실제 빈 녹화가 재현됐기 때문이다.
+  - 카메라 NIC의 과거 `.10/24` 기본값이 격리된 Pixhawk NIC subnet과 다시 겹칠 수 있었다.
+- 확인:
+  - startup, `영상 수신 확인`, Preview, 두 번의 restart와 세 번의 record path를 포함한 SDK
+    TCP/2240 pcap은 packet 0, drop 0이었다. 자동 encoder SET과 `SETH`는 없었다.
+  - 수정 전 blank start session `20260827_050359_648097447`은 worker/MP4 없이 active로 표시됐다.
+  - 수정 후 session `20260827_050834_833389066`은 Record 단독으로 양쪽 worker와 MP4를 만들고
+    정상 Stop/EOS/save/종료했다.
+  - Legacy 지원/설정/네트워크/런처 `95 passed`, encoder/session 집중 `16 passed`.
+  - 전체 `test_stereo.py` 단일 프로세스는 기존 Qt native order-dependent segmentation fault를
+    재현했으며, 변경된 테스트는 격리 선택에서 통과했다.
+- 남은 위험:
+  - MP4 생성·저장 경로는 PASS지만 Left/Right 모두 NAL5가 0이고 decode loss/reference gap/final
+    `stts=0`이므로 usable MP4는 계속 FAIL이다. Workswell sender firmware 수정이 필요하다.
+  - 별도 clean Ubuntu OS/VM 재현과 Legacy Qt test-order crash는 아직 남아 있다.
+
 ## v2.3.1 — 2026-08-26 — WIRIS preview RTP gap 손상 차단
 
 - 변경:
@@ -21,8 +49,13 @@
   - WIRIS timestamp/sample layout에서 `mdat` fragment box를 H.264 NAL로 오인시킨
     `mp4mux fragment-duration=1000`을 제거했다. direct H.264 copy와 정상 EOS 계약은 유지하며
     실제 앱 Left/Right MP4의 ffprobe 및 strict software full decode가 exit 0이다.
+  - Workstation/Legacy startup, Auto-Connect, Enable, Reactivate에서 저장 encoder profile
+    자동 적용을 제거했다. `GETH=TRUE`이면 `SETH TRUE`도 생략하고, `GETH=FALSE`에서만 한 번
+    전송한다. `SEBR/SEQZ/SEGS/SEIR`은 별도 수동 명령으로만 변경한다.
   - Legacy startup의 미완료 spool 자동 복구와 intrinsics 자동 적용을 제거했다. 기존 파일과
     명시적 recovery/manual load utility는 보존하며 새 session은 기록 버튼 시점에만 만든다.
+  - Legacy MP4 검증은 recording이 기대된 side를 별도로 보존한다. worker가 첫 GUI frame 전에
+    실패해 frame count가 0이어도 missing/zero/non-`ftyp` MP4는 session finalize 실패로 남긴다.
   - RTP gap status는 5초 누적 요약으로 제한해 GUI log 폭주를 방지한다.
   - 검증용 `STEREO_PREVIEW_IDENTITY_LOG`에 producer RGB/process queue/deep-copied QImage
     SHA-256, size/stride/bytesPerLine, sequence/drop/reorder를 기록한다.

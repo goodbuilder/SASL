@@ -14,6 +14,15 @@ from Workstation.tests.workstation_test_support import (
 )
 
 
+def test_default_camera_host_address_preserves_camera_pixhawk_nic_isolation() -> None:
+    from Workstation.workstation_core.settings import AppSettings
+
+    settings = AppSettings()
+
+    assert settings.camera_host_address == "10.0.0.11/32"
+    assert settings.pixhawk_host_address == "10.0.0.10"
+
+
 def test_save_settings_failure_leaves_existing_settings_file_intact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -224,6 +233,16 @@ def test_workstation_shutdown_orders_runtime_stop_before_settings_save(
     from Workstation import standalone_gui
 
     monkeypatch.setattr(standalone_gui, "APP_ROOT", tmp_path)
+    monkeypatch.setattr(
+        standalone_gui.WirisStereoDistancePanel,
+        "_initial_status",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        standalone_gui.WirisStereoDistancePanel,
+        "_auto_load_intrinsics",
+        lambda self: None,
+    )
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     panel = standalone_gui.WirisStereoDistancePanel()
     assert panel.app_root == tmp_path.resolve()
@@ -236,8 +255,10 @@ def test_workstation_shutdown_orders_runtime_stop_before_settings_save(
         "stop-drone-telemetry",
         "stop-runtime-workers",
         "stop-auxiliary-workers",
-        "close-measurement-data-writer",
+        "wait-session-save",
+        "verify-resource-cleanup",
         "save-settings",
+        "close-measurement-data-writer",
     )
     panel.close()
     app.processEvents()
@@ -452,6 +473,28 @@ def test_yolo_weights_file_picker_failure_preserves_previous_selection(
     workspace.deleteLater()
     QtWidgets.QApplication.processEvents()
 
+
+def test_visible_encoder_settings_are_labeled_manual_reference_only(tmp_path: Path) -> None:
+    from Workstation.settings_workspace import SettingsWorkspace
+
+    backend = SimpleNamespace(panel=SimpleNamespace(app_root=tmp_path / "workstation-data"))
+    workspace = SettingsWorkspace(backend=backend)
+
+    for key in (
+        "wiris_visible_encoder_bitrate",
+        "wiris_visible_encoder_qp",
+        "wiris_visible_encoder_gop",
+        "wiris_visible_encoder_idr",
+    ):
+        tooltip = workspace.settings_widgets[key].toolTip()
+        assert "Manual-reference" in tooltip
+        assert "do not apply it" in tooltip
+
+    workspace.close()
+    workspace.deleteLater()
+    QtWidgets.QApplication.processEvents()
+
+
 def test_workstation_every_flat_app_setting_has_an_editable_surface() -> None:
     from dataclasses import fields
 
@@ -639,11 +682,17 @@ def test_system_measurement_and_time_save_apply_visible_payload_before_persist()
     window.settings_workspace.gnss_network_password_edit.setText("session-only-secret")
     backend.calls.clear()
     assert window.commands.invoke("settings.save") is True
-    assert backend.calls[0] == (
+    assert backend.calls[0][:2] == (
         "set_gnss_ntrip_session_password",
         "session-only-secret",
     )
     assert backend.calls[1][0] == "settings_apply"
+    applied_network = backend.calls[1][1]["gnss_operation"]["network"]
+    assert backend.calls[0][2:] == (
+        applied_network["caster_host"],
+        applied_network["mountpoint"],
+        applied_network["username"],
+    )
     assert backend.calls[1][1]["interface_name"] == "enx-visible"
     assert backend.calls[1][1]["yolo_input_size"] == 960
     assert backend.calls[2] == "settings_save"

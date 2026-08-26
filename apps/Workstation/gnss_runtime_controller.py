@@ -89,6 +89,20 @@ class NtripCredentialResolution:
     source: str
 
 
+def _ntrip_credential_account_key(
+    caster_host: object,
+    mountpoint: object,
+    username: object,
+) -> tuple[str, str, str]:
+    """Return the non-secret identity that owns one session credential."""
+
+    return (
+        str(caster_host or "").strip().casefold(),
+        str(mountpoint or "").strip().lstrip("/"),
+        str(username or "").strip(),
+    )
+
+
 def _connect_gui_signal(signal, callback) -> None:
     """Deliver a worker signal to a panel/UI callback on the Qt GUI thread.
 
@@ -1194,7 +1208,23 @@ class GnssRuntimeController:
         session_password_explicit = bool(
             getattr(self.panel, "_gnss_ntrip_session_password_explicit", True)
         )
-        if username and session_password and session_password_explicit:
+        current_key = _ntrip_credential_account_key(
+            network.caster_host,
+            network.mountpoint,
+            username,
+        )
+        session_key = getattr(self.panel, "_gnss_ntrip_session_credential_key", None)
+        # Lightweight legacy/test panels have no account marker. Real UI
+        # handoffs always supply one; preserving the no-marker behavior keeps
+        # old facade clients source compatible without allowing an actual
+        # edited password to bleed into a different caster/account.
+        session_key_matches = session_key is None or tuple(session_key) == current_key
+        if (
+            username
+            and session_password
+            and session_password_explicit
+            and session_key_matches
+        ):
             return NtripCredentialResolution(username=username, password=session_password, source="session")
 
         if not username:
@@ -1221,7 +1251,7 @@ class GnssRuntimeController:
         # No saved or environment credential exists.  Preserve the
         # deployment fallback for an untouched field profile, but only after
         # the stronger account-specific sources above have been exhausted.
-        if username and session_password:
+        if username and session_password and session_key_matches:
             return NtripCredentialResolution(username=username, password=session_password, source="session")
 
         if not storage_available:
@@ -1247,6 +1277,20 @@ class GnssRuntimeController:
             network.caster_host, network.mountpoint, credential.username, credential.password
         )
 
+    def _commit_pending_ntrip_credential(self, status_line: str) -> None:
+        """Persist a typed credential only after the caster accepted it."""
+
+        pending = getattr(self.panel, "_gnss_ntrip_pending_credential", None)
+        if not pending:
+            return
+        network, credential = pending
+        if " 200 " not in f" {str(status_line).upper()} " and not str(status_line).upper().endswith(" 200"):
+            return
+        self._maybe_persist_ntrip_credential(network, credential)
+        self.panel._gnss_ntrip_pending_credential = None
+        if hasattr(self.panel, "_refresh_ntrip_credential_status"):
+            self.panel._refresh_ntrip_credential_status()
+
     def _reject_ntrip_start(self, message: str, tone: str) -> None:
         """Every guard below routes through here so a rejected Start NTRIP
         click always leaves a line in the visible log, not only the small
@@ -1256,6 +1300,29 @@ class GnssRuntimeController:
 
         self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], message, tone)
         self.panel._log(f"[GNSS] NTRIP 시작 거부: {message}")
+
+    def _rollback_ntrip_start_setup(self, message: str) -> None:
+        """Undo the UI/state reservation when no network worker was started."""
+
+        text = str(message)
+        self.panel.gnss_operation_gate_active = False
+        self.panel.gnss_active_operation_config = None
+        self.panel.gnss_network_connected = False
+        self.panel.gnss_network_phase = "ERROR"
+        self.panel.gnss_network_last_error = text
+        self.panel._gnss_ntrip_pending_credential = None
+        self.panel._set_gnss_operation_controls_locked(False)
+        if hasattr(self.panel, "gnss_network_start_button"):
+            self.panel.gnss_network_start_button.setEnabled(
+                self.panel._gnss_selected_operation_mode()
+                != GnssOperationMode.LOCAL_SURVEY_IN
+            )
+        if hasattr(self.panel, "gnss_network_stop_button"):
+            self.panel.gnss_network_stop_button.setEnabled(False)
+        self.panel._gnss_transition(
+            GnssOperationState.FAULT,
+            f"NTRIP setup failure: {text}",
+        )
 
     def _prepare_ntrip_rtcm_route(self, route: RtcmRouteConfig) -> bool:
         """Prepare optional Pixhawk delivery without gating NTRIP transport.
@@ -1360,14 +1427,32 @@ class GnssRuntimeController:
         self.panel.gnss_network_stop_button.setEnabled(True)
         self.panel._set_gnss_operation_controls_locked(True)
         self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], "NTRIP 연결 중", "warn")
-        self._maybe_persist_ntrip_credential(config.network, credential)
+        self.panel._gnss_ntrip_pending_credential = (
+            config.network,
+            credential,
+        ) if credential.source == "session" else None
+        self.panel._gnss_ntrip_active_credential_source = credential.source
+        self.panel._gnss_ntrip_active_credential_key = _ntrip_credential_account_key(
+            config.network.caster_host,
+            config.network.mountpoint,
+            credential.username,
+        )
         self.panel._refresh_ntrip_credential_status()
-        pipeline = self._ensure_rtcm_pipeline()
-        route = self._rtcm_route_config()
-        if not self._prepare_ntrip_rtcm_route(route):
+        try:
+            pipeline = self._ensure_rtcm_pipeline()
+            route = self._rtcm_route_config()
+            if not self._prepare_ntrip_rtcm_route(route):
+                self._rollback_ntrip_start_setup(
+                    "RTCM 주입 worker를 시작할 수 없습니다"
+                )
+                return
+            self._sync_rtcm_pipeline_config(reset=True)
+            self._sync_rtcm_evidence_context()
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            message = f"NTRIP RTCM 준비 실패: {exc}"
+            self._reject_ntrip_start(message, "bad")
+            self._rollback_ntrip_start_setup(message)
             return
-        self._sync_rtcm_pipeline_config(reset=True)
-        self._sync_rtcm_evidence_context()
         thread = QtCore.QThread(self.panel)
         worker = NtripNetworkWorker(
             config=config.network,
@@ -1399,6 +1484,9 @@ class GnssRuntimeController:
         thread = self.panel.gnss_network_thread
         self.panel.gnss_network_connected = False
         self.panel.gnss_network_phase = "STOPPED"
+        self.panel._gnss_ntrip_pending_credential = None
+        self.panel._gnss_ntrip_active_credential_source = ""
+        self.panel._gnss_ntrip_active_credential_key = None
         self.panel.latest_gnss_base_position = None
         self.panel.gnss_operation_gate_active = False
         self.panel.gnss_operation_manager.stop()
@@ -1444,7 +1532,14 @@ class GnssRuntimeController:
         ntrip_credentials.delete_password(host, mountpoint, username)
         self.panel._refresh_ntrip_credential_status()
 
-    def set_gnss_ntrip_session_password(self, password: str) -> None:
+    def set_gnss_ntrip_session_password(
+        self,
+        password: str,
+        *,
+        caster_host: str | None = None,
+        mountpoint: str | None = None,
+        username: str | None = None,
+    ) -> None:
         """Copy a typed password into the widget ``_resolve_ntrip_credentials``
         actually reads.
 
@@ -1464,8 +1559,19 @@ class GnssRuntimeController:
         if hasattr(self.panel, "gnss_ntrip_password_edit"):
             self.panel.gnss_ntrip_password_edit.setText(str(password))
             self.panel._gnss_ntrip_session_password_explicit = True
+            if caster_host is None or mountpoint is None or username is None:
+                try:
+                    caster_host, mountpoint, username = self._ntrip_credential_lookup_key()
+                except (AttributeError, TypeError, ValueError):
+                    caster_host = mountpoint = username = None
+            self.panel._gnss_ntrip_session_credential_key = (
+                None
+                if caster_host is None or mountpoint is None or username is None
+                else _ntrip_credential_account_key(caster_host, mountpoint, username)
+            )
 
     def _handle_gnss_network_connected(self, status_line: str, stats: object) -> None:
+        self._commit_pending_ntrip_credential(status_line)
         self.panel.gnss_network_connected = True
         self.panel.gnss_network_phase = "CONNECTED"
         self.panel.gnss_network_stats = stats
@@ -1572,12 +1678,13 @@ class GnssRuntimeController:
 
     def _handle_gnss_network_failed(self, message: str) -> None:
         self.panel.gnss_network_connected = False
-        self.panel.gnss_network_phase = "ERROR"
+        auth_failed = "401" in str(message) or "unauthorized" in str(message).lower()
+        self.panel.gnss_network_phase = "HTTP_AUTH_FAILED" if auth_failed else "ERROR"
         self.panel.gnss_network_last_error = str(message)
         text = str(message)
         # 401 means the caster rejected the credentials; it is deliberately
         # not asserted here whether the username or the password was wrong.
-        if "401" in text or "unauthorized" in text.lower():
+        if auth_failed:
             display = f"NTRIP 인증 거부 (username/password 확인 필요): {text}"
         else:
             display = f"NTRIP 실패: {text}"
@@ -1587,6 +1694,7 @@ class GnssRuntimeController:
         # this same small status label, which is exactly why a rejected
         # password after Start NTRIP "does nothing" a second time.
         self.panel._log(f"[GNSS] {display}")
+        self.panel._gnss_ntrip_pending_credential = None
         self.panel._gnss_transition(GnssOperationState.FAULT, f"NTRIP failure: {text}")
 
     def _handle_gnss_network_reconnecting(self, message: str) -> None:
@@ -1610,7 +1718,7 @@ class GnssRuntimeController:
             self.panel.gnss_network_thread = None
             self.panel.gnss_network_worker = None
             self.panel.gnss_network_connected = False
-            if getattr(self.panel, "gnss_network_phase", "") != "ERROR":
+            if getattr(self.panel, "gnss_network_phase", "") not in {"ERROR", "HTTP_AUTH_FAILED"}:
                 self.panel.gnss_network_phase = "STOPPED"
             self.panel.gnss_active_operation_config = None
             self.panel._set_gnss_operation_controls_locked(False)

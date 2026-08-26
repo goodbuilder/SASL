@@ -912,6 +912,40 @@ def test_ntrip_worker_passes_explicit_credentials_to_client_and_reuses_them_on_r
     assert credential_attempts[1] == ("field-user", "field-secret")
 
 
+def test_ntrip_worker_treats_http_401_as_immediate_terminal_auth_failure(monkeypatch) -> None:
+    import Workstation.gnss_runtime_workers as runtime_workers
+
+    attempts = 0
+
+    class RejectingClient:
+        def __init__(self, _config, **_kwargs) -> None:
+            self.stats = None
+
+        def connect(self, *, gga_sentence=None):
+            nonlocal attempts
+            attempts += 1
+            raise NtripProtocolError("NTRIP caster rejected request: HTTP/1.1 401 Unauthorized")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(runtime_workers, "NtripClient", RejectingClient)
+    worker = runtime_workers.NtripNetworkWorker(
+        config=NetworkConfig(), username="field-user", password="field-secret"
+    )
+    reconnecting: list[str] = []
+    failed: list[str] = []
+    worker.reconnecting.connect(reconnecting.append)
+    worker.failed.connect(failed.append)
+
+    worker.run()
+
+    assert attempts == 1
+    assert reconnecting == []
+    assert len(failed) == 1
+    assert "401" in failed[0]
+
+
 def test_network_config_carries_plain_username_and_never_a_password_field() -> None:
     """Required test 2 (structural half): NetworkConfig has nowhere to put a password."""
 
@@ -1119,6 +1153,85 @@ def test_resolve_ntrip_credentials_uses_explicit_session_edit_over_keyring(
     )
 
 
+def test_explicit_session_password_is_bound_to_its_caster_account(monkeypatch) -> None:
+    panel = _panel_with_password("")
+    controller = GnssRuntimeController(panel)
+    controller.set_gnss_ntrip_session_password(
+        "old-session-secret",
+        caster_host="old.example.org",
+        mountpoint="OLD",
+        username="field-user",
+    )
+    monkeypatch.setattr(ntrip_credentials, "secure_storage_available", lambda: True)
+    monkeypatch.setattr(
+        ntrip_credentials,
+        "load_password",
+        lambda host, _mountpoint, _username: (
+            "new-account-secret" if host == "new.example.org" else None
+        ),
+    )
+
+    old = controller._resolve_ntrip_credentials(
+        NetworkConfig(caster_host="old.example.org", mountpoint="OLD", username="field-user")
+    )
+    new = controller._resolve_ntrip_credentials(
+        NetworkConfig(caster_host="new.example.org", mountpoint="NEW", username="field-user")
+    )
+
+    assert old.source == "session"
+    assert old.password == "old-session-secret"
+    assert new.source == "keyring"
+    assert new.password == "new-account-secret"
+
+
+def test_pending_session_password_is_saved_only_after_http_200(monkeypatch) -> None:
+    saved: list[tuple[str, str, str, str]] = []
+    monkeypatch.setattr(
+        ntrip_credentials,
+        "save_password",
+        lambda host, mountpoint, username, password: (
+            saved.append((host, mountpoint, username, password)) or True
+        ),
+    )
+    network = NetworkConfig(
+        caster_host="caster",
+        mountpoint="MOUNT",
+        username="field-user",
+        remember_password=True,
+    )
+    credential = NtripCredentialResolution(
+        username="field-user", password="field-secret", source="session"
+    )
+    panel = SimpleNamespace(
+        _gnss_ntrip_pending_credential=(network, credential),
+        _gnss_ntrip_active_credential_source="session",
+    )
+    controller = GnssRuntimeController(panel)
+
+    controller._commit_pending_ntrip_credential("HTTP/1.1 200 OK")
+
+    assert saved == [("caster", "MOUNT", "field-user", "field-secret")]
+    assert panel._gnss_ntrip_pending_credential is None
+
+
+def test_ntrip_auth_failure_projects_typed_health_state() -> None:
+    health = evaluate_ntrip_health(
+        network_mode=True,
+        connected=False,
+        running=False,
+        phase="HTTP_AUTH_FAILED",
+        connected_at_s=None,
+        last_chunk_s=None,
+        last_rtcm_s=None,
+        now_s=100.0,
+        transport_stale_after_s=10.0,
+        correction_stale_after_s=3.0,
+        last_error="HTTP/1.1 401 Unauthorized",
+    )
+
+    assert health.state is NtripHealthState.HTTP_AUTH_FAILED
+
+
 def test_set_gnss_ntrip_session_password_bridges_settings_workspace_field_into_resolve() -> None:
     """Regression: the Settings workspace's password field lives on a
     different object than ``panel`` (SettingsWorkspace.gnss_network_password_edit
@@ -1177,6 +1290,46 @@ def test_ntrip_route_preparation_keeps_pixhawk_worker_failure_blocking() -> None
     assert controller._prepare_ntrip_rtcm_route(RtcmRouteConfig(ntrip_targets=("left",))) is False
     assert health_calls == [("network-label", "RTCM 주입 worker를 시작할 수 없습니다", "bad")]
     assert logs == ["[GNSS] NTRIP 시작 거부: RTCM 주입 worker를 시작할 수 없습니다"]
+
+
+def test_ntrip_pre_worker_failure_rolls_back_locked_start_state() -> None:
+    class Button:
+        def __init__(self) -> None:
+            self.enabled = None
+
+        def setEnabled(self, enabled: bool) -> None:
+            self.enabled = bool(enabled)
+
+    lock_calls: list[bool] = []
+    transitions: list[tuple[object, str]] = []
+    panel = SimpleNamespace(
+        gnss_operation_gate_active=True,
+        gnss_active_operation_config=object(),
+        gnss_network_connected=False,
+        gnss_network_phase="CONNECTING",
+        gnss_network_last_error="",
+        _gnss_ntrip_pending_credential=(object(), object()),
+        _gnss_ntrip_active_credential_source="session",
+        _gnss_ntrip_active_credential_key=("caster", "MOUNT", "user"),
+        gnss_network_start_button=Button(),
+        gnss_network_stop_button=Button(),
+        _gnss_selected_operation_mode=lambda: GnssOperationMode.NETWORK_RTK_DIRECT,
+        _set_gnss_operation_controls_locked=lock_calls.append,
+        _gnss_transition=lambda state, reason: transitions.append((state, reason)),
+    )
+    controller = GnssRuntimeController(panel)
+
+    controller._rollback_ntrip_start_setup("RTCM worker sentinel")
+
+    assert panel.gnss_operation_gate_active is False
+    assert panel.gnss_active_operation_config is None
+    assert panel.gnss_network_phase == "ERROR"
+    assert panel.gnss_network_last_error == "RTCM worker sentinel"
+    assert panel._gnss_ntrip_pending_credential is None
+    assert panel.gnss_network_start_button.enabled is True
+    assert panel.gnss_network_stop_button.enabled is False
+    assert lock_calls == [False]
+    assert transitions == [(GnssOperationState.FAULT, "NTRIP setup failure: RTCM worker sentinel")]
 
 
 def test_resolve_ntrip_credentials_falls_back_to_keyring(monkeypatch) -> None:

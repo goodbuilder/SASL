@@ -19,6 +19,9 @@ from PyQt5 import QtCore, QtGui
 
 from Workstation.runtime_paths import WORKSTATION_MODELS_ROOT
 from Workstation.workstation_core.error_throttle import should_emit_throttled_error
+from Workstation.workstation_core.mp4_integrity import (
+    H264_MP4_INTEGRITY_SCHEMA,
+)
 from Workstation.workstation_core.native_frame_ring import (
     DEFAULT_NATIVE_MAX_HEIGHT,
     DEFAULT_NATIVE_MAX_WIDTH,
@@ -79,6 +82,7 @@ UINT32_HALF_RANGE = 2**31
 MAX_RTP_TIMING_CACHE = 240
 MAX_RTP_PTS_MATCH_DELTA_NS = 5_000_000
 MAX_RTP_DISCONTINUITY_CACHE = 64
+H264_NAL_TYPE_IDR = 5
 MAX_RTCP_SR_ARRIVAL_CACHE = 128
 MAX_RTCP_RATE_SAMPLES = 12
 DEFAULT_RECORD_VIDEO_QUEUE_SIZE = 300
@@ -98,6 +102,11 @@ _LINUX_PR_SET_PDEATHSIG = 1
 DECODER_FALLBACK_FIRST_FRAME_TIMEOUT_S = 30.0
 DECODER_FALLBACK_STALL_TIMEOUT_S = 30.0
 DECODER_FALLBACK_STATUS_PREFIX = "DECODER_FALLBACK_REQUIRED:"
+DECODER_FALLBACK_ACTIVE_STATUS_PREFIX = "DECODER_FALLBACK_ACTIVE:"
+GST_ERROR_RTSP_SOURCE = "rtsp-source"
+GST_ERROR_RECORDING_OUTPUT = "recording-output"
+GST_ERROR_DECODER_HEALTH = "decoder-health"
+GST_ERROR_PIPELINE = "pipeline"
 
 
 def _arm_linux_parent_death_signal() -> bool:
@@ -289,6 +298,27 @@ def _draw_detections(cv2, frame, detections: list[DetectionBox], best_detection:
 
 def _emit_status(output_queue, text: str) -> None:
     output_queue.put(("status", text))
+
+
+def _emit_terminal_exit(output_queue, reason: str) -> None:
+    output_queue.put(("terminal_exit", {"reason": str(reason)}))
+
+
+def _emit_decoder_fallback(
+    output_queue,
+    *,
+    reason: str,
+    recording_restart_required: bool,
+) -> None:
+    output_queue.put(
+        (
+            "decoder_fallback",
+            {
+                "reason": str(reason),
+                "recording_restart_required": bool(recording_restart_required),
+            },
+        )
+    )
 
 
 def _emit_recording_finalized(
@@ -508,6 +538,92 @@ def decoder_candidates(decoder: str | None) -> tuple[str, ...]:
     return (NVIDIA_H264_DECODER, SOFTWARE_H264_DECODER)
 
 
+def classify_gstreamer_error(
+    *,
+    source_name: object,
+    detail: object,
+    active_decoder: object,
+) -> str:
+    """Classify a GStreamer failure by the element that owns the boundary.
+
+    Generic pipeline errors are deliberately *not* treated as decoder health.
+    Falling back to CPU for an RTSP, parser, mux, or filesink failure merely
+    hides the real fault and restarts an otherwise healthy decoder.
+    """
+
+    source = str(source_name or "").strip().lower().replace("-", "_")
+    message = str(detail or "").strip().lower()
+    decoder = str(active_decoder or "").strip().lower()
+
+    recording_sources = ("filesink", "record_mux", "mp4mux", "qtmux")
+    if any(token in source for token in recording_sources):
+        return GST_ERROR_RECORDING_OUTPUT
+
+    rtsp_sources = (
+        "rtspsrc",
+        "rtph264depay",
+        "h264parse",
+        "typefind",
+        "tcpclientsrc",
+        "udpsrc",
+    )
+    if source == "src" or any(token in source for token in rtsp_sources):
+        return GST_ERROR_RTSP_SOURCE
+
+    decoder_sources = tuple(
+        token for token in (decoder, NVIDIA_H264_DECODER, SOFTWARE_H264_DECODER) if token
+    )
+    if any(token in source for token in decoder_sources):
+        return GST_ERROR_DECODER_HEALTH
+
+    # parse_launch has no GstMessage source. In that one boundary, an explicit
+    # missing/failing decoder element name is still direct decoder evidence.
+    if not source and any(token in message for token in decoder_sources):
+        return GST_ERROR_DECODER_HEALTH
+    if not source and any(token in message for token in recording_sources):
+        return GST_ERROR_RECORDING_OUTPUT
+    if not source and any(token in message for token in rtsp_sources):
+        return GST_ERROR_RTSP_SOURCE
+    return GST_ERROR_PIPELINE
+
+
+def gstreamer_error_fallback_reason(
+    *,
+    requested_decoder: str,
+    active_decoder: str,
+    already_fell_back: bool,
+    error_class: str,
+    detail: object,
+) -> str | None:
+    """Return an Auto CPU fallback reason only for direct NVDEC health evidence."""
+
+    if error_class != GST_ERROR_DECODER_HEALTH:
+        return None
+    if normalize_decoder_mode(requested_decoder) != DECODER_AUTO:
+        return None
+    if active_decoder != NVIDIA_H264_DECODER or already_fell_back:
+        return None
+    normalized_detail = " ".join(str(detail or "unknown decoder error").split())
+    return f"nvh264dec decoder-health error: {normalized_detail}"
+
+
+def _gstreamer_message_source_name(message: object) -> str:
+    source = getattr(message, "src", None)
+    getter = getattr(source, "get_name", None)
+    if callable(getter):
+        try:
+            return str(getter() or "")
+        except Exception:
+            return ""
+    return str(source or "")
+
+
+def _requested_decoder_mode(config: dict[str, Any]) -> str:
+    return normalize_decoder_mode(
+        str(config.get("_requested_decoder_mode", config.get("decoder", DECODER_AUTO)))
+    )
+
+
 def runtime_decoder_fallback_reason(
     *,
     requested_decoder: str,
@@ -518,6 +634,7 @@ def runtime_decoder_fallback_reason(
     already_fell_back: bool,
     rtp_recovery_pending: bool = False,
     last_recovery_s: float | None = None,
+    encoded_input_active: bool = True,
 ) -> str | None:
     if normalize_decoder_mode(requested_decoder) != DECODER_AUTO:
         return None
@@ -531,6 +648,7 @@ def runtime_decoder_fallback_reason(
         already_fell_back=already_fell_back,
         rtp_recovery_pending=rtp_recovery_pending,
         last_recovery_s=last_recovery_s,
+        encoded_input_active=encoded_input_active,
     )
 
 
@@ -543,10 +661,15 @@ def nvidia_decoder_health_failure_reason(
     already_fell_back: bool,
     rtp_recovery_pending: bool = False,
     last_recovery_s: float | None = None,
+    encoded_input_active: bool = True,
 ) -> str | None:
     if rtp_recovery_pending:
         return None
-    if already_fell_back or active_decoder != NVIDIA_H264_DECODER:
+    if (
+        already_fell_back
+        or active_decoder != NVIDIA_H264_DECODER
+        or not encoded_input_active
+    ):
         return None
     if last_recovery_s is not None and (
         last_frame_s is None or float(last_recovery_s) > float(last_frame_s)
@@ -568,6 +691,54 @@ def format_rtp_sequence_discontinuity(discontinuity: "RtpSequenceDiscontinuity")
         f"seq={discontinuity.previous_sequence}->{discontinuity.sequence}, "
         f"missing={discontinuity.missing_packets}"
     )
+
+
+def h264_byte_stream_nal_unit_types(
+    access_unit: bytes | bytearray | memoryview,
+) -> tuple[int, ...]:
+    """Return NAL types from a normalized Annex-B H.264 access unit.
+
+    The live pipeline forces ``h264parse`` to emit byte-stream/alignment=au,
+    so start codes are an independent boundary for inspecting NAL headers.
+    Payload bytes are never searched as candidate headers: H.264 byte-stream
+    emulation prevention guarantees that a real ``00 00 01`` begins a NAL.
+    Malformed or non-Annex-B input therefore returns no types and fails closed.
+    """
+
+    try:
+        data = (
+            access_unit
+            if isinstance(access_unit, (bytes, bytearray))
+            else memoryview(access_unit).cast("B").tobytes()
+        )
+    except (TypeError, ValueError):
+        return ()
+    nal_types: list[int] = []
+    cursor = 0
+    while True:
+        # Searching for the three-byte suffix also finds a four-byte start
+        # code at its second zero. bytes.find() keeps this inspection in C;
+        # the Python camera thread does not walk multi-megabyte slice payloads.
+        start_index = data.find(b"\x00\x00\x01", cursor)
+        if start_index < 0:
+            break
+        header_index = start_index + 3
+        if header_index >= len(data):
+            break
+        header = int(data[header_index])
+        nal_type = header & 0x1F
+        if not (header & 0x80) and not (
+            nal_type == H264_NAL_TYPE_IDR and not (header & 0x60)
+        ):
+            nal_types.append(nal_type)
+        cursor = header_index + 1
+    return tuple(nal_types)
+
+
+def h264_access_unit_has_idr(access_unit: bytes | bytearray | memoryview) -> bool:
+    """Prove that an AU contains an H.264 IDR slice (NAL unit type 5)."""
+
+    return H264_NAL_TYPE_IDR in h264_byte_stream_nal_unit_types(access_unit)
 
 
 def should_suppress_decoded_output(*, active_decoder: str, rtp_discontinuity_latched: bool) -> bool:
@@ -595,8 +766,13 @@ def recording_integrity_contract(backend: str | None) -> dict[str, str | bool]:
     if normalized_backend == STREAM_BACKEND_GSTREAMER:
         return {
             "recording_encoding_mode": RECORDING_ENCODING_H264_COPY_GATED,
-            "recording_integrity_verified": True,
-            "recording_integrity_scope": "rtp-sequence+h264-access-unit",
+            # This is a requirement, not a pre-finalization success claim.
+            # Per-file validation overrides it only after the finalized bytes
+            # pass IDR/frame_num, decoded-count, and MP4 timing checks.
+            "recording_integrity_verified": False,
+            "recording_integrity_scope": (
+                "finalized-mp4:h264-idr+frame-num+decode-count+sample-timing"
+            ),
         }
     return {
         "recording_encoding_mode": RECORDING_ENCODING_DECODED_REENCODE_UNVERIFIED,
@@ -1070,6 +1246,8 @@ class GstRtpTimingTracker:
         self._pts_order: deque[int] = deque(maxlen=MAX_RTP_TIMING_CACHE)
         self._active_rtp_ssrc: int | None = None
         self._last_rtp_sequence: int | None = None
+        self._rtp_packet_count = 0
+        self._last_rtp_packet_monotonic_s: float | None = None
         self._rtp_discontinuities: deque[RtpSequenceDiscontinuity] = deque(
             maxlen=MAX_RTP_DISCONTINUITY_CACHE
         )
@@ -1079,14 +1257,19 @@ class GstRtpTimingTracker:
         self._h264_access_unit_discontinuities: deque[H264AccessUnitDiscontinuity] = deque(
             maxlen=MAX_RTP_DISCONTINUITY_CACHE
         )
-        self._decoded_output_blocked = False
-        self._encoded_output_blocked = False
+        # A newly attached decoder can start in the middle of a dependency
+        # chain. Treat startup exactly like post-loss recovery: no compressed
+        # or decoded output is trusted until a parser-normalized IDR AU enters
+        # the decoder and that exact PTS returns from it.
+        self._decoded_output_blocked = True
+        self._encoded_output_blocked = True
         self._blocked_after_pts_ns: int | None = None
-        self._blocked_since_monotonic_s: float | None = None
+        self._blocked_since_monotonic_s: float | None = time.monotonic()
         self._recovery_candidate_pts_ns: int | None = None
         self._recovery_candidate_observed_s: float | None = None
         self._encoded_recovery_marker_pts_ns: int | None = None
         self._accepted_access_unit_seen = False
+        self._access_unit_discontinuity_reported = False
         self._sr_by_ssrc: dict[int, RtcpSenderReportTiming] = {}
         self._sr_count_by_ssrc: dict[int, int] = {}
         self._clock_rate_samples_by_ssrc: dict[int, deque[dict[str, float]]] = {}
@@ -1117,9 +1300,28 @@ class GstRtpTimingTracker:
         observed_s = time.monotonic() if observed_monotonic_s is None else float(observed_monotonic_s)
         normalized_pts_ns = None if rtp_pts_ns is None else int(rtp_pts_ns)
         with self._lock:
+            self._rtp_packet_count += 1
+            self._last_rtp_packet_monotonic_s = observed_s
             if self._active_rtp_ssrc != normalized_ssrc:
+                previous_ssrc = self._active_rtp_ssrc
                 self._active_rtp_ssrc = normalized_ssrc
                 self._last_rtp_sequence = normalized_sequence
+                if previous_ssrc is not None:
+                    self._h264_access_unit_discontinuities.append(
+                        H264AccessUnitDiscontinuity(
+                            reason="ssrc-change",
+                            pts_ns=normalized_pts_ns,
+                            observed_monotonic_s=observed_s,
+                        )
+                    )
+                    self._access_unit_discontinuity_reported = True
+                    # A new SSRC owns a new RTP timestamp domain. Do not carry
+                    # the prior stream's high PTS threshold into its recovery.
+                    self._blocked_after_pts_ns = None
+                    self._latch_compressed_discontinuity_locked(
+                        observed_s=observed_s,
+                        pts_ns=normalized_pts_ns,
+                    )
                 self._clear_frame_timing_locked()
                 return None
             previous = self._last_rtp_sequence
@@ -1143,14 +1345,31 @@ class GstRtpTimingTracker:
                 rtp_pts_ns=normalized_pts_ns,
             )
             self._rtp_discontinuities.append(discontinuity)
-            # Popping the status event must not release this latch.  Only a
-            # clean parser AU followed by the matching decoded PTS can do so.
+            # Popping the status event must not release this latch. Only a
+            # parser-proven IDR followed by that exact decoded PTS can do so.
             self._latch_compressed_discontinuity_locked(
                 observed_s=observed_s,
                 pts_ns=normalized_pts_ns,
             )
             self._clear_frame_timing_locked()
             return discontinuity
+
+    def has_recent_rtp_input(
+        self,
+        *,
+        now_s: float | None = None,
+        max_age_s: float = 2.0,
+    ) -> bool:
+        """True only when the compressed-input boundary is still receiving RTP."""
+
+        observed_s = time.monotonic() if now_s is None else float(now_s)
+        with self._lock:
+            last_s = self._last_rtp_packet_monotonic_s
+            return bool(
+                self._rtp_packet_count > 0
+                and last_s is not None
+                and observed_s - last_s <= max(0.0, float(max_age_s))
+            )
 
     def pop_rtp_discontinuity(self) -> RtpSequenceDiscontinuity | None:
         with self._lock:
@@ -1161,6 +1380,10 @@ class GstRtpTimingTracker:
     def decoded_output_blocked(self) -> bool:
         with self._lock:
             return self._decoded_output_blocked
+
+    def encoded_output_blocked(self) -> bool:
+        with self._lock:
+            return self._encoded_output_blocked
 
     def blocked_duration_s(self, *, now_s: float | None = None) -> float:
         observed_s = time.monotonic() if now_s is None else float(now_s)
@@ -1195,12 +1418,19 @@ class GstRtpTimingTracker:
         pts_ns: int | None,
         is_delta: bool,
         is_corrupted: bool,
+        is_random_access: bool,
         observed_s: float,
     ) -> bool:
-        if not self._decoded_output_blocked or is_delta or is_corrupted or pts_ns is None:
+        _ = is_delta
+        if (
+            not self._decoded_output_blocked
+            or not is_random_access
+            or is_corrupted
+            or pts_ns is None
+        ):
             return False
         # The AU containing the missing RTP packet is itself suspect even when
-        # the parser labels it non-delta.  Recovery must be a later clean AU.
+        # it contains an IDR. Recovery must be a later, complete IDR AU.
         if self._blocked_after_pts_ns is not None and pts_ns <= self._blocked_after_pts_ns:
             return False
         self._recovery_candidate_pts_ns = int(pts_ns)
@@ -1215,6 +1445,7 @@ class GstRtpTimingTracker:
         pts_ns: int | None,
         is_delta: bool,
         is_corrupted: bool,
+        is_random_access: bool = False,
         observed_monotonic_s: float | None = None,
     ) -> bool:
         observed_s = time.monotonic() if observed_monotonic_s is None else float(observed_monotonic_s)
@@ -1224,6 +1455,7 @@ class GstRtpTimingTracker:
                 pts_ns=normalized_pts_ns,
                 is_delta=bool(is_delta),
                 is_corrupted=bool(is_corrupted),
+                is_random_access=bool(is_random_access),
                 observed_s=observed_s,
             )
 
@@ -1234,6 +1466,7 @@ class GstRtpTimingTracker:
         is_delta: bool,
         is_corrupted: bool,
         is_discontinuous: bool,
+        is_random_access: bool = False,
         observed_monotonic_s: float | None = None,
     ) -> bool:
         """Keep an invalid AU and every dependent AU out of all consumers."""
@@ -1241,22 +1474,26 @@ class GstRtpTimingTracker:
         observed_s = time.monotonic() if observed_monotonic_s is None else float(observed_monotonic_s)
         normalized_pts_ns = None if pts_ns is None else int(pts_ns)
         with self._lock:
-            # GstBaseParse marks the first otherwise valid buffer DISCONT at a
-            # normal stream/segment start.  Treating that marker as packet loss
-            # drops the only startup reference AU and can hold WIRIS blank for
-            # an entire long GOP. RTP forward gaps and CORRUPTED remain strict.
+            # GstBaseParse marks the first valid IDR DISCONT at a normal stream
+            # or segment start. An explicitly parsed IDR is a safe reset for
+            # that marker; DISCONT on every other accepted chain remains strict.
             reason = (
                 "missing-pts"
                 if normalized_pts_ns is None
                 else "corrupted"
                 if is_corrupted
                 else "discont"
-                if is_discontinuous and self._accepted_access_unit_seen
+                if (
+                    is_discontinuous
+                    and self._accepted_access_unit_seen
+                    and not is_random_access
+                )
                 else None
             )
             if reason is not None:
                 is_new_event = (
-                    not self._encoded_output_blocked
+                    not self._access_unit_discontinuity_reported
+                    or not self._encoded_output_blocked
                     or self._recovery_candidate_pts_ns is not None
                 )
                 if is_new_event:
@@ -1267,6 +1504,7 @@ class GstRtpTimingTracker:
                             observed_monotonic_s=observed_s,
                         )
                     )
+                    self._access_unit_discontinuity_reported = True
                 self._latch_compressed_discontinuity_locked(
                     observed_s=observed_s,
                     pts_ns=normalized_pts_ns,
@@ -1279,6 +1517,7 @@ class GstRtpTimingTracker:
                 pts_ns=normalized_pts_ns,
                 is_delta=bool(is_delta),
                 is_corrupted=bool(is_corrupted),
+                is_random_access=bool(is_random_access),
                 observed_s=observed_s,
             ):
                 self._accepted_access_unit_seen = True
@@ -1311,7 +1550,7 @@ class GstRtpTimingTracker:
             if (
                 resume_pts_ns is None
                 or normalized_pts_ns is None
-                or normalized_pts_ns < resume_pts_ns
+                or normalized_pts_ns != resume_pts_ns
             ):
                 return True
             observed_s = self._recovery_candidate_observed_s or time.monotonic()
@@ -1331,6 +1570,7 @@ class GstRtpTimingTracker:
             self._recovery_candidate_pts_ns = None
             self._recovery_candidate_observed_s = None
             self._encoded_recovery_marker_pts_ns = None
+            self._access_unit_discontinuity_reported = False
             return False
 
     def pop_rtp_recovery(self) -> RtpSequenceRecovery | None:
@@ -1604,11 +1844,28 @@ class GstRtpTimingTracker:
             return self.Gst.PadProbeReturn.OK
         flags = buffer.get_flags()
         pts_ns = None if buffer.pts == self.Gst.CLOCK_TIME_NONE else int(buffer.pts)
+        is_random_access = False
+        map_info = None
+        if self.encoded_output_blocked() or bool(flags & self.Gst.BufferFlags.DISCONT):
+            try:
+                mapped, map_info = buffer.map(self.Gst.MapFlags.READ)
+                if mapped:
+                    is_random_access = h264_access_unit_has_idr(map_info.data)
+            except Exception:
+                # A boundary that cannot be inspected is not safe to recover on.
+                is_random_access = False
+            finally:
+                if map_info is not None:
+                    try:
+                        buffer.unmap(map_info)
+                    except Exception:
+                        pass
         should_drop = self.should_drop_encoded_access_unit(
             pts_ns=pts_ns,
             is_delta=bool(flags & self.Gst.BufferFlags.DELTA_UNIT),
             is_corrupted=bool(flags & self.Gst.BufferFlags.CORRUPTED),
             is_discontinuous=bool(flags & self.Gst.BufferFlags.DISCONT),
+            is_random_access=is_random_access,
         )
         if should_drop:
             return self.Gst.PadProbeReturn.DROP
@@ -1782,7 +2039,7 @@ def build_gst_pipeline_text(
     # consumed them. Only decoded raw frames may be dropped as stale.
     h264parse_element = (
         "h264parse config-interval=-1 disable-passthrough=true name=parse "
-        "! video/x-h264,alignment=au"
+        "! video/x-h264,stream-format=byte-stream,alignment=au"
     )
     encoded_queue = (
         "queue "
@@ -1874,8 +2131,15 @@ def _launch_gst_pipeline(
                 rtp_timing_tracker.attach(pipeline)
             state_result = pipeline.set_state(Gst.State.PLAYING)
             if state_result == Gst.StateChangeReturn.FAILURE:
-                raise RuntimeError(f"{decoder} failed to enter PLAYING state")
-            _emit_status(output_queue, f"GStreamer 디코더: {decoder}")
+                # PLAYING failure alone does not identify the failing element.
+                # Do not label it as a decoder fault and hide an RTSP/filesink
+                # failure behind an unnecessary CPU retry.
+                raise RuntimeError("pipeline failed to enter PLAYING state")
+            _emit_status(
+                output_queue,
+                f"GStreamer decoder candidate: {decoder} "
+                "(PLAYING requested; current-generation frame pending)",
+            )
             if record_video_path:
                 _emit_status(output_queue, f"GStreamer H264 원본 녹화 시작: {record_video_path}")
             return pipeline, sink, bus, decoder
@@ -1883,8 +2147,27 @@ def _launch_gst_pipeline(
             last_error = f"{decoder}: {exc}"
             if pipeline is not None:
                 pipeline.set_state(Gst.State.NULL)
-            if normalize_decoder_mode(decoder_mode) == DECODER_AUTO and decoder == NVIDIA_H264_DECODER:
-                _emit_status(output_queue, f"NVIDIA 디코더 사용 불가, software로 재시도: {exc}")
+            error_class = classify_gstreamer_error(
+                source_name="",
+                detail=exc,
+                active_decoder=decoder,
+            )
+            fallback_reason = gstreamer_error_fallback_reason(
+                requested_decoder=decoder_mode,
+                active_decoder=decoder,
+                already_fell_back=False,
+                error_class=error_class,
+                detail=exc,
+            )
+            if fallback_reason is not None:
+                _emit_decoder_fallback(
+                    output_queue,
+                    reason=(
+                        f"{fallback_reason}; software candidate pending "
+                        "current-generation frame"
+                    ),
+                    recording_restart_required=False,
+                )
                 continue
             break
     raise RuntimeError(last_error or "no usable decoder")
@@ -1902,8 +2185,25 @@ def _finalize_gst_recording(
     if not record_video_path:
         return True
     finalization_config = config or {}
+    live_integrity_terminal_failure = bool(
+        finalization_config.get("_integrity_manual_reconnect_required", False)
+    )
 
-    def finish(success: bool, detail: str) -> bool:
+    def finish(
+        success: bool,
+        detail: str,
+        *,
+        container_success: bool = False,
+        validation: dict[str, Any] | None = None,
+    ) -> bool:
+        integrity = dict(validation or {})
+        if not integrity:
+            integrity = {
+                "integrity_validation_status": "NOT_RUN",
+                "integrity_failure_reasons": ["container_finalization_failed"],
+                "recording_usable": False,
+                "recording_integrity_verified": False,
+            }
         _emit_recording_finalized(
             output_queue,
             path=record_video_path,
@@ -1912,6 +2212,12 @@ def _finalize_gst_recording(
             detail=detail,
             contract=recording_integrity_contract(STREAM_BACKEND_GSTREAMER),
             metrics={
+                "container_finalization_success": bool(container_success),
+                "integrity_terminal_failure": (
+                    "H264_IDR_RANDOM_ACCESS_UNAVAILABLE"
+                    if live_integrity_terminal_failure
+                    else ""
+                ),
                 "integrity_gap_events": int(
                     finalization_config.get("_integrity_gap_events", 0) or 0
                 ),
@@ -1922,6 +2228,7 @@ def _finalize_gst_recording(
                     finalization_config.get("_integrity_suppressed_decoded_frames", 0)
                     or 0
                 ),
+                **integrity,
             },
         )
         return success
@@ -1944,8 +2251,115 @@ def _finalize_gst_recording(
                 _emit_status(output_queue, f"GStreamer 녹화 종료 오류: {detail}")
                 return finish(False, f"EOS bus error: {detail}")
             if message.type == Gst.MessageType.EOS:
-                _emit_status(output_queue, f"GStreamer H264 원본 녹화 저장 완료: {record_video_path}")
-                return finish(True, "EOS received; mp4mux finalized")
+                _emit_status(
+                    output_queue,
+                    f"GStreamer H264 원본 녹화 mux 저장 완료; "
+                    f"최종 MP4 무결성 검증 중: {record_video_path}",
+                )
+                validator = finalization_config.get("_recording_integrity_validator")
+                if callable(validator):
+                    try:
+                        validation = dict(validator(record_video_path))
+                    except Exception as exc:
+                        validation = {
+                            "integrity_validation_status": "FAIL",
+                            "integrity_failure_reasons": [
+                                f"integrity_validator_exception:{type(exc).__name__}"
+                            ],
+                            "recording_usable": False,
+                            "recording_integrity_verified": False,
+                        }
+                else:
+                    # Full decode/header/timing validation is intentionally not
+                    # run inside the camera child. EOS already consumes up to
+                    # nine seconds of its twelve-second cooperative stop budget;
+                    # the package worker validates the immutable bytes later.
+                    validation = {
+                        "integrity_schema": H264_MP4_INTEGRITY_SCHEMA,
+                        "integrity_validation_status": "PENDING",
+                        "integrity_failure_reasons": [
+                            "finalized_mp4_package_validation_pending"
+                        ],
+                        "recording_usable": False,
+                        "recording_integrity_verified": False,
+                    }
+
+                live_failures: list[str] = []
+                if live_integrity_terminal_failure:
+                    live_failures.append("live_h264_idr_random_access_unavailable")
+                if int(finalization_config.get("_integrity_gap_events", 0) or 0) > 0:
+                    live_failures.append("live_rtp_sequence_gap_detected")
+                if int(finalization_config.get("_integrity_missing_packets", 0) or 0) > 0:
+                    live_failures.append("live_rtp_missing_packet_detected")
+                if int(
+                    finalization_config.get("_integrity_suppressed_decoded_frames", 0)
+                    or 0
+                ) > 0:
+                    live_failures.append("live_decoder_frame_suppression_detected")
+                if live_failures:
+                    validation["integrity_failure_reasons"] = list(
+                        dict.fromkeys(
+                            [
+                                *tuple(validation.get("integrity_failure_reasons", ()) or ()),
+                                *live_failures,
+                            ]
+                        )
+                    )
+                    validation.update(
+                        integrity_validation_status="FAIL",
+                        recording_usable=False,
+                        recording_integrity_verified=False,
+                    )
+
+                usable = bool(
+                    validation.get("integrity_schema") == H264_MP4_INTEGRITY_SCHEMA
+                    and validation.get("integrity_validation_status") == "PASS"
+                    and validation.get("recording_usable") is True
+                    and validation.get("recording_integrity_verified") is True
+                )
+                if not usable:
+                    validation_failures = list(
+                        validation.get("integrity_failure_reasons", ()) or ()
+                    )
+                    if validation.get("integrity_schema") != H264_MP4_INTEGRITY_SCHEMA:
+                        validation_failures.append("integrity_validation_schema_invalid")
+                    if not validation_failures:
+                        validation_failures.append("integrity_validation_incomplete")
+                    validation.update(
+                        integrity_validation_status="FAIL",
+                        integrity_failure_reasons=list(
+                            dict.fromkeys(validation_failures)
+                        ),
+                        recording_usable=False,
+                        recording_integrity_verified=False,
+                    )
+                if usable:
+                    detail = "EOS received; mp4mux finalized; MP4 integrity PASS"
+                    _emit_status(
+                        output_queue,
+                        f"GStreamer H264 원본 녹화 무결성 PASS: {record_video_path}",
+                    )
+                else:
+                    reasons = ",".join(
+                        str(item)
+                        for item in tuple(
+                            validation.get("integrity_failure_reasons", ()) or ()
+                        )
+                    ) or "integrity_validation_incomplete"
+                    detail = (
+                        "EOS received; mp4mux finalized; MP4 integrity FAIL: "
+                        f"{reasons}"
+                    )
+                    _emit_status(
+                        output_queue,
+                        f"GStreamer H264 원본 녹화 무결성 FAIL: {reasons}",
+                    )
+                return finish(
+                    usable,
+                    detail,
+                    container_success=True,
+                    validation=validation,
+                )
         _emit_status(output_queue, f"GStreamer 녹화 EOS 대기 시간 초과: {record_video_path}")
         return finish(False, "EOS timeout")
     except Exception as exc:
@@ -2265,12 +2679,17 @@ def _run_gstreamer_stream_once(
             _emit_status(output_queue, f"GStreamer MP4 저장 경로 준비 실패: {exc}")
             return False
     stream_failed = False
+    launch_decoder_mode = str(config.get("decoder", DECODER_AUTO))
+    config.setdefault(
+        "_requested_decoder_mode",
+        normalize_decoder_mode(launch_decoder_mode),
+    )
     try:
         pipeline, sink, bus, active_decoder = _launch_gst_pipeline(
             Gst,
             config["url"],
             latency_ms=int(config.get("rtsp_latency_ms", DEFAULT_RTSP_LATENCY_MS)),
-            decoder_mode=str(config.get("decoder", DECODER_AUTO)),
+            decoder_mode=launch_decoder_mode,
             transport=str(config.get("rtsp_transport", RTSP_TRANSPORT_UDP)),
             keyframe_only=keyframe_only,
             record_video_path=record_video_path,
@@ -2280,6 +2699,15 @@ def _run_gstreamer_stream_once(
     except Exception as exc:
         _emit_status(output_queue, f"GStreamer 오류: {exc}")
         return False
+    if (
+        normalize_decoder_mode(launch_decoder_mode) == DECODER_AUTO
+        and active_decoder == SOFTWARE_H264_DECODER
+    ):
+        # _launch_gst_pipeline authorizes this only for a classified NVDEC
+        # launch failure. Keep later reconnects on the proven per-process
+        # fallback instead of retrying NVDEC forever.
+        config["_runtime_decoder_fallback_active"] = True
+        config["decoder"] = DECODER_SOFTWARE
 
     rate_limiter = AdaptiveYoloRateLimiter.from_config(config, enable_detection=enable_detection)
     next_frame_s = 0.0
@@ -2315,12 +2743,13 @@ def _run_gstreamer_stream_once(
     reader_stop = threading.Event()
     suppressed_decoded_frames = 0
     reported_suppressed_frames = 0
+    decoder_frame_announced = False
     rtp_gap_reporter = RtpDiscontinuityReporter()
 
     def reader_loop() -> None:
         nonlocal displayed_frames, last_frame_received_s
         nonlocal latest_frame, latest_height, latest_sequence, latest_width
-        nonlocal suppressed_decoded_frames
+        nonlocal decoder_frame_announced, suppressed_decoded_frames
         while not stop_event.is_set() and not reader_stop.is_set():
             sample = sink.emit("try-pull-sample", 200_000_000)
             if sample is None:
@@ -2350,6 +2779,12 @@ def _run_gstreamer_stream_once(
                 receive_s,
                 received_wall_s=receive_wall_s,
             ) or {}
+            rtp_timing_metadata.update(
+                {
+                    "active_decoder": active_decoder,
+                    "requested_decoder": _requested_decoder_mode(config),
+                }
+            )
             success, map_info = buffer.map(Gst.MapFlags.READ)
             if not success:
                 continue
@@ -2388,6 +2823,12 @@ def _run_gstreamer_stream_once(
                 timestamp_source="gstreamer-pts",
                 extra_metadata=rtp_timing_metadata,
             )
+            if preview_emitted and not decoder_frame_announced:
+                decoder_frame_announced = True
+                _emit_status(
+                    output_queue,
+                    f"GStreamer decoder frame verified: {active_decoder}",
+                )
             with latest_lock:
                 latest_sequence += 1
                 displayed_frames += int(preview_emitted)
@@ -2410,13 +2851,13 @@ def _run_gstreamer_stream_once(
     last_rtp_recovery_s: float | None = None
     if keyframe_only:
         _emit_status(output_queue, "GStreamer I-frame only 진단 모드")
-    else:
-        recording_text = ", 단일 RTSP H264->MP4 저장" if record_video_path else ""
-        _emit_status(
-            output_queue,
-            ("GStreamer YOLO 실행 중" if enable_detection else "GStreamer 카메라 스트림 실행 중")
-            + f": HEALTHY (RTP/AU 무결성 감시{recording_text})",
-        )
+    recording_text = ", 단일 RTSP H264->MP4 저장" if record_video_path else ""
+    _emit_status(
+        output_queue,
+        "RECOVERING_INTEGRITY: H264 IDR(NAL type 5) startup boundary 대기; "
+        "IDR까지 encoded 저장 차단, exact decoded PTS까지 preview/YOLO/native 차단"
+        f"{recording_text}",
+    )
     last_processed_sequence = 0
     try:
         while not stop_event.is_set():
@@ -2430,7 +2871,8 @@ def _run_gstreamer_stream_once(
                     output_queue,
                     "RECOVERING_INTEGRITY: H264 access-unit discontinuity "
                     f"reason={h264_discontinuity.reason}, pts_ns={h264_discontinuity.pts_ns}; "
-                    "clean non-delta AU까지 preview/YOLO/저장 차단",
+                    "complete IDR까지 encoded 저장 차단, "
+                    "exact decoded PTS까지 preview/YOLO/native 차단",
                 )
             while True:
                 rtp_recovery = rtp_timing_tracker.pop_rtp_recovery()
@@ -2445,7 +2887,7 @@ def _run_gstreamer_stream_once(
                 config["_integrity_suppressed_decoded_frames"] = suppressed_decoded_frames
                 _emit_status(
                     output_queue,
-                    "HEALTHY: clean non-delta AU에서 출력 복구 "
+                    "HEALTHY: H264 IDR random-access + exact decoded PTS에서 출력 복구 "
                     f"ssrc={rtp_recovery.ssrc}, pts_ns={rtp_recovery.resume_pts_ns}, "
                     f"blocked={rtp_recovery.blocked_duration_s:.3f}s, "
                     f"suppressed={newly_suppressed_frames}",
@@ -2461,7 +2903,8 @@ def _run_gstreamer_stream_once(
                     _emit_status(
                         output_queue,
                         f"RECOVERING_INTEGRITY: {format_rtp_sequence_discontinuity(rtp_discontinuity)}; "
-                        "clean non-delta AU까지 preview/YOLO/저장 차단",
+                        "complete IDR까지 encoded 저장 차단, "
+                        "exact decoded PTS까지 preview/YOLO/native 차단",
                     )
                 summary = rtp_gap_reporter.observe(rtp_discontinuity, now_s=now_s)
                 config["_integrity_gap_events"] = rtp_gap_reporter.total_events
@@ -2474,43 +2917,61 @@ def _run_gstreamer_stream_once(
                     error, debug = message.parse_error()
                     detail = error.message if debug is None else f"{error.message} ({debug})"
                     stream_failed = True
-                    fallback_reason = runtime_decoder_fallback_reason(
-                        requested_decoder=str(config.get("decoder", DECODER_AUTO)),
+                    source_name = _gstreamer_message_source_name(message)
+                    error_class = classify_gstreamer_error(
+                        source_name=source_name,
+                        detail=detail,
                         active_decoder=active_decoder,
-                        started_s=stream_started_s,
-                        last_frame_s=last_frame_received_s,
-                        now_s=time.monotonic()
-                        + DECODER_FALLBACK_FIRST_FRAME_TIMEOUT_S,
+                    )
+                    fallback_reason = gstreamer_error_fallback_reason(
+                        requested_decoder=_requested_decoder_mode(config),
+                        active_decoder=active_decoder,
                         already_fell_back=bool(config.get("_runtime_decoder_fallback_active")),
-                        rtp_recovery_pending=rtp_timing_tracker.decoded_output_blocked(),
-                        last_recovery_s=last_rtp_recovery_s,
+                        error_class=error_class,
+                        detail=detail,
                     )
                     if fallback_reason is not None:
-                        config["_runtime_decoder_fallback_reason"] = (
-                            f"{fallback_reason}; bus error={detail}"
+                        config["_runtime_decoder_fallback_reason"] = fallback_reason
+                        _emit_status(
+                            output_queue,
+                            "NVIDIA decoder-health failure: "
+                            f"source={source_name or '--'}; {detail}",
                         )
-                    else:
-                        strict_reason = nvidia_decoder_health_failure_reason(
-                            active_decoder=active_decoder,
-                            started_s=stream_started_s,
-                            last_frame_s=last_frame_received_s,
-                            now_s=time.monotonic() + DECODER_FALLBACK_FIRST_FRAME_TIMEOUT_S,
-                            already_fell_back=False,
-                            rtp_recovery_pending=rtp_timing_tracker.decoded_output_blocked(),
-                            last_recovery_s=last_rtp_recovery_s,
-                        )
+                    elif error_class == GST_ERROR_DECODER_HEALTH:
+                        config["_decoder_manual_restart_required"] = True
                         if (
-                            normalize_decoder_mode(str(config.get("decoder", DECODER_AUTO)))
-                            == DECODER_NVIDIA
-                            and strict_reason is not None
+                            _requested_decoder_mode(config) == DECODER_NVIDIA
+                            and active_decoder == NVIDIA_H264_DECODER
                         ):
                             _emit_status(
                                 output_queue,
-                                f"NVIDIA 디코더 오류: {strict_reason}; software fallback 금지, Auto로 변경하세요. "
-                                f"bus error={detail}",
+                                "NVIDIA 디코더 오류: decoder-health failure; "
+                                "software fallback 금지, Auto로 변경하세요. "
+                                f"source={source_name or '--'}; {detail}",
                             )
                         else:
-                            _emit_status(output_queue, f"스트림 오류: {detail}")
+                            _emit_status(
+                                output_queue,
+                                "디코더 오류: decoder-health failure; "
+                                f"source={source_name or '--'}; {detail}",
+                            )
+                    elif error_class == GST_ERROR_RTSP_SOURCE:
+                        _emit_status(
+                            output_queue,
+                            f"RTSP/source 오류: source={source_name or '--'}; {detail}",
+                        )
+                    elif error_class == GST_ERROR_RECORDING_OUTPUT:
+                        config["_recording_output_failure"] = detail
+                        _emit_status(
+                            output_queue,
+                            "MP4 mux/filesink 오류: "
+                            f"source={source_name or '--'}; {detail}",
+                        )
+                    else:
+                        _emit_status(
+                            output_queue,
+                            f"GStreamer pipeline 오류: source={source_name or '--'}; {detail}",
+                        )
                 else:
                     stream_failed = True
                     _emit_status(output_queue, "스트림 종료")
@@ -2529,8 +2990,9 @@ def _run_gstreamer_stream_once(
                 _emit_status(
                     output_queue,
                     "INTEGRITY_RECOVERY_TIMEOUT: "
-                    f"{integrity_blocked_s:.1f}s 동안 clean non-delta AU 없음; "
-                    "MP4를 마무리하고 자동 재연결하지 않습니다. 수동 재연결이 필요합니다.",
+                    f"{integrity_blocked_s:.1f}s 동안 verified H264 IDR + exact decoded PTS 없음; "
+                    "이 side를 unavailable로 종료하고 자동 재연결하지 않습니다. "
+                    "카메라가 IDR을 송출한 뒤 수동 재연결이 필요합니다.",
                 )
                 break
             with latest_lock:
@@ -2538,8 +3000,15 @@ def _run_gstreamer_stream_once(
             frame_age_s = now_s - (
                 stream_started_s if last_receive_s is None else last_receive_s
             )
+            recent_input = getattr(rtp_timing_tracker, "has_recent_rtp_input", None)
+            try:
+                encoded_input_active = bool(
+                    recent_input(now_s=now_s, max_age_s=2.0)
+                ) if callable(recent_input) else False
+            except (TypeError, ValueError):
+                encoded_input_active = False
             fallback_reason = runtime_decoder_fallback_reason(
-                requested_decoder=str(config.get("decoder", DECODER_AUTO)),
+                requested_decoder=_requested_decoder_mode(config),
                 active_decoder=active_decoder,
                 started_s=stream_started_s,
                 last_frame_s=last_receive_s,
@@ -2547,12 +3016,13 @@ def _run_gstreamer_stream_once(
                 already_fell_back=bool(config.get("_runtime_decoder_fallback_active")),
                 rtp_recovery_pending=integrity_recovery_pending,
                 last_recovery_s=last_rtp_recovery_s,
+                encoded_input_active=encoded_input_active,
             )
             if fallback_reason is not None:
                 stream_failed = True
                 config["_runtime_decoder_fallback_reason"] = fallback_reason
                 break
-            if normalize_decoder_mode(str(config.get("decoder", DECODER_AUTO))) == DECODER_NVIDIA:
+            if _requested_decoder_mode(config) == DECODER_NVIDIA:
                 strict_reason = nvidia_decoder_health_failure_reason(
                     active_decoder=active_decoder,
                     started_s=stream_started_s,
@@ -2561,9 +3031,11 @@ def _run_gstreamer_stream_once(
                     already_fell_back=False,
                     rtp_recovery_pending=integrity_recovery_pending,
                     last_recovery_s=last_rtp_recovery_s,
+                    encoded_input_active=encoded_input_active,
                 )
                 if strict_reason is not None:
                     stream_failed = True
+                    config["_decoder_manual_restart_required"] = True
                     _emit_status(
                         output_queue,
                         f"NVIDIA 디코더 오류: {strict_reason}; software fallback 금지, Auto로 변경하세요.",
@@ -2609,7 +3081,7 @@ def _run_gstreamer_stream_once(
                     if integrity_recovery_pending:
                         _emit_status(
                             output_queue,
-                            "RECOVERING_INTEGRITY: clean non-delta AU 대기 중 "
+                            "RECOVERING_INTEGRITY: H264 IDR + exact decoded PTS 대기 중 "
                             f"({integrity_blocked_s:.1f}/{integrity_recovery_timeout_s:.0f}s)",
                         )
                     else:
@@ -2688,6 +3160,10 @@ def _run_gstreamer_stream_once(
 def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2, model, enable_detection: bool) -> None:
     """Run GStreamer with one explicit owner for any reconnect policy."""
 
+    config.setdefault(
+        "_requested_decoder_mode",
+        normalize_decoder_mode(str(config.get("decoder", DECODER_AUTO))),
+    )
     reconnect_policy = normalize_rtsp_reconnect_policy(
         str(config.get("rtsp_reconnect_policy", RTSP_RECONNECT_AUTOMATIC))
     )
@@ -2704,15 +3180,45 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
             config.pop("_integrity_manual_reconnect_required", False)
         )
         if integrity_manual_reconnect and not stop_event.is_set():
+            _emit_terminal_exit(
+                output_queue,
+                "H264 IDR random-access recovery unavailable; manual reconnect required",
+            )
+            return
+        recording_failure = config.pop("_recording_output_failure", None)
+        if recording_failure and not stop_event.is_set():
+            _emit_status(
+                output_queue,
+                "MP4 mux/filesink failure: recording side stopped; "
+                "decoder fallback/reconnect disabled",
+            )
+            _emit_terminal_exit(output_queue, "MP4 mux/filesink failure")
+            return
+        if bool(config.pop("_decoder_manual_restart_required", False)):
+            _emit_terminal_exit(output_queue, "decoder-health failure requires manual restart")
             return
         fallback_reason = config.pop("_runtime_decoder_fallback_reason", None)
         if fallback_reason and not stop_event.is_set():
             config["_runtime_decoder_fallback_active"] = True
             config["decoder"] = DECODER_SOFTWARE
             if _record_video_path(config):
-                _emit_status(output_queue, f"{DECODER_FALLBACK_STATUS_PREFIX} {fallback_reason}")
+                _emit_decoder_fallback(
+                    output_queue,
+                    reason=(
+                        f"{fallback_reason}; this side MP4 finalized; "
+                        "software override applies on next side start"
+                    ),
+                    recording_restart_required=True,
+                )
                 return
-            _emit_status(output_queue, f"decoder fallback: {fallback_reason}; avdec_h264로 재시작")
+            _emit_decoder_fallback(
+                output_queue,
+                reason=(
+                    f"{fallback_reason}; preview-only avdec_h264 restart; "
+                    "current-generation frame pending"
+                ),
+                recording_restart_required=False,
+            )
             _run_gstreamer_stream_once(config, output_queue, stop_event, cv2, model, enable_detection)
             return
         if not recovered and not stop_event.is_set():
@@ -2733,17 +3239,48 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
         if bool(config.pop("_integrity_manual_reconnect_required", False)):
             _emit_status(
                 output_queue,
-                "RTP/AU 무결성 복구 실패: 자동 재연결 안 함; 수동 재연결이 필요합니다.",
+                "H264 IDR random-access 복구 실패: 이 side unavailable; "
+                "자동 재연결 안 함; 수동 재연결이 필요합니다.",
             )
+            _emit_terminal_exit(
+                output_queue,
+                "H264 IDR random-access recovery unavailable; manual reconnect required",
+            )
+            return
+        recording_failure = config.pop("_recording_output_failure", None)
+        if recording_failure:
+            _emit_status(
+                output_queue,
+                "MP4 mux/filesink failure: recording side stopped; "
+                "decoder fallback/reconnect disabled",
+            )
+            _emit_terminal_exit(output_queue, "MP4 mux/filesink failure")
+            return
+        if bool(config.pop("_decoder_manual_restart_required", False)):
+            _emit_terminal_exit(output_queue, "decoder-health failure requires manual restart")
             return
         fallback_reason = config.pop("_runtime_decoder_fallback_reason", None)
         if fallback_reason:
             config["_runtime_decoder_fallback_active"] = True
             config["decoder"] = DECODER_SOFTWARE
             if _record_video_path(config):
-                _emit_status(output_queue, f"{DECODER_FALLBACK_STATUS_PREFIX} {fallback_reason}")
+                _emit_decoder_fallback(
+                    output_queue,
+                    reason=(
+                        f"{fallback_reason}; this side MP4 finalized; "
+                        "software override applies on next side start"
+                    ),
+                    recording_restart_required=True,
+                )
                 return
-            _emit_status(output_queue, f"decoder fallback: {fallback_reason}; avdec_h264로 재시작")
+            _emit_decoder_fallback(
+                output_queue,
+                reason=(
+                    f"{fallback_reason}; preview-only avdec_h264 restart; "
+                    "current-generation frame pending"
+                ),
+                recording_restart_required=False,
+            )
             continue
         if bool(config.pop("_gst_last_run_received_frame", False)):
             consecutive_failures = 0
@@ -3202,7 +3739,14 @@ class CameraIpcCounters:
 
 class _BoundedProcessOutputQueue:
     METADATA_KINDS = frozenset({"detection", "stats"})
-    CRITICAL_CONTROL_KINDS = frozenset({"fatal_error", "recording_finalized"})
+    CRITICAL_CONTROL_KINDS = frozenset(
+        {
+            "decoder_fallback",
+            "fatal_error",
+            "recording_finalized",
+            "terminal_exit",
+        }
+    )
 
     def __init__(
         self,
@@ -3418,6 +3962,7 @@ class YoloStreamWorker(QtCore.QObject):
         self._stop_requested = False
         self._stop_requested_monotonic_s: float | None = None
         self._finished = False
+        self._child_terminal_exit_reason = ""
 
     @QtCore.pyqtSlot()
     def run(self) -> None:
@@ -3426,6 +3971,7 @@ class YoloStreamWorker(QtCore.QObject):
         self._stop_requested = False
         self._stop_requested_monotonic_s = None
         self._finished = False
+        self._child_terminal_exit_reason = ""
         consecutive_crashes = 0
         try:
             while not self._stop_requested:
@@ -3469,8 +4015,21 @@ class YoloStreamWorker(QtCore.QObject):
 
                 exitcode = getattr(process, "exitcode", None)
                 runtime_s = max(0.0, time.monotonic() - process_started_s)
-                self._stop_child_process()
+                child_stopped = self._stop_child_process()
+                if not child_stopped:
+                    self.status_changed.emit(
+                        "스트림 자식 프로세스 종료 확인 실패; "
+                        "재시작하지 않고 종료 검증을 대기합니다."
+                    )
+                    self._stop_requested = True
+                    break
                 if self._stop_requested:
+                    break
+                if self._child_terminal_exit_reason:
+                    self.status_changed.emit(
+                        "스트림 프로세스 영구 종료: "
+                        f"{self._child_terminal_exit_reason}; 자동 재시작 안 함"
+                    )
                     break
                 if (
                     self.config["rtsp_reconnect_policy"]
@@ -3502,8 +4061,8 @@ class YoloStreamWorker(QtCore.QObject):
                 while not self._stop_requested and time.monotonic() < retry_at_s:
                     time.sleep(min(0.05, max(0.0, retry_at_s - time.monotonic())))
         finally:
-            self._stop_child_process()
-            self._emit_finished_once()
+            if self._stop_child_process():
+                self._emit_finished_once()
 
     def stop(self) -> None:
         self.request_stop()
@@ -3511,6 +4070,8 @@ class YoloStreamWorker(QtCore.QObject):
         if process is None:
             return
         if not process.is_alive():
+            if self._stop_child_process():
+                self._emit_finished_once()
             return
         # Give the child a chance to release its video writer and queues after
         # observing the stop event.  Escalate only if cooperative shutdown
@@ -3531,6 +4092,8 @@ class YoloStreamWorker(QtCore.QObject):
         if process.is_alive():
             process.kill()
             process.join(timeout=YOLO_KILL_JOIN_TIMEOUT_S)
+        if self._stop_child_process():
+            self._emit_finished_once()
 
     def request_stop(self) -> None:
         self._stop_requested = True
@@ -3566,6 +4129,9 @@ class YoloStreamWorker(QtCore.QObject):
         process = self._process
         if process is not None and process.is_alive():
             process.kill()
+            return
+        if process is not None and self._stop_child_process():
+            self._emit_finished_once()
 
     def _queue_has_pending_messages(self) -> bool:
         return any(
@@ -3604,7 +4170,7 @@ class YoloStreamWorker(QtCore.QObject):
                     break
                 self._handle_worker_message(message)
 
-    def _stop_child_process(self) -> None:
+    def _stop_child_process(self) -> bool:
         process = self._process
         if process is not None and process.is_alive():
             if self._stop_requested_monotonic_s is None:
@@ -3627,6 +4193,13 @@ class YoloStreamWorker(QtCore.QObject):
             if process.is_alive():
                 process.kill()
                 process.join(timeout=YOLO_KILL_JOIN_TIMEOUT_S)
+            if process.is_alive():
+                # Keep the handle and IPC owners reachable so the application
+                # resource audit cannot mistake a kill request for confirmed
+                # child death. A later forced-shutdown retry calls
+                # kill_child_process() again and completes cleanup only after
+                # is_alive() becomes false.
+                return False
         self._process = None
         self._stop_event = None
         for message_queue in (
@@ -3648,9 +4221,31 @@ class YoloStreamWorker(QtCore.QObject):
         self._event_queue = None
         self._metadata_queue = None
         self._frame_queue = None
+        return True
 
     def _handle_worker_message(self, message) -> None:
         kind = message[0]
+        if kind == "decoder_fallback":
+            payload = dict(message[1] or {}) if len(message) > 1 else {}
+            reason = str(payload.get("reason") or "unknown decoder fallback")
+            recording_restart_required = bool(
+                payload.get("recording_restart_required", False)
+            )
+            if recording_restart_required:
+                self._child_terminal_exit_reason = (
+                    "recording-side decoder fallback requires a new side start"
+                )
+                prefix = DECODER_FALLBACK_STATUS_PREFIX
+            else:
+                prefix = DECODER_FALLBACK_ACTIVE_STATUS_PREFIX
+            self.status_changed.emit(f"{prefix} {reason}")
+            return
+        if kind == "terminal_exit":
+            payload = dict(message[1] or {}) if len(message) > 1 else {}
+            self._child_terminal_exit_reason = str(
+                payload.get("reason") or "child requested permanent exit"
+            )
+            return
         if kind == "status":
             self.status_changed.emit(message[1])
             return

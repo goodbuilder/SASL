@@ -13,10 +13,16 @@ import hashlib
 import json
 import math
 import multiprocessing
+import os
+from pathlib import Path
+import re
+import secrets
+import stat
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
-from multiprocessing import resource_tracker, shared_memory
+from multiprocessing import shared_memory
 from typing import Any
 
 
@@ -28,6 +34,10 @@ DEFAULT_NATIVE_RING_CAPACITY = 16
 DEFAULT_NATIVE_MAX_WIDTH = 1280
 DEFAULT_NATIVE_MAX_HEIGHT = 720
 DEFAULT_NATIVE_CHANNELS = 3
+NATIVE_FRAME_SHM_PREFIX = "sasl_ws_native_"
+_NATIVE_FRAME_SHM_NAME_RE = re.compile(
+    rf"^{re.escape(NATIVE_FRAME_SHM_PREFIX)}(?P<pid>\d+)_(?P<token>[0-9a-f]{{16}})$"
+)
 
 # All header fields use signed 64-bit storage so one RawArray can be shared
 # through Python's spawn context without platform-dependent struct padding.
@@ -64,6 +74,74 @@ def _timestamp_s(value_ns: int) -> float | None:
     return None if int(value_ns) < 0 else int(value_ns) / 1_000_000_000.0
 
 
+def _process_is_alive(pid: int) -> bool:
+    if int(pid) <= 0:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def reclaim_orphaned_native_frame_segments(
+    *,
+    current_pid: int | None = None,
+    shm_root: str | os.PathLike[str] = "/dev/shm",
+) -> tuple[str, ...]:
+    """Unlink only dead, same-user Workstation native-frame segments.
+
+    ``SIGKILL`` cannot execute owner cleanup, and a multiprocessing resource
+    tracker is not a sufficient oracle once several spawned camera processes
+    share registrations.  The Workstation-specific name embeds its owner PID;
+    startup may therefore recover a previous dead instance without scanning or
+    deleting arbitrary Python ``psm_*`` objects.
+    """
+
+    if os.name != "posix" or not hasattr(os, "getuid"):
+        return ()
+    root = Path(shm_root)
+    if not root.is_dir():
+        return ()
+    owner_pid = os.getpid() if current_pid is None else int(current_pid)
+    owner_uid = os.getuid()
+    reclaimed: list[str] = []
+    try:
+        entries = tuple(root.iterdir())
+    except OSError:
+        return ()
+    for entry in entries:
+        match = _NATIVE_FRAME_SHM_NAME_RE.fullmatch(entry.name)
+        if match is None:
+            continue
+        stale_pid = int(match.group("pid"))
+        if stale_pid == owner_pid or _process_is_alive(stale_pid):
+            continue
+        try:
+            details = entry.stat(follow_symlinks=False)
+        except (FileNotFoundError, OSError):
+            continue
+        if details.st_uid != owner_uid or not stat.S_ISREG(details.st_mode):
+            continue
+        try:
+            segment = shared_memory.SharedMemory(name=entry.name, create=False)
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+        try:
+            segment.unlink()
+        except (FileNotFoundError, PermissionError, OSError):
+            pass
+        else:
+            reclaimed.append(entry.name)
+        finally:
+            segment.close()
+    return tuple(sorted(reclaimed))
+
+
 @dataclass(frozen=True, order=True)
 class FrameKey:
     camera_id: str
@@ -83,12 +161,72 @@ class FrameKey:
         return f"{self.camera_id}:{self.stream_generation}:{self.frame_id}"
 
     @classmethod
-    def from_mapping(cls, payload: dict[str, Any]) -> "FrameKey":
-        return cls(
-            camera_id=str(payload.get("camera_id") or ""),
-            stream_generation=int(payload.get("stream_generation") or 0),
-            frame_id=int(payload.get("frame_id") or 0),
-        )
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "FrameKey":
+        """Parse one frame identity and reject contradictory redundancy.
+
+        Runtime metadata intentionally carries both the three typed components
+        and their compact ``frame_key`` projection.  Treating either copy as
+        authoritative would let a partially stale or tampered payload select a
+        different ring slot than the evidence row names.  When both forms are
+        present they therefore have to identify exactly the same frame.
+        """
+
+        if not isinstance(payload, Mapping):
+            raise TypeError("frame key payload must be a mapping")
+
+        compact_value = payload.get("frame_key")
+        compact_text = str(compact_value or "").strip()
+        compact_key: FrameKey | None = None
+        if compact_text:
+            parts = compact_text.rsplit(":", 2)
+            if len(parts) != 3 or not parts[0]:
+                raise ValueError("frame_key must be camera:generation:frame")
+            try:
+                compact_key = cls(
+                    camera_id=parts[0],
+                    stream_generation=int(parts[1]),
+                    frame_id=int(parts[2]),
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "frame_key generation and frame components must be integers"
+                ) from exc
+
+        component_names = ("camera_id", "stream_generation", "frame_id")
+        component_present = {
+            name: name in payload and payload.get(name) not in (None, "")
+            for name in component_names
+        }
+        try:
+            component_key = cls(
+                camera_id=str(payload.get("camera_id") or ""),
+                stream_generation=int(payload.get("stream_generation") or 0),
+                frame_id=int(payload.get("frame_id") or 0),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("frame key components are malformed") from exc
+
+        if compact_key is None:
+            return component_key
+
+        comparisons = {
+            "camera_id": (component_key.camera_id, compact_key.camera_id),
+            "stream_generation": (
+                component_key.stream_generation,
+                compact_key.stream_generation,
+            ),
+            "frame_id": (component_key.frame_id, compact_key.frame_id),
+        }
+        mismatched = [
+            name
+            for name, (component, compact) in comparisons.items()
+            if component_present[name] and component != compact
+        ]
+        if mismatched:
+            raise ValueError(
+                "frame_key/component mismatch: " + ",".join(mismatched)
+            )
+        return compact_key
 
 
 @dataclass(frozen=True)
@@ -209,6 +347,10 @@ class SharedNativeFrameRing:
         normalized_capacity = max(1, int(capacity))
         slot_bytes = max(1, int(max_width)) * max(1, int(max_height)) * max(1, int(channels))
         shm = shared_memory.SharedMemory(
+            name=(
+                f"{NATIVE_FRAME_SHM_PREFIX}{os.getpid()}_"
+                f"{secrets.token_hex(8)}"
+            ),
             create=True,
             size=normalized_capacity * slot_bytes,
         )
@@ -256,13 +398,13 @@ class SharedNativeFrameRing:
         with self._local_lock:
             if self._shm is None:
                 shm = shared_memory.SharedMemory(name=self.shm_name, create=False)
-                # Only the owning parent may unlink the segment. Python 3.10's
-                # resource tracker otherwise lets any short-lived attachment
-                # remove it when that process exits.
-                try:
-                    resource_tracker.unregister(shm._name, "shared_memory")
-                except (AttributeError, KeyError):
-                    pass
+                # Camera workers are created through the parent's ``spawn``
+                # context and share its resource-tracker process.  Unregistering
+                # this attachment would therefore remove the owning parent's
+                # global registration as well, leaking the segment if the
+                # parent is later SIGKILLed.  Keep the shared registration;
+                # graceful owner cleanup still calls ``unlink()`` explicitly,
+                # while tracker EOF reclaims it after an abnormal parent exit.
                 self._shm = shm
             return self._shm
 
@@ -566,4 +708,6 @@ __all__ = [
     "NativeFrameSnapshot",
     "PIXEL_FORMAT_BGR24",
     "SharedNativeFrameRing",
+    "NATIVE_FRAME_SHM_PREFIX",
+    "reclaim_orphaned_native_frame_segments",
 ]

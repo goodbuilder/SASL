@@ -1,8 +1,8 @@
 {
   "intrinsics_path": "calibration_captures/intrinsics.json",
-  "yolo_weights_path": "/home/moontaehyung/바탕화면/SASL-20260821/apps/StereoWIRIS/yolov8n_uav.pt",
+  "yolo_weights_path": "yolov8n_uav.pt",
   "interface_name": "enx588694fce07e",
-  "camera_host_address": "10.0.0.10/24",
+  "camera_host_address": "10.0.0.11/32",
   "left_rtsp_url": "rtsp://10.0.0.231:8554/visible",
   "right_rtsp_url": "rtsp://10.0.0.232:8554/visible",
   "left_control_host": "10.0.0.231",

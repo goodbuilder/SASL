@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The canonical environment must not be completed by ~/.local packages or
+# executables. System-site packages remain available through pyvenv.cfg.
+export PYTHONNOUSERSITE=1
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+unset PYTHONPATH
+unset PYTHONHOME
+unset LD_LIBRARY_PATH
+unset GI_TYPELIB_PATH
+unset GST_PLUGIN_PATH
+unset GST_PLUGIN_PATH_1_0
+unset GST_PLUGIN_SYSTEM_PATH
+unset GST_PLUGIN_SYSTEM_PATH_1_0
+unset GST_PLUGIN_SCANNER
+unset GST_PLUGIN_SCANNER_1_0
+
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APPS_DIR="$(cd "$APP_DIR/.." && pwd)"
 SASL_ROOT="$(cd "$APP_DIR/../.." && pwd)"
@@ -53,7 +68,7 @@ if [[ "$(realpath -s -m "$PYTHON_BIN")" != "$(realpath -s -m "$CANONICAL_PYTHON"
   exit 2
 fi
 
-export PYTHONPATH="$APPS_DIR:$SASL_ROOT:$COMMON_PYTHON${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$APPS_DIR:$SASL_ROOT:$COMMON_PYTHON"
 WORKSTATION_DATA_ROOT="${SASL_WORKSTATION_DATA_ROOT:-$SASL_ROOT/.local/workstation_data}"
 if [[ "$WORKSTATION_DATA_ROOT" != /* ]]; then
   WORKSTATION_DATA_ROOT="$SASL_ROOT/$WORKSTATION_DATA_ROOT"

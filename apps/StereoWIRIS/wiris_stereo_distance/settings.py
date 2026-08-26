@@ -19,9 +19,11 @@ DEFAULT_PIXHAWK_ETHERNET_MODE = "dual"
 @dataclass(frozen=True)
 class AppSettings:
     intrinsics_path: str = DEFAULT_INTRINSICS_PATH
-    yolo_weights_path: str = ".local/models/yolov8m.pt"
+    yolo_weights_path: str = "yolov8n_uav.pt"
     interface_name: str = "enx588694fce07e"
-    camera_host_address: str = "10.0.0.10/24"
+    # Keep cameras off the Pixhawk NIC's 10.0.0.10/24 connected subnet.
+    # Explicit .231/.232 host routes use this /32 source on the camera NIC.
+    camera_host_address: str = "10.0.0.11/32"
     left_rtsp_url: str = "rtsp://10.0.0.231:8554/visible"
     right_rtsp_url: str = "rtsp://10.0.0.232:8554/visible"
     left_control_host: str = "10.0.0.231"
@@ -35,8 +37,8 @@ class AppSettings:
     right_control_port: int = 2240
     # The left camera's SDK can acknowledge read commands after roughly 2 s.
     wiris_control_timeout_s: float = 5.0
-    # Field-validated WIRIS visible encoder profile. RTSP enable reapplies
-    # changed fields and verifies each readback before frame probing.
+    # Stored reference values for explicit/manual encoder commands. Automatic
+    # RTSP enable and Auto-Connect never apply these values to a camera.
     wiris_visible_encoder_bitrate: int = 0
     wiris_visible_encoder_qp: int = 1
     wiris_visible_encoder_gop: int = 90

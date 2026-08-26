@@ -19,6 +19,14 @@ def _copy_launcher(tmp_path: Path, app_name: str) -> tuple[Path, Path]:
     return fake_root, destination
 
 
+def _copy_runtime_doctor(tmp_path: Path) -> tuple[Path, Path]:
+    fake_root = tmp_path / "runtime-doctor"
+    destination = fake_root / "tools" / "check_operator_runtime.sh"
+    destination.parent.mkdir(parents=True)
+    shutil.copy2(REPOSITORY_ROOT / "tools" / "check_operator_runtime.sh", destination)
+    return fake_root, destination
+
+
 @pytest.mark.parametrize("app_name", ("StereoWIRIS", "Workstation"))
 def test_launcher_help_needs_no_venv_and_ignores_wrong_override(
     tmp_path: Path,
@@ -99,6 +107,132 @@ def test_wrong_python_bin_is_exit_two(tmp_path: Path, app_name: str) -> None:
     assert "only supports" in result.stderr
 
 
+@pytest.mark.parametrize("app_name", ("StereoWIRIS", "Workstation"))
+def test_launcher_enforces_isolated_user_site_and_pythonpath(
+    tmp_path: Path,
+    app_name: str,
+) -> None:
+    fake_root, launcher = _copy_launcher(tmp_path, app_name)
+    canonical = fake_root / ".venv" / "bin" / "python"
+    observed = fake_root / "observed-env"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$PYTHONNOUSERSITE\" \"$PYTHONPATH\" \"$PATH\" "
+        "\"${PYTHONHOME-unset}\" \"${LD_LIBRARY_PATH-unset}\" "
+        "\"${GI_TYPELIB_PATH-unset}\" \"${GST_PLUGIN_PATH-unset}\" "
+        "\"${GST_PLUGIN_PATH_1_0-unset}\" \"${GST_PLUGIN_SYSTEM_PATH-unset}\" "
+        "\"${GST_PLUGIN_SYSTEM_PATH_1_0-unset}\" \"${GST_PLUGIN_SCANNER-unset}\" "
+        f"\"${{GST_PLUGIN_SCANNER_1_0-unset}}\" > '{observed}'\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    canonical.chmod(0o755)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "/tmp/ambient-pythonpath"
+    env["PATH"] = f"{Path.home() / '.local/bin'}:{env.get('PATH', '')}"
+    env["PYTHONHOME"] = "/tmp/ambient-pythonhome"
+    env["LD_LIBRARY_PATH"] = "/tmp/ambient-library"
+    env["GI_TYPELIB_PATH"] = "/tmp/ambient-typelib"
+    env["GST_PLUGIN_PATH"] = "/tmp/ambient-gst-plugin"
+    env["GST_PLUGIN_PATH_1_0"] = "/tmp/ambient-gst-plugin-1.0"
+    env["GST_PLUGIN_SYSTEM_PATH"] = "/tmp/ambient-gst-system-plugin"
+    env["GST_PLUGIN_SYSTEM_PATH_1_0"] = "/tmp/ambient-gst-system-plugin-1.0"
+    env["GST_PLUGIN_SCANNER"] = "/tmp/ambient-gst-scanner"
+    env["GST_PLUGIN_SCANNER_1_0"] = "/tmp/ambient-gst-scanner-1.0"
+
+    arguments = ["--check"]
+    if app_name == "StereoWIRIS":
+        arguments.append("--mavlink-only")
+    result = subprocess.run(
+        [str(launcher), *arguments],
+        cwd=tmp_path,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    (
+        no_user_site,
+        python_path,
+        executable_path,
+        python_home,
+        library_path,
+        typelib_path,
+        plugin_path,
+        plugin_path_1_0,
+        system_plugin_path,
+        system_plugin_path_1_0,
+        plugin_scanner,
+        plugin_scanner_1_0,
+    ) = observed.read_text(encoding="utf-8").splitlines()
+    assert no_user_site == "1"
+    assert "/tmp/ambient-pythonpath" not in python_path
+    assert ".local/bin" not in executable_path
+    assert python_home == "unset"
+    assert library_path == "unset"
+    assert typelib_path == "unset"
+    assert plugin_path == "unset"
+    assert plugin_path_1_0 == "unset"
+    assert system_plugin_path == "unset"
+    assert system_plugin_path_1_0 == "unset"
+    assert plugin_scanner == "unset"
+    assert plugin_scanner_1_0 == "unset"
+
+
+def test_runtime_doctor_enforces_the_same_isolated_environment(tmp_path: Path) -> None:
+    fake_root, doctor = _copy_runtime_doctor(tmp_path)
+    canonical = fake_root / ".venv" / "bin" / "python"
+    observed = fake_root / "observed-env"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$PYTHONNOUSERSITE\" \"$PYTHONPATH\" \"$PATH\" "
+        "\"${PYTHONHOME-unset}\" \"${LD_LIBRARY_PATH-unset}\" "
+        "\"${GI_TYPELIB_PATH-unset}\" \"${GST_PLUGIN_PATH-unset}\" "
+        "\"${GST_PLUGIN_PATH_1_0-unset}\" \"${GST_PLUGIN_SYSTEM_PATH-unset}\" "
+        "\"${GST_PLUGIN_SYSTEM_PATH_1_0-unset}\" \"${GST_PLUGIN_SCANNER-unset}\" "
+        f"\"${{GST_PLUGIN_SCANNER_1_0-unset}}\" > '{observed}'\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    canonical.chmod(0o755)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PYTHONPATH": "/tmp/ambient-pythonpath",
+            "PYTHONHOME": "/tmp/ambient-pythonhome",
+            "LD_LIBRARY_PATH": "/tmp/ambient-library",
+            "GI_TYPELIB_PATH": "/tmp/ambient-typelib",
+            "GST_PLUGIN_PATH": "/tmp/ambient-gst-plugin",
+            "GST_PLUGIN_PATH_1_0": "/tmp/ambient-gst-plugin-1.0",
+            "GST_PLUGIN_SYSTEM_PATH": "/tmp/ambient-gst-system-plugin",
+            "GST_PLUGIN_SYSTEM_PATH_1_0": "/tmp/ambient-gst-system-plugin-1.0",
+            "GST_PLUGIN_SCANNER": "/tmp/ambient-gst-scanner",
+            "GST_PLUGIN_SCANNER_1_0": "/tmp/ambient-gst-scanner-1.0",
+            "PATH": f"{Path.home() / '.local/bin'}:{env.get('PATH', '')}",
+        }
+    )
+
+    result = subprocess.run(
+        [str(doctor), "--execution"],
+        cwd=tmp_path,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    values = observed.read_text(encoding="utf-8").splitlines()
+    assert values[0] == "1"
+    assert values[1] == str(fake_root / "common" / "python")
+    assert ".local/bin" not in values[2]
+    assert values[3:] == ["unset"] * 9
+
+
 def test_direct_workstation_app_venv_is_rejected_before_qt() -> None:
     python = REPOSITORY_ROOT / "apps" / "Workstation" / ".venv" / "bin" / "python"
     if not python.is_file():
@@ -153,11 +287,27 @@ def test_direct_stereowiris_simulation_venv_is_rejected_before_qt() -> None:
 def test_camera_worker_pins_spawn_to_parent_sys_executable(monkeypatch, module_name: str) -> None:
     module = __import__(module_name, fromlist=["YoloStreamWorker"])
 
+    class FakeSharedValue:
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+        def get_lock(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc_value, _traceback) -> bool:
+            return False
+
     class FakeContext:
         executable: str | None = None
 
         def set_executable(self, executable: str) -> None:
             self.executable = executable
+
+        def Value(self, _typecode: str, value: int) -> FakeSharedValue:
+            return FakeSharedValue(value)
 
     context = FakeContext()
     if module_name.startswith("wiris_"):

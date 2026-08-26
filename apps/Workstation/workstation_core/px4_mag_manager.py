@@ -17,7 +17,12 @@ GPS1_MAG_ID = 396809
 GPS2_MAG_ID = 396817
 GPS_MAG_IDS = (GPS1_MAG_ID, GPS2_MAG_ID)
 INTERNAL_MAG_IDS = (BOARD_INTERNAL_MAG_ID, *GPS_MAG_IDS)
-MAG_SLOTS = tuple(range(5))
+# PX4 v1.17's sensors module declares four calibration instances, exposed as
+# CAL_MAG0_* through CAL_MAG3_*. CAL_MAG4_* is not part of the stock firmware
+# parameter surface and waiting for it turns an otherwise read-only refresh
+# into eighteen sequential timeouts. Explicit callers may still request an
+# arbitrary parameter through the generic MAVLink parameter API.
+MAG_SLOTS = tuple(range(4))
 MAG_PRIORITY_LEVELS = (
     (-1, "Uninitialized"),
     (0, "Disabled"),

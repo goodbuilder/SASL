@@ -156,3 +156,17 @@ def test_rtcm_parser_rejects_bad_crc_and_resyncs_on_the_next_frame():
     frames = parser.feed(bytes(corrupted) + good_frame)
 
     assert frames == [good_frame]
+
+
+def test_rtcm_parser_recovers_valid_frame_enclosed_by_corrupt_length_candidate():
+    # Independently frozen RTCM3 type-1077 frame. The leading false candidate
+    # claims nine payload bytes, so its apparent boundary encloses this entire
+    # valid frame. CRC failure must rescan after the false sync byte instead of
+    # discarding the claimed candidate length and losing the correction.
+    good_frame = bytes.fromhex("d300034350008d44be")
+    corrupt_candidate = b"\xd3\x00\x09" + good_frame + b"\x00\x00\x00"
+    parser = Rtcm3StreamParser()
+
+    frames = parser.feed(corrupt_candidate)
+
+    assert frames == [good_frame]

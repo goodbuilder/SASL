@@ -18,6 +18,7 @@ class NtripHealthState(str, Enum):
     RTCM_STALE = "RTCM_STALE"
     STALE = "STALE"
     RECONNECTING = "RECONNECTING"
+    HTTP_AUTH_FAILED = "HTTP_AUTH_FAILED"
     ERROR = "ERROR"
 
 
@@ -87,6 +88,8 @@ def evaluate_ntrip_health(
 
     if not network_mode:
         state = NtripHealthState.DISABLED
+    elif phase_value == "HTTP_AUTH_FAILED":
+        state = NtripHealthState.HTTP_AUTH_FAILED
     elif phase_value == "ERROR" or (
         last_error
         and not running

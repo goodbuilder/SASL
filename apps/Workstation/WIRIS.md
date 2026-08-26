@@ -3,7 +3,8 @@
 이 문서는 `apps/Workstation`에서 사용하는 왼쪽/오른쪽 Workswell WIRIS Enterprise의
 실장비 설정, Workstation 설정, 성능 기준선, 변경 및 복구 절차를 기록한다.
 
-- 기준 snapshot: `2026-08-24T00:02:11+09:00` (Asia/Seoul)
+- 초기 기준 snapshot: `2026-08-24T00:02:11+09:00` (Asia/Seoul)
+- 최신 상태 확인: `2026-08-27` 순차 read-only SDK GET
 - 실장비 firmware: 양쪽 모두 `2.18.72`
 - 목표: 카메라 화질을 최대한 보존하면서 양쪽 decoded rate를 지속적으로 `17 Hz` 이상 유지
 - 절대 조건: visible encoder bitrate는 양쪽 모두 `0`으로 유지
@@ -26,13 +27,14 @@ PC 카메라망:
 
 ```text
 Interface: enx588694fce07e
-Camera-network address: 10.0.0.10/24
+Camera-network address: 10.0.0.11/32
+Host routes: 10.0.0.231/32, 10.0.0.232/32, preferred source 10.0.0.11
 Link: 1000 Mb/s, full duplex, carrier up
 MTU: 1500
 ```
 
-snapshot 시점에 같은 인터페이스에는 `10.41.10.1/24`, `192.168.0.254/24`,
-`10.0.0.10/24`가 함께 설정되어 있었다. 카메라 route의 source는 `10.0.0.10`이어야 한다.
+초기 snapshot 시점의 `10.0.0.10/24`는 이후 Pixhawk 전용 RTL8156B NIC로 분리됐다. 현재 카메라
+route의 source는 `10.0.0.11`이며 이 NIC는 기본 route를 소유하지 않는다.
 
 ## 2. 실장비 공통 상태
 
@@ -63,12 +65,14 @@ snapshot 시점에 같은 인터페이스에는 `10.41.10.1/24`, `192.168.0.254/
 |---|---|---:|---:|
 | Bitrate | `GEBR VISIBLE` | `0` | `0` |
 | QP | `GEQZ VISIBLE` | `1` | `1` |
-| GOP | `GEGS VISIBLE` | `90` | `90` |
+| GOP | `GEGS VISIBLE` | `30` | `30` |
 | IDR interval | `GEIR VISIBLE` | `1` | `1` |
 | Slice-size | `GSSS` | `0` | `0` |
 
 `bitrate=0`은 constant-quality mode이며 QP가 유효한 조건이다. Bitrate에 대해서는 테스트 중
 `SEBR` 명령을 보내지 않는다. 모든 변경 전후에 `GEBR VISIBLE=0`을 readback한다.
+`GEIR=1`은 설정 readback일 뿐 이 FW의 실제 random-access 증거가 아니다. 순차 재부팅 전후,
+RTSP 비활성/활성 중 적용 후에도 두 visible stream 모두 NAL type 5를 한 번도 내보내지 않았다.
 
 ### Thermal encoder
 
@@ -129,14 +133,14 @@ Canonical settings file:
 
 ```text
 <repository-root>/.local/workstation_data/stereo_distance_settings.json
-SHA256: 4f3f415e641ca2e8df0931463160c66a7e2013d0c702659010616b89f894f419
+SHA256: 4c0a19d8492334c1780e31081f035aeb1c34919747f937c413a8cc61fae173e6
 ```
 
 WIRIS/RTSP 관련 저장값:
 
 ```text
 interface_name: enx588694fce07e
-camera_host_address: 10.0.0.10/24
+camera_host_address: 10.0.0.11/32
 left_rtsp_url: rtsp://10.0.0.231:8554/visible
 right_rtsp_url: rtsp://10.0.0.232:8554/visible
 left_control_host: 10.0.0.231
@@ -147,10 +151,10 @@ wiris_control_timeout_s: 5.0
 wiris_visible_encoder_bitrate: 0
 wiris_visible_encoder_qp: 1
 wiris_visible_encoder_gop: 90
-wiris_visible_encoder_idr: 1
+wiris_visible_encoder_idr: 0
 preview_width: 1280
 rtsp_latency_ms: 100
-rtsp_decoder: software
+rtsp_decoder: auto
 stream_backend: gstreamer
 rtsp_transport: tcp
 yolo_event_queue_size: 128
@@ -162,22 +166,18 @@ FTP는 양쪽 모두 enabled, port `21`, user `wiris-enterprise`, remote directo
 
 ### 장비와 Workstation의 정합성
 
-장비 visible profile과 canonical Workstation 저장값은 공통 `0/1/90/1`을 사용한다.
-현재 저장 schema는 좌/우 encoder profile을 분리하지 않으므로 양쪽 모두 IDR 1을 사용한다.
-코드의 dataclass fallback 기본값은 별도이며, 현장 운용에서는 위 canonical JSON이 source of truth다.
+최신 실장비 readback은 양쪽 `0/1/30/1`이다. 저장된 `0/1/90/0` encoder 값은 수동 작업을 위한 reference이며
+장비 상태의 source of truth가 아니다. 실제 상태는 명시적 SDK GET readback으로 확인한다.
+Workstation/Legacy startup, Auto-Connect, Enable, Reactivate는 저장값을 장비에 적용하지 않는다.
 
 ### Encoder-profile 재전송 방지 코드
 
-`2026-08-24`에 Workstation RTSP enable worker를 다음과 같이 변경했다.
+현재 자동 RTSP 경로는 다음 계약을 사용한다.
 
-1. 일반 enable에서 `GETH=TRUE`이면 `SETH TRUE`를 보내지 않는다.
-2. `GEBR/GEQZ/GEGS/GEIR VISIBLE`을 먼저 읽는다.
-3. 목표와 다른 필드에만 `SEBR/SEQZ/SEGS/SEIR`을 보낸다.
-4. 한 필드의 목표 readback과 SDK 복구를 확인한 뒤 다음 필드로 진행한다.
-5. SDK connection 사이에 `250 ms` 간격을 두고 transient reset/refused는 최대 30회 재시도한다.
-6. initial readback과 변경 필드별 확인값으로 최종 profile을 구성하며, 동일한 4개 GET을 마지막에
-   중복 전송하지 않는다.
-7. 명시적 카메라별 `재활성화` 동작은 사용자 의도이므로 `SETH TRUE`를 유지한다.
+1. `GETH=TRUE`이면 startup/Auto-Connect/Enable/Reactivate 모두 `SETH TRUE`를 보내지 않는다.
+2. `GETH=FALSE`일 때만 `SETH TRUE`를 한 번 보낸다.
+3. 자동 경로는 `SEBR/SEQZ/SEGS/SEIR`을 전송하지 않는다.
+4. encoder 변경은 별도 승인된 수동 WIRIS command에서만 수행하고 전후 readback을 남긴다.
 
 이미 실행 중인 Workstation은 Python code와 settings를 자동 reload하지 않는다. 이 변경 전에 시작된
 프로세스는 완전히 종료한 뒤 다시 실행해야 보호 로직이 적용된다.
@@ -189,7 +189,7 @@ Focused RTSP worker tests: 5 passed
 Camera regression file: 44 passed
 Camera/contract/recovery tests: 71 passed
 Full Workstation suite after first guard: 999 passed, 1 skipped
-Latest full suite: 1056 passed, 1 skipped in 90.24 s
+Current full suite: 1466 passed, 1 skipped in 127.86 s
 ```
 
 ## 6. 성능 기준선
@@ -264,10 +264,9 @@ both sides: every post-warm-up 1-second decoded sample >= 17.0 Hz
 - 외부 스크립트와 Workstation이 동시에 SDK `2240`에 연결하지 않도록 한다.
 - canonical JSON을 변경한 뒤 이미 실행 중인 Workstation은 새 값을 자동 reload하지 않는다. 반드시
   완전히 종료한 뒤 다시 실행해야 한다.
-- 수정된 encoder-profile worker는 일반 enable에서 `GETH=TRUE`인 경우 `SETH TRUE`를 생략하고,
-  readback과 다른 encoder 필드만 순차 적용한다. SDK 명령 사이에 250 ms 간격을 두고 transient
-  오류를 재시도한다. 수정 전에 시작된 Workstation 프로세스에는 이 보호가 없으므로 반드시
-  재시작한다.
+- 자동 RTSP 경로는 `GETH=TRUE`이면 `SETH TRUE`를 생략하고 encoder profile을 적용하지 않는다.
+  `GETH=FALSE`일 때만 `SETH TRUE`를 한 번 보낸다. 수정 전에 시작된 프로세스에는 이 보호가
+  없으므로 반드시 재시작한다.
 - 변경 전 `IRCR=FALSE`와 활성 RTSP client 없음부터 확인한다.
 - 한 번에 한 필드, 한 카메라만 변경하고 최소 15-30초 기다린다.
 - `REBT`는 FW `2.18.72`에서 FTP만 남기고 SDK `2240`/RTSP `8554`를 재기동하지 못한 사례가
@@ -277,6 +276,24 @@ both sides: every post-warm-up 1-second decoded sample >= 17.0 Hz
 - 물리 재부팅 후 QP/GOP는 유지됐지만 IDR은 `0`으로 돌아갔다. IDR은 SDK가 command-ready가 된
   후 마지막에 다시 적용한다.
 - `GSSS`가 바뀐 채 서비스가 중단되면 물리 재부팅 후 `GSSS`부터 readback하고 시험을 재개한다.
+
+### Visible GOP 30 현장 적용 — 2026-08-26
+
+사용자 승인에 따라 양쪽 visible encoder의 GOP만 `90 -> 30`으로 변경했다. 목적은 RTP sequence
+discontinuity 자체를 없애는 것이 아니라, 무결성 gate가 손상된 reference chain을 차단한 뒤 다음
+clean non-delta intra를 기다리는 시간과 그에 따른 `STALE` 체류시간을 줄이는 것이다. 약
+15-18 Hz 수신율에서 GOP 90의 명목 intra 주기는 약 5-6초지만 GOP 30은 약 1.7-2초다.
+
+변경 전에는 Workstation camera child, RTSP client 및 encoded recording이 없음을 확인했다. 양쪽
+모두 `HIWS=OK`, `IACT=TRUE`, `GETH=TRUE`, `IRCR=FALSE`, visible profile `0/1/90/0`을 readback한
+뒤, 한 카메라씩 `SEGS VISIBLE 30 -> OK`와 독립 `GEGS VISIBLE -> 30`을 확인했다. 15초 안정화
+후 최종 readback은 양쪽 `0/1/30/0`이며 bitrate, QP, IDR, Ethernet mode와 recording state는
+바뀌지 않았다.
+
+변경 후 5초 TCP/100 ms/NVIDIA RTSP probe는 오류 없이 1280x720 decoded frame을 왼쪽 60개,
+오른쪽 37개 수신했다. 이 짧은 probe는 송출 복구 확인일 뿐 장시간 성능 합격이나 RTP omission
+해결 증거가 아니다. gap 빈도와 복구시간, 화질, bandwidth를 별도로 관찰하고 문제가 커지면
+한 카메라씩 `SEGS VISIBLE 90`으로 원복한 뒤 readback한다.
 
 ### Slice-size 실장비 시험 결과
 
@@ -419,6 +436,13 @@ SSSS 1000000   # tested: FAIL
 SSSS 0         # final / rollback
 ```
 
+현재 visible GOP와 rollback 명령:
+
+```text
+SEGS VISIBLE 30   # current
+SEGS VISIBLE 90   # rollback
+```
+
 ## 10. Change log
 
 - `2026-08-24`: 최초 실장비/Workstation snapshot, 기존 encoder 탐색 결과, 서비스 장애 복구 규칙,
@@ -439,3 +463,11 @@ SSSS 0         # final / rollback
   `250 ms`, transient readback 재시도, 중복 final readback 제거를 추가했다. 관련 테스트 71개 PASS.
 - `2026-08-24`: Calibration `Actual zoom readback`에 양쪽 `Zoom-in`/`Zoom-out` 버튼과 명령 완료 후
   자동 `GZVV` readback 예약을 추가했다. Calibration regression 40개 PASS.
+- `2026-08-26`: RTP gap 뒤 clean-intra 대기와 `STALE` 체류시간을 줄이기 위해 사용자 승인으로
+  양쪽 visible GOP를 `90 -> 30`으로 변경했다. 최종 profile `0/1/30/0`과 5초 dual RTSP decode를
+  확인했으며, sender omission 자체의 해결로 판정하지 않는다.
+- `2026-08-27`: 사용자 승인으로 양쪽 `SEIR VISIBLE 1`을 적용하고 순차 SDK 재부팅, fresh RTSP,
+  active-stream 재적용까지 확인했다. 최종 readback은 `GETH=TRUE`, `0/1/30/1`, `GSSS=0`,
+  `IRCR=FALSE`지만 모든 elementary stream의 NAL5는 0이었다. 공개 최신 SDK rev 241106EN에는
+  별도 visible encoder restart 명령이 없으므로 추가 임의 SET 없이 Workswell firmware/support
+  답변을 기다린다.

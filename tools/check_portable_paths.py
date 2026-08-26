@@ -31,11 +31,14 @@ SCANNED_SUFFIXES = {
 }
 HISTORICAL_PREFIXES = (
     "apps/Simulation/reports/",
+    "apps/StereoWIRIS/calibration_captures/",
+    "apps/StereoWIRIS/docs/changes/",
     "common/firmware/artifacts/",
 )
 EXEMPT_EXACT = {
     "AGENTS.md",
     "apps/StereoWIRIS/UPDATE.md",
+    "apps/Workstation/intrinsics_zoom_08.json",
     "apps/Workstation/tests/test_portable_path_policy.py",
     "apps/Workstation/tests/test_portable_paths.py",
     "tools/check_portable_paths.py",

@@ -158,6 +158,83 @@ def test_measurement_attempt_round_trips_through_its_canonical_recalculation_bou
     assert recovered.canonical_sha256() == attempt.canonical_sha256()
 
 
+def test_detection_snapshot_retains_descriptor_timestamp_for_independent_recalculation() -> None:
+    metadata = {
+        "camera_id": "left",
+        "stream_generation": 7,
+        "frame_id": 11,
+        "frame_key": "left:7:11",
+        "timestamp_s": 10.25,
+        "source_timestamp_s": 9.75,
+        "native_width": 640,
+        "native_height": 480,
+        "native_channels": 3,
+        "native_byte_length": 640 * 480 * 3,
+        "native_pixel_format": "BGR24",
+        "source_native_frame_id": "left:7:11",
+    }
+    descriptor_identity = {
+        key: metadata[key]
+        for key in (
+            "camera_id",
+            "stream_generation",
+            "frame_id",
+            "frame_key",
+            "timestamp_s",
+            "source_timestamp_s",
+            "native_width",
+            "native_height",
+            "native_channels",
+            "native_byte_length",
+            "native_pixel_format",
+        )
+    }
+    metadata["frame_descriptor_sha256"] = hashlib.sha256(
+        json.dumps(
+            descriptor_identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    observation = SimpleNamespace(
+        camera="left",
+        timestamp_s=10.25,
+        width=640,
+        height=480,
+        x1=10.0,
+        y1=20.0,
+        x2=30.0,
+        y2=40.0,
+        confidence=0.9,
+        class_id=0,
+        class_name="target",
+        timestamp_metadata=metadata,
+        candidate_class_ids=(0,),
+    )
+
+    snapshot = DetectionSnapshot.from_observation(
+        observation,
+        pairing_timestamp_basis="app_receive_monotonic",
+        pairing_timestamp_s=10.25,
+    )
+    persisted_metadata = dict(snapshot.timestamp_metadata_items)
+
+    assert persisted_metadata["timestamp_s"] == 10.25
+    persisted_identity = {
+        key: persisted_metadata[key]
+        for key in descriptor_identity
+    }
+    assert hashlib.sha256(
+        json.dumps(
+            persisted_identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest() == persisted_metadata["frame_descriptor_sha256"]
+
+
 def test_terminal_record_ids_are_stable_and_namespaces_cannot_collide() -> None:
     attempt = _attempt()
     recovered = MeasurementAttempt.from_canonical_payload(

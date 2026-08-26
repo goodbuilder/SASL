@@ -498,6 +498,74 @@ def test_old_recoverable_session_and_unavailable_storage_never_disable_measureme
     window.deleteLater()
     app.processEvents()
 
+
+@pytest.mark.parametrize(
+    ("case", "sync_state", "blocking_reason"),
+    (
+        ("operating-kd-missing", "not-verified", "exact operating K,D missing"),
+        ("operating-zoom-mismatch", "not-verified", "operating zoom mismatch"),
+        ("stereo-rt-missing", "not-verified", "stereo R,t missing"),
+        ("correspondence-missing", "verified", "left/right correspondence missing"),
+        ("live-attitude-gnss-missing", "verified", "live Pixhawk/GNSS missing"),
+        ("stus-failed", "failed", "STUS/RTCP verification failed"),
+    ),
+)
+def test_method_readiness_failures_remain_visible_without_disabling_global_start(
+    case: str,
+    sync_state: str,
+    blocking_reason: str,
+) -> None:
+    from Workstation.workstation_core.measurement_methods import (
+        MEASUREMENT_METHOD_IDS,
+        MEASUREMENT_METHOD_LABELS,
+    )
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    backend.panel.camera_sync_status = sync_state
+    backend.panel.camera_sync_reason = blocking_reason
+    backend.panel.last_distance_status = f"거리: {blocking_reason}"
+    catalog = [
+        {
+            "method_id": method_id,
+            "label": MEASUREMENT_METHOD_LABELS[method_id],
+            "instance_id": f"blocked:{case}:{method_id}",
+            "ready": False,
+            "reasons": [blocking_reason],
+            "primary_blocker": blocking_reason,
+            "runtime_status": "BLOCKED",
+            "components": {},
+        }
+        for method_id in MEASUREMENT_METHOD_IDS
+    ]
+    backend._measurement_method_snapshot = {
+        "selected_method_id": "",
+        "selected_instance_id": "",
+        "selection_reason": "no_ready_method",
+        "ready_methods": [],
+        "fill_policy_locked": False,
+        "method_capabilities": catalog,
+        "method_catalog": catalog,
+    }
+    window = WorkstationMainWindow(backend=backend)
+    window.show()
+    backend.calls.clear()
+    window.status_adapter.refresh()
+    app.processEvents()
+
+    action = window.commands.action("detection.toggle")
+    button = window.measurement.control_buttons["detection.toggle"]
+    assert action.isEnabled(), case
+    assert button.isEnabled(), case
+    assert action.text() == "측정 시작"
+    assert window.commands.invoke("detection.toggle") is True
+    assert backend.calls == ["detection"]
+
+    window.status_adapter.stop()
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+
 def test_protocol_selection_is_read_only_and_recording_fallback_is_visible() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     backend = _FakeBackend()

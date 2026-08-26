@@ -1654,6 +1654,8 @@ class WirisRtspEnableWorker(QtCore.QObject):
         self.candidate_ports = candidate_ports
         self.urls = urls
         self.timeout_s = timeout_s
+        # Retained for the explicit/manual profile helper and compatibility.
+        # _enable_rtsp() deliberately never applies these stored values.
         self.visible_encoder_profile = dict(visible_encoder_profile or {})
 
     @QtCore.pyqtSlot()
@@ -1693,34 +1695,46 @@ class WirisRtspEnableWorker(QtCore.QObject):
                     f"[카메라] {camera_name} Telnet port 자동 보정: "
                     f"{corrected} -> {port} ({GET_ETHERNET_MODE_COMMAND}={before})"
                 )
-            try:
-                set_command = build_wiris_command(
-                    host=host,
-                    port=port,
-                    command=SET_ETHERNET_MODE_COMMAND,
-                    timeout_s=self.timeout_s,
-                )
-                response = send_tcp_line(set_command)
-            except Exception as exc:
-                statuses.append(f"{label}=enable-failed")
-                logs.append(f"[카메라] {camera_name} RTSP/Ethernet Mode 활성화 실패: {exc}")
-                continue
-            if not self._set_ethernet_response_ok(response):
-                statuses.append(f"{label}=enable-rejected")
-                logs.append(
-                    f"[카메라] {camera_name} RTSP/Ethernet Mode 활성화 실패: "
-                    f"{SET_ETHERNET_MODE_COMMAND} 응답={response or 'empty'}"
-                )
-                continue
+            ethernet_mode_already_enabled = before.strip().upper() == "TRUE"
+            response = "SKIPPED"
+            if not ethernet_mode_already_enabled:
+                try:
+                    set_command = build_wiris_command(
+                        host=host,
+                        port=port,
+                        command=SET_ETHERNET_MODE_COMMAND,
+                        timeout_s=self.timeout_s,
+                    )
+                    response = send_tcp_line(set_command)
+                except Exception as exc:
+                    statuses.append(f"{label}=enable-failed")
+                    logs.append(f"[카메라] {camera_name} RTSP/Ethernet Mode 활성화 실패: {exc}")
+                    continue
+                if not self._set_ethernet_response_ok(response):
+                    statuses.append(f"{label}=enable-rejected")
+                    logs.append(
+                        f"[카메라] {camera_name} RTSP/Ethernet Mode 활성화 실패: "
+                        f"{SET_ETHERNET_MODE_COMMAND} 응답={response or 'empty'}"
+                    )
+                    continue
             statuses.append(f"{label}=enable-sent")
-            logs.append(
-                f"[카메라] {camera_name} RTSP/Ethernet Mode 활성화: "
-                f"{GET_ETHERNET_MODE_COMMAND}={before or 'n/a'}, {SET_ETHERNET_MODE_COMMAND} 응답={response or 'sent'}"
-            )
-            profile_error = self._apply_visible_encoder_profile(host, port, logs, camera_name)
-            if profile_error:
-                statuses[-1] = f"{label}=encoder-profile-failed"
-                logs.append(f"[카메라] {camera_name} visible encoder profile 적용 실패: {profile_error}")
+            if ethernet_mode_already_enabled:
+                logs.append(
+                    f"[카메라] {camera_name} RTSP/Ethernet Mode 이미 활성화됨: "
+                    f"{GET_ETHERNET_MODE_COMMAND}={before}; {SET_ETHERNET_MODE_COMMAND} 생략"
+                )
+            else:
+                logs.append(
+                    f"[카메라] {camera_name} RTSP/Ethernet Mode 활성화: "
+                    f"{GET_ETHERNET_MODE_COMMAND}={before or 'n/a'}, "
+                    f"{SET_ETHERNET_MODE_COMMAND} 응답={response or 'sent'}"
+                )
+            if self.visible_encoder_profile:
+                logs.append(
+                    f"[카메라] {camera_name} 저장 visible encoder profile은 RTSP "
+                    "활성화에서 자동 적용하지 않음; "
+                    "SEBR/SEQZ/SEGS/SEIR은 명시적 수동 WIRIS 명령에서만 전송"
+                )
 
         should_check = any(status.endswith("=enable-sent") for status in statuses)
         closed: list[str] = []
@@ -1746,6 +1760,12 @@ class WirisRtspEnableWorker(QtCore.QObject):
         logs: list[str],
         camera_name: str,
     ) -> str:
+        """Apply an encoder profile only from an explicit operator-owned path.
+
+        Automatic RTSP enable and Auto-Connect must not call this helper.  The
+        manual WIRIS command UI remains available for SEBR/SEQZ/SEGS/SEIR.
+        """
+
         if not self.visible_encoder_profile:
             return ""
         fields = (
@@ -3250,6 +3270,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.video_recording_enabled = False
         self.video_recording_paths: dict[str, Path] = {}
         self._raw_video_validation_required = False
+        self._raw_video_expected_cameras: tuple[str, ...] = ()
         self._last_distance_history_key: tuple[object, ...] | None = None
         self._measurement_attempt_counter = 0
         self._last_measurement_attempt_key: tuple[object, ...] | None = None
@@ -12683,36 +12704,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             candidate_ports=candidate_ports,
             urls=urls,
             timeout_s=self.zoom_timeout_spin.value(),
-            visible_encoder_profile={
-                "bitrate": int(
-                    getattr(
-                        self.settings,
-                        "wiris_visible_encoder_bitrate",
-                        DEFAULT_WIRIS_VISIBLE_ENCODER_PROFILE["bitrate"],
-                    )
-                ),
-                "qp": int(
-                    getattr(
-                        self.settings,
-                        "wiris_visible_encoder_qp",
-                        DEFAULT_WIRIS_VISIBLE_ENCODER_PROFILE["qp"],
-                    )
-                ),
-                "gop": int(
-                    getattr(
-                        self.settings,
-                        "wiris_visible_encoder_gop",
-                        DEFAULT_WIRIS_VISIBLE_ENCODER_PROFILE["gop"],
-                    )
-                ),
-                "idr": int(
-                    getattr(
-                        self.settings,
-                        "wiris_visible_encoder_idr",
-                        DEFAULT_WIRIS_VISIBLE_ENCODER_PROFILE["idr"],
-                    )
-                ),
-            },
         )
         self.rtsp_enable_worker.moveToThread(self.rtsp_enable_thread)
         self.rtsp_enable_thread.started.connect(self.rtsp_enable_worker.run)
@@ -14207,6 +14198,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.yolo_enabled = enable_detection
             if self.video_recording_enabled:
                 self._raw_video_validation_required = True
+                self._raw_video_expected_cameras = tuple(
+                    dict.fromkeys(
+                        (*self._raw_video_expected_cameras, *started_sides)
+                    )
+                )
             self.start_button.setEnabled(True)
             self.camera_connect_button.setEnabled(True)
             if len(started_sides) != 2:
@@ -14643,17 +14639,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             if left_reference_gps is None or right_reference_gps is None
             else ned_delta_m(left_reference_gps, right_reference_gps)
         )
-        camera_recording_expected = bool(
-            self.camera_connected
-            or self._pending_camera_start is not None
-            or self.left_pane.worker is not None
-            or self.left_pane.thread is not None
-            or self.right_pane.worker is not None
-            or self.right_pane.thread is not None
-        )
         self.distance_recording_enabled = True
         self.video_recording_enabled = True
-        self._raw_video_validation_required = camera_recording_expected
+        # The Legacy action is explicitly a camera/video Session recording,
+        # not a data-only arm switch.  Both configured sides are expected even
+        # before their first GUI frame so a failed worker cannot make MP4
+        # validation disappear from finalization.
+        self._raw_video_validation_required = True
+        self._raw_video_expected_cameras = ("left", "right")
         self._record_px4_mag_status_snapshot()
         self._last_distance_history_key = None
         self._measurement_attempt_counter = 0
@@ -14670,10 +14663,29 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "[저장] 세션 기록을 시작했습니다: "
             f"session={self.recording_session_id}, {self._format_video_recording_paths()}"
         )
-        if self.camera_connected:
-            self._start_camera_streams(enable_detection=self.yolo_enabled, switch_to_depth=self.yolo_enabled)
+        if not self.camera_connected:
+            self._log("[저장] Preview 미연결 상태이므로 좌/우 영상 녹화 스트림을 자동 시작합니다.")
+        try:
+            camera_start_accepted = self._start_camera_streams(
+                enable_detection=self.yolo_enabled,
+                switch_to_depth=self.yolo_enabled,
+            )
+        except Exception as exc:  # noqa: BLE001 - roll back the visible arm state.
+            camera_start_accepted = False
+            camera_start_error = f"{type(exc).__name__}: {exc}"
         else:
-            self._log("[저장] 카메라 스트림을 시작하면 좌/우 영상 녹화가 함께 시작됩니다.")
+            camera_start_error = "camera stream start request rejected"
+        if camera_start_accepted is False:
+            self.distance_recording_enabled = False
+            self.video_recording_enabled = False
+            self.distance_recording_started_monotonic_s = None
+            self._session_save_retry_required = True
+            self.record_button.setText("세션 기록 시작")
+            detail = f"세션 기록 시작 실패: {camera_start_error}"
+            self.recording_status_label.setText(detail)
+            self._log(f"[저장] {detail}")
+            self._refresh_operation_header()
+            return
         self._refresh_recording_status_label()
         self._refresh_operation_header()
 
@@ -15293,6 +15305,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                     "left": len(self.camera_recording_rows["left"]),
                     "right": len(self.camera_recording_rows["right"]),
                 },
+                expected_cameras=self._raw_video_expected_cameras,
             )
             if video_errors:
                 detail = " | ".join(video_errors)
@@ -15396,6 +15409,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._session_save_retry_required = False
             self._session_save_finalized = True
             self._raw_video_validation_required = False
+            self._raw_video_expected_cameras = ()
         else:
             self._session_save_retry_required = True
             self._session_save_finalized = False
@@ -15614,6 +15628,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "left_video_path": str(self.video_recording_paths.get("left", "")),
             "right_video_path": str(self.video_recording_paths.get("right", "")),
             "raw_video_validation_required": self._raw_video_validation_required,
+            "raw_video_expected_cameras": list(self._raw_video_expected_cameras),
             "matched_frame_pair_count": len(self.distance_recording_rows),
             "camera_left_gui_frame_count": len(self.camera_recording_rows["left"]),
             "camera_right_gui_frame_count": len(self.camera_recording_rows["right"]),
@@ -22459,6 +22474,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         }
         self._raw_video_validation_required = bool(
             metadata.get("raw_video_validation_required", False)
+        )
+        raw_expected = metadata.get("raw_video_expected_cameras")
+        self._raw_video_expected_cameras = tuple(
+            str(side)
+            for side in (
+                raw_expected
+                if isinstance(raw_expected, (list, tuple, set))
+                else self.video_recording_paths if self._raw_video_validation_required else ()
+            )
+            if str(side) in {"left", "right"}
         )
         self._session_save_retry_required = True
         self._session_save_finalized = False

@@ -126,6 +126,7 @@ class StatusIndicator(QtWidgets.QFrame):
             "RECONNECTING": "RETRY",
             "QUALIFYING": "QUAL",
             "ATTITUDE STALE": "ATT STALE",
+            "MAVLINK INITIAL RX TIMEOUT": "NO HB",
             "ETH MAVLINK RX STALLED": "ETH STALL",
             "RECOVERING": "RECOVER",
         }

@@ -82,6 +82,44 @@ def test_param_read_defers_attitude_instead_of_dropping_telemetry() -> None:
     assert attitudes[0].roll_deg == pytest.approx(5.72957795)
 
 
+def test_generic_param_api_does_not_reject_explicit_non_stock_parameter_name() -> None:
+    from Workstation.workstation_core.pixhawk_attitude import DualPixhawkMavlinkSubscriber
+
+    class ParamValue:
+        param_id = "CAL_MAG4_ID"
+        param_value = 9.0
+        param_type = 9
+
+        @staticmethod
+        def get_type() -> str:
+            return "PARAM_VALUE"
+
+    class Mav:
+        def __init__(self) -> None:
+            self.requests: list[tuple[object, ...]] = []
+
+        def param_request_read_send(self, *args: object) -> None:
+            self.requests.append(args)
+
+    class Connection:
+        target_system = 1
+        target_component = 1
+
+        def __init__(self) -> None:
+            self.mav = Mav()
+            self.messages = [ParamValue()]
+
+        def recv_match(self, **_kwargs):
+            return self.messages.pop(0) if self.messages else None
+
+    connection = Connection()
+    subscriber = DualPixhawkMavlinkSubscriber(left_url="udp:fake", right_url="")
+    subscriber.connections["left"] = connection
+
+    assert subscriber.read_param("left", "CAL_MAG4_ID", timeout_s=0.1) == pytest.approx(9.0)
+    assert connection.mav.requests == [(1, 1, b"CAL_MAG4_ID", -1)]
+
+
 def test_common_param_receive_loop_preserves_integer_bits_and_unmatched_message() -> None:
     from Workstation.workstation_core import pixhawk_attitude
 
@@ -188,6 +226,62 @@ def test_repeated_mavlink_receive_error_is_rate_limited(monkeypatch) -> None:
 
     receive_errors = [status for status in statuses if "serial sentinel" in status]
     assert len(receive_errors) == 2
+
+
+def test_successful_rtcm_status_is_bounded_per_side_during_frame_burst(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from Workstation.workstation_core import pixhawk_attitude
+
+    clock = [100.0]
+    sent: list[tuple[object, bytes]] = []
+    monkeypatch.setattr(pixhawk_attitude.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        pixhawk_attitude,
+        "_send_mavlink_rtcm_data",
+        lambda connection, payload: sent.append((connection, payload)) or 2,
+    )
+    subscriber = pixhawk_attitude.DualPixhawkMavlinkSubscriber(
+        left_url="udp:left",
+        right_url="udp:right",
+    )
+    subscriber.connections.update(left=object(), right=object())
+    statuses: list[str] = []
+    subscriber.status_changed.connect(statuses.append)
+
+    for _index in range(100):
+        subscriber.send_rtcm_data("left", b"left-frame")
+        subscriber.send_rtcm_data("right", b"right-frame")
+
+    assert len(sent) == 200
+    assert len([text for text in statuses if "RTCM 주입" in text]) == 2
+    assert any(text.startswith("왼쪽 RTCM 주입") for text in statuses)
+    assert any(text.startswith("오른쪽 RTCM 주입") for text in statuses)
+
+    clock[0] += pixhawk_attitude.MAVLINK_RTCM_STATUS_INTERVAL_S - 0.001
+    subscriber.send_rtcm_data("left", b"still-throttled")
+    subscriber.send_rtcm_data("right", b"still-throttled")
+    assert len([text for text in statuses if "RTCM 주입" in text]) == 2
+
+    clock[0] += 0.001
+    subscriber.mavlink_health_snapshot = lambda _side, **_kwargs: SimpleNamespace(
+        rtcm_eligible=True,
+        connection_generation=7,
+    )
+    for _index in range(100):
+        left = subscriber.send_rtcm_data_if_eligible(
+            "left",
+            b"next-window-left",
+            expected_generation=7,
+        )
+        right = subscriber.send_rtcm_data_if_eligible(
+            "right",
+            b"next-window-right",
+            expected_generation=7,
+        )
+        assert left["sent"] is True
+        assert right["sent"] is True
+    assert len([text for text in statuses if "RTCM 주입" in text]) == 4
 
 
 def test_pixhawk_connect_disconnect_operations_do_not_overlap() -> None:
@@ -777,6 +871,587 @@ def test_stock_stream_profile_is_exact_and_private_stream_is_not_retried(monkeyp
     assert len(mav.calls) == initial_count
 
 
+def test_stock_stream_profile_burst_uses_the_side_send_lock() -> None:
+    from Workstation.workstation_core.pixhawk_attitude import (
+        DualPixhawkMavlinkSubscriber,
+        MAVLINK_STOCK_STREAM_REQUESTS,
+    )
+
+    class Guard:
+        def __init__(self) -> None:
+            self.active = False
+            self.entries = 0
+
+        def __enter__(self):
+            assert not self.active
+            self.active = True
+            self.entries += 1
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self.active = False
+
+    guard = Guard()
+    calls: list[tuple[object, ...]] = []
+
+    class Mav:
+        def command_long_send(self, *args: object) -> None:
+            assert guard.active
+            calls.append(args)
+
+    subscriber = DualPixhawkMavlinkSubscriber(left_url="", right_url="")
+    subscriber.connections["left"] = SimpleNamespace(
+        mav=Mav(),
+        mavlink=SimpleNamespace(MAV_CMD_SET_MESSAGE_INTERVAL=511),
+        target_system=1,
+        target_component=1,
+    )
+    subscriber._mavlink_send_locks["left"] = guard
+
+    subscriber._request_mavlink_sensor_streams("left")
+
+    assert guard.entries == 1
+    assert not guard.active
+    assert len(calls) == len(MAVLINK_STOCK_STREAM_REQUESTS)
+
+
+def test_remote_px4_reboot_rearms_only_affected_stock_profile_on_next_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from Workstation.workstation_core import pixhawk_attitude
+    from Workstation.workstation_core.mavlink_liveness import MavlinkLivenessState
+    from Workstation.workstation_core.pixhawk_attitude import (
+        DualPixhawkMavlinkSubscriber,
+        MAVLINK_STOCK_STREAM_REQUESTS,
+    )
+
+    clock = [100.0]
+    monkeypatch.setattr(pixhawk_attitude.time, "monotonic", lambda: clock[0])
+
+    class Message:
+        def __init__(self, message_type: str, system_id: int, **values: object) -> None:
+            self._message_type = message_type
+            self._system_id = system_id
+            self.__dict__.update(values)
+
+        def get_type(self) -> str:
+            return self._message_type
+
+        def get_srcSystem(self) -> int:
+            return self._system_id
+
+        def get_srcComponent(self) -> int:
+            return 1
+
+    class Mav:
+        def __init__(self) -> None:
+            self.commands: list[tuple[object, ...]] = []
+
+        def command_long_send(self, *args: object) -> None:
+            self.commands.append(args)
+
+    def connection(system_id: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            mav=Mav(),
+            mavlink=SimpleNamespace(MAV_CMD_SET_MESSAGE_INTERVAL=511),
+            target_system=system_id,
+            target_component=1,
+        )
+
+    subscriber = DualPixhawkMavlinkSubscriber(
+        left_url="udpin:0.0.0.0:14550",
+        right_url="udpin:0.0.0.0:14551",
+    )
+    subscriber.connections.update({"left": connection(1), "right": connection(2)})
+    statuses: list[str] = []
+    setup_requests: list[str] = []
+    left_attitudes: list[object] = []
+    subscriber.status_changed.connect(statuses.append)
+    subscriber.stream_setup_required.connect(setup_requests.append)
+    subscriber.extrinsic_changed.connect(
+        lambda side, state: left_attitudes.append(state) if side == "left" else None
+    )
+
+    def deliver(side: str, message: Message) -> None:
+        assert subscriber._observe_mavlink_transport_message(
+            side,
+            message,
+            received_at_s=clock[0],
+        )
+        subscriber._handle_mavlink_message(side, message, received_at_s=clock[0])
+
+    def heartbeat(side: str, system_id: int) -> None:
+        deliver(side, Message("HEARTBEAT", system_id))
+
+    def attitude(side: str, system_id: int, boot_ms: int) -> None:
+        deliver(
+            side,
+            Message(
+                "ATTITUDE",
+                system_id,
+                roll=0.0,
+                pitch=0.0,
+                yaw=0.0,
+                time_boot_ms=boot_ms,
+            ),
+        )
+
+    heartbeat("left", 1)
+    attitude("left", 1, 120_000)
+    heartbeat("right", 2)
+    attitude("right", 2, 220_000)
+    for side in ("left", "right"):
+        subscriber._mavlink_liveness[side].qualification_s = 1.0
+
+    clock[0] = 101.1
+    heartbeat("left", 1)
+    attitude("left", 1, 121_100)
+    heartbeat("right", 2)
+    attitude("right", 2, 221_100)
+    assert subscriber.mavlink_health_snapshot("left").state is MavlinkLivenessState.LIVE
+    assert subscriber.mavlink_health_snapshot("right").state is MavlinkLivenessState.LIVE
+
+    profile_size = len(MAVLINK_STOCK_STREAM_REQUESTS)
+    left_mav = subscriber.connections["left"].mav
+    right_mav = subscriber.connections["right"].mav
+    assert len(left_mav.commands) == profile_size
+    assert len(right_mav.commands) == profile_size
+    left_generation = subscriber.mavlink_health_snapshot("left").connection_generation
+    right_generation = subscriber.mavlink_health_snapshot("right").connection_generation
+    subscriber._mavlink_stream_configured.update(("left", "right"))
+    subscriber._stream_setup_requests_sent.update(("left", "right"))
+    statuses.clear()
+
+    # One low sample is only a candidate; the second increasing low sample is
+    # authoritative reboot evidence. No profile command is sent from ATTITUDE.
+    clock[0] = 102.0
+    attitude("left", 1, 100)
+    assert "left" in subscriber._mavlink_stream_requests_sent
+    clock[0] = 102.05
+    attitude("left", 1, 133)
+
+    assert "left" not in subscriber._mavlink_stream_requests_sent
+    assert "right" in subscriber._mavlink_stream_requests_sent
+    assert len(left_mav.commands) == profile_size
+    assert len(right_mav.commands) == profile_size
+    left_health = subscriber.mavlink_health_snapshot("left")
+    right_health = subscriber.mavlink_health_snapshot("right")
+    # A remote boot invalidates PX4 evidence but does not replace the host UDP
+    # listener, so its host connection generation remains stable.
+    assert left_health.connection_generation == left_generation
+    assert left_health.state is MavlinkLivenessState.CONNECTING
+    assert right_health.connection_generation == right_generation
+    assert right_health.state is MavlinkLivenessState.LIVE
+    assert subscriber._mavlink_stream_configured == {"left", "right"}
+    assert subscriber._stream_setup_requests_sent == {"left", "right"}
+    assert setup_requests == []
+
+    # The next expected heartbeat owns one re-request. A delayed packet from
+    # the prior boot and repeated new-boot samples must not create a storm.
+    clock[0] = 102.1
+    heartbeat("left", 1)
+    assert len(left_mav.commands) == profile_size * 2
+    assert len(right_mav.commands) == profile_size
+    assert subscriber.mavlink_health_snapshot("left").state is MavlinkLivenessState.RECOVERING
+
+    clock[0] = 102.15
+    attitude("left", 1, 121_050)
+    clock[0] = 102.2
+    attitude("left", 1, 166)
+    clock[0] = 102.25
+    attitude("left", 1, 199)
+    clock[0] = 103.0
+    heartbeat("left", 1)
+
+    assert len(left_mav.commands) == profile_size * 2
+    assert len(right_mav.commands) == profile_size
+    reboot_statuses = [text for text in statuses if "PX4 재부팅 감지" in text]
+    assert len(reboot_statuses) == 1
+    assert all(int(call[2]) == 511 for call in left_mav.commands)
+    assert len(left_attitudes) == 6
+
+    # The latch belongs to one boot transition, not the lifetime of the host
+    # socket. A later genuine reboot gets one new rearm as well.
+    for observed_s, boot_ms in ((107.0, 4_200), (111.0, 8_200), (115.0, 12_200)):
+        clock[0] = observed_s
+        attitude("left", 1, boot_ms)
+        clock[0] += 0.01
+        heartbeat("left", 1)
+    assert len(left_mav.commands) == profile_size * 2
+
+    clock[0] = 116.0
+    attitude("left", 1, 100)
+    clock[0] = 116.05
+    attitude("left", 1, 133)
+    assert "left" not in subscriber._mavlink_stream_requests_sent
+    clock[0] = 116.1
+    heartbeat("left", 1)
+
+    assert len(left_mav.commands) == profile_size * 3
+    assert len(right_mav.commands) == profile_size
+    assert len([text for text in statuses if "PX4 재부팅 감지" in text]) == 2
+    assert subscriber.mavlink_health_snapshot("right").connection_generation == right_generation
+    assert setup_requests == []
+
+
+def test_rapid_remote_reboot_beyond_reorder_tolerance_rearms_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from Workstation.workstation_core import pixhawk_attitude
+    from Workstation.workstation_core.pixhawk_attitude import (
+        DualPixhawkMavlinkSubscriber,
+        MAVLINK_STOCK_STREAM_REQUESTS,
+    )
+
+    clock = [10.0]
+    monkeypatch.setattr(pixhawk_attitude.time, "monotonic", lambda: clock[0])
+
+    class Message:
+        def __init__(self, message_type: str, **values: object) -> None:
+            self._message_type = message_type
+            self.__dict__.update(values)
+
+        def get_type(self) -> str:
+            return self._message_type
+
+        def get_srcSystem(self) -> int:
+            return 1
+
+        def get_srcComponent(self) -> int:
+            return 1
+
+    class Mav:
+        def __init__(self) -> None:
+            self.commands: list[tuple[object, ...]] = []
+
+        def command_long_send(self, *args: object) -> None:
+            self.commands.append(args)
+
+    mav = Mav()
+    subscriber = DualPixhawkMavlinkSubscriber(left_url="udp:test", right_url="")
+    subscriber.connections["left"] = SimpleNamespace(
+        mav=mav,
+        mavlink=SimpleNamespace(MAV_CMD_SET_MESSAGE_INTERVAL=511),
+        target_system=1,
+        target_component=1,
+    )
+    statuses: list[str] = []
+    subscriber.status_changed.connect(statuses.append)
+
+    def deliver(message: Message, at_s: float) -> None:
+        clock[0] = at_s
+        assert subscriber._observe_mavlink_transport_message(
+            "left", message, received_at_s=at_s
+        )
+        subscriber._handle_mavlink_message("left", message, received_at_s=at_s)
+
+    def attitude(boot_ms: int, at_s: float) -> None:
+        deliver(
+            Message(
+                "ATTITUDE",
+                roll=0.0,
+                pitch=0.0,
+                yaw=0.0,
+                time_boot_ms=boot_ms,
+            ),
+            at_s,
+        )
+
+    deliver(Message("HEARTBEAT"), 10.0)
+    attitude(5_000, 10.01)
+    profile_size = len(MAVLINK_STOCK_STREAM_REQUESTS)
+    assert len(mav.commands) == profile_size
+    statuses.clear()
+
+    attitude(100, 10.1)
+    attitude(133, 10.15)
+    assert "left" not in subscriber._mavlink_stream_requests_sent
+    assert len(mav.commands) == profile_size
+
+    deliver(Message("HEARTBEAT"), 10.2)
+    attitude(166, 10.25)
+    attitude(199, 10.3)
+    deliver(Message("HEARTBEAT"), 10.8)
+
+    assert len(mav.commands) == profile_size * 2
+    assert len([text for text in statuses if "PX4 재부팅 감지" in text]) == 1
+
+
+@pytest.mark.parametrize(
+    ("initial_boot_ms", "later_boot_ms"),
+    (
+        (100_000, (99_001, 100_033)),
+        (100_000, (98_000, 100_033)),
+        ((1 << 32) - 16, (25, 58)),
+    ),
+    ids=("small-out-of-order-regression", "exact-reorder-tolerance", "uint32-wrap"),
+)
+def test_attitude_boot_time_reorder_and_uint32_wrap_do_not_rearm_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    initial_boot_ms: int,
+    later_boot_ms: tuple[int, int],
+) -> None:
+    from Workstation.workstation_core import pixhawk_attitude
+    from Workstation.workstation_core.pixhawk_attitude import (
+        DualPixhawkMavlinkSubscriber,
+        MAVLINK_STOCK_STREAM_REQUESTS,
+    )
+
+    clock = [10.0]
+    monkeypatch.setattr(pixhawk_attitude.time, "monotonic", lambda: clock[0])
+
+    class Message:
+        def __init__(self, message_type: str, **values: object) -> None:
+            self._message_type = message_type
+            self.__dict__.update(values)
+
+        def get_type(self) -> str:
+            return self._message_type
+
+        def get_srcSystem(self) -> int:
+            return 1
+
+        def get_srcComponent(self) -> int:
+            return 1
+
+    class Mav:
+        def __init__(self) -> None:
+            self.commands: list[tuple[object, ...]] = []
+
+        def command_long_send(self, *args: object) -> None:
+            self.commands.append(args)
+
+    mav = Mav()
+    subscriber = DualPixhawkMavlinkSubscriber(left_url="udp:test", right_url="")
+    subscriber.connections["left"] = SimpleNamespace(
+        mav=mav,
+        mavlink=SimpleNamespace(MAV_CMD_SET_MESSAGE_INTERVAL=511),
+        target_system=1,
+        target_component=1,
+    )
+    statuses: list[str] = []
+    subscriber.status_changed.connect(statuses.append)
+
+    def deliver(message: Message) -> None:
+        assert subscriber._observe_mavlink_transport_message(
+            "left", message, received_at_s=clock[0]
+        )
+        subscriber._handle_mavlink_message("left", message, received_at_s=clock[0])
+
+    deliver(Message("HEARTBEAT"))
+    deliver(
+        Message(
+            "ATTITUDE",
+            roll=0.0,
+            pitch=0.0,
+            yaw=0.0,
+            time_boot_ms=initial_boot_ms,
+        )
+    )
+    profile_size = len(MAVLINK_STOCK_STREAM_REQUESTS)
+    assert len(mav.commands) == profile_size
+    statuses.clear()
+
+    for offset, boot_ms in enumerate(later_boot_ms, start=1):
+        clock[0] += 0.05
+        deliver(
+            Message(
+                "ATTITUDE",
+                roll=0.0,
+                pitch=0.0,
+                yaw=0.0,
+                time_boot_ms=boot_ms,
+            )
+        )
+    clock[0] += 0.5
+    deliver(Message("HEARTBEAT"))
+
+    assert len(mav.commands) == profile_size
+    assert "left" in subscriber._mavlink_stream_requests_sent
+    assert not any("PX4 재부팅 감지" in text for text in statuses)
+
+
+def test_boot_time_regression_after_uint32_half_range_is_still_a_reboot() -> None:
+    from Workstation.workstation_core.pixhawk_attitude import _MavlinkBootTimeTracker
+
+    tracker = _MavlinkBootTimeTracker()
+    assert tracker.observe(3_000_000_000, received_at_s=10.0).reboot is None
+    assert tracker.observe(100, received_at_s=10.05).reboot is None
+
+    confirmed = tracker.observe(133, received_at_s=10.1)
+
+    assert confirmed.reboot is not None
+    assert confirmed.reboot.previous_time_boot_ms == 3_000_000_000
+    assert confirmed.reboot.current_time_boot_ms == 133
+
+
+def test_replaced_host_connection_starts_a_fresh_boot_time_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from Workstation.workstation_core import pixhawk_attitude
+    from Workstation.workstation_core.pixhawk_attitude import (
+        DualPixhawkMavlinkSubscriber,
+        MAVLINK_STOCK_STREAM_REQUESTS,
+    )
+
+    clock = [10.0]
+    monkeypatch.setattr(pixhawk_attitude.time, "monotonic", lambda: clock[0])
+
+    class Message:
+        def __init__(self, message_type: str, **values: object) -> None:
+            self._message_type = message_type
+            self.__dict__.update(values)
+
+        def get_type(self) -> str:
+            return self._message_type
+
+        def get_srcSystem(self) -> int:
+            return 1
+
+        def get_srcComponent(self) -> int:
+            return 1
+
+    class Mav:
+        def __init__(self) -> None:
+            self.commands: list[tuple[object, ...]] = []
+
+        def command_long_send(self, *args: object) -> None:
+            self.commands.append(args)
+
+    class Connection:
+        target_system = 1
+        target_component = 1
+
+        def __init__(self) -> None:
+            self.mav = Mav()
+            self.mavlink = SimpleNamespace(MAV_CMD_SET_MESSAGE_INTERVAL=511)
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    subscriber = DualPixhawkMavlinkSubscriber(left_url="udp:test", right_url="")
+    statuses: list[str] = []
+    subscriber.status_changed.connect(statuses.append)
+
+    def deliver(message: Message, received_at_s: float) -> None:
+        clock[0] = received_at_s
+        assert subscriber._observe_mavlink_transport_message(
+            "left", message, received_at_s=received_at_s
+        )
+        subscriber._handle_mavlink_message(
+            "left", message, received_at_s=received_at_s
+        )
+
+    original = Connection()
+    subscriber.connections["left"] = original
+    deliver(Message("HEARTBEAT"), 10.0)
+    deliver(
+        Message(
+            "ATTITUDE",
+            roll=0.0,
+            pitch=0.0,
+            yaw=0.0,
+            time_boot_ms=100_000,
+        ),
+        10.1,
+    )
+    original_generation = subscriber.mavlink_health_snapshot(
+        "left", now_s=10.1
+    ).connection_generation
+    subscriber.stop("left")
+    assert original.closed
+
+    replacement = Connection()
+    subscriber.connections["left"] = replacement
+    statuses.clear()
+    for received_at_s, boot_ms in ((20.0, 100), (20.05, 133)):
+        deliver(
+            Message(
+                "ATTITUDE",
+                roll=0.0,
+                pitch=0.0,
+                yaw=0.0,
+                time_boot_ms=boot_ms,
+            ),
+            received_at_s,
+        )
+    deliver(Message("HEARTBEAT"), 20.1)
+
+    assert len(replacement.mav.commands) == len(MAVLINK_STOCK_STREAM_REQUESTS)
+    assert not any("PX4 재부팅 감지" in text for text in statuses)
+    assert subscriber.mavlink_health_snapshot(
+        "left", now_s=20.1
+    ).connection_generation == original_generation + 1
+
+
+def test_device_runtime_passes_and_syncs_explicit_pixhawk_peer_hosts() -> None:
+    from Workstation.device_runtime_controller import DeviceRuntimeController
+
+    panel = SimpleNamespace(
+        mavlink_pixhawk=None,
+        left_mavlink_url_edit=SimpleNamespace(text=lambda: "udpin:0.0.0.0:14550"),
+        right_mavlink_url_edit=SimpleNamespace(text=lambda: "udpin:0.0.0.0:14551"),
+        left_mavlink_baud_spin=SimpleNamespace(value=lambda: 57600),
+        right_mavlink_baud_spin=SimpleNamespace(value=lambda: 57600),
+        left_pixhawk_eth_ip_edit=SimpleNamespace(text=lambda: "10.0.0.2"),
+        right_pixhawk_eth_ip_edit=SimpleNamespace(text=lambda: "10.0.0.3"),
+        custom_watch_specs=[],
+        _update_extrinsic=lambda *_args: None,
+        _update_gps=lambda *_args: None,
+        _update_mag_sensor=lambda *_args: None,
+        _update_gps_sensor=lambda *_args: None,
+        _update_gnss_relative=lambda *_args: None,
+        _update_custom_watch=lambda *_args: None,
+        _update_mavlink_optional_timeline=lambda *_args: None,
+        _handle_mavlink_stream_setup_required=lambda *_args: None,
+        _append_px4_shell_output=lambda *_args: None,
+        _handle_mavlink_status_changed=lambda *_args: None,
+    )
+    controller = DeviceRuntimeController(panel)
+
+    subscriber = controller._ensure_mavlink_subscriber()
+
+    assert subscriber.peer_hosts == {"left": "10.0.0.2", "right": "10.0.0.3"}
+    panel.left_pixhawk_eth_ip_edit = SimpleNamespace(text=lambda: "10.0.0.12")
+    panel.right_pixhawk_eth_ip_edit = SimpleNamespace(text=lambda: "10.0.0.13")
+    controller._sync_mavlink_subscriber_settings()
+    assert subscriber.peer_hosts == {"left": "10.0.0.12", "right": "10.0.0.13"}
+
+
+def test_automatic_calibration_param_refresh_waits_for_live_qualification() -> None:
+    from Workstation.device_runtime_controller import DeviceRuntimeController
+
+    health = {"left": "QUALIFYING", "right": "MAVLINK INITIAL RX TIMEOUT"}
+
+    class Subscriber:
+        connections = {"left": object(), "right": object()}
+
+        @staticmethod
+        def mavlink_health_snapshot(side: str):
+            return SimpleNamespace(state=SimpleNamespace(value=health[side]))
+
+    started: list[tuple[str, str]] = []
+    panel = SimpleNamespace(
+        mavlink_pixhawk=Subscriber(),
+        _px4_calibration_auto_refreshed_sides=set(),
+        _start_pixhawk_parameter_worker=lambda side, operation: started.append((side, operation)),
+    )
+    controller = DeviceRuntimeController(panel)
+
+    controller._auto_refresh_px4_calibration_params_when_live()
+    assert started == []
+    assert panel._px4_calibration_auto_refreshed_sides == set()
+
+    health["left"] = "LIVE"
+    controller._auto_refresh_px4_calibration_params_when_live()
+    assert started == [("left", "calibration_refresh")]
+    assert panel._px4_calibration_auto_refreshed_sides == {"left"}
+
+    controller._auto_refresh_px4_calibration_params_when_live()
+    assert started == [("left", "calibration_refresh")]
+
+
 def test_all_rx_stall_blocks_initial_and_attitude_stream_requests(monkeypatch: pytest.MonkeyPatch) -> None:
     from Workstation.workstation_core import pixhawk_attitude
     from Workstation.workstation_core.pixhawk_attitude import DualPixhawkMavlinkSubscriber
@@ -808,7 +1483,7 @@ def test_all_rx_stall_blocks_initial_and_attitude_stream_requests(monkeypatch: p
     assert model.observe_packet(
         system_id=1,
         component_id=1,
-        message_type="SYS_STATUS",
+        message_type="HEARTBEAT",
         received_at_s=clock[0],
         generation=generation,
     )
@@ -2105,6 +2780,246 @@ def test_pixhawk_connection_and_stream_setup_workers_keep_transport_io_off_ui_pa
     assert subscriber.setup_args["host_ip"] == "10.41.10.1"
     assert setup_results[0]["cameras"] == ("left",)
     assert connection_results[0]["connections"] == ("left",)
+
+
+def test_pixhawk_connect_status_precedes_gui_completion_without_precompletion_repolish_and_starts_timer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    workstation_qapplication,
+) -> None:
+    import threading
+
+    from PyQt5 import QtCore
+
+    from Workstation import device_runtime_controller, standalone_gui
+    from Workstation.workstation_core.pixhawk_attitude import DualPixhawkMavlinkSubscriber
+
+    monkeypatch.setattr(
+        standalone_gui.WirisStereoDistancePanel,
+        "_initial_status",
+        lambda _self: None,
+    )
+    monkeypatch.setattr(
+        standalone_gui.WirisStereoDistancePanel,
+        "_auto_load_intrinsics",
+        lambda _self: None,
+    )
+    app = workstation_qapplication
+    panel = standalone_gui.WirisStereoDistancePanel(
+        app_root=tmp_path,
+        settings_path=tmp_path / "settings.json",
+    )
+    gui_thread = panel.thread()
+    worker_entered = threading.Event()
+    release_worker = threading.Event()
+    events: list[tuple[str, QtCore.QThread]] = []
+    probe_threads: list[QtCore.QThread] = []
+    receive_tick_threads: list[QtCore.QThread] = []
+
+    class Connection:
+        target_system = 1
+        target_component = 1
+
+        def recv_match(self, **_kwargs):
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class GatedSubscriber(DualPixhawkMavlinkSubscriber):
+        def start(
+            self,
+            camera=None,
+            *,
+            start_timer=True,
+            apply_pending_setup=False,
+        ) -> None:
+            assert camera == "left"
+            assert start_timer is False
+            assert apply_pending_setup is False
+            events.append(("worker", QtCore.QThread.currentThread()))
+            self.connections["left"] = Connection()
+            for index in range(32):
+                self.status_changed.emit(f"connect-status-{index}")
+            worker_entered.set()
+            if not release_worker.wait(2.0):
+                raise RuntimeError("test release timeout")
+
+    subscriber = GatedSubscriber(
+        left_url="udpin:0.0.0.0:14550",
+        right_url="",
+    )
+    subscriber.timer.timeout.connect(
+        lambda: receive_tick_threads.append(QtCore.QThread.currentThread())
+    )
+    monkeypatch.setattr(
+        device_runtime_controller,
+        "DualPixhawkMavlinkSubscriber",
+        lambda **_kwargs: subscriber,
+    )
+    # Keep the real connect completion and receive-timer boundary while
+    # excluding unrelated post-connect shell/PARAM workers.
+    monkeypatch.setattr(panel, "_request_mavlink_eth0_status", lambda *_args: None)
+    monkeypatch.setattr(panel, "refresh_px4_mag_manager", lambda *_args: None)
+    monkeypatch.setattr(panel, "refresh_px4_attitude_cal_status", lambda *_args: None)
+    monkeypatch.setattr(panel, "_refresh_operation_header", lambda *_args: None)
+
+    real_status = panel._handle_mavlink_status_changed
+
+    def tracked_status(text: str) -> None:
+        events.append(("status", QtCore.QThread.currentThread()))
+        real_status(text)
+
+    monkeypatch.setattr(panel, "_handle_mavlink_status_changed", tracked_status)
+    real_apply = panel._apply_pixhawk_connection_result
+
+    def tracked_apply(camera, force_setup, target_sides) -> None:
+        events.append(("completed", QtCore.QThread.currentThread()))
+        real_apply(camera, force_setup, target_sides)
+
+    monkeypatch.setattr(panel, "_apply_pixhawk_connection_result", tracked_apply)
+    real_set_role = panel._set_button_role
+
+    def tracked_set_role(button, role: str) -> None:
+        if button.property("role") != role:
+            events.append(("role-change", QtCore.QThread.currentThread()))
+        real_set_role(button, role)
+
+    monkeypatch.setattr(panel, "_set_button_role", tracked_set_role)
+    real_refresh_actions = panel._refresh_mavlink_side_actions
+
+    def tracked_refresh_actions() -> None:
+        events.append(("action-refresh", QtCore.QThread.currentThread()))
+        real_refresh_actions()
+
+    monkeypatch.setattr(
+        panel,
+        "_refresh_mavlink_side_actions",
+        tracked_refresh_actions,
+    )
+
+    probe = QtCore.QTimer(panel)
+    probe.setInterval(1)
+    probe.timeout.connect(
+        lambda: probe_threads.append(QtCore.QThread.currentThread())
+    )
+    thread = None
+    try:
+        panel.connect_mavlink_pixhawk("left")
+        thread = panel.pixhawk_connection_thread
+        assert thread is not None
+        assert worker_entered.wait(1.0)
+
+        # The transport is open but completion is deliberately held. Status
+        # delivery must stay cheap and must not force a synchronous QStyle
+        # repolish before the GUI-owner completion can start the receive timer.
+        probe.start()
+        deadline = time.monotonic() + 1.0
+        while (
+            not probe_threads
+            or len([event for event in events if event[0] == "status"]) < 32
+        ) and time.monotonic() < deadline:
+            app.processEvents(QtCore.QEventLoop.AllEvents, 10)
+            time.sleep(0.001)
+
+        assert probe_threads
+        assert all(owner is gui_thread for owner in probe_threads)
+        status_threads = [owner for name, owner in events if name == "status"]
+        assert len(status_threads) == 32
+        assert all(owner is gui_thread for owner in status_threads)
+        assert not any(name == "completed" for name, _owner in events)
+        assert not any(name == "role-change" for name, _owner in events)
+        assert len([name for name, _owner in events if name == "action-refresh"]) <= 1
+
+        release_worker.set()
+        deadline = time.monotonic() + 2.0
+        while (
+            panel.pixhawk_connection_thread is not None
+            or not subscriber.timer.isActive()
+            or not receive_tick_threads
+        ) and time.monotonic() < deadline:
+            app.processEvents(QtCore.QEventLoop.AllEvents, 10)
+            time.sleep(0.001)
+
+        names = [name for name, _owner in events]
+        assert names.index("status") < names.index("completed") < names.index("role-change")
+        assert [owner for name, owner in events if name == "worker"] == [thread]
+        assert [owner for name, owner in events if name == "completed"] == [gui_thread]
+        assert subscriber.timer.thread() is gui_thread
+        assert subscriber.timer.isActive()
+        assert receive_tick_threads
+        assert all(owner is gui_thread for owner in receive_tick_threads)
+        assert panel.pixhawk_connection_thread is None
+        assert panel.left_mavlink_button.text() == "Disconnect P1 MAVLink"
+        assert panel.left_mavlink_button.property("role") == "danger"
+        assert len([name for name, _owner in events if name == "action-refresh"]) <= 3
+    finally:
+        release_worker.set()
+        probe.stop()
+        deadline = time.monotonic() + 2.0
+        try:
+            while thread is not None and thread.isRunning() and time.monotonic() < deadline:
+                app.processEvents(QtCore.QEventLoop.AllEvents, 10)
+                time.sleep(0.001)
+            if thread is not None and thread.isRunning():
+                thread.quit()
+                assert thread.wait(1_000)
+        except RuntimeError:
+            pass
+        subscriber.timer.stop()
+        subscriber.connections.clear()
+        panel.mavlink_pixhawk = None
+        panel._save_current_settings = lambda: None
+        panel.close()
+        panel.deleteLater()
+        app.processEvents()
+
+
+def test_dynamic_button_role_change_never_forces_synchronous_qstyle_repolish() -> None:
+    from Workstation import standalone_gui
+
+    class BlockingStyleSentinel:
+        def unpolish(self, _button) -> None:
+            raise AssertionError("button role must not synchronously unpolish QStyle")
+
+        def polish(self, _button) -> None:
+            raise AssertionError("button role must not synchronously polish QStyle")
+
+    class Button:
+        def __init__(self) -> None:
+            self.role = "primary"
+            self.update_count = 0
+
+        def property(self, name: str):
+            assert name == "role"
+            return self.role
+
+        def setProperty(self, name: str, value: str) -> None:
+            assert name == "role"
+            self.role = value
+
+        def style(self) -> BlockingStyleSentinel:
+            return BlockingStyleSentinel()
+
+        def update(self) -> None:
+            self.update_count += 1
+
+    button = Button()
+
+    standalone_gui.WirisStereoDistancePanel._set_button_role(
+        SimpleNamespace(),
+        button,
+        "danger",
+    )
+    standalone_gui.WirisStereoDistancePanel._set_button_role(
+        SimpleNamespace(),
+        button,
+        "danger",
+    )
+
+    assert button.role == "danger"
+    assert button.update_count == 1
+
 
 def test_pixhawk_usb_bootstrap_worker_keeps_usb_shell_and_cleanup_off_ui_path(monkeypatch) -> None:
     from Workstation import standalone_gui

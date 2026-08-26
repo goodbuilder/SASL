@@ -7,6 +7,7 @@ persistence I/O runs in Workstation.session_workers.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -57,6 +58,7 @@ from Workstation.workstation_core.native_frame_store import AsyncNativeFrameStor
 from Workstation.workstation_core.native_evidence_writer import (
     AsyncNativeEvidenceWriter,
     EVIDENCE_FRAME_UNAVAILABLE,
+    RingPairReservation,
 )
 from Workstation.workstation_core.native_frame_ring import FrameKey
 from Workstation.workstation_core.measurement_data_store import (
@@ -72,6 +74,7 @@ from Workstation.ulog_controller import (
     ULogController,
 )
 from Workstation.workstation_core.mavlink_sources import MavlinkSourceId
+from Workstation.workstation_core.mp4_integrity import H264_MP4_INTEGRITY_SCHEMA
 from Workstation.workstation_core.recording_session import (
     SavedSessionFiles,
     SpoolRows,
@@ -107,6 +110,143 @@ from Workstation.wiris_runtime_workers import (
 
 RECORDING_PREVIEW_LIMIT = 256
 RECORDING_KEY_CACHE_LIMIT = 1024
+_RECORDING_START_MISSING = object()
+
+# Every panel attribute replaced while opening a recording session.  The
+# transaction keeps the original objects (including any unsaved legacy rows)
+# alive until start commits, then restores those exact objects on failure.
+_RECORDING_START_STATE_ATTRIBUTES = (
+    "_recording_mode",
+    "_manual_recording_active",
+    "recording_session_id",
+    "_pnp_session_prepared",
+    "_session_save_finalized",
+    "_measurement_attempt_generation_id",
+    "recording_session_started_unix_ns",
+    "recording_session_started_monotonic_ns",
+    "recording_session_anchor_uncertainty_ns",
+    "recording_session_started_wall_s",
+    "recording_session_started_monotonic_s",
+    "distance_recording_started_monotonic_s",
+    "distance_recording_rows",
+    "distance_recording_keys",
+    "external_parameter_recording_rows",
+    "camera_recording_rows",
+    "px4_recording_rows",
+    "gnss_base_recording_rows",
+    "extrinsics_comparison_recording_rows",
+    "method_evaluation_bundle_rows",
+    "_recording_pair_row_index",
+    "_recording_pending_native_request_rows",
+    "_recovered_session_metadata",
+    "_recovered_session_output_dir",
+    "_recording_clock_sync_start_observation",
+    "_recording_clock_sync_end_observation",
+    "recording_reference_attitudes",
+    "recording_reference_gps",
+    "recording_origin_gps",
+    "recording_nominal_intrinsics_snapshot",
+    "recording_nominal_optical_pose_profile_hash",
+    "recording_reference_baseline_ned_m",
+    "distance_recording_enabled",
+    "video_recording_enabled",
+    "_last_distance_history_key",
+    "_measurement_attempt_counter",
+    "_last_measurement_attempt_key",
+    "_last_measurement_attempt",
+    "_last_frozen_measurement_pair",
+    "_method_evaluation_submitted",
+    "_method_evaluation_committed",
+    "_method_evaluation_accepting",
+    "_method_evaluation_stop_retry_scheduled",
+    "_native_frame_stop_retry_scheduled",
+    "_recording_stop_retry_generation",
+    "_recording_stop_retry_request",
+    "_measurement_method_result_counters",
+    "video_recording_paths",
+    "_video_recording_allocation_sizes",
+    "_video_recording_start_snapshot",
+)
+
+
+def _nonfinite_external_reason(value: float) -> str:
+    if math.isnan(value):
+        return "nan"
+    return "positive_infinity" if value > 0.0 else "negative_infinity"
+
+
+def _normalize_external_timeline_value(
+    value: object,
+    *,
+    path: str,
+    nonfinite_reasons: dict[str, str],
+) -> object:
+    """Replace only non-finite numerics while retaining their exact source path."""
+
+    if isinstance(value, float) and not math.isfinite(value):
+        nonfinite_reasons[path] = _nonfinite_external_reason(value)
+        return None
+    if isinstance(value, Mapping):
+        normalized: dict[str, object] = {}
+        for key, item in value.items():
+            name = str(key)
+            child_path = f"{path}.{name}" if path else name
+            normalized[name] = _normalize_external_timeline_value(
+                item,
+                path=child_path,
+                nonfinite_reasons=nonfinite_reasons,
+            )
+        return normalized
+    if isinstance(value, list):
+        return [
+            _normalize_external_timeline_value(
+                item,
+                path=f"{path}[{index}]",
+                nonfinite_reasons=nonfinite_reasons,
+            )
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _normalize_external_timeline_value(
+                item,
+                path=f"{path}[{index}]",
+                nonfinite_reasons=nonfinite_reasons,
+            )
+            for index, item in enumerate(value)
+        )
+    return value
+
+
+def _normalize_external_timeline_values(
+    values: Mapping[str, object],
+) -> tuple[dict[str, object], dict[str, str]]:
+    """Return a JSON-safe numeric payload and merged producer evidence."""
+
+    detected_reasons: dict[str, str] = {}
+    normalized = {
+        str(key): _normalize_external_timeline_value(
+            value,
+            path=str(key),
+            nonfinite_reasons=detected_reasons,
+        )
+        for key, value in values.items()
+    }
+    raw_fields = normalized.pop("nonfinite_source_fields", ())
+    raw_reasons = normalized.pop("nonfinite_source_reasons", {})
+    merged_reasons: dict[str, str] = {}
+    if isinstance(raw_reasons, Mapping):
+        for field, reason in raw_reasons.items():
+            field_name = str(field).strip()
+            if field_name:
+                merged_reasons[field_name] = str(reason or "non_finite")
+    if isinstance(raw_fields, (list, tuple)):
+        for field in raw_fields:
+            field_name = str(field).strip()
+            if field_name:
+                merged_reasons.setdefault(field_name, "non_finite")
+    merged_reasons.update(detected_reasons)
+    return normalized, merged_reasons
 
 
 def new_measurement_attempt_generation_id(session_id: str = "") -> str:
@@ -115,6 +255,8 @@ def new_measurement_attempt_generation_id(session_id: str = "") -> str:
 
 RECORDING_CONTROLLER_METHODS = [
     "_refresh_recording_status_label",
+    "video_recording_start_snapshot",
+    "_set_video_recording_start_snapshot",
     "_recording_table_value",
     "_recording_preview_rows",
     "_recording_sheet_names",
@@ -129,6 +271,9 @@ RECORDING_CONTROLLER_METHODS = [
     "start_automatic_session_recording",
     "stop_automatic_session_recording",
     "_start_session_recording",
+    "_schedule_legacy_recording_stop_retry",
+    "_cancel_legacy_recording_stop_retry",
+    "_retry_legacy_recording_stop",
     "_recover_retryable_recording_session",
     "_stop_session_recording",
     "capture_pnp_hr_photos",
@@ -256,6 +401,9 @@ class RecordingController:
         if not bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", True)):
             active = self.panel._session_recording_active()
             mode = str(getattr(self.panel, "_recording_mode", "manual") or "manual")
+            video_state = str(
+                self.video_recording_start_snapshot().get("state") or "IDLE"
+            )
             storage_reader = getattr(self.panel, "data_storage_snapshot", None)
             try:
                 storage = storage_reader() if callable(storage_reader) else {}
@@ -265,7 +413,8 @@ class RecordingController:
             dropped = int(storage.get("dropped_records") or 0)
             self.panel.recording_status_label.setText(
                 f"데이터 기록: {'진행 중' if active else '중지'} · mode={mode} · "
-                f"storage={storage_state} · pairs={len(self.panel.distance_recording_rows)}"
+                f"video={video_state} · storage={storage_state} · "
+                f"pairs={len(self.panel.distance_recording_rows)}"
                 + (f" · dropped={dropped}" if dropped else "")
             )
             return
@@ -280,6 +429,89 @@ class RecordingController:
             "세션 기록: "
             f"{state}, 매칭 프레임쌍={len(self.panel.distance_recording_rows)}{session}"
         )
+
+    def video_recording_start_snapshot(self) -> dict[str, object]:
+        snapshot = getattr(self.panel, "_video_recording_start_snapshot", None)
+        if not isinstance(snapshot, dict):
+            return {
+                "schema": "workstation-video-start-v1",
+                "state": "IDLE",
+                "detail": "video recording is not requested",
+                "sides": {},
+            }
+        return copy.deepcopy(snapshot)
+
+    def _set_video_recording_start_snapshot(
+        self,
+        sides: Mapping[str, Mapping[str, object]] | None,
+        *,
+        detail: str = "",
+        refresh: bool = True,
+    ) -> dict[str, object]:
+        normalized_sides: dict[str, dict[str, object]] = {}
+        for side in ("left", "right"):
+            raw = (sides or {}).get(side)
+            if not isinstance(raw, Mapping):
+                continue
+            state = str(raw.get("state") or "FAILED").upper()
+            if state not in {"WAITING_FOR_CAMERA", "STARTING", "RUNNING", "FAILED"}:
+                state = "FAILED"
+            normalized_sides[side] = {
+                "state": state,
+                "path": str(raw.get("path") or ""),
+                "size_bytes": max(0, int(raw.get("size_bytes") or 0)),
+                "detail": str(raw.get("detail") or ""),
+            }
+        states = tuple(row["state"] for row in normalized_sides.values())
+        if not states:
+            aggregate = "IDLE"
+        elif any(state in {"WAITING_FOR_CAMERA", "STARTING"} for state in states):
+            aggregate = "STARTING"
+        elif all(state == "RUNNING" for state in states):
+            aggregate = "RUNNING"
+        elif any(state == "RUNNING" for state in states):
+            aggregate = "PARTIAL"
+        else:
+            aggregate = "FAILED"
+        snapshot = {
+            "schema": "workstation-video-start-v1",
+            "state": aggregate,
+            "detail": str(detail),
+            "sides": normalized_sides,
+            "updated_monotonic_s": time.monotonic(),
+        }
+        previous = self.video_recording_start_snapshot()
+        self.panel._video_recording_start_snapshot = snapshot
+        if aggregate == "FAILED" and not any(
+            row["state"] == "RUNNING" for row in normalized_sides.values()
+        ):
+            # Distance/telemetry collection remains active.  This flag only
+            # claims that a video branch has independently become usable.
+            self.panel.video_recording_enabled = False
+        changed = (
+            previous.get("state") != aggregate
+            or previous.get("sides") != normalized_sides
+            or previous.get("detail") != str(detail)
+        )
+        append = getattr(self.panel, "append_workstation_data", None)
+        if changed and callable(append):
+            append(
+                "events",
+                {
+                    "event_type": "video_start_state_changed",
+                    "runtime_generation": str(
+                        getattr(self.panel, "recording_session_id", "") or ""
+                    ),
+                    "state": aggregate,
+                    "detail": str(detail),
+                    "sides": copy.deepcopy(normalized_sides),
+                },
+                priority=True,
+            )
+        refresher = getattr(self.panel, "_refresh_recording_status_label", None)
+        if refresh and changed and callable(refresher):
+            refresher()
+        return self.video_recording_start_snapshot()
 
     def _recording_table_value(self, row: dict[str, object], field: str) -> str:
         value = row.get(field, "")
@@ -434,6 +666,280 @@ class RecordingController:
         lines = [f"{key}: {value}" for key, value in row.items()]
         self.panel.recording_sample_detail.setPlainText("\n".join(lines))
 
+    @staticmethod
+    def _widget_text(widget: object | None) -> str | None:
+        reader = getattr(widget, "text", None)
+        if not callable(reader):
+            return None
+        try:
+            return str(reader())
+        except (AttributeError, RuntimeError, TypeError):
+            return None
+
+    def _recording_start_snapshot(self) -> dict[str, object]:
+        retry_timer = getattr(self.panel, "_recording_stop_retry_timer", None)
+        try:
+            retry_timer_active = bool(retry_timer is not None and retry_timer.isActive())
+            retry_timer_remaining_ms = (
+                max(1, int(retry_timer.remainingTime()))
+                if retry_timer_active
+                else 0
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            retry_timer_active = False
+            retry_timer_remaining_ms = 0
+        return {
+            "attributes": {
+                name: getattr(self.panel, name, _RECORDING_START_MISSING)
+                for name in _RECORDING_START_STATE_ATTRIBUTES
+            },
+            "deferred_native_frame_results": self._deferred_native_frame_results,
+            "record_button_text": self._widget_text(
+                getattr(self.panel, "record_button", None)
+            ),
+            "status_label_text": self._widget_text(
+                getattr(self.panel, "recording_status_label", None)
+            ),
+            "camera_connected": bool(
+                getattr(self.panel, "camera_connected", False)
+            ),
+            "yolo_enabled": bool(getattr(self.panel, "yolo_enabled", False)),
+            "recording_stop_retry_timer_active": retry_timer_active,
+            "recording_stop_retry_timer_remaining_ms": retry_timer_remaining_ms,
+        }
+
+    @staticmethod
+    def _recording_row_resources(value: object) -> tuple[object, ...]:
+        if isinstance(value, Mapping):
+            return tuple(value.values())
+        return (value,)
+
+    def _release_failed_recording_start_rows(
+        self,
+        previous_attributes: Mapping[str, object],
+        created_resources: Sequence[object] = (),
+    ) -> None:
+        row_attributes = (
+            "distance_recording_rows",
+            "camera_recording_rows",
+            "px4_recording_rows",
+            "gnss_base_recording_rows",
+            "extrinsics_comparison_recording_rows",
+            "method_evaluation_bundle_rows",
+        )
+        previous_ids = {
+            id(resource)
+            for name in row_attributes
+            for resource in self._recording_row_resources(
+                previous_attributes.get(name, _RECORDING_START_MISSING)
+            )
+            if resource is not _RECORDING_START_MISSING
+        }
+        candidates: list[object] = list(created_resources)
+        for name in row_attributes:
+            current = getattr(self.panel, name, _RECORDING_START_MISSING)
+            candidates.extend(self._recording_row_resources(current))
+        released: set[int] = set()
+        for resource in candidates:
+            identity = id(resource)
+            if (
+                resource is _RECORDING_START_MISSING
+                or identity in previous_ids
+                or identity in released
+            ):
+                continue
+            released.add(identity)
+            closer = getattr(resource, "discard_spool", None)
+            if not callable(closer):
+                closer = getattr(resource, "close", None)
+            if not callable(closer):
+                continue
+            try:
+                closer()
+            except (OSError, RuntimeError, TypeError, ValueError):
+                pass
+
+    def _rollback_failed_recording_start(
+        self,
+        snapshot: Mapping[str, object],
+        *,
+        camera_start_attempted: bool,
+        created_row_resources: Sequence[object] = (),
+    ) -> None:
+        attributes = snapshot.get("attributes")
+        previous_attributes = (
+            dict(attributes) if isinstance(attributes, Mapping) else {}
+        )
+        if camera_start_attempted:
+            cancel_start = getattr(self.panel, "_cancel_pending_camera_start", None)
+            if callable(cancel_start):
+                try:
+                    cancel_start()
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    pass
+            stopper = getattr(self.panel, "stop_yolo_streams", None)
+            if callable(stopper):
+                try:
+                    stopper(wait=False)
+                except TypeError:
+                    try:
+                        stopper()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+        self._release_failed_recording_start_rows(
+            previous_attributes,
+            created_row_resources,
+        )
+        for name, value in previous_attributes.items():
+            if value is _RECORDING_START_MISSING:
+                try:
+                    delattr(self.panel, name)
+                except AttributeError:
+                    pass
+            else:
+                setattr(self.panel, name, value)
+        deferred = snapshot.get(
+            "deferred_native_frame_results", _RECORDING_START_MISSING
+        )
+        if deferred is not _RECORDING_START_MISSING:
+            self._deferred_native_frame_results = deferred  # type: ignore[assignment]
+        retry_timer = getattr(self.panel, "_recording_stop_retry_timer", None)
+        if (
+            retry_timer is not None
+            and bool(snapshot.get("recording_stop_retry_timer_active", False))
+            and getattr(self.panel, "_recording_stop_retry_request", None) is not None
+        ):
+            try:
+                retry_timer.start(
+                    max(
+                        1,
+                        int(
+                            snapshot.get(
+                                "recording_stop_retry_timer_remaining_ms", 100
+                            )
+                            or 100
+                        ),
+                    )
+                )
+            except (RuntimeError, TypeError, ValueError):
+                pass
+
+        for widget_name, snapshot_name in (
+            ("record_button", "record_button_text"),
+            ("recording_status_label", "status_label_text"),
+        ):
+            text = snapshot.get(snapshot_name)
+            setter = getattr(getattr(self.panel, widget_name, None), "setText", None)
+            if text is not None and callable(setter):
+                try:
+                    setter(str(text))
+                except (AttributeError, RuntimeError, TypeError):
+                    pass
+
+        sync_rtcm_context = getattr(self.panel, "_sync_rtcm_evidence_context", None)
+        if callable(sync_rtcm_context):
+            try:
+                sync_rtcm_context()
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                pass
+        for method_name in (
+            "_refresh_recording_table",
+            "_refresh_recording_status_label",
+            "_refresh_operation_header",
+        ):
+            refresher = getattr(self.panel, method_name, None)
+            if callable(refresher):
+                try:
+                    refresher()
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    pass
+
+        if camera_start_attempted and bool(snapshot.get("camera_connected", False)):
+            restarter = getattr(self.panel, "_start_camera_streams", None)
+            if callable(restarter):
+                detection = bool(snapshot.get("yolo_enabled", False))
+                try:
+                    restarter(
+                        enable_detection=detection,
+                        switch_to_depth=detection,
+                    )
+                except Exception:
+                    pass
+
+    def _schedule_legacy_recording_stop_retry(
+        self,
+        *,
+        restart_streams: bool,
+        final_clock_sync_snapshot: dict[str, object] | None,
+        barrier: str,
+    ) -> None:
+        generation = int(
+            getattr(self.panel, "_recording_stop_retry_generation", 0) or 0
+        ) + 1
+        self.panel._recording_stop_retry_generation = generation
+        self.panel._recording_stop_retry_request = {
+            "generation": generation,
+            "recording_session_id": str(
+                getattr(self.panel, "recording_session_id", "") or ""
+            ),
+            "restart_streams": bool(restart_streams),
+            "final_clock_sync_snapshot": final_clock_sync_snapshot,
+            "barrier": str(barrier),
+        }
+        timer = getattr(self.panel, "_recording_stop_retry_timer", None)
+        if timer is None:
+            parent = self.panel if isinstance(self.panel, QtCore.QObject) else None
+            timer = QtCore.QTimer(parent)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._retry_legacy_recording_stop)
+            self.panel._recording_stop_retry_timer = timer
+        timer.start(100)
+
+    def _cancel_legacy_recording_stop_retry(self) -> None:
+        self.panel._recording_stop_retry_generation = int(
+            getattr(self.panel, "_recording_stop_retry_generation", 0) or 0
+        ) + 1
+        self.panel._recording_stop_retry_request = None
+        self.panel._method_evaluation_stop_retry_scheduled = False
+        self.panel._native_frame_stop_retry_scheduled = False
+        timer = getattr(self.panel, "_recording_stop_retry_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except RuntimeError:
+                pass
+
+    def _retry_legacy_recording_stop(self) -> None:
+        request = getattr(self.panel, "_recording_stop_retry_request", None)
+        if not isinstance(request, Mapping):
+            return
+        generation = int(request.get("generation") or -1)
+        if generation != int(
+            getattr(self.panel, "_recording_stop_retry_generation", 0) or 0
+        ):
+            return
+        expected_session = str(request.get("recording_session_id") or "")
+        current_session = str(
+            getattr(self.panel, "recording_session_id", "") or ""
+        )
+        if expected_session != current_session:
+            self._cancel_legacy_recording_stop_retry()
+            return
+        active = getattr(self.panel, "_session_recording_active", None)
+        if callable(active) and not bool(active()):
+            self._cancel_legacy_recording_stop_retry()
+            return
+        self.panel._recording_stop_retry_request = None
+        self.panel._method_evaluation_stop_retry_scheduled = False
+        self.panel._native_frame_stop_retry_scheduled = False
+        self._stop_session_recording(
+            restart_streams=bool(request.get("restart_streams", True)),
+            final_clock_sync_snapshot=request.get("final_clock_sync_snapshot"),
+        )
+
     def toggle_session_recording(self) -> bool | None:
         if self.panel._session_recording_active():
             self.panel._stop_session_recording()
@@ -447,23 +953,45 @@ class RecordingController:
 
         if self.panel._session_recording_active():
             return True
-        previous_mode = str(getattr(self.panel, "_recording_mode", "manual") or "manual")
+        previous_automatic = bool(
+            getattr(self.panel, "_automatic_session_recording", False)
+        )
+        previous_manual = bool(
+            getattr(self.panel, "_manual_recording_active", False)
+        )
+        previous_mode = str(
+            getattr(self.panel, "_recording_mode", "manual") or "manual"
+        )
         self.panel._automatic_session_recording = True
         self.panel._manual_recording_active = False
         self.panel._recording_mode = "automatic_detection"
         try:
             result = self._start_session_recording(start_camera_streams=False)
         except Exception:
-            self.panel._automatic_session_recording = False
+            self.panel._automatic_session_recording = previous_automatic
+            self.panel._manual_recording_active = previous_manual
             self.panel._recording_mode = previous_mode
             raise
         if result is False:
-            self.panel._automatic_session_recording = False
+            self.panel._automatic_session_recording = previous_automatic
+            self.panel._manual_recording_active = previous_manual
             self.panel._recording_mode = previous_mode
             return False
-        self.panel.recording_status_label.setText(
-            "측정 데이터 기록: 진행 중"
-        )
+        try:
+            refresh = getattr(self.panel, "_refresh_recording_status_label", None)
+            if callable(refresh):
+                refresh()
+            else:
+                self.panel.recording_status_label.setText(
+                    "측정 데이터 기록: STARTING · video=STARTING"
+                )
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            logger = getattr(self.panel, "_log", None)
+            if callable(logger):
+                try:
+                    logger(f"[저장] 자동 기록 상태 표시 갱신 실패: {exc}")
+                except Exception:
+                    pass
         return True
 
     def stop_automatic_session_recording(
@@ -492,9 +1020,62 @@ class RecordingController:
         self.panel._automatic_session_recording = False
         return True
 
-    def _start_session_recording(self, *, start_camera_streams: bool = True) -> bool | None:
-        if not bool(getattr(self.panel, "_automatic_session_recording", False)):
-            self.panel._recording_mode = "manual"
+    def _start_session_recording(
+        self,
+        *,
+        start_camera_streams: bool = True,
+    ) -> bool | None:
+        automatic = bool(
+            getattr(self.panel, "_automatic_session_recording", False)
+        )
+        if not automatic and bool(
+            getattr(self.panel, "_shutdown_in_progress", False)
+        ):
+            status_text = "Manual recording start rejected: application shutdown is in progress"
+            self.panel.recording_status_label.setText(status_text)
+            logger = getattr(self.panel, "_log", None)
+            if callable(logger):
+                logger(f"[저장] {status_text}")
+            return False
+
+        snapshot = self._recording_start_snapshot()
+        transaction: dict[str, object] = {
+            "camera_start_attempted": False,
+            "created_row_resources": [],
+        }
+        try:
+            return self._start_session_recording_transaction_body(
+                start_camera_streams=start_camera_streams,
+                transaction=transaction,
+            )
+        except Exception:
+            self._rollback_failed_recording_start(
+                snapshot,
+                camera_start_attempted=bool(
+                    transaction.get("camera_start_attempted", False)
+                ),
+                created_row_resources=tuple(
+                    transaction.get("created_row_resources", ()) or ()
+                ),
+            )
+            raise
+
+    def _start_session_recording_transaction_body(
+        self,
+        *,
+        start_camera_streams: bool,
+        transaction: dict[str, object],
+    ) -> bool | None:
+        stus_operation = getattr(self.panel, "_camera_sync_stus_operation", None)
+        if isinstance(stus_operation, dict) and bool(stus_operation.get("active")):
+            status_text = (
+                "데이터 기록: WIRIS 시간 폐루프 보정/검증 완료 대기 중 "
+                f"(attempt {stus_operation.get('attempts_started', 1)}/"
+                f"{stus_operation.get('max_attempts', 2)})"
+            )
+            self.panel.recording_status_label.setText(status_text)
+            self.panel._log(f"[저장] {status_text}")
+            return False
         if self._camera_photo_capture_active():
             self.panel.recording_status_label.setText("데이터 기록: HR/OZ still 캡처 완료 대기 중")
             return False
@@ -512,6 +1093,9 @@ class RecordingController:
             self.panel.recording_status_label.setText(status_text)
             self.panel._log(f"[저장] {status_text}")
             return False
+        if not bool(getattr(self.panel, "_automatic_session_recording", False)):
+            self.panel._recording_mode = "manual"
+        self._cancel_legacy_recording_stop_retry()
         self.panel._manual_recording_active = not bool(
             getattr(self.panel, "_automatic_session_recording", False)
         )
@@ -521,19 +1105,6 @@ class RecordingController:
         self.panel.recording_session_id = generation or f"manual-{uuid.uuid4().hex}"
         self.panel._pnp_session_prepared = False
         self.panel._session_save_finalized = False
-        append = getattr(self.panel, "append_workstation_data", None)
-        if callable(append):
-            append(
-                "events",
-                {
-                    "event_type": "recording_started",
-                    "recording_mode": str(
-                        getattr(self.panel, "_recording_mode", "manual") or "manual"
-                    ),
-                    "runtime_generation": self.panel.recording_session_id,
-                },
-                priority=True,
-            )
         self.panel._measurement_attempt_generation_id = new_measurement_attempt_generation_id(
             self.panel.recording_session_id
         )
@@ -549,35 +1120,44 @@ class RecordingController:
         self.panel.recording_session_started_wall_s = self.panel.recording_session_started_unix_ns * 1e-9
         self.panel.recording_session_started_monotonic_s = self.panel.recording_session_started_monotonic_ns * 1e-9
         self.panel.distance_recording_started_monotonic_s = self.panel.recording_session_started_monotonic_s
-        self.panel.distance_recording_rows = self._new_live_rows(
+        created_row_resources = transaction.get("created_row_resources")
+        if not isinstance(created_row_resources, list):
+            created_row_resources = []
+            transaction["created_row_resources"] = created_row_resources
+
+        def allocate_rows(stream: str, **kwargs: object) -> object:
+            rows = self._new_live_rows(stream, **kwargs)
+            created_row_resources.append(rows)
+            return rows
+
+        self.panel.distance_recording_rows = allocate_rows(
             "measurements",
             preview_limit=RECORDING_PREVIEW_LIMIT,
             priority=True,
         )
-        self.panel.distance_recording_keys.clear()
-        self.panel.external_parameter_recording_rows.clear()
+        self.panel.distance_recording_keys = []
+        previous_external_rows = getattr(
+            self.panel, "external_parameter_recording_rows", None
+        )
+        self.panel.external_parameter_recording_rows = deque(
+            maxlen=getattr(previous_external_rows, "maxlen", 256) or 256
+        )
         self.panel.camera_recording_rows = {
-            side: self._new_live_rows(f"camera.{side}") for side in ("left", "right")
+            side: allocate_rows(f"camera.{side}") for side in ("left", "right")
         }
         self.panel.px4_recording_rows = {
-            side: self._new_live_rows(f"px4.{side}") for side in ("left", "right")
+            side: allocate_rows(f"px4.{side}") for side in ("left", "right")
         }
-        self.panel.gnss_base_recording_rows = self._new_live_rows("gnss.base")
-        self.panel.extrinsics_comparison_recording_rows = self._new_live_rows(
+        self.panel.gnss_base_recording_rows = allocate_rows("gnss.base")
+        self.panel.extrinsics_comparison_recording_rows = allocate_rows(
             "geometry.comparisons"
         )
-        self.panel.method_evaluation_bundle_rows = self._new_live_rows(
+        self.panel.method_evaluation_bundle_rows = allocate_rows(
             "method_evaluations", priority=True
         )
-        self.panel._recording_pair_row_index.clear()
-        pending_native_rows = getattr(
-            self.panel,
-            "_recording_pending_native_request_rows",
-            None,
-        )
-        if isinstance(pending_native_rows, dict):
-            pending_native_rows.clear()
-        self._deferred_native_frame_results.clear()
+        self.panel._recording_pair_row_index = {}
+        self.panel._recording_pending_native_request_rows = {}
+        self._deferred_native_frame_results = {}
         self.panel._recovered_session_metadata = None
         self.panel._recovered_session_output_dir = None
         self.panel._recording_clock_sync_start_observation = None
@@ -624,6 +1204,35 @@ class RecordingController:
             for method_id in MEASUREMENT_METHOD_IDS
         }
         self.panel._prepare_video_recording_paths()
+        video_start_sides: dict[str, dict[str, object]] = {}
+        allocation_sizes: dict[str, int] = {}
+        for side in ("left", "right"):
+            raw_path = self.panel.video_recording_paths.get(side)
+            if raw_path is None:
+                video_start_sides[side] = {
+                    "state": "FAILED",
+                    "path": "",
+                    "size_bytes": 0,
+                    "detail": "video path was not allocated; data collection continues",
+                }
+                continue
+            path = Path(raw_path).expanduser()
+            try:
+                baseline_size = path.stat().st_size if path.is_file() else 0
+            except OSError:
+                baseline_size = 0
+            allocation_sizes[side] = baseline_size
+            video_start_sides[side] = {
+                "state": "WAITING_FOR_CAMERA",
+                "path": str(path),
+                "size_bytes": baseline_size,
+                "detail": "waiting for camera worker and positive file growth",
+            }
+        self.panel._video_recording_allocation_sizes = allocation_sizes
+        self._set_video_recording_start_snapshot(
+            video_start_sides,
+            detail="video paths allocated; camera worker postcondition pending",
+        )
         self.panel._refresh_recording_table()
         self.panel.record_button.setText("수동 기록 중지")
         self.panel._log(
@@ -631,11 +1240,40 @@ class RecordingController:
             f"mode={self.panel._recording_mode}, {self.panel._format_video_recording_paths()}"
         )
         if start_camera_streams and self.panel.camera_connected:
-            self.panel._start_camera_streams(enable_detection=self.panel.yolo_enabled, switch_to_depth=self.panel.yolo_enabled)
+            transaction["camera_start_attempted"] = True
+            self.panel._start_camera_streams(
+                enable_detection=self.panel.yolo_enabled,
+                switch_to_depth=self.panel.yolo_enabled,
+            )
         elif start_camera_streams:
             self.panel._log("[저장] 카메라 스트림을 시작하면 좌/우 영상 녹화가 함께 시작됩니다.")
         self.panel._refresh_recording_status_label()
         self.panel._refresh_operation_header()
+        append = getattr(self.panel, "append_workstation_data", None)
+        if callable(append):
+            try:
+                append(
+                    "events",
+                    {
+                        "event_type": "recording_started",
+                        "recording_mode": str(
+                            getattr(self.panel, "_recording_mode", "manual")
+                            or "manual"
+                        ),
+                        "runtime_generation": self.panel.recording_session_id,
+                    },
+                    priority=True,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                # Measurement data is availability-first.  Failing to enqueue
+                # this status event must not turn an otherwise complete start
+                # into a half-rolled-back camera/session boundary.
+                try:
+                    self.panel._log(
+                        f"[저장] recording_started event 기록 실패: {exc}"
+                    )
+                except Exception:
+                    pass
         return None
 
     @staticmethod
@@ -826,6 +1464,7 @@ class RecordingController:
         final_clock_sync_snapshot: dict[str, object] | None = None,
     ) -> None:
         if not bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", True)):
+            self._cancel_legacy_recording_stop_retry()
             # Sessionless stop is a resource boundary, not a persistence
             # transaction. Optional/late writers retain their own bounded
             # ownership and never delay the next Measurement.
@@ -834,6 +1473,11 @@ class RecordingController:
                 self.panel._recording_clock_sync_end_observation = final_clock_sync_snapshot
             self.panel.distance_recording_enabled = False
             self.panel.video_recording_enabled = False
+            self._set_video_recording_start_snapshot(
+                {},
+                detail="video recording stopped",
+                refresh=False,
+            )
             self.panel.distance_recording_started_monotonic_s = None
             sync_rtcm_context = getattr(
                 self.panel, "_sync_rtcm_evidence_context", None
@@ -881,11 +1525,47 @@ class RecordingController:
                         if isinstance(finalizations, dict)
                         else {}
                     )
+                    h264_copy = str(backend or "").strip().lower() in {
+                        "gst",
+                        "gstreamer",
+                    }
+                    integrity_pass = bool(
+                        finalization.get("integrity_schema")
+                        == H264_MP4_INTEGRITY_SCHEMA
+                        and finalization.get("integrity_validation_status") == "PASS"
+                        and finalization.get("recording_usable") is True
+                        and finalization.get("recording_integrity_verified") is True
+                    )
+                    integrity_status = str(
+                        finalization.get("integrity_validation_status")
+                        or ("PENDING" if not finalization else "FAIL")
+                    )
+                    integrity_failure_reasons = list(
+                        finalization.get("integrity_failure_reasons", ()) or ()
+                    )
+                    if h264_copy and finalization and not integrity_pass:
+                        integrity_status = "FAIL"
+                        if (
+                            finalization.get("integrity_schema")
+                            != H264_MP4_INTEGRITY_SCHEMA
+                        ):
+                            integrity_failure_reasons.append(
+                                "integrity_validation_schema_invalid"
+                            )
+                        if not integrity_failure_reasons:
+                            integrity_failure_reasons.append(
+                                "finalized_mp4_integrity_evidence_incomplete"
+                            )
+                        integrity_failure_reasons = list(
+                            dict.fromkeys(integrity_failure_reasons)
+                        )
                     finalization_state = (
                         "success"
                         if finalization.get("success") is True
+                        and (integrity_pass if h264_copy else True)
                         else "failed"
                         if finalization.get("success") is False
+                        or (h264_copy and finalization.get("success") is True)
                         else "pending"
                     )
                     append(
@@ -897,6 +1577,16 @@ class RecordingController:
                             "media_type": "video/mp4",
                             "stream_backend": backend,
                             **recording_integrity_contract(backend),
+                            "container_finalization_success": bool(
+                                finalization.get(
+                                    "container_finalization_success",
+                                    finalization.get("success", False),
+                                )
+                            ),
+                            "integrity_validation_status": integrity_status,
+                            "recording_integrity_verified": bool(integrity_pass),
+                            "recording_usable": bool(integrity_pass),
+                            "integrity_failure_reasons": integrity_failure_reasons,
                             "finalization_state": finalization_state,
                             "finalization_detail": str(
                                 finalization.get("detail") or ""
@@ -954,15 +1644,11 @@ class RecordingController:
                     )
                 ):
                     self.panel._method_evaluation_stop_retry_scheduled = True
-
-                    def retry_stop() -> None:
-                        self.panel._method_evaluation_stop_retry_scheduled = False
-                        self.panel._stop_session_recording(
-                            restart_streams=restart_streams,
-                            final_clock_sync_snapshot=final_clock_sync_snapshot,
-                        )
-
-                    QtCore.QTimer.singleShot(100, retry_stop)
+                    self._schedule_legacy_recording_stop_retry(
+                        restart_streams=restart_streams,
+                        final_clock_sync_snapshot=final_clock_sync_snapshot,
+                        barrier="method_evaluation",
+                    )
                 return
         pending_native_frames = self.native_frame_persistence_pending_count()
         if pending_native_frames:
@@ -973,16 +1659,13 @@ class RecordingController:
                 getattr(self.panel, "_native_frame_stop_retry_scheduled", False)
             ):
                 self.panel._native_frame_stop_retry_scheduled = True
-
-                def retry_native_stop() -> None:
-                    self.panel._native_frame_stop_retry_scheduled = False
-                    self.panel._stop_session_recording(
-                        restart_streams=restart_streams,
-                        final_clock_sync_snapshot=final_clock_sync_snapshot,
-                    )
-
-                QtCore.QTimer.singleShot(100, retry_native_stop)
+                self._schedule_legacy_recording_stop_retry(
+                    restart_streams=restart_streams,
+                    final_clock_sync_snapshot=final_clock_sync_snapshot,
+                    barrier="native_frame_persistence",
+                )
             return
+        self._cancel_legacy_recording_stop_retry()
         self._shutdown_native_frame_stores()
         if final_clock_sync_snapshot is None:
             final_clock_sync_snapshot = (
@@ -3153,6 +3836,7 @@ class RecordingController:
         pair_id: str,
         purpose: str,
         record_key: tuple[object, ...] | None = None,
+        reservation: RingPairReservation | None = None,
     ) -> dict[str, object]:
         """Persist evaluated-pair source pixels without resizing or overlays.
 
@@ -3162,9 +3846,13 @@ class RecordingController:
         """
 
         if not self.panel.recording_session_id:
+            if reservation is not None:
+                reservation.release()
             return {"native_pair_status": "session_id_missing"}
         resolver = getattr(self.panel, "_recording_session_dir", None)
         if not callable(resolver):
+            if reservation is not None:
+                reservation.release()
             return {"native_pair_status": "session_directory_owner_missing"}
         session_id = str(self.panel.recording_session_id)
         root = Path(resolver(session_id))
@@ -3228,6 +3916,8 @@ class RecordingController:
         if exact_ring_mode and len(exact_ring_frames) != 2:
             missing = missing or ["left", "right"]
         if missing:
+            if reservation is not None:
+                reservation.release()
             return {
                 "native_pair_status": EVIDENCE_FRAME_UNAVAILABLE,
                 "native_pair_error": (
@@ -3246,6 +3936,26 @@ class RecordingController:
         }
         if exact_ring_mode:
             writer = self._native_evidence_writer_for_session(session_id, root)
+            if reservation is not None:
+                expected_keys = tuple(
+                    frame_key for _side, _ring, frame_key, _metadata in exact_ring_frames
+                )
+                if reservation.frame_keys != expected_keys:
+                    reservation.release()
+                    return {
+                        "native_pair_status": EVIDENCE_FRAME_UNAVAILABLE,
+                        "native_pair_error": (
+                            "pre-pinned pair reservation does not match selected FrameKeys"
+                        ),
+                        "evidence_state": "REJECTED",
+                    }
+                return writer.enqueue_reserved_pair(
+                    request_id=request_id,
+                    pair_id=pair_id,
+                    purpose=purpose,
+                    reservation=reservation,
+                    context=context,
+                )
             return writer.enqueue_ring_pair(
                 request_id=request_id,
                 pair_id=pair_id,
@@ -3254,6 +3964,8 @@ class RecordingController:
                 context=context,
             )
 
+        if reservation is not None:
+            reservation.release()
         store = self._native_frame_store_for_session(session_id, root)
         scheduled = store.enqueue_pair(
             request_id=request_id,
@@ -4278,23 +4990,51 @@ class RecordingController:
         side = self.panel._recording_side(camera)
         if side is None:
             return
+        normalized_values, nonfinite_reasons = _normalize_external_timeline_values(
+            values
+        )
         if side not in self.panel.px4_recording_rows:
             rows = self._new_live_rows(f"px4.{side}")
             self.panel.px4_recording_rows[side] = rows
         host_receive_monotonic_ns = time.monotonic_ns()
         host_receive_utc_ns = time.time_ns()
-        raw_sample_monotonic_s = values.get("sample_app_timestamp_s")
-        sample_monotonic_s = (
-            host_receive_monotonic_ns * 1e-9
-            if raw_sample_monotonic_s in (None, "")
-            else float(raw_sample_monotonic_s)
-        )
-        raw_gps_utc_us = values.get("gps_utc_us")
-        source_utc_ns = (
-            None
-            if raw_gps_utc_us in (None, "", 0, "0")
-            else int(raw_gps_utc_us) * 1000
-        )
+        raw_sample_monotonic_s = normalized_values.get("sample_app_timestamp_s")
+        sample_timestamp_source = "sample_app_timestamp_s"
+        sample_timestamp_fallback_reason = ""
+        if raw_sample_monotonic_s in (None, ""):
+            sample_monotonic_s = host_receive_monotonic_ns * 1e-9
+            sample_timestamp_source = "host_receive_monotonic_ns"
+            reason = nonfinite_reasons.get("sample_app_timestamp_s")
+            sample_timestamp_fallback_reason = (
+                f"sample_app_timestamp_s is non-finite: {reason}"
+                if reason is not None
+                else "sample_app_timestamp_s unavailable"
+            )
+        else:
+            try:
+                sample_monotonic_s = float(raw_sample_monotonic_s)
+            except (TypeError, ValueError, OverflowError):
+                sample_monotonic_s = host_receive_monotonic_ns * 1e-9
+                sample_timestamp_source = "host_receive_monotonic_ns"
+                sample_timestamp_fallback_reason = (
+                    "sample_app_timestamp_s is not numeric"
+                )
+            if not math.isfinite(sample_monotonic_s):
+                # The recursive normalizer owns floats, but keep this guard for
+                # numeric wrappers that expose float(...) without subclassing float.
+                sample_monotonic_s = host_receive_monotonic_ns * 1e-9
+                sample_timestamp_source = "host_receive_monotonic_ns"
+                sample_timestamp_fallback_reason = (
+                    "sample_app_timestamp_s converted to a non-finite number"
+                )
+        raw_gps_utc_us = normalized_values.get("gps_utc_us")
+        if raw_gps_utc_us in (None, "", 0, "0"):
+            source_utc_ns = None
+        else:
+            try:
+                source_utc_ns = int(raw_gps_utc_us) * 1000
+            except (TypeError, ValueError, OverflowError):
+                source_utc_ns = None
         rows = self.panel.px4_recording_rows[side]
         row = self.panel._raw_timeline_row(
             side=side,
@@ -4304,7 +5044,9 @@ class RecordingController:
             host_receive_monotonic_ns=host_receive_monotonic_ns,
             host_receive_utc_ns=host_receive_utc_ns,
             source_utc_ns=source_utc_ns,
-            source_utc_method=str(values.get("source_utc_method") or "gps_utc"),
+            source_utc_method=str(
+                normalized_values.get("source_utc_method") or "gps_utc"
+            ),
             sequence=len(rows),
         )
         if row is None:
@@ -4317,7 +5059,14 @@ class RecordingController:
             }
         )
         row.update(mavlink_link_provenance(self.panel, side))
-        row.update(values)
+        row.update(normalized_values)
+        row["sample_timestamp_source"] = sample_timestamp_source
+        row["sample_timestamp_fallback_reason"] = sample_timestamp_fallback_reason
+        if nonfinite_reasons:
+            row["nonfinite_source_fields"] = sorted(nonfinite_reasons)
+            row["nonfinite_source_reasons"] = {
+                name: nonfinite_reasons[name] for name in sorted(nonfinite_reasons)
+            }
         rows.append(row)
         self.panel.external_parameter_recording_rows.append(row)
         self.panel._refresh_recording_status_label()

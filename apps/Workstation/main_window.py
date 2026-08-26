@@ -1732,13 +1732,18 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         # in settings_payload()'s JSON-safe dict (see NetworkConfig /
         # ntrip_credentials.py). It needs its own explicit handoff here,
         # where both this workspace and the backend are in scope.
+        payload = self.settings_workspace.settings_payload()
         if bool(getattr(self.settings_workspace, "_gnss_network_password_explicit", False)):
+            network = payload["gnss_operation"]["network"]
             password_applied = self.backend.set_gnss_ntrip_session_password(
-                self.settings_workspace.gnss_network_password_edit.text()
+                self.settings_workspace.gnss_network_password_edit.text(),
+                caster_host=str(network.get("caster_host", "")),
+                mountpoint=str(network.get("mountpoint", "")),
+                username=str(network.get("username", "")),
             )
             if password_applied is False:
                 raise RuntimeError("NTRIP session password apply was rejected")
-        return self.backend.apply_workstation_system_settings(self.settings_workspace.settings_payload())
+        return self.backend.apply_workstation_system_settings(payload)
 
     def _settings_save(self) -> object:
         applied = self._settings_apply()
@@ -1850,7 +1855,14 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         recording_state = recording.state if recording else "IDLE"
         recording_locked = recording_state in {"ACTIVE", "FINALIZING"}
         panel = getattr(self.backend, "panel", self.backend)
-        clock_change_active = getattr(panel, "wiris_time_sync_thread", None) is not None
+        stus_operation = getattr(panel, "_camera_sync_stus_operation", None)
+        clock_change_active = (
+            getattr(panel, "wiris_time_sync_thread", None) is not None
+            or (
+                isinstance(stus_operation, dict)
+                and bool(stus_operation.get("active"))
+            )
+        )
         automatic_recording = bool(
             getattr(panel, "_automatic_session_recording", False)
         )
@@ -1874,7 +1886,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 button.setEnabled(not recording_locked and not rtsp_operation_active)
         time_set_button = self.time_workspace.operation_buttons.get("time.set_pc")
         if time_set_button is not None:
-            time_set_button.setEnabled(not recording_locked)
+            time_set_button.setEnabled(not recording_locked and not clock_change_active)
         swap_button = self.alignment.operation_buttons.get("alignment.swap_pixhawks")
         if swap_button is not None:
             swap_button.setEnabled(not recording_locked)
@@ -1932,17 +1944,20 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 and not recovery_active
                 and pixhawk_state_by_side.get(side) == "ETH MAVLINK RX STALLED",
             )
-        self.commands.set_enabled("time.set_pc", not recording_locked)
+        self.commands.set_enabled("time.set_pc", not recording_locked and not clock_change_active)
         # Never hide a Measurement start/stop request behind presentation
         # state.  The backend command boundary owns the fail-closed checks and
         # reports why an unsafe lifecycle or writer transition was rejected.
         self.commands.set_enabled("detection.toggle", True)
-        self.commands.set_enabled(
-            "recording.toggle",
+        manual_record_enabled = (
             not automatic_recording
             and recording_state not in {"FINALIZING", "RECOVERABLE"}
-            and (recording_locked or not clock_change_active),
+            and (recording_locked or not clock_change_active)
         )
+        self.commands.set_enabled("recording.toggle", manual_record_enabled)
+        manual_record_button = self.advanced.operation_buttons.get("recording.toggle")
+        if manual_record_button is not None:
+            manual_record_button.setEnabled(manual_record_enabled)
         camera_state = snapshot.get("camera.left")
         self.commands.set_text("camera.toggle", "Stop preview" if camera_state and camera_state.state in {"LIVE", "STARTING"} else "Preview")
         detection = snapshot.get("detection")

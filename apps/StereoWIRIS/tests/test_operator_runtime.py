@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,6 +15,7 @@ from sasl_common.operator_runtime import (
     SOFTWARE_H264_DECODER,
     DecoderSelection,
     check_official_interpreter,
+    check_python_distributions,
     check_runtime_executables,
     probe_gstreamer,
     render_report,
@@ -105,6 +108,70 @@ def test_required_native_executables_have_package_recovery() -> None:
     }
     assert all(item.level == "FAIL" for item in diagnostics)
     assert {item.ubuntu_packages[0] for item in diagnostics} == {"gstreamer1.0-tools", "ffmpeg"}
+
+
+def test_deployment_bootstrap_import_does_not_require_venv_site_packages() -> None:
+    common_python = Path(__file__).resolve().parents[3] / "common" / "python"
+    script = (
+        "import sys; "
+        f"sys.path.insert(0, {str(common_python)!r}); "
+        "import sasl_common.operator_runtime; "
+        "print('bootstrap import ok')"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "bootstrap import ok"
+
+
+def _runtime_manifest(root: Path, requirement: str) -> None:
+    manifest = root / "requirements" / "runtime.txt"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(requirement + "\n", encoding="utf-8")
+
+
+def test_runtime_distributions_reject_enabled_user_site(tmp_path: Path) -> None:
+    _runtime_manifest(tmp_path, "example-package>=1,<2")
+
+    diagnostics = check_python_distributions(
+        root=tmp_path,
+        version_lookup=lambda _name: "1.5",
+        user_site_enabled=True,
+    )
+
+    assert diagnostics[0].level == "FAIL"
+    assert diagnostics[0].code == "python.user_site"
+
+
+def test_runtime_distributions_enforce_declared_version_ranges(tmp_path: Path) -> None:
+    _runtime_manifest(tmp_path, "example-package>=1,<2")
+
+    diagnostics = check_python_distributions(
+        root=tmp_path,
+        version_lookup=lambda _name: "2.1",
+        user_site_enabled=False,
+    )
+
+    assert diagnostics[0].level == "FAIL"
+    assert diagnostics[0].code == "python.distributions.version"
+
+
+def test_runtime_distributions_accept_isolated_matching_versions(tmp_path: Path) -> None:
+    _runtime_manifest(tmp_path, "example-package>=1,<2")
+
+    diagnostics = check_python_distributions(
+        root=tmp_path,
+        version_lookup=lambda _name: "1.5",
+        user_site_enabled=False,
+    )
+
+    assert diagnostics[0].level == "PASS"
 
 
 @pytest.mark.parametrize("missing_element", REQUIRED_GSTREAMER_ELEMENTS)
@@ -287,5 +354,16 @@ def test_auto_software_capability_sets_effective_decoder_without_rejecting_camer
         allowed = owner._apply_decoder_start_policy(panel)
 
     assert allowed is True
-    assert panel._runtime_decoder_override == DECODER_SOFTWARE
+    if owner_name == "CameraStreamLifecycleController":
+        assert panel._runtime_decoder_override is None
+        assert panel._runtime_decoder_overrides == {
+            "left": DECODER_SOFTWARE,
+            "right": DECODER_SOFTWARE,
+        }
+        assert panel.decoder_fallback_reasons == {
+            "left": selected.reason,
+            "right": selected.reason,
+        }
+    else:
+        assert panel._runtime_decoder_override == DECODER_SOFTWARE
     assert logs and "avdec_h264" in logs[-1]

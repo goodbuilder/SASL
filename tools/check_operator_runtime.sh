@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The doctor must measure the same closed runtime used by the operator
+# launchers.  In particular, do not let an invoking shell's user packages,
+# ROS overlay, or locally installed GStreamer plugins satisfy the check.
+export PYTHONNOUSERSITE=1
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+unset PYTHONPATH
+unset PYTHONHOME
+unset LD_LIBRARY_PATH
+unset GI_TYPELIB_PATH
+unset GST_PLUGIN_PATH
+unset GST_PLUGIN_PATH_1_0
+unset GST_PLUGIN_SYSTEM_PATH
+unset GST_PLUGIN_SYSTEM_PATH_1_0
+unset GST_PLUGIN_SCANNER
+unset GST_PLUGIN_SCANNER_1_0
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SASL_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CANONICAL_PYTHON="$SASL_ROOT/.venv/bin/python"

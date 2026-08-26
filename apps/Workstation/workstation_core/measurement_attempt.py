@@ -58,6 +58,7 @@ DETECTION_METADATA_ALLOWLIST = (
     "native_channels",
     "native_byte_length",
     "native_pixel_format",
+    "timestamp_s",
     "source_timestamp_s",
     "timestamp_source",
     "timestamp_reference",

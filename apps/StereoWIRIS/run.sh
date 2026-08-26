@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
+# Start from the repository/system contract. ROS setup below may append its
+# own explicit overlay paths, but ~/.local and an ambient Python path cannot
+# silently satisfy the operator runtime.
+export PYTHONNOUSERSITE=1
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+unset PYTHONPATH
+unset PYTHONHOME
+unset LD_LIBRARY_PATH
+unset GI_TYPELIB_PATH
+unset GST_PLUGIN_PATH
+unset GST_PLUGIN_PATH_1_0
+unset GST_PLUGIN_SYSTEM_PATH
+unset GST_PLUGIN_SYSTEM_PATH_1_0
+unset GST_PLUGIN_SCANNER
+unset GST_PLUGIN_SCANNER_1_0
+
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SASL_ROOT="$(cd "$APP_DIR/../.." && pwd)"
 SASL_ROS_WORKSPACE="${SASL_ROS_WORKSPACE:-$SASL_ROOT/workspace/main}"
@@ -9,8 +25,6 @@ PX4_MSGS_OVERLAY_SETUP="$SASL_ROS_WORKSPACE/install/setup.bash"
 PX4_MSGS_OVERLAY_MANIFEST="$SASL_ROS_WORKSPACE/install/share/sasl_ros_workspace/px4_msgs-overlay.env"
 PX4_MSGS_REF="${PX4_MSGS_REF:-86d8239e962f6939e05c3737784f60c02fa884db}"
 CANONICAL_PYTHON="$SASL_ROOT/.venv/bin/python"
-export PATH="$HOME/.local/bin:$PATH"
-export LD_LIBRARY_PATH="$HOME/.local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-$APP_DIR/.cache/matplotlib}"
 mkdir -p "$MPLCONFIGDIR"
 
@@ -168,7 +182,7 @@ if [[ "$(realpath -s -m "$PYTHON_BIN")" != "$(realpath -s -m "$CANONICAL_PYTHON"
   exit 2
 fi
 
-export PYTHONPATH="$APP_DIR/compat:$APP_DIR:$SASL_ROOT/apps:$SASL_ROOT/common/python:$SASL_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$APP_DIR/compat:$APP_DIR:$SASL_ROOT/apps:$SASL_ROOT/common/python:$SASL_ROOT"
 
 # The interpreter and common media runtime must be valid before any ROS
 # overlay can change Python/library lookup paths.

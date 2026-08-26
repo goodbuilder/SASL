@@ -324,8 +324,21 @@ class StandalonePanelBackend(QtCore.QObject):
     def gnss_ntrip_forget_password(self) -> Any:
         return self._call("forget_gnss_ntrip_password")
 
-    def set_gnss_ntrip_session_password(self, password: str) -> Any:
-        return self._call("set_gnss_ntrip_session_password", password)
+    def set_gnss_ntrip_session_password(
+        self,
+        password: str,
+        *,
+        caster_host: str | None = None,
+        mountpoint: str | None = None,
+        username: str | None = None,
+    ) -> Any:
+        return self._call(
+            "set_gnss_ntrip_session_password",
+            password,
+            caster_host=caster_host,
+            mountpoint=mountpoint,
+            username=username,
+        )
 
     def calibration_capture_images(self) -> Any:
         return self._call("capture_calibration_images")

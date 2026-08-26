@@ -241,6 +241,7 @@ def _valid_runtime_versions(*, include_av: bool = False) -> dict[str, str]:
         "pymavlink": "2.4.49",
         "pyqtgraph": "0.13.7",
         "keyring": "23.5.0",
+        "setuptools": "79.0.1",
         "packaging": "25.0",
         "ultralytics": "8.4.0",
     }
@@ -268,6 +269,11 @@ def test_runtime_requirements_make_av_conditional_and_numpy_strict() -> None:
     incompatible["numpy"] = "1.26.4"
     errors = _runtime_version_errors(incompatible, gstreamer_requirements)
     assert errors == ["numpy==1.26.4 does not satisfy >=1.23.5,<1.25"]
+
+    incompatible = _valid_runtime_versions()
+    incompatible["setuptools"] = "80.0.0"
+    errors = _runtime_version_errors(incompatible, gstreamer_requirements)
+    assert errors == ["setuptools==80.0.0 does not satisfy >=77,<80"]
 
     errors = _runtime_version_errors(_valid_runtime_versions(), pyav_requirements)
     assert errors == ["missing distribution av (required >=11,<16)"]

@@ -191,6 +191,12 @@ At startup the GUI only reports the selected network interface and leaves camera
 
 Use this tab for WIRIS/Pixhawk connection controls and field readiness checks.
 
+The isolated field default is camera NIC `10.0.0.11/32` with explicit routes to `.231/.232`;
+Pixhawk NIC `10.0.0.10/24` is a different adapter. Do not apply `.10/24` to the camera NIC or the
+two traffic classes return to one connected subnet.
+The bundled Legacy model setting is the app-relative `yolov8n_uav.pt`; moving the checkout does not
+require editing a user-home path.
+
 - `Telnet port 탐색` scans candidate WIRIS `IP Address` values for TCP ports `1-65535`, verifies open ports with `HIWS`, and applies the discovered `IP Address`/`Telnet port` only to the side whose button was pressed. `WIRIS 자동 연결` is the path that can fill both sides at once.
 - `WIRIS 자동 연결` tries a monitorless setup flow: full-scan WIRIS SDK control ports, verify each candidate with `HIWS`, fill left/right control hosts and their per-camera ports, sync RTSP hosts, send Ethernet Mode commands, check RTSP frames, and connect camera preview when both streams are valid.
 - `영상 주소 탐색` scans camera network candidates for RTSP ports and fills the PC camera-network IP plus left/right camera RTSP URL fields.
@@ -203,9 +209,16 @@ Use this tab for WIRIS/Pixhawk connection controls and field readiness checks.
 - `제어 확인` checks whether each WIRIS `IP Address` accepts TCP commands on its own configured `Telnet port`. It does not change RTSP URLs; if an OSD `IP Address` and RTSP URL host differ, the app logs a warning and leaves the stream settings untouched.
 - `IP Address / IP Mask 변경` contains STIP static-IP controls. `STIP 적용` writes a new OSD `IP Address` and `IP Mask` to the selected WIRIS through its current `IP Address`/`Telnet port`; use it only when the target camera is uniquely identified, preferably with one WIRIS connected.
 - The `RTSP port / 영상` group shows the full `RTSP URL`; its URL port is the OSD `RTSP port`. Its `IP Address` + `RTSP 적용` controls update only the RTSP URL host, while Telnet control settings remain separate.
-- `영상 송출 활성화` sends the WIRIS Ethernet Mode command, then reads and repairs the field-validated visible encoder profile (`bitrate/QP/GOP/IDR = 0/1/90/1`) one field at a time with readback before re-running RTSP frame checks. A readback mismatch fails closed instead of probing a stream with an unknown encoder state.
+- `영상 송출 활성화` first reads `GETH`. It sends `SETH TRUE` exactly once only when Ethernet mode is disabled, then re-runs RTSP frame checks. Startup, Auto-Connect and Enable never apply the saved `bitrate/QP/GOP/IDR` reference, so stale JSON cannot silently send `SEBR/SEQZ/SEGS/SEIR`; encoder changes remain explicit manual WIRIS commands with separate readback evidence.
 - If a saved `Telnet port` is open but returns `ERR` for `GETH`, the app now treats it as the wrong SDK command port, tries the default WIRIS SDK port `2240`, saves the corrected port when `GETH` returns `TRUE/FALSE`, and waits until the RTSP URL port is actually open before checking frames.
 - `영상 수신 확인` checks both TCP port reachability and actual first-frame reception using the selected stream `백엔드`. A camera can report port-open while still failing stream/frame reception.
+- When Legacy recording expects a camera side, session finalization requires that side's MP4 path,
+  positive size and `ftyp` header even if the worker failed before its first GUI frame. A missing
+  no-frame MP4 remains an explicit retryable save failure; it is never skipped as "no camera data".
+- `세션 기록 시작` is a dual-camera video request even when Preview is currently disconnected. It
+  immediately starts both record-capable RTSP workers and marks both MP4s expected before the first
+  GUI frame. If the stream-start request is rejected, the UI returns to `세션 기록 시작` and keeps a
+  retryable failure instead of displaying an active empty session.
 - `카메라 Preview 연결` starts left/right camera preview streams without loading YOLO; while connected, the same button changes to `카메라 Preview 해제` and stops camera preview plus any active YOLO stream without disconnecting Pixhawk.
 - If left/right RTSP URLs resolve to the same stream identity, preview/YOLO start and distance calculation are blocked because the pair is not a valid stereo source.
 
@@ -521,7 +534,7 @@ The diagnostic checks host IPs, UDP `8888` / `14550` / `14551`, USB MAVLink cand
 ## Known Limitations and Workarounds
 
 - Camera RTSP decoding defaults to `Auto` over TCP and can also force `NVIDIA` or `Software`. NVIDIA mode requires a working NVIDIA driver and GStreamer `nvh264dec`. RTP forward gaps gate the current decoder until a parsed clean intra boundary; Auto changes to software only for decoder health failure. An artifact with neither a gap nor a decoder health signal still requires same-bitstream NVIDIA/Software diagnosis.
-- A clean-intra gate cannot reconstruct H.264 reference packets that the WIRIS sender never transmits. On the tested `GEIR=0` firmware, non-delta intra pictures are not true IDR resets; after a loss the operator may see either a fail-closed freeze or later motion corruption. Exact TCP pcap confirmed camera-origin RTP sequence omission. Do not compensate by silently changing QP/bitrate/transport: the tested QP10, SEBR20M, latency500 and UDP variants either retained the problem, timed out, or increased loss/freeze. Keep the restored `0/1/90/0`, TCP/100 ms state pending a vendor sender/IDR fix.
+- A clean-intra gate cannot reconstruct H.264 reference packets that the WIRIS sender never transmits. On the tested `GEIR=0` firmware, non-delta intra pictures are not true IDR resets; after a loss the operator may see either a fail-closed freeze or later motion corruption. Exact TCP pcap confirmed camera-origin RTP sequence omission. Do not compensate by silently changing QP/bitrate/transport: the tested QP10, SEBR20M, latency500 and UDP variants either retained the problem, timed out, or increased loss/freeze. Preserve the user-approved and independently read-back current `0/1/30/0`, TCP/100 ms device state pending a vendor sender/IDR fix; stored application references are not permission to write it.
 - Software H.264 decoding skips B-frames to reduce CPU pressure in live mode.
 - `영상 수신 확인` distinguishes `port-closed`, `open-no-frame`, and `frame-ok`; `open-no-frame` usually means the RTSP server is listening but the media path or encoder is not delivering frames.
 - `Telnet port 탐색` and `영상 주소 탐색` can only TCP-scan IP ranges that are currently routed through a local interface; add the camera subnet to the selected interface first when cameras use a different static IP range.
@@ -566,6 +579,11 @@ canonical venv and installs the repository runtime referenced by the compatibili
 is the read-only check.
 
 ## Change Log
+
+- 2026-08-27: Changed the camera-interface default to isolated `10.0.0.11/32` and verified a hardware
+  pcap containing zero SDK-control packets across startup, receive check, Preview, restart and
+  recording. Legacy Record now starts both camera recorders when Preview is disconnected and rolls
+  back a rejected start. Real MP4 creation/EOS passes, but FW 2.18.72 zero-IDR files remain unusable.
 
 - 2026-08-26: Added RTP forward-gap detection, decoder-independent clean-intra output recovery,
   health-only Auto software fallback, bounded initial PLAYING retry, throttled gap summaries, and

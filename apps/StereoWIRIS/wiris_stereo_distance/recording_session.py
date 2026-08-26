@@ -358,16 +358,27 @@ def format_video_paths(paths: dict[str, Path]) -> str:
 def raw_video_artifact_errors(
     paths: dict[str, Path],
     camera_frame_counts: dict[str, int],
+    *,
+    expected_cameras: tuple[str, ...] | list[str] | set[str] | None = None,
 ) -> tuple[str, ...]:
-    """Validate session-owned MP4 evidence when GUI frames were received."""
+    """Validate MP4 evidence for every expected or frame-producing camera."""
 
     errors: list[str] = []
+    expected = {
+        str(camera)
+        for camera in (expected_cameras or ())
+        if str(camera) in {"left", "right"}
+    }
     for camera in ("left", "right"):
-        if max(0, int(camera_frame_counts.get(camera, 0))) == 0:
+        frame_count = max(0, int(camera_frame_counts.get(camera, 0)))
+        if camera not in expected and frame_count == 0:
             continue
         path = paths.get(camera)
         if path is None:
             errors.append(f"{camera} MP4 경로 없음")
+            continue
+        if not path.is_file():
+            errors.append(f"{camera} MP4 파일 없음 (frames={frame_count}): {path}")
             continue
         try:
             size_bytes = path.stat().st_size

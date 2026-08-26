@@ -1172,6 +1172,11 @@ class CameraPane(QtWidgets.QGroupBox):
     ) -> None:
         if ring is not None and ring not in self._retired_native_frame_rings:
             self._retired_native_frame_rings.append(ring)
+        CameraPane.sweep_retired_native_frame_rings(self)
+
+    def sweep_retired_native_frame_rings(self) -> bool:
+        """Unlink every retired ring whose evidence leases have drained."""
+
         survivors: list[SharedNativeFrameRing] = []
         for candidate in self._retired_native_frame_rings:
             try:
@@ -1184,3 +1189,4 @@ class CameraPane(QtWidgets.QGroupBox):
             candidate.close()
             candidate.unlink()
         self._retired_native_frame_rings = survivors
+        return not survivors

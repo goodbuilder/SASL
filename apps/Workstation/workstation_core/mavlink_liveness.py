@@ -17,6 +17,7 @@ from typing import Callable
 MAVLINK_ATTITUDE_FRESH_S = 2.0
 MAVLINK_HEARTBEAT_FRESH_S = 3.0
 MAVLINK_ALL_RX_STALL_S = 10.0
+MAVLINK_INITIAL_RX_TIMEOUT_S = 10.0
 MAVLINK_QUALIFICATION_S = 600.0
 
 
@@ -26,6 +27,7 @@ class MavlinkLivenessState(str, Enum):
     QUALIFYING = "QUALIFYING"
     LIVE = "LIVE"
     ATTITUDE_STALE = "ATTITUDE STALE"
+    INITIAL_RX_TIMEOUT = "MAVLINK INITIAL RX TIMEOUT"
     RX_STALLED = "ETH MAVLINK RX STALLED"
     RECOVERING = "RECOVERING"
     ERROR = "ERROR"
@@ -36,11 +38,14 @@ class MavlinkSideHealthSnapshot:
     side: str
     connection_generation: int
     endpoint: str
+    peer_host: str
     expected_system_id: int
     observed_system_id: int | None
     observed_component_id: int | None
     identity_verified: bool
     listener_open: bool
+    listener_opened_monotonic_s: float | None
+    listener_age_s: float | None
     last_any_rx_monotonic_s: float | None
     last_heartbeat_rx_monotonic_s: float | None
     last_attitude_rx_monotonic_s: float | None
@@ -67,10 +72,12 @@ class MavlinkSideLiveness:
         side: str,
         expected_system_id: int,
         endpoint: str = "",
+        peer_host: str = "",
         clock: Callable[[], float] = time.monotonic,
         attitude_fresh_s: float = MAVLINK_ATTITUDE_FRESH_S,
         heartbeat_fresh_s: float = MAVLINK_HEARTBEAT_FRESH_S,
         all_rx_stall_s: float = MAVLINK_ALL_RX_STALL_S,
+        initial_rx_timeout_s: float = MAVLINK_INITIAL_RX_TIMEOUT_S,
         qualification_s: float = MAVLINK_QUALIFICATION_S,
     ) -> None:
         expected_system_id = int(expected_system_id)
@@ -80,6 +87,7 @@ class MavlinkSideLiveness:
             float(attitude_fresh_s),
             float(heartbeat_fresh_s),
             float(all_rx_stall_s),
+            float(initial_rx_timeout_s),
             float(qualification_s),
         )
         if any(value <= 0.0 for value in thresholds):
@@ -87,14 +95,18 @@ class MavlinkSideLiveness:
         self.side = str(side)
         self.expected_system_id = expected_system_id
         self.endpoint = str(endpoint)
+        self.peer_host = str(peer_host).strip()
         self.attitude_fresh_s = thresholds[0]
         self.heartbeat_fresh_s = thresholds[1]
         self.all_rx_stall_s = thresholds[2]
-        self.qualification_s = thresholds[3]
+        self.initial_rx_timeout_s = thresholds[3]
+        self.qualification_s = thresholds[4]
         self._clock = clock
         self._lock = threading.RLock()
         self._connection_generation = 0
         self._listener_open = False
+        self._listener_opened_s: float | None = None
+        self._identity_wait_started_s: float | None = None
         self._observed_system_id: int | None = None
         self._observed_component_id: int | None = None
         self._identity_verified = False
@@ -121,17 +133,22 @@ class MavlinkSideLiveness:
         self,
         *,
         endpoint: str | None = None,
+        peer_host: str | None = None,
         now_s: float | None = None,
         recovering: bool = False,
     ) -> int:
         """Start a new connection generation and discard all old evidence."""
 
-        self._time(now_s)
+        opened_s = self._time(now_s)
         with self._lock:
             self._connection_generation += 1
             if endpoint is not None:
                 self.endpoint = str(endpoint)
+            if peer_host is not None:
+                self.peer_host = str(peer_host).strip()
             self._listener_open = True
+            self._listener_opened_s = opened_s
+            self._identity_wait_started_s = opened_s
             self._observed_system_id = None
             self._observed_component_id = None
             self._identity_verified = False
@@ -151,6 +168,8 @@ class MavlinkSideLiveness:
         self._time(now_s)
         with self._lock:
             self._listener_open = False
+            self._listener_opened_s = None
+            self._identity_wait_started_s = None
             self._active_command = None
             self._qualification_started_s = None
             self._stalled = False
@@ -165,6 +184,32 @@ class MavlinkSideLiveness:
     def clear_error(self) -> None:
         with self._lock:
             self._error = None
+
+    def note_remote_reboot(self, *, now_s: float | None = None) -> bool:
+        """Invalidate old-boot evidence without replacing the host listener.
+
+        A PX4 power-cycle can restart ``time_boot_ms`` while pymavlink keeps the
+        same UDP socket object.  That is a new remote boot, not a new host
+        connection generation.  Require a fresh HEARTBEAT identity and a new
+        qualification interval while preserving the listener generation used
+        by in-flight host routing callbacks.
+        """
+
+        reboot_s = self._time(now_s)
+        with self._lock:
+            if not self._listener_open:
+                return False
+            self._observed_system_id = None
+            self._observed_component_id = None
+            self._identity_verified = False
+            self._identity_wait_started_s = reboot_s
+            self._last_any_rx_s = None
+            self._last_heartbeat_rx_s = None
+            self._last_attitude_rx_s = None
+            self._qualification_started_s = None
+            self._stalled = False
+            self._recovering = True
+            return True
 
     def begin_command(self, command: str, *, now_s: float | None = None) -> None:
         self._time(now_s)
@@ -225,9 +270,10 @@ class MavlinkSideLiveness:
                 self._observed_component_id = int(component_id) if component_id is not None else None
             except (TypeError, ValueError):
                 self._observed_component_id = None
-            self._identity_verified = True
             self._last_any_rx_s = self._latest(self._last_any_rx_s, received_s)
             if message_name == "HEARTBEAT":
+                self._identity_verified = True
+                self._identity_wait_started_s = None
                 self._last_heartbeat_rx_s = self._latest(self._last_heartbeat_rx_s, received_s)
             elif message_name == "ATTITUDE":
                 self._last_attitude_rx_s = self._latest(self._last_attitude_rx_s, received_s)
@@ -317,6 +363,11 @@ class MavlinkSideLiveness:
             self._mark_stalled_if_due(observed_s)
             self._refresh_qualification(observed_s)
             any_age = self._age(observed_s, self._last_any_rx_s)
+            listener_age = self._age(observed_s, self._listener_opened_s)
+            identity_wait_age = self._age(
+                observed_s,
+                self._identity_wait_started_s,
+            )
             heartbeat_age = self._age(observed_s, self._last_heartbeat_rx_s)
             attitude_age = self._age(observed_s, self._last_attitude_rx_s)
             heartbeat_fresh, attitude_fresh = self._streams_fresh(observed_s)
@@ -338,8 +389,15 @@ class MavlinkSideLiveness:
                 state = MavlinkLivenessState.DISCONNECTED
                 reason = "LISTENER_CLOSED"
             elif not self._identity_verified:
-                state = MavlinkLivenessState.CONNECTING
-                reason = "AWAITING_EXPECTED_SYSTEM_ID"
+                if (
+                    identity_wait_age is not None
+                    and identity_wait_age >= self.initial_rx_timeout_s
+                ):
+                    state = MavlinkLivenessState.INITIAL_RX_TIMEOUT
+                    reason = "EXPECTED_HEARTBEAT_NOT_RECEIVED"
+                else:
+                    state = MavlinkLivenessState.CONNECTING
+                    reason = "AWAITING_EXPECTED_HEARTBEAT"
             elif self._active_command is not None:
                 state = MavlinkLivenessState.RECOVERING if self._recovering else MavlinkLivenessState.QUALIFYING
                 reason = "ACTIVE_COMMAND"
@@ -385,11 +443,14 @@ class MavlinkSideLiveness:
                 side=self.side,
                 connection_generation=self._connection_generation,
                 endpoint=self.endpoint,
+                peer_host=self.peer_host,
                 expected_system_id=self.expected_system_id,
                 observed_system_id=self._observed_system_id,
                 observed_component_id=self._observed_component_id,
                 identity_verified=self._identity_verified,
                 listener_open=self._listener_open,
+                listener_opened_monotonic_s=self._listener_opened_s,
+                listener_age_s=listener_age,
                 last_any_rx_monotonic_s=self._last_any_rx_s,
                 last_heartbeat_rx_monotonic_s=self._last_heartbeat_rx_s,
                 last_attitude_rx_monotonic_s=self._last_attitude_rx_s,

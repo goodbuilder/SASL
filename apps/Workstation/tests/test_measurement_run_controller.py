@@ -84,6 +84,28 @@ def test_busy_start_is_queued_and_duplicate_live_start_is_rejected() -> None:
     assert controller.begin_measurement_run() is False
 
 
+def test_failed_start_retires_generation_but_keeps_next_start_available() -> None:
+    panel = _panel()
+    controller = MeasurementRunController(panel)
+    assert controller.begin_measurement_run()
+    failed_generation = panel._measurement_run_generation
+
+    assert controller.fail_measurement_start("no current-generation frame")
+
+    snapshot = controller.measurement_run_snapshot()
+    assert snapshot["state"] == "ERROR"
+    assert snapshot["generation"] == ""
+    assert snapshot["error"] == "no current-generation frame"
+    assert panel._measurement_run_last_generation == failed_generation
+    assert [payload["event_type"] for _stream, payload in panel._events] == [
+        "measurement_start_requested",
+        "measurement_start_failed",
+    ]
+    assert controller.begin_measurement_run()
+    assert controller.state == "STARTING"
+    assert panel._measurement_run_generation != failed_generation
+
+
 def test_real_panel_ignores_old_session_and_prepares_type_owned_paths(
     monkeypatch,
     tmp_path,

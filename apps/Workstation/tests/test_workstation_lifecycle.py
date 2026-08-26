@@ -768,11 +768,290 @@ def test_shutdown_deadline_force_terminates_an_unresponsive_worker(monkeypatch) 
         blocked_thread=Thread(),
         _log=lambda message: calls.append(message),
     )
-    monkeypatch.setattr(app_lifecycle_controller.time, "monotonic", lambda: 16.0)
+    monkeypatch.setattr(app_lifecycle_controller.time, "monotonic", lambda: 23.0)
 
-    assert app_lifecycle_controller.AppLifecycleController(panel).shutdown_for_close() is True
+    assert app_lifecycle_controller.AppLifecycleController(panel).shutdown_for_close() is False
     assert "terminate" in calls
     assert any(str(value).startswith("wait:") for value in calls)
+    assert panel._shutdown_resource_report["complete"] is False
+    assert panel._shutdown_resource_report["running_threads"]
+
+
+def test_shutdown_preserves_camera_eos_window_beyond_old_five_second_deadline(
+    monkeypatch,
+) -> None:
+    from Workstation import app_lifecycle_controller
+    from Workstation.workstation_core import camera_pane, yolo_stream
+
+    clock = [100.0]
+    forced: list[float] = []
+
+    class Coordinator:
+        def run(self) -> bool:
+            # Model an MP4 EOS/finalization ACK arriving eight seconds after
+            # the first close request: later than the historical 5 s global
+            # deadline, but within the declared 9 s EOS/12 s camera window.
+            return clock[0] >= 108.0
+
+    panel = SimpleNamespace(
+        _shutdown_coordinator=Coordinator(),
+        _shutdown_started_monotonic_s=None,
+        _log=lambda _message: None,
+    )
+    controller = app_lifecycle_controller.AppLifecycleController(panel)
+    controller._force_shutdown_after_deadline = lambda: forced.append(clock[0]) or False
+    monkeypatch.setattr(app_lifecycle_controller.time, "monotonic", lambda: clock[0])
+
+    assert yolo_stream.GST_RECORDING_EOS_TIMEOUT_S == pytest.approx(9.0)
+    assert camera_pane.CAMERA_STOP_COOPERATIVE_WAIT_MS == 12_000
+    assert app_lifecycle_controller.SHUTDOWN_DEADLINE_S >= 12.0
+    assert controller.shutdown_for_close() is False
+    clock[0] = 106.0
+    assert controller.shutdown_for_close() is False
+    assert forced == []
+    clock[0] = 108.0
+    assert controller.shutdown_for_close() is True
+    assert forced == []
+
+
+def test_shutdown_deadline_is_measured_from_late_camera_stop_request(monkeypatch) -> None:
+    from Workstation import app_lifecycle_controller
+
+    clock = [113.0]
+    forced: list[float] = []
+    panel = SimpleNamespace(
+        _shutdown_coordinator=SimpleNamespace(run=lambda: False),
+        _shutdown_started_monotonic_s=100.0,
+        left_pane=SimpleNamespace(_stop_requested_monotonic_s=106.0),
+        right_pane=None,
+        _log=lambda _message: None,
+    )
+    controller = app_lifecycle_controller.AppLifecycleController(panel)
+    controller._force_shutdown_after_deadline = lambda: forced.append(clock[0]) or False
+    monkeypatch.setattr(app_lifecycle_controller.time, "monotonic", lambda: clock[0])
+
+    assert controller.shutdown_for_close() is False
+    assert forced == []
+    clock[0] = 118.1
+    assert controller.shutdown_for_close() is False
+    assert forced == [118.1]
+
+
+def test_shutdown_auxiliary_gate_includes_active_oz_capture_thread() -> None:
+    from Workstation.app_lifecycle_controller import AppLifecycleController
+
+    checked: list[str] = []
+
+    def stop_thread(attr: str) -> bool:
+        checked.append(attr)
+        return attr != "oz_photo_capture_thread"
+
+    panel = SimpleNamespace(
+        stop_auto_calibration_capture=lambda: True,
+        _stop_calibration_preview_worker=lambda *, wait=False: True,
+        stop_wiris_lrf_polling=lambda *, wait=False: True,
+        _measurement_view_controller_owner=None,
+        _shutdown_native_frame_stores=lambda: True,
+        left_pane=None,
+        right_pane=None,
+        _shutdown_stop_thread=stop_thread,
+    )
+
+    assert AppLifecycleController(panel)._shutdown_stop_auxiliary_workers() is False
+    assert "pnp_photo_capture_thread" in checked
+    assert "oz_photo_capture_thread" in checked
+
+
+def test_forced_shutdown_does_not_close_data_store_or_claim_success_for_stuck_child(
+    monkeypatch,
+) -> None:
+    from Workstation import app_lifecycle_controller
+
+    calls: list[str] = []
+
+    class Process:
+        def is_alive(self) -> bool:
+            return True
+
+    class Worker:
+        def __init__(self) -> None:
+            self._process = Process()
+            self._stop_requested_monotonic_s = 0.0
+
+        def request_stop(self) -> None:
+            calls.append("request")
+
+        def terminate_child_process(self) -> None:
+            calls.append("terminate-child")
+
+        def kill_child_process(self) -> None:
+            calls.append("kill-child")
+
+    class CameraThread:
+        def isRunning(self) -> bool:  # noqa: N802
+            return True
+
+        def requestInterruption(self) -> None:  # noqa: N802
+            calls.append("interrupt-camera-thread")
+
+        def quit(self) -> None:
+            calls.append("quit-camera-thread")
+
+        def terminate(self) -> None:
+            calls.append("terminate-camera-thread")
+
+        def wait(self, _timeout_ms: int) -> bool:
+            return False
+
+    camera_thread = CameraThread()
+
+    panel = SimpleNamespace(
+        _shutdown_coordinator=SimpleNamespace(run=lambda: False),
+        _shutdown_started_monotonic_s=0.0,
+        left_pane=SimpleNamespace(
+            worker=Worker(),
+            thread=camera_thread,
+            native_frame_ring=None,
+            _retired_native_frame_rings=[],
+        ),
+        right_pane=None,
+        camera_stream_thread=camera_thread,
+        close_workstation_data=lambda **_kwargs: calls.append("close-data") or True,
+        append_workstation_data=lambda *_args, **_kwargs: True,
+        _log=calls.append,
+    )
+    clock = [13.0]
+    monkeypatch.setattr(app_lifecycle_controller.time, "monotonic", lambda: clock[0])
+
+    assert app_lifecycle_controller.AppLifecycleController(panel).shutdown_for_close() is False
+    assert "terminate-child" in calls
+    assert "kill-child" not in calls
+    assert "terminate-camera-thread" not in calls
+    assert "close-data" not in calls
+    report = panel._shutdown_resource_report
+    assert report["complete"] is False
+    assert "camera-child:left" in report["live_processes"]
+    clock[0] = 21.0
+    assert app_lifecycle_controller.AppLifecycleController(panel).shutdown_for_close() is False
+    assert "kill-child" in calls
+    assert "terminate-camera-thread" not in calls
+    assert "close-data" not in calls
+
+
+def test_forced_shutdown_reports_clean_mock_resources_before_success(monkeypatch) -> None:
+    from Workstation import app_lifecycle_controller
+
+    class Process:
+        alive = True
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+    process = Process()
+
+    class Worker:
+        _process = process
+        _stop_requested_monotonic_s = 0.0
+
+        def request_stop(self) -> None:
+            pass
+
+        def terminate_child_process(self) -> None:
+            process.alive = False
+
+        def kill_child_process(self) -> None:
+            process.alive = False
+
+    class Thread:
+        running = True
+
+        def isRunning(self) -> bool:  # noqa: N802
+            return self.running
+
+        def requestInterruption(self) -> None:  # noqa: N802
+            pass
+
+        def quit(self) -> None:
+            pass
+
+        def terminate(self) -> None:
+            self.running = False
+
+        def wait(self, _timeout_ms: int) -> bool:
+            return not self.running
+
+    thread = Thread()
+
+    class Coordinator:
+        def run(self) -> bool:
+            return not process.alive and not thread.running
+
+    panel = SimpleNamespace(
+        _shutdown_coordinator=Coordinator(),
+        _shutdown_started_monotonic_s=0.0,
+        left_pane=SimpleNamespace(
+            worker=Worker(),
+            native_frame_ring=None,
+            _retired_native_frame_rings=[],
+        ),
+        right_pane=None,
+        cleanup_thread=thread,
+        append_workstation_data=lambda *_args, **_kwargs: True,
+        _log=lambda _message: None,
+    )
+    monkeypatch.setattr(app_lifecycle_controller.time, "monotonic", lambda: 13.0)
+
+    assert app_lifecycle_controller.AppLifecycleController(panel).shutdown_for_close() is True
+    assert panel._shutdown_resource_report["complete"] is True
+    assert panel._shutdown_resource_report["running_threads"] == []
+    assert panel._shutdown_resource_report["live_processes"] == []
+    assert panel._shutdown_resource_report["open_sockets"] == []
+    assert panel._shutdown_resource_report["shared_memory"] == []
+
+
+def test_shutdown_resource_report_detects_open_named_socket() -> None:
+    from Workstation.app_lifecycle_controller import AppLifecycleController
+
+    class Socket:
+        descriptor = 17
+
+        def fileno(self) -> int:
+            return self.descriptor
+
+    socket = Socket()
+    panel = SimpleNamespace(
+        camera_control_socket=socket,
+        left_pane=None,
+        right_pane=None,
+    )
+    controller = AppLifecycleController(panel)
+
+    report = controller._shutdown_resource_snapshot()
+    assert report["complete"] is False
+    assert report["open_sockets"] == ["camera_control_socket"]
+    socket.descriptor = -1
+    assert controller._shutdown_resource_snapshot()["complete"] is True
+
+
+def test_shutdown_resource_evidence_rejection_keeps_close_pending() -> None:
+    from Workstation.app_lifecycle_controller import AppLifecycleController
+
+    accepted = {"value": False}
+    panel = SimpleNamespace(
+        left_pane=None,
+        right_pane=None,
+        append_workstation_data=lambda *_args, **_kwargs: accepted["value"],
+        _log=lambda _message: None,
+    )
+    controller = AppLifecycleController(panel)
+
+    assert controller._shutdown_verify_resources() is False
+    assert panel._shutdown_resource_report["complete"] is True
+    assert not hasattr(panel, "_shutdown_resource_report_fingerprint")
+
+    accepted["value"] = True
+    assert controller._shutdown_verify_resources() is True
+    assert panel._shutdown_resource_report_fingerprint
 
 
 def test_stop_all_stays_pending_after_starting_async_pixhawk_disconnect() -> None:
@@ -877,6 +1156,106 @@ with tempfile.TemporaryDirectory() as directory:
     assert "QThread: Destroyed while thread is still running" not in completed.stderr
     assert "Fatal Python error" not in completed.stderr
 
+
+def test_offscreen_shutdown_stops_active_pixhawk_timer_without_qt_warning(
+    tmp_path: Path,
+) -> None:
+    """The transport closer must not stop a GUI-owned timer from its QThread."""
+
+    repository = Path(__file__).resolve().parents[3]
+    environment = os.environ.copy()
+    environment["QT_QPA_PLATFORM"] = "offscreen"
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (str(repository / "apps"), str(repository), str(repository / "common" / "python"))
+    )
+    runtime_dir = tmp_path / "qt-runtime"
+    runtime_dir.mkdir(mode=0o700)
+    environment["XDG_RUNTIME_DIR"] = str(runtime_dir)
+    script = r'''
+import tempfile
+import time
+from pathlib import Path
+
+from PyQt5 import QtCore, QtWidgets
+
+from Workstation import standalone_gui
+from Workstation.workstation_core.pixhawk_attitude import DualPixhawkMavlinkSubscriber
+
+
+class Mav:
+    def heartbeat_send(self, *_args):
+        pass
+
+
+class Connection:
+    target_system = 1
+    target_component = 1
+    mavlink = None
+
+    def __init__(self):
+        self.mav = Mav()
+        self.closed = False
+
+    def recv_match(self, **_kwargs):
+        return None
+
+    def close(self):
+        self.closed = True
+
+
+standalone_gui.WirisStereoDistancePanel._initial_status = lambda self: None
+standalone_gui.WirisStereoDistancePanel._auto_load_intrinsics = lambda self: None
+app = QtWidgets.QApplication([])
+with tempfile.TemporaryDirectory() as directory:
+    panel = standalone_gui.WirisStereoDistancePanel(app_root=Path(directory))
+    subscriber = DualPixhawkMavlinkSubscriber(left_url="", right_url="")
+    connections = {"left": Connection(), "right": Connection()}
+    subscriber.connections.update(connections)
+    subscriber.timer.start()
+    callback_ticks = []
+    subscriber.timer.timeout.connect(lambda: callback_ticks.append(time.monotonic()))
+    panel.mavlink_pixhawk = subscriber
+
+    results = []
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        results.append(panel.shutdown_for_close())
+        app.processEvents(QtCore.QEventLoop.AllEvents, 10)
+        if results[-1]:
+            break
+        time.sleep(0.005)
+
+    assert results[0] is False
+    assert results[-1] is True
+    assert panel._shutdown_resource_report["complete"] is True
+    assert panel.pixhawk_disconnection_thread is None
+    assert all(connection.closed for connection in connections.values())
+    assert not subscriber.timer.isActive()
+    ticks_after_shutdown = len(callback_ticks)
+    settle_deadline = time.monotonic() + 0.06
+    while time.monotonic() < settle_deadline:
+        app.processEvents(QtCore.QEventLoop.AllEvents, 10)
+        time.sleep(0.002)
+    assert len(callback_ticks) == ticks_after_shutdown
+
+    panel.deleteLater()
+    app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+    app.processEvents()
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repository / "apps" / "Workstation",
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+
+
 def test_session_save_shutdown_wait_is_non_blocking_and_retryable() -> None:
     from Workstation import standalone_gui
 
@@ -898,6 +1277,63 @@ def test_session_save_shutdown_wait_is_non_blocking_and_retryable() -> None:
     assert standalone_gui.WirisStereoDistancePanel._wait_for_session_save(panel) is False
     panel._session_save_thread = None
     assert standalone_gui.WirisStereoDistancePanel._wait_for_session_save(panel) is True
+
+
+def test_active_session_save_gate_runs_before_data_close() -> None:
+    from sasl_common.lifecycle import LifecycleStep
+    from Workstation.recording_controller import RecordingController
+
+    class Thread:
+        def isRunning(self) -> bool:  # noqa: N802
+            return True
+
+    closes: list[str] = []
+    panel = SimpleNamespace(
+        _session_save_thread=Thread(),
+        _session_save_worker=object(),
+        _session_save_shutdown_wait_started_s=None,
+        _session_save_shutdown_timeout_logged=False,
+        _log=lambda _message: None,
+    )
+    recording = RecordingController(panel)
+    coordinator = LifecycleCoordinator(
+        [
+            LifecycleStep("wait-session-save", recording._wait_for_session_save),
+            LifecycleStep("close-data", lambda: closes.append("close") or True),
+        ]
+    )
+
+    assert coordinator.run() is False
+    assert closes == []
+    panel._session_save_thread = None
+    assert coordinator.run() is True
+    assert closes == ["close"]
+
+
+def test_shutdown_auxiliary_gate_retries_pinned_retired_ring() -> None:
+    from Workstation.app_lifecycle_controller import AppLifecycleController
+
+    pinned = {"value": True}
+
+    class Pane:
+        def sweep_retired_native_frame_rings(self) -> bool:
+            return not pinned["value"]
+
+    panel = SimpleNamespace(
+        stop_auto_calibration_capture=lambda: True,
+        _stop_calibration_preview_worker=lambda *, wait=False: True,
+        stop_wiris_lrf_polling=lambda *, wait=False: True,
+        _measurement_view_controller_owner=None,
+        _shutdown_native_frame_stores=lambda: True,
+        left_pane=Pane(),
+        right_pane=Pane(),
+        _shutdown_stop_thread=lambda _attr: True,
+    )
+    controller = AppLifecycleController(panel)
+
+    assert controller._shutdown_stop_auxiliary_workers() is False
+    pinned["value"] = False
+    assert controller._shutdown_stop_auxiliary_workers() is True
 
 def test_visible_time_workspace_recomputes_live_sync_summary_after_verification_timer_stops() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])

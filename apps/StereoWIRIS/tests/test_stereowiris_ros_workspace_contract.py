@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -76,6 +77,45 @@ def test_direct_python_entrypoint_uses_only_canonical_ros_workspace() -> None:
     assert 'SASL_ROOT / "workspace" / "main"' in source
     assert "px4_msgs_ws" not in source
     assert "Path.home()" not in source
+
+
+def test_direct_python_entrypoint_reads_app_local_saved_mavlink_mode(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    app = repository / "apps" / "StereoWIRIS"
+    app.mkdir(parents=True)
+    main_path = app / "main.py"
+    shutil.copy2(ROOT / "main.py", main_path)
+    (app / "stereo_distance_settings.json").write_text(
+        '{"pixhawk_ethernet_mode": "mavlink"}\n',
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env.pop("SASL_MAVLINK_ONLY", None)
+    env.pop("SASL_PIXHAWK_ETHERNET_MODE", None)
+    env["SASL_ROS_LIBRARY_PATH_READY"] = "1"
+    env["PYTHONPATH"] = str(ROOT.parents[1] / "common" / "python")
+    probe = (
+        "import importlib.util\n"
+        f"path = {str(main_path)!r}\n"
+        "spec = importlib.util.spec_from_file_location('copied_stereowiris_main', path)\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(module)\n"
+        "print('mavlink-only' if module.MAVLINK_ONLY_REQUESTED else 'ros')\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=repository,
+        env=env,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "mavlink-only"
 
 
 def test_missing_ros_source_fails_after_common_runtime_gate(tmp_path: Path) -> None:

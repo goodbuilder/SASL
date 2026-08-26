@@ -248,7 +248,16 @@ class MeasurementDataStore:
                 return False
             with self._state_lock:
                 self._states[evicted.stream].dropped_records += 1
-            target.put_nowait(queued)
+            try:
+                target.put_nowait(queued)
+            except queue.Full:
+                # Another producer can claim the slot between the eviction and
+                # this non-blocking admission.  Treat that race as a factual
+                # drop of this record instead of leaking queue.Full through a
+                # camera/telemetry callback.
+                with self._state_lock:
+                    self._states[name].dropped_records += 1
+                return False
         with self._state_lock:
             if self._states[name].state == "IDLE":
                 self._states[name].state = "PENDING"

@@ -52,6 +52,7 @@ CORE_RUNTIME_REQUIREMENTS = (
     RuntimeRequirement("pymavlink", "pymavlink", ">=2.4.41,<3"),
     RuntimeRequirement("pyqtgraph", "pyqtgraph", ">=0.13,<0.14"),
     RuntimeRequirement("keyring", "keyring", ">=23,<26"),
+    RuntimeRequirement("setuptools", "setuptools", ">=77,<80"),
     RuntimeRequirement("packaging", "packaging", ">=23,<27"),
     RuntimeRequirement("ultralytics", "ultralytics", ">=8.3,<9"),
 )
@@ -418,6 +419,17 @@ def main(argv: list[str] | None = None) -> int:
         return startup_report.exit_code
     if any(item.level == "WARN" for item in startup_report.diagnostics):
         print(render_report(startup_report, title="SASL Workstation startup warning"))
+
+    from .workstation_core.native_frame_ring import (
+        reclaim_orphaned_native_frame_segments,
+    )
+
+    reclaimed_native_segments = reclaim_orphaned_native_frame_segments()
+    if reclaimed_native_segments:
+        print(
+            "[startup] reclaimed "
+            f"{len(reclaimed_native_segments)} orphan native-frame shared-memory segment(s)"
+        )
 
     from PyQt5 import QtWidgets
 

@@ -18,8 +18,9 @@ def test_load_settings_defaults_when_missing(tmp_path: Path) -> None:
     assert settings.manual_focal_override is False
     assert settings.use_triangulation is True
     assert settings.intrinsics_path == DEFAULT_INTRINSICS_PATH
-    assert settings.yolo_weights_path == ".local/models/yolov8m.pt"
+    assert settings.yolo_weights_path == "yolov8n_uav.pt"
     assert settings.interface_name == "enx588694fce07e"
+    assert settings.camera_host_address == "10.0.0.11/32"
     assert settings.left_rtsp_url == "rtsp://10.0.0.231:8554/visible"
     assert settings.right_rtsp_url == "rtsp://10.0.0.232:8554/visible"
     assert settings.left_control_host == "10.0.0.231"

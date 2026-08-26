@@ -22,6 +22,7 @@ MEASUREMENT_RUN_METHODS = (
     "confirm_measurement_running",
     "request_measurement_stop",
     "finish_measurement_run",
+    "fail_measurement_start",
     "cancel_measurement_start",
     # Compatibility names used by the camera/measurement view during the
     # vertical migration. They own no persisted package or Session.
@@ -258,13 +259,60 @@ class MeasurementRunController:
         self._set_state("IDLE", "Ready for next Measurement")
         return True
 
+    def fail_measurement_start(self, reason: str) -> bool:
+        """Retire a failed live start without creating restart ownership.
+
+        A camera/decoder start failure is different from an operator
+        cancellation: the UI must retain an explicit ERROR until the next
+        Start request, while the failed generation and every automatic owner
+        are no longer live.  ERROR is intentionally admissible to
+        :meth:`begin_measurement_run`, so the failure never disables a future
+        Measurement.
+        """
+
+        if self.state not in {"QUEUED", "STARTING"}:
+            return False
+        failure = str(reason or "Measurement camera start failed")
+        generation = str(
+            getattr(self.panel, "_measurement_run_generation", "") or ""
+        )
+        append = getattr(self.panel, "append_workstation_data", None)
+        if callable(append):
+            append(
+                "events",
+                {
+                    "event_type": "measurement_start_failed",
+                    "runtime_generation": generation,
+                    "failed_utc_ns": time.time_ns(),
+                    "failed_monotonic_ns": time.monotonic_ns(),
+                    "reason": failure,
+                    "recording_mode": "measurement",
+                },
+                priority=True,
+            )
+        self.panel._measurement_run_last_generation = generation
+        self.panel._measurement_run_queued_reason = ""
+        self.panel._measurement_run_generation = ""
+        self.panel._measurement_run_active_sides = ()
+        self.panel._measurement_id = ""
+        self.panel._measurement_package_state = "IDLE"
+        self.panel._measurement_package_detection_started = False
+        self.panel._measurement_package_detection_completed = False
+        self.panel._measurement_package_finalize_requested = False
+        self.panel._method_evaluation_accepting = False
+        self._set_state("ERROR", "Measurement start failed", failure)
+        return True
+
     def cancel_measurement_start(self, reason: str = "Measurement start cancelled") -> bool:
         if self.state not in {"QUEUED", "STARTING"}:
             return False
         self.panel._measurement_run_queued_reason = ""
         self.panel._measurement_run_generation = ""
+        self.panel._measurement_run_active_sides = ()
         self.panel._measurement_id = ""
         self.panel._measurement_package_state = "IDLE"
+        self.panel._measurement_package_detection_started = False
+        self.panel._method_evaluation_accepting = False
         self._set_state("IDLE", str(reason))
         return True
 

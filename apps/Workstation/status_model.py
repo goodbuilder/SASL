@@ -241,10 +241,16 @@ class BackendStatusAdapter(QtCore.QObject):
         )
         active_decoders = getattr(panel, "active_stream_decoders", {}) or {}
         fallback_reasons = getattr(panel, "decoder_fallback_reasons", {}) or {}
+        runtime_overrides = getattr(panel, "_runtime_decoder_overrides", {}) or {}
+        runtime_override = (
+            runtime_overrides.get(side)
+            if isinstance(runtime_overrides, Mapping) and side in runtime_overrides
+            else getattr(panel, "_runtime_decoder_override", None)
+        )
         decoder = decoder_presentation(
             requested_mode=requested_decoder,
             active_decoder=(active_decoders.get(side) if isinstance(active_decoders, Mapping) else None),
-            runtime_override=getattr(panel, "_runtime_decoder_override", None),
+            runtime_override=runtime_override,
             fallback_reason=(fallback_reasons.get(side) if isinstance(fallback_reasons, Mapping) else ""),
         )
         detail = f"{detail}; decoder={decoder.value_text}"
@@ -435,6 +441,7 @@ class BackendStatusAdapter(QtCore.QObject):
             NtripHealthState.RTCM_STALE: StatusSeverity.BAD,
             NtripHealthState.STALE: StatusSeverity.BAD,
             NtripHealthState.RECONNECTING: StatusSeverity.WARN,
+            NtripHealthState.HTTP_AUTH_FAILED: StatusSeverity.BAD,
             NtripHealthState.ERROR: StatusSeverity.BAD,
         }[health.state]
         chunks = health.chunks_received
@@ -472,6 +479,11 @@ class BackendStatusAdapter(QtCore.QObject):
         mountpoint = str(getattr(network_config, "mountpoint", "") or "")
         if caster_host or mountpoint:
             detail_parts.append(f"caster={caster_host or '--'}/{mountpoint or '--'}")
+        credential_source = str(
+            getattr(panel, "_gnss_ntrip_active_credential_source", "") or ""
+        )
+        if credential_source:
+            detail_parts.append(f"credential source={credential_source}")
         detail_parts.append(
             f"reconnects={health.reconnect_count}"
         )
@@ -515,6 +527,7 @@ class BackendStatusAdapter(QtCore.QObject):
                 "QUALIFYING": StatusSeverity.WARN,
                 "LIVE": StatusSeverity.OK,
                 "ATTITUDE STALE": StatusSeverity.WARN,
+                "MAVLINK INITIAL RX TIMEOUT": StatusSeverity.BAD,
                 "ETH MAVLINK RX STALLED": StatusSeverity.BAD,
                 "RECOVERING": StatusSeverity.WARN,
                 "ERROR": StatusSeverity.BAD,
@@ -538,6 +551,7 @@ class BackendStatusAdapter(QtCore.QObject):
 
             detail_parts = [
                 f"endpoint={getattr(health, 'endpoint', '') or '--'}",
+                f"peer={getattr(health, 'peer_host', '') or '--'}",
                 (
                     f"sysid={getattr(health, 'observed_system_id', '--')}"
                     f"/{getattr(health, 'expected_system_id', '--')}"
@@ -548,6 +562,12 @@ class BackendStatusAdapter(QtCore.QObject):
             ]
             if state in {"QUALIFYING", "RECOVERING"}:
                 detail_parts.append(f"qualification={qualification_text}")
+            if state in {"CONNECTING", "MAVLINK INITIAL RX TIMEOUT"}:
+                listener_age_s = getattr(health, "listener_age_s", None)
+                if listener_age_s is not None:
+                    detail_parts.append(f"listener={max(0.0, float(listener_age_s)):.1f}s")
+            if state == "MAVLINK INITIAL RX TIMEOUT":
+                detail_parts.append("expected-sysid HEARTBEAT not received")
             if state == "ATTITUDE STALE":
                 detail_parts.append("bounded ATTITUDE request only")
             if state == "ETH MAVLINK RX STALLED":

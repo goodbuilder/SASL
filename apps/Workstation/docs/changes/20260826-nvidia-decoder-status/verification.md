@@ -6,8 +6,8 @@
 |---|---|---|
 | Auto selects NVDEC | selection unit/fake probes | host doctor |
 | Actual NVDEC decode | gst pipeline exit/caps | synthetic 1080p30 CUDA-memory decode |
-| Per-side actual display | UI/status tests | Workstation screenshot sequence |
-| CPU fallback reason | reducer/controller tests | injected/real failure if safe |
+| Per-side actual display | current-generation frame/UI/status tests | Workstation screenshot sequence |
+| CPU fallback reason/isolation | classifier/controller/supervisor tests | injected/real failure if safe |
 | No geometry/focus change | widget geometry tests | screenshot sequence |
 | Resource behavior | worker-count contract | `nvidia-smi dmon`, dual RTSP pending |
 
@@ -24,7 +24,7 @@
 
 - Command: `../../.venv/bin/python -m pytest -q tests/test_workstation_runtime_camera_status.py tests/test_workstation_camera.py`
 - Result: `64 passed in 4.17s`.
-- Verified requested/effective/candidates/NVIDIA availability, dual-side fallback reason,
+- Verified requested/effective/candidates/NVIDIA availability, fallback reason projection,
   selector-clears-override retry, and static `/proc` model/driver identity parsing.
 
 ### Slice 3–4 — Camera/CAM/Performance UI and Auto persistence/docs: PASS
@@ -35,6 +35,18 @@
   GPU→fallback geometry and focus stability, selector retry, and Settings compatibility.
 - Persisted runtime setting changed from `software` to `auto`; repository default was already Auto.
 - Updated approved `./README.md` and UI workflow/status/implementation product contracts.
+
+### Slice 6 — current-frame decoder truth and per-side failure isolation: PASS (software)
+
+- RED focused run: **13 failed** because `PLAYING` status activated decoder evidence, error classes
+  were absent, and fallback/restart ownership was global.
+- GREEN: `QT_QPA_PLATFORM=offscreen ../../.venv/bin/python -m pytest -q
+  tests/test_decoder_truth_isolation.py` returned **22 passed** after adding current-generation
+  frame ACK, RTSP/source vs recording-output vs decoder-health routing, critical fallback evidence,
+  per-side overrides, and a spawned terminal-child no-respawn check.
+- Dependent decoder/camera/worker/readiness set returned **138 passed**. Hardware fallback remains
+  NOT_RUN and is not inferred from the fake GStreamer boundary.
+- Final fresh Workstation project regression returned **1376 passed, 1 skipped in 148.07 s**.
 
 ## Regression and application evidence
 
@@ -66,7 +78,10 @@
 
 ## Feature isolation and contract evidence
 
-Pending: software selection, Auto fallback, explicit NVIDIA error, recording-safe restart, shutdown.
+Software PASS: a Left-only fallback leaves Right active, preview fallback restarts only the failed
+side, recording fallback stops only the failed side without reopening its MP4, and intentional
+terminal exit is not respawned as a crash. Explicit NVIDIA and non-decoder errors never authorize
+software fallback. Real-device failure injection and shutdown remain pending.
 
 ## Visual authenticity and dynamic-layout stability evidence
 

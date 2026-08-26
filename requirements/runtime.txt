@@ -3,7 +3,9 @@
 PyQt5>=5.15,<6
 numpy>=1.23.5,<1.25
 scipy>=1.8,<1.11
-opencv-python>=4.8,<5
+# 4.12+ requires the NumPy 2.x line on supported CPython versions, which
+# conflicts with this runtime's calibrated NumPy/SciPy 1.24 stack.
+opencv-python>=4.8,<4.12
 PyYAML>=6,<7
 pyarrow>=14,<24
 XlsxWriter>=3.1,<4
@@ -13,6 +15,9 @@ pymavlink>=2.4.41,<3
 # reference runtime above.  Keep the compatible 0.13 line explicit.
 pyqtgraph>=0.13,<0.14
 PyOpenGL>=3.1,<4
+# Torch 2.13 requires >=77 while Ubuntu/ROS colcon-core exposed through the
+# supported system-site-packages venv requires <80.
+setuptools>=77,<80
 packaging>=23,<27
 # Detection is part of the normal Measurement workflow.
 ultralytics>=8.3,<9
