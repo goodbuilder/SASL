@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import json
 import sys
@@ -29,6 +30,8 @@ from sasl_common.operator_runtime import (
 )
 
 SETTINGS_PATH = APP_ROOT / "stereo_distance_settings.json"
+MODEL_MANIFEST_PATH = APP_ROOT / "model-manifest.json"
+DEFAULT_MODEL_FILENAME = "yolov8n_uav.pt"
 REQUIRED_APP_IMPORTS = (
     "cv2",
     "numpy",
@@ -71,19 +74,74 @@ def _model_path(configured: object) -> Path:
     return APP_ROOT / path
 
 
+def _model_diagnostic(
+    model: Path,
+    *,
+    manifest_path: Path = MODEL_MANIFEST_PATH,
+) -> Diagnostic:
+    recovery = (
+        "Copy the approved yolov8n_uav.pt bytes matching "
+        "apps/StereoWIRIS/model-manifest.json into apps/StereoWIRIS/",
+    )
+    if not model.is_file():
+        return Diagnostic(
+            "FAIL",
+            "stereowiris.model",
+            f"YOLO model is missing: {model}",
+            recovery=recovery,
+        )
+    if model.name != DEFAULT_MODEL_FILENAME:
+        return Diagnostic("PASS", "stereowiris.model", f"custom YOLO model: {model}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        expected_filename = str(manifest["filename"])
+        expected_size = int(manifest["size_bytes"])
+        expected_sha256 = str(manifest["sha256"]).lower()
+        if expected_filename != DEFAULT_MODEL_FILENAME:
+            raise ValueError(
+                f"filename must be {DEFAULT_MODEL_FILENAME}, got {expected_filename}"
+            )
+        if expected_size <= 0:
+            raise ValueError("size_bytes must be positive")
+        if len(expected_sha256) != 64:
+            raise ValueError("sha256 must contain 64 hexadecimal characters")
+        int(expected_sha256, 16)
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        return Diagnostic(
+            "FAIL",
+            "stereowiris.model",
+            f"YOLO model manifest is invalid: {exc}",
+            recovery=recovery,
+        )
+    actual_size = model.stat().st_size
+    if actual_size != expected_size:
+        return Diagnostic(
+            "FAIL",
+            "stereowiris.model",
+            f"YOLO model size mismatch: expected={expected_size}, actual={actual_size}, path={model}",
+            recovery=recovery,
+        )
+    digest = hashlib.sha256()
+    with model.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != expected_sha256:
+        return Diagnostic(
+            "FAIL",
+            "stereowiris.model",
+            f"YOLO model SHA-256 does not match model-manifest.json: {model}",
+            recovery=recovery,
+        )
+    return Diagnostic(
+        "PASS",
+        "stereowiris.model",
+        f"approved YOLO model: {model} ({actual_size} bytes, sha256={expected_sha256})",
+    )
+
+
 def _app_report(payload: dict[str, object], diagnostics: list[Diagnostic]) -> RuntimeReport:
     model = _model_path(payload.get("yolo_weights_path"))
-    if model.is_file():
-        diagnostics.append(Diagnostic("PASS", "stereowiris.model", f"YOLO model: {model}"))
-    else:
-        diagnostics.append(
-            Diagnostic(
-                "FAIL",
-                "stereowiris.model",
-                f"YOLO model is missing: {model}",
-                recovery=("Set yolo_weights_path to an existing model in stereo_distance_settings.json",),
-            )
-        )
+    diagnostics.append(_model_diagnostic(model))
     for module_name in REQUIRED_APP_IMPORTS:
         try:
             importlib.import_module(module_name)

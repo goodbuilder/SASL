@@ -49,6 +49,7 @@ tools/check_operator_runtime.sh --deployment
 if [[ -d .venv ]]; then mv .venv ".venv.backup-$(date +%Y%m%d-%H%M%S)"; fi
 python3 -m venv --system-site-packages .venv
 .venv/bin/python -m pip install -r requirements.txt
+install -Dm0644 "$APPROVED_WORKSTATION_MODEL" .local/workstation_data/models/yolov8m.pt
 tools/check_operator_runtime.sh --execution
 ./apps/Workstation/run.sh --check
 ./apps/Workstation/run.sh
@@ -59,6 +60,10 @@ environment: user-site packages and ambient Python, loader, GI and GStreamer plu
 paths are cleared before the canonical repository paths are added. Deployment checks can bootstrap
 with `/usr/bin/python3 -S` before the venv or third-party `packaging` module exists; version parsing
 is loaded only by the execution check after the interpreter gate.
+The Ubuntu manifest includes both `python3-gi` and `python3-cairo`, which keeps the system
+PyGObject dependency graph complete when exposed through the canonical venv. Set
+`APPROVED_WORKSTATION_MODEL` to the approved external file before the `install` command; `--check`
+verifies its bytes against `model-manifest.json`.
 
 The launcher accepts only repository `.venv/bin/python`; app-local, Simulation, system Python,
 manual `dist-packages` `.pth`, and arbitrary `PYTHON_BIN` fallback are unsupported. `--check`
@@ -1517,6 +1522,10 @@ live on the panel at solve time -- a later live-GPS change cannot silently retar
 frozen Mountain image.
 
 ## Change Log
+
+- 2026-08-27: Reproduced the operator runtime in a separate official Ubuntu 22.04 KVM guest and
+  made the external model provisioning step explicit. Added the missing system `python3-cairo`
+  dependency so the fresh canonical venv also passes `pip check`.
 
 - 2026-08-27: Added the implementation-independent native evidence qualifier and retained
   descriptor `timestamp_s` in canonical detection snapshots. A real 88-pair/176-PNG audit verified

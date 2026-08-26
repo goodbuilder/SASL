@@ -2,6 +2,9 @@
 # This is an apt/dpkg manifest, not a pip requirements file.
 python3.10-venv
 python3-gi
+# Completes python3-gi's declared PyGObject dependency inside the canonical
+# --system-site-packages venv so `python -m pip check` is clean.
+python3-cairo
 gir1.2-gstreamer-1.0
 gir1.2-gst-plugins-base-1.0
 gstreamer1.0-tools

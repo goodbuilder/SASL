@@ -1,0 +1,7 @@
+{
+  "schema": "stereowiris-yolo-model-v1",
+  "filename": "yolov8n_uav.pt",
+  "size_bytes": 6269475,
+  "sha256": "8a2204bf2ed7c09b9dbabeaa1c1e984ab482c10325e2387150e23d8daa3cb777",
+  "provisioning": "Copy the approved Legacy YOLO bytes into apps/StereoWIRIS; runtime download is disabled."
+}

@@ -271,6 +271,7 @@ def test_dependency_manifests_keep_native_and_optional_backends_separate() -> No
     assert "PyGObject" not in runtime
     assert "\nav" not in runtime
     assert "python3-gi" in system
+    assert "python3-cairo" in system
     assert "gstreamer1.0-libav" in system
     assert "av>=11,<16" in optional_pyav
     assert "../../../requirements/runtime.txt" in stereo_compat

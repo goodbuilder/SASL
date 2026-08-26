@@ -80,6 +80,7 @@ tools/check_operator_runtime.sh --deployment
 if [[ -d .venv ]]; then mv .venv ".venv.backup-$(date +%Y%m%d-%H%M%S)"; fi
 python3 -m venv --system-site-packages .venv
 .venv/bin/python -m pip install -r requirements.txt
+install -Dm0644 "$APPROVED_LEGACY_MODEL" apps/StereoWIRIS/yolov8n_uav.pt
 tools/check_operator_runtime.sh --execution
 apps/StereoWIRIS/run.sh --check --mavlink-only
 ```
@@ -194,8 +195,10 @@ Use this tab for WIRIS/Pixhawk connection controls and field readiness checks.
 The isolated field default is camera NIC `10.0.0.11/32` with explicit routes to `.231/.232`;
 Pixhawk NIC `10.0.0.10/24` is a different adapter. Do not apply `.10/24` to the camera NIC or the
 two traffic classes return to one connected subnet.
-The bundled Legacy model setting is the app-relative `yolov8n_uav.pt`; moving the checkout does not
-require editing a user-home path.
+The Legacy model setting is the app-relative `yolov8n_uav.pt`, but the model bytes are an approved
+external artifact and are not bundled in Git. Set `APPROVED_LEGACY_MODEL` to the supplied source,
+run the `install` command above, and require `--check` to validate its size and SHA-256 against
+`model-manifest.json`. Moving the checkout does not require editing a user-home path.
 
 - `Telnet port 탐색` scans candidate WIRIS `IP Address` values for TCP ports `1-65535`, verifies open ports with `HIWS`, and applies the discovered `IP Address`/`Telnet port` only to the side whose button was pressed. `WIRIS 자동 연결` is the path that can fill both sides at once.
 - `WIRIS 자동 연결` tries a monitorless setup flow: full-scan WIRIS SDK control ports, verify each candidate with `HIWS`, fill left/right control hosts and their per-camera ports, sync RTSP hosts, send Ethernet Mode commands, check RTSP frames, and connect camera preview when both streams are valid.
@@ -579,6 +582,10 @@ canonical venv and installs the repository runtime referenced by the compatibili
 is the read-only check.
 
 ## Change Log
+
+- 2026-08-27: Corrected the clean-checkout model contract: `yolov8n_uav.pt` is externally
+  provisioned rather than bundled. Added a tracked size/SHA-256 manifest and made the runtime check
+  fail closed for missing, truncated, or altered default model bytes.
 
 - 2026-08-27: Changed the camera-interface default to isolated `10.0.0.11/32` and verified a hardware
   pcap containing zero SDK-control packets across startup, receive check, Preview, restart and

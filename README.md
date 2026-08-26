@@ -793,6 +793,11 @@ tools/check_operator_runtime.sh --deployment
 if [[ -d .venv ]]; then mv .venv ".venv.backup-$(date +%Y%m%d-%H%M%S)"; fi
 python3 -m venv --system-site-packages .venv
 .venv/bin/python -m pip install -r requirements.txt
+
+# Model bytes are approved external artifacts, not Git content.
+install -Dm0644 "$APPROVED_WORKSTATION_MODEL" .local/workstation_data/models/yolov8m.pt
+install -Dm0644 "$APPROVED_LEGACY_MODEL" apps/StereoWIRIS/yolov8n_uav.pt
+
 tools/check_operator_runtime.sh --execution
 apps/Workstation/run.sh --check
 apps/StereoWIRIS/run.sh --check --mavlink-only
@@ -805,6 +810,10 @@ Simulation, or system interpreter is an error. Manual `.pth` injection of
 pinned ROS 2/PX4 message overlay prepared by `tools/bootstrap_ros_workspace.sh`; its common
 runtime gate runs before that overlay is sourced. Development and CI dependencies are declared
 in `requirements/dev.txt`. Optional PyAV is isolated in `requirements/optional-pyav.txt`.
+Set `APPROVED_WORKSTATION_MODEL` and `APPROVED_LEGACY_MODEL` to the locally supplied approved
+source files before running the two `install` commands. The launchers validate the installed
+size and SHA-256 against `apps/Workstation/model-manifest.json` and
+`apps/StereoWIRIS/model-manifest.json`; neither model is downloaded or stored in Git.
 
 For the manual cross-zoom calibration flow, open `Pre-run Calibration`. At
 the large-board pose, set both visible cameras to nominal 1×, capture matching
@@ -1016,6 +1025,11 @@ its generated path, telemetry, XLSX, compact CSVs, and left/right MP4 together.
   responsible for confirming the actual hardware zoom before measurement.
 
 ## Change Log
+
+- 2026-08-27: Closed the clean-Ubuntu model provisioning gap exposed by an official Jammy KVM
+  recreation. The Ubuntu manifest now includes `python3-cairo` so the system PyGObject dependency
+  graph passes `pip check`; Legacy's ignored `yolov8n_uav.pt` now has a tracked size/SHA-256
+  manifest, explicit provisioning instructions, and fail-closed runtime validation.
 
 - 2026-08-26: Established the canonical Ubuntu 22.04 operator runtime: one root
   `--system-site-packages` venv, read-only deployment/execution doctor, system-owned
