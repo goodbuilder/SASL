@@ -21,7 +21,7 @@ _CONTEXT_LABELS = {
     "processing.experiment": "Protocol",
     "processing.measurement": "Measurement",
     "processing.alignment": "Alignment",
-    "tasks.session": "Sessions",
+    "tasks.data": "Data",
     "tasks.calibration": "Calibration",
     "tasks.advanced": "Advanced",
     "tasks.settings": "Settings",
@@ -67,9 +67,9 @@ _CONTEXT_LAYOUTS = {
         "Measurement",
         ("State", "Result / reason", "Timestamp", "Output contract", "Verdict"),
     ),
-    "tasks.session": (
-        "Sessions",
-        ("State", "Session / selection", "Created / samples", "Storage / contract", "Verdict"),
+    "tasks.data": (
+        "Data",
+        ("State", "Recording / queue", "Last write", "Storage root", "Verdict"),
     ),
     "tasks.calibration": (
         "Calibration",
@@ -284,7 +284,7 @@ class InspectorWidget(QtWidgets.QWidget):
             "devices.time": ("synchronization",),
             "processing.experiment": ("gnss", "synchronization", "measurement", "recording"),
             "processing.measurement": ("measurement",),
-            "tasks.session": ("recording", "measurement"),
+            "tasks.data": ("recording", "measurement"),
             "diagnostics.camera": ("camera.left", "camera.right"),
             "diagnostics.pixhawk": ("pixhawk.left", "pixhawk.right"),
             "diagnostics.gnss": ("gnss.base", "gnss.ntrip"),
@@ -323,8 +323,8 @@ class InspectorWidget(QtWidgets.QWidget):
             valid=valid,
         )
         self.source_value.set_value(detail_text, source=source_text)
-        self.output_section.setVisible(context_id in {"processing.measurement", "tasks.session"})
-        self.geometry_section.setVisible(context_id != "tasks.session")
+        self.output_section.setVisible(context_id in {"processing.measurement", "tasks.data"})
+        self.geometry_section.setVisible(context_id != "tasks.data")
         self.open_advanced_button.setVisible(context_id.startswith("diagnostics."))
         self._refresh_context_details(context_id)
         self._refresh_active_geometry()
@@ -344,7 +344,7 @@ class InspectorWidget(QtWidgets.QWidget):
         self._selection = dict(selection)
         self._configure_context_section(context_id)
         self.context_label.setText(_CONTEXT_LABELS.get(context_id, context_id.replace(".", " · ").title()))
-        self.geometry_section.setVisible(context_id != "tasks.session")
+        self.geometry_section.setVisible(context_id != "tasks.data")
         self._refresh_context_details(context_id)
         self._refresh_active_geometry()
         self._refresh_mountain_margin_control(context_id)
@@ -702,53 +702,39 @@ class InspectorWidget(QtWidgets.QWidget):
                 verdict="ERROR PRESENT" if bad_count else "CHECK WARNINGS" if warn_count else "NO ACTIVE ERROR",
             )
             source = "StatusModel + recording evidence"
-        elif context_id == "tasks.session":
-            snapshot_method = getattr(self.backend, "measurement_session_snapshot", None)
+        elif context_id == "tasks.data":
+            snapshot_method = getattr(self.backend, "data_storage_snapshot", None)
             if not callable(snapshot_method):
                 snapshot_method = getattr(
                     getattr(self.backend, "panel", self.backend),
-                    "measurement_session_snapshot",
+                    "data_storage_snapshot",
                     None,
                 )
             try:
-                session = snapshot_method() if callable(snapshot_method) else {}
+                storage = snapshot_method() if callable(snapshot_method) else {}
             except Exception as exc:
-                session = {"state": "ERROR", "error": str(exc)}
-            session = session if isinstance(session, Mapping) else {}
-            metadata = session.get("metadata")
-            metadata = metadata if isinstance(metadata, Mapping) else {}
-            state = str(session.get("state") or "IDLE").upper()
-            session_id = str(session.get("session_id") or "")
-            measurements = session.get("measurements")
-            measurement_count = (
-                len(measurements) if isinstance(measurements, (tuple, list)) else 0
-            )
-            selected_measurement = str(
-                session.get("selected_measurement_id")
-                or session.get("active_measurement_id")
-                or ""
-            )
-            created = " ".join(
-                value
-                for value in (
-                    str(metadata.get("opened_local_date") or ""),
-                    str(metadata.get("opened_local_time") or ""),
-                )
-                if value
-            )
-            error = str(session.get("error") or "")
+                storage = {"state": "UNAVAILABLE", "error": str(exc)}
+            storage = storage if isinstance(storage, Mapping) else {}
+            state = str(storage.get("state") or "UNAVAILABLE").upper()
+            streams = storage.get("streams")
+            streams = streams if isinstance(streams, Mapping) else {}
+            errors = [
+                str(row.get("last_error") or "")
+                for row in streams.values()
+                if isinstance(row, Mapping) and row.get("last_error")
+            ]
             values.update(
-                primary="Ready for saving" if state == "OPEN" else "No folder" if state == "IDLE" else state,
+                primary=state,
                 secondary=(
-                    f"{session_id} / {selected_measurement}"
-                    if session_id and selected_measurement
-                    else session_id or "--"
+                    f"priority={int(storage.get('priority_pending') or 0)} · "
+                    f"bulk={int(storage.get('bulk_pending') or 0)} · "
+                    f"dropped={int(storage.get('dropped_records') or 0)}"
                 ),
-                timing=f"{created or '--'} · measurements={measurement_count}",
-                contract=str(session.get("session_dir") or "--"),
-                verdict=error or state,
+                timing="Per-record UTC/source clocks",
+                contract=str(storage.get("root") or "--"),
+                verdict=(errors[0] if errors else str(storage.get("error") or state)),
             )
-            source = "measurement_session_snapshot"
+            source = "data_storage_snapshot"
         elif context_id == "tasks.settings":
             snapshot_method = getattr(self.backend, "workstation_settings_snapshot", None)
             try:

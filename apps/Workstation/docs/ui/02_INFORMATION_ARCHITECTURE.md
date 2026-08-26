@@ -1,13 +1,14 @@
 # StereoWIRIS Information Architecture
 
-- Status: Draft
+- Status: Implemented sessionless revision, 2026-08-26
 - Depends on: 00_PRODUCT_VISION.md, 01_USER_WORKFLOW.md
 
 ## 1. Philosophy
 
-Organize according to engineering meaning, not implementation modules.
+Organize by engineering meaning and operator task. Persisted data reports what was captured; it
+does not own whether a live Measurement command is allowed.
 
-## 2. Six UI Domains
+## 2. UI domains
 
 1. Navigation
 2. Workspace
@@ -20,90 +21,80 @@ Every feature has one primary owner.
 
 ## 3. Navigation
 
-Purpose: select device, subsystem, or engineering task. Navigation does not execute commands or edit parameters.
-
-Candidate hierarchy:
-
+```text
 StereoWIRIS
-- Overview
-- Protocol
-- Devices
-  - Cameras
-  - Pixhawk
-  - GNSS / RTK
-  - Time / Sync
-- Alignment
-- Pre-run Calibration
-- Session
-- Measurement
-- Recording / Review
-- Advanced
-- Settings
-- Diagnostics / Analysis
+├── Overview
+├── Protocol
+├── Devices
+│   ├── Cameras
+│   ├── Pixhawk
+│   ├── Telemetry
+│   ├── Base GNSS
+│   └── Time / Sync
+├── Data
+├── Calibration
+├── Alignment
+├── Measurement
+├── Advanced
+├── Settings
+└── Diagnostics
+```
 
-Left/Right camera views and P1/P2 Pixhawk evidence are local paired views, not separate
-navigation contexts. Detection belongs to Cameras, synchronization belongs to Time / Sync,
-Session owns the daily lifecycle and current-child readiness; Review/Files belong to
-Recording / Review.
+Left/Right camera and P1/P2 evidence are paired local views. Detection belongs to Cameras;
+synchronization belongs to Time / Sync. `Data` owns fixed writer status, capture tools, data-folder
+access, and a file-manager link to legacy recordings. It owns no Session lifecycle or readiness
+gate.
 
-## 4. Workspace
+## 4. Workspace ownership
 
-Largest area where engineering work is performed. Current Workstation workspaces are
-Overview, Protocol, Cameras, Time / Sync, Session, Measurement, Alignment, Pre-run Calibration,
-Recording / Review, and Advanced. Pixhawk and GNSS are local tabs of the paired Alignment
-workspace; Detection is a Cameras section.
+- Measurement: transient run state, live inputs, method readiness, result, quality, history.
+- Data: type-owned paths, writer queues/errors/drops, explicit HR/OZ and ULog tools.
+- Alignment: app-lifetime pose candidates, frozen references, Apply/Revert/Reset.
+- Calibration: reusable photo sets and K,D/R,t profiles, independent of Measurement.
+- Advanced: Manual record and file/video utilities.
+- Diagnostics: factual logs, raw states, communication, timing, performance.
 
 ## 5. Inspector
 
-Contextual properties/configuration of selected object. It shall not contain logs, large plots, or camera preview.
+Contextual read-only/configuration projection. It does not contain large logs or camera preview.
+For Data it shows writer/storage facts, not Session/package state.
 
-## 6. Toolbar
+## 6. Toolbar and commands
 
-Commands only. No configuration forms and no system-state truth.
+Commands request change; status confirms it. Configuration fields do not belong in the toolbar.
+The Measurement request stays available when storage is DEGRADED or UNAVAILABLE.
 
-## 7. Diagnostics
+## 7. Global status
 
-Engineering evidence such as logs, raw states, communication details, timing, performance.
+Camera, Pixhawk, RTK, Detection, Measurement run, recording, storage degradation, and FPS are
+compact projections only. `QUEUED` identifies camera-resource contention; it is not a save state.
 
-## 8. Global Status
-
-Compact persistent state. Candidates: Camera, Pixhawk, RTK, Detection, Measurement, Recording, FPS. Include only high-value reliable states.
-
-## 9. Mapping Examples
+## 8. Mapping examples
 
 - Camera Preview → Workspace
-- Exposure/Gain → Inspector
 - Connect Camera → Command
 - Camera Connected → Status
-- Record Start → Command
-- Recording Active → Status
-- Measurement Result/Quality → Workspace
-- Measurement Debug → Diagnostics
-- YOLO Threshold → Inspector
-- Detection Enable → Command
-- GNSS details → Workspace or Diagnostics depending on task
-- Raw MAVLink → Diagnostics
-- Calibration workflow/result → Workspace
+- Measurement Start/Stop → Command
+- Measurement `IDLE/QUEUED/STARTING/RUNNING/STOPPING/ERROR` → Status
+- Fixed stream paths/drop counts → Data Workspace
+- Manual record → Advanced command
+- Capture HR/OZ/ULog → Data Capture
+- Measurement result/quality → Measurement Workspace
+- Raw MAVLink/logs → Diagnostics
+- Calibration workflow/result → Calibration Workspace
 
-## 10. Domain Interaction
+## 9. Forbidden structures
 
-Navigation changes context. Workspace/Inspector reflect context. Commands act on the system. Status reports confirmed state. Diagnostics provides evidence.
+- No Create/Open/Close/Finalize/Seal/Retry-Save Session UI.
+- No automatic legacy Session catalog scan or recovery.
+- No storage-health gate on Measurement admission.
+- No duplicate Data/Recording/Review top-level navigation.
+- No coordinate conversion in generic UI adapters.
 
-## 11. Forbidden Structures
+## 10. Success criteria
 
-Do not default to new top-level tabs, settings pages per object, commands inside Diagnostics, logs inside Inspector, or Global Status buried in Workspace.
-
-## 12. Decision Tree
-
-Command? → Toolbar/Command layer
-State? → Status
-Configuration? → Inspector
-Engineering task? → Workspace
-Evidence? → Diagnostics
-System structure? → Navigation
-
-## 13. Success Criteria
-
-- engineers can predict where features belong
-- new subsystems extend domains rather than top-level tabs
-- domain ownership is clear
+- Operators can begin a Measurement after a long gap without closing old data state.
+- Actual camera contention queues and resumes visibly.
+- Data failures remain visible without disabling Measurement.
+- Legacy folders remain untouched and file-manager-only.
+- Alignment remains stable until Revert, Reset, or restart.

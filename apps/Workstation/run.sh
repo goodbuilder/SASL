@@ -5,30 +5,52 @@ APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APPS_DIR="$(cd "$APP_DIR/.." && pwd)"
 SASL_ROOT="$(cd "$APP_DIR/../.." && pwd)"
 COMMON_PYTHON="$SASL_ROOT/common/python"
+CANONICAL_PYTHON="$SASL_ROOT/.venv/bin/python"
 
-resolve_python() {
-  local candidate resolved
-  for candidate in "$@"; do
-    [[ -n "$candidate" ]] || continue
-    if [[ "$candidate" == */* ]]; then
-      if [[ -x "$candidate" ]]; then
-        printf '%s\n' "$candidate"
-        return 0
-      fi
-      continue
-    fi
-    resolved="$(command -v "$candidate" 2>/dev/null || true)"
-    if [[ -n "$resolved" && -x "$resolved" ]]; then
-      printf '%s\n' "$resolved"
-      return 0
-    fi
-  done
-  return 1
+usage() {
+  cat <<'USAGE'
+Usage: apps/Workstation/run.sh [--check] [--maximized] [app args...]
+
+Options:
+  --check  Verify the canonical Python, settings, model, and GStreamer runtime.
+  --help   Show this dependency-free help.
+USAGE
 }
 
-PYTHON_BIN="${PYTHON_BIN:-}"
+case "${1:-}" in
+  --help|-h)
+    usage
+    exit 0
+    ;;
+esac
+
+if [[ ! -x "$CANONICAL_PYTHON" ]]; then
+  printf '%s\n' \
+    "FAIL python.executable: canonical venv is missing: $CANONICAL_PYTHON" \
+    "  Recovery: cd $SASL_ROOT" \
+    "  Recovery: python3 -m venv --system-site-packages .venv" \
+    "  Recovery: .venv/bin/python -m pip install -r requirements.txt" >&2
+  exit 1
+fi
+
+PYTHON_BIN="${PYTHON_BIN:-$CANONICAL_PYTHON}"
+if [[ "$PYTHON_BIN" != /* ]]; then
+  if [[ "$PYTHON_BIN" == */* ]]; then
+    PYTHON_BIN="$(realpath -s -m "$PWD/$PYTHON_BIN")"
+  else
+    PYTHON_BIN="$(command -v "$PYTHON_BIN" 2>/dev/null || true)"
+  fi
+fi
 if [[ -z "$PYTHON_BIN" ]]; then
-  PYTHON_BIN="$(resolve_python "$SASL_ROOT/.venv/bin/python" python3 python)"
+  printf '%s\n' "FAIL python.override: PYTHON_BIN could not be resolved" "  Recovery: unset PYTHON_BIN" >&2
+  exit 2
+fi
+if [[ "$(realpath -s -m "$PYTHON_BIN")" != "$(realpath -s -m "$CANONICAL_PYTHON")" ]]; then
+  printf '%s\n' \
+    "FAIL python.override: Workstation only supports $CANONICAL_PYTHON" \
+    "  actual PYTHON_BIN: ${PYTHON_BIN:-unresolved}" \
+    "  Recovery: unset PYTHON_BIN" >&2
+  exit 2
 fi
 
 export PYTHONPATH="$APPS_DIR:$SASL_ROOT:$COMMON_PYTHON${PYTHONPATH:+:$PYTHONPATH}"
@@ -41,9 +63,17 @@ export MPLCONFIGDIR="${MPLCONFIGDIR:-$WORKSTATION_DATA_ROOT/.cache/matplotlib}"
 mkdir -p "$MPLCONFIGDIR"
 
 case "${1:-}" in
-  --check|--help|-h)
+  --check)
     exec "$PYTHON_BIN" -m Workstation "$@"
     ;;
 esac
+
+# Every launch overwrites this file with the current session's stdout/stderr
+# (including the traceback PyQt5 prints just before an unhandled-exception
+# abort) so the most recent run's log is always available without having to
+# remember a `| tee` wrapper.
+LOG_FILE="${WORKSTATION_RUN_LOG:-$WORKSTATION_DATA_ROOT/logs/run.log}"
+mkdir -p "$(dirname "$LOG_FILE")"
+exec > >(tee "$LOG_FILE") 2>&1
 
 exec "$PYTHON_BIN" -m Workstation --maximized "$@"

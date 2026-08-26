@@ -124,6 +124,10 @@ class StatusIndicator(QtWidgets.QFrame):
             "RTCM_ACTIVE": "RTCM OK",
             "RTCM_STALE": "STALE",
             "RECONNECTING": "RETRY",
+            "QUALIFYING": "QUAL",
+            "ATTITUDE STALE": "ATT STALE",
+            "ETH MAVLINK RX STALLED": "ETH STALL",
+            "RECOVERING": "RECOVER",
         }
         age = "" if status.age_s is None else f" · age {status.age_s:.2f}s"
         self.state.setText(compact_state_names.get(status.state, status.state) if self.compact else status.state)

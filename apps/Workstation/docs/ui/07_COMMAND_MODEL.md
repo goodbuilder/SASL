@@ -20,7 +20,9 @@
 
 ## 3. Global Commands
 
-Only high-frequency cross-context operations. Candidates: Connect/Disconnect/Reconnect, Preview, Detection, Start/Stop Recording, Save, Export, Diagnostics.
+Only high-frequency cross-context operations. Candidates: Connect/Disconnect/Reconnect, Preview,
+Measurement Start/Stop, Manual Record, open Data, and Diagnostics. There is no Measurement
+Session Save/Finalize command.
 
 ## 4. Contextual Commands
 
@@ -30,7 +32,8 @@ Operate on selected object/workspace: camera connect/preview/capture, calibratio
 
 Transitions matter. Examples:
 - Connect: DISCONNECTED → CONNECTING → CONNECTED
-- Recording: IDLE → STARTING → ACTIVE → STOPPING → SAVED/IDLE
+- Measurement: IDLE → QUEUED(optional) → STARTING → RUNNING → STOPPING → IDLE
+- Manual recording: IDLE → STARTING → ACTIVE → STOPPING → IDLE
 - Preview: STOPPED → STARTING → LIVE → STOPPING → STOPPED
 
 Avoid naive toggles where backend transitions are meaningful.
@@ -43,6 +46,15 @@ Use only when ON/OFF are symmetrical, transition is simple, backend state is obs
 
 Immediate examples: export, copy, screenshot, open file. Destructive actions require appropriate confirmation.
 
+The P1/P2 Ethernet stall action is a guarded destructive command, not a generic reboot. It is
+enabled only for `ETH MAVLINK RX STALLED`, while Measurement/recording/save/finalization and other
+PX4 commands are idle. It requires one current unique USB heartbeat mapping (P1=sysid1/P2=sysid2),
+names side/device/sysid in the confirmation, and revalidates the same identity in a one-shot worker.
+Operator No, missing/stale/duplicate/changed identity, or revalidation failure sends no reboot.
+The stalled Ethernet connection is never used as the reboot transport. The command writes no
+parameter/config/file and does not imply recovery; `RECOVERING` plus 10-minute qualification is the
+observable postcondition. Automatic reboot is not a supported command.
+
 ## 8. Command Ownership
 
 One authoritative action/controller path. Menu and Toolbar should reuse the same QAction/command logic.
@@ -50,7 +62,7 @@ One authoritative action/controller path. Menu and Toolbar should reuse the same
 ## 9. Toolbar
 
 Candidate Phase 1:
-[Connect] [Preview] | [Detection] | [Record] [Stop] | [Save] | [Diagnostics]
+[Connect] [Preview] | [Measurement] | [Manual Record] | [Data] | [Diagnostics]
 
 Toolbar remains compact; configuration fields do not belong there.
 
@@ -76,11 +88,12 @@ that save never updates the active alias, persisted settings, or Measurement geo
 still requires explicit confirmation before Apply; `FAIL` cannot be applied. Structural validation
 of K,D/R,t and exact operating-profile applicability remain hard Apply gates.
 
-`측정 시작` creates a child when none is prepared and then starts Detection. Child creation is
-lifecycle-gated, not geometry-gated: it requires an open parent and no mutable prior child/producer,
-but does not require Alignment, exact K,D, GNSS, or a ready method. A Pre HR/OZ request may create
-the same draft first. Missing geometry blocks valid MeasurementAttempt creation while matched raw
-evidence is retained as a blocked pair.
+`측정 시작` creates only a transient run and then starts Detection. It does not require a parent,
+save completion, storage health, Alignment, exact K,D, GNSS, or a ready method. Missing geometry
+blocks a valid result while matched raw evidence remains available. Manual record is stopped first;
+actual camera-resource contention creates QUEUED and resumes automatically. The shared button/QAction
+is never disabled by Session/storage state. Invalid RTSP inputs or duplicate live intervals are
+rejected with an operator-visible reason.
 
 ## 14. Detection / Recording / Calibration Separation
 
@@ -89,7 +102,7 @@ evidence is retained as a blocked pair.
 - runtime detection state → Status
 
 - Recording start/stop → Command
-- output/session config → Inspector/Workspace
+- output/data-root config → Settings/Data Workspace
 - recording state → Status
 
 - Calibration global entry → Navigation/command
@@ -98,6 +111,9 @@ evidence is retained as a blocked pair.
 ## 15. Command Logging
 
 Important system-changing commands should be logged separately from resulting state transitions where useful.
+For verified-USB recovery, log discovery identity, operator cancellation or acceptance, immediate
+worker revalidation, command send/failure, Ethernet recovery transition, and qualification result as
+distinct events.
 
 ## 16. Anti-Patterns
 

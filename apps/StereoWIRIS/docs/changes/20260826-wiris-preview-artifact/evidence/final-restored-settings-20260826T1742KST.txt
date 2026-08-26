@@ -1,0 +1,19 @@
+Final restored state after all encoder/transport A/B tests
+
+Left GETH = TRUE
+Left GEBR VISIBLE = 0
+Left GEQZ VISIBLE = 1
+Left GEGS VISIBLE = 90
+Left GEIR VISIBLE = 0
+
+Right GETH = TRUE
+Right GEBR VISIBLE = 0
+Right GEQZ VISIBLE = 1
+Right GEGS VISIBLE = 90
+Right GEIR VISIBLE = 0
+
+StereoWIRIS persisted stream settings:
+rtsp_transport = tcp
+rtsp_latency_ms = 100
+
+No firmware, reboot, IP/subnet, or factory-reset operation was performed.

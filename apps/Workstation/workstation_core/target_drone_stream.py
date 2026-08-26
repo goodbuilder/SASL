@@ -491,6 +491,7 @@ class TargetDroneReceiver:
         spool_max_rows: int = 1_000_000,
         spool_max_bytes: int = 512 * 1024 * 1024,
         spool_fsync_every_rows: int = 1,
+        spool: Any | None = None,
         mavutil_module: Any | None = None,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
         utc_ns: Callable[[], int] = time.time_ns,
@@ -512,11 +513,15 @@ class TargetDroneReceiver:
         self.heartbeat_timeout_s = float(heartbeat_timeout_s)
         if not math.isfinite(self.heartbeat_timeout_s) or self.heartbeat_timeout_s <= 0.0:
             raise ValueError("heartbeat_timeout_s must be finite and positive")
-        self.spool = BoundedAppendOnlyJsonlSpool(
-            spool_path,
-            max_rows=spool_max_rows,
-            max_bytes=spool_max_bytes,
-            fsync_every_rows=spool_fsync_every_rows,
+        self.spool = (
+            spool
+            if spool is not None
+            else BoundedAppendOnlyJsonlSpool(
+                spool_path,
+                max_rows=spool_max_rows,
+                max_bytes=spool_max_bytes,
+                fsync_every_rows=spool_fsync_every_rows,
+            )
         )
         self._mavutil_module = mavutil_module
         self._monotonic_ns = monotonic_ns

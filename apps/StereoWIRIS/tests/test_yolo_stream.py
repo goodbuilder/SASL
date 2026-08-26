@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 import queue
+import signal
 import threading
 import time
 
@@ -21,14 +22,19 @@ from wiris_stereo_distance.yolo_stream import (
     SOFTWARE_H264_DECODER,
     DEFAULT_RTSP_LATENCY_MS,
     GstRtpTimingTracker,
+    RollingFrameRateEstimator,
     STREAM_BACKEND_OPENCV_AUTO,
     STREAM_BACKEND_PYAV,
     RtpFrameTiming,
     RtcpSenderReportTiming,
     YoloStreamWorker,
     _BoundedProcessOutputQueue,
+    _finalize_gst_recording,
+    _iter_ffmpeg_recording_pids,
     _open_record_video_writer,
+    _emit_preview_frame,
     _process_frame_for_output,
+    _report_recording_process_early_exit,
     _release_record_video_writer,
     _run_opencv_stream,
     _activate_cpu_fallback_rate_limiter,
@@ -153,6 +159,131 @@ def test_preview_output_rate_limiter_does_not_change_capture_timestamps() -> Non
     assert _should_emit_preview_frame({"display_rate_hz": "invalid"}, 1.0)
 
 
+def test_preview_identity_metadata_hashes_the_exact_queued_rgb_bytes(monkeypatch, tmp_path) -> None:
+    import hashlib
+    import cv2
+
+    monkeypatch.setenv("STEREO_PREVIEW_IDENTITY_LOG", str(tmp_path / "identity.jsonl"))
+
+    class OutputQueue:
+        def __init__(self) -> None:
+            self.messages = []
+
+        def put(self, message) -> None:
+            self.messages.append(message)
+
+    frame = np.array([[[1, 2, 3], [4, 5, 6]]], dtype=np.uint8)
+    output_queue = OutputQueue()
+    config = {"display_rate_hz": 0.0, "preview_max_width": 0, "url": "rtsp://camera/visible"}
+
+    assert _emit_preview_frame(
+        cv2,
+        frame,
+        config,
+        output_queue,
+        timestamp_s=10.0,
+        source_timestamp_s=9.5,
+        timestamp_source="test-pts",
+    )
+
+    _kind, metadata, width, height, data = output_queue.messages[0]
+    assert (width, height) == (2, 1)
+    assert metadata["frame_identity_version"] == 1
+    assert metadata["frame_seq"] == 1
+    assert metadata["pixel_format"] == "RGB888"
+    assert metadata["stride"] == 6
+    assert metadata["byte_count"] == len(data) == 6
+    assert metadata["producer_rgb_sha256"] == hashlib.sha256(data).hexdigest()
+
+
+def test_worker_identity_log_proves_queue_qimage_match_and_detects_reorder(monkeypatch, tmp_path) -> None:
+    import hashlib
+    import json
+
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    identity_path = tmp_path / "identity.jsonl"
+    monkeypatch.setenv("STEREO_PREVIEW_IDENTITY_LOG", str(identity_path))
+
+    from PyQt5 import QtWidgets
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    worker = YoloStreamWorker(
+        url="rtsp://10.0.0.232:8554/visible",
+        weights_path="weights.pt",
+        device="cpu",
+        input_size=640,
+        conf_threshold=0.5,
+        iou_threshold=0.45,
+        max_rate_hz=30.0,
+        enable_detection=False,
+    )
+    original = bytes([255, 0, 0, 0, 255, 0])
+    digest = hashlib.sha256(original).hexdigest()
+
+    def emit(sequence: int) -> None:
+        worker._handle_worker_message(
+            (
+                "frame",
+                {
+                    "timestamp_s": float(sequence),
+                    "frame_identity_version": 1,
+                    "frame_seq": sequence,
+                    "producer_rgb_sha256": digest,
+                    "pixel_format": "RGB888",
+                    "stride": 6,
+                    "byte_count": len(original),
+                },
+                2,
+                1,
+                original,
+            )
+        )
+
+    emit(1)
+    emit(3)
+    emit(2)
+
+    records = [json.loads(line) for line in identity_path.read_text(encoding="utf-8").splitlines()]
+    assert [record["frame_seq"] for record in records] == [1, 3, 2]
+    assert all(record["producer_queue_match"] for record in records)
+    assert all(record["queue_qimage_match"] for record in records)
+    assert all(record["qimage_bytes_per_line"] >= 6 for record in records)
+    assert records[1]["queue_sequence_delta"] == 2
+    assert records[1]["queue_dropped_total"] == 1
+    assert records[2]["queue_reordered"] is True
+    assert records[2]["queue_reordered_total"] == 1
+    _ = app
+
+
+def test_worker_qimage_deep_copy_survives_source_buffer_overwrite(monkeypatch) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from PyQt5 import QtWidgets
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    worker = YoloStreamWorker(
+        url="rtsp://10.0.0.232:8554/visible",
+        weights_path="weights.pt",
+        device="cpu",
+        input_size=640,
+        conf_threshold=0.5,
+        iou_threshold=0.45,
+        max_rate_hz=30.0,
+        enable_detection=False,
+    )
+    received = []
+    worker.frame_ready.connect(lambda image, _metadata: received.append(image))
+    source = bytearray([255, 0, 0, 0, 255, 0])
+
+    worker._handle_worker_message(("frame", {}, 2, 1, source))
+    source[:] = b"\x00" * len(source)
+
+    assert len(received) == 1
+    assert received[0].pixelColor(0, 0).getRgb()[:3] == (255, 0, 0)
+    assert received[0].pixelColor(1, 0).getRgb()[:3] == (0, 255, 0)
+    _ = app
+
+
 def _predict_config() -> dict:
     return {
         "input_size": 640,
@@ -171,7 +302,10 @@ def test_gstreamer_pipeline_uses_configurable_low_latency_default() -> None:
     assert "do-rtcp=true" in pipeline
     assert "rtspsrc name=src" in pipeline
     assert "rtph264depay name=depay source-info=true" in pipeline
-    assert "queue leaky=downstream max-size-buffers=1" in pipeline
+    assert "h264parse config-interval=-1" in pipeline
+    assert "queue max-size-buffers=0 max-size-bytes=0 max-size-time=250000000" in pipeline
+    assert "queue leaky=downstream max-size-buffers=8" in pipeline
+    assert "queue leaky=downstream max-size-buffers=1" not in pipeline
     assert NVIDIA_H264_DECODER in pipeline
     assert SOFTWARE_H264_DECODER not in pipeline
     assert "appsink name=sink" in pipeline
@@ -444,6 +578,289 @@ def test_rtp_timing_tracker_keeps_relative_timestamp_when_pc_utc_is_invalid() ->
     assert "rtcp_timing_invalid_reason" not in metadata
 
 
+def test_rtp_sequence_tracker_latches_forward_gap_until_pipeline_replacement() -> None:
+    tracker = GstRtpTimingTracker(SimpleNamespace(), SimpleNamespace())
+
+    assert tracker.register_rtp_sequence(ssrc=0x0F078CC9, sequence=11570, observed_monotonic_s=1.0) is None
+    discontinuity = tracker.register_rtp_sequence(
+        ssrc=0x0F078CC9,
+        sequence=11585,
+        observed_monotonic_s=1.1,
+        rtp_pts_ns=1_000,
+    )
+
+    assert discontinuity is not None
+    assert discontinuity.ssrc == 0x0F078CC9
+    assert discontinuity.previous_sequence == 11570
+    assert discontinuity.sequence == 11585
+    assert discontinuity.missing_packets == 14
+    assert discontinuity.observed_monotonic_s == pytest.approx(1.1)
+    assert tracker.decoded_output_blocked()
+    assert tracker.pop_rtp_discontinuity() == discontinuity
+    assert tracker.pop_rtp_discontinuity() is None
+    # Consuming the diagnostic record must not reopen the NVIDIA output race.
+    assert tracker.decoded_output_blocked()
+
+
+def test_rtp_gate_reopens_only_at_clean_intra_after_gap_pts() -> None:
+    tracker = GstRtpTimingTracker(SimpleNamespace(), SimpleNamespace())
+    tracker.register_rtp_sequence(ssrc=7, sequence=100, rtp_pts_ns=1_000)
+    tracker.register_rtp_sequence(
+        ssrc=7,
+        sequence=103,
+        observed_monotonic_s=5.0,
+        rtp_pts_ns=2_000,
+    )
+
+    assert not tracker.register_access_unit(
+        pts_ns=1_900,
+        is_delta=False,
+        is_corrupted=False,
+        observed_monotonic_s=5.1,
+    )
+    assert not tracker.register_access_unit(
+        pts_ns=2_000,
+        is_delta=False,
+        is_corrupted=False,
+        observed_monotonic_s=5.15,
+    )
+    assert not tracker.register_access_unit(
+        pts_ns=2_100,
+        is_delta=True,
+        is_corrupted=False,
+        observed_monotonic_s=5.2,
+    )
+    assert not tracker.register_access_unit(
+        pts_ns=2_200,
+        is_delta=False,
+        is_corrupted=True,
+        observed_monotonic_s=5.3,
+    )
+    assert tracker.register_access_unit(
+        pts_ns=2_300,
+        is_delta=False,
+        is_corrupted=False,
+        observed_monotonic_s=5.4,
+    )
+    assert tracker.should_suppress_decoded_buffer(2_200)
+    assert tracker.decoded_output_blocked()
+    assert not tracker.should_suppress_decoded_buffer(2_300)
+    assert not tracker.decoded_output_blocked()
+    recovery = tracker.pop_rtp_recovery()
+    assert recovery is not None
+    assert recovery.ssrc == 7
+    assert recovery.resume_pts_ns == 2_300
+    assert recovery.blocked_duration_s == pytest.approx(0.4)
+
+
+def test_encoded_au_gate_drops_missing_pts_and_delta_until_clean_intra() -> None:
+    tracker = GstRtpTimingTracker(SimpleNamespace(), SimpleNamespace())
+
+    assert tracker.should_drop_encoded_access_unit(
+        pts_ns=None,
+        is_delta=False,
+        is_corrupted=False,
+        is_discontinuous=False,
+        observed_monotonic_s=10.0,
+    )
+    event = tracker.pop_h264_access_unit_discontinuity()
+    assert event is not None
+    assert event.reason == "missing-pts"
+    assert tracker.decoded_output_blocked()
+    assert tracker.should_drop_encoded_access_unit(
+        pts_ns=1_000,
+        is_delta=True,
+        is_corrupted=False,
+        is_discontinuous=False,
+        observed_monotonic_s=10.1,
+    )
+    assert not tracker.should_drop_encoded_access_unit(
+        pts_ns=2_000,
+        is_delta=False,
+        is_corrupted=False,
+        is_discontinuous=False,
+        observed_monotonic_s=10.2,
+    )
+    assert tracker.consume_encoded_recovery_marker(2_000)
+    assert not tracker.consume_encoded_recovery_marker(2_000)
+    assert tracker.decoded_output_blocked()
+    assert tracker.should_suppress_decoded_buffer(1_999)
+    assert not tracker.should_suppress_decoded_buffer(2_000)
+
+
+def test_encoded_au_gate_relatches_on_discont_or_corrupted_buffer() -> None:
+    tracker = GstRtpTimingTracker(SimpleNamespace(), SimpleNamespace())
+
+    assert tracker.should_drop_encoded_access_unit(
+        pts_ns=5_000,
+        is_delta=True,
+        is_corrupted=False,
+        is_discontinuous=True,
+        observed_monotonic_s=20.0,
+    )
+    assert tracker.pop_h264_access_unit_discontinuity().reason == "discont"
+    assert tracker.should_drop_encoded_access_unit(
+        pts_ns=5_100,
+        is_delta=False,
+        is_corrupted=True,
+        is_discontinuous=False,
+        observed_monotonic_s=20.1,
+    )
+    assert not tracker.should_drop_encoded_access_unit(
+        pts_ns=5_200,
+        is_delta=False,
+        is_corrupted=False,
+        is_discontinuous=False,
+        observed_monotonic_s=20.2,
+    )
+    assert tracker.consume_encoded_recovery_marker(5_200)
+    assert not tracker.should_suppress_decoded_buffer(5_200)
+
+
+def test_encoded_au_gate_drops_non_delta_discont_before_later_clean_intra() -> None:
+    tracker = GstRtpTimingTracker(SimpleNamespace(), SimpleNamespace())
+
+    assert tracker.should_drop_encoded_access_unit(
+        pts_ns=7_000,
+        is_delta=False,
+        is_corrupted=False,
+        is_discontinuous=True,
+        observed_monotonic_s=30.0,
+    )
+    assert tracker.decoded_output_blocked()
+    assert tracker.should_suppress_decoded_buffer(7_000)
+    assert not tracker.should_drop_encoded_access_unit(
+        pts_ns=8_000,
+        is_delta=False,
+        is_corrupted=False,
+        is_discontinuous=False,
+        observed_monotonic_s=30.5,
+    )
+    assert not tracker.should_suppress_decoded_buffer(8_000)
+
+
+def test_rtp_sequence_tracker_ignores_wrap_duplicate_old_and_ssrc_change() -> None:
+    tracker = GstRtpTimingTracker(SimpleNamespace(), SimpleNamespace())
+
+    assert tracker.register_rtp_sequence(ssrc=1, sequence=65535) is None
+    assert tracker.register_rtp_sequence(ssrc=1, sequence=0) is None
+    assert tracker.register_rtp_sequence(ssrc=1, sequence=0) is None
+    assert tracker.register_rtp_sequence(ssrc=1, sequence=65535) is None
+    assert tracker.register_rtp_sequence(ssrc=1, sequence=1) is None
+    assert tracker.register_rtp_sequence(ssrc=2, sequence=40000) is None
+    assert tracker.register_rtp_sequence(ssrc=2, sequence=40001) is None
+
+    assert tracker.pop_rtp_discontinuity() is None
+    assert not tracker.decoded_output_blocked()
+
+
+def test_rtp_gap_gates_both_decoders_without_triggering_health_fallback() -> None:
+    from wiris_stereo_distance import yolo_stream
+
+    discontinuity = yolo_stream.RtpSequenceDiscontinuity(
+        ssrc=1234,
+        previous_sequence=11570,
+        sequence=11585,
+        missing_packets=14,
+        observed_monotonic_s=20.0,
+    )
+    common = {
+        "active_decoder": yolo_stream.NVIDIA_H264_DECODER,
+        "started_s": 10.0,
+        "last_frame_s": 19.9,
+        "now_s": 20.0,
+        "already_fell_back": False,
+        "rtp_discontinuity": discontinuity,
+    }
+
+    assert yolo_stream.runtime_decoder_fallback_reason(
+        requested_decoder="auto",
+        **common,
+    ) is None
+    assert yolo_stream.runtime_decoder_fallback_reason(
+        requested_decoder="nvidia",
+        **common,
+    ) is None
+    assert yolo_stream.nvidia_decoder_health_failure_reason(**common) is None
+    assert yolo_stream.should_suppress_decoded_output(
+        active_decoder=yolo_stream.NVIDIA_H264_DECODER,
+        rtp_discontinuity_latched=True,
+    )
+    assert yolo_stream.should_suppress_decoded_output(
+        active_decoder=yolo_stream.SOFTWARE_H264_DECODER,
+        rtp_discontinuity_latched=True,
+    )
+
+
+def test_software_rtp_gap_reporter_aggregates_instead_of_flooding_status() -> None:
+    from wiris_stereo_distance import yolo_stream
+
+    reporter = yolo_stream.RtpDiscontinuityReporter(interval_s=5.0)
+
+    def event(observed_s: float, missing: int) -> yolo_stream.RtpSequenceDiscontinuity:
+        return yolo_stream.RtpSequenceDiscontinuity(
+            ssrc=1,
+            previous_sequence=10,
+            sequence=11 + missing,
+            missing_packets=missing,
+            observed_monotonic_s=observed_s,
+        )
+
+    assert reporter.observe(event(1.0, 2), now_s=1.0) is None
+    assert reporter.observe(event(3.0, 4), now_s=3.0) is None
+    status = reporter.observe(event(6.0, 1), now_s=6.0)
+    assert status is not None
+    assert "events=3 (+3)" in status
+    assert "missing=7 (+7)" in status
+    assert reporter.observe(event(7.0, 5), now_s=7.0) is None
+    final_status = reporter.flush(now_s=7.0)
+    assert final_status is not None
+    assert "events=4 (+1)" in final_status
+    assert "missing=12 (+5)" in final_status
+    assert reporter.flush(now_s=8.0) is None
+
+
+def test_auto_fallback_503_reconnect_uses_bounded_backoff_only_for_software_transition() -> None:
+    from wiris_stereo_distance import yolo_stream
+
+    common = {
+        "active_decoder": yolo_stream.SOFTWARE_H264_DECODER,
+        "fallback_active": True,
+        "error_detail": "Service Unavailable (503)",
+    }
+    assert yolo_stream.decoder_fallback_rtsp_retry_delay_s(**common, retry_count=0) == 0.5
+    assert yolo_stream.decoder_fallback_rtsp_retry_delay_s(**common, retry_count=1) == 1.0
+    assert yolo_stream.decoder_fallback_rtsp_retry_delay_s(**common, retry_count=2) == 2.0
+    assert yolo_stream.decoder_fallback_rtsp_retry_delay_s(**common, retry_count=3) is None
+    assert yolo_stream.decoder_fallback_rtsp_retry_delay_s(
+        **{**common, "active_decoder": yolo_stream.NVIDIA_H264_DECODER},
+        retry_count=0,
+    ) is None
+    assert yolo_stream.decoder_fallback_rtsp_retry_delay_s(
+        **{**common, "fallback_active": False},
+        retry_count=0,
+    ) is None
+    assert yolo_stream.decoder_fallback_rtsp_retry_delay_s(
+        **{**common, "error_detail": "Unauthorized (401)"},
+        retry_count=0,
+    ) is None
+
+
+def test_gstreamer_initial_playing_failure_uses_bounded_start_retry() -> None:
+    from wiris_stereo_distance import yolo_stream
+
+    detail = "avdec_h264: avdec_h264 failed to enter PLAYING state"
+    assert yolo_stream.gstreamer_start_retry_delay_s(error_detail=detail, retry_count=0) == 0.5
+    assert yolo_stream.gstreamer_start_retry_delay_s(error_detail=detail, retry_count=1) == 1.0
+    assert yolo_stream.gstreamer_start_retry_delay_s(error_detail=detail, retry_count=2) == 2.0
+    assert yolo_stream.gstreamer_start_retry_delay_s(error_detail=detail, retry_count=3) == 4.0
+    assert yolo_stream.gstreamer_start_retry_delay_s(error_detail=detail, retry_count=4) is None
+    assert yolo_stream.gstreamer_start_retry_delay_s(
+        error_detail="pipeline missing appsink",
+        retry_count=0,
+    ) is None
+
+
 def test_gstreamer_pipeline_can_drop_delta_frames_for_keyframe_only_diagnostics() -> None:
     pipeline = build_gst_pipeline_text("rtsp://10.0.0.232:8554/visible", keyframe_only=True)
 
@@ -452,8 +869,14 @@ def test_gstreamer_pipeline_can_drop_delta_frames_for_keyframe_only_diagnostics(
     assert "identity drop-buffer-flags=delta-unit" in pipeline
 
 
+def test_gstreamer_pipeline_names_primary_parser_for_intra_recovery_probe() -> None:
+    pipeline = build_gst_pipeline_text("rtsp://10.0.0.232:8554/visible")
+
+    assert "h264parse config-interval=-1 name=parse" in pipeline
+
+
 def test_gstreamer_pipeline_records_encoded_h264_without_reencoding(tmp_path) -> None:
-    record_path = tmp_path / "raw left.mkv"
+    record_path = tmp_path / "raw left.mp4"
     pipeline = build_gst_pipeline_text(
         "rtsp://10.0.0.232:8554/visible",
         record_video_path=str(record_path),
@@ -461,14 +884,94 @@ def test_gstreamer_pipeline_records_encoded_h264_without_reencoding(tmp_path) ->
 
     assert "! tee name=encoded" in pipeline
     assert "encoded. ! queue" in pipeline
-    assert "! matroskamux" in pipeline
-    assert f"! filesink location='{record_path}' sync=false" in pipeline
+    assert "! video/x-h264,stream-format=avc,alignment=au" in pipeline
+    assert "fragment-duration" not in pipeline
+    assert "! mp4mux ! filesink" in pipeline
+    assert "matroskamux" not in pipeline
+    assert f'! filesink location="{record_path}" sync=false' in pipeline
     assert pipeline.count("h264parse") >= 2
     assert "! videoconvert ! video/x-raw,format=BGR ! appsink" in pipeline
+    assert pipeline.count("rtspsrc") == 1
+
+
+def test_gstreamer_location_round_trips_non_ascii_path_without_literal_quotes(tmp_path) -> None:
+    import gi
+
+    from wiris_stereo_distance import yolo_stream
+
+    gi.require_version("Gst", "1.0")
+    from gi.repository import Gst
+
+    Gst.init(None)
+    record_path = tmp_path / "바탕 화면" / 'raw "left".mp4'
+    pipeline = Gst.parse_launch(
+        "fakesrc ! filesink name=record_sink "
+        f"location={yolo_stream._gst_location(str(record_path))}"
+    )
+    try:
+        assert pipeline.get_by_name("record_sink").get_property("location") == str(record_path)
+    finally:
+        pipeline.set_state(Gst.State.NULL)
+
+
+def test_gstreamer_recording_finalization_waits_beyond_old_three_second_budget(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from wiris_stereo_distance import yolo_stream
+
+    clock_ticks = iter(float(index) * 0.5 for index in range(40))
+    monkeypatch.setattr(yolo_stream.time, "monotonic", lambda: next(clock_ticks))
+
+    class FakePipeline:
+        def __init__(self) -> None:
+            self.events = []
+
+        def send_event(self, event) -> None:
+            self.events.append(event)
+
+    class FakeBus:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def timed_pop_filtered(self, _timeout_ns, _message_types):
+            self.calls += 1
+            if self.calls <= 7:
+                return None
+            return SimpleNamespace(type=1)
+
+    class OutputQueue:
+        def __init__(self) -> None:
+            self.messages = []
+
+        def put(self, message) -> None:
+            self.messages.append(message)
+
+    Gst = SimpleNamespace(
+        Event=SimpleNamespace(new_eos=lambda: "eos"),
+        MessageType=SimpleNamespace(EOS=1, ERROR=2),
+    )
+    pipeline = FakePipeline()
+    bus = FakeBus()
+    output_queue = OutputQueue()
+    record_path = tmp_path / "large.mp4"
+    record_path.write_bytes(b"mp4-data")
+
+    _finalize_gst_recording(
+        Gst,
+        pipeline,
+        bus,
+        output_queue,
+        str(record_path),
+    )
+
+    assert pipeline.events == ["eos"]
+    assert bus.calls == 8
+    assert any("저장 완료" in message[1] for message in output_queue.messages)
 
 
 def test_gstreamer_recording_pipeline_saves_encoded_h264_without_decode(tmp_path) -> None:
-    record_path = tmp_path / "raw left.mkv"
+    record_path = tmp_path / "raw left.mp4"
     pipeline = build_gst_recording_pipeline_text(
         "rtsp://10.0.0.232:8554/visible",
         record_video_path=str(record_path),
@@ -476,8 +979,11 @@ def test_gstreamer_recording_pipeline_saves_encoded_h264_without_decode(tmp_path
 
     assert "rtph264depay" in pipeline
     assert "! h264parse config-interval=-1" in pipeline
-    assert "! matroskamux" in pipeline
-    assert f"! filesink location='{record_path}' sync=false" in pipeline
+    assert "! video/x-h264,stream-format=avc,alignment=au" in pipeline
+    assert "fragment-duration" not in pipeline
+    assert "! mp4mux ! filesink" in pipeline
+    assert "matroskamux" not in pipeline
+    assert f'! filesink location="{record_path}" sync=false' in pipeline
     assert "videoconvert" not in pipeline
     assert "appsink" not in pipeline
 
@@ -495,8 +1001,130 @@ def test_ffmpeg_recording_command_copies_h264_to_mp4_with_generated_pts(tmp_path
     assert "-c:v" in command
     assert "copy" in command
     assert "-movflags" in command
-    assert "+faststart" in command
+    assert "+frag_keyframe+empty_moov+default_base_moof" in command
     assert str(record_path) == command[-1]
+
+
+def test_yolo_worker_honors_stop_requested_before_run_starts_child() -> None:
+    worker = YoloStreamWorker(
+        url="rtsp://camera.invalid/visible",
+        weights_path="weights.pt",
+        device="cpu",
+        input_size=640,
+        conf_threshold=0.5,
+        iou_threshold=0.45,
+        max_rate_hz=30.0,
+        enable_detection=False,
+    )
+
+    class FailIfStartedContext:
+        def Event(self):
+            raise AssertionError("child lifecycle started after stop was requested")
+
+    worker._mp_context = FailIfStartedContext()
+    worker.request_stop()
+    worker.run()
+
+    assert worker._process is None
+
+
+def test_stale_ffmpeg_scan_covers_prior_session_for_same_camera(tmp_path) -> None:
+    proc_root = tmp_path / "proc"
+    recordings_root = tmp_path / "recordings"
+    current_path = recordings_root / "sessions" / "current" / "video" / "raw_left.mp4"
+    stale_path = recordings_root / "sessions" / "old" / "video" / "raw_left.mp4"
+    other_path = recordings_root / "sessions" / "other" / "video" / "raw_right.mp4"
+    camera_url = "rtsp://10.0.0.231:8554/visible"
+
+    def write_cmdline(pid: int, parts: list[str]) -> None:
+        pid_dir = proc_root / str(pid)
+        pid_dir.mkdir(parents=True)
+        (pid_dir / "cmdline").write_bytes(b"\0".join(part.encode() for part in parts) + b"\0")
+
+    write_cmdline(101, ["ffmpeg", "-i", camera_url, "-y", str(stale_path)])
+    write_cmdline(
+        102,
+        ["ffmpeg", "-i", "rtsp://10.0.0.232:8554/visible", "-y", str(other_path)],
+    )
+    write_cmdline(103, ["python", "worker.py", camera_url, str(stale_path)])
+
+    assert _iter_ffmpeg_recording_pids(
+        str(current_path),
+        camera_url=camera_url,
+        proc_root=proc_root,
+    ) == [101]
+
+
+def test_force_stopping_worker_signals_registered_recorder_group_first(monkeypatch) -> None:
+    from wiris_stereo_distance import yolo_stream as yolo_stream_module
+
+    worker = YoloStreamWorker(
+        url="rtsp://camera.invalid/visible",
+        weights_path="weights.pt",
+        device="cpu",
+        input_size=640,
+        conf_threshold=0.5,
+        iou_threshold=0.45,
+        max_rate_hz=30.0,
+        enable_detection=False,
+    )
+    calls: list[tuple[object, ...]] = []
+
+    class FakeChild:
+        def is_alive(self) -> bool:
+            return True
+
+        def terminate(self) -> None:
+            calls.append(("terminate_child",))
+
+    worker._process = FakeChild()
+    worker._handle_worker_message(
+        ("recording_process_started", 4321, "/recordings/session/video/raw_left.mp4")
+    )
+    monkeypatch.setattr(
+        yolo_stream_module.os,
+        "killpg",
+        lambda pid, requested_signal: calls.append(("killpg", pid, requested_signal)),
+    )
+
+    worker.terminate_child_process()
+
+    assert calls == [
+        ("killpg", 4321, signal.SIGINT),
+        ("terminate_child",),
+    ]
+
+
+def test_ffmpeg_early_exit_reports_captured_error_to_worker_status() -> None:
+    class FakeProcess:
+        returncode = 1
+        _recording_stderr_tail = ["camera rejected second RTSP client"]
+        _recording_stderr_thread = None
+
+        def poll(self) -> int:
+            return self.returncode
+
+    class OutputQueue:
+        def __init__(self) -> None:
+            self.messages: list[object] = []
+
+        def put(self, message: object) -> None:
+            self.messages.append(message)
+
+    output_queue = OutputQueue()
+
+    assert _report_recording_process_early_exit(
+        FakeProcess(),
+        output_queue,
+        "/recordings/session/video/raw_left.mp4",
+        already_reported=False,
+    ) is True
+    assert any(
+        message[0] == "status"
+        and "조기 종료" in message[1]
+        and "camera rejected second RTSP client" in message[1]
+        for message in output_queue.messages
+    )
 
 
 def test_gstreamer_pipeline_can_use_nvidia_decoder() -> None:
@@ -510,13 +1138,98 @@ def test_gstreamer_pipeline_can_use_software_decoder() -> None:
     pipeline = build_gst_pipeline_text("rtsp://10.0.0.232:8554/visible", decoder="software")
 
     assert SOFTWARE_H264_DECODER in pipeline
-    assert "skip-frame=1" in pipeline
+    assert "skip-frame=1" not in pipeline
+    assert "output-corrupt=false" in pipeline
     assert NVIDIA_H264_DECODER not in pipeline
 
 
 def test_decoder_candidates_auto_falls_back_to_software() -> None:
     assert decoder_candidates("auto") == (NVIDIA_H264_DECODER, SOFTWARE_H264_DECODER)
+    assert decoder_candidates("nvidia") == (NVIDIA_H264_DECODER,)
     assert decoder_candidates("software") == (SOFTWARE_H264_DECODER,)
+
+
+def test_runtime_nvidia_decoder_fallback_uses_first_frame_and_stall_deadlines() -> None:
+    from wiris_stereo_distance import yolo_stream
+
+    common = {
+        "requested_decoder": "auto",
+        "active_decoder": yolo_stream.NVIDIA_H264_DECODER,
+        "started_s": 10.0,
+        "already_fell_back": False,
+    }
+    first_frame_deadline_s = 10.0 + yolo_stream.DECODER_FALLBACK_FIRST_FRAME_TIMEOUT_S
+    assert yolo_stream.runtime_decoder_fallback_reason(
+        **common, last_frame_s=None, now_s=first_frame_deadline_s - 0.1
+    ) is None
+    assert "first-frame" in yolo_stream.runtime_decoder_fallback_reason(
+        **common, last_frame_s=None, now_s=first_frame_deadline_s
+    )
+    stall_deadline_s = 12.0 + yolo_stream.DECODER_FALLBACK_STALL_TIMEOUT_S
+    assert yolo_stream.runtime_decoder_fallback_reason(
+        **common, last_frame_s=12.0, now_s=stall_deadline_s - 0.1
+    ) is None
+    assert "stall" in yolo_stream.runtime_decoder_fallback_reason(
+        **common, last_frame_s=12.0, now_s=stall_deadline_s
+    )
+    assert yolo_stream.runtime_decoder_fallback_reason(
+        **{**common, "active_decoder": yolo_stream.SOFTWARE_H264_DECODER},
+        last_frame_s=None,
+        now_s=99.0,
+    ) is None
+    assert yolo_stream.runtime_decoder_fallback_reason(
+        **{**common, "requested_decoder": "nvidia"},
+        last_frame_s=None,
+        now_s=99.0,
+    ) is None
+    assert "first-frame" in yolo_stream.nvidia_decoder_health_failure_reason(
+        active_decoder=yolo_stream.NVIDIA_H264_DECODER,
+        started_s=10.0,
+        last_frame_s=None,
+        now_s=first_frame_deadline_s,
+        already_fell_back=False,
+    )
+    assert yolo_stream.runtime_decoder_fallback_reason(
+        **common,
+        last_frame_s=12.0,
+        now_s=99.0,
+        rtp_recovery_pending=True,
+    ) is None
+    assert yolo_stream.nvidia_decoder_health_failure_reason(
+        active_decoder=yolo_stream.NVIDIA_H264_DECODER,
+        started_s=10.0,
+        last_frame_s=12.0,
+        now_s=99.0,
+        already_fell_back=False,
+        rtp_recovery_pending=True,
+    ) is None
+    assert yolo_stream.runtime_decoder_fallback_reason(
+        **common,
+        last_frame_s=12.0,
+        now_s=20.0,
+        last_recovery_s=19.0,
+    ) is None
+    assert yolo_stream.runtime_decoder_fallback_reason(
+        **common,
+        last_frame_s=12.0,
+        now_s=22.0,
+        last_recovery_s=19.0,
+    ) is None
+    assert "stall" in yolo_stream.runtime_decoder_fallback_reason(
+        **common,
+        last_frame_s=12.0,
+        now_s=19.0 + yolo_stream.DECODER_FALLBACK_STALL_TIMEOUT_S,
+        last_recovery_s=19.0,
+    )
+
+
+def test_decoded_rate_uses_a_rolling_window_and_expires_after_a_gap() -> None:
+    estimator = RollingFrameRateEstimator(window_s=5.0)
+    for index in range(100):
+        estimator.add(index / 20.0)
+
+    assert estimator.rate(5.0) == pytest.approx(19.8)
+    assert estimator.rate(10.1) == 0.0
 
 
 def test_stream_backend_normalization() -> None:

@@ -19,6 +19,7 @@ from Workstation.workstation_core.strict_jsonl import (
     append_jsonl_record,
     prepare_jsonl_append,
 )
+from Workstation.workstation_core.measurement_data_store import creation_timestamp_text
 
 
 @dataclass(frozen=True)
@@ -45,7 +46,7 @@ class NativeFrameArtifact:
 
 
 def _safe_token(value: object, fallback: str) -> str:
-    text = "".join(character if character.isalnum() or character in "._-" else "_" for character in str(value or ""))
+    text = "".join(character if character.isalnum() or character in ".+-_" else "_" for character in str(value or ""))
     return text.strip("._") or fallback
 
 
@@ -89,7 +90,13 @@ class NativeFrameStore:
                 raise IOError("Qt failed to encode native PNG")
             with temporary.open("rb") as handle:
                 os.fsync(handle.fileno())
-            os.replace(temporary, destination)
+            try:
+                os.link(temporary, destination)
+            except FileExistsError as exc:
+                raise OSError(
+                    f"refusing to replace existing native frame: {destination}"
+                ) from exc
+            temporary.unlink()
             descriptor = os.open(output_dir, os.O_RDONLY)
             try:
                 os.fsync(descriptor)
@@ -162,11 +169,13 @@ class AsyncNativeFrameStore(QtCore.QObject):
         session_root: Path | str,
         *,
         max_pending: int = DEFAULT_MAX_PENDING,
+        timestamp_filenames: bool = False,
         parent: QtCore.QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self.root = Path(session_root).expanduser().resolve()
         self.max_pending = max(1, int(max_pending))
+        self.timestamp_filenames = bool(timestamp_filenames)
         self._lock = threading.RLock()
         self._pending: set[str] = set()
         self._work_queue: queue.Queue[object] = queue.Queue(
@@ -206,9 +215,15 @@ class AsyncNativeFrameStore(QtCore.QObject):
                 (str(side), QtGui.QImage(image), dict(metadata))
                 for side, image, metadata in frames
             )
+            stored_pair_id = str(pair_id)
+            if self.timestamp_filenames:
+                stored_pair_id = (
+                    f"{creation_timestamp_text()}_"
+                    f"{_safe_token(pair_id, 'frame')}"
+                )
             task = (
                 request,
-                str(pair_id),
+                stored_pair_id,
                 str(purpose),
                 frozen_frames,
                 tuple(str(side) for side in missing_sides),
@@ -222,10 +237,11 @@ class AsyncNativeFrameStore(QtCore.QObject):
                 return None
 
         purpose_value = _safe_token(purpose, "unspecified")
-        identifier = _safe_token(pair_id, "frame")
+        identifier = _safe_token(stored_pair_id, "frame")
         scheduled: dict[str, object] = {
             "native_pair_status": "pending",
             "native_pair_request_id": request,
+            "evidence_state": "WRITING",
         }
         for side, image, metadata in frozen_frames:
             scheduled.update(
@@ -278,7 +294,10 @@ class AsyncNativeFrameStore(QtCore.QObject):
     ) -> dict[str, object]:
         if self._store is None:
             self._store = NativeFrameStore(self.root)
-        fields: dict[str, object] = {"native_pair_status": "complete"}
+        fields: dict[str, object] = {
+            "native_pair_status": "complete",
+            "evidence_state": "SAVED",
+        }
         failed = list(missing_sides)
         for side, image, metadata in frames:
             try:
@@ -308,6 +327,7 @@ class AsyncNativeFrameStore(QtCore.QObject):
             fields["native_pair_status"] = "missing:" + ",".join(
                 dict.fromkeys(failed)
             )
+            fields["evidence_state"] = "FAILED"
         return {
             "request_id": request_id,
             "context": context,
@@ -342,6 +362,7 @@ class AsyncNativeFrameStore(QtCore.QObject):
                     "context": context,
                     "fields": {
                         "native_pair_status": "failed",
+                        "evidence_state": "FAILED",
                         "native_pair_error": f"{type(exc).__name__}: {exc}",
                     },
                 }

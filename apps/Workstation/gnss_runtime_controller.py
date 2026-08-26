@@ -188,6 +188,7 @@ class GnssRuntimeController:
         self._last_rtcm_result_ui_update_s = float("-inf")
         self._last_ntrip_ui_update_s = float("-inf")
         self._last_pipeline_drop_count = 0
+        self._last_pipeline_blocked_stall_count = 0
         package_signal = getattr(panel, "measurement_package_changed", None)
         if (
             hasattr(package_signal, "connect")
@@ -229,6 +230,28 @@ class GnssRuntimeController:
         )
 
     def _rtcm_evidence_context(self) -> RtcmEvidenceContext:
+        if not bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", True)):
+            active_reader = getattr(self.panel, "_session_recording_active", None)
+            active = bool(active_reader()) if callable(active_reader) else False
+            resolver = getattr(self.panel, "_recording_session_dir", None)
+            root = None
+            if callable(resolver):
+                try:
+                    root = Path(resolver("measurement-data"))
+                except (OSError, TypeError, ValueError):
+                    root = None
+            return RtcmEvidenceContext(
+                # RtcmEvidenceContext retains its legacy state vocabulary as
+                # an internal writer contract only; there is no persisted
+                # Measurement Session. COLLECTING makes the fixed RTCM files
+                # active for Manual record and Measurement intervals.
+                state="COLLECTING" if active else "IDLE",
+                session_id="measurement-data" if active and root is not None else "",
+                session_root=root if active else None,
+                context_token=(
+                    "measurement-data-live" if active and root is not None else ""
+                ),
+            )
         state = str(getattr(self.panel, "_measurement_package_state", "IDLE") or "IDLE")
         session_id = str(getattr(self.panel, "recording_session_id", "") or "")
         measurement_id = str(getattr(self.panel, "_measurement_id", "") or "")
@@ -391,6 +414,7 @@ class GnssRuntimeController:
         payload = self._rtcm_route_config().as_dict()
         if reset:
             self._last_pipeline_drop_count = 0
+            self._last_pipeline_blocked_stall_count = 0
             pipeline.reset_requested.emit(payload)
         else:
             pipeline.configure_requested.emit(payload)
@@ -468,15 +492,40 @@ class GnssRuntimeController:
                 f"[GNSS] RTCM 오래된 주입 대기 프레임 {delta}개 폐기 "
                 f"(누계={dropped}, evidence 원본은 유지)"
             )
+        blocked_stall = int(integrity.get("injection_blocked_stall") or 0)
+        if blocked_stall > self._last_pipeline_blocked_stall_count:
+            delta = blocked_stall - self._last_pipeline_blocked_stall_count
+            self._last_pipeline_blocked_stall_count = blocked_stall
+            self.panel._log(
+                f"[GNSS] stalled MAVLink target RTCM 차단 {delta}회 "
+                f"(누계={blocked_stall}, transport failure와 분리)"
+            )
 
         latest_result = snapshot.get("latest_injection_result")
         if isinstance(latest_result, dict):
             sent = tuple(latest_result.get("sent") or ())
             failed = tuple(latest_result.get("failed") or ())
+            blocked = tuple(latest_result.get("blocked_targets") or ())
             if failed:
                 text = "RTCM 주입 실패: " + ", ".join(
                     f"{self.panel._px4_mag_camera_label(str(side))}:{error}"
                     for side, error in failed
+                )
+                level = "warn" if sent else "bad"
+            elif blocked:
+                blocked_labels = ", ".join(
+                    self.panel._px4_mag_camera_label(str(item.get("side") or ""))
+                    for item in blocked
+                    if isinstance(item, dict)
+                )
+                sent_labels = ", ".join(
+                    self.panel._px4_mag_camera_label(str(side))
+                    for side, _packets in sent
+                )
+                text = (
+                    f"RTCM 일부 주입: {sent_labels} | stalled 차단 {blocked_labels}"
+                    if sent
+                    else f"RTCM stalled target 차단: {blocked_labels}"
                 )
                 level = "warn" if sent else "bad"
             elif sent:
@@ -564,7 +613,7 @@ class GnssRuntimeController:
                 or failure_context_token == current_context.context_token
             )
         )
-        if (
+        if bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", False)) and (
             belongs_to_current_context
             and package_state in {"COLLECTING", "POST_CAPTURE", "VERIFYING", "RECOVERABLE"}
         ):
@@ -951,6 +1000,23 @@ class GnssRuntimeController:
     def _gnss_gga_provider(self) -> str | None:
         """Return the current GGA sentence, or ``None`` with a logged reason.
 
+        A VRS caster (e.g. NGII's RTS2.ngii.go.kr) silently withholds RTCM
+        while it has no periodic GGA to compute the virtual station against
+        -- the TCP transport stays "connected" the whole time, so nothing
+        else here would ever surface that.  ``_gnss_last_gga_skip_reason``
+        records why the *last* call could not produce a sentence (cleared as
+        soon as one succeeds again) so the NTRIP status panel can show it.
+        """
+
+        sentence = self._resolve_gga_sentence()
+        if sentence is not None:
+            self.panel._gnss_last_gga_skip_reason = ""
+            self.panel._gnss_last_gga_skip_monotonic_s = None
+        return sentence
+
+    def _resolve_gga_sentence(self) -> str | None:
+        """Return the current GGA sentence, or ``None`` with a logged reason.
+
         This is polled at connect time and roughly once per
         ``on_gga_interval_s`` while streaming (see ``NtripClient``), so a
         genuinely stuck ``None`` state logs at that same modest rate --
@@ -959,21 +1025,45 @@ class GnssRuntimeController:
 
         active_config = self.panel._gnss_active_operation_config()
         policy = active_config.network.gga_policy
+
+        def log_skip(key: str, message: str) -> None:
+            now_s = time.monotonic()
+            self.panel._gnss_last_gga_skip_reason = message
+            self.panel._gnss_last_gga_skip_monotonic_s = now_s
+            throttle = getattr(self.panel, "_gnss_gga_skip_log_throttle", None)
+            if not isinstance(throttle, dict):
+                throttle = {}
+                self.panel._gnss_gga_skip_log_throttle = throttle
+            previous_s = float(throttle.get(key, float("-inf")))
+            if now_s - previous_s < 30.0:
+                return
+            throttle[key] = now_s
+            self.panel._log(message)
+
         if policy == GgaPolicy.BASE_GNSS:
             sample = getattr(self.panel, "latest_gnss_base_position", None)
             if sample is None:
-                self.panel._log("[GNSS][NTRIP] GGA skipped: no Base GNSS sample received yet (policy=BASE_GNSS)")
+                log_skip(
+                    "base-missing",
+                    "[GNSS][NTRIP] GGA skipped: no Base GNSS sample received yet "
+                    "(policy=BASE_GNSS)",
+                )
                 return None
             age_s = max(0.0, time.monotonic() - sample.timestamp_s)
             if age_s > 15.0:
-                self.panel._log(
+                log_skip(
+                    "base-stale",
                     f"[GNSS][NTRIP] GGA skipped: Base GNSS sample is stale "
-                    f"(age={age_s:.1f}s > 15.0s, policy=BASE_GNSS)"
+                    f"(age={age_s:.1f}s > 15.0s, policy=BASE_GNSS)",
                 )
                 return None
             return gga_from_coordinate_sample(sample)
         if policy == GgaPolicy.MANUAL:
-            self.panel._log("[GNSS][NTRIP] GGA skipped: GGA policy is MANUAL; GGA is intentionally never sent")
+            log_skip(
+                "manual",
+                "[GNSS][NTRIP] GGA skipped: GGA policy is MANUAL; "
+                "GGA is intentionally never sent",
+            )
             return None
         left = self._selected_rover_gps_state("left")
         right = self._selected_rover_gps_state("right")
@@ -982,15 +1072,17 @@ class GnssRuntimeController:
 
         def fresh(position: object, side: str) -> object | None:
             if position is None:
-                self.panel._log(
+                log_skip(
+                    f"{side}-missing",
                     f"[GNSS][NTRIP] GGA skipped: {side} GNSS has no message "
-                    f"(policy={policy.value})"
+                    f"(policy={policy.value})",
                 )
                 return None
             if not bool(getattr(position, "has_position", False)):
-                self.panel._log(
+                log_skip(
+                    f"{side}-incomplete",
                     f"[GNSS][NTRIP] GGA skipped: {side} GNSS position is incomplete "
-                    f"(policy={policy.value})"
+                    f"(policy={policy.value})",
                 )
                 return None
             try:
@@ -999,15 +1091,17 @@ class GnssRuntimeController:
             except (AttributeError, TypeError, ValueError):
                 age_s = float("nan")
             if not isfinite(age_s) or age_s < 0.0:
-                self.panel._log(
+                log_skip(
+                    f"{side}-timestamp-invalid",
                     f"[GNSS][NTRIP] GGA skipped: {side} GNSS timestamp is invalid "
-                    f"(policy={policy.value})"
+                    f"(policy={policy.value})",
                 )
                 return None
             if age_s > maximum_age_s:
-                self.panel._log(
+                log_skip(
+                    f"{side}-stale",
                     f"[GNSS][NTRIP] GGA skipped: {side} GNSS sample is stale "
-                    f"(age={age_s:.3f}s > {maximum_age_s:.3f}s, policy={policy.value})"
+                    f"(age={age_s:.3f}s > {maximum_age_s:.3f}s, policy={policy.value})",
                 )
                 return None
             return position
@@ -1029,9 +1123,10 @@ class GnssRuntimeController:
                     return "message received but lat/lon/alt incomplete"
                 return "stale or invalid timestamp"
 
-            self.panel._log(
+            log_skip(
+                "system-center-unavailable",
                 "[GNSS][NTRIP] GGA skipped: no left/right GNSS position available "
-                f"(policy={policy.value}, left={describe(left)}, right={describe(right)})"
+                f"(policy={policy.value}, left={describe(left)}, right={describe(right)})",
             )
             return None
         timestamp_delta_ms = abs(
@@ -1042,9 +1137,10 @@ class GnssRuntimeController:
             active_config.readiness.maximum_left_right_timestamp_delta_ms
         )
         if timestamp_delta_ms > maximum_delta_ms:
-            self.panel._log(
+            log_skip(
+                "system-center-skew",
                 "[GNSS][NTRIP] GGA skipped: left/right GNSS timestamp delta "
-                f"{timestamp_delta_ms:.3f}ms > {maximum_delta_ms:.3f}ms"
+                f"{timestamp_delta_ms:.3f}ms > {maximum_delta_ms:.3f}ms",
             )
             return None
         positions = (fresh_left, fresh_right)
@@ -1073,12 +1169,13 @@ class GnssRuntimeController:
     def _resolve_ntrip_credentials(self, network) -> "NtripCredentialResolution":
         """Resolve the username/password to authenticate with, in priority order.
 
-        1. The password currently typed into the UI (this run's session).
+        1. A password explicitly edited in the UI (this run's session).
         2. The OS secure credential store (keyring), keyed by
            host/mountpoint/username.
         3. The legacy ``username_env``/``password_env`` indirection, read
            from the OS environment.
-        4. None of the above -> raise with a specific, non-guessing reason.
+        4. The untouched masked deployment fallback.
+        5. None of the above -> raise with a specific, non-guessing reason.
 
         The username itself is plain config (``network.username``, or the
         legacy env var's resolved value); only the password is ever secret.
@@ -1089,7 +1186,15 @@ class GnssRuntimeController:
         if hasattr(self.panel, "gnss_ntrip_password_edit"):
             session_password = self.panel.gnss_ntrip_password_edit.text()
 
-        if username and session_password:
+        # Both NTRIP password widgets start with the masked deployment
+        # fallback.  That non-empty initial value is not an operator edit and
+        # must not make a saved account credential unreachable after restart.
+        # Lightweight/test panels predating this marker retain the historical
+        # interpretation that their supplied value is explicit.
+        session_password_explicit = bool(
+            getattr(self.panel, "_gnss_ntrip_session_password_explicit", True)
+        )
+        if username and session_password and session_password_explicit:
             return NtripCredentialResolution(username=username, password=session_password, source="session")
 
         if not username:
@@ -1112,6 +1217,12 @@ class GnssRuntimeController:
         legacy_password = os.getenv(network.password_env, "") if network.password_env else ""
         if legacy_username and legacy_password:
             return NtripCredentialResolution(username=legacy_username, password=legacy_password, source="legacy_env")
+
+        # No saved or environment credential exists.  Preserve the
+        # deployment fallback for an untouched field profile, but only after
+        # the stronger account-specific sources above have been exhausted.
+        if username and session_password:
+            return NtripCredentialResolution(username=username, password=session_password, source="session")
 
         if not storage_available:
             raise NtripCredentialError(
@@ -1352,6 +1463,7 @@ class GnssRuntimeController:
 
         if hasattr(self.panel, "gnss_ntrip_password_edit"):
             self.panel.gnss_ntrip_password_edit.setText(str(password))
+            self.panel._gnss_ntrip_session_password_explicit = True
 
     def _handle_gnss_network_connected(self, status_line: str, stats: object) -> None:
         self.panel.gnss_network_connected = True
@@ -1789,19 +1901,51 @@ class GnssRuntimeController:
         mavlink = self.panel.mavlink_pixhawk
         connections = getattr(mavlink, "connections", None)
         heartbeat_sides = getattr(mavlink, "_heartbeat_logged", set())
+        health_reader = getattr(mavlink, "mavlink_health_snapshot", None)
         routes: dict[str, RoverCorrectionStatus] = {}
         rover_samples: dict[str, RoverReadinessInput] = {}
         for side in target_sides:
             side_stats = injection_map.get(side)
             if not isinstance(side_stats, dict):
                 side_stats = {}
-            if isinstance(connections, dict):
+            health = None
+            if callable(health_reader):
+                try:
+                    health = health_reader(side, now_s=now_s)
+                except Exception:
+                    health = None
+            if health is not None:
+                endpoint_live = bool(getattr(health, "identity_verified", False)) and bool(
+                    getattr(health, "rtcm_eligible", False)
+                )
+                endpoint_identity = (
+                    f"mavlink:{side}:sysid={getattr(health, 'observed_system_id', '')}:"
+                    f"generation={getattr(health, 'connection_generation', 0)}"
+                    if endpoint_live
+                    else ""
+                )
+                health_state = str(
+                    getattr(
+                        getattr(health, "state", None),
+                        "value",
+                        getattr(health, "state", ""),
+                    )
+                )
+                health_fault = (
+                    ""
+                    if endpoint_live
+                    else f"MAVLink {health_state or 'ineligible'}: "
+                    f"{getattr(health, 'stall_reason', '') or 'RTCM blocked'}"
+                )
+            elif isinstance(connections, dict):
                 endpoint_live = side in connections and side in heartbeat_sides
                 endpoint_identity = f"mavlink:{side}" if endpoint_live else ""
+                health_fault = ""
             else:
                 # Test adapters may not expose the production subscriber
                 # internals; their presence still represents a route endpoint.
                 endpoint_identity = "" if mavlink is None else f"mavlink:{side}"
+                health_fault = ""
             routes[side] = RoverCorrectionStatus(
                 target=side,
                 enabled=True,
@@ -1809,7 +1953,16 @@ class GnssRuntimeController:
                 bytes_sent=int(side_stats.get("bytes") or 0),
                 packets_sent=int(side_stats.get("packets") or 0),
                 last_delivery_monotonic_s=side_stats.get("last_delivery_s"),
-                fault_reason=("injection failed" if int(side_stats.get("fail") or 0) > 0 else ""),
+                fault_reason=(
+                    health_fault
+                    or (
+                        "RTCM blocked: MAVLink stalled"
+                        if int(side_stats.get("blocked_stall") or 0) > 0
+                        else "injection failed"
+                        if int(side_stats.get("fail") or 0) > 0
+                        else ""
+                    )
+                ),
             )
         for side in ("left", "right", "drone"):
             gps = self._selected_rover_gps_state(side)
@@ -2219,6 +2372,7 @@ class GnssRuntimeController:
         pipeline = getattr(self.panel, "rtcm_pipeline_worker", None)
         if pipeline is not None:
             self._last_pipeline_drop_count = 0
+            self._last_pipeline_blocked_stall_count = 0
             pipeline.reset_requested.emit(self._rtcm_route_config().as_dict())
         self.panel._refresh_gnss_base_rtcm_stats()
 
@@ -2294,6 +2448,7 @@ class GnssRuntimeController:
         injection_parts: list[str] = []
         total_packets = 0
         total_fail = 0
+        total_blocked_stall = 0
         for side, label in (("left", "L"), ("right", "R"), ("drone", "T")):
             side_stats = injection.get(side) if isinstance(injection, dict) else None
             if not isinstance(side_stats, dict):
@@ -2302,9 +2457,14 @@ class GnssRuntimeController:
             side_bytes = int(side_stats.get("bytes") or 0)
             side_packets = int(side_stats.get("packets") or 0)
             side_fail = int(side_stats.get("fail") or 0)
+            side_blocked_stall = int(side_stats.get("blocked_stall") or 0)
             total_packets += side_packets
             total_fail += side_fail
-            injection_parts.append(f"{label} frames={side_frames} bytes={side_bytes} fail={side_fail}")
+            total_blocked_stall += side_blocked_stall
+            injection_parts.append(
+                f"{label} frames={side_frames} bytes={side_bytes} "
+                f"fail={side_fail} blocked_stall={side_blocked_stall}"
+            )
         target_sides = (
             self.panel._gnss_base_rtcm_target_sides(source=self._drone_rtcm_source())
             if hasattr(self.panel, "gnss_base_rtcm_target_combo")
@@ -2315,7 +2475,13 @@ class GnssRuntimeController:
             injection_level = "idle"
         else:
             injection_text = " | ".join(injection_parts)
-            injection_level = "good" if frames and total_fail == 0 else "warn" if frames else "idle"
+            injection_level = (
+                "good"
+                if frames and total_fail == 0 and total_blocked_stall == 0
+                else "warn"
+                if frames
+                else "idle"
+            )
         avg_frame = (total_bytes / frames) if frames else 0.0
         integrity = stats.get("integrity") if isinstance(stats.get("integrity"), dict) else {}
         ingress = stats.get("ingress") if isinstance(stats.get("ingress"), dict) else {}
@@ -2324,11 +2490,13 @@ class GnssRuntimeController:
         injected_sequence = int(integrity.get("last_injected_sequence") or 0)
         evidence_failed = int(integrity.get("evidence_failed") or 0)
         dropped_stale = int(integrity.get("injection_dropped_stale") or 0)
+        blocked_stall = int(integrity.get("injection_blocked_stall") or 0)
         queue_depth = int(ingress.get("queued") or 0)
         backpressure_waits = int(ingress.get("backpressure_waits") or 0)
         integrity_text = (
             f"seq rx/persist/inject={received_sequence}/{persisted_sequence}/{injected_sequence}"
-            f" | stale_drop={dropped_stale} | q={queue_depth} | bp={backpressure_waits}"
+            f" | stale_drop={dropped_stale} | blocked_stall={blocked_stall}"
+            f" | q={queue_depth} | bp={backpressure_waits}"
         )
         bandwidth_text = (
             "packet 대기 중"
@@ -2340,7 +2508,7 @@ class GnssRuntimeController:
             "bad"
             if evidence_failed
             else "warn"
-            if total_fail or dropped_stale or backpressure_waits
+            if total_fail or dropped_stale or blocked_stall or backpressure_waits
             else "good"
             if frames
             else "idle"
@@ -2531,6 +2699,7 @@ class GnssRuntimeController:
         payload_bytes: int,
         packet_count: int = 0,
         failed: bool = False,
+        blocked_stall: bool = False,
     ) -> None:
         injection = self.panel.gnss_base_rtcm_stats.get("injection")
         if not isinstance(injection, dict):
@@ -2540,6 +2709,9 @@ class GnssRuntimeController:
             return
         if failed:
             side_stats["fail"] = int(side_stats.get("fail") or 0) + 1
+            return
+        if blocked_stall:
+            side_stats["blocked_stall"] = int(side_stats.get("blocked_stall") or 0) + 1
             return
         side_stats["frames"] = int(side_stats.get("frames") or 0) + 1
         side_stats["bytes"] = int(side_stats.get("bytes") or 0) + int(payload_bytes)
@@ -2712,9 +2884,11 @@ class GnssRuntimeController:
         payload_bytes = int(data.get("payload_bytes") or 0)
         sent = tuple(data.get("sent") or ())
         failed = tuple(data.get("failed") or ())
+        blocked = tuple(data.get("blocked_targets") or ())
         dropped = int(data.get("dropped") or 0)
         sent_labels: list[str] = []
         failed_labels: list[str] = []
+        blocked_labels: list[str] = []
         for side, packet_count in sent:
             side = str(side)
             self.panel._record_gnss_base_rtcm_injection(
@@ -2727,24 +2901,45 @@ class GnssRuntimeController:
             side = str(side)
             self.panel._record_gnss_base_rtcm_injection(side, payload_bytes=payload_bytes, failed=True)
             failed_labels.append(f"{self.panel._px4_mag_camera_label(side)}:{error}")
+        for item in blocked:
+            if not isinstance(item, dict):
+                continue
+            side = str(item.get("side") or "")
+            if not side:
+                continue
+            if str(item.get("category") or "") == "stall":
+                self.panel._record_gnss_base_rtcm_injection(
+                    side,
+                    payload_bytes=payload_bytes,
+                    blocked_stall=True,
+                )
+            blocked_labels.append(
+                f"{self.panel._px4_mag_camera_label(side)}:{item.get('reason') or 'liveness blocked'}"
+            )
         if dropped:
             self.panel._log(f"[GNSS] RTCM 오래된 대기 프레임 {dropped}개를 폐기했습니다.")
         # Receive/pending updates and completed injection updates use separate
         # clocks.  Otherwise every high-rate receive event consumes the one
         # slot that should publish delivery stats and advance readiness.
-        if not failed_labels and not self._rtcm_result_ui_update_due():
+        if not failed_labels and not blocked_labels and not self._rtcm_result_ui_update_due():
             return
-        if failed_labels:
+        if failed_labels or blocked_labels:
             self._last_rtcm_result_ui_update_s = time.monotonic()
-        if sent_labels and not failed_labels:
+        if sent_labels and not failed_labels and not blocked_labels:
             level = "good"
             text = f"RTCM {payload_bytes} bytes -> {', '.join(sent_labels)}"
+        elif sent_labels and blocked_labels:
+            level = "warn"
+            text = f"RTCM 일부 주입: {', '.join(sent_labels)} | 차단 {', '.join(blocked_labels)}"
         elif sent_labels:
             level = "warn"
             text = f"RTCM 일부 주입: {', '.join(sent_labels)} | 실패 {', '.join(failed_labels)}"
         elif failed_labels:
             level = "bad"
             text = f"RTCM 주입 실패: {', '.join(failed_labels)}"
+        elif blocked_labels:
+            level = "bad"
+            text = f"RTCM stalled target 차단: {', '.join(blocked_labels)}"
         else:
             return
         self.panel._set_health_label(self.panel.gnss_base_status_labels["rtcm_injection"], text, level)

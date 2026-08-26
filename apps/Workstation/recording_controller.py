@@ -54,6 +54,19 @@ from Workstation.workstation_core.hr_evidence import (
     import_hr_image_file,
 )
 from Workstation.workstation_core.native_frame_store import AsyncNativeFrameStore
+from Workstation.workstation_core.native_evidence_writer import (
+    AsyncNativeEvidenceWriter,
+    EVIDENCE_FRAME_UNAVAILABLE,
+)
+from Workstation.workstation_core.native_frame_ring import FrameKey
+from Workstation.workstation_core.measurement_data_store import (
+    LiveDataRows,
+    creation_timestamp_text,
+)
+from Workstation.run_evidence_controller import (
+    persistence_failure_error,
+    report_recoverable_persistence_failure,
+)
 from Workstation.ulog_controller import (
     ManualOwnershipClaim,
     ULogController,
@@ -71,6 +84,7 @@ from Workstation.workstation_core.recording_session import (
 )
 from Workstation.workstation_core.rtk_geometry import ned_delta_m, project_ned_baseline_to_p1_body_frd
 from Workstation.workstation_core.runtime_camera_status import infer_runtime_camera_timestamp_reference
+from Workstation.workstation_core.yolo_stream import recording_integrity_contract
 from Workstation.workstation_core.sync import (
     ATTITUDE_STALE_AGE_S,
     ATTITUDE_STALE_PAIR_DELTA_S,
@@ -190,20 +204,11 @@ class RecordingController:
         # in the GUI owner until the worker returns; it is never camera truth.
         self._pending_hr_requests: dict[str, dict[str, object]] = {}
         self._pending_oz_requests: dict[str, dict[str, object]] = {}
+        self._deferred_native_frame_results: dict[str, dict[str, object]] = {}
 
     def _handle_recording_spool_error(self, exc: OSError) -> None:
         message = f"recording spool write failed: {exc}"
-        self.panel.distance_recording_enabled = False
-        self.panel.video_recording_enabled = False
-        self.panel._session_save_retry_required = True
-        self.panel._session_save_last_error = message
-        label = getattr(self.panel, "recording_status_label", None)
-        setter = getattr(label, "setText", None)
-        if callable(setter):
-            setter(f"세션 기록 실패(복구 가능): {message}")
-        logger = getattr(self.panel, "_log", None)
-        if callable(logger):
-            logger(f"[저장] {message}")
+        self.panel._log(f"[저장] {message}; Measurement continues")
 
     def _new_recording_spool(
         self,
@@ -217,7 +222,53 @@ class RecordingController:
             on_write_error=self._handle_recording_spool_error,
         )
 
+    def _new_live_rows(
+        self,
+        stream: str,
+        *,
+        preview_limit: int = RECORDING_PREVIEW_LIMIT,
+        priority: bool | None = None,
+    ) -> LiveDataRows | SpoolRows:
+        owner = getattr(self.panel, "_data_storage_controller", None)
+        try:
+            controller = owner() if callable(owner) else None
+            store = getattr(controller, "store", None)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            store = None
+            logger = getattr(self.panel, "_log", None)
+            if callable(logger):
+                logger(
+                    f"[저장] {stream} writer 준비 실패; 메모리 기록으로 측정 계속: {exc}"
+                )
+        if store is None:
+            # Lightweight legacy/test callers without the Workstation data
+            # owner still receive an in-memory row sequence. Production
+            # Workstation always exposes DataStorageController.
+            return SpoolRows(preview_limit=preview_limit, supports_updates=True)
+        return LiveDataRows(
+            store,
+            stream,
+            preview_limit=preview_limit,
+            priority=priority,
+        )
+
     def _refresh_recording_status_label(self) -> None:
+        if not bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", True)):
+            active = self.panel._session_recording_active()
+            mode = str(getattr(self.panel, "_recording_mode", "manual") or "manual")
+            storage_reader = getattr(self.panel, "data_storage_snapshot", None)
+            try:
+                storage = storage_reader() if callable(storage_reader) else {}
+            except Exception:
+                storage = {}
+            storage_state = str(storage.get("state") or "UNAVAILABLE")
+            dropped = int(storage.get("dropped_records") or 0)
+            self.panel.recording_status_label.setText(
+                f"데이터 기록: {'진행 중' if active else '중지'} · mode={mode} · "
+                f"storage={storage_state} · pairs={len(self.panel.distance_recording_rows)}"
+                + (f" · dropped={dropped}" if dropped else "")
+            )
+            return
         if self.panel._session_save_thread is not None:
             self.panel.recording_status_label.setText(
                 f"세션 기록: 저장 중, session={self.panel.recording_session_id or 'none'}"
@@ -238,7 +289,7 @@ class RecordingController:
 
     def _recording_preview_rows(self) -> list[dict[str, object]]:
         rows = self.panel.distance_recording_rows
-        if isinstance(rows, SpoolRows):
+        if isinstance(rows, (SpoolRows, LiveDataRows)):
             return rows.preview_rows
         return list(rows[-RECORDING_PREVIEW_LIMIT:])
 
@@ -392,31 +443,13 @@ class RecordingController:
         return self.panel._start_session_recording()
 
     def start_automatic_session_recording(self) -> bool:
-        """Start the session owned by the Measurement/Detection lifecycle.
-
-        Session IDs, spools, and video paths remain owned by the recording
-        controller.  The camera lifecycle only asks for this boundary before
-        it starts a detection stream, so the normal operator path never needs
-        a separate Record or Save action.
-        """
+        """Start best-effort recording for a transient Measurement run."""
 
         if self.panel._session_recording_active():
             return True
-        if bool(getattr(self.panel, "_measurement_package_explicit_lifecycle", False)):
-            snapshotter = getattr(self.panel, "measurement_package_snapshot", None)
-            snapshot = snapshotter() if callable(snapshotter) else {}
-            if not isinstance(snapshot, Mapping) or str(snapshot.get("state") or "") != "COLLECTING":
-                self.panel.recording_status_label.setText(
-                    "세션 기록: 측정 시작이 준비한 COLLECTING 상태가 필요합니다"
-                )
-                return False
-        if bool(getattr(self.panel, "_session_save_retry_required", False)):
-            self.panel.recording_status_label.setText(
-                "세션 기록: 이전 자동 저장 실패를 먼저 확인해야 합니다"
-            )
-            return False
         previous_mode = str(getattr(self.panel, "_recording_mode", "manual") or "manual")
         self.panel._automatic_session_recording = True
+        self.panel._manual_recording_active = False
         self.panel._recording_mode = "automatic_detection"
         try:
             result = self._start_session_recording(start_camera_streams=False)
@@ -429,7 +462,7 @@ class RecordingController:
             self.panel._recording_mode = previous_mode
             return False
         self.panel.recording_status_label.setText(
-            f"자동 세션 기록: 진행 중, session={self.panel.recording_session_id}"
+            "측정 데이터 기록: 진행 중"
         )
         return True
 
@@ -463,49 +496,44 @@ class RecordingController:
         if not bool(getattr(self.panel, "_automatic_session_recording", False)):
             self.panel._recording_mode = "manual"
         if self._camera_photo_capture_active():
-            self.panel.recording_status_label.setText("세션 기록: HR/OZ still 캡처 완료 대기 중")
+            self.panel.recording_status_label.setText("데이터 기록: HR/OZ still 캡처 완료 대기 중")
             return False
-        if self.panel._session_save_thread is not None:
-            self.panel.recording_status_label.setText("세션 기록: 이전 세션 저장 완료 대기 중")
-            return False
-        if self.panel.wiris_time_sync_thread is not None:
-            status_text = "세션 기록: WIRIS 시간 동기화 및 스트림 재연결 완료 대기 중"
+        if start_camera_streams and self.panel.wiris_time_sync_thread is not None:
+            status_text = "데이터 기록: WIRIS 시간 동기화 및 스트림 재연결 완료 대기 중"
             self.panel.recording_status_label.setText(status_text)
             self.panel._log(f"[저장] {status_text}")
             return False
-        if (
+        if start_camera_streams and (
             self.panel.pixhawk_connection_thread is not None
             or self.panel.pixhawk_disconnection_thread is not None
             or self.panel.pixhawk_usb_bootstrap_thread is not None
         ):
-            status_text = "세션 기록: Pixhawk 연결/부트스트랩 완료 대기 중"
+            status_text = "데이터 기록: Pixhawk 연결/부트스트랩 완료 대기 중"
             self.panel.recording_status_label.setText(status_text)
             self.panel._log(f"[저장] {status_text}")
             return False
-        if not self.panel._pnp_session_prepared:
-            self.panel.recording_session_id = session_id_now()
-            self.panel.pnp_photo_capture_records = []
-            self.panel.oz_photo_capture_records = []
+        self.panel._manual_recording_active = not bool(
+            getattr(self.panel, "_automatic_session_recording", False)
+        )
+        generation = str(
+            getattr(self.panel, "_measurement_run_generation", "") or ""
+        )
+        self.panel.recording_session_id = generation or f"manual-{uuid.uuid4().hex}"
         self.panel._pnp_session_prepared = False
         self.panel._session_save_finalized = False
-        self._ensure_ulog_controller()
-        evidence_start = getattr(self.panel, "ensure_workstation_run_evidence", None)
-        if callable(evidence_start):
-            try:
-                evidence_start(
-                    "recording_started",
-                    {
-                        "session_id": self.panel.recording_session_id,
-                        "measurement_id": str(getattr(self.panel, "_measurement_id", "") or ""),
-                        "recording_mode": str(
-                            getattr(self.panel, "_recording_mode", "manual") or "manual"
-                        ),
-                    },
-                    source="RecordingController",
-                    coordinate_contract="not_applicable",
-                )
-            except Exception as exc:
-                self.panel._log(f"[저장] run evidence linkage failed: {exc}")
+        append = getattr(self.panel, "append_workstation_data", None)
+        if callable(append):
+            append(
+                "events",
+                {
+                    "event_type": "recording_started",
+                    "recording_mode": str(
+                        getattr(self.panel, "_recording_mode", "manual") or "manual"
+                    ),
+                    "runtime_generation": self.panel.recording_session_id,
+                },
+                priority=True,
+            )
         self.panel._measurement_attempt_generation_id = new_measurement_attempt_generation_id(
             self.panel.recording_session_id
         )
@@ -521,33 +549,35 @@ class RecordingController:
         self.panel.recording_session_started_wall_s = self.panel.recording_session_started_unix_ns * 1e-9
         self.panel.recording_session_started_monotonic_s = self.panel.recording_session_started_monotonic_ns * 1e-9
         self.panel.distance_recording_started_monotonic_s = self.panel.recording_session_started_monotonic_s
-        self.panel.distance_recording_rows = self._new_recording_spool(
+        self.panel.distance_recording_rows = self._new_live_rows(
+            "measurements",
             preview_limit=RECORDING_PREVIEW_LIMIT,
-            supports_updates=True,
+            priority=True,
         )
         self.panel.distance_recording_keys.clear()
         self.panel.external_parameter_recording_rows.clear()
-        spool_root = self.panel._recording_session_dir(self.panel.recording_session_id) / ".spool"
-        self.panel.distance_recording_rows.bind(spool_root / "pair_rows.jsonl")
         self.panel.camera_recording_rows = {
-            side: self._new_recording_spool() for side in ("left", "right")
+            side: self._new_live_rows(f"camera.{side}") for side in ("left", "right")
         }
         self.panel.px4_recording_rows = {
-            side: self._new_recording_spool() for side in ("left", "right")
+            side: self._new_live_rows(f"px4.{side}") for side in ("left", "right")
         }
-        self.panel.gnss_base_recording_rows = self._new_recording_spool()
-        self.panel.extrinsics_comparison_recording_rows = self._new_recording_spool()
-        self.panel.method_evaluation_bundle_rows = self._new_recording_spool()
-        for side, rows in self.panel.camera_recording_rows.items():
-            rows.bind(spool_root / f"camera_{side}.jsonl")
-        for side, rows in self.panel.px4_recording_rows.items():
-            rows.bind(spool_root / f"px4_{side}.jsonl")
-        self.panel.gnss_base_recording_rows.bind(spool_root / "gnss_base.jsonl")
-        self.panel.extrinsics_comparison_recording_rows.bind(spool_root / "extrinsics_comparison.jsonl")
-        self.panel.method_evaluation_bundle_rows.bind(
-            spool_root / "method_evaluation_bundles.jsonl"
+        self.panel.gnss_base_recording_rows = self._new_live_rows("gnss.base")
+        self.panel.extrinsics_comparison_recording_rows = self._new_live_rows(
+            "geometry.comparisons"
+        )
+        self.panel.method_evaluation_bundle_rows = self._new_live_rows(
+            "method_evaluations", priority=True
         )
         self.panel._recording_pair_row_index.clear()
+        pending_native_rows = getattr(
+            self.panel,
+            "_recording_pending_native_request_rows",
+            None,
+        )
+        if isinstance(pending_native_rows, dict):
+            pending_native_rows.clear()
+        self._deferred_native_frame_results.clear()
         self.panel._recovered_session_metadata = None
         self.panel._recovered_session_output_dir = None
         self.panel._recording_clock_sync_start_observation = None
@@ -576,6 +606,9 @@ class RecordingController:
         )
         self.panel.distance_recording_enabled = True
         self.panel.video_recording_enabled = True
+        sync_rtcm_context = getattr(self.panel, "_sync_rtcm_evidence_context", None)
+        if callable(sync_rtcm_context):
+            sync_rtcm_context()
         self.panel._record_px4_mag_status_snapshot()
         self.panel._last_distance_history_key = None
         self.panel._measurement_attempt_counter = 0
@@ -591,15 +624,11 @@ class RecordingController:
             for method_id in MEASUREMENT_METHOD_IDS
         }
         self.panel._prepare_video_recording_paths()
-        write_recovery_metadata(
-            self.panel._recording_session_dir(self.panel.recording_session_id),
-            self.panel._recording_session_metadata(),
-        )
         self.panel._refresh_recording_table()
-        self.panel.record_button.setText("세션 기록 중지")
+        self.panel.record_button.setText("수동 기록 중지")
         self.panel._log(
-            "[저장] 세션 기록을 시작했습니다: "
-            f"session={self.panel.recording_session_id}, {self.panel._format_video_recording_paths()}"
+            "[저장] 데이터 기록을 시작했습니다: "
+            f"mode={self.panel._recording_mode}, {self.panel._format_video_recording_paths()}"
         )
         if start_camera_streams and self.panel.camera_connected:
             self.panel._start_camera_streams(enable_detection=self.panel.yolo_enabled, switch_to_depth=self.panel.yolo_enabled)
@@ -667,6 +696,18 @@ class RecordingController:
             default=0,
         )
         return f"{normalized}-{high_water + 1:03d}"
+
+    def _new_capture_id(
+        self,
+        records: Sequence[Mapping[str, object]],
+        prefix: str,
+    ) -> str:
+        if not bool(
+            getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
+        ):
+            normalized = re.sub(r"[^a-z0-9]+", "", str(prefix).lower()) or "capture"
+            return f"{normalized}-{creation_timestamp_text()}"
+        return self._next_capture_id(records, prefix)
 
     def _recover_retryable_recording_session(self) -> bool:
         try:
@@ -784,6 +825,114 @@ class RecordingController:
         restart_streams: bool = True,
         final_clock_sync_snapshot: dict[str, object] | None = None,
     ) -> None:
+        if not bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", True)):
+            # Sessionless stop is a resource boundary, not a persistence
+            # transaction. Optional/late writers retain their own bounded
+            # ownership and never delay the next Measurement.
+            self.panel._method_evaluation_accepting = False
+            if final_clock_sync_snapshot is not None:
+                self.panel._recording_clock_sync_end_observation = final_clock_sync_snapshot
+            self.panel.distance_recording_enabled = False
+            self.panel.video_recording_enabled = False
+            self.panel.distance_recording_started_monotonic_s = None
+            sync_rtcm_context = getattr(
+                self.panel, "_sync_rtcm_evidence_context", None
+            )
+            if callable(sync_rtcm_context):
+                sync_rtcm_context()
+            was_manual = bool(getattr(self.panel, "_manual_recording_active", False))
+            self.panel._manual_recording_active = False
+            for rows in (
+                getattr(self.panel, "distance_recording_rows", ()),
+                *(getattr(self.panel, "camera_recording_rows", {}) or {}).values(),
+                *(getattr(self.panel, "px4_recording_rows", {}) or {}).values(),
+                getattr(self.panel, "gnss_base_recording_rows", ()),
+                getattr(self.panel, "extrinsics_comparison_recording_rows", ()),
+                getattr(self.panel, "method_evaluation_bundle_rows", ()),
+            ):
+                closer = getattr(rows, "close", None)
+                if callable(closer):
+                    closer()
+            append = getattr(self.panel, "append_workstation_data", None)
+            if callable(append):
+                append(
+                    "events",
+                    {
+                        "event_type": "recording_stopped",
+                        "recording_mode": str(
+                            getattr(self.panel, "_recording_mode", "manual") or "manual"
+                        ),
+                        "runtime_generation": str(
+                            getattr(self.panel, "recording_session_id", "") or ""
+                        ),
+                        "was_manual": was_manual,
+                    },
+                    priority=True,
+                )
+                for side, raw_path in (
+                    getattr(self.panel, "video_recording_paths", {}) or {}
+                ).items():
+                    path = Path(raw_path).expanduser()
+                    backend = self.panel.stream_backend_combo.currentData()
+                    pane = getattr(self.panel, f"{side}_pane", None)
+                    finalizations = getattr(pane, "recording_finalizations", {})
+                    finalization = (
+                        dict(finalizations.get(str(path), {}))
+                        if isinstance(finalizations, dict)
+                        else {}
+                    )
+                    finalization_state = (
+                        "success"
+                        if finalization.get("success") is True
+                        else "failed"
+                        if finalization.get("success") is False
+                        else "pending"
+                    )
+                    append(
+                        "artifacts",
+                        {
+                            "event_type": "video_closed",
+                            "side": str(side),
+                            "path": str(path),
+                            "media_type": "video/mp4",
+                            "stream_backend": backend,
+                            **recording_integrity_contract(backend),
+                            "finalization_state": finalization_state,
+                            "finalization_detail": str(
+                                finalization.get("detail") or ""
+                            ),
+                            "present": path.is_file(),
+                            "size_bytes": path.stat().st_size if path.is_file() else 0,
+                        },
+                        priority=True,
+                    )
+            self.panel.recording_session_id = ""
+            self.panel._recording_mode = "idle"
+            flush = getattr(self.panel, "flush_workstation_data", None)
+            if callable(flush):
+                flush()
+            record_button = getattr(self.panel, "record_button", None)
+            setter = getattr(record_button, "setText", None)
+            if callable(setter):
+                setter("수동 기록 시작")
+            self.panel._log(
+                "[저장] 데이터 기록을 중지했습니다; background 저장은 다음 측정을 차단하지 않습니다."
+            )
+            if restart_streams and self.panel.camera_connected:
+                self.panel._start_camera_streams(
+                    enable_detection=self.panel.yolo_enabled,
+                    switch_to_depth=self.panel.yolo_enabled,
+                )
+            resume = getattr(self.panel, "_resume_queued_measurement_start", None)
+            if callable(resume):
+                resume()
+            refresh = getattr(self.panel, "_refresh_recording_status_label", None)
+            if callable(refresh):
+                refresh()
+            refresh = getattr(self.panel, "_refresh_operation_header", None)
+            if callable(refresh):
+                refresh()
+            return
         if self._camera_photo_capture_active():
             self.panel.recording_status_label.setText("세션 기록: HR/OZ still 캡처 완료 대기 중")
             return
@@ -872,7 +1021,7 @@ class RecordingController:
                     target_snapshot = target_owner.stop_target_drone_stream(timeout_s=3.0)
                 artifact = target_snapshot.get("artifact")
                 if isinstance(artifact, dict):
-                    self._register_session_owned_artifact(
+                    registration = self._register_session_owned_artifact(
                         artifact["absolute_path"],
                         role="target_drone_raw_mavlink_jsonl",
                         media_type="application/x-ndjson",
@@ -884,6 +1033,9 @@ class RecordingController:
                         expected_size_bytes=artifact.get("size_bytes"),
                         expected_sha256=artifact.get("sha256"),
                     )
+                    error = persistence_failure_error(registration)
+                    if error is not None:
+                        raise OSError(error)
             except Exception as exc:
                 self.panel.recording_status_label.setText(
                     f"세션 기록: Target Drone drain/artifact 실패 ({exc})"
@@ -923,7 +1075,7 @@ class RecordingController:
             relative = str(artifact.get("relative_path") or "")
             if not relative:
                 continue
-            self._register_session_owned_artifact(
+            registration = self._register_session_owned_artifact(
                 controller.session_root / relative,
                 role=f"ulog/{artifact.get('source_id', 'unknown')}",
                 media_type="application/vnd.px4.ulog",
@@ -931,6 +1083,9 @@ class RecordingController:
                 expected_size_bytes=artifact.get("size_bytes"),
                 expected_sha256=artifact.get("sha256"),
             )
+            error = persistence_failure_error(registration)
+            if error is not None:
+                raise OSError(f"ULog artifact registration failed: {error}")
 
     def _register_session_owned_artifact(
         self,
@@ -986,6 +1141,20 @@ class RecordingController:
         evidence cannot silently cross a Measurement boundary.
         """
 
+        if not bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", True)):
+            if not str(getattr(self.panel, "recording_session_id", "") or ""):
+                self.panel.recording_session_id = "measurement-data"
+            writer = getattr(self.panel, "append_workstation_data", None)
+            if callable(writer):
+                writer(
+                    "capture.events",
+                    {
+                        "event_type": f"{capture_channel}_capture_requested",
+                        "capture_channel": str(capture_channel),
+                    },
+                    priority=True,
+                )
+            return
         if not self._measurement_package_capture_allowed():
             raise RuntimeError(
                 "Create Session Folder is required before pre/post evidence capture"
@@ -999,7 +1168,7 @@ class RecordingController:
         self._ensure_ulog_controller()
         evidence_start = getattr(self.panel, "ensure_workstation_run_evidence", None)
         if callable(evidence_start):
-            evidence_start(
+            evidence_result = evidence_start(
                 f"{capture_channel}_capture_requested",
                 {
                     "session_id": self.panel.recording_session_id,
@@ -1009,6 +1178,11 @@ class RecordingController:
                 source="RecordingController",
                 coordinate_contract="native raster u-right/v-down; OpenCV optical RDF",
             )
+            evidence_error = persistence_failure_error(evidence_result)
+            if evidence_error is not None:
+                raise OSError(
+                    f"{capture_channel} run evidence setup failed: {evidence_error}"
+                )
 
     def _measurement_package_capture_allowed(self, *, prepare_if_needed: bool = False) -> bool:
         """Keep legacy callers compatible while enforcing explicit UI sessions."""
@@ -1055,7 +1229,14 @@ class RecordingController:
         self._prepare_camera_evidence_session("oz")
 
     def _ensure_ulog_controller(self) -> ULogController:
-        session_id = str(getattr(self.panel, "recording_session_id", "") or "")
+        sessionless = not bool(
+            getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
+        )
+        session_id = (
+            "measurement-data"
+            if sessionless
+            else str(getattr(self.panel, "recording_session_id", "") or "")
+        )
         if not session_id:
             raise RuntimeError("recording session ID is not prepared")
         root_resolver = getattr(self.panel, "_recording_session_dir", None)
@@ -1072,6 +1253,7 @@ class RecordingController:
             current = ULogController(
                 root,
                 session_id,
+                timestamp_filenames=sessionless,
                 automatic_sources=(
                     automatic_sources if isinstance(automatic_sources, dict) else None
                 ),
@@ -1113,7 +1295,7 @@ class RecordingController:
             expected_sha256=expected_sha256,
         )
         absolute = controller.session_root / str(artifact["relative_path"])
-        self._register_session_owned_artifact(
+        registration = self._register_session_owned_artifact(
             absolute,
             role=f"ulog/{resolved_source.value}",
             media_type="application/vnd.px4.ulog",
@@ -1121,6 +1303,9 @@ class RecordingController:
             expected_size_bytes=artifact.get("size_bytes"),
             expected_sha256=artifact.get("sha256"),
         )
+        registration_error = persistence_failure_error(registration)
+        if registration_error is not None:
+            raise OSError(f"ULog artifact registration failed: {registration_error}")
         append_event = getattr(self.panel, "append_workstation_run_event", None)
         if callable(append_event):
             append_event(
@@ -1312,7 +1497,7 @@ class RecordingController:
             self.panel.recording_status_label.setText("HR/OZ still 캡처가 이미 진행 중입니다")
             return False
         self._prepare_pnp_evidence_session()
-        capture_id = self._next_capture_id(self.panel.pnp_photo_capture_records, "hr")
+        capture_id = self._new_capture_id(self.panel.pnp_photo_capture_records, "hr")
         request = self._new_hr_request_context(capture_id, normalized_purpose)
         self._pending_hr_requests[capture_id] = request
         target_infos = self._camera_photo_target_infos()
@@ -1381,7 +1566,7 @@ class RecordingController:
             self.panel.recording_status_label.setText("HR/OZ still 캡처가 이미 진행 중입니다")
             return False
         self._prepare_oz_evidence_session()
-        capture_id = self._next_capture_id(
+        capture_id = self._new_capture_id(
             getattr(self.panel, "oz_photo_capture_records", ()),
             "oz",
         )
@@ -1447,7 +1632,18 @@ class RecordingController:
 
         settings = getattr(self.panel, "settings", None)
         if output_dir is None and self.panel.recording_session_id:
-            output_dir = self.panel._recording_session_dir(self.panel.recording_session_id) / "frames"
+            root = self.panel._recording_session_dir(self.panel.recording_session_id)
+            output_dir = (
+                root / "images" / "camera_stills"
+                if not bool(
+                    getattr(
+                        self.panel,
+                        "_measurement_session_hierarchy_enabled",
+                        True,
+                    )
+                )
+                else root / "frames"
+            )
         return {
             "ftp_enabled": bool(getattr(settings, "wiris_ftp_enabled", False)),
             "ftp_settings_by_label": {
@@ -1523,6 +1719,15 @@ class RecordingController:
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
+        if not bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", True)):
+            normalized.pop("session_id", None)
+            writer = getattr(self.panel, "append_workstation_data", None)
+            if callable(writer):
+                writer("capture.events", normalized, priority=True)
+            self.panel.pnp_photo_capture_records.append(normalized)
+            return json.loads(
+                json.dumps(normalized, ensure_ascii=False, allow_nan=False, sort_keys=True)
+            )
         output_dir = self.panel._recording_session_dir(self.panel.recording_session_id)
         output_dir.mkdir(parents=True, exist_ok=True)
         event_path = output_dir / "hr_captures.jsonl"
@@ -1589,6 +1794,15 @@ class RecordingController:
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
+        if not bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", True)):
+            normalized.pop("session_id", None)
+            writer = getattr(self.panel, "append_workstation_data", None)
+            if callable(writer):
+                writer("capture.events", normalized, priority=True)
+            records.append(normalized)
+            return json.loads(
+                json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+            )
         output_dir = self.panel._recording_session_dir(self.panel.recording_session_id)
         output_dir.mkdir(parents=True, exist_ok=True)
         event_path = output_dir / "oz_captures.jsonl"
@@ -1853,13 +2067,36 @@ class RecordingController:
         session_root = Path(
             self.panel._recording_session_dir(self.panel.recording_session_id)
         ).resolve()
-        destination_root = session_root / "hr" / "imported" / capture_component
+        sessionless = not bool(
+            getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
+        )
+        destination_root = (
+            session_root / "images" / "hr_imported"
+            if sessionless
+            else session_root / "hr" / "imported" / capture_component
+        )
         stored_files: dict[str, dict[str, object]] = {}
         for side_name, image in imported.items():
             suffix = Path(image.source_name).suffix.lower()
             if not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
                 suffix = ".bin"
-            destination = destination_root / f"{side_name}-{image.sha256}{suffix}"
+            if sessionless:
+                source_stem = re.sub(
+                    r"[^A-Za-z0-9._-]+",
+                    "_",
+                    Path(image.source_name).stem,
+                ).strip("._") or "image"
+                stem = (
+                    f"{creation_timestamp_text(imported_utc_ns)}_"
+                    f"{side_name}_{source_stem}"
+                )
+                destination = destination_root / f"{stem}{suffix}"
+                sequence = 1
+                while destination.exists() or destination.is_symlink():
+                    destination = destination_root / f"{stem}-{sequence:02d}{suffix}"
+                    sequence += 1
+            else:
+                destination = destination_root / f"{side_name}-{image.sha256}{suffix}"
             stored = image.write_exact(destination)
             resolved = stored.resolve(strict=True)
             try:
@@ -1904,13 +2141,21 @@ class RecordingController:
             left=imported.get("left"),
             right=imported.get("right"),
             captured_utc_ns=source_capture_utc_ns,
-            note="exact HR file import into Workstation session",
+            note=(
+                "exact HR file import into Workstation data root"
+                if sessionless
+                else "exact HR file import into Workstation session"
+            ),
         ).to_mapping()
         capture_event.update(
             {
                 "event_type": "hr_file_imported",
                 "state": "imported",
-                "storage": "session_owned_exact_file",
+                "storage": (
+                    "type_owned_exact_file"
+                    if sessionless
+                    else "session_owned_exact_file"
+                ),
                 "ftp_downloaded": False,
                 "stored_files": stored_files,
                 "capture_time_semantics": time_semantics,
@@ -1944,6 +2189,17 @@ class RecordingController:
         *,
         final_clock_sync_snapshot: dict[str, object] | None = None,
     ) -> None:
+        if not bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", True)):
+            flush = getattr(self.panel, "flush_workstation_data", None)
+            if callable(flush):
+                flush()
+            self.panel._session_save_finalized = True
+            self.panel._session_save_retry_required = False
+            self.panel.recording_status_label.setText(
+                "데이터 기록: append flush 요청 완료 · 다음 측정 가능"
+            )
+            self.panel._refresh_operation_header()
+            return
         if self.panel.distance_recording_enabled:
             self.panel.recording_status_label.setText("세션 기록: 기록을 중지한 뒤 저장할 수 있습니다")
             self.panel._refresh_operation_header()
@@ -2682,6 +2938,9 @@ class RecordingController:
                 "transport": self.panel.rtsp_transport_combo.currentData(),
                 "decoder": self.panel.decoder_combo.currentData(),
                 "rtsp_latency_ms": self.panel.rtsp_latency_spin.value(),
+                **recording_integrity_contract(
+                    self.panel.stream_backend_combo.currentData()
+                ),
             },
         }
 
@@ -2909,7 +3168,10 @@ class RecordingController:
             return {"native_pair_status": "session_directory_owner_missing"}
         session_id = str(self.panel.recording_session_id)
         root = Path(resolver(session_id))
-        store = self._native_frame_store_for_session(session_id, root)
+        exact_ring_frames: list[
+            tuple[str, object, FrameKey, Mapping[str, object]]
+        ] = []
+        exact_ring_mode = True
         frames: list[tuple[str, QtGui.QImage, Mapping[str, object]]] = []
         missing: list[str] = []
         for side, detection in (
@@ -2917,33 +3179,89 @@ class RecordingController:
             ("right", right_detection),
         ):
             pane = getattr(self.panel, f"{side}_pane", None)
-            getter = getattr(pane, "native_measurement_frame", None)
-            # CameraPane's native cache is keyed by the producer's
-            # app-receive monotonic timestamp.  pairing_timestamp_s may instead
-            # be RTCP/NTP Unix time and is only valid for stereo pairing.
-            cached = (
-                getter(detection.app_receive_monotonic_s)
-                if callable(getter)
+            ring_getter = getattr(pane, "native_ring_for_frame_key", None)
+            detection_metadata = getattr(detection, "timestamp_metadata", {})
+            detection_metadata = (
+                dict(detection_metadata)
+                if isinstance(detection_metadata, Mapping)
+                else {}
+            )
+            try:
+                frame_key = FrameKey.from_mapping(detection_metadata)
+            except (TypeError, ValueError):
+                frame_key = FrameKey("", 0, 0)
+            if callable(ring_getter):
+                ring = (
+                    ring_getter(frame_key)
+                    if frame_key.camera_id
+                    and frame_key.stream_generation > 0
+                    and frame_key.frame_id > 0
+                    and detection_metadata.get("native_ring_available") is not False
+                    else None
+                )
+                if ring is None:
+                    missing.append(side)
+                    continue
+                exact_ring_frames.append(
+                    (side, ring, frame_key, detection_metadata)
+                )
+                continue
+
+            exact_ring_mode = False
+            legacy_getter = getattr(pane, "native_measurement_frame", None)
+            legacy_cached = (
+                legacy_getter(detection.app_receive_monotonic_s)
+                if callable(legacy_getter)
                 else None
+            )
+            cached = (
+                None
+                if legacy_cached is None
+                else (legacy_cached[1], legacy_cached[2])
             )
             if cached is None:
                 missing.append(side)
                 continue
-            _timestamp_s, image, metadata = cached
+            image, metadata = cached
             frames.append((side, image, dict(metadata)))
-        if not frames:
-            return {"native_pair_status": "missing:" + ",".join(missing)}
+
+        if exact_ring_mode and len(exact_ring_frames) != 2:
+            missing = missing or ["left", "right"]
+        if missing:
+            return {
+                "native_pair_status": EVIDENCE_FRAME_UNAVAILABLE,
+                "native_pair_error": (
+                    "exact FrameKey is absent or was overwritten; nearest-frame "
+                    "substitution is forbidden"
+                ),
+                "native_pair_missing_sides": ",".join(dict.fromkeys(missing)),
+                "evidence_state": "REJECTED",
+            }
+
         request_id = f"native-{uuid.uuid4().hex}"
+        context = {
+            "session_id": session_id,
+            "record_key": list(record_key) if record_key is not None else None,
+            "writer_kind": "ring" if exact_ring_mode else "legacy",
+        }
+        if exact_ring_mode:
+            writer = self._native_evidence_writer_for_session(session_id, root)
+            return writer.enqueue_ring_pair(
+                request_id=request_id,
+                pair_id=pair_id,
+                purpose=purpose,
+                frames=exact_ring_frames,
+                context=context,
+            )
+
+        store = self._native_frame_store_for_session(session_id, root)
         scheduled = store.enqueue_pair(
             request_id=request_id,
             pair_id=pair_id,
             purpose=purpose,
             frames=frames,
-            missing_sides=missing,
-            context={
-                "session_id": session_id,
-                "record_key": list(record_key) if record_key is not None else None,
-            },
+            missing_sides=(),
+            context=context,
         )
         if scheduled is None:
             return {
@@ -2951,6 +3269,7 @@ class RecordingController:
                 "native_pair_error": (
                     f"native frame queue limit {store.max_pending} reached"
                 ),
+                "evidence_state": "FAILED",
             }
         return scheduled
 
@@ -2963,11 +3282,24 @@ class RecordingController:
         if not isinstance(stores, dict):
             stores = {}
             self.panel._native_frame_async_stores = stores
-        store = stores.get(session_id)
+        store_key = (
+            "measurement-data"
+            if not bool(
+                getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
+            )
+            else session_id
+        )
+        store = stores.get(store_key)
         if isinstance(store, AsyncNativeFrameStore):
             return store
         parent = self.panel if isinstance(self.panel, QtCore.QObject) else None
-        store = AsyncNativeFrameStore(root, parent=parent)
+        store = AsyncNativeFrameStore(
+            root,
+            timestamp_filenames=not bool(
+                getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
+            ),
+            parent=parent,
+        )
         callback = getattr(self.panel, "_handle_async_native_frame_result", None)
         if callable(callback):
             store.completed.connect(callback, QtCore.Qt.QueuedConnection)
@@ -2976,8 +3308,46 @@ class RecordingController:
                 self._handle_async_native_frame_result,
                 QtCore.Qt.DirectConnection,
             )
-        stores[session_id] = store
+        stores[store_key] = store
         return store
+
+    def _native_evidence_writer_for_session(
+        self,
+        session_id: str,
+        root: Path,
+    ) -> AsyncNativeEvidenceWriter:
+        writers = getattr(self.panel, "_native_evidence_writers", None)
+        if not isinstance(writers, dict):
+            writers = {}
+            self.panel._native_evidence_writers = writers
+        writer_key = (
+            "measurement-data"
+            if not bool(
+                getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
+            )
+            else session_id
+        )
+        writer = writers.get(writer_key)
+        if isinstance(writer, AsyncNativeEvidenceWriter):
+            return writer
+        parent = self.panel if isinstance(self.panel, QtCore.QObject) else None
+        writer = AsyncNativeEvidenceWriter(
+            root,
+            timestamp_filenames=not bool(
+                getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
+            ),
+            parent=parent,
+        )
+        callback = getattr(self.panel, "_handle_async_native_frame_result", None)
+        if callable(callback):
+            writer.completed.connect(callback, QtCore.Qt.QueuedConnection)
+        else:
+            writer.completed.connect(
+                self._handle_async_native_frame_result,
+                QtCore.Qt.DirectConnection,
+            )
+        writers[writer_key] = writer
+        return writer
 
     def _handle_async_native_frame_result(self, payload: object) -> None:
         data = dict(payload or {})
@@ -2990,20 +3360,71 @@ class RecordingController:
             "native_pair_status": "failed",
             "native_pair_error": "async native frame result is malformed",
         }
-        stores = getattr(self.panel, "_native_frame_async_stores", None)
-        store = stores.get(session_id) if isinstance(stores, dict) else None
-        try:
-            raw_key = context.get("record_key")
-            record_key = tuple(raw_key) if isinstance(raw_key, (tuple, list)) else None
-            if record_key is not None:
-                row_index = getattr(self.panel, "_recording_pair_row_index", {}).get(
-                    record_key
+        writer_kind = str(context.get("writer_kind") or "legacy")
+        stores = getattr(
+            self.panel,
+            "_native_evidence_writers"
+            if writer_kind == "ring"
+            else "_native_frame_async_stores",
+            None,
+        )
+        store_key = (
+            "measurement-data"
+            if not bool(
+                getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
+            )
+            else session_id
+        )
+        store = stores.get(store_key) if isinstance(stores, dict) else None
+        raw_key = context.get("record_key")
+        record_key = tuple(raw_key) if isinstance(raw_key, (tuple, list)) else None
+        rows = getattr(self.panel, "distance_recording_rows", None)
+        pending = getattr(self.panel, "_recording_pending_native_request_rows", {})
+        target = pending.pop(request_id, None) if isinstance(pending, dict) else None
+        if target is None and rows is not None and request_id:
+            for candidate_index, candidate in enumerate(rows):
+                if str(candidate.get("native_pair_request_id") or "") == request_id:
+                    target = (session_id, candidate_index)
+                    break
+        if target is None and record_key is not None:
+            # A non-QObject test adapter can deliver directly from the writer
+            # thread before the GUI-side append/upsert binds the request ID.
+            # Disk persistence is already complete, so release the store's I/O
+            # barrier now. The binding path drains this exact payload if the
+            # row is committed; a later row-building exception must never leave
+            # session shutdown waiting on work that has already finished.
+            self._deferred_native_frame_results[request_id] = data
+            if isinstance(store, (AsyncNativeFrameStore, AsyncNativeEvidenceWriter)):
+                store.acknowledge(request_id)
+            return
+        if not bool(
+            getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
+        ):
+            writer = getattr(self.panel, "append_workstation_data", None)
+            if callable(writer):
+                writer(
+                    "native.frames",
+                    {
+                        "event_type": "native_frame_pair_persisted",
+                        "runtime_generation": session_id,
+                        "request_id": request_id,
+                        **fields,
+                    },
+                    priority=True,
                 )
-                rows = getattr(self.panel, "distance_recording_rows", None)
-                if row_index is not None and rows is not None:
-                    current = dict(rows[row_index])
+        try:
+            if target is not None and rows is not None:
+                bound_session_id, row_index = target
+                current = dict(rows[row_index])
+                current_request_id = str(
+                    current.get("native_pair_request_id") or ""
+                )
+                if (
+                    bound_session_id == session_id
+                    and current_request_id in {"", request_id}
+                ):
                     current.update(fields)
-                    if isinstance(rows, SpoolRows):
+                    if isinstance(rows, (SpoolRows, LiveDataRows)):
                         rows.replace(row_index, current)
                     else:
                         rows[row_index] = current
@@ -3019,31 +3440,62 @@ class RecordingController:
                         f"{fields.get('native_pair_error', '')}"
                     )
         finally:
-            if isinstance(store, AsyncNativeFrameStore):
+            if isinstance(store, (AsyncNativeFrameStore, AsyncNativeEvidenceWriter)):
                 store.acknowledge(request_id)
 
     def native_frame_persistence_pending_count(self) -> int:
-        stores = getattr(self.panel, "_native_frame_async_stores", None)
-        if not isinstance(stores, dict):
-            return 0
-        return sum(
-            store.pending_count
-            for store in stores.values()
-            if isinstance(store, AsyncNativeFrameStore)
-        )
+        pending = 0
+        for attribute, writer_type in (
+            ("_native_frame_async_stores", AsyncNativeFrameStore),
+            ("_native_evidence_writers", AsyncNativeEvidenceWriter),
+        ):
+            stores = getattr(self.panel, attribute, None)
+            if not isinstance(stores, dict):
+                continue
+            pending += sum(
+                store.pending_count
+                for store in stores.values()
+                if isinstance(store, writer_type)
+            )
+        return pending
 
     def _shutdown_native_frame_stores(self) -> bool:
-        stores = getattr(self.panel, "_native_frame_async_stores", None)
-        if not isinstance(stores, dict):
-            return True
         all_closed = True
-        for session_id, store in list(stores.items()):
-            if not isinstance(store, AsyncNativeFrameStore) or store.close():
-                stores.pop(session_id, None)
-                if isinstance(store, QtCore.QObject):
-                    store.deleteLater()
-            else:
-                all_closed = False
+        for attribute, writer_type in (
+            ("_native_frame_async_stores", AsyncNativeFrameStore),
+            ("_native_evidence_writers", AsyncNativeEvidenceWriter),
+        ):
+            stores = getattr(self.panel, attribute, None)
+            if not isinstance(stores, dict):
+                continue
+            for session_id, store in list(stores.items()):
+                if not isinstance(store, writer_type) or store.close():
+                    stores.pop(session_id, None)
+                    orphaned = []
+                    for request_id, payload in self._deferred_native_frame_results.items():
+                        context = payload.get("context")
+                        context = (
+                            dict(context) if isinstance(context, Mapping) else {}
+                        )
+                        if (
+                            str(session_id) == "measurement-data"
+                            or str(context.get("session_id") or "")
+                            == str(session_id)
+                        ):
+                            orphaned.append(request_id)
+                    for request_id in orphaned:
+                        self._deferred_native_frame_results.pop(request_id, None)
+                    if orphaned:
+                        logger = getattr(self.panel, "_log", None)
+                        if callable(logger):
+                            logger(
+                                "[저장] 행 등록 전 완료된 native frame 결과를 "
+                                f"세션 종료 시 정리했습니다: {len(orphaned)} requests"
+                            )
+                    if isinstance(store, QtCore.QObject):
+                        store.deleteLater()
+                else:
+                    all_closed = False
         return all_closed
 
     def _persist_native_measurement_pair(
@@ -3110,6 +3562,42 @@ class RecordingController:
             "measurement_result_sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
         }
 
+    def _track_pending_native_row(
+        self,
+        row_index: int,
+        values: Mapping[str, object],
+    ) -> None:
+        """Bind one in-flight native request to its permanent append-only row.
+
+        ``_recording_pair_row_index`` is LRU-pruned at
+        ``RECORDING_KEY_CACHE_LIMIT``. Request IDs are unique and remain bound
+        until their own completion, so repeated writes for one pair cannot
+        consume each other's lookup or overwrite a newer pending request.
+        """
+
+        request_id = str(values.get("native_pair_request_id") or "")
+        if not request_id:
+            return
+        pending = getattr(
+            self.panel,
+            "_recording_pending_native_request_rows",
+            None,
+        )
+        if not isinstance(pending, dict):
+            return
+        if str(values.get("native_pair_status") or "") == "pending":
+            session_id = str(
+                values.get("session_id")
+                or getattr(self.panel, "recording_session_id", "")
+                or ""
+            )
+            pending[request_id] = (session_id, row_index)
+            deferred = self._deferred_native_frame_results.pop(request_id, None)
+            if deferred is not None:
+                self._handle_async_native_frame_result(deferred)
+        else:
+            pending.pop(request_id, None)
+
     def _upsert_pair_recording_row(
         self,
         measurement_attempt: MeasurementAttempt,
@@ -3140,6 +3628,7 @@ class RecordingController:
                 for cached_key, cached_index in self.panel._recording_pair_row_index.items()
                 if cached_index >= minimum_cached_index
             }
+            self._track_pending_native_row(row_index, values)
             self.panel._append_recording_table_row(values)
             inserted = True
         else:
@@ -3149,8 +3638,9 @@ class RecordingController:
             current.update(values)
             current["sample_index"] = sample_index
             current["pair_sequence"] = pair_sequence
-            if isinstance(self.panel.distance_recording_rows, SpoolRows):
+            if isinstance(self.panel.distance_recording_rows, (SpoolRows, LiveDataRows)):
                 self.panel.distance_recording_rows.replace(row_index, current)
+            self._track_pending_native_row(row_index, values)
             self.panel._refresh_recording_table()
             inserted = False
         self.panel._refresh_recording_status_label()
@@ -3292,6 +3782,7 @@ class RecordingController:
                 for cached_key, cached_index in self.panel._recording_pair_row_index.items()
                 if cached_index >= minimum_cached_index
             }
+            self._track_pending_native_row(row_index, row)
             self.panel._append_recording_table_row(row)
         else:
             current = self.panel.distance_recording_rows[row_index]
@@ -3300,8 +3791,9 @@ class RecordingController:
             current.update(row)
             current["sample_index"] = sample_index
             current["pair_sequence"] = pair_sequence
-            if isinstance(self.panel.distance_recording_rows, SpoolRows):
+            if isinstance(self.panel.distance_recording_rows, (SpoolRows, LiveDataRows)):
                 self.panel.distance_recording_rows.replace(row_index, current)
+            self._track_pending_native_row(row_index, row)
             self.panel._refresh_recording_table()
         self.panel._refresh_recording_status_label()
         self.panel._refresh_operation_header()
@@ -3787,12 +4279,7 @@ class RecordingController:
         if side is None:
             return
         if side not in self.panel.px4_recording_rows:
-            rows = self._new_recording_spool()
-            rows.bind(
-                self.panel._recording_session_dir(self.panel.recording_session_id)
-                / ".spool"
-                / f"px4_{side}.jsonl"
-            )
+            rows = self._new_live_rows(f"px4.{side}")
             self.panel.px4_recording_rows[side] = rows
         host_receive_monotonic_ns = time.monotonic_ns()
         host_receive_utc_ns = time.time_ns()

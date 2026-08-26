@@ -7,11 +7,13 @@ import io
 import re
 import struct
 import subprocess
+import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from wiris_stereo_distance.px4_mag_manager import (
     BOARD_INTERNAL_MAG_ID,
@@ -341,6 +343,8 @@ MAVLINK_RM3100_STREAM_REQUESTS = (
 )
 MAVLINK_MAX_MESSAGES_PER_TICK = 256
 MAVLINK_MAX_PROCESS_TIME_S = 0.020
+MAVLINK_DUPLICATE_TTL_S = 0.250
+MAVLINK_DUPLICATE_CACHE_SIZE = 512
 
 
 def camera_label_ko(camera: str) -> str:
@@ -1184,9 +1188,36 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         self._ros2_client_config: dict[str, Any] | None = None
         self._ros2_client_started: set[str] = set()
         self._latest_gnss_relative: dict[str, GnssRelativeState] = {}
+        self._command_state_lock = threading.RLock()
+        self._active_command_cameras: set[str] = set()
+        self._deferred_command_messages: dict[str, deque[Any]] = {
+            "left": deque(),
+            "right": deque(),
+        }
+        self._recent_raw_packets: dict[str, deque[tuple[float, bytes]]] = {
+            "left": deque(maxlen=MAVLINK_DUPLICATE_CACHE_SIZE),
+            "right": deque(maxlen=MAVLINK_DUPLICATE_CACHE_SIZE),
+        }
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(20)
         self.timer.timeout.connect(self.spin_once)
+
+    @contextmanager
+    def exclusive_command(self, camera: str):
+        """Reserve one MAVLink receive path for a blocking command."""
+
+        camera = str(camera)
+        with self._command_state_lock:
+            if camera not in self.connections:
+                raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 연결이 없습니다.")
+            if camera in self._active_command_cameras:
+                raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 명령이 이미 진행 중입니다.")
+            self._active_command_cameras.add(camera)
+        try:
+            yield
+        finally:
+            with self._command_state_lock:
+                self._active_command_cameras.discard(camera)
 
     def start(self, camera: str | None = None) -> None:
         try:
@@ -1241,6 +1272,10 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             self._mavlink_stream_configured.discard(side)
             self._ros2_client_started.discard(side)
             self._latest_gnss_relative.pop(side, None)
+            self._deferred_command_messages.setdefault(side, deque()).clear()
+            self._recent_raw_packets.setdefault(
+                side, deque(maxlen=MAVLINK_DUPLICATE_CACHE_SIZE)
+            ).clear()
         if not self.connections:
             self.timer.stop()
         if camera is None:
@@ -1275,7 +1310,8 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         for camera, connection in self.connections.items():
             if camera not in target_cameras:
                 continue
-            self._apply_mavlink_stream_config(camera, connection)
+            with self.exclusive_command(camera):
+                self._apply_mavlink_stream_config(camera, connection)
 
     def start_px4_uxrce_client_shell(
         self,
@@ -1313,22 +1349,32 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         )
 
     def read_param_int(self, camera: str, name: str, *, timeout_s: float = 2.0) -> int | None:
-        connection = self.connections.get(camera)
-        if connection is None:
-            raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 연결이 없습니다.")
-        return _mavlink_read_param_int(connection, name, timeout_s=timeout_s)
+        with self.exclusive_command(camera):
+            return _mavlink_read_param_int(
+                self.connections[camera],
+                name,
+                timeout_s=timeout_s,
+                on_unmatched=lambda message: self._defer_command_message(camera, message),
+            )
 
     def read_param(self, camera: str, name: str, *, timeout_s: float = 2.0) -> int | float | None:
-        connection = self.connections.get(camera)
-        if connection is None:
-            raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 연결이 없습니다.")
-        return _mavlink_read_param(connection, name, timeout_s=timeout_s)
+        with self.exclusive_command(camera):
+            return _mavlink_read_param(
+                self.connections[camera],
+                name,
+                timeout_s=timeout_s,
+                on_unmatched=lambda message: self._defer_command_message(camera, message),
+            )
 
     def set_param_int(self, camera: str, name: str, value: int, *, timeout_s: float = 2.0) -> int | None:
-        connection = self.connections.get(camera)
-        if connection is None:
-            raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 연결이 없습니다.")
-        actual = _mavlink_set_param_int(connection, name, int(value), timeout_s=timeout_s)
+        with self.exclusive_command(camera):
+            actual = _mavlink_set_param_int(
+                self.connections[camera],
+                name,
+                int(value),
+                timeout_s=timeout_s,
+                on_unmatched=lambda message: self._defer_command_message(camera, message),
+            )
         if actual == int(value):
             self.status_changed.emit(f"{camera_label_ko(camera)} PX4 param 설정 확인: {name}={actual}")
         else:
@@ -1364,18 +1410,27 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         sysid = int(config["sysids"].get(camera, 1))
         command = (
             f"param set MAV_SYS_ID {sysid}\n"
-            f"mavlink start -x -u {int(port)} -t {host_ip} -o {int(port)} -r {rate} -m normal\n"
-            "mavlink status"
+            "param set MAV_2_CONFIG 1000\n"
+            "param set MAV_2_MODE 0\n"
+            "param set MAV_2_BROADCAST 1\n"
+            f"param set MAV_2_REMOTE_PRT {int(port)}\n"
+            f"param set MAV_2_UDP_PRT {int(port)}\n"
+            f"param set MAV_2_RATE {rate}\n"
+            "param save"
         )
         try:
-            _send_mavlink_shell_command(connection, command)
+            _send_mavlink_shell_command(
+                connection,
+                command,
+                on_unmatched=lambda message: self._defer_command_message(camera, message),
+            )
         except Exception as exc:
             self.status_changed.emit(f"{camera_label_ko(camera)} MAVLink stream 설정 명령 실패: {exc}")
             return
         self._mavlink_stream_configured.add(camera)
         self.status_changed.emit(
-            f"{camera_label_ko(camera)} MAVLink stream 설정 명령 전송: sysid={sysid}, "
-            f"host={host_ip}, port={int(port)}"
+            f"{camera_label_ko(camera)} MAVLink 단일-instance 영구 설정 저장: sysid={sysid}, "
+            f"host={host_ip}, port={int(port)} (재부팅 후 적용)"
         )
 
     def _apply_ros2_client_config(self, camera: str, connection: Any) -> None:
@@ -1492,20 +1547,57 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
 
     def spin_once(self) -> None:
         for camera, connection in list(self.connections.items()):
+            with self._command_state_lock:
+                if camera in self._active_command_cameras:
+                    continue
             # ``spin_once`` runs from a Qt timer.  A continuously busy serial
             # link must not monopolize the GUI thread while we drain it.
             deadline = time.monotonic() + MAVLINK_MAX_PROCESS_TIME_S
             for _ in range(MAVLINK_MAX_MESSAGES_PER_TICK):
-                try:
-                    message = connection.recv_match(blocking=False)
-                except Exception as exc:
-                    self.status_changed.emit(f"{camera_label_ko(camera)} MAVLink 수신 실패: {exc}")
-                    break
+                with self._command_state_lock:
+                    if camera in self._active_command_cameras:
+                        break
+                    try:
+                        pending = self._deferred_command_messages.setdefault(camera, deque())
+                        message = pending.popleft() if pending else connection.recv_match(blocking=False)
+                    except Exception as exc:
+                        self.status_changed.emit(f"{camera_label_ko(camera)} MAVLink 수신 실패: {exc}")
+                        break
                 if message is None:
                     break
+                if self._is_duplicate_packet(camera, message):
+                    continue
                 self._handle_mavlink_message(camera, message)
                 if time.monotonic() >= deadline:
                     break
+
+    def _defer_command_message(self, camera: str, message: Any) -> None:
+        if message is None:
+            return
+        with self._command_state_lock:
+            self._deferred_command_messages.setdefault(str(camera), deque()).append(message)
+
+    def _is_duplicate_packet(self, camera: str, message: Any) -> bool:
+        reader = getattr(message, "get_msgbuf", None)
+        if not callable(reader):
+            return False
+        try:
+            raw = bytes(reader())
+        except Exception:
+            return False
+        if not raw:
+            return False
+        now_s = time.monotonic()
+        recent = self._recent_raw_packets.setdefault(
+            str(camera), deque(maxlen=MAVLINK_DUPLICATE_CACHE_SIZE)
+        )
+        cutoff_s = now_s - MAVLINK_DUPLICATE_TTL_S
+        while recent and recent[0][0] < cutoff_s:
+            recent.popleft()
+        duplicate = any(previous == raw for _timestamp_s, previous in recent)
+        if not duplicate:
+            recent.append((now_s, raw))
+        return duplicate
 
     def _handle_mavlink_message(self, camera: str, message: Any) -> None:
         message_type = message.get_type() if hasattr(message, "get_type") else ""
@@ -1995,15 +2087,29 @@ def _serial_control_output_from_message(message: Any) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def _read_mavlink_shell_output(connection: Any, *, timeout_s: float) -> str:
+def _mavlink_message_type(message: Any) -> str:
+    reader = getattr(message, "get_type", None)
+    return str(reader() if callable(reader) else "")
+
+
+def _read_mavlink_shell_output(
+    connection: Any,
+    *,
+    timeout_s: float,
+    on_unmatched: Callable[[Any], None] | None = None,
+) -> str:
     recv_match = getattr(connection, "recv_match", None)
     if recv_match is None:
         return ""
     deadline = time.monotonic() + max(0.0, float(timeout_s))
     chunks: list[str] = []
     while time.monotonic() < deadline:
-        message = recv_match(type="SERIAL_CONTROL", blocking=True, timeout=0.05)
+        message = recv_match(blocking=True, timeout=0.05)
         if message is None:
+            continue
+        if _mavlink_message_type(message) != "SERIAL_CONTROL":
+            if on_unmatched is not None:
+                on_unmatched(message)
             continue
         text = _serial_control_output_from_message(message)
         if text:
@@ -2023,6 +2129,7 @@ def _send_mavlink_shell_command(
     command: str,
     *,
     timeout_s: float = 0.8,
+    on_unmatched: Callable[[Any], None] | None = None,
 ) -> MavlinkShellCommandResult:
     mav = getattr(connection, "mav", None)
     if mav is None or not hasattr(mav, "serial_control_send"):
@@ -2035,25 +2142,39 @@ def _send_mavlink_shell_command(
         ("respond+exclusive", respond_flag | exclusive_flag),
         ("respond", respond_flag),
     )
-    payload = (command.rstrip() + "\n").encode("utf-8")
-    selected_label, selected_flags = variants[-1]
-    probe_output = ""
-    for label, flags in variants:
-        # Opening the shell first matters on PX4 NSH links that only respond after a read request.
-        mav.serial_control_send(device, flags, 0, 0, 0, [0] * 70)
-        output = _read_mavlink_shell_output(connection, timeout_s=min(timeout_s, 0.25))
-        if output or label == variants[-1][0]:
-            selected_label = label
-            selected_flags = flags
-            probe_output = output
-            break
-    _send_mavlink_shell_payload(mav, device=device, flags=selected_flags, payload=payload)
-    command_output = _read_mavlink_shell_output(connection, timeout_s=timeout_s)
-    return MavlinkShellCommandResult(
-        command=command,
-        output=probe_output + command_output,
-        flag_label=selected_label,
-    )
+    try:
+        payload = (command.rstrip() + "\n").encode("utf-8")
+        selected_label, selected_flags = variants[-1]
+        probe_output = ""
+        for label, flags in variants:
+            # Opening the shell first matters on PX4 NSH links that only respond after a read request.
+            mav.serial_control_send(device, flags, 0, 0, 0, [0] * 70)
+            output = _read_mavlink_shell_output(
+                connection,
+                timeout_s=min(timeout_s, 0.25),
+                on_unmatched=on_unmatched,
+            )
+            if output or label == variants[-1][0]:
+                selected_label = label
+                selected_flags = flags
+                probe_output = output
+                break
+        _send_mavlink_shell_payload(mav, device=device, flags=selected_flags, payload=payload)
+        command_output = _read_mavlink_shell_output(
+            connection,
+            timeout_s=timeout_s,
+            on_unmatched=on_unmatched,
+        )
+        return MavlinkShellCommandResult(
+            command=command,
+            output=probe_output + command_output,
+            flag_label=selected_label,
+        )
+    finally:
+        try:
+            mav.serial_control_send(device, 0, 0, 0, 0, [0] * 70)
+        except Exception:
+            pass
 
 
 def _send_mavlink_rtcm_data(connection: Any, payload: bytes) -> int:
@@ -2129,17 +2250,45 @@ def _mavlink_param_float_to_int(value: Any) -> int:
     return struct.unpack("<I", struct.pack("<f", float(value)))[0]
 
 
-def _mavlink_recv_param_value(connection: Any, name: str, *, timeout_s: float) -> int | None:
+def _mavlink_recv_param_value_loop(
+    connection: Any,
+    name: str,
+    *,
+    timeout_s: float,
+    decode: Callable[[float, int | None], int | float],
+    on_unmatched: Callable[[Any], None] | None = None,
+) -> int | float | None:
     deadline = time.monotonic() + float(timeout_s)
     while time.monotonic() < deadline:
         remaining = max(0.0, deadline - time.monotonic())
-        message = connection.recv_match(type="PARAM_VALUE", blocking=True, timeout=min(0.2, remaining))
+        message = connection.recv_match(blocking=True, timeout=min(0.2, remaining))
         if message is None:
             continue
-        if _mavlink_param_id_text(message) != name:
+        if (
+            _mavlink_message_type(message) != "PARAM_VALUE"
+            or _mavlink_param_id_text(message) != name
+        ):
+            if on_unmatched is not None:
+                on_unmatched(message)
             continue
-        return _mavlink_param_float_to_int(getattr(message, "param_value"))
+        return decode(getattr(message, "param_value"), getattr(message, "param_type", None))
     return None
+
+
+def _mavlink_recv_param_value(
+    connection: Any,
+    name: str,
+    *,
+    timeout_s: float,
+    on_unmatched: Callable[[Any], None] | None = None,
+) -> int | None:
+    return _mavlink_recv_param_value_loop(
+        connection,
+        name,
+        timeout_s=timeout_s,
+        decode=lambda raw_param_value, _param_type: _mavlink_param_float_to_int(raw_param_value),
+        on_unmatched=on_unmatched,
+    )
 
 
 # MAV_PARAM_TYPE_REAL32 = 9, MAV_PARAM_TYPE_REAL64 = 10. Every other MAV_PARAM_TYPE is an
@@ -2154,31 +2303,51 @@ def _mavlink_decode_param_value(raw_param_value: float, param_type: int | None) 
     return _mavlink_param_float_to_int(raw_param_value)
 
 
-def _mavlink_recv_param_value_typed(connection: Any, name: str, *, timeout_s: float) -> int | float | None:
-    deadline = time.monotonic() + float(timeout_s)
-    while time.monotonic() < deadline:
-        remaining = max(0.0, deadline - time.monotonic())
-        message = connection.recv_match(type="PARAM_VALUE", blocking=True, timeout=min(0.2, remaining))
-        if message is None:
-            continue
-        if _mavlink_param_id_text(message) != name:
-            continue
-        return _mavlink_decode_param_value(getattr(message, "param_value"), getattr(message, "param_type", None))
-    return None
+def _mavlink_recv_param_value_typed(
+    connection: Any,
+    name: str,
+    *,
+    timeout_s: float,
+    on_unmatched: Callable[[Any], None] | None = None,
+) -> int | float | None:
+    return _mavlink_recv_param_value_loop(
+        connection,
+        name,
+        timeout_s=timeout_s,
+        decode=_mavlink_decode_param_value,
+        on_unmatched=on_unmatched,
+    )
 
 
-def _mavlink_read_param(connection: Any, name: str, *, timeout_s: float = 2.0) -> int | float | None:
+def _mavlink_read_param(
+    connection: Any,
+    name: str,
+    *,
+    timeout_s: float = 2.0,
+    on_unmatched: Callable[[Any], None] | None = None,
+) -> int | float | None:
     mav = getattr(connection, "mav", None)
     if mav is None or not hasattr(mav, "param_request_read_send"):
         return None
     target_system = int(getattr(connection, "target_system", 0) or 1)
     target_component = int(getattr(connection, "target_component", 0) or 1)
     mav.param_request_read_send(target_system, target_component, _mavlink_param_id(name), -1)
-    return _mavlink_recv_param_value_typed(connection, name, timeout_s=timeout_s)
+    return _mavlink_recv_param_value_typed(
+        connection,
+        name,
+        timeout_s=timeout_s,
+        on_unmatched=on_unmatched,
+    )
 
 
-def _mavlink_read_param_int(connection: Any, name: str, *, timeout_s: float = 2.0) -> int | None:
-    if hasattr(connection, "param_fetch_one"):
+def _mavlink_read_param_int(
+    connection: Any,
+    name: str,
+    *,
+    timeout_s: float = 2.0,
+    on_unmatched: Callable[[Any], None] | None = None,
+) -> int | None:
+    if on_unmatched is None and hasattr(connection, "param_fetch_one"):
         try:
             value = connection.param_fetch_one(name, timeout=timeout_s)
         except TypeError:
@@ -2199,10 +2368,22 @@ def _mavlink_read_param_int(connection: Any, name: str, *, timeout_s: float = 2.
     target_system = int(getattr(connection, "target_system", 0) or 1)
     target_component = int(getattr(connection, "target_component", 0) or 1)
     mav.param_request_read_send(target_system, target_component, _mavlink_param_id(name), -1)
-    return _mavlink_recv_param_value(connection, name, timeout_s=timeout_s)
+    return _mavlink_recv_param_value(
+        connection,
+        name,
+        timeout_s=timeout_s,
+        on_unmatched=on_unmatched,
+    )
 
 
-def _mavlink_set_param_int(connection: Any, name: str, value: int, *, timeout_s: float = 2.0) -> int | None:
+def _mavlink_set_param_int(
+    connection: Any,
+    name: str,
+    value: int,
+    *,
+    timeout_s: float = 2.0,
+    on_unmatched: Callable[[Any], None] | None = None,
+) -> int | None:
     mav = getattr(connection, "mav", None)
     if mav is None or not hasattr(mav, "param_set_send"):
         raise RuntimeError("MAVLink PARAM_SET을 지원하지 않는 연결입니다.")
@@ -2217,7 +2398,12 @@ def _mavlink_set_param_int(connection: Any, name: str, value: int, *, timeout_s:
         _mavlink_int_to_param_float(int(value)),
         param_type,
     )
-    return _mavlink_recv_param_value(connection, name, timeout_s=timeout_s)
+    return _mavlink_recv_param_value(
+        connection,
+        name,
+        timeout_s=timeout_s,
+        on_unmatched=on_unmatched,
+    )
 
 
 def _decode_mavlink_serial_control(message: Any) -> str:

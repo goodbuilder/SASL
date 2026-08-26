@@ -82,6 +82,88 @@ def test_param_read_defers_attitude_instead_of_dropping_telemetry() -> None:
     assert attitudes[0].roll_deg == pytest.approx(5.72957795)
 
 
+def test_common_param_receive_loop_preserves_integer_bits_and_unmatched_message() -> None:
+    from Workstation.workstation_core import pixhawk_attitude
+
+    class Message:
+        def __init__(self, message_type: str, **values) -> None:
+            self._message_type = message_type
+            self.__dict__.update(values)
+
+        def get_type(self) -> str:
+            return self._message_type
+
+    class Connection:
+        def __init__(self) -> None:
+            self.messages = [
+                Message("ATTITUDE", roll=0.1),
+                Message(
+                    "PARAM_VALUE",
+                    param_id="COUNT",
+                    param_value=pixhawk_attitude._mavlink_int_to_param_float(123),
+                    param_type=6,
+                ),
+            ]
+
+        def recv_match(self, **_kwargs):
+            return self.messages.pop(0) if self.messages else None
+
+    unmatched: list[object] = []
+
+    assert pixhawk_attitude._mavlink_recv_param_value(
+        Connection(),
+        "COUNT",
+        timeout_s=0.1,
+        on_unmatched=unmatched.append,
+    ) == 123
+    assert len(unmatched) == 1
+    assert unmatched[0].get_type() == "ATTITUDE"
+
+
+def test_duplicate_raw_mavlink_packet_is_ignored_before_signal_delivery() -> None:
+    from Workstation.workstation_core.pixhawk_attitude import DualPixhawkMavlinkSubscriber
+
+    class Message:
+        roll = 0.1
+        pitch = 0.2
+        yaw = 0.3
+        time_boot_ms = 10
+
+        def get_type(self):
+            return "ATTITUDE"
+
+        def get_msgbuf(self):
+            return b"same-mavlink-packet"
+
+        def get_srcSystem(self):
+            return 1
+
+        def get_srcComponent(self):
+            return 1
+
+        def get_seq(self):
+            return 7
+
+        def get_msgId(self):
+            return 30
+
+    class Connection:
+        def __init__(self):
+            self.messages = [Message(), Message()]
+
+        def recv_match(self, **_kwargs):
+            return self.messages.pop(0) if self.messages else None
+
+    subscriber = DualPixhawkMavlinkSubscriber(left_url="udp:fake", right_url="")
+    subscriber.connections["left"] = Connection()
+    attitudes = []
+    subscriber.extrinsic_changed.connect(lambda _side, state: attitudes.append(state))
+
+    subscriber.spin_once()
+
+    assert len(attitudes) == 1
+
+
 def test_repeated_mavlink_receive_error_is_rate_limited(monkeypatch) -> None:
     from Workstation.workstation_core import pixhawk_attitude
 
@@ -104,8 +186,8 @@ def test_repeated_mavlink_receive_error_is_rate_limited(monkeypatch) -> None:
     now["value"] += 1.0
     subscriber.spin_once()
 
-    assert len(statuses) == 2
-    assert all("serial sentinel" in status for status in statuses)
+    receive_errors = [status for status in statuses if "serial sentinel" in status]
+    assert len(receive_errors) == 2
 
 
 def test_pixhawk_connect_disconnect_operations_do_not_overlap() -> None:
@@ -125,6 +207,227 @@ def test_pixhawk_connect_disconnect_operations_do_not_overlap() -> None:
 
     assert any("연결 해제가 끝난 뒤" in message for message in logs)
     assert any("연결 작업이 끝난 뒤" in message for message in logs)
+
+
+def test_all_rx_stall_does_not_cycle_host_socket_as_remote_recovery(monkeypatch) -> None:
+    from Workstation import device_runtime_controller
+    from Workstation.device_runtime_controller import DeviceRuntimeController
+    from Workstation.workstation_core import pixhawk_attitude
+    from Workstation.workstation_core.pixhawk_attitude import DualPixhawkMavlinkSubscriber
+
+    clock = {"value": 0.0}
+    monkeypatch.setattr(pixhawk_attitude.time, "monotonic", lambda: clock["value"])
+    monkeypatch.setattr(device_runtime_controller.time, "monotonic", lambda: clock["value"])
+    subscriber = DualPixhawkMavlinkSubscriber(
+        left_url="udpin:0.0.0.0:14550",
+        right_url="",
+    )
+    subscriber.connections["left"] = object()
+    model = subscriber._ensure_liveness_listener("left")
+    for message_type in ("HEARTBEAT", "ATTITUDE"):
+        assert model.observe_packet(
+            system_id=1,
+            component_id=1,
+            message_type=message_type,
+            received_at_s=0.0,
+            generation=model.connection_generation,
+        )
+    clock["value"] = 10.0
+
+    logs: list[str] = []
+    labels: list[str] = []
+    refreshed: list[bool] = []
+    panel = SimpleNamespace(
+        mavlink_pixhawk=subscriber,
+        pixhawk_disconnection_thread=None,
+        _session_recording_active=lambda: False,
+        _mavlink_target_sides=lambda _camera: ("left",),
+        _mavlink_open_sides=lambda: {"left"},
+        _px4_mag_camera_label=lambda side: "P1" if side == "left" else "P2",
+        _log=logs.append,
+        pixhawk_connection_label=SimpleNamespace(setText=labels.append),
+        _refresh_mavlink_side_actions=lambda: refreshed.append(True),
+    )
+    controller = DeviceRuntimeController(panel)
+    host_cycles: list[str] = []
+    controller.disconnect_mavlink_pixhawk = lambda *_args, **_kwargs: host_cycles.append("disconnect")
+
+    controller.connect_mavlink_pixhawk("left")
+
+    assert host_cycles == []
+    assert any("host UDP socket 재연결" in message for message in logs)
+    assert labels == ["픽스호크 MAVLink: P1 ETH RX STALLED · RTCM/명령 차단"]
+    assert refreshed == [True]
+
+
+def _verified_usb_recovery_panel(*, now_s: float = 100.0) -> SimpleNamespace:
+    stalled = SimpleNamespace(state=SimpleNamespace(value="ETH MAVLINK RX STALLED"))
+    return SimpleNamespace(
+        _px4_mag_camera_label=lambda side: "P1" if side == "left" else "P2",
+        _session_recording_active=lambda: False,
+        _measurement_run_state="IDLE",
+        _session_save_thread=None,
+        _measurement_package_finalize_requested=False,
+        _session_save_retry_required=False,
+        pixhawk_connection_thread=None,
+        pixhawk_disconnection_thread=None,
+        pixhawk_stream_setup_thread=None,
+        pixhawk_usb_bootstrap_thread=None,
+        pixhawk_persistent_config_thread=None,
+        pixhawk_usb_discovery_thread=None,
+        pixhawk_usb_recovery_thread=None,
+        pixhawk_shell_threads={},
+        pixhawk_parameter_threads={},
+        mavlink_pixhawk=SimpleNamespace(
+            mavlink_health_snapshot=lambda _side: stalled,
+        ),
+        pixhawk_usb_identity_evidence=[
+            {
+                "device": "/dev/serial/by-id/p1",
+                "resolved_device": "/dev/ttyACM0",
+                "baud": 115200,
+                "system_id": 1,
+                "component_id": 1,
+                "observed_monotonic_s": now_s,
+            }
+        ],
+        pixhawk_usb_recovery_status={},
+        _log=lambda _message: None,
+    )
+
+
+def test_verified_usb_recovery_operator_no_sends_no_command(monkeypatch) -> None:
+    from Workstation import device_runtime_controller
+    from Workstation.device_runtime_controller import DeviceRuntimeController
+
+    panel = _verified_usb_recovery_panel()
+    logs: list[str] = []
+    panel._log = logs.append
+    monkeypatch.setattr(device_runtime_controller.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(
+        device_runtime_controller.QtWidgets.QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: device_runtime_controller.QtWidgets.QMessageBox.No,
+    )
+
+    started = DeviceRuntimeController(panel).recover_stalled_pixhawk_via_verified_usb("left")
+
+    assert started is False
+    assert panel.pixhawk_usb_recovery_thread is None
+    assert panel.pixhawk_usb_recovery_status["left"]["state"] == "CANCELLED"
+    assert any("취소" in message for message in logs)
+
+
+@pytest.mark.parametrize("mode", ("duplicate", "stale", "missing"))
+def test_verified_usb_recovery_ambiguous_or_stale_identity_fails_closed(monkeypatch, mode: str) -> None:
+    from Workstation import device_runtime_controller
+    from Workstation.device_runtime_controller import DeviceRuntimeController
+
+    panel = _verified_usb_recovery_panel()
+    if mode == "duplicate":
+        panel.pixhawk_usb_identity_evidence.append(
+            {
+                **panel.pixhawk_usb_identity_evidence[0],
+                "device": "/dev/serial/by-id/p1-duplicate",
+                "resolved_device": "/dev/ttyACM1",
+            }
+        )
+    elif mode == "stale":
+        panel.pixhawk_usb_identity_evidence[0]["observed_monotonic_s"] = 60.0
+    else:
+        panel.pixhawk_usb_identity_evidence = []
+    monkeypatch.setattr(device_runtime_controller.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(
+        device_runtime_controller.QtWidgets.QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: pytest.fail("confirmation must not open without unique fresh identity"),
+    )
+
+    assert DeviceRuntimeController(panel).recover_stalled_pixhawk_via_verified_usb("left") is False
+    assert panel.pixhawk_usb_recovery_status["left"]["state"] == "ERROR"
+    assert panel.pixhawk_usb_recovery_thread is None
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value", "reason"),
+    (
+        ("_measurement_run_state", "RUNNING", "Measurement lifecycle"),
+        ("_session_save_thread", object(), "save/finalization"),
+        ("_measurement_package_finalize_requested", True, "finalization"),
+        ("pixhawk_shell_threads", {"left": object()}, "shell/reboot"),
+    ),
+)
+def test_verified_usb_recovery_lifecycle_guards_fail_before_confirmation(
+    monkeypatch,
+    attribute: str,
+    value: object,
+    reason: str,
+) -> None:
+    from Workstation import device_runtime_controller
+    from Workstation.device_runtime_controller import DeviceRuntimeController
+
+    panel = _verified_usb_recovery_panel()
+    setattr(panel, attribute, value)
+    logs: list[str] = []
+    panel._log = logs.append
+    monkeypatch.setattr(device_runtime_controller.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(
+        device_runtime_controller.QtWidgets.QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: pytest.fail("unsafe lifecycle must fail before confirmation"),
+    )
+
+    assert DeviceRuntimeController(panel).recover_stalled_pixhawk_via_verified_usb("left") is False
+    assert any(reason in message for message in logs)
+
+
+def test_usb_command_sent_is_not_recovery_or_live_evidence() -> None:
+    from Workstation.device_runtime_controller import DeviceRuntimeController
+
+    panel = _verified_usb_recovery_panel()
+    logs: list[str] = []
+    panel._log = logs.append
+    controller = DeviceRuntimeController(panel)
+
+    controller._apply_pixhawk_usb_recovery_result(
+        {
+            "camera": "left",
+            "device": "/dev/serial/by-id/p1",
+            "system_id": 1,
+            "component_id": 1,
+            "command_sent": True,
+        }
+    )
+
+    assert panel.pixhawk_usb_recovery_status["left"]["state"] == "COMMAND_SENT"
+    assert panel.mavlink_pixhawk.mavlink_health_snapshot("left").state.value == "ETH MAVLINK RX STALLED"
+    assert any("command send만으로 LIVE/READY로 처리하지 않습니다" in message for message in logs)
+
+
+def test_stalled_ethernet_connection_is_never_used_for_reboot_command(monkeypatch) -> None:
+    from Workstation import device_runtime_controller
+    from Workstation.device_runtime_controller import DeviceRuntimeController
+
+    logs: list[str] = []
+    panel = SimpleNamespace(
+        mavlink_pixhawk=SimpleNamespace(
+            connections={"left": object()},
+            mavlink_health_snapshot=lambda _side: SimpleNamespace(
+                state=SimpleNamespace(value="ETH MAVLINK RX STALLED"),
+                command_eligible=False,
+            ),
+        ),
+        _log=logs.append,
+    )
+    monkeypatch.setattr(
+        device_runtime_controller.QtWidgets.QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: pytest.fail("stalled Ethernet command must fail before confirmation"),
+    )
+
+    DeviceRuntimeController(panel).reboot_pixhawk_from_mavlink("left")
+
+    assert any("verified-USB recovery" in message for message in logs)
 
 
 def test_alignment_refresh_never_overwrites_the_canonical_rtk_baseline() -> None:
@@ -415,11 +718,12 @@ def test_measurement_gps_cache_drops_previous_receiver_after_source_change() -> 
     assert selected_left is None
 
 
-def test_sasl_can_mag_stream_request_retries_until_dedicated_sample(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_stock_stream_profile_is_exact_and_private_stream_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
     from Workstation.workstation_core import pixhawk_attitude
     from Workstation.workstation_core.pixhawk_attitude import (
         DualPixhawkMavlinkSubscriber,
-        MAVLINK_RM3100_STREAM_REQUESTS,
+        MAVLINK_STOCK_STREAM_CONSUMERS,
+        MAVLINK_STOCK_STREAM_REQUESTS,
     )
 
     clock = [100.0]
@@ -443,38 +747,233 @@ def test_sasl_can_mag_stream_request_retries_until_dedicated_sample(monkeypatch:
     subscriber.connections["left"] = connection
 
     subscriber._request_mavlink_sensor_streams("left")
-    initial_count = len(MAVLINK_RM3100_STREAM_REQUESTS)
+    initial_count = len(MAVLINK_STOCK_STREAM_REQUESTS)
     assert len(mav.calls) == initial_count
-
-    clock[0] += 1.0
-    subscriber._request_mavlink_sensor_streams("left")
-    assert len(mav.calls) == initial_count
-
-    clock[0] += 1.1
-    subscriber._request_mavlink_sensor_streams("left")
-    assert len(mav.calls) == initial_count + 1
-    assert mav.calls[-1][4] == 180
-
-    subscriber._handle_mavlink_message(
-        "left",
-        SimpleNamespace(
-            get_type=lambda: "SASL_CAN_MAG",
-            get_srcSystem=lambda: 1,
-            get_srcComponent=lambda: 1,
-            get_seq=lambda: 7,
-            get_msgId=lambda: 180,
-            xmag=0.1,
-            ymag=0.2,
-            zmag=0.3,
-            can_port=1,
-            device_id=8944899,
-            node_id=125,
-            time_usec=10,
-        ),
+    requested_names = tuple(name for name, _rate in MAVLINK_STOCK_STREAM_REQUESTS)
+    assert requested_names == (
+        "ATTITUDE",
+        "SYS_STATUS",
+        "GPS_RAW_INT",
+        "GPS2_RAW",
+        "GPS_RTK",
+        "GPS2_RTK",
+        "SCALED_IMU",
+        "SCALED_IMU2",
+        "SCALED_IMU3",
+        "DEBUG_VECT",
+        "RAW_IMU",
+        "LOCAL_POSITION_NED",
+        "GLOBAL_POSITION_INT",
+        "VFR_HUD",
+        "BATTERY_STATUS",
     )
-    clock[0] += 3.0
+    assert set(MAVLINK_STOCK_STREAM_CONSUMERS) == set(requested_names)
+    assert all(MAVLINK_STOCK_STREAM_CONSUMERS[name] for name in requested_names)
+    assert "SASL_CAN_MAG" not in requested_names
+    assert 180 not in {int(call[4]) for call in mav.calls}
+
+    clock[0] += 10.0
     subscriber._request_mavlink_sensor_streams("left")
-    assert len(mav.calls) == initial_count + 1
+    assert len(mav.calls) == initial_count
+
+
+def test_all_rx_stall_blocks_initial_and_attitude_stream_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    from Workstation.workstation_core import pixhawk_attitude
+    from Workstation.workstation_core.pixhawk_attitude import DualPixhawkMavlinkSubscriber
+
+    clock = [100.0]
+    monkeypatch.setattr(pixhawk_attitude.time, "monotonic", lambda: clock[0])
+
+    class FakeMav:
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+
+        def command_long_send(self, *args: object) -> None:
+            self.calls.append(args)
+
+    mav = FakeMav()
+    connection = SimpleNamespace(
+        mav=mav,
+        mavlink=SimpleNamespace(MAV_CMD_SET_MESSAGE_INTERVAL=511),
+        target_system=1,
+        target_component=1,
+    )
+    subscriber = DualPixhawkMavlinkSubscriber(
+        left_url="udpin:0.0.0.0:14550",
+        right_url="",
+    )
+    subscriber.connections["left"] = connection
+    model = subscriber._ensure_liveness_listener("left")
+    generation = model.connection_generation
+    assert model.observe_packet(
+        system_id=1,
+        component_id=1,
+        message_type="SYS_STATUS",
+        received_at_s=clock[0],
+        generation=generation,
+    )
+
+    clock[0] += 10.0
+    subscriber._request_mavlink_sensor_streams("left")
+    subscriber._request_stale_attitude_stream("left")
+
+    assert mav.calls == []
+
+
+def test_udpin_exclusive_guard_rejects_an_existing_listener() -> None:
+    import errno
+
+    from Workstation.workstation_core.pixhawk_attitude import (
+        _assert_mavlink_udpin_available,
+    )
+
+    class Probe:
+        def __init__(self, *, fail: bool) -> None:
+            self.fail = fail
+            self.closed = False
+
+        def bind(self, _endpoint) -> None:
+            if self.fail:
+                raise OSError(errno.EADDRINUSE, "already bound")
+
+        def close(self) -> None:
+            self.closed = True
+
+    blocked = Probe(fail=True)
+    with pytest.raises(RuntimeError, match="already in use"):
+        _assert_mavlink_udpin_available(
+            "udpin:127.0.0.1:14550",
+            socket_factory=lambda *_args: blocked,
+        )
+    assert blocked.closed is True
+
+    available = Probe(fail=False)
+    _assert_mavlink_udpin_available(
+        "udpin:127.0.0.1:14550",
+        socket_factory=lambda *_args: available,
+    )
+    assert available.closed is True
+
+
+def test_udpin_connection_disables_reuse_after_pymavlink_bind() -> None:
+    import socket
+
+    from Workstation.workstation_core.pixhawk_attitude import (
+        _disable_mavlink_udpin_reuse,
+    )
+
+    calls: list[tuple[int, int, int]] = []
+    connection = SimpleNamespace(
+        port=SimpleNamespace(
+            setsockopt=lambda level, option, value: calls.append(
+                (int(level), int(option), int(value))
+            )
+        )
+    )
+
+    _disable_mavlink_udpin_reuse(connection, "udpin:0.0.0.0:14550")
+
+    assert calls == [(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)]
+
+
+def test_subscriber_start_guards_and_hardens_udpin_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pymavlink import mavutil
+
+    from Workstation.workstation_core import pixhawk_attitude
+    from Workstation.workstation_core.pixhawk_attitude import (
+        DualPixhawkMavlinkSubscriber,
+    )
+
+    calls: list[tuple[str, str]] = []
+
+    class Connection:
+        def close(self) -> None:
+            calls.append(("close", "left"))
+
+    connection = Connection()
+    monkeypatch.setattr(
+        pixhawk_attitude,
+        "_assert_mavlink_udpin_available",
+        lambda url: calls.append(("guard", url)),
+    )
+    monkeypatch.setattr(
+        pixhawk_attitude,
+        "_disable_mavlink_udpin_reuse",
+        lambda actual, url: calls.append(("harden", url))
+        if actual is connection
+        else None,
+    )
+    monkeypatch.setattr(
+        mavutil,
+        "mavlink_connection",
+        lambda *_args, **_kwargs: connection,
+    )
+    subscriber = DualPixhawkMavlinkSubscriber(
+        left_url="udpin:0.0.0.0:14550",
+        right_url="",
+    )
+
+    subscriber.start("left", start_timer=False)
+
+    assert calls[:2] == [
+        ("guard", "udpin:0.0.0.0:14550"),
+        ("harden", "udpin:0.0.0.0:14550"),
+    ]
+    subscriber.stop("left")
+
+
+def test_attitude_stream_is_re_requested_when_heartbeat_survives_a_stall(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from Workstation.workstation_core import pixhawk_attitude
+    from Workstation.workstation_core.pixhawk_attitude import (
+        DualPixhawkMavlinkSubscriber,
+    )
+
+    clock = [100.0]
+    monkeypatch.setattr(pixhawk_attitude.time, "monotonic", lambda: clock[0])
+
+    class FakeMav:
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+
+        def command_long_send(self, *args: object) -> None:
+            self.calls.append(args)
+
+    mav = FakeMav()
+    connection = SimpleNamespace(
+        mav=mav,
+        mavlink=SimpleNamespace(MAV_CMD_SET_MESSAGE_INTERVAL=511),
+        target_system=1,
+        target_component=1,
+    )
+    subscriber = DualPixhawkMavlinkSubscriber(left_url="", right_url="")
+    subscriber.connections["left"] = connection
+    heartbeat = SimpleNamespace(get_type=lambda: "HEARTBEAT")
+    attitude = SimpleNamespace(
+        get_type=lambda: "ATTITUDE",
+        roll=0.0,
+        pitch=0.0,
+        yaw=0.0,
+    )
+
+    subscriber._handle_mavlink_message("left", heartbeat)
+    subscriber._handle_mavlink_message("left", attitude)
+    mav.calls.clear()
+
+    clock[0] += 3.0
+    subscriber._handle_mavlink_message("left", heartbeat)
+
+    assert any(call[4] == pixhawk_attitude.MAVLINK_MESSAGE_IDS["ATTITUDE"] for call in mav.calls)
+
+    subscriber._handle_mavlink_message("left", attitude)
+    mav.calls.clear()
+    clock[0] += 1.0
+    subscriber._handle_mavlink_message("left", heartbeat)
+
+    assert not any(call[4] == pixhawk_attitude.MAVLINK_MESSAGE_IDS["ATTITUDE"] for call in mav.calls)
 
 def test_recording_protocol_includes_fix_alignment_and_final_sync_gates() -> None:
     from Workstation.protocol import evaluate_recording_protocol
@@ -663,6 +1162,89 @@ def test_base_gnss_workspace_projects_survey_in_and_ntrip_without_relabeling_fra
     assert not workspace.ntrip_group.isHidden()
     workspace.deleteLater()
     app.processEvents()
+
+def test_base_gnss_workspace_shows_gga_transmission_status() -> None:
+    """A VRS caster withholds RTCM without periodic GGA while the transport
+    itself keeps reporting "connected" -- the GGA transmission row is the
+    only place that stuck-but-connected state becomes visible.
+    """
+
+    from Workstation.workspaces import BaseGnssWorkspace
+    from Workstation.workstation_core.gnss_operation import (
+        CorrectionSourceIdentity,
+        GnssOperationConfig,
+        GnssOperationManager,
+        GnssOperationMode,
+    )
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    manager = GnssOperationManager(GnssOperationConfig())
+    manager.configure(GnssOperationConfig(operation_mode=GnssOperationMode.NETWORK_RTK_DIRECT))
+    manager.set_source_identity(
+        CorrectionSourceIdentity(
+            source_kind="NTRIP",
+            caster_host="RTS2.ngii.go.kr",
+            caster_port=2101,
+            mountpoint="VRS-RTCM32",
+        )
+    )
+    now_s = time.monotonic()
+    panel = SimpleNamespace(
+        gnss_operation_manager=manager,
+        gnss_base_serial_connected=False,
+        gnss_base_detect_thread=None,
+        workstation_gnss_base_discovery_status="NOT RUN",
+        _gnss_base_candidate_rows=[],
+        gnss_network_connected=True,
+        gnss_network_thread=object(),
+        gnss_network_status_line="ICY 200 OK",
+        gnss_network_stats=SimpleNamespace(
+            connected_at_monotonic_s=now_s - 20.0,
+            last_chunk_monotonic_s=now_s - 0.5,
+            last_gga_monotonic_s=None,
+            gga_sent_count=0,
+            bytes_received=1000,
+            chunks_received=5,
+        ),
+        latest_gnss_base_survey_in={},
+        gnss_base_survey_samples=(),
+        gnss_coordinate_samples=(),
+        gnss_fixed_base_profile=None,
+        gnss_fixed_base_reconfigure_ack=False,
+        gnss_fixed_base_reconfigure_readback=False,
+        gnss_fixed_base_reconfigure_rtcm=False,
+        gnss_base_rtcm_stats={},
+        _gnss_last_gga_skip_reason=(
+            "[GNSS][NTRIP] GGA skipped: no left/right GNSS position available "
+            "(policy=system_center, left=no message received, right=no message received)"
+        ),
+        _gnss_last_gga_skip_monotonic_s=now_s - 2.0,
+    )
+    backend = SimpleNamespace(panel=panel, gnss_base_apply_candidate=lambda row: None)
+    workspace = BaseGnssWorkspace(backend, lambda _command: True)
+    workspace.refresh({})
+
+    gga_text = workspace.ntrip_values["gga_transmission"].value.text()
+    assert "차단" in gga_text
+    assert "no left/right GNSS position available" in gga_text
+    assert "[GNSS][NTRIP] GGA skipped:" not in gga_text
+    assert "INVALID" in workspace.ntrip_values["gga_transmission"].meta.text()
+
+    # A rover fix arrives and GGA starts flowing again -- the skip reason
+    # clears and the row reports normal transmission instead of a block.
+    panel._gnss_last_gga_skip_reason = ""
+    panel._gnss_last_gga_skip_monotonic_s = None
+    panel.gnss_network_stats.last_gga_monotonic_s = now_s - 1.0
+    panel.gnss_network_stats.gga_sent_count = 1
+    workspace.refresh({})
+
+    gga_text = workspace.ntrip_values["gga_transmission"].value.text()
+    assert "전송 중" in gga_text
+    assert "VALID" in workspace.ntrip_values["gga_transmission"].meta.text()
+
+    workspace.deleteLater()
+    app.processEvents()
+
 
 def test_base_gnss_workspace_shows_non_gating_rts2_checklist() -> None:
     from Workstation.workspaces import BaseGnssWorkspace
@@ -1197,7 +1779,169 @@ def test_pixhawk_usb_discovery_worker_keeps_serial_probe_off_ui_path(monkeypatch
     worker.discovered.connect(results.append)
     worker.run()
 
-    assert results == [{"candidates": ["/dev/ttyACM0"], "found": [("/dev/ttyACM0", 115200)]}]
+    assert results == [
+        {
+            "candidates": ["/dev/ttyACM0"],
+            "found": [
+                {
+                    "device": "/dev/ttyACM0",
+                    "resolved_device": "/dev/ttyACM0",
+                    "baud": 115200,
+                    "system_id": None,
+                    "component_id": None,
+                    "observed_monotonic_s": None,
+                }
+            ],
+        }
+    ]
+
+
+def test_usb_probe_preserves_heartbeat_system_component_and_observation_time(monkeypatch) -> None:
+    from pymavlink import mavutil
+
+    from Workstation.workstation_core import pixhawk_attitude
+
+    captured: dict[str, object] = {}
+
+    class Heartbeat:
+        def get_srcSystem(self):
+            return 1
+
+        def get_srcComponent(self):
+            return 42
+
+    class Connection:
+        def __init__(self) -> None:
+            self.mav = SimpleNamespace(heartbeat_send=lambda *args: captured.setdefault("heartbeat", args))
+            self.closed = False
+
+        def wait_heartbeat(self, *, timeout):
+            captured["timeout"] = timeout
+            return Heartbeat()
+
+        def close(self):
+            self.closed = True
+
+    connection = Connection()
+
+    def factory(device, **kwargs):
+        captured["device"] = device
+        captured.update(kwargs)
+        return connection
+
+    monkeypatch.setattr(mavutil, "mavlink_connection", factory)
+    monkeypatch.setattr(pixhawk_attitude.time, "monotonic", lambda: 123.5)
+
+    found = pixhawk_attitude.probe_usb_mavlink_devices(
+        ["/dev/ttyACM0"],
+        baudrates=(115200,),
+        timeout_s=0.8,
+    )
+
+    assert len(found) == 1
+    identity = found[0]
+    assert identity.device == "/dev/ttyACM0"
+    assert identity.baud == 115200
+    assert identity.system_id == 1
+    assert identity.component_id == 42
+    assert identity.observed_monotonic_s == 123.5
+    assert captured["source_system"] == 255
+    assert captured["source_component"] == 190
+    assert connection.closed
+
+
+def test_verified_usb_recovery_worker_revalidates_identity_before_one_shot_reboot(monkeypatch) -> None:
+    from pymavlink import mavutil
+
+    from Workstation import device_runtime_workers
+
+    commands: list[tuple[object, ...]] = []
+
+    class Heartbeat:
+        def get_srcSystem(self):
+            return 1
+
+        def get_srcComponent(self):
+            return 1
+
+    class Connection:
+        def __init__(self) -> None:
+            self.mav = SimpleNamespace(
+                heartbeat_send=lambda *_args: None,
+                command_long_send=lambda *args: commands.append(args),
+            )
+            self.closed = False
+
+        def wait_heartbeat(self, *, timeout):
+            assert timeout == 1.5
+            return Heartbeat()
+
+        def close(self):
+            self.closed = True
+
+    connection = Connection()
+    monkeypatch.setattr(mavutil, "mavlink_connection", lambda *_args, **_kwargs: connection)
+    results: list[dict[str, object]] = []
+    failures: list[str] = []
+    worker = device_runtime_workers.PixhawkUsbRecoveryWorker(
+        camera="left",
+        evidence={"device": "/dev/ttyACM0", "baud": 115200, "component_id": 1},
+        expected_system_id=1,
+    )
+    worker.completed.connect(results.append)
+    worker.failed.connect(failures.append)
+
+    worker.run()
+
+    assert failures == []
+    assert results[0]["command_sent"] is True
+    assert commands == [
+        (
+            1,
+            1,
+            mavutil.mavlink.MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    ]
+    assert connection.closed
+
+
+def test_verified_usb_recovery_worker_wrong_sysid_fails_without_reboot(monkeypatch) -> None:
+    from pymavlink import mavutil
+
+    from Workstation import device_runtime_workers
+
+    commands: list[tuple[object, ...]] = []
+    heartbeat = SimpleNamespace(get_srcSystem=lambda: 2, get_srcComponent=lambda: 1)
+    connection = SimpleNamespace(
+        mav=SimpleNamespace(
+            heartbeat_send=lambda *_args: None,
+            command_long_send=lambda *args: commands.append(args),
+        ),
+        wait_heartbeat=lambda **_kwargs: heartbeat,
+        close=lambda: None,
+    )
+    monkeypatch.setattr(mavutil, "mavlink_connection", lambda *_args, **_kwargs: connection)
+    failures: list[str] = []
+    worker = device_runtime_workers.PixhawkUsbRecoveryWorker(
+        camera="left",
+        evidence={"device": "/dev/ttyACM0", "baud": 115200, "component_id": 1},
+        expected_system_id=1,
+    )
+    worker.failed.connect(failures.append)
+
+    worker.run()
+
+    assert commands == []
+    assert len(failures) == 1
+    assert "expected 1, got 2" in failures[0]
 
 def test_pixhawk_host_ip_discovery_worker_keeps_interface_scan_off_ui_path(monkeypatch) -> None:
     from Workstation import standalone_gui
@@ -1552,13 +2296,19 @@ def test_pixhawk_connection_cards_keep_fixed_width_when_px4_timestamp_changes() 
     assert right.minimumWidth() == PIXHAWK_CONNECTION_INDICATOR_WIDTH_PX
     assert right.maximumWidth() == PIXHAWK_CONNECTION_INDICATOR_WIDTH_PX
 
-    def set_detail(timestamp: str) -> None:
+    def set_detail(timestamp: str, *, state: str = "LIVE") -> None:
         left.set_status(
             RuntimeStatus(
                 key="pixhawk.left",
                 label="P1",
-                state="LIVE",
-                severity=StatusSeverity.OK,
+                state=state,
+                severity=(
+                    StatusSeverity.BAD
+                    if state == "ETH MAVLINK RX STALLED"
+                    else StatusSeverity.WARN
+                    if state != "LIVE"
+                    else StatusSeverity.OK
+                ),
                 detail=f"MAVLink attitude age 0.10 s; rpy=1.00/2.00/3.00 deg; PX4 t={timestamp}",
             )
         )
@@ -1566,10 +2316,18 @@ def test_pixhawk_connection_cards_keep_fixed_width_when_px4_timestamp_changes() 
 
     set_detail("9.99")
     first_geometry = (left.width(), right.width(), right.x())
-    set_detail("1234567.890123")
-    second_geometry = (left.width(), right.width(), right.x())
+    geometries = []
+    for state in (
+        "QUALIFYING",
+        "LIVE",
+        "ATTITUDE STALE",
+        "ETH MAVLINK RX STALLED",
+        "RECOVERING",
+    ):
+        set_detail("1234567.890123", state=state)
+        geometries.append((left.width(), right.width(), right.x()))
 
-    assert first_geometry == second_geometry
+    assert all(geometry == first_geometry for geometry in geometries)
     assert first_geometry[:2] == (
         PIXHAWK_CONNECTION_INDICATOR_WIDTH_PX,
         PIXHAWK_CONNECTION_INDICATOR_WIDTH_PX,
@@ -2226,7 +2984,9 @@ def test_diagnostics_gnss_tab_surfaces_the_registered_ntrip_status() -> None:
     assert "GGA sent=3" in text
     assert "caster=RTS1.ngii.go.kr/RTK-RTCM32" in text
 
-def test_pixhawk_eth_mav_recovery_is_visible_and_routes_to_usb_owner() -> None:
+def test_pixhawk_verified_usb_recovery_is_visible_and_stall_gated() -> None:
+    from Workstation.status_model import RuntimeStatus
+
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     backend = _FakeBackend()
     window = WorkstationMainWindow(backend=backend)
@@ -2258,8 +3018,8 @@ def test_pixhawk_eth_mav_recovery_is_visible_and_routes_to_usb_owner() -> None:
         "Find network",
         "Find host IP",
     ]
-    assert window.pixhawk.operation_buttons["pixhawk.recover_eth_mavlink.p1"].text() == "P1 ETH MAV"
-    assert window.pixhawk.operation_buttons["pixhawk.recover_eth_mavlink.p2"].text() == "P2 ETH MAV"
+    assert window.pixhawk.operation_buttons["pixhawk.recover_eth_mavlink.p1"].text() == "P1 verified-USB reboot"
+    assert window.pixhawk.operation_buttons["pixhawk.recover_eth_mavlink.p2"].text() == "P2 verified-USB reboot"
     assert window.pixhawk.receiver_model.rowCount() == 4
     assert window.pixhawk.gnss_source_combos["left"].currentData() == "GPS1"
     assert window.pixhawk.gnss_source_combos["right"].currentData() == "GPS1"
@@ -2267,15 +3027,35 @@ def test_pixhawk_eth_mav_recovery_is_visible_and_routes_to_usb_owner() -> None:
     assert window.pixhawk.recovery_values["left"]["usb"].value.text() == "/dev/ttyACM0"
     assert window.pixhawk.recovery_values["right"]["baud"].value.text() == "115200"
 
-    backend.panel.pixhawk_usb_bootstrap_status["left"] = {
-        "state": "RECOVERED",
-        "detail": "단일 Ethernet MAVLink 설정·재부팅 완료; UDP telemetry 확인 중",
+    backend.panel.pixhawk_usb_recovery_status = {
+        "left": {
+        "state": "COMMAND_SENT",
+        "detail": "USB reboot command sent; Ethernet telemetry 확인 중",
         "updated_s": 10.0,
+        }
     }
+    backend.panel.pixhawk_usb_identity_evidence = [
+        {
+            "device": "/dev/ttyACM0",
+            "baud": 115200,
+            "system_id": 1,
+            "component_id": 1,
+            "observed_monotonic_s": 10.0,
+        }
+    ]
     window.pixhawk.refresh(window.status_adapter.model.snapshot())
-    assert window.pixhawk.recovery_values["left"]["recovery"].value.text() == "RECOVERED"
+    assert window.pixhawk.recovery_values["left"]["recovery"].value.text() == "COMMAND_SENT"
     assert "HB NO LINK" in window.pixhawk.recovery_values["left"]["telemetry"].value.text()
 
+    assert window.commands.action("pixhawk.recover_eth_mavlink.p1").isEnabled() is False
+    snapshot = window.status_adapter.model.snapshot()
+    snapshot["pixhawk.left"] = RuntimeStatus(
+        key="pixhawk.left",
+        label="P1",
+        state="ETH MAVLINK RX STALLED",
+        severity=StatusSeverity.BAD,
+    )
+    window._refresh_from_status(snapshot)
     assert window.commands.invoke("pixhawk.recover_eth_mavlink.p1") is True
     assert backend.calls[-1] == ("pixhawk_recover_eth_mavlink", "left")
 
@@ -2292,14 +3072,31 @@ def test_pixhawk_recovery_evidence_separates_usb_control_and_attitude() -> None:
     panel = SimpleNamespace(
         left_pixhawk_bootstrap_url_edit=QtWidgets.QLineEdit("/dev/ttyACM0"),
         left_pixhawk_bootstrap_baud_spin=left_baud,
-        pixhawk_usb_bootstrap_thread=None,
-        pixhawk_usb_bootstrap_status={
-            "left": {"state": "RECOVERED", "detail": "stream started", "updated_s": 99.0}
+        pixhawk_usb_recovery_thread=None,
+        pixhawk_usb_recovery_status={
+            "left": {"state": "COMMAND_SENT", "detail": "reboot command sent", "updated_s": 99.0}
         },
+        pixhawk_usb_identity_evidence=[
+            {
+                "device": "/dev/serial/by-id/p1",
+                "resolved_device": "/dev/ttyACM0",
+                "baud": 115200,
+                "system_id": 1,
+                "component_id": 1,
+                "observed_monotonic_s": 99.0,
+            }
+        ],
         mavlink_pixhawk=SimpleNamespace(
             urls={"left": "udpin:0.0.0.0:14550"},
             connections={"left": object()},
             _heartbeat_logged={"left"},
+            mavlink_health_snapshot=lambda _side, **_kwargs: SimpleNamespace(
+                state=SimpleNamespace(value="LIVE"),
+                listener_open=True,
+                heartbeat_rx_age_s=0.1,
+                attitude_rx_age_s=0.1,
+                qualification_elapsed_s=600.0,
+            ),
         ),
         latest_extrinsics={
             "left": SimpleNamespace(
@@ -2314,13 +3111,14 @@ def test_pixhawk_recovery_evidence_separates_usb_control_and_attitude() -> None:
 
     recovery = EvidenceAdapter(panel).pixhawk_recovery("left", now_s=100.0)
 
-    assert recovery["usb_url"] == "/dev/ttyACM0"
+    assert recovery["usb_url"] == "/dev/serial/by-id/p1"
     assert recovery["usb_baud"] == 115_200
     assert recovery["state"] == "RECOVERED"
     assert recovery["heartbeat_state"] == "OK"
     assert recovery["attitude_state"] == "OK"
     assert recovery["mavlink_endpoint"] == "udpin:0.0.0.0:14550"
-    assert "PX4 Ethernet MAVLink" in str(recovery["contract"])
+    assert recovery["usb_system_id"] == 1
+    assert "10-minute qualification" in str(recovery["contract"])
 
     left_baud.deleteLater()
     panel.left_pixhawk_bootstrap_url_edit.deleteLater()

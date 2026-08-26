@@ -23,10 +23,26 @@ def test_optical_pose_has_no_editable_candidate_dof_controls() -> None:
     assert not hasattr(pane, "dof_checkboxes")
     assert not hasattr(pane, "dof_payload")
     assert pane.apply_button.text() == "Apply candidate"
+    assert pane.reset_button.text() == "Reset Alignment"
     assert "NO FROZEN BURST" in pane.frozen_preview_labels["left"].text()
     assert "NO FROZEN BURST" in pane.frozen_preview_labels["right"].text()
     assert pane.apply_payload() is None
 
+    pane.deleteLater()
+    app.processEvents()
+
+
+def test_alignment_reset_is_an_explicit_owner_command() -> None:
+    app = _app()
+    pane = OpticalPosePane()
+    captured: list[tuple[str, object]] = []
+    pane.command_requested.connect(
+        lambda command_id, payload: captured.append((command_id, payload))
+    )
+
+    pane.reset_button.click()
+
+    assert captured == [("alignment.pose.reset", {})]
     pane.deleteLater()
     app.processEvents()
 
@@ -699,6 +715,61 @@ def test_multiview_capture_clears_a_target_pair_after_it_was_accumulated() -> No
     app.processEvents()
 
 
+def test_multiview_capture_preserves_target_pair_when_sample_is_blocked() -> None:
+    app = _app()
+    pane = OpticalPosePane()
+    first = QtGui.QImage(640, 480, QtGui.QImage.Format_RGB888)
+    second = QtGui.QImage(640, 480, QtGui.QImage.Format_RGB888)
+    first.fill(QtGui.QColor("#333333"))
+    second.fill(QtGui.QColor("#444444"))
+
+    def frames(image: QtGui.QImage, suffix: str) -> dict[str, object]:
+        return {
+            side: {
+                "image": image,
+                "frame_id": f"{suffix}-{side}",
+                "sha256": (("a" if side == "left" else "b") + suffix) * 16,
+                "width": 640,
+                "height": 480,
+                "overlay_applied": False,
+            }
+            for side in ("left", "right")
+        }
+
+    pane.apply_snapshot({"frozen_frames": frames(first, "burst-1")})
+    pane.annotation_mode_combo.setCurrentIndex(pane.annotation_mode_combo.findData("target"))
+    pane.annotation_views["left"].add_source_point((100.0, 120.0), mode="target")
+    pane.annotation_views["right"].add_source_point((200.0, 220.0), mode="target")
+    pane.apply_snapshot(
+        {
+            "drone_rtk_multiview_samples": [
+                {
+                    "sample_id": "sample-blocked",
+                    "burst_id": "burst-1",
+                    "state": "BLOCKED",
+                    "annotations": {
+                        side: {"frame_id": f"burst-1-{side}"}
+                        for side in ("left", "right")
+                    },
+                }
+            ],
+            "frozen_frames": frames(second, "burst-2"),
+        }
+    )
+
+    assert pane.annotation_views["left"].annotation_points("target") == (
+        SourcePixel(100.0, 120.0),
+    )
+    assert pane.annotation_views["right"].annotation_points("target") == (
+        SourcePixel(200.0, 220.0),
+    )
+    assert pane.annotation_payloads()["left"].frame_id == "burst-1-left"
+    assert pane.annotation_payloads()["right"].frame_id == "burst-1-right"
+
+    pane.deleteLater()
+    app.processEvents()
+
+
 def test_optical_pose_frozen_reference_columns_are_real_16_9_viewports() -> None:
     app = _app()
     pane = OpticalPosePane()
@@ -980,6 +1051,46 @@ def test_drone_rtk_multiview_sample_projects_target_and_readiness_state() -> Non
     assert "READY/total=1/1" in pane.method_information_labels["Drone Multi-view"].text()
     payload = pane.command_payload("alignment.pose.solve_drone_rtk_multiview")
     assert payload["multiview_source"] == "accumulated_frozen_targets"
+
+    pane.deleteLater()
+    app.processEvents()
+
+
+def test_blocked_multiview_sample_does_not_mark_its_frame_collected() -> None:
+    app = _app()
+    pane = OpticalPosePane()
+    observation = _drone_rtk_observation(
+        "obs-002",
+        sequence=0,
+        state="EVIDENCE_READY",
+        drone=_drone_rtk_gnss_row(role="drone", latitude_deg=37.1, longitude_deg=127.1),
+        left=_drone_rtk_gnss_row(role="left", latitude_deg=37.2, longitude_deg=127.2),
+        right=_drone_rtk_gnss_row(role="right", latitude_deg=37.3, longitude_deg=127.3),
+        sync_left_s=0.008,
+        sync_right_s=0.004,
+        left_frame_timestamp_s=100.0,
+        right_frame_timestamp_s=100.004,
+    )
+    sample = {
+        "sample_id": "sample-002",
+        "capture_observation_id": "obs-002",
+        "burst_id": observation["burst_id"],
+        "state": "BLOCKED",
+        "annotations": {
+            "left": {"frame_id": observation["frames"]["left"]["frame_id"]},
+            "right": {"frame_id": observation["frames"]["right"]["frame_id"]},
+        },
+    }
+
+    pane.apply_snapshot(
+        {
+            "drone_rtk_multiview_samples": [sample],
+            "drone_rtk_capture_observations": [observation],
+        }
+    )
+
+    assert pane._drone_rtk_multiview_collected_frame_ids["left"] == set()
+    assert pane._drone_rtk_multiview_collected_frame_ids["right"] == set()
 
     pane.deleteLater()
     app.processEvents()

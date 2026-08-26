@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import multiprocessing
+
+import pytest
 from PyQt5 import QtGui, QtWidgets
 
 from Workstation.workstation_core.camera_pane import CameraPane
+from Workstation.workstation_core.native_frame_ring import SharedNativeFrameRing
+from Workstation.workstation_core.stereo import DetectionObservation
 
 
 def _image(red: int) -> QtGui.QImage:
@@ -63,6 +68,31 @@ def test_hidden_camera_pane_retains_and_publishes_frame_without_pixmap_render() 
     assert pane.current_image() is not None
     assert pane.image_label.pixmap() is None or pane.image_label.pixmap().isNull()
     pane.deleteLater()
+
+
+def test_camera_preview_preserves_full_source_aspect_without_center_crop() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    pane = CameraPane("left")
+    pane.show()
+    app.processEvents()
+    pane.image_label.resize(200, 200)
+    source = QtGui.QImage(160, 90, QtGui.QImage.Format_RGB888)
+    source.fill(QtGui.QColor("blue"))
+
+    pane._show_frame(source, {"sequence": 1})
+
+    pixmap = pane.image_label.pixmap()
+    assert pixmap is not None and not pixmap.isNull()
+    assert pixmap.width() <= pane.image_label.width()
+    assert pixmap.height() <= pane.image_label.height()
+    assert pixmap.width() / pixmap.height() == pytest.approx(16.0 / 9.0, rel=0.02)
+    assert (pixmap.width(), pixmap.height()) != (
+        pane.image_label.width(),
+        pane.image_label.height(),
+    )
+    pane.close()
+    pane.deleteLater()
+
 
 def test_preview_inbox_rejects_old_stream_generation() -> None:
     _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -147,4 +177,85 @@ def test_detection_metadata_carries_the_owning_stream_generation() -> None:
 
     assert len(delivered) == 1
     assert delivered[0].timestamp_metadata["stream_generation"] == 11
+    pane.deleteLater()
+
+
+def test_exact_frame_key_reads_native_ring_and_never_substitutes_overwritten_frame() -> None:
+    _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    pane = CameraPane("left")
+    pane.stream_generation = 5
+    ring = SharedNativeFrameRing.create(
+        camera_id="left",
+        stream_generation=5,
+        capacity=1,
+        max_width=2,
+        max_height=1,
+        channels=3,
+        mp_context=multiprocessing.get_context("spawn"),
+    )
+    pane.native_frame_ring = ring
+    try:
+        first = ring.publish_bytes(
+            bytes([255, 0, 0, 255, 0, 0]),
+            width=2,
+            height=1,
+            channels=3,
+            timestamp_s=1.0,
+        )
+        first_metadata = first.to_mapping()
+        pane._remember_native_descriptor(first_metadata)
+        detection = DetectionObservation.from_payload(
+            "left",
+            {
+                "timestamp_s": 1.0,
+                "width": 2,
+                "height": 1,
+                "best_detection": {
+                    "x1": 0.0,
+                    "y1": 0.0,
+                    "x2": 1.0,
+                    "y2": 1.0,
+                    "confidence": 0.9,
+                    "class_id": 0,
+                    "class_name": "target",
+                },
+                "detections": [],
+                "timestamp_metadata": first_metadata,
+            },
+        )
+        resolved = pane.native_frame_for_detection(detection)
+        assert resolved is not None
+        image, metadata = resolved
+        assert image.pixelColor(0, 0) == QtGui.QColor("blue")
+        assert metadata["frame_key"] == "left:5:1"
+
+        ring.publish_bytes(
+            bytes([0, 0, 255, 0, 0, 255]),
+            width=2,
+            height=1,
+            channels=3,
+            timestamp_s=1.0001,
+        )
+        assert pane.native_frame_for_detection(detection) is None
+    finally:
+        pane.native_frame_ring = None
+        ring.close()
+        ring.unlink()
+        pane.deleteLater()
+
+
+def test_gui_heartbeat_records_a_two_second_event_loop_stall(monkeypatch) -> None:
+    from Workstation.workstation_core import camera_pane
+
+    _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    pane = CameraPane("left")
+    pane._gui_heartbeat_last_s = 10.0
+    monkeypatch.setattr(camera_pane.time, "monotonic", lambda: 12.25)
+
+    pane._record_gui_heartbeat()
+    snapshot = pane.backpressure_snapshot()
+
+    assert snapshot["gui_heartbeat_max_delay_s"] == pytest.approx(2.0)
+    assert snapshot["gui_heartbeat_count"] == 1
+    assert snapshot["workstation_rss_bytes"] > 0
     pane.deleteLater()

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import errno
 import glob
+import io
 import math
 import os
-import io
 import re
+import socket
 import struct
 import threading
 import time
@@ -14,6 +16,15 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
+from Workstation.workstation_core.error_throttle import (
+    DEFAULT_ERROR_LOG_THROTTLE_S,
+    should_emit_throttled_error,
+)
+from Workstation.workstation_core.mavlink_liveness import (
+    MavlinkLivenessState,
+    MavlinkSideHealthSnapshot,
+    MavlinkSideLiveness,
+)
 from Workstation.workstation_core.px4_mag_manager import (
     BOARD_INTERNAL_MAG_ID,
     GPS1_MAG_ID,
@@ -313,7 +324,7 @@ MAVLINK_MAG_SLOT_BY_MESSAGE = {
     message_name: sensor_slot
     for sensor_slot, _imu_label, message_name in MAVLINK_MAG_STREAMS
 }
-MAVLINK_RM3100_STREAM_REQUESTS = (
+MAVLINK_STOCK_STREAM_REQUESTS = (
     ("ATTITUDE", 30.0),
     ("SYS_STATUS", 1.0),
     ("GPS_RAW_INT", 5.0),
@@ -324,18 +335,104 @@ MAVLINK_RM3100_STREAM_REQUESTS = (
     ("SCALED_IMU2", 20.0),
     ("SCALED_IMU3", 20.0),
     ("DEBUG_VECT", 20.0),
-    ("SASL_CAN_MAG", 20.0),
     ("RAW_IMU", 20.0),
     ("LOCAL_POSITION_NED", 10.0),
     ("GLOBAL_POSITION_INT", 10.0),
     ("VFR_HUD", 5.0),
     ("BATTERY_STATUS", 2.0),
 )
+MAVLINK_STOCK_STREAM_CONSUMERS = {
+    "ATTITUDE": ("extrinsic/status/measurement",),
+    "SYS_STATUS": ("optional timeline", "battery evidence"),
+    "GPS_RAW_INT": ("GNSS position/source selection/measurement",),
+    "GPS2_RAW": ("GNSS position/source selection/measurement",),
+    "GPS_RTK": ("GNSS relative baseline",),
+    "GPS2_RTK": ("GNSS relative baseline",),
+    "SCALED_IMU": ("mag sensor presentation/evidence",),
+    "SCALED_IMU2": ("mag sensor presentation/evidence",),
+    "SCALED_IMU3": ("mag sensor presentation/evidence",),
+    "DEBUG_VECT": ("CAN-mag compatibility presentation/evidence",),
+    "RAW_IMU": ("optional timeline/session evidence",),
+    "LOCAL_POSITION_NED": ("optional timeline/session evidence",),
+    "GLOBAL_POSITION_INT": ("optional timeline/session evidence",),
+    "VFR_HUD": ("optional timeline/session evidence",),
+    "BATTERY_STATUS": ("optional timeline/battery evidence",),
+}
+# Compatibility name for existing callers; the default is now explicitly the
+# Stock profile and contains no private SASL_CAN_MAG request.
+MAVLINK_RM3100_STREAM_REQUESTS = MAVLINK_STOCK_STREAM_REQUESTS
 MAVLINK_MAX_MESSAGES_PER_TICK = 256
 MAVLINK_MAX_PROCESS_TIME_S = 0.020
-MAVLINK_RECEIVE_ERROR_INTERVAL_S = 1.0
+MAVLINK_RECEIVE_ERROR_INTERVAL_S = DEFAULT_ERROR_LOG_THROTTLE_S
 MAVLINK_STREAM_REQUEST_MAX_ATTEMPTS = 3
 MAVLINK_STREAM_REQUEST_RETRY_S = 2.0
+MAVLINK_DUPLICATE_TTL_S = 0.250
+MAVLINK_DUPLICATE_CACHE_SIZE = 512
+MAVLINK_ATTITUDE_STALE_S = 2.0
+MAVLINK_ATTITUDE_RECOVERY_COOLDOWN_S = 10.0
+MAVLINK_GCS_SOURCE_SYSTEM = 255
+MAVLINK_GCS_SOURCE_COMPONENT = 190
+MAVLINK_GCS_HEARTBEAT_INTERVAL_S = 1.0
+MAVLINK_EXPECTED_SYSTEM_IDS = {"left": 1, "right": 2}
+
+
+def _mavlink_udpin_endpoint(url: str) -> tuple[str, int] | None:
+    """Return the IPv4 bind endpoint for a pymavlink ``udpin`` URL."""
+
+    text = str(url).strip()
+    if not text.lower().startswith("udpin:"):
+        return None
+    address = text[6:]
+    try:
+        host, port_text = address.rsplit(":", 1)
+        port = int(port_text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid MAVLink udpin URL: {url!r}") from exc
+    if not host or port <= 0 or port > 65535:
+        raise ValueError(f"Invalid MAVLink udpin URL: {url!r}")
+    return host, port
+
+
+def _assert_mavlink_udpin_available(
+    url: str,
+    *,
+    socket_factory: Callable[..., Any] = socket.socket,
+) -> None:
+    """Fail before pymavlink silently shares an existing UDP input port.
+
+    pymavlink enables ``SO_REUSEADDR`` before binding every ``udpin`` socket.
+    That is convenient for generic telemetry tools, but unsafe for this
+    owner: a leaked worker or another application can bind the same endpoint
+    and make packet delivery non-deterministic while both UIs claim success.
+    """
+
+    endpoint = _mavlink_udpin_endpoint(url)
+    if endpoint is None:
+        return
+    probe = socket_factory(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.bind(endpoint)
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            host, port = endpoint
+            raise RuntimeError(
+                f"MAVLink UDP input {host}:{port} is already in use; "
+                "close the other MAVLink session or leaked worker before reconnecting"
+            ) from exc
+        raise
+    finally:
+        probe.close()
+
+
+def _disable_mavlink_udpin_reuse(connection: Any, url: str) -> None:
+    """Make the live pymavlink socket exclusive after its successful bind."""
+
+    if _mavlink_udpin_endpoint(url) is None:
+        return
+    port_socket = getattr(connection, "port", None)
+    setsockopt = getattr(port_socket, "setsockopt", None)
+    if callable(setsockopt):
+        setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
 
 
 def camera_label_ko(camera: str) -> str:
@@ -409,6 +506,27 @@ def mavlink_message_provenance(message: Any) -> dict[str, int | None]:
 
 
 DEFAULT_USB_MAVLINK_BAUDRATES = (57600, 115200, 921600)
+USB_MAVLINK_IDENTITY_MAX_AGE_S = 30.0
+
+
+@dataclass(frozen=True)
+class UsbMavlinkIdentity:
+    device: str
+    resolved_device: str
+    baud: int
+    system_id: int
+    component_id: int
+    observed_monotonic_s: float
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "device": self.device,
+            "resolved_device": self.resolved_device,
+            "baud": self.baud,
+            "system_id": self.system_id,
+            "component_id": self.component_id,
+            "observed_monotonic_s": self.observed_monotonic_s,
+        }
 
 
 @dataclass(frozen=True)
@@ -438,26 +556,48 @@ def probe_usb_mavlink_devices(
     *,
     baudrates: tuple[int, ...] = DEFAULT_USB_MAVLINK_BAUDRATES,
     timeout_s: float = 1.0,
-) -> list[tuple[str, int]]:
+) -> list[UsbMavlinkIdentity]:
     try:
         from pymavlink import mavutil
     except Exception as exc:
         raise RuntimeError(f"pymavlink를 사용할 수 없어 USB Pixhawk 자동 탐지를 할 수 없습니다. ({exc})") from exc
-    found: list[tuple[str, int]] = []
+    found: list[UsbMavlinkIdentity] = []
     for device in candidates if candidates is not None else usb_mavlink_device_candidates():
         for baud in baudrates:
             connection = None
             try:
-                connection = mavutil.mavlink_connection(device, baud=int(baud), autoreconnect=False, robust_parsing=True)
+                connection = mavutil.mavlink_connection(
+                    device,
+                    baud=int(baud),
+                    autoreconnect=False,
+                    robust_parsing=True,
+                    source_system=MAVLINK_GCS_SOURCE_SYSTEM,
+                    source_component=MAVLINK_GCS_SOURCE_COMPONENT,
+                )
                 connection.mav.heartbeat_send(
-                    mavutil.mavlink.MAV_TYPE_GENERIC,
+                    mavutil.mavlink.MAV_TYPE_GCS,
                     mavutil.mavlink.MAV_AUTOPILOT_INVALID,
                     0,
                     0,
-                    0,
+                    mavutil.mavlink.MAV_STATE_ACTIVE,
                 )
-                if connection.wait_heartbeat(timeout=timeout_s) is not None:
-                    found.append((device, int(baud)))
+                heartbeat = connection.wait_heartbeat(timeout=timeout_s)
+                if heartbeat is not None:
+                    provenance = mavlink_message_provenance(heartbeat)
+                    system_id = provenance["mavlink_source_system"]
+                    component_id = provenance["mavlink_source_component"]
+                    if system_id is None or component_id is None:
+                        continue
+                    found.append(
+                        UsbMavlinkIdentity(
+                            device=str(device),
+                            resolved_device=os.path.realpath(device),
+                            baud=int(baud),
+                            system_id=int(system_id),
+                            component_id=int(component_id),
+                            observed_monotonic_s=time.monotonic(),
+                        )
+                    )
                     break
             except Exception:
                 continue
@@ -515,10 +655,24 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
     shell_output = QtCore.pyqtSignal(str, str)
     status_changed = QtCore.pyqtSignal(str)
 
-    def __init__(self, *, left_url: str, right_url: str, left_baud: int = 57600, right_baud: int = 57600, custom_watches: tuple[dict[str, str], ...] = ()) -> None:
+    def __init__(
+        self,
+        *,
+        left_url: str,
+        right_url: str,
+        left_baud: int = 57600,
+        right_baud: int = 57600,
+        custom_watches: tuple[dict[str, str], ...] = (),
+        expected_system_ids: dict[str, int] | None = None,
+    ) -> None:
         super().__init__()
         self.urls = {"left": left_url.strip(), "right": right_url.strip()}
         self.baudrates = {"left": int(left_baud), "right": int(right_baud)}
+        self.expected_system_ids = dict(MAVLINK_EXPECTED_SYSTEM_IDS)
+        if expected_system_ids is not None:
+            self.expected_system_ids.update(
+                {str(side): int(system_id) for side, system_id in expected_system_ids.items()}
+            )
         self.connections: dict[str, Any] = {}
         self.last_connect_errors: dict[str, str] = {}
         self.custom_watches = list(custom_watches)
@@ -528,16 +682,42 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         self._mavlink_stream_request_attempts: dict[str, int] = {}
         self._mavlink_stream_last_request_s: dict[str, float] = {}
         self._sasl_can_mag_stream_confirmed: set[str] = set()
+        self._last_attitude_message_s: dict[str, float] = {}
+        self._attitude_stream_request_attempts: dict[str, int] = {}
+        self._attitude_stream_last_request_s: dict[str, float] = {}
+        self._attitude_stream_outage_reported: set[str] = set()
         self._mavlink_stream_config: dict[str, Any] | None = None
         self._mavlink_stream_configured: set[str] = set()
         self._latest_gnss_relative: dict[str, GnssRelativeState] = {}
         self._command_state_lock = threading.RLock()
+        self._mavlink_send_locks = {
+            "left": threading.RLock(),
+            "right": threading.RLock(),
+        }
         self._active_command_cameras: set[str] = set()
         self._deferred_command_messages: dict[str, deque[Any]] = {
             "left": deque(),
             "right": deque(),
         }
+        self._recent_raw_packets: dict[str, deque[tuple[float, bytes]]] = {
+            "left": deque(maxlen=MAVLINK_DUPLICATE_CACHE_SIZE),
+            "right": deque(maxlen=MAVLINK_DUPLICATE_CACHE_SIZE),
+        }
         self._last_receive_errors: dict[str, tuple[str, float]] = {}
+        self._last_gcs_heartbeat_errors: dict[str, tuple[str, float]] = {}
+        self._gcs_heartbeat_last_attempt_s: dict[str, float] = {}
+        self._identity_mismatch_reported: set[tuple[str, int]] = set()
+        self._liveness_connection_ids: dict[str, int] = {}
+        self._last_health_states: dict[str, MavlinkLivenessState] = {}
+        self._mavlink_liveness = {
+            side: MavlinkSideLiveness(
+                side=side,
+                expected_system_id=self.expected_system_ids[side],
+                endpoint=self.urls.get(side, ""),
+                clock=lambda: time.monotonic(),
+            )
+            for side in ("left", "right")
+        }
         self._stream_setup_requests_sent: set[str] = set()
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(20)
@@ -555,17 +735,22 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         """
 
         camera = str(camera)
-        with self._command_state_lock:
-            if camera not in self.connections:
-                raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 연결이 없습니다.")
-            if camera in self._active_command_cameras:
-                raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 명령이 이미 진행 중입니다.")
-            self._active_command_cameras.add(camera)
-        try:
-            yield
-        finally:
+        send_lock = self._mavlink_send_locks.setdefault(camera, threading.RLock())
+        with send_lock:
             with self._command_state_lock:
-                self._active_command_cameras.discard(camera)
+                if camera not in self.connections:
+                    raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 연결이 없습니다.")
+                if camera in self._active_command_cameras:
+                    raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 명령이 이미 진행 중입니다.")
+                model = self._ensure_liveness_listener(camera)
+                model.begin_command("MAVLINK COMMAND", now_s=time.monotonic())
+                self._active_command_cameras.add(camera)
+            try:
+                yield
+            finally:
+                with self._command_state_lock:
+                    self._active_command_cameras.discard(camera)
+                    model.end_command(now_s=time.monotonic())
 
     def start(
         self,
@@ -588,27 +773,39 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 self.last_connect_errors[side] = "MAVLink URL이 설정되지 않았습니다."
                 continue
             if side in self.connections:
+                self._ensure_liveness_listener(side)
                 started_any = True
                 self.last_connect_errors.pop(side, None)
                 continue
+            connection = None
             try:
+                _assert_mavlink_udpin_available(url)
                 connection = mavutil.mavlink_connection(
                     url,
                     baud=self.baudrates.get(side, 57600),
                     autoreconnect=True,
                     robust_parsing=True,
                     dialect=sasl_dialect,
+                    source_system=MAVLINK_GCS_SOURCE_SYSTEM,
+                    source_component=MAVLINK_GCS_SOURCE_COMPONENT,
                 )
+                _disable_mavlink_udpin_reuse(connection, url)
             except Exception as exc:
                 # A multi-side request (``camera=None``) must not fail the sides
                 # that did connect just because one side raised; the caller reads
                 # ``last_connect_errors`` afterwards to surface a partial-connect
                 # status instead of a misleading full-success label.
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except Exception:
+                        pass
                 self.last_connect_errors[side] = str(exc)
                 self.status_changed.emit(f"{camera_label_ko(side)} MAVLink 연결 실패: {exc}")
                 continue
             with self._command_state_lock:
                 self.connections[side] = connection
+                self._open_liveness_generation(side, connection)
             started_any = True
             self.last_connect_errors.pop(side, None)
             self.status_changed.emit(
@@ -630,6 +827,44 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         if self.connections:
             self.timer.start()
 
+    def _open_liveness_generation(self, side: str, connection: Any) -> MavlinkSideLiveness:
+        model = self._mavlink_liveness[str(side)]
+        model.open_listener(
+            endpoint=self.urls.get(str(side), ""),
+            now_s=time.monotonic(),
+        )
+        self._liveness_connection_ids[str(side)] = id(connection)
+        self._gcs_heartbeat_last_attempt_s.pop(str(side), None)
+        return model
+
+    def _ensure_liveness_listener(self, side: str) -> MavlinkSideLiveness:
+        side = str(side)
+        model = self._mavlink_liveness[side]
+        connection = self.connections.get(side)
+        if connection is not None and self._liveness_connection_ids.get(side) != id(connection):
+            return self._open_liveness_generation(side, connection)
+        return model
+
+    def mavlink_health_snapshot(
+        self,
+        side: str,
+        *,
+        now_s: float | None = None,
+    ) -> MavlinkSideHealthSnapshot:
+        model = self._ensure_liveness_listener(str(side))
+        return model.snapshot(now_s=now_s)
+
+    def mavlink_health_snapshots(
+        self,
+        *,
+        now_s: float | None = None,
+    ) -> dict[str, MavlinkSideHealthSnapshot]:
+        observed_s = time.monotonic() if now_s is None else float(now_s)
+        return {
+            side: self.mavlink_health_snapshot(side, now_s=observed_s)
+            for side in ("left", "right")
+        }
+
     def stop(self, camera: str | None = None) -> None:
         if camera is None:
             connections = list(self.connections.items())
@@ -643,16 +878,31 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 except Exception:
                     pass
                 self.connections.pop(side, None)
+                self._mavlink_liveness[side].close_listener(now_s=time.monotonic())
+                self._liveness_connection_ids.pop(side, None)
             self._heartbeat_logged.discard(side)
             self._mavlink_stream_requests_sent.discard(side)
             self._mavlink_stream_request_attempts.pop(side, None)
             self._mavlink_stream_last_request_s.pop(side, None)
             self._sasl_can_mag_stream_confirmed.discard(side)
+            self._last_attitude_message_s.pop(side, None)
+            self._attitude_stream_request_attempts.pop(side, None)
+            self._attitude_stream_last_request_s.pop(side, None)
+            self._attitude_stream_outage_reported.discard(side)
             self._mavlink_stream_configured.discard(side)
             self._stream_setup_requests_sent.discard(side)
             self._latest_gnss_relative.pop(side, None)
             self._deferred_command_messages.setdefault(side, deque()).clear()
+            self._recent_raw_packets.setdefault(
+                side, deque(maxlen=MAVLINK_DUPLICATE_CACHE_SIZE)
+            ).clear()
             self._last_receive_errors.pop(side, None)
+            self._last_gcs_heartbeat_errors.pop(side, None)
+            self._gcs_heartbeat_last_attempt_s.pop(side, None)
+            self._identity_mismatch_reported = {
+                item for item in self._identity_mismatch_reported if item[0] != side
+            }
+            self._last_health_states.pop(side, None)
         if not self.connections:
             self.timer.stop()
         if camera is None:
@@ -736,11 +986,55 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         connection = self.connections.get(camera)
         if connection is None:
             raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 연결이 없습니다.")
-        packet_count = _send_mavlink_rtcm_data(connection, payload)
+        with self._mavlink_send_locks.setdefault(str(camera), threading.RLock()):
+            packet_count = _send_mavlink_rtcm_data(connection, payload)
         self.status_changed.emit(
             f"{camera_label_ko(camera)} RTCM 주입: {len(payload)} bytes / {packet_count} MAVLink packets"
         )
         return packet_count
+
+    def send_rtcm_data_if_eligible(
+        self,
+        camera: str,
+        payload: bytes,
+        *,
+        expected_generation: int | None = None,
+    ) -> dict[str, object]:
+        """Atomically recheck side health and send one complete RTCM frame."""
+
+        camera = str(camera)
+        connection = self.connections.get(camera)
+        if connection is None:
+            raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 연결이 없습니다.")
+        with self._mavlink_send_locks.setdefault(camera, threading.RLock()):
+            health = self.mavlink_health_snapshot(camera, now_s=time.monotonic())
+            if (
+                expected_generation is not None
+                and health.connection_generation != int(expected_generation)
+            ):
+                return {
+                    "sent": False,
+                    "packet_count": 0,
+                    "health": health,
+                    "block_reason": "connection-generation-changed",
+                }
+            if not health.rtcm_eligible:
+                return {
+                    "sent": False,
+                    "packet_count": 0,
+                    "health": health,
+                    "block_reason": "target-mavlink-ineligible",
+                }
+            packet_count = int(_send_mavlink_rtcm_data(connection, payload) or 0)
+        self.status_changed.emit(
+            f"{camera_label_ko(camera)} RTCM 주입: {len(payload)} bytes / {packet_count} MAVLink packets"
+        )
+        return {
+            "sent": True,
+            "packet_count": packet_count,
+            "health": health,
+            "block_reason": "",
+        }
 
     def _apply_pending_connection_setup(self, camera: str, connection: Any) -> None:
         if self._mavlink_stream_config is not None and camera not in self._mavlink_stream_configured:
@@ -787,6 +1081,11 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         connection = self.connections.get(camera)
         if connection is None:
             return
+        health = self.mavlink_health_snapshot(camera, now_s=time.monotonic())
+        if health.state is MavlinkLivenessState.RX_STALLED:
+            return
+        if camera in self._mavlink_stream_requests_sent:
+            return
         mav = getattr(connection, "mav", None)
         if mav is None or not hasattr(mav, "command_long_send"):
             return
@@ -795,21 +1094,10 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         target_system = int(getattr(connection, "target_system", 0) or 1)
         target_component = int(getattr(connection, "target_component", 0) or 1)
         now_s = time.monotonic()
-        retry_only = camera in self._mavlink_stream_requests_sent
-        if retry_only:
-            if camera in self._sasl_can_mag_stream_confirmed:
-                return
-            attempts = self._mavlink_stream_request_attempts.get(camera, 1)
-            elapsed_s = now_s - self._mavlink_stream_last_request_s.get(camera, 0.0)
-            if attempts >= MAVLINK_STREAM_REQUEST_MAX_ATTEMPTS or elapsed_s < MAVLINK_STREAM_REQUEST_RETRY_S:
-                return
-            requests = (("SASL_CAN_MAG", 20.0),)
-        else:
-            attempts = 0
-            requests = MAVLINK_RM3100_STREAM_REQUESTS
+        requests = MAVLINK_STOCK_STREAM_REQUESTS
         requested = []
         self._mavlink_stream_requests_sent.add(camera)
-        self._mavlink_stream_request_attempts[camera] = attempts + 1
+        self._mavlink_stream_request_attempts[camera] = 1
         self._mavlink_stream_last_request_s[camera] = now_s
         try:
             for message_name, rate_hz in requests:
@@ -835,15 +1123,76 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             self._mavlink_stream_last_request_s.pop(camera, None)
             self.status_changed.emit(f"{camera_label_ko(camera)} MAVLink sensor stream 요청 실패: {exc}")
             return
-        if retry_only:
-            self.status_changed.emit(
-                f"{camera_label_ko(camera)} MAVLink SASL_CAN_MAG stream 재요청 "
-                f"({attempts + 1}/{MAVLINK_STREAM_REQUEST_MAX_ATTEMPTS})"
+        if "ATTITUDE" in requested:
+            self._attitude_stream_request_attempts[camera] = 1
+            self._attitude_stream_last_request_s[camera] = now_s
+        self.status_changed.emit(
+            f"{camera_label_ko(camera)} MAVLink Stock sensor stream 요청: {', '.join(requested)}"
+        )
+
+    def _request_stale_attitude_stream(self, camera: str) -> None:
+        """Re-request ATTITUDE while heartbeat proves the transport is alive."""
+
+        connection = self.connections.get(camera)
+        if connection is None:
+            return
+        health = self.mavlink_health_snapshot(camera, now_s=time.monotonic())
+        if health.state is MavlinkLivenessState.RX_STALLED:
+            return
+        mav = getattr(connection, "mav", None)
+        if mav is None or not hasattr(mav, "command_long_send"):
+            return
+        now_s = time.monotonic()
+        last_attitude_s = self._last_attitude_message_s.get(camera)
+        if last_attitude_s is not None and now_s - last_attitude_s <= MAVLINK_ATTITUDE_STALE_S:
+            self._attitude_stream_request_attempts.pop(camera, None)
+            self._attitude_stream_last_request_s.pop(camera, None)
+            self._attitude_stream_outage_reported.discard(camera)
+            return
+        attempts = self._attitude_stream_request_attempts.get(camera, 0)
+        last_request_s = self._attitude_stream_last_request_s.get(camera, float("-inf"))
+        if attempts >= MAVLINK_STREAM_REQUEST_MAX_ATTEMPTS:
+            if now_s - last_request_s < MAVLINK_ATTITUDE_RECOVERY_COOLDOWN_S:
+                if camera not in self._attitude_stream_outage_reported:
+                    self._attitude_stream_outage_reported.add(camera)
+                    self.status_changed.emit(
+                        f"{camera_label_ko(camera)} MAVLink heartbeat는 수신 중이나 "
+                        "ATTITUDE stream 복구 응답이 없습니다. 재시도를 대기합니다."
+                    )
+                return
+            attempts = 0
+            self._attitude_stream_outage_reported.discard(camera)
+        if now_s - last_request_s < MAVLINK_STREAM_REQUEST_RETRY_S:
+            return
+        mavlink = getattr(connection, "mavlink", None)
+        command_id = _mavlink_constant(mavlink, "MAV_CMD_SET_MESSAGE_INTERVAL", 511)
+        target_system = int(getattr(connection, "target_system", 0) or 1)
+        target_component = int(getattr(connection, "target_component", 0) or 1)
+        self._attitude_stream_request_attempts[camera] = attempts + 1
+        self._attitude_stream_last_request_s[camera] = now_s
+        try:
+            mav.command_long_send(
+                target_system,
+                target_component,
+                command_id,
+                0,
+                MAVLINK_MESSAGE_IDS["ATTITUDE"],
+                int(1_000_000 / 30.0),
+                0,
+                0,
+                0,
+                0,
+                0,
             )
-        else:
+        except Exception as exc:
             self.status_changed.emit(
-                f"{camera_label_ko(camera)} MAVLink sensor stream 요청: {', '.join(requested)}"
+                f"{camera_label_ko(camera)} MAVLink ATTITUDE stream 복구 요청 실패: {exc}"
             )
+            return
+        self.status_changed.emit(
+            f"{camera_label_ko(camera)} MAVLink ATTITUDE stream 복구 요청 "
+            f"({attempts + 1}/{MAVLINK_STREAM_REQUEST_MAX_ATTEMPTS})"
+        )
 
     def send_shell_command(self, camera: str, command: str) -> None:
         connection = self.connections.get(camera)
@@ -911,10 +1260,13 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             with self._command_state_lock:
                 if camera in self._active_command_cameras:
                     continue
+            self._ensure_liveness_listener(camera)
             # ``spin_once`` runs from a Qt timer.  A continuously busy serial
             # link must not monopolize the GUI thread while we drain it.
             deadline = time.monotonic() + MAVLINK_MAX_PROCESS_TIME_S
             for _ in range(MAVLINK_MAX_MESSAGES_PER_TICK):
+                deferred = False
+                received_at_s: float | None = None
                 with self._command_state_lock:
                     if camera in self._active_command_cameras:
                         break
@@ -922,39 +1274,198 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                         pending = self._deferred_command_messages.setdefault(
                             camera, deque()
                         )
-                        message = (
-                            pending.popleft()
-                            if pending
-                            else connection.recv_match(blocking=False)
-                        )
+                        if pending:
+                            received_at_s, message = pending.popleft()
+                            deferred = True
+                        else:
+                            message = connection.recv_match(blocking=False)
+                            if message is not None:
+                                received_at_s = time.monotonic()
                     except Exception as exc:
                         self._emit_receive_error(camera, exc)
                         break
                 if message is None:
                     break
-                self._handle_mavlink_message(camera, message)
+                if not deferred and not self._observe_mavlink_transport_message(
+                    camera,
+                    message,
+                    received_at_s=received_at_s,
+                ):
+                    continue
+                if self._is_duplicate_packet(camera, message):
+                    continue
+                self._handle_mavlink_message(
+                    camera,
+                    message,
+                    received_at_s=received_at_s,
+                )
                 if time.monotonic() >= deadline:
                     break
+            self._send_due_gcs_heartbeat(camera, connection, now_s=time.monotonic())
+            self._emit_liveness_transition(camera, now_s=time.monotonic())
 
     def _defer_command_message(self, camera: str, message: Any) -> None:
         """Retain telemetry consumed while a blocking command owns recv_match."""
 
         if message is None:
             return
+        received_at_s = time.monotonic()
+        if not self._observe_mavlink_transport_message(
+            str(camera),
+            message,
+            received_at_s=received_at_s,
+        ):
+            return
         with self._command_state_lock:
-            self._deferred_command_messages.setdefault(str(camera), deque()).append(message)
+            self._deferred_command_messages.setdefault(str(camera), deque()).append(
+                (received_at_s, message)
+            )
+
+    def _observe_mavlink_transport_message(
+        self,
+        camera: str,
+        message: Any,
+        *,
+        received_at_s: float | None = None,
+    ) -> bool:
+        """Record arrival before duplicate filtering and reject known wrong peers."""
+
+        camera = str(camera)
+        model = self._ensure_liveness_listener(camera)
+        provenance = mavlink_message_provenance(message)
+        system_id = provenance["mavlink_source_system"]
+        component_id = provenance["mavlink_source_component"]
+        expected_system_id = self.expected_system_ids[camera]
+        if system_id is not None and int(system_id) != expected_system_id:
+            mismatch = (camera, int(system_id))
+            if mismatch not in self._identity_mismatch_reported:
+                self._identity_mismatch_reported.add(mismatch)
+                self.status_changed.emit(
+                    f"{camera_label_ko(camera)} MAVLink identity 불일치: "
+                    f"expected sysid {expected_system_id}, got {int(system_id)}"
+                )
+            return False
+        message_type = message.get_type() if hasattr(message, "get_type") else ""
+        accepted = model.observe_packet(
+            system_id=system_id,
+            component_id=component_id,
+            message_type=message_type,
+            received_at_s=received_at_s,
+            generation=model.connection_generation,
+        )
+        # Small legacy/test doubles may not expose MAVLink provenance.  They
+        # can still exercise downstream decoders, but never establish link
+        # identity or qualify the transport.
+        return accepted or system_id is None
+
+    def _send_due_gcs_heartbeat(
+        self,
+        camera: str,
+        connection: Any,
+        *,
+        now_s: float,
+    ) -> None:
+        camera = str(camera)
+        model = self._ensure_liveness_listener(camera)
+        health = model.snapshot(now_s=now_s)
+        if not health.identity_verified or not health.listener_open:
+            return
+        last_attempt_s = self._gcs_heartbeat_last_attempt_s.get(camera)
+        if (
+            last_attempt_s is not None
+            and now_s - last_attempt_s < MAVLINK_GCS_HEARTBEAT_INTERVAL_S
+        ):
+            return
+        mav = getattr(connection, "mav", None)
+        sender = getattr(mav, "heartbeat_send", None)
+        if not callable(sender):
+            return
+        self._gcs_heartbeat_last_attempt_s[camera] = now_s
+        mavlink = getattr(connection, "mavlink", None)
+        try:
+            with self._mavlink_send_locks.setdefault(camera, threading.RLock()):
+                sender(
+                    _mavlink_constant(mavlink, "MAV_TYPE_GCS", 6),
+                    _mavlink_constant(mavlink, "MAV_AUTOPILOT_INVALID", 8),
+                    0,
+                    0,
+                    _mavlink_constant(mavlink, "MAV_STATE_ACTIVE", 4),
+                )
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            if should_emit_throttled_error(
+                self._last_gcs_heartbeat_errors,
+                camera,
+                message,
+                now_s,
+                MAVLINK_GCS_HEARTBEAT_INTERVAL_S,
+            ):
+                self.status_changed.emit(
+                    f"{camera_label_ko(camera)} GCS heartbeat 전송 실패: {exc}"
+                )
+            return
+        self._last_gcs_heartbeat_errors.pop(camera, None)
+        model.note_gcs_heartbeat_sent(
+            sent_at_s=now_s,
+            generation=health.connection_generation,
+        )
+
+    def _emit_liveness_transition(self, camera: str, *, now_s: float) -> None:
+        health = self.mavlink_health_snapshot(str(camera), now_s=now_s)
+        previous = self._last_health_states.get(str(camera))
+        if previous is health.state:
+            return
+        self._last_health_states[str(camera)] = health.state
+        detail = ""
+        if health.state is MavlinkLivenessState.RX_STALLED:
+            detail = (
+                f"; ANY age={health.any_rx_age_s:.1f}s; RTCM/commands blocked; "
+                "PX4/NuttX UDP task deadlock suspected"
+            )
+        elif health.state in {MavlinkLivenessState.QUALIFYING, MavlinkLivenessState.RECOVERING}:
+            detail = (
+                f"; qualification={int(health.qualification_elapsed_s) // 60:02d}:"
+                f"{int(health.qualification_elapsed_s) % 60:02d}/10:00"
+            )
+        self.status_changed.emit(
+            f"{camera_label_ko(camera)} MAVLink liveness: {health.state.value}{detail}"
+        )
+
+    def _is_duplicate_packet(self, camera: str, message: Any) -> bool:
+        """Drop an exact duplicate transport packet before any downstream signal."""
+
+        reader = getattr(message, "get_msgbuf", None)
+        if not callable(reader):
+            return False
+        try:
+            raw = bytes(reader())
+        except Exception:
+            return False
+        if not raw:
+            return False
+        now_s = time.monotonic()
+        recent = self._recent_raw_packets.setdefault(
+            str(camera), deque(maxlen=MAVLINK_DUPLICATE_CACHE_SIZE)
+        )
+        cutoff_s = now_s - MAVLINK_DUPLICATE_TTL_S
+        while recent and recent[0][0] < cutoff_s:
+            recent.popleft()
+        duplicate = any(previous == raw for _timestamp_s, previous in recent)
+        if not duplicate:
+            recent.append((now_s, raw))
+        return duplicate
 
     def _emit_receive_error(self, camera: str, exc: BaseException) -> None:
         message = f"{type(exc).__name__}: {exc}"
         now_s = time.monotonic()
-        previous = self._last_receive_errors.get(str(camera))
-        if (
-            previous is not None
-            and previous[0] == message
-            and now_s - previous[1] < MAVLINK_RECEIVE_ERROR_INTERVAL_S
+        if not should_emit_throttled_error(
+            self._last_receive_errors,
+            str(camera),
+            message,
+            now_s,
+            MAVLINK_RECEIVE_ERROR_INTERVAL_S,
         ):
             return
-        self._last_receive_errors[str(camera)] = (message, now_s)
         self.status_changed.emit(
             f"{camera_label_ko(camera)} MAVLink 수신 실패: {exc}"
         )
@@ -981,10 +1492,16 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             "(CAN1_MAG/CAN2_MAG 아님 - CAN 자력계 데이터가 아닐 수 있음)"
         )
 
-    def _handle_mavlink_message(self, camera: str, message: Any) -> None:
+    def _handle_mavlink_message(
+        self,
+        camera: str,
+        message: Any,
+        *,
+        received_at_s: float | None = None,
+    ) -> None:
         message_type = message.get_type() if hasattr(message, "get_type") else ""
         namespace = self.urls.get(camera, "")
-        now_s = time.monotonic()
+        now_s = time.monotonic() if received_at_s is None else float(received_at_s)
         provenance = mavlink_message_provenance(message)
         self._emit_custom_watch_samples(camera, message, message_type, now_s)
         optional_row = _mavlink_optional_timeline_row(
@@ -996,6 +1513,10 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         if optional_row is not None:
             self.optional_timeline_changed.emit(camera, optional_row)
         if message_type == "ATTITUDE":
+            self._last_attitude_message_s[camera] = now_s
+            self._attitude_stream_request_attempts.pop(camera, None)
+            self._attitude_stream_last_request_s.pop(camera, None)
+            self._attitude_stream_outage_reported.discard(camera)
             extrinsic = camera_extrinsic_from_euler_rad(
                 camera=camera,
                 namespace=namespace,
@@ -1109,6 +1630,7 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 self._stream_setup_requests_sent.add(camera)
                 self.stream_setup_required.emit(camera)
             self._request_mavlink_sensor_streams(camera)
+            self._request_stale_attitude_stream(camera)
             if camera not in self._heartbeat_logged:
                 self._heartbeat_logged.add(camera)
                 self.status_changed.emit(f"{camera_label_ko(camera)} MAVLink heartbeat 수신")
@@ -1787,13 +2309,14 @@ def _mavlink_param_float_to_int(value: Any) -> int:
     return struct.unpack("<I", struct.pack("<f", float(value)))[0]
 
 
-def _mavlink_recv_param_value(
+def _mavlink_recv_param_value_loop(
     connection: Any,
     name: str,
     *,
     timeout_s: float,
+    decode: Callable[[float, int | None], int | float],
     on_unmatched: Callable[[Any], None] | None = None,
-) -> int | None:
+) -> int | float | None:
     deadline = time.monotonic() + float(timeout_s)
     while time.monotonic() < deadline:
         remaining = max(0.0, deadline - time.monotonic())
@@ -1807,8 +2330,24 @@ def _mavlink_recv_param_value(
             if on_unmatched is not None:
                 on_unmatched(message)
             continue
-        return _mavlink_param_float_to_int(getattr(message, "param_value"))
+        return decode(getattr(message, "param_value"), getattr(message, "param_type", None))
     return None
+
+
+def _mavlink_recv_param_value(
+    connection: Any,
+    name: str,
+    *,
+    timeout_s: float,
+    on_unmatched: Callable[[Any], None] | None = None,
+) -> int | None:
+    return _mavlink_recv_param_value_loop(
+        connection,
+        name,
+        timeout_s=timeout_s,
+        decode=lambda raw_param_value, _param_type: _mavlink_param_float_to_int(raw_param_value),
+        on_unmatched=on_unmatched,
+    )
 
 
 # MAV_PARAM_TYPE_REAL32 = 9, MAV_PARAM_TYPE_REAL64 = 10. Every other MAV_PARAM_TYPE is an
@@ -1830,21 +2369,13 @@ def _mavlink_recv_param_value_typed(
     timeout_s: float,
     on_unmatched: Callable[[Any], None] | None = None,
 ) -> int | float | None:
-    deadline = time.monotonic() + float(timeout_s)
-    while time.monotonic() < deadline:
-        remaining = max(0.0, deadline - time.monotonic())
-        message = connection.recv_match(blocking=True, timeout=min(0.2, remaining))
-        if message is None:
-            continue
-        if (
-            _mavlink_message_type(message) != "PARAM_VALUE"
-            or _mavlink_param_id_text(message) != name
-        ):
-            if on_unmatched is not None:
-                on_unmatched(message)
-            continue
-        return _mavlink_decode_param_value(getattr(message, "param_value"), getattr(message, "param_type", None))
-    return None
+    return _mavlink_recv_param_value_loop(
+        connection,
+        name,
+        timeout_s=timeout_s,
+        decode=_mavlink_decode_param_value,
+        on_unmatched=on_unmatched,
+    )
 
 
 def _mavlink_read_param(

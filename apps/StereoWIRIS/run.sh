@@ -8,6 +8,7 @@ PX4_MSGS_SOURCE_DIR="$SASL_ROS_WORKSPACE/src/px4_msgs"
 PX4_MSGS_OVERLAY_SETUP="$SASL_ROS_WORKSPACE/install/setup.bash"
 PX4_MSGS_OVERLAY_MANIFEST="$SASL_ROS_WORKSPACE/install/share/sasl_ros_workspace/px4_msgs-overlay.env"
 PX4_MSGS_REF="${PX4_MSGS_REF:-86d8239e962f6939e05c3737784f60c02fa884db}"
+CANONICAL_PYTHON="$SASL_ROOT/.venv/bin/python"
 export PATH="$HOME/.local/bin:$PATH"
 export LD_LIBRARY_PATH="$HOME/.local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-$APP_DIR/.cache/matplotlib}"
@@ -86,14 +87,14 @@ done
 usage() {
   cat <<'USAGE'
 Usage:
-  apps/StereoWIRIS/run.sh [--check] [--mavlink-only] [--ui legacy|workstation] [app args...]
+  apps/StereoWIRIS/run.sh [--check] [--mavlink-only] [--ui legacy] [app args...]
 
 Starts the StereoWIRIS GUI application.
 
 Options:
   --check   Verify Python and import paths without starting the GUI.
   --mavlink-only  Start Legacy without ROS2/uXRCE-DDS dependencies.
-  --ui      Select the single operational UI for this process; default is legacy.
+  --ui      Legacy is the operational UI; workstation is accepted only with --check.
   --help    Show this help.
 USAGE
 }
@@ -138,30 +139,40 @@ require_canonical_px4_msgs_overlay() {
   fi
 }
 
-resolve_python() {
-  local candidate resolved
-  for candidate in "$@"; do
-    [[ -n "$candidate" ]] || continue
-    if [[ "$candidate" == */* ]]; then
-      if [[ -x "$candidate" ]]; then
-        printf '%s\n' "$candidate"
-        return 0
-      fi
-      continue
-    fi
-    resolved="$(command -v "$candidate" 2>/dev/null || true)"
-    if [[ -n "$resolved" && -x "$resolved" ]]; then
-      printf '%s\n' "$resolved"
-      return 0
-    fi
-  done
-  return 1
-}
-
-PYTHON_BIN="${PYTHON_BIN:-}"
-if [[ -z "$PYTHON_BIN" ]]; then
-  PYTHON_BIN="$(resolve_python "$APP_DIR/.venv/bin/python" "$SASL_ROOT/apps/Simulation/.venv/bin/python" "$SASL_ROOT/.local/legacy/Simulation/.venv/bin/python" python3 python)"
+if [[ ! -x "$CANONICAL_PYTHON" ]]; then
+  printf '%s\n' \
+    "FAIL python.executable: canonical venv is missing: $CANONICAL_PYTHON" \
+    "  Recovery: cd $SASL_ROOT" \
+    "  Recovery: python3 -m venv --system-site-packages .venv" \
+    "  Recovery: .venv/bin/python -m pip install -r requirements.txt" >&2
+  exit 1
 fi
+
+PYTHON_BIN="${PYTHON_BIN:-$CANONICAL_PYTHON}"
+if [[ "$PYTHON_BIN" != /* ]]; then
+  if [[ "$PYTHON_BIN" == */* ]]; then
+    PYTHON_BIN="$(realpath -s -m "$PWD/$PYTHON_BIN")"
+  else
+    PYTHON_BIN="$(command -v "$PYTHON_BIN" 2>/dev/null || true)"
+  fi
+fi
+if [[ -z "$PYTHON_BIN" ]]; then
+  printf '%s\n' "FAIL python.override: PYTHON_BIN could not be resolved" "  Recovery: unset PYTHON_BIN" >&2
+  exit 2
+fi
+if [[ "$(realpath -s -m "$PYTHON_BIN")" != "$(realpath -s -m "$CANONICAL_PYTHON")" ]]; then
+  printf '%s\n' \
+    "FAIL python.override: StereoWIRIS only supports $CANONICAL_PYTHON" \
+    "  actual PYTHON_BIN: ${PYTHON_BIN:-unresolved}" \
+    "  Recovery: unset PYTHON_BIN" >&2
+  exit 2
+fi
+
+export PYTHONPATH="$APP_DIR/compat:$APP_DIR:$SASL_ROOT/apps:$SASL_ROOT/common/python:$SASL_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
+# The interpreter and common media runtime must be valid before any ROS
+# overlay can change Python/library lookup paths.
+"$PYTHON_BIN" -m sasl_common.operator_runtime --execution --decoder auto || exit $?
 
 if [[ "$WORKSTATION_UI_REQUESTED" != "1" && "$MAVLINK_ONLY_REQUESTED" != "1" ]]; then
   if ! require_canonical_px4_msgs_overlay; then
@@ -175,64 +186,12 @@ if [[ "$WORKSTATION_UI_REQUESTED" != "1" && "$MAVLINK_ONLY_REQUESTED" != "1" ]];
 fi
 
 if [[ "$CHECK_REQUESTED" == "1" ]]; then
-    export PYTHONPATH="$APP_DIR/compat:$APP_DIR:$SASL_ROOT/apps:$SASL_ROOT/common/python:$SASL_ROOT${PYTHONPATH:+:$PYTHONPATH}"
     if [[ "$WORKSTATION_UI_REQUESTED" == "1" ]]; then
-      "$PYTHON_BIN" - <<'PY'
-from pathlib import Path
-import sys
-
-import cv2
-import numpy as np
-import pyarrow
-import xlsxwriter
-import yaml
-
-import sasl_common.lifecycle
-import Workstation.standalone_gui
-
-print("StereoWIRIS Workstation runtime check ok")
-print(f"python={sys.executable}")
-print(f"sasl_root={Path.cwd().resolve()}")
-print(
-    f"opencv={cv2.__version__}, numpy={np.__version__}, yaml={yaml.__version__}, "
-    f"xlsxwriter={xlsxwriter.__version__}, pyarrow={pyarrow.__version__}"
-)
-PY
+      exec "$PYTHON_BIN" -m Workstation --check
     else
-      "$PYTHON_BIN" - <<'PY'
-from pathlib import Path
-import sys
-
-import cv2
-import numpy as np
-import pyarrow
-import xlsxwriter
-import yaml
-
-import sasl_common.stereo_geometry
-import sasl_common.lifecycle
-import wiris_stereo_distance.gui
-import wiris_stereo_distance.legacy_gui
-import Workstation.standalone_gui
-
-print("StereoWIRIS runtime check ok")
-print(f"python={sys.executable}")
-print(f"sasl_root={Path.cwd().resolve()}")
-print(
-    f"opencv={cv2.__version__}, numpy={np.__version__}, yaml={yaml.__version__}, "
-    f"xlsxwriter={xlsxwriter.__version__}, pyarrow={pyarrow.__version__}"
-)
-PY
+      exec "$PYTHON_BIN" "$APP_DIR/scripts/check_runtime.py" --app-only
     fi
-    exit 0
-fi
-
-bash "$APP_DIR/scripts/bootstrap_network_tools.sh" || true
-
-if [[ "${STEREO_BOOTSTRAP_CALIBRATION_DEPS:-0}" == "1" ]]; then
-  PYTHON_BIN="$PYTHON_BIN" bash "$APP_DIR/scripts/bootstrap_calibration_deps.sh"
 fi
 
 cd "$APP_DIR"
-export PYTHONPATH="$APP_DIR/compat:$APP_DIR:$SASL_ROOT/apps:$SASL_ROOT/common/python:$SASL_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 exec "$PYTHON_BIN" "$APP_DIR/main.py" "$@"

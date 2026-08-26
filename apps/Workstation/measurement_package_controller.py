@@ -4,8 +4,9 @@ The recording controller owns producers and their asynchronous save workers.
 This controller owns the higher-level operator contract:
 
 ``Start Session -> Start Measurement (create child + Detection) -> automatic
-save and seal on stop``.  A sealed measurement leaves the parent session open
-for another child; ``Close Session`` seals the aggregate child-manifest index.
+save and seal on stop``. A sealed measurement leaves the parent session open
+for another child. ``Close Session`` first stops an active Detection interval
+when necessary, then seals the aggregate child-manifest index.
 
 Finalization is deliberately resumable.  A click may move the package to
 ``VERIFYING`` while camera/capture/save workers drain; their completion
@@ -637,10 +638,7 @@ class MeasurementPackageController:
                     and measurement_state in _SEALED_STATES | {"IDLE"}
                 ),
                 "can_finalize_measurement": measurement_state in {"POST_CAPTURE", "RECOVERABLE"},
-                "can_close_session": (
-                    session_state in {"OPEN", "CLOSING", "RECOVERABLE"}
-                    and measurement_state in _SEALED_STATES | {"IDLE"}
-                ),
+                "can_close_session": session_state in {"OPEN", "CLOSING", "RECOVERABLE"},
             }
         )
         return dict(_json_copy(result))
@@ -1363,7 +1361,7 @@ class MeasurementPackageController:
             getattr(self.panel, "_measurement_package_detection_completed", False)
         ):
             return True
-        if state != "COLLECTING" or not bool(
+        if state not in {"COLLECTING", "RECOVERABLE"} or not bool(
             getattr(self.panel, "_measurement_package_detection_started", False)
         ):
             self._set_state(state, "No active package Detection interval can be stopped")
@@ -2854,6 +2852,91 @@ class MeasurementPackageController:
     ) -> bool:
         return self.begin_next_measurement(metadata)
 
+    def _stop_active_detection_for_session_close(self) -> bool:
+        """Stop the active Detection interval before sealing its parent Session.
+
+        The camera lifecycle remains the runtime owner when a Detection stream
+        is live or still starting. A controller-only integration has no such
+        producer, so it can close the logical interval directly. In both cases
+        the caller has already latched the parent-close request; normal
+        Measurement finalization consumes it after every writer and
+        persistence barrier drains.
+        """
+
+        runtime_stop_required = bool(
+            getattr(self.panel, "yolo_enabled", False)
+            or getattr(self.panel, "_pending_camera_start", None) is not None
+        )
+        stopper = getattr(self.panel, "stop_yolo_detection", None)
+        if runtime_stop_required and callable(stopper):
+            try:
+                result = stopper()
+            except Exception as exc:  # noqa: BLE001 - runtime boundary becomes retryable state.
+                self.panel._measurement_session_close_requested = False
+                self._set_state(
+                    _state_text(
+                        getattr(self.panel, "_measurement_package_state", "COLLECTING")
+                    ),
+                    "Session close could not stop active Detection",
+                    str(exc),
+                )
+                return False
+            if result is False and bool(
+                getattr(self.panel, "_measurement_package_detection_started", False)
+            ) and not bool(
+                getattr(self.panel, "_measurement_package_detection_completed", False)
+            ):
+                self.panel._measurement_session_close_requested = False
+                self._set_state(
+                    _state_text(
+                        getattr(self.panel, "_measurement_package_state", "COLLECTING")
+                    ),
+                    "Session close could not stop active Detection",
+                    "Detection runtime rejected the stop request",
+                )
+                return False
+
+        detection_active = bool(
+            getattr(self.panel, "_measurement_package_detection_started", False)
+        ) and not bool(
+            getattr(self.panel, "_measurement_package_detection_completed", False)
+        )
+        if not detection_active:
+            return True
+        if runtime_stop_required:
+            self.panel._measurement_session_close_requested = False
+            self._set_state(
+                _state_text(
+                    getattr(self.panel, "_measurement_package_state", "COLLECTING")
+                ),
+                "Session close could not confirm Detection stop",
+                "Detection runtime still reports an active interval",
+            )
+            return False
+
+        try:
+            completed = self.complete_measurement_detection()
+        except Exception as exc:  # noqa: BLE001 - lifecycle boundary reports the owner failure.
+            self.panel._measurement_session_close_requested = False
+            self._set_state(
+                _state_text(
+                    getattr(self.panel, "_measurement_package_state", "COLLECTING")
+                ),
+                "Session close could not complete the inactive Detection interval",
+                str(exc),
+            )
+            return False
+        if not completed:
+            self.panel._measurement_session_close_requested = False
+            self._set_state(
+                _state_text(
+                    getattr(self.panel, "_measurement_package_state", "COLLECTING")
+                ),
+                "Session close could not complete the inactive Detection interval",
+            )
+            return False
+        return True
+
     def close_measurement_session(self) -> bool:
         if not self._hierarchy_enabled():
             self._set_state(
@@ -2862,19 +2945,40 @@ class MeasurementPackageController:
             )
             return False
         state = _state_text(getattr(self.panel, "_measurement_package_state", "IDLE"))
-        if state not in _SEALED_STATES | {"IDLE"}:
+        detection_started = bool(
+            getattr(self.panel, "_measurement_package_detection_started", False)
+        )
+        detection_completed = bool(
+            getattr(self.panel, "_measurement_package_detection_completed", False)
+        )
+        if (
+            state in {"COLLECTING", "RECOVERABLE"}
+            and detection_started
+            and not detection_completed
+        ):
+            self.panel._measurement_session_close_requested = True
+            self._set_state(
+                state,
+                "Session close requested; stopping Detection before automatic save and seal",
+            )
+            if not self._stop_active_detection_for_session_close():
+                return False
+            state = _state_text(
+                getattr(self.panel, "_measurement_package_state", "COLLECTING")
+            )
             detection_started = bool(
                 getattr(self.panel, "_measurement_package_detection_started", False)
             )
             detection_completed = bool(
                 getattr(self.panel, "_measurement_package_detection_completed", False)
             )
-            if state == "COLLECTING" and detection_started and not detection_completed:
-                self._set_state(
-                    state,
-                    "Stop Detection before closing; Session will close automatically after save and seal",
-                )
-                return False
+            session = self.session
+            if session is not None and str(
+                getattr(session, "state", "") or ""
+            ).upper() == "SEALED":
+                return True
+
+        if state not in _SEALED_STATES | {"IDLE"}:
             if (
                 state in {"COLLECTING", "RECOVERABLE"}
                 and not detection_started

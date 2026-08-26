@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import time
+import threading
 from collections import deque
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from wiris_stereo_distance.stereo import DetectionObservation
 from wiris_stereo_distance.yolo_stream import YoloStreamWorker
+
+
+CAMERA_STOP_TERMINATE_AFTER_S = 12.0
+CAMERA_STOP_KILL_AFTER_S = 20.0
 
 
 def infer_camera_timestamp_reference(metadata: dict) -> str:
@@ -49,6 +54,15 @@ class CameraPane(QtWidgets.QGroupBox):
         self.detection_stream_active = False
         self.stream_generation = 0
         self.current_status = "중지됨"
+        self._preview_lock = threading.Lock()
+        self._pending_preview: tuple[int, QtGui.QImage, object] | None = None
+        self._preview_frame_callback = None
+        self._preview_timer = QtCore.QTimer(self)
+        self._preview_timer.setTimerType(QtCore.Qt.PreciseTimer)
+        self._preview_timer.setInterval(67)
+        self._preview_timer.timeout.connect(self._drain_preview_frame)
+        self._stop_requested_monotonic_s: float | None = None
+        self._stop_escalation_level = 0
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(10, 12, 10, 10)
@@ -64,9 +78,11 @@ class CameraPane(QtWidgets.QGroupBox):
         self.detection_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         layout.addWidget(self.detection_label)
 
-    def start_stream(self, url: str, *, enable_detection: bool, **kwargs) -> None:
+    def start_stream(self, url: str, *, enable_detection: bool, **kwargs) -> bool:
         if self.worker is not None or self.thread is not None:
-            self.stop()
+            if not self.stop(wait=False):
+                self._set_status("이전 카메라 worker 종료 대기 중")
+                return False
         self.stream_generation += 1
         stream_generation = self.stream_generation
         self.latest_image = None
@@ -77,6 +93,10 @@ class CameraPane(QtWidgets.QGroupBox):
         self.selected_measurement_frame_timestamp_s = None
         self.selected_measurement_frame_lookup_delta_s = None
         self.detection_stream_active = bool(enable_detection)
+        self._clear_pending_preview()
+        self._preview_timer.start()
+        self._stop_requested_monotonic_s = None
+        self._stop_escalation_level = 0
         self.image_label.setPixmap(QtGui.QPixmap())
         self.image_label.setText("YOLO 시작 중..." if enable_detection else "카메라 연결 중...")
         self._set_detection_label(None)
@@ -84,11 +104,11 @@ class CameraPane(QtWidgets.QGroupBox):
         self.worker = YoloStreamWorker(url=url, enable_detection=enable_detection, **kwargs)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
-        self.worker.frame_ready.connect(
-            lambda image, metadata, generation=stream_generation: self._show_frame_if_current(
-                generation, image, metadata
-            )
-        )
+        def submit_preview(image, metadata, generation=stream_generation) -> None:
+            self._submit_preview_frame_for_generation(generation, image, metadata)
+
+        self._preview_frame_callback = submit_preview
+        self.worker.frame_ready.connect(submit_preview, QtCore.Qt.DirectConnection)
         self.worker.measurement_frame_ready.connect(
             lambda timestamp_s, image, generation=stream_generation: self._store_measurement_frame_if_current(
                 generation, timestamp_s, image
@@ -113,22 +133,77 @@ class CameraPane(QtWidgets.QGroupBox):
         )
         self.thread.start()
         self._set_status("YOLO 시작 중" if enable_detection else "카메라 연결 중")
+        return True
 
-    def start_yolo(self, url: str, **kwargs) -> None:
-        self.start_stream(url, enable_detection=True, **kwargs)
+    def start_yolo(self, url: str, **kwargs) -> bool:
+        return self.start_stream(url, enable_detection=True, **kwargs)
 
-    def stop(self, *, wait: bool = False) -> None:
+    def stop(self, *, wait: bool = False) -> bool:
         self.stream_generation += 1
         worker = self.worker
         thread = self.thread
         if worker is not None:
+            callback = self._preview_frame_callback
+            if callback is not None:
+                try:
+                    worker.frame_ready.disconnect(callback)
+                except (TypeError, RuntimeError):
+                    pass
+            self._preview_frame_callback = None
             worker.request_stop()
-        if wait and thread is not None and not thread.wait(1000):
-            thread.requestInterruption()
-            thread.terminate()
-            thread.wait(250)
-        self.worker = None
-        self.thread = None
+            if self._stop_requested_monotonic_s is None:
+                self._stop_requested_monotonic_s = time.monotonic()
+        stopped = thread is None
+        if thread is not None:
+            if wait:
+                stopped = bool(thread.wait(1500))
+                if not stopped and worker is not None:
+                    # The worker owns a multiprocessing child and its recorder.
+                    # Stop that resource owner before waiting for the QThread;
+                    # terminating the QThread would skip recorder finalization.
+                    force_stop = getattr(worker, "stop", None)
+                    if callable(force_stop):
+                        force_stop()
+                    stopped = bool(thread.wait(1500))
+            else:
+                is_running = getattr(thread, "isRunning", None)
+                stopped = bool(
+                    callable(is_running) and not is_running()
+                )
+                if (
+                    not stopped
+                    and worker is not None
+                    and self._stop_requested_monotonic_s is not None
+                ):
+                    elapsed_s = max(
+                        0.0,
+                        time.monotonic() - self._stop_requested_monotonic_s,
+                    )
+                    if (
+                        elapsed_s >= CAMERA_STOP_KILL_AFTER_S
+                        and self._stop_escalation_level < 2
+                    ):
+                        kill_child = getattr(worker, "kill_child_process", None)
+                        if callable(kill_child):
+                            kill_child()
+                        self._stop_escalation_level = 2
+                    elif (
+                        elapsed_s >= CAMERA_STOP_TERMINATE_AFTER_S
+                        and self._stop_escalation_level < 1
+                    ):
+                        terminate_child = getattr(
+                            worker,
+                            "terminate_child_process",
+                            None,
+                        )
+                        if callable(terminate_child):
+                            terminate_child()
+                        self._stop_escalation_level = 1
+        if stopped:
+            self.worker = None
+            self.thread = None
+            self._stop_requested_monotonic_s = None
+            self._stop_escalation_level = 0
         self.latest_image = None
         self.latest_detection = None
         self.measurement_frame_images.clear()
@@ -137,18 +212,26 @@ class CameraPane(QtWidgets.QGroupBox):
         self.selected_measurement_frame_timestamp_s = None
         self.selected_measurement_frame_lookup_delta_s = None
         self.detection_stream_active = False
+        self._preview_timer.stop()
+        self._clear_pending_preview()
         self.image_label.setText("중지됨")
         self.image_label.setPixmap(QtGui.QPixmap())
         self._set_status("중지됨")
         self._set_detection_label(None)
         self.detection_changed.emit(self.camera_label, None)
+        if not stopped:
+            self._set_status("종료 대기 중")
+        return stopped
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override.
         self._refresh_pixmap()
         super().resizeEvent(event)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override.
-        self.stop(wait=True)
+        if not self.stop(wait=False):
+            event.ignore()
+            QtCore.QTimer.singleShot(100, self.close)
+            return
         super().closeEvent(event)
 
     def _show_frame(self, image: QtGui.QImage, metadata: object | None = None) -> None:
@@ -169,6 +252,31 @@ class CameraPane(QtWidgets.QGroupBox):
         if generation != self.stream_generation:
             return
         self._show_frame(image, metadata)
+
+    def _submit_preview_frame_for_generation(
+        self,
+        generation: int,
+        image: QtGui.QImage,
+        metadata: object,
+    ) -> None:
+        if generation != self.stream_generation:
+            return
+        with self._preview_lock:
+            self._pending_preview = (generation, image, metadata)
+
+    @QtCore.pyqtSlot()
+    def _drain_preview_frame(self) -> None:
+        with self._preview_lock:
+            pending = self._pending_preview
+            self._pending_preview = None
+        if pending is None:
+            return
+        generation, image, metadata = pending
+        self._show_frame_if_current(generation, image, metadata)
+
+    def _clear_pending_preview(self) -> None:
+        with self._preview_lock:
+            self._pending_preview = None
 
     def _store_measurement_frame(self, timestamp_s: float, image: QtGui.QImage) -> None:
         key = float(timestamp_s)
@@ -307,8 +415,12 @@ class CameraPane(QtWidgets.QGroupBox):
         )
         self.detection_label.setText(text)
 
-    def _clear_thread_if_current(self, generation: int, thread: QtCore.QThread) -> None:
-        if generation != self.stream_generation or self.thread is not thread:
+    def _clear_thread_if_current(self, _generation: int, thread: QtCore.QThread) -> None:
+        # stop() advances stream_generation so stale frames are rejected, but
+        # the stopped thread still owns the worker until this callback runs.
+        if self.thread is not thread:
             return
         self.thread = None
         self.worker = None
+        self._stop_requested_monotonic_s = None
+        self._stop_escalation_level = 0

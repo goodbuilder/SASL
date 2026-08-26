@@ -152,6 +152,7 @@ def test_calibration_workspace_separates_live_and_ftp_previews_with_actions_belo
         lambda: None,
         lambda _command_id: True,
     )
+    workspace.advanced_calibration_toggle.setChecked(True)
     workspace.resize(1000, 700)
     workspace.show()
     app.processEvents()
@@ -852,6 +853,32 @@ def test_calibration_workspace_keeps_checkerboard_overlay_over_live_frame() -> N
     panel.right_pane.deleteLater()
     panel.deleteLater()
     app.processEvents()
+
+
+def test_calibration_checkerboard_overlay_uses_red_accent() -> None:
+    from PyQt5 import QtGui
+
+    from Workstation import standalone_gui
+    from Workstation.workstation_core.theme import ACCENT
+
+    source = QtGui.QImage(120, 120, QtGui.QImage.Format_RGB888)
+    source.fill(QtGui.QColor("black"))
+    panel = SimpleNamespace(
+        _checkerboard_config=lambda: SimpleNamespace(pattern_size=(2, 2))
+    )
+    corners = [(40.0, 40.0), (80.0, 40.0), (40.0, 80.0), (80.0, 80.0)]
+
+    overlay = standalone_gui.WirisStereoDistancePanel._calibration_overlay_image(
+        panel,
+        source,
+        found=True,
+        corners=corners,
+        status="checkerboard: found",
+    )
+
+    expected = QtGui.QColor(ACCENT)
+    assert overlay.pixelColor(40, 40) == expected
+    assert overlay.pixelColor(60, 40) == expected
 
 def test_wiris_command_and_zoom_workers_keep_tcp_io_off_ui_path(monkeypatch) -> None:
     from Workstation import standalone_gui
@@ -1809,10 +1836,10 @@ def test_workstation_uses_source_backed_alignment_calibration_and_recording_page
     assert window.calibration.intrinsic_model.rowCount() == 2
     window._select_context("tasks.session_details")
     app.processEvents()
-    assert window._current_context == "tasks.session"
-    assert window.navigation.currentIndex().data(QtCore.Qt.UserRole) == "tasks.session"
-    assert window.sessions.current_tab_id() == "review"
-    assert window.recording.artifact_model.rowCount() >= 1
+    assert window._current_context == "tasks.data"
+    assert window.navigation.currentIndex().data(QtCore.Qt.UserRole) == "tasks.data"
+    assert window.sessions.current_tab_id() == "current"
+    assert window.recording.artifact_model.headerData(0, QtCore.Qt.Horizontal) == "Type"
     assert window.recording.protocol_state_label.text().startswith("BLOCKED")
     assert any("Both camera streams" in label.text() for label in window.recording.protocol_check_labels.values())
     assert any("Checkerboard stereo R,t" in label.text() for label in window.recording.protocol_check_labels.values())
@@ -1938,16 +1965,12 @@ def test_load_intrinsics_opens_file_picker_and_applies_selected_profile(
     assert "profiles/intrinsics" in immutable.as_posix()
     assert load_intrinsics_json(immutable) == result
     assert panel.manual_focal_checkbox.isChecked() is False
-    assert panel.calibration_status_label.text().startswith(
-        "Loaded and applied intrinsics: selected_intrinsics.json | Session copy="
+    assert panel.calibration_status_label.text() == (
+        "Loaded and applied intrinsics: selected_intrinsics.json"
     )
-    session_copies = list(
-        (tmp_path / "recordings" / panel.recording_session_id / "calibration").glob(
-            "*/loaded_intrinsics/*-selected_intrinsics.json"
-        )
-    )
-    assert len(session_copies) == 1
-    assert session_copies[0].read_bytes() == selected_path.read_bytes()
+    assert not (
+        tmp_path / "recordings" / panel.recording_session_id / "calibration"
+    ).exists()
     panel.deleteLater()
     app.processEvents()
 

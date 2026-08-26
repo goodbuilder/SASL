@@ -3,9 +3,49 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from Workstation.workstation_core.run_evidence import RunEvidenceLedger
+
+
+PERSISTENCE_FAILURE_SCHEMA = "workstation-persistence-failure-v1"
+
+
+def persistence_failure_error(result: object) -> str | None:
+    """Return the persisted error text for the controller's failure contract."""
+
+    if not isinstance(result, Mapping):
+        return None
+    if (
+        result.get("schema") != PERSISTENCE_FAILURE_SCHEMA
+        or result.get("status") != "failed"
+    ):
+        return None
+    return str(result.get("error") or "persistence operation failed")
+
+
+def report_recoverable_persistence_failure(panel: object, message: str) -> None:
+    """Publish one recoverable storage failure through the shared panel state."""
+
+    text = str(message)
+    if not bool(getattr(panel, "_measurement_session_hierarchy_enabled", True)):
+        label = getattr(panel, "recording_status_label", None)
+        setter = getattr(label, "setText", None)
+        if callable(setter):
+            setter(f"데이터 저장 저하(측정 계속): {text}")
+        logger = getattr(panel, "_log", None)
+        if callable(logger):
+            logger(f"[저장] {text}; Measurement continues")
+        return
+    setattr(panel, "_session_save_retry_required", True)
+    setattr(panel, "_session_save_last_error", text)
+    label = getattr(panel, "recording_status_label", None)
+    setter = getattr(label, "setText", None)
+    if callable(setter):
+        setter(f"세션 기록 실패(복구 가능): {text}")
+    logger = getattr(panel, "_log", None)
+    if callable(logger):
+        logger(f"[저장] {text}")
 
 
 RUN_EVIDENCE_CONTROLLER_METHODS = (
@@ -44,12 +84,52 @@ class RunEvidenceController:
         ledger = self._ledger
         if ledger is None or ledger.root != root:
             if ledger is not None:
-                try:
-                    ledger.flush()
-                except OSError as exc:
-                    self._record_persistence_failure(exc)
+                # Do not abandon the old dirty ledger when its durability
+                # barrier fails.  The public wrapper records the failure and
+                # leaves this binding intact so the same session can retry.
+                ledger.flush()
             ledger = RunEvidenceLedger(root)
             self._ledger = ledger
+        return ledger
+
+    def _get_or_create_session_ledger(self) -> RunEvidenceLedger:
+        ledger = self._ensure_session_ledger()
+        if ledger is None:
+            ledger = RunEvidenceLedger(self._session_root())
+            self._ledger = ledger
+        return ledger
+
+    def _run_persistence(
+        self,
+        kind: str,
+        operation: Callable[[], Any],
+    ) -> Any:
+        try:
+            return operation()
+        except OSError as exc:
+            self._record_persistence_failure(exc)
+            return self._failed_write_result(kind, exc)
+
+    def _locked_ledger_or_failure(self) -> RunEvidenceLedger | dict[str, Any]:
+        ledger = self._run_persistence(
+            "run_event_setup",
+            self._get_or_create_session_ledger,
+        )
+        if self.is_persistence_failure(ledger):
+            return dict(ledger)
+        assert isinstance(ledger, RunEvidenceLedger)
+        if ledger.locked:
+            return ledger
+        setup = self._run_persistence(
+            "run_event",
+            lambda: ledger.append_event(
+                "session_prepared",
+                {},
+                source="RunEvidenceController",
+            ),
+        )
+        if self.is_persistence_failure(setup):
+            return dict(setup)
         return ledger
 
     def ensure_workstation_run_evidence(
@@ -60,24 +140,32 @@ class RunEvidenceController:
         source: str = "Workstation",
         coordinate_contract: str = "not_applicable",
     ) -> dict[str, Any]:
-        try:
-            ledger = self._ensure_session_ledger()
-            if ledger is None:
-                ledger = RunEvidenceLedger(self._session_root())
-                self._ledger = ledger
-        except OSError as exc:
-            self._record_persistence_failure(exc)
-            return self._failed_write_result("run_event_setup", exc)
-        try:
-            return ledger.append_event(
+        if not bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", True)):
+            event = {
+                "event_type": str(event_type),
+                "source": str(source),
+                "coordinate_contract": str(coordinate_contract),
+                "payload": dict(payload or {}),
+            }
+            writer = getattr(self.panel, "append_workstation_data", None)
+            persisted = bool(writer("events", event, priority=True)) if callable(writer) else False
+            return {**event, "persisted": persisted}
+        ledger = self._run_persistence(
+            "run_event_setup",
+            self._get_or_create_session_ledger,
+        )
+        if self.is_persistence_failure(ledger):
+            return dict(ledger)
+        assert isinstance(ledger, RunEvidenceLedger)
+        return self._run_persistence(
+            "run_event",
+            lambda: ledger.append_event(
                 event_type,
                 dict(payload or {}),
                 source=source,
                 coordinate_contract=coordinate_contract,
-            )
-        except OSError as exc:
-            self._record_persistence_failure(exc)
-            return self._failed_write_result("run_event", exc)
+            ),
+        )
 
     def append_workstation_run_event(
         self,
@@ -88,25 +176,31 @@ class RunEvidenceController:
         coordinate_contract: str,
         source_timestamp_ns: int | None = None,
     ) -> dict[str, Any]:
-        if self._ledger is None or not self._ledger.locked:
-            setup = self.ensure_workstation_run_evidence(
-                "session_prepared",
-                {},
-                source="RunEvidenceController",
-            )
-            if self._ledger is None:
-                return dict(setup)
-        try:
-            return self._ledger.append_event(
+        if not bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", True)):
+            event = {
+                "event_type": str(event_type),
+                "source": str(source),
+                "source_timestamp_ns": source_timestamp_ns,
+                "coordinate_contract": str(coordinate_contract),
+                "payload": dict(payload),
+            }
+            writer = getattr(self.panel, "append_workstation_data", None)
+            persisted = bool(writer("events", event, priority=True)) if callable(writer) else False
+            return {**event, "persisted": persisted}
+        ledger = self._locked_ledger_or_failure()
+        if self.is_persistence_failure(ledger):
+            return dict(ledger)
+        assert isinstance(ledger, RunEvidenceLedger)
+        return self._run_persistence(
+            "run_event",
+            lambda: ledger.append_event(
                 event_type,
                 payload,
                 source=source,
                 source_timestamp_ns=source_timestamp_ns,
                 coordinate_contract=coordinate_contract,
-            )
-        except OSError as exc:
-            self._record_persistence_failure(exc)
-            return self._failed_write_result("run_event", exc)
+            ),
+        )
 
     def import_workstation_session_artifact(
         self,
@@ -116,24 +210,32 @@ class RunEvidenceController:
         media_type: str = "application/octet-stream",
         metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if self._ledger is None or not self._ledger.locked:
-            setup = self.ensure_workstation_run_evidence(
-                "session_prepared",
-                {},
-                source="RunEvidenceController",
-            )
-            if self._ledger is None:
-                return dict(setup)
-        try:
-            return self._ledger.import_artifact(
+        if not bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", True)):
+            source = Path(source_path).expanduser().resolve(strict=True)
+            record = {
+                "event_type": "artifact_import_reference",
+                "role": str(role),
+                "media_type": str(media_type),
+                "source_path": str(source),
+                "size_bytes": source.stat().st_size,
+                "metadata": dict(metadata or {}),
+            }
+            writer = getattr(self.panel, "append_workstation_data", None)
+            persisted = bool(writer("artifacts", record, priority=True)) if callable(writer) else False
+            return {**record, "persisted": persisted}
+        ledger = self._locked_ledger_or_failure()
+        if self.is_persistence_failure(ledger):
+            return dict(ledger)
+        assert isinstance(ledger, RunEvidenceLedger)
+        return self._run_persistence(
+            "artifact_import",
+            lambda: ledger.import_artifact(
                 source_path,
                 role=role,
                 media_type=media_type,
                 metadata=metadata,
-            ).to_mapping()
-        except OSError as exc:
-            self._record_persistence_failure(exc)
-            return self._failed_write_result("artifact_import", exc)
+            ).to_mapping(),
+        )
 
     def register_workstation_session_artifact(
         self,
@@ -147,28 +249,41 @@ class RunEvidenceController:
     ) -> dict[str, Any]:
         """Inventory an already sealed file below the active session root."""
 
-        if self._ledger is None or not self._ledger.locked:
-            setup = self.ensure_workstation_run_evidence(
-                "session_prepared",
-                {},
-                source="RunEvidenceController",
-            )
-            if self._ledger is None:
-                return dict(setup)
-        try:
-            return self._ledger.register_session_artifact(
+        if not bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", True)):
+            path = Path(session_path).expanduser().resolve(strict=True)
+            record = {
+                "event_type": "artifact_registered",
+                "role": str(role),
+                "media_type": str(media_type),
+                "path": str(path),
+                "size_bytes": path.stat().st_size,
+                "expected_size_bytes": expected_size_bytes,
+                "expected_sha256": expected_sha256,
+                "metadata": dict(metadata or {}),
+            }
+            writer = getattr(self.panel, "append_workstation_data", None)
+            persisted = bool(writer("artifacts", record, priority=True)) if callable(writer) else False
+            return {**record, "persisted": persisted}
+        ledger = self._locked_ledger_or_failure()
+        if self.is_persistence_failure(ledger):
+            return dict(ledger)
+        assert isinstance(ledger, RunEvidenceLedger)
+        return self._run_persistence(
+            "artifact_registration",
+            lambda: ledger.register_session_artifact(
                 session_path,
                 role=role,
                 media_type=media_type,
                 metadata=metadata,
                 expected_size_bytes=expected_size_bytes,
                 expected_sha256=expected_sha256,
-            ).to_mapping()
-        except OSError as exc:
-            self._record_persistence_failure(exc)
-            return self._failed_write_result("artifact_registration", exc)
+            ).to_mapping(),
+        )
 
     def flush_workstation_run_evidence(self) -> bool:
+        if not bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", True)):
+            flusher = getattr(self.panel, "flush_workstation_data", None)
+            return True if not callable(flusher) else bool(flusher())
         ledger = self._ledger
         if ledger is None:
             return True
@@ -181,24 +296,28 @@ class RunEvidenceController:
 
     def _record_persistence_failure(self, exc: OSError) -> None:
         message = f"run evidence persistence failed: {exc}"
-        setattr(self.panel, "_session_save_retry_required", True)
-        setattr(self.panel, "_session_save_last_error", message)
-        label = getattr(self.panel, "recording_status_label", None)
-        setter = getattr(label, "setText", None)
-        if callable(setter):
-            setter(f"세션 기록 실패(복구 가능): {message}")
-        logger = getattr(self.panel, "_log", None)
-        if callable(logger):
-            logger(f"[저장] {message}")
+        report_recoverable_persistence_failure(self.panel, message)
 
     @staticmethod
     def _failed_write_result(kind: str, exc: OSError) -> dict[str, Any]:
         return {
-            "schema": "workstation-persistence-failure-v1",
+            "schema": PERSISTENCE_FAILURE_SCHEMA,
             "status": "failed",
             "kind": str(kind),
             "error": str(exc),
         }
 
+    @staticmethod
+    def is_persistence_failure(result: object) -> bool:
+        """True when a helper above swallowed an OSError and returned a failure dict."""
 
-__all__ = ["RUN_EVIDENCE_CONTROLLER_METHODS", "RunEvidenceController"]
+        return persistence_failure_error(result) is not None
+
+
+__all__ = [
+    "PERSISTENCE_FAILURE_SCHEMA",
+    "RUN_EVIDENCE_CONTROLLER_METHODS",
+    "RunEvidenceController",
+    "persistence_failure_error",
+    "report_recoverable_persistence_failure",
+]

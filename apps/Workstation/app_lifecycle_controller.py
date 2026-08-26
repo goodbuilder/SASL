@@ -4,6 +4,8 @@ from __future__ import annotations
 import time
 from PyQt5 import QtCore, QtWidgets
 
+from Workstation.run_evidence_controller import persistence_failure_error
+
 
 SHUTDOWN_DEADLINE_S = 5.0
 SHUTDOWN_FORCE_WAIT_S = 1.0
@@ -24,20 +26,34 @@ APP_LIFECYCLE_METHODS = [
 class AppLifecycleController:
     def __init__(self, panel):
         self.panel = panel
+        self._linked_target_artifact_ids: set[str] = set()
 
     def _shutdown_save_settings(self) -> bool:
+        flush_ok = True
+        data_flusher = getattr(self.panel, "flush_workstation_data", None)
+        if callable(data_flusher):
+            try:
+                if data_flusher() is False:
+                    flush_ok = False
+                    self.panel._log("[종료] measurement data flush 요청 실패")
+            except Exception as exc:
+                flush_ok = False
+                self.panel._log(f"[종료] measurement data flush 요청 실패: {exc}")
         flusher = getattr(self.panel, "flush_workstation_run_evidence", None)
         if callable(flusher):
             try:
-                flusher()
+                if flusher() is False:
+                    flush_ok = False
+                    self.panel._log("[종료] run evidence flush 실패")
             except Exception as exc:
+                flush_ok = False
                 self.panel._log(f"[종료] run evidence flush 실패: {exc}")
         try:
             self.panel._save_current_settings()
         except Exception as exc:
             self.panel._log(f"[종료] 설정 저장 실패: {exc}")
             return False
-        return True
+        return flush_ok
 
     def _shutdown_stop_thread(self, attr: str) -> bool:
         thread = getattr(self.panel, attr, None)
@@ -125,38 +141,77 @@ class AppLifecycleController:
         if owner is None:
             return True
         snapshot = owner.target_drone_stream_snapshot()
-        if not snapshot.get("worker_alive") and snapshot.get("phase") in {
-            "UNCONFIGURED",
-            "CONFIGURED",
-            "DEFERRED",
-            "STOPPED",
-            "SEALED",
-            "FAILED",
+        result = snapshot
+        if snapshot.get("worker_alive") or snapshot.get("phase") in {
+            "RUNNING",
+            "STARTING",
         }:
-            return True
-        try:
-            result = owner.stop_target_drone_stream(timeout_s=1.0)
-        except Exception as exc:
-            self.panel._log(f"[종료] Target Drone drain/stop 실패: {exc}")
+            try:
+                result = owner.stop_target_drone_stream(timeout_s=1.0)
+            except Exception as exc:
+                self.panel._log(f"[종료] Target Drone drain/stop 실패: {exc}")
+                return False
+        if not isinstance(result, dict):
+            self.panel._log("[종료] Target Drone stop snapshot이 잘못된 형식입니다.")
             return False
         artifact = result.get("artifact") if isinstance(result, dict) else None
         if isinstance(artifact, dict):
-            importer = getattr(self.panel, "import_workstation_session_artifact", None)
-            if callable(importer) and not artifact.get("ledger_imported"):
+            artifact_id = str(
+                artifact.get("artifact_id")
+                or artifact.get("sha256")
+                or artifact.get("absolute_path")
+                or ""
+            )
+            if artifact_id not in self._linked_target_artifact_ids:
+                registrar = getattr(
+                    self.panel,
+                    "register_workstation_session_artifact",
+                    None,
+                )
+                importer = getattr(
+                    self.panel,
+                    "import_workstation_session_artifact",
+                    None,
+                )
                 try:
-                    importer(
-                        artifact["absolute_path"],
-                        role="target_drone_raw_mavlink_jsonl",
-                        media_type="application/x-ndjson",
-                        metadata={
-                            key: value
-                            for key, value in artifact.items()
-                            if key != "absolute_path"
-                        },
-                    )
+                    metadata = {
+                        key: value
+                        for key, value in artifact.items()
+                        if key != "absolute_path"
+                    }
+                    if callable(registrar):
+                        linkage = registrar(
+                            artifact["absolute_path"],
+                            role="target_drone_raw_mavlink_jsonl",
+                            media_type="application/x-ndjson",
+                            metadata=metadata,
+                            expected_size_bytes=artifact.get("size_bytes"),
+                            expected_sha256=artifact.get("sha256"),
+                        )
+                    elif callable(importer):
+                        linkage = importer(
+                            artifact["absolute_path"],
+                            role="target_drone_raw_mavlink_jsonl",
+                            media_type="application/x-ndjson",
+                            metadata=metadata,
+                        )
+                    else:
+                        self.panel._log(
+                            "[종료] Target Drone artifact linkage owner가 없습니다."
+                        )
+                        return False
                 except Exception as exc:
                     self.panel._log(f"[종료] Target Drone artifact linkage 실패: {exc}")
                     return False
+                linkage_error = persistence_failure_error(linkage)
+                if linkage_error is not None:
+                    self.panel._log(
+                        "[종료] Target Drone artifact linkage 실패: "
+                        f"{linkage_error}"
+                    )
+                    return False
+                if artifact_id:
+                    self._linked_target_artifact_ids.add(artifact_id)
         return not bool(result.get("worker_alive"))
 
     def _shutdown_stop_drone_telemetry(self) -> bool:
@@ -207,10 +262,20 @@ class AppLifecycleController:
         flusher = getattr(self.panel, "flush_workstation_run_evidence", None)
         if callable(flusher):
             try:
-                flusher()
+                if flusher() is False and callable(logger):
+                    logger("[종료] run evidence 최종 flush 실패")
             except Exception as exc:  # noqa: BLE001 - force close continues.
                 if callable(logger):
                     logger(f"[종료] run evidence 최종 flush 실패: {exc}")
+
+        data_closer = getattr(self.panel, "close_workstation_data", None)
+        if callable(data_closer):
+            try:
+                if data_closer(timeout_s=0.1) is False and callable(logger):
+                    logger("[종료] measurement data writer가 deadline 내 종료되지 않았습니다")
+            except Exception as exc:  # noqa: BLE001 - force close continues.
+                if callable(logger):
+                    logger(f"[종료] measurement data writer 종료 실패: {exc}")
 
         for side in ("left", "right"):
             pane = getattr(self.panel, f"{side}_pane", None)

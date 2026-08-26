@@ -3,6 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+from Workstation import recording_controller as recording_module
 from Workstation.recording_controller import RecordingController
 
 
@@ -78,3 +81,41 @@ def test_session_owned_artifact_keeps_legacy_external_import_fallback(tmp_path: 
             },
         )
     ]
+
+
+def test_ulog_finalization_rejects_structured_registration_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class FakeULogController:
+        session_root = tmp_path
+
+        def ulog_snapshot(self) -> dict[str, object]:
+            return {
+                "sources": {},
+                "artifacts": [
+                    {
+                        "relative_path": "ulog/left/flight.ulg",
+                        "source_id": "left",
+                        "size_bytes": 12,
+                        "sha256": "a" * 64,
+                    }
+                ],
+            }
+
+        def stop_automatic_ulog_and_collect(self, _source: object) -> None:
+            raise AssertionError("no automatic source should be stopped")
+
+    monkeypatch.setattr(recording_module, "ULogController", FakeULogController)
+    panel = SimpleNamespace(
+        _workstation_ulog_controller=FakeULogController(),
+        register_workstation_session_artifact=lambda *_args, **_kwargs: {
+            "schema": "workstation-persistence-failure-v1",
+            "status": "failed",
+            "kind": "artifact_registration",
+            "error": "ulog-disk-sentinel",
+        },
+    )
+
+    with pytest.raises(OSError, match="ulog-disk-sentinel"):
+        RecordingController(panel)._finalize_workstation_ulogs()

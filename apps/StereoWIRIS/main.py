@@ -1,9 +1,28 @@
 import json
-from pathlib import Path
 import os
 import sys
+from pathlib import Path
 
 SASL_ROOT = Path(__file__).resolve().parents[2]
+COMMON_PYTHON = SASL_ROOT / "common" / "python"
+if str(COMMON_PYTHON) not in sys.path:
+    sys.path.insert(0, str(COMMON_PYTHON))
+
+from sasl_common.operator_runtime import (
+    DECODER_AUTO,
+    check_execution,
+    render_report,
+)
+
+
+def _operator_runtime_gate() -> int:
+    report = check_execution(DECODER_AUTO, root=SASL_ROOT)
+    if report.exit_code:
+        print(render_report(report, title="StereoWIRIS startup blocked"), file=sys.stderr)
+        return report.exit_code
+    if any(item.level == "WARN" for item in report.diagnostics):
+        print(render_report(report, title="StereoWIRIS startup warning"))
+    return 0
 
 
 def _workstation_requested(argv: list[str]) -> bool:
@@ -53,6 +72,11 @@ def _mavlink_only_requested(argv: list[str]) -> bool:
 # not need a ROS installation or a generated px4_msgs overlay just to start.
 WORKSTATION_REQUESTED = _workstation_requested(sys.argv)
 MAVLINK_ONLY_REQUESTED = _mavlink_only_requested(sys.argv)
+
+if __name__ == "__main__" and not any(argument in {"--help", "-h"} for argument in sys.argv[1:]):
+    runtime_status = _operator_runtime_gate()
+    if runtime_status:
+        raise SystemExit(runtime_status)
 
 if not WORKSTATION_REQUESTED:
     # The panel uses this runtime marker to disable ROS2-only controls and

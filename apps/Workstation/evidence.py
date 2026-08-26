@@ -1442,6 +1442,12 @@ class EvidenceAdapter:
                 "last_chunk_age_s": ntrip_health.transport_age_s,
                 "last_gga_age_s": _age(getattr(network_stats, "last_gga_monotonic_s", None), now),
                 "gga_sent_count": _integer(getattr(network_stats, "gga_sent_count", 0), 0),
+                # A VRS caster withholds RTCM without periodic GGA while the
+                # transport itself stays "connected" -- this is the reason
+                # _gnss_gga_provider() last returned None instead of a
+                # sentence, empty once it succeeds again.
+                "gga_skip_reason": str(getattr(self.panel, "_gnss_last_gga_skip_reason", "") or ""),
+                "gga_skip_age_s": _age(getattr(self.panel, "_gnss_last_gga_skip_monotonic_s", None), now),
                 "bytes_received": ntrip_health.bytes_received,
                 "chunks_received": ntrip_health.chunks_received,
                 "byte_rate_bps": (
@@ -1573,38 +1579,81 @@ class EvidenceAdapter:
         panel = self.panel
         url_widget = getattr(panel, f"{side}_pixhawk_bootstrap_url_edit", None)
         baud_widget = getattr(panel, f"{side}_pixhawk_bootstrap_baud_spin", None)
-        status_by_side = getattr(panel, "pixhawk_usb_bootstrap_status", {}) or {}
+        status_by_side = getattr(panel, "pixhawk_usb_recovery_status", {}) or {}
         record = status_by_side.get(side, {}) if isinstance(status_by_side, Mapping) else {}
         record = record if isinstance(record, Mapping) else {}
-        active = getattr(panel, "pixhawk_usb_bootstrap_thread", None) is not None
+        active = getattr(panel, "pixhawk_usb_recovery_thread", None) is not None
         state = str(record.get("state", "IDLE") or "IDLE").upper()
         if active:
             state = "RUNNING"
         detail = str(record.get("detail", "") or "")
         updated_s = _number(record.get("updated_s"))
-        provenance = mavlink_link_provenance(panel, side)
-        attitude = self.attitude(side, now_s=now)
-        attitude_age = _number(attitude.get("age_s"))
-        attitude_ok = (
-            str(attitude.get("state", "WAITING")).upper() == "LIVE"
-            and attitude_age is not None
-            and attitude_age < 2.0
+        subscriber = getattr(panel, "mavlink_pixhawk", None)
+        health_reader = getattr(subscriber, "mavlink_health_snapshot", None)
+        try:
+            health = health_reader(side, now_s=now) if callable(health_reader) else None
+        except Exception:
+            health = None
+        health_state = str(
+            getattr(getattr(health, "state", None), "value", getattr(health, "state", ""))
+            if health is not None
+            else ""
         )
-        link_open = bool(provenance.get("mavlink_link_open", False))
-        heartbeat_ok = bool(provenance.get("mavlink_heartbeat_seen", False))
+        if not active and state == "COMMAND_SENT" and health_state == "RECOVERING":
+            state = "QUALIFYING"
+        elif not active and state in {"COMMAND_SENT", "QUALIFYING"} and health_state == "LIVE":
+            state = "RECOVERED"
+        provenance = mavlink_link_provenance(panel, side)
+        if health is not None:
+            attitude_age = _number(getattr(health, "attitude_rx_age_s", None))
+            heartbeat_age = _number(getattr(health, "heartbeat_rx_age_s", None))
+            attitude_ok = attitude_age is not None and attitude_age <= 2.0
+            heartbeat_ok = heartbeat_age is not None and heartbeat_age <= 3.0
+        else:
+            attitude = self.attitude(side, now_s=now)
+            attitude_age = _number(attitude.get("age_s"))
+            heartbeat_age = None
+            attitude_ok = (
+                str(attitude.get("state", "WAITING")).upper() == "LIVE"
+                and attitude_age is not None
+                and attitude_age < 2.0
+            )
+            heartbeat_ok = bool(provenance.get("mavlink_heartbeat_seen", False))
+        link_open = bool(getattr(health, "listener_open", False)) if health is not None else bool(
+            provenance.get("mavlink_link_open", False)
+        )
         heartbeat_state = "OK" if heartbeat_ok else "WAITING" if link_open else "NO LINK"
         attitude_state = "OK" if attitude_ok else "WAITING"
+        expected_system_id = 1 if side == "left" else 2
+        identities = getattr(panel, "pixhawk_usb_identity_evidence", ()) or ()
+        matching = [
+            item
+            for item in identities
+            if isinstance(item, Mapping)
+            and _integer(item.get("system_id")) == expected_system_id
+        ]
+        identity = matching[0] if len(matching) == 1 else {}
+        usb_url = str(identity.get("device") or _widget_text(url_widget, "--") or "--")
+        usb_baud = _integer(identity.get("baud"))
+        if usb_baud is None:
+            usb_baud = _integer(_widget_value(baud_widget))
         if not detail:
             detail = {
                 "IDLE": "대기",
-                "RUNNING": "USB shell로 PX4 Ethernet MAVLink 시작 중",
-                "RECOVERED": "PX4 Ethernet MAVLink 시작 완료; UDP telemetry 확인 중",
+                "RUNNING": "USB identity 재검증 및 one-shot reboot 진행 중",
+                "COMMAND_SENT": "USB reboot command 전송; Ethernet packet 재개 대기",
+                "QUALIFYING": "Ethernet packet 재개; 10분 qualification 진행 중",
+                "RECOVERED": "10분 qualification 통과",
+                "CANCELLED": "operator 취소",
                 "ERROR": "결과 없음",
             }.get(state, "결과 없음")
         return {
             "side": side,
-            "usb_url": _widget_text(url_widget, "--") or "--",
-            "usb_baud": _integer(_widget_value(baud_widget)),
+            "usb_url": usb_url,
+            "usb_baud": usb_baud,
+            "usb_system_id": _integer(identity.get("system_id")),
+            "usb_component_id": _integer(identity.get("component_id")),
+            "usb_identity_count": len(matching),
             "state": state,
             "detail": detail,
             "updated_age_s": None if updated_s is None else max(0.0, now - updated_s),
@@ -1614,7 +1663,12 @@ class EvidenceAdapter:
             "attitude_state": attitude_state,
             "telemetry": f"Heartbeat {heartbeat_state} · ATTITUDE {attitude_state}",
             "mavlink_endpoint": str(provenance.get("mavlink_endpoint", "") or ""),
-            "contract": "USB control path starts PX4 Ethernet MAVLink; telemetry remains MAVLink attitude evidence",
+            "liveness_state": health_state,
+            "qualification_elapsed_s": _number(getattr(health, "qualification_elapsed_s", None)),
+            "contract": (
+                "unique current USB heartbeat sysid + operator confirmation + one-shot reboot; "
+                "success requires Ethernet HB/ATT 10-minute qualification"
+            ),
         }
 
     def physical_alignment(self) -> dict[str, object]:
@@ -2459,6 +2513,69 @@ class EvidenceAdapter:
 
     def recording(self, *, now_s: float | None = None) -> dict[str, object]:
         now = time.monotonic() if now_s is None else float(now_s)
+        if not bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", True)):
+            storage_reader = getattr(self.panel, "data_storage_snapshot", None)
+            run_reader = getattr(self.panel, "measurement_run_snapshot", None)
+            try:
+                storage = storage_reader() if callable(storage_reader) else {}
+            except Exception as exc:
+                storage = {"state": "UNAVAILABLE", "error": str(exc), "streams": {}}
+            try:
+                run = run_reader() if callable(run_reader) else {}
+            except Exception:
+                run = {}
+            active = bool(
+                getattr(self.panel, "distance_recording_enabled", False)
+                or getattr(self.panel, "video_recording_enabled", False)
+            )
+            elapsed_method = getattr(self.panel, "_recording_elapsed_s", None)
+            try:
+                elapsed = _number(elapsed_method(now)) if callable(elapsed_method) else None
+            except Exception:
+                elapsed = None
+            paths = getattr(self.panel, "video_recording_paths", {}) or {}
+            return {
+                "state": "ACTIVE" if active else str(storage.get("state") or "IDLE"),
+                "active": active,
+                "measurement_state": str(run.get("state") or "IDLE"),
+                "recording_mode": str(
+                    getattr(self.panel, "_recording_mode", "manual") or "manual"
+                ),
+                "output_dir": str(storage.get("root") or ""),
+                "video_paths": {
+                    str(side): str(path) for side, path in paths.items()
+                }
+                if isinstance(paths, dict)
+                else {},
+                "artifacts": (),
+                "elapsed_s": elapsed,
+                "status_label": _widget_text(
+                    getattr(self.panel, "recording_status_label", None), ""
+                ),
+                "retry_required": False,
+                "finalized": False,
+                "storage": storage,
+                "sample_counts": {
+                    "pairs": _safe_len(getattr(self.panel, "distance_recording_rows", ())),
+                    "camera_left": _safe_len(
+                        (getattr(self.panel, "camera_recording_rows", {}) or {}).get("left", ())
+                    ),
+                    "camera_right": _safe_len(
+                        (getattr(self.panel, "camera_recording_rows", {}) or {}).get("right", ())
+                    ),
+                    "px4_left": _safe_len(
+                        (getattr(self.panel, "px4_recording_rows", {}) or {}).get("left", ())
+                    ),
+                    "px4_right": _safe_len(
+                        (getattr(self.panel, "px4_recording_rows", {}) or {}).get("right", ())
+                    ),
+                    "gnss_base": _safe_len(
+                        getattr(self.panel, "gnss_base_recording_rows", ())
+                    ),
+                },
+                "source": "MeasurementDataStore + transient capture state",
+                "clock": "per-record UTC/source clocks",
+            }
         session_id = str(getattr(self.panel, "recording_session_id", "") or "")
         output_dir: Path | None = None
         if session_id:

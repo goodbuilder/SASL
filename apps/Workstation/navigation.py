@@ -5,7 +5,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 _CONTEXT_ALIASES = {
     # Keep saved UI state and external callers compatible while the visible
-    # tree moves to paired contexts and a single session surface.
+    # tree moves to paired contexts and a single Data surface.
     "devices.cameras.left": "devices.cameras",
     "devices.cameras.right": "devices.cameras",
     "devices.cameras.stereo": "devices.cameras",
@@ -13,12 +13,13 @@ _CONTEXT_ALIASES = {
     "devices.pixhawk.p2": "devices.pixhawk",
     "processing.detection": "devices.cameras",
     "processing.synchronization": "devices.time",
-    # Session lifecycle, evidence, and saved review share one visible
-    # workspace.  Legacy recording/review contexts remain valid deep links.
-    "tasks.session_details": "tasks.session",
-    "tasks.recording": "tasks.session",
-    "tasks.playback": "tasks.session",
-    "tasks.export": "tasks.session",
+    # Legacy session/recording/review contexts remain valid deep links into
+    # the sessionless Data workspace; they no longer expose a lifecycle.
+    "tasks.session": "tasks.data",
+    "tasks.session_details": "tasks.data",
+    "tasks.recording": "tasks.data",
+    "tasks.playback": "tasks.data",
+    "tasks.export": "tasks.data",
 }
 
 
@@ -71,9 +72,7 @@ class NavigationTree(QtWidgets.QTreeView):
         devices.appendRow(self._item("Time / Sync", "devices.time"))
         root.appendRow(devices)
 
-        # One Session owns the calibration, alignment, and repeated
-        # measurements performed during the current experiment run.
-        root.appendRow(self._item("Sessions", "tasks.session"))
+        root.appendRow(self._item("Data", "tasks.data"))
         root.appendRow(self._item("Calibration", "tasks.calibration"))
         root.appendRow(self._item("Alignment", "processing.alignment"))
         root.appendRow(self._item("Measurement", "processing.measurement"))

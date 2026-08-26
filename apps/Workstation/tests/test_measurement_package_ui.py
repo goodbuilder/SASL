@@ -246,7 +246,7 @@ def test_measurement_package_controls_follow_explicit_lifecycle() -> None:
     assert workspace.finalize_session_button.text() == "Retry Save"
     assert workspace.session_status_label.text() == "Session: IDLE"
     assert workspace.session_step_label.text() == "Next: Sessions > Current"
-    assert not workspace.control_buttons["detection.toggle"].isEnabled()
+    assert workspace.control_buttons["detection.toggle"].isEnabled()
     assert not workspace.finalize_session_button.isEnabled()
 
     panel.begin_measurement_session()
@@ -284,7 +284,7 @@ def test_measurement_package_controls_follow_explicit_lifecycle() -> None:
         },
     )
     workspace.refresh({})
-    assert not workspace.control_buttons["detection.toggle"].isEnabled()
+    assert workspace.control_buttons["detection.toggle"].isEnabled()
     assert workspace.finalize_session_button.isEnabled()
     assert workspace.evidence_summary_label.text() == (
         "Evidence: INCOMPLETE · 1 ok / 1 missing"
@@ -297,6 +297,7 @@ def test_measurement_package_controls_follow_explicit_lifecycle() -> None:
     assert workspace.session_step_label.text() == "Saving…"
     assert "draining producers" in workspace.session_step_label.toolTip()
     assert "waiting for producer drain" in workspace.session_status_label.toolTip()
+    assert workspace.control_buttons["detection.toggle"].isEnabled()
     assert all(
         len(label.text()) <= workspace.RUN_STATUS_TEXT_LIMIT
         for label in (
@@ -340,7 +341,7 @@ def test_hierarchical_controls_drive_two_measurements_then_close() -> None:
     workspace.refresh({})
     assert workspace.findChild(QtWidgets.QWidget, "measurementPackageStart") is None
     assert workspace.findChild(QtWidgets.QWidget, "measurementPackageNewMeasurement") is None
-    assert not workspace.control_buttons["detection.toggle"].isEnabled()
+    assert workspace.control_buttons["detection.toggle"].isEnabled()
 
     assert backend.begin_measurement_session()
     workspace.refresh({})
@@ -370,6 +371,7 @@ def test_hierarchical_controls_drive_two_measurements_then_close() -> None:
     workspace.finalize_session_button.click()
     assert backend.close_measurement_session()
     workspace.refresh({})
+    assert workspace.control_buttons["detection.toggle"].isEnabled()
 
     assert backend.calls == [
         "session.begin",

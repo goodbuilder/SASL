@@ -33,6 +33,56 @@ class _Subscriber:
         return 2
 
 
+def _health(
+    state: str,
+    *,
+    eligible: bool,
+    generation: int,
+    age_s: float,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        state=SimpleNamespace(value=state),
+        rtcm_eligible=eligible,
+        connection_generation=generation,
+        any_rx_age_s=age_s,
+        stall_reason=("ALL_EXPECTED_RX_SILENT" if state == "ETH MAVLINK RX STALLED" else ""),
+    )
+
+
+class _HealthSubscriber:
+    def __init__(self, health_by_side: dict[str, SimpleNamespace]) -> None:
+        self.health_by_side = health_by_side
+        self.sent: list[tuple[str, bytes]] = []
+
+    def mavlink_health_snapshot(self, side: str, **_kwargs):
+        return self.health_by_side[side]
+
+    def send_rtcm_data_if_eligible(
+        self,
+        side: str,
+        payload: bytes,
+        *,
+        expected_generation: int | None = None,
+    ) -> dict[str, object]:
+        health = self.health_by_side[side]
+        if expected_generation is not None and health.connection_generation != expected_generation:
+            return {
+                "sent": False,
+                "packet_count": 0,
+                "health": health,
+                "block_reason": "connection-generation-changed",
+            }
+        if not health.rtcm_eligible:
+            return {
+                "sent": False,
+                "packet_count": 0,
+                "health": health,
+                "block_reason": "target-mavlink-ineligible",
+            }
+        self.sent.append((side, bytes(payload)))
+        return {"sent": True, "packet_count": 2, "health": health, "block_reason": ""}
+
+
 def test_gnss_base_serial_write_timeout_fails_and_finishes(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
@@ -157,6 +207,144 @@ def test_injection_worker_echoes_pipeline_identity_with_delivery_result(monkeypa
             "last_delivery_s": 42.5,
         }
     ]
+
+
+def test_injection_worker_blocks_only_stalled_side_and_preserves_live_side(monkeypatch) -> None:
+    from Workstation import device_runtime_workers
+
+    monkeypatch.setattr(device_runtime_workers.QtCore.QTimer, "singleShot", lambda *_args: None)
+    subscriber = _HealthSubscriber(
+        {
+            "left": _health(
+                "ETH MAVLINK RX STALLED",
+                eligible=False,
+                generation=3,
+                age_s=12.5,
+            ),
+            "right": _health("QUALIFYING", eligible=True, generation=8, age_s=0.1),
+        }
+    )
+    results: list[dict[str, object]] = []
+    worker = PixhawkRtcmInjectionWorker(subscriber, max_injection_age_s=0.0)
+    worker.injected.connect(results.append)
+
+    worker.enqueue(("left", "right"), RTCM_1077)
+
+    assert subscriber.sent == [("right", RTCM_1077)]
+    result = results[0]
+    assert result["sent"] == (("right", 2),)
+    assert result["failed"] == ()
+    assert result["dropped"] == 0
+    assert result["blocked_stall"] == 1
+    assert result["blocked_generation"] == 0
+    assert result["drop_reason"] == "target-mavlink-stalled"
+    assert result["dropped_targets"] == ("left",)
+    assert result["terminal_outcome"] == "partial-blocked"
+    assert result["target_rx_age_s"] == {"left": 12.5}
+    assert result["target_connection_generations"] == {"left": 3}
+
+
+def test_injection_worker_rechecks_liveness_after_enqueue_before_send(monkeypatch) -> None:
+    from Workstation import device_runtime_workers
+
+    monkeypatch.setattr(device_runtime_workers.QtCore.QMetaObject, "invokeMethod", lambda *_args: None)
+    subscriber = _HealthSubscriber(
+        {
+            "left": _health("QUALIFYING", eligible=True, generation=1, age_s=0.1),
+            "right": _health("QUALIFYING", eligible=True, generation=2, age_s=0.1),
+        }
+    )
+    results: list[dict[str, object]] = []
+    worker = PixhawkRtcmInjectionWorker(subscriber, max_injection_age_s=0.0)
+    worker.injected.connect(results.append)
+    worker.submit_envelope(
+        {"pipeline_sequence": 31, "targets": ("left", "right"), "payload": RTCM_1077}
+    )
+
+    subscriber.health_by_side["left"] = _health(
+        "ETH MAVLINK RX STALLED",
+        eligible=False,
+        generation=1,
+        age_s=10.0,
+    )
+    worker._drain_one()
+
+    assert subscriber.sent == [("right", RTCM_1077)]
+    assert results[0]["pipeline_sequence"] == 31
+    assert results[0]["blocked_stall"] == 1
+    assert results[0]["sent"] == (("right", 2),)
+
+
+def test_injection_worker_rejects_stale_connection_generation(monkeypatch) -> None:
+    from Workstation import device_runtime_workers
+
+    monkeypatch.setattr(device_runtime_workers.QtCore.QMetaObject, "invokeMethod", lambda *_args: None)
+    subscriber = _HealthSubscriber(
+        {"left": _health("QUALIFYING", eligible=True, generation=4, age_s=0.1)}
+    )
+    results: list[dict[str, object]] = []
+    worker = PixhawkRtcmInjectionWorker(subscriber, max_injection_age_s=0.0)
+    worker.injected.connect(results.append)
+    worker.submit_envelope(
+        {"pipeline_sequence": 32, "targets": ("left",), "payload": RTCM_1077}
+    )
+
+    subscriber.health_by_side["left"] = _health(
+        "QUALIFYING",
+        eligible=True,
+        generation=5,
+        age_s=0.0,
+    )
+    worker._drain_one()
+
+    assert subscriber.sent == []
+    assert results[0]["blocked_generation"] == 1
+    assert results[0]["blocked_stall"] == 0
+    assert results[0]["drop_reason"] == "target-mavlink-generation-changed"
+    assert results[0]["terminal_outcome"] == "blocked"
+
+
+def test_rtcm_send_does_not_reset_mavlink_qualification(monkeypatch) -> None:
+    from Workstation import device_runtime_workers
+    from Workstation.workstation_core import pixhawk_attitude
+
+    clock = {"value": 0.0}
+    monkeypatch.setattr(pixhawk_attitude.time, "monotonic", lambda: clock["value"])
+    monkeypatch.setattr(device_runtime_workers.time, "monotonic", lambda: clock["value"])
+    monkeypatch.setattr(device_runtime_workers.QtCore.QTimer, "singleShot", lambda *_args: None)
+
+    sent_packets: list[tuple[int, int]] = []
+    connection = SimpleNamespace(
+        mav=SimpleNamespace(
+            gps_rtcm_data_send=lambda flags, length, _data: sent_packets.append((flags, length))
+        )
+    )
+    subscriber = pixhawk_attitude.DualPixhawkMavlinkSubscriber(
+        left_url="udpin:0.0.0.0:14550",
+        right_url="",
+    )
+    subscriber.connections["left"] = connection
+    model = subscriber._ensure_liveness_listener("left")
+    for message_type in ("HEARTBEAT", "ATTITUDE"):
+        assert model.observe_packet(
+            system_id=1,
+            component_id=1,
+            message_type=message_type,
+            received_at_s=0.0,
+            generation=model.connection_generation,
+        )
+    before = subscriber.mavlink_health_snapshot("left", now_s=0.0)
+
+    clock["value"] = 1.0
+    worker = PixhawkRtcmInjectionWorker(subscriber, max_injection_age_s=0.0)
+    worker.enqueue(("left",), RTCM_1077)
+    after = subscriber.mavlink_health_snapshot("left", now_s=1.0)
+
+    assert sent_packets == [(0, len(RTCM_1077))]
+    assert before.qualification_started_monotonic_s == 0.0
+    assert after.qualification_started_monotonic_s == 0.0
+    assert after.active_command is None
+    assert after.qualification_elapsed_s == 1.0
 
 
 def test_injection_worker_rechecks_age_immediately_before_device_send(monkeypatch) -> None:

@@ -314,7 +314,8 @@ def test_workstation_recording_gate_protects_preview_mapping_and_save() -> None:
     assert not window.commands.action("pixhawk.reset_level_calibration").isEnabled()
     assert not window.commands.action("pixhawk.toggle_mavlink").isEnabled()
     assert window.commands.action("detection.toggle").isEnabled()
-    assert not window.commands.action("session.save").isEnabled()
+    with pytest.raises(KeyError):
+        window.commands.action("session.save")
     assert not window.measurement.control_buttons["camera.toggle"].isEnabled()
     assert window.measurement.control_buttons["detection.toggle"].isEnabled()
     assert not window.time_workspace.operation_buttons["time.set_pc"].isEnabled()
@@ -336,8 +337,8 @@ def test_workstation_recording_gate_protects_preview_mapping_and_save() -> None:
     backend.panel.camera_connected = True
     window.status_adapter.refresh()
     app.processEvents()
-    assert not window.commands.action("detection.toggle").isEnabled()
-    assert not window.measurement.control_buttons["detection.toggle"].isEnabled()
+    assert window.commands.action("detection.toggle").isEnabled()
+    assert window.measurement.control_buttons["detection.toggle"].isEnabled()
 
     backend.panel.recording_active = False
     backend.panel.camera_connected = False
@@ -346,7 +347,8 @@ def test_workstation_recording_gate_protects_preview_mapping_and_save() -> None:
     app.processEvents()
     assert window.commands.action("camera.toggle").isEnabled()
     assert window.commands.action("time.set_pc").isEnabled()
-    assert window.commands.action("session.save").isEnabled()
+    with pytest.raises(KeyError):
+        window.commands.action("session.save")
 
     backend.panel.wiris_time_sync_thread = object()
     window._refresh_from_status(window.status_adapter.model.snapshot())
@@ -358,6 +360,51 @@ def test_workstation_recording_gate_protects_preview_mapping_and_save() -> None:
     app.processEvents()
     window.deleteLater()
     app.processEvents()
+
+
+def test_measurement_command_and_button_do_not_diverge_during_manual_recording() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    package = {
+        "state": "IDLE",
+        "session_state": "OPEN",
+        "session_id": "session-001",
+        "measurement_id": "",
+        "revision": "",
+        "detection_started": False,
+        "detection_completed": False,
+        "artifacts": [],
+    }
+    session = {
+        "state": "OPEN",
+        "session_id": "session-001",
+        "measurements": [],
+    }
+    backend.measurement_package_snapshot = lambda: dict(package)
+    backend.measurement_session_snapshot = lambda: dict(session)
+    backend.begin_measurement = lambda: True
+    backend.toggle_detection = lambda: backend.calls.append("detection.rejected") or False
+    window = WorkstationMainWindow(backend=backend)
+
+    backend.panel.recording_active = True
+    backend.panel.camera_connected = True
+    backend.panel._automatic_session_recording = False
+    window.status_adapter.refresh()
+    app.processEvents()
+
+    assert window.measurement.control_buttons["detection.toggle"].isEnabled()
+    assert window.commands.action("detection.toggle").isEnabled()
+    assert window.commands.invoke("detection.toggle") is False
+    assert backend.calls[-1] == "detection.rejected"
+    assert package["state"] == "IDLE"
+    assert window.measurement.control_buttons["detection.toggle"].isEnabled()
+    assert window.commands.action("detection.toggle").isEnabled()
+
+    window.status_adapter.stop()
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+
 
 def test_recording_preview_updates_in_place_and_key_value_rows_do_not_show_sample_detail(
     monkeypatch: pytest.MonkeyPatch,

@@ -1002,3 +1002,102 @@ def test_zero_quaternion_returns_invalid_triangulation_attempt() -> None:
 
     assert attempt.result is None
     assert attempt.reason == "invalid_quaternion"
+
+
+def test_missing_translation_with_valid_quaternions_reports_missing_rtk_translation() -> None:
+    from Workstation.workstation_core.calibration import CameraIntrinsics
+    from Workstation.workstation_core.triangulation import (
+        triangulate_pixels_with_pixhawk_mount_attempt,
+    )
+
+    intrinsics = CameraIntrinsics(
+        width=640,
+        height=480,
+        camera_matrix=((900.0, 0.0, 320.0), (0.0, 900.0, 240.0), (0.0, 0.0, 1.0)),
+        distortion_coefficients=(0.0, 0.0, 0.0, 0.0, 0.0),
+        reprojection_error_px=0.1,
+        image_count=10,
+    )
+
+    attempt = triangulate_pixels_with_pixhawk_mount_attempt(
+        left_pixel=(340.0, 240.0),
+        right_pixel=(300.0, 240.0),
+        left_intrinsics=intrinsics,
+        right_intrinsics=intrinsics,
+        left_body_to_world_q=(1.0, 0.0, 0.0, 0.0),
+        right_body_to_world_q=(1.0, 0.0, 0.0, 0.0),
+        translation_right_in_left_m=None,
+    )
+
+    assert attempt.result is None
+    assert attempt.reason == "missing_rtk_translation"
+
+
+def test_missing_translation_takes_precedence_over_quaternion_validation() -> None:
+    from Workstation.workstation_core.calibration import CameraIntrinsics
+    from Workstation.workstation_core.triangulation import (
+        triangulate_pixels_with_pixhawk_mount_attempt,
+    )
+
+    intrinsics = CameraIntrinsics(
+        width=640,
+        height=480,
+        camera_matrix=((900.0, 0.0, 320.0), (0.0, 900.0, 240.0), (0.0, 0.0, 1.0)),
+        distortion_coefficients=(0.0, 0.0, 0.0, 0.0, 0.0),
+        reprojection_error_px=0.1,
+        image_count=10,
+    )
+
+    attempt = triangulate_pixels_with_pixhawk_mount_attempt(
+        left_pixel=(340.0, 240.0),
+        right_pixel=(300.0, 240.0),
+        left_intrinsics=intrinsics,
+        right_intrinsics=intrinsics,
+        left_body_to_world_q=(0.0, 0.0, 0.0, 0.0),
+        right_body_to_world_q=(0.0, 0.0, 0.0, 0.0),
+        translation_right_in_left_m=None,
+    )
+
+    assert attempt.reason == "missing_rtk_translation"
+
+
+def test_pixhawk_triangulation_normalizes_each_attitude_once(monkeypatch) -> None:
+    from Workstation.workstation_core import triangulation
+    from Workstation.workstation_core.calibration import CameraIntrinsics
+
+    intrinsics = CameraIntrinsics(
+        width=640,
+        height=480,
+        camera_matrix=((900.0, 0.0, 320.0), (0.0, 900.0, 240.0), (0.0, 0.0, 1.0)),
+        distortion_coefficients=(0.0, 0.0, 0.0, 0.0, 0.0),
+        reprojection_error_px=0.1,
+        image_count=10,
+    )
+    original = triangulation.normalize_quaternion
+    calls: list[tuple[float, ...]] = []
+
+    def counted(value):
+        frozen = tuple(value)
+        calls.append(frozen)
+        return original(frozen)
+
+    monkeypatch.setattr(triangulation, "normalize_quaternion", counted)
+
+    translation = triangulation.camera_translation_right_in_left_camera(
+        baseline_right_in_left_world_m=(0.0, 0.4, 0.0),
+        left_body_to_world_q=(2.0, 0.0, 0.0, 0.0),
+    )
+    assert translation is not None
+    assert len(calls) == 1
+
+    calls.clear()
+    triangulation.triangulate_pixels_with_pixhawk_mount_attempt(
+        left_pixel=(340.0, 240.0),
+        right_pixel=(300.0, 240.0),
+        left_intrinsics=intrinsics,
+        right_intrinsics=intrinsics,
+        left_body_to_world_q=(2.0, 0.0, 0.0, 0.0),
+        right_body_to_world_q=(3.0, 0.0, 0.0, 0.0),
+        translation_right_in_left_m=translation,
+    )
+    assert len(calls) == 2

@@ -37,6 +37,7 @@ from Workstation.workstation_core.gnss_operation import (
     GnssReadinessSnapshot,
     HeightType,
     NetworkConfig,
+    RoutingConfig,
 )
 from Workstation.workstation_core.rtcm_pipeline import RtcmRouteConfig
 from Workstation.workstation_core.settings import AppSettings, load_settings, save_settings
@@ -150,6 +151,47 @@ def test_rtcm_receive_throttle_does_not_suppress_injection_success_refresh() -> 
     assert ("label", "RTCM 16 bytes -> left", "good") in calls
     assert ("stats",) in calls
     assert ("readiness",) in calls
+
+
+def test_rtcm_stall_block_is_not_recorded_as_transport_failure() -> None:
+    calls: list[tuple[object, ...]] = []
+    panel = SimpleNamespace(
+        gnss_base_status_labels={"rtcm_injection": object()},
+        _record_gnss_base_rtcm_injection=lambda *args, **kwargs: calls.append(
+            ("record", args, kwargs)
+        ),
+        _px4_mag_camera_label=lambda side: str(side),
+        _set_health_label=lambda _label, text, level: calls.append(("label", text, level)),
+        _refresh_gnss_base_rtcm_stats=lambda: calls.append(("stats",)),
+        _refresh_gnss_operation_readiness=lambda: calls.append(("readiness",)),
+        _log=lambda message: calls.append(("log", message)),
+    )
+    controller = GnssRuntimeController(panel)
+
+    controller._apply_pixhawk_rtcm_result(
+        {
+            "payload_bytes": 16,
+            "sent": (("right", 1),),
+            "failed": (),
+            "dropped": 0,
+            "blocked_stall": 1,
+            "blocked_targets": (
+                {"side": "left", "category": "stall", "reason": "ALL_EXPECTED_RX_SILENT"},
+            ),
+        }
+    )
+
+    assert (
+        "record",
+        ("left",),
+        {"payload_bytes": 16, "blocked_stall": True},
+    ) in calls
+    assert not any(
+        call[0] == "record" and bool(call[2].get("failed"))
+        for call in calls
+        if len(call) == 3
+    )
+    assert any(call[0] == "label" and "차단" in str(call[1]) for call in calls)
 
 
 def test_retired_caster_settings_are_migrated_to_ngii_rts2(tmp_path) -> None:
@@ -726,6 +768,80 @@ def test_worker_ui_signal_is_queued_to_the_gui_thread_without_text_document_warn
         QtCore.qInstallMessageHandler(previous_handler)
 
 
+def test_panel_log_called_from_worker_is_requeued_before_touching_qt_text(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from Workstation import standalone_gui
+
+    monkeypatch.setattr(
+        standalone_gui.WirisStereoDistancePanel,
+        "_initial_status",
+        lambda _self: None,
+    )
+    monkeypatch.setattr(
+        standalone_gui.WirisStereoDistancePanel,
+        "_auto_load_intrinsics",
+        lambda _self: None,
+    )
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = standalone_gui.WirisStereoDistancePanel(
+        app_root=tmp_path,
+        settings_path=tmp_path / "settings.json",
+    )
+    panel.wiris_log.clear()
+    callback_threads: list[QtCore.QThread] = []
+    qt_messages: list[str] = []
+
+    class Observer(QtCore.QObject):
+        @QtCore.pyqtSlot()
+        def changed(self) -> None:
+            callback_threads.append(QtCore.QThread.currentThread())
+
+    class Emitter(QtCore.QObject):
+        finished = QtCore.pyqtSignal()
+
+        @QtCore.pyqtSlot()
+        def run(self) -> None:
+            panel._log("[GNSS][NTRIP] worker-thread log")
+            self.finished.emit()
+
+    observer = Observer()
+    emitter = Emitter()
+    thread = QtCore.QThread()
+    panel.wiris_log.textChanged.connect(observer.changed)
+    emitter.moveToThread(thread)
+    thread.started.connect(emitter.run)
+    emitter.finished.connect(thread.quit)
+    previous_handler = QtCore.qInstallMessageHandler(
+        lambda _kind, _context, message: qt_messages.append(str(message))
+    )
+    thread.start()
+    try:
+        deadline = time.monotonic() + 2.0
+        while (
+            panel.wiris_log.toPlainText() != "[GNSS][NTRIP] worker-thread log"
+            and time.monotonic() < deadline
+        ):
+            app.processEvents()
+            time.sleep(0.005)
+
+        assert panel.wiris_log.toPlainText() == "[GNSS][NTRIP] worker-thread log"
+        assert callback_threads == [app.thread()]
+        assert not any(
+            "QTextBlock" in message or "QTextCursor" in message
+            for message in qt_messages
+        )
+    finally:
+        thread.quit()
+        assert thread.wait(1000)
+        QtCore.qInstallMessageHandler(previous_handler)
+        panel._save_current_settings = lambda: None
+        panel.close()
+        panel.deleteLater()
+        app.processEvents()
+
+
 # --- Direct username/password UI: credential plumbing, storage, and UI ----
 
 
@@ -945,6 +1061,64 @@ def test_resolve_ntrip_credentials_prefers_session_password(monkeypatch) -> None
     assert resolved == NtripCredentialResolution(username="field-user", password="typed-secret", source="session")
 
 
+def test_resolve_ntrip_credentials_prefers_keyring_over_unedited_deployment_default(
+    monkeypatch,
+) -> None:
+    """A masked deployment default must not shadow a saved account secret.
+
+    Regression: both password widgets are pre-populated for the field profile,
+    so treating every non-empty widget as an explicit session edit made the
+    keyring branch unreachable after restart and could produce caster 401s.
+    """
+
+    panel = _panel_with_password(DEFAULT_NTRIP_SESSION_PASSWORD)
+    panel._gnss_ntrip_session_password_explicit = False
+    controller = GnssRuntimeController(panel)
+    monkeypatch.setattr(ntrip_credentials, "secure_storage_available", lambda: True)
+    monkeypatch.setattr(
+        ntrip_credentials,
+        "load_password",
+        lambda _host, _mountpoint, _username: "stored-account-secret",
+    )
+    network = NetworkConfig(
+        caster_host="RTS2.ngii.go.kr",
+        mountpoint="VRS-RTCM32",
+        username=DEFAULT_NTRIP_USERNAME,
+    )
+
+    resolved = controller._resolve_ntrip_credentials(network)
+
+    assert resolved == NtripCredentialResolution(
+        username=DEFAULT_NTRIP_USERNAME,
+        password="stored-account-secret",
+        source="keyring",
+    )
+
+
+def test_resolve_ntrip_credentials_uses_explicit_session_edit_over_keyring(
+    monkeypatch,
+) -> None:
+    panel = _panel_with_password("rotated-session-secret")
+    panel._gnss_ntrip_session_password_explicit = True
+    controller = GnssRuntimeController(panel)
+    monkeypatch.setattr(ntrip_credentials, "secure_storage_available", lambda: True)
+    monkeypatch.setattr(
+        ntrip_credentials,
+        "load_password",
+        lambda _host, _mountpoint, _username: "old-stored-secret",
+    )
+
+    resolved = controller._resolve_ntrip_credentials(
+        NetworkConfig(caster_host="caster", mountpoint="MOUNT", username="field-user")
+    )
+
+    assert resolved == NtripCredentialResolution(
+        username="field-user",
+        password="rotated-session-secret",
+        source="session",
+    )
+
+
 def test_set_gnss_ntrip_session_password_bridges_settings_workspace_field_into_resolve() -> None:
     """Regression: the Settings workspace's password field lives on a
     different object than ``panel`` (SettingsWorkspace.gnss_network_password_edit
@@ -1101,16 +1275,16 @@ def test_settings_workspace_ntrip_defaults_are_masked_and_not_in_settings_payloa
         workspace.deleteLater()
 
 
-def test_untouched_ntrip_defaults_resolve_and_operator_edits_override_them() -> None:
+def test_empty_ntrip_password_requires_operator_input(monkeypatch) -> None:
+    monkeypatch.setattr(ntrip_credentials, "secure_storage_available", lambda: False)
+    monkeypatch.delenv("NTRIP_USERNAME", raising=False)
+    monkeypatch.delenv("NTRIP_PASSWORD", raising=False)
     panel = _panel_with_password(DEFAULT_NTRIP_SESSION_PASSWORD)
     controller = GnssRuntimeController(panel)
     network = NetworkConfig(caster_host="caster", mountpoint="MOUNT")
 
-    assert controller._resolve_ntrip_credentials(network) == NtripCredentialResolution(
-        username=DEFAULT_NTRIP_USERNAME,
-        password=DEFAULT_NTRIP_SESSION_PASSWORD,
-        source="session",
-    )
+    with pytest.raises(NtripCredentialError):
+        controller._resolve_ntrip_credentials(network)
 
     panel.gnss_ntrip_password_edit.setText("operator-password")
     overridden = NetworkConfig(
@@ -1125,10 +1299,10 @@ def test_untouched_ntrip_defaults_resolve_and_operator_edits_override_them() -> 
     )
 
 
-def test_runtime_owner_has_usable_ntrip_defaults_before_settings_apply(
+def test_runtime_owner_requires_password_before_settings_apply(
     monkeypatch, tmp_path
 ) -> None:
-    """Direct Start NTRIP uses the defaults even if Settings was never opened."""
+    """Direct Start NTRIP never obtains a password from a plaintext default."""
 
     from Workstation import standalone_gui
 
@@ -1143,14 +1317,22 @@ def test_runtime_owner_has_usable_ntrip_defaults_before_settings_apply(
         settings_path=tmp_path / "settings.json",
     )
     try:
+        monkeypatch.delenv("NGII_RTS2_USERNAME", raising=False)
+        monkeypatch.delenv("NGII_RTS2_PASSWORD", raising=False)
+        monkeypatch.setattr(ntrip_credentials, "secure_storage_available", lambda: False)
         assert panel.gnss_ntrip_username_edit.text() == DEFAULT_NTRIP_USERNAME
         assert panel.gnss_ntrip_password_edit.text() == DEFAULT_NTRIP_SESSION_PASSWORD
-        assert panel._resolve_ntrip_credentials(panel._build_gnss_operation_config().network) == (
-            NtripCredentialResolution(
-                username=DEFAULT_NTRIP_USERNAME,
-                password=DEFAULT_NTRIP_SESSION_PASSWORD,
-                source="session",
+        with pytest.raises(NtripCredentialError):
+            panel._resolve_ntrip_credentials(
+                panel._build_gnss_operation_config().network
             )
+        panel.gnss_ntrip_password_edit.setText("operator-password")
+        assert panel._resolve_ntrip_credentials(
+            panel._build_gnss_operation_config().network
+        ) == NtripCredentialResolution(
+            username=DEFAULT_NTRIP_USERNAME,
+            password="operator-password",
+            source="session",
         )
     finally:
         panel._save_current_settings = lambda: None
@@ -1302,6 +1484,44 @@ def test_gga_provider_logs_specific_reason_for_missing_rover_positions() -> None
     )
 
 
+def test_gga_provider_throttles_repeated_missing_position_logs() -> None:
+    logged: list[str] = []
+    panel = _gga_panel(gga_policy=GgaPolicy.SYSTEM_CENTER, log_sink=logged, latest_gps={})
+    controller = GnssRuntimeController(panel)
+
+    assert controller._gnss_gga_provider() is None
+    first_messages = list(logged)
+    assert controller._gnss_gga_provider() is None
+
+    assert logged == first_messages
+
+
+def test_camera_state_log_throttles_identical_liveness_updates() -> None:
+    from Workstation import standalone_gui
+
+    logged: list[str] = []
+    panel = SimpleNamespace(
+        _last_logged_camera_states={},
+        _extract_active_decoder_from_state=lambda _state: None,
+        _set_active_stream_decoder=lambda _camera, _decoder: None,
+        _camera_name_ko=lambda camera: camera,
+        _log=logged.append,
+    )
+
+    standalone_gui.WirisStereoDistancePanel._log_state(
+        panel,
+        "left",
+        "카메라 스트림 실행 중",
+    )
+    standalone_gui.WirisStereoDistancePanel._log_state(
+        panel,
+        "left",
+        "카메라 스트림 실행 중",
+    )
+
+    assert logged == ["[카메라] left 스트림 상태: 카메라 스트림 실행 중"]
+
+
 def test_gga_provider_logs_stale_base_sample_age_for_base_gnss_policy() -> None:
     logged: list[str] = []
     stale_sample = SimpleNamespace(timestamp_s=time.monotonic() - 30.0)
@@ -1343,6 +1563,44 @@ def test_gga_provider_system_center_success_does_not_log_anything() -> None:
     assert result is not None
     assert result.startswith("$GPGGA,")
     assert logged == []
+
+
+def test_gga_provider_records_skip_reason_and_clears_it_on_success() -> None:
+    """A VRS caster withholds RTCM without periodic GGA while the transport
+    still reports "connected" -- _gnss_last_gga_skip_reason is the only
+    signal the NTRIP status panel has for that failure mode.
+    """
+
+    logged: list[str] = []
+    now_s = time.monotonic()
+    panel = _gga_panel(gga_policy=GgaPolicy.SYSTEM_CENTER, log_sink=logged, latest_gps={})
+    controller = GnssRuntimeController(panel)
+
+    assert controller._gnss_gga_provider() is None
+    assert "no left/right GNSS position available" in panel._gnss_last_gga_skip_reason
+    assert panel._gnss_last_gga_skip_monotonic_s is not None
+
+    left = SimpleNamespace(
+        latitude_deg=37.0,
+        longitude_deg=127.0,
+        altitude_m=50.0,
+        has_position=True,
+        timestamp_s=now_s - 0.02,
+    )
+    right = SimpleNamespace(
+        latitude_deg=37.0001,
+        longitude_deg=127.0001,
+        altitude_m=51.0,
+        has_position=True,
+        timestamp_s=now_s - 0.01,
+    )
+    panel.latest_gps = {"left": left, "right": right}
+
+    result = controller._gnss_gga_provider()
+
+    assert result is not None
+    assert panel._gnss_last_gga_skip_reason == ""
+    assert panel._gnss_last_gga_skip_monotonic_s is None
 
 
 def test_gga_provider_uses_the_operator_selected_gps2_source() -> None:
@@ -1434,6 +1692,73 @@ def test_gnss_readiness_uses_the_operator_selected_gps2_source(monkeypatch) -> N
     selected = captured[0].rover_samples["left"]
     assert selected.fix_type == 6
     assert selected.device_id == "mavlink/GPS2_RAW"
+
+
+def test_gnss_readiness_marks_stalled_rtcm_target_endpoint_missing_and_faulted(monkeypatch) -> None:
+    from Workstation import gnss_runtime_controller
+
+    now_s = time.monotonic()
+    config = GnssOperationConfig(
+        operation_mode=GnssOperationMode.NETWORK_RTK_DIRECT,
+        routing=RoutingConfig(left_enabled=True, right_enabled=False),
+    )
+    manager = SimpleNamespace(
+        config=config,
+        state=GnssOperationState.MEASURING,
+        source_identity=None,
+        update_readiness=lambda _snapshot: None,
+        invalidate=lambda _reason: None,
+    )
+    stalled_health = SimpleNamespace(
+        identity_verified=True,
+        rtcm_eligible=False,
+        state=SimpleNamespace(value="ETH MAVLINK RX STALLED"),
+        stall_reason="ALL_EXPECTED_RX_SILENT",
+        observed_system_id=1,
+        connection_generation=4,
+    )
+    captured = []
+    panel = SimpleNamespace(
+        gnss_operation_gate_active=True,
+        gnss_operation_manager=manager,
+        gnss_active_operation_config=None,
+        _build_gnss_operation_config=lambda: config,
+        _gnss_base_rtcm_target_sides=lambda: ("left",),
+        gnss_base_rtcm_stats={
+            "injection": {
+                "left": {
+                    "frames": 10,
+                    "bytes": 100,
+                    "packets": 10,
+                    "fail": 0,
+                    "blocked_stall": 1,
+                    "last_delivery_s": now_s,
+                }
+            },
+            "last_frame_s": now_s,
+        },
+        mavlink_pixhawk=SimpleNamespace(
+            connections={"left": object()},
+            mavlink_health_snapshot=lambda _side, **_kwargs: stalled_health,
+        ),
+        latest_gps={},
+        _selected_baseline_gps_state=lambda _side: None,
+        gnss_rover_fixed_since={"left": None, "right": None, "drone": None},
+        latest_baseline_vector=None,
+        latest_baseline_quality=None,
+    )
+
+    def capture_readiness(_config, inputs):
+        captured.append(inputs)
+        return SimpleNamespace(reasons=("route_fault",), warnings=(), reason_messages={})
+
+    monkeypatch.setattr(gnss_runtime_controller, "evaluate_gnss_readiness", capture_readiness)
+    GnssRuntimeController(panel)._refresh_gnss_operation_readiness()
+
+    route = captured[0].routes["left"]
+    assert route.endpoint_identity == ""
+    assert "ETH MAVLINK RX STALLED" in route.fault_reason
+    assert "ALL_EXPECTED_RX_SILENT" in route.fault_reason
 
 
 def test_gga_provider_rejects_stale_or_skewed_rover_positions() -> None:

@@ -3,14 +3,23 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from pathlib import Path
 
 from PyQt5 import QtCore, QtGui
+from sasl_common.operator_runtime import (
+    DECODER_AUTO,
+    DECODER_SOFTWARE,
+    NVIDIA_H264_DECODER,
+    SOFTWARE_H264_DECODER,
+    current_decoder_selection,
+)
 
 from Workstation.camera_time_sync_controller import (
     CAMERA_SYNC_STATUS_NOT_VERIFIED,
     CAMERA_SYNC_STATUS_RECONNECTING,
     CAMERA_SYNC_STATUS_WARMING,
 )
+from Workstation.workstation_core.yolo_stream import recording_integrity_contract
 
 CAMERA_STREAM_LIFECYCLE_METHODS = [
     "toggle_camera_connection",
@@ -18,10 +27,13 @@ CAMERA_STREAM_LIFECYCLE_METHODS = [
     "connect_cameras",
     "start_yolo",
     "stop_yolo_detection",
+    "_resume_queued_measurement_start",
     "_start_camera_streams",
     "_schedule_camera_start_retry",
     "_cancel_pending_camera_start",
     "stop_yolo_streams",
+    "_schedule_camera_stop_watchdog",
+    "_cancel_camera_stop_watchdog",
     "_stop_camera_panes",
     "_clear_calibration_previews",
     "_clear_detection_state",
@@ -33,23 +45,18 @@ class CameraStreamLifecycleController:
     def __init__(self, panel):
         self.panel = panel
 
-    def toggle_camera_connection(self) -> None:
+    def toggle_camera_connection(self, *_qt_signal_args: object) -> None:
         if self.panel.camera_connected or self.panel._pending_camera_start is not None:
             self.panel.stop_yolo_streams()
         else:
             self.panel.connect_cameras()
 
     def toggle_yolo_detection(self) -> bool | None:
-        if (
-            self.panel._session_recording_active()
-            and not bool(getattr(self.panel, "_automatic_session_recording", False))
-            and (
-                self.panel.camera_connected or self.panel._pending_camera_start is not None
-            )
-        ):
-            self.panel._log("[YOLO] 세션 기록 중에는 실행 중인 카메라의 Detection 모드를 바꿀 수 없습니다.")
-            return False
-        if self.panel.yolo_enabled or self.panel._pending_camera_start is not None:
+        run_state = self._measurement_run_state()
+        if run_state == "QUEUED":
+            self.panel._log("[YOLO] 측정 시작 요청이 이미 대기 중입니다.")
+            return None
+        if self.panel.yolo_enabled or run_state in {"RUNNING", "STOPPING"}:
             self.panel.stop_yolo_detection()
         else:
             return self.panel.start_yolo()
@@ -60,8 +67,78 @@ class CameraStreamLifecycleController:
             self.panel._cancel_auto_wiris_connect_retry()
         self.panel._start_camera_streams(enable_detection=False, switch_to_depth=False)
 
-    def _measurement_package_state(self) -> str:
-        reader = getattr(self.panel, "measurement_package_snapshot", None)
+    def _apply_decoder_start_policy(self) -> bool:
+        backend_combo = getattr(self.panel, "stream_backend_combo", None)
+        if backend_combo is not None and str(backend_combo.currentData() or "gstreamer") != "gstreamer":
+            return True
+        decoder_combo = getattr(self.panel, "decoder_combo", None)
+        if decoder_combo is None:
+            return True
+        requested = str(decoder_combo.currentData() or DECODER_AUTO)
+        auto_capability = current_decoder_selection(DECODER_AUTO)
+        nvidia_available = (
+            auto_capability.allowed
+            and auto_capability.effective == NVIDIA_H264_DECODER
+        )
+        fallback_reasons = getattr(self.panel, "decoder_fallback_reasons", None)
+        if not isinstance(fallback_reasons, dict):
+            fallback_reasons = {"left": "", "right": ""}
+            self.panel.decoder_fallback_reasons = fallback_reasons
+        if (
+            requested == DECODER_AUTO
+            and getattr(self.panel, "_runtime_decoder_override", None) == DECODER_SOFTWARE
+        ):
+            reason = next((str(value) for value in fallback_reasons.values() if str(value)), "")
+            self.panel.decoder_selection_status = {
+                "requested": DECODER_AUTO,
+                "effective": SOFTWARE_H264_DECODER,
+                "candidates": (SOFTWARE_H264_DECODER,),
+                "allowed": True,
+                "degraded": True,
+                "reason": reason or "runtime NVIDIA fallback override active",
+                "nvidia_available": nvidia_available,
+            }
+            return True
+        selection = current_decoder_selection(requested)
+        self.panel.decoder_selection_status = {
+            "requested": selection.requested,
+            "effective": selection.effective,
+            "candidates": tuple(selection.candidates),
+            "allowed": selection.allowed,
+            "degraded": selection.degraded,
+            "reason": selection.reason,
+            "nvidia_available": nvidia_available,
+        }
+        if not selection.allowed:
+            message = (
+                "NVIDIA 디코더를 시작할 수 없습니다: "
+                f"{selection.reason}. 디코더를 Auto 또는 Software로 변경하고 "
+                "tools/check_operator_runtime.sh --execution을 실행하세요."
+            )
+            self.panel._log(f"[카메라] {message}")
+            label = getattr(self.panel, "camera_connection_label", None)
+            if label is not None:
+                label.setText(message)
+            return False
+        if selection.effective == NVIDIA_H264_DECODER:
+            fallback_reasons.update(left="", right="")
+        elif requested == DECODER_SOFTWARE:
+            fallback_reasons.update(left="", right="")
+        if requested == DECODER_AUTO and selection.effective == SOFTWARE_H264_DECODER:
+            if getattr(self.panel, "_runtime_decoder_override", None) != DECODER_SOFTWARE:
+                self.panel._log(
+                    f"[카메라] Auto decoder 경고: {selection.reason}; avdec_h264를 사용합니다."
+                )
+            self.panel._runtime_decoder_override = DECODER_SOFTWARE
+            fallback_reasons.update(left=selection.reason, right=selection.reason)
+        return True
+
+    def _measurement_run_state(self) -> str:
+        reader = getattr(self.panel, "measurement_run_snapshot", None)
+        legacy = False
+        if not callable(reader):
+            reader = getattr(self.panel, "measurement_package_snapshot", None)
+            legacy = True
         if not callable(reader):
             return "IDLE"
         try:
@@ -70,25 +147,53 @@ class CameraStreamLifecycleController:
             return "IDLE"
         if not isinstance(snapshot, Mapping):
             return "IDLE"
-        return str(snapshot.get("state") or "IDLE").upper()
+        state = str(snapshot.get("state") or "IDLE").upper()
+        if legacy:
+            return {
+                "COLLECTING": "STARTING",
+                "POST_CAPTURE": "STOPPING",
+                "VERIFYING": "STOPPING",
+                "SEALED_COMPLETE": "IDLE",
+                "SEALED_INCOMPLETE": "IDLE",
+                "RECOVERABLE": "ERROR",
+            }.get(state, state)
+        return state
+
+    def _measurement_package_state(self) -> str:
+        """Compatibility projection for tests/older callers."""
+
+        return {
+            "IDLE": "IDLE",
+            "QUEUED": "COLLECTING",
+            "STARTING": "COLLECTING",
+            "RUNNING": "COLLECTING",
+            "STOPPING": "POST_CAPTURE",
+            "ERROR": "RECOVERABLE",
+        }.get(self._measurement_run_state(), "IDLE")
 
     def _uses_explicit_package_lifecycle(self) -> bool:
         return bool(getattr(self.panel, "_measurement_package_explicit_lifecycle", False))
 
     def _prepare_package_for_detection(self, state: str) -> bool:
-        """Create the next child lazily when the operator starts measuring."""
+        """Prepare one transient run without consulting persisted evidence."""
 
-        if state == "COLLECTING":
+        run_state = self._measurement_run_state()
+        if run_state in {"STARTING", "RUNNING"}:
             return True
-        if state not in {"IDLE", "SEALED_COMPLETE", "SEALED_INCOMPLETE"}:
+        if run_state not in {"IDLE", "QUEUED", "ERROR"}:
             return False
         starter = getattr(self.panel, "begin_measurement", None)
         if not callable(starter):
             starter = getattr(self.panel, "begin_next_measurement", None)
         if not callable(starter):
-            self.panel._log(
-                "[YOLO] 측정 시작이 차단되었습니다: Measurement 생성 owner를 사용할 수 없습니다."
-            )
+            if (
+                not callable(getattr(self.panel, "measurement_run_snapshot", None))
+                and not bool(
+                    getattr(self.panel, "_measurement_package_explicit_lifecycle", False)
+                )
+            ):
+                return True
+            self.panel._log("[YOLO] 측정 시작 owner를 사용할 수 없습니다.")
             return False
         try:
             started = starter()
@@ -96,7 +201,7 @@ class CameraStreamLifecycleController:
             self.panel._log(f"[YOLO] 새 Measurement 생성 실패: {exc}")
             return False
         if started is False:
-            reader = getattr(self.panel, "measurement_package_snapshot", None)
+            reader = getattr(self.panel, "measurement_run_snapshot", None)
             try:
                 snapshot = reader() if callable(reader) else {}
             except Exception:
@@ -107,38 +212,89 @@ class CameraStreamLifecycleController:
                 else ""
             )
             suffix = f" · {detail}" if detail else ""
-            self.panel._log(f"[YOLO] 새 Measurement 생성이 거부되었습니다{suffix}")
+            self.panel._log(f"[YOLO] Measurement 시작 준비가 거부되었습니다{suffix}")
             return False
-        return self._measurement_package_state() == "COLLECTING"
+        return self._measurement_run_state() == "STARTING"
 
     def _reserve_package_detection(self) -> bool:
-        state = self._measurement_package_state()
-        package_active = state != "IDLE"
-        if (
-            not package_active
-            and self.panel._session_recording_active()
-            and not bool(getattr(self.panel, "_automatic_session_recording", False))
-        ):
-            # Advanced/manual recording remains a supported legacy path; the
-            # new Measurement workflow itself never enters through this gate.
-            return True
-        if not self._uses_explicit_package_lifecycle() and not package_active:
-            # Compatibility for bare controller callers and older automation.
-            return True
-        if self._uses_explicit_package_lifecycle() and not self._prepare_package_for_detection(state):
+        if not self._prepare_package_for_detection(self._measurement_package_state()):
             return False
-        starter = getattr(self.panel, "begin_measurement_detection", None)
-        if not callable(starter):
-            self.panel._log("[YOLO] 측정 시작이 차단되었습니다: Detection owner를 사용할 수 없습니다.")
-            return False
-        return bool(starter())
+        if not callable(getattr(self.panel, "measurement_run_snapshot", None)):
+            starter = getattr(self.panel, "begin_measurement_detection", None)
+            if callable(starter):
+                return bool(starter())
+        return True
 
     def _complete_package_detection(self) -> bool:
-        state = self._measurement_package_state()
-        if state not in {"COLLECTING", "POST_CAPTURE"}:
+        state = self._measurement_run_state()
+        if state not in {"STARTING", "RUNNING", "ERROR", "STOPPING"}:
             return True
-        completer = getattr(self.panel, "complete_measurement_detection", None)
+        completer = getattr(self.panel, "request_measurement_stop", None)
+        if not callable(completer):
+            completer = getattr(self.panel, "complete_measurement_detection", None)
         return True if not callable(completer) else bool(completer())
+
+    def _camera_busy_reason(self) -> str:
+        busy_threads = (
+            ("pnp_photo_capture_thread", "HR capture is using the cameras"),
+            ("oz_photo_capture_thread", "OZ capture is using the cameras"),
+            ("optical_pose_wiris_ftp_thread", "Alignment HR capture is using the cameras"),
+            ("optical_pose_wiris_ftp_oz_thread", "Alignment OZ capture is using the cameras"),
+            ("calibration_wiris_ftp_thread", "Calibration HR capture is using the cameras"),
+            ("calibration_wiris_ftp_oz_thread", "Calibration OZ download is using the cameras"),
+            ("calibration_wiris_oz_capture_thread", "Calibration OZ capture is using the cameras"),
+            ("calibration_wiris_oz_sync_thread", "Calibration camera synchronization is running"),
+            ("calibration_wiris_oz_delete_thread", "Calibration camera cleanup is running"),
+            ("calibration_wiris_oz_format_thread", "Calibration image-format change is running"),
+            ("calibration_wiris_oz_gilc_thread", "Calibration GILC operation is running"),
+            ("wiris_time_sync_thread", "camera time synchronization is running"),
+            ("wiris_image_format_thread", "camera image-format change is running"),
+            ("wiris_command_thread", "a camera command is running"),
+            ("wiris_zoom_thread", "camera zoom is changing"),
+            ("wiris_stip_thread", "camera STIP configuration is running"),
+            ("wiris_lrf_thread", "camera LRF query is running"),
+            ("camera_auto_detect_thread", "camera discovery is running"),
+            ("rtsp_check_thread", "camera RTSP check is running"),
+            ("rtsp_enable_thread", "camera RTSP activation is running"),
+        )
+        for attribute, reason in busy_threads:
+            if getattr(self.panel, attribute, None) is not None:
+                return reason
+        if getattr(self.panel, "_rtsp_reactivation_side", None) is not None:
+            return "camera RTSP reactivation is running"
+        if bool(getattr(self.panel, "auto_wiris_connect_pending", False)):
+            return "camera auto-connect is running"
+        return ""
+
+    def _queue_measurement_start(self, reason: str) -> None:
+        queue_start = getattr(self.panel, "queue_measurement_start", None)
+        if callable(queue_start):
+            queue_start(reason)
+        self.panel._pending_measurement_run_start = True
+
+        def retry() -> None:
+            if not bool(getattr(self.panel, "_pending_measurement_run_start", False)):
+                return
+            if self._camera_busy_reason() or bool(
+                getattr(self.panel, "_manual_recording_active", False)
+            ):
+                QtCore.QTimer.singleShot(100, retry)
+                return
+            self.panel._pending_measurement_run_start = False
+            self.panel.start_yolo()
+
+        QtCore.QTimer.singleShot(100, retry)
+
+    def _resume_queued_measurement_start(self) -> bool:
+        if not bool(getattr(self.panel, "_pending_measurement_run_start", False)):
+            return False
+        if self._camera_busy_reason() or bool(
+            getattr(self.panel, "_manual_recording_active", False)
+        ):
+            return False
+        self.panel._pending_measurement_run_start = False
+        QtCore.QTimer.singleShot(0, self.panel.start_yolo)
+        return True
 
     def _detection_inputs_valid(self) -> bool:
         if not hasattr(self.panel, "left_url_edit") or not hasattr(
@@ -161,16 +317,24 @@ class CameraStreamLifecycleController:
     def start_yolo(self) -> bool | None:
         if not self._detection_inputs_valid():
             return False
+        if bool(getattr(self.panel, "_manual_recording_active", False)):
+            self._queue_measurement_start("stopping Manual record")
+            stopper = getattr(self.panel, "_stop_session_recording", None)
+            if callable(stopper):
+                stopper(restart_streams=False)
+            return None
+        busy_reason = self._camera_busy_reason()
+        if busy_reason:
+            self._queue_measurement_start(busy_reason)
+            return None
         if not self._reserve_package_detection():
-            self.panel._log(
-                "[YOLO] 측정 시작이 차단되었습니다. Session 상태와 이전 Measurement 저장 상태를 확인하세요."
-            )
+            self.panel._log("[YOLO] 측정 시작 준비가 거부되었습니다: live run state를 확인하세요.")
             return False
         if not self.panel._session_recording_active():
             try:
                 started = self.panel.start_automatic_session_recording()
             except Exception as exc:
-                self.panel._log(f"[저장] 자동 세션 준비 실패: {exc}")
+                self.panel._log(f"[저장] 자동 데이터 기록 준비 실패: {exc}")
                 cancel = getattr(self.panel, "cancel_measurement_detection_start", None)
                 if callable(cancel):
                     cancel(str(exc))
@@ -178,7 +342,7 @@ class CameraStreamLifecycleController:
             if started is False:
                 cancel = getattr(self.panel, "cancel_measurement_detection_start", None)
                 if callable(cancel):
-                    cancel("recording session could not start")
+                    cancel("measurement recording could not start")
                 return False
         stream_result = self.panel._start_camera_streams(
             enable_detection=True, switch_to_depth=True
@@ -190,8 +354,6 @@ class CameraStreamLifecycleController:
             cancel = getattr(self.panel, "cancel_measurement_detection_start", None)
             cancelled = bool(cancel("Detection camera start was cancelled")) if callable(cancel) else False
             if not cancelled:
-                # Recording or another producer already started, so retain the
-                # attempted interval as explicit incomplete evidence.
                 self._complete_package_detection()
             self.panel.stop_yolo_streams()
             return
@@ -204,8 +366,6 @@ class CameraStreamLifecycleController:
         self.panel._log("[YOLO] 검출을 중지하고 카메라 프리뷰만 유지합니다.")
         self._complete_package_detection()
         if bool(getattr(self.panel, "_automatic_session_recording", False)):
-            # Measurement stop closes writers; the package controller's
-            # completion path owns automatic persistence and sealing.
             self.panel.stop_yolo_streams()
             if self.panel._session_recording_active():
                 return
@@ -214,6 +374,12 @@ class CameraStreamLifecycleController:
         self.panel._start_camera_streams(enable_detection=False, switch_to_depth=False)
 
     def _start_camera_streams(self, *, enable_detection: bool, switch_to_depth: bool) -> bool:
+        # A leftover stop watchdog from a prior disconnect must not call
+        # pane.stop() again once this start attempt owns the pane's teardown
+        # (via _stop_camera_panes below and, if needed, its own start retry).
+        self._cancel_camera_stop_watchdog()
+        if not self._apply_decoder_start_policy():
+            return False
         kwargs = self.panel.yolo_kwargs()
         left_url = self.panel.left_url_edit.text().strip()
         right_url = self.panel.right_url_edit.text().strip()
@@ -305,11 +471,10 @@ class CameraStreamLifecycleController:
                 )
             self.panel._refresh_session_toggle_buttons()
             self.panel._refresh_operation_header()
-            continuation = getattr(
-                self.panel, "_continue_measurement_package_finalization", None
-            )
-            if callable(continuation):
-                continuation()
+            if enable_detection:
+                confirmer = getattr(self.panel, "confirm_measurement_running", None)
+                if callable(confirmer):
+                    confirmer(started_sides)
             return True
 
         return start_both()
@@ -345,6 +510,93 @@ class CameraStreamLifecycleController:
         self.panel._camera_start_request_generation += 1
         self.panel._pending_camera_start = None
 
+    def _schedule_camera_stop_watchdog(self) -> None:
+        """Keep re-issuing stop() until a wedged camera worker actually exits.
+
+        camera_pane.stop(wait=False) only escalates to terminate/kill the
+        child process once enough time has elapsed *and* stop() is called
+        again; a plain disconnect otherwise calls it exactly once and, if the
+        worker did not exit immediately (e.g. GStreamer wedged on a network
+        interface that was not up yet), leaves it in "종료 대기 중" forever
+        with the leaked process never escalated. This mirrors
+        _schedule_camera_start_retry's retry loop, but only drives teardown;
+        it never restarts a stream.
+        """
+        self.panel._camera_stop_watchdog_generation += 1
+        generation = self.panel._camera_stop_watchdog_generation
+
+        def retry() -> None:
+            if generation != self.panel._camera_stop_watchdog_generation:
+                return
+            left_stopped = self.panel.left_pane.stop(wait=False)
+            right_stopped = self.panel.right_pane.stop(wait=False)
+            if not (left_stopped and right_stopped):
+                QtCore.QTimer.singleShot(250, retry)
+                return
+            self._append_pending_video_finalization_artifacts()
+            finisher = getattr(self.panel, "finish_measurement_run", None)
+            if callable(finisher) and self._measurement_run_state() == "STOPPING":
+                finisher()
+            self._resume_queued_measurement_start()
+
+        QtCore.QTimer.singleShot(250, retry)
+
+    def _append_pending_video_finalization_artifacts(self) -> None:
+        pending = getattr(self.panel, "_pending_video_finalization_artifacts", None)
+        if not isinstance(pending, dict):
+            return
+        paths = pending.get("paths")
+        if not isinstance(paths, dict):
+            self.panel._pending_video_finalization_artifacts = None
+            return
+        backend = str(pending.get("backend") or "gstreamer")
+        append = getattr(self.panel, "append_workstation_data", None)
+        for side, raw_path in paths.items():
+            path = Path(raw_path).expanduser()
+            pane = getattr(self.panel, f"{side}_pane", None)
+            finalizations = getattr(pane, "recording_finalizations", {})
+            payload = (
+                dict(finalizations.pop(str(path), {}))
+                if isinstance(finalizations, dict)
+                else {}
+            )
+            success = bool(payload.get("success", False))
+            detail = str(
+                payload.get("detail")
+                or "worker exited without recording-finalization evidence"
+            )
+            if callable(append):
+                append(
+                    "artifacts",
+                    {
+                        "event_type": "video_finalized",
+                        "side": str(side),
+                        "path": str(path),
+                        "media_type": "video/mp4",
+                        "stream_backend": backend,
+                        **recording_integrity_contract(backend),
+                        **payload,
+                        "finalization_success": success,
+                        "finalization_detail": detail,
+                        "present": path.is_file(),
+                        "size_bytes": path.stat().st_size if path.is_file() else 0,
+                    },
+                    priority=True,
+                )
+            if not success:
+                logger = getattr(self.panel, "_log", None)
+                if callable(logger):
+                    logger(
+                        f"[저장] {side} MP4 finalization 검증 실패: {path} ({detail})"
+                    )
+        self.panel._pending_video_finalization_artifacts = None
+        flush = getattr(self.panel, "flush_workstation_data", None)
+        if callable(flush):
+            flush()
+
+    def _cancel_camera_stop_watchdog(self) -> None:
+        self.panel._camera_stop_watchdog_generation += 1
+
     def stop_yolo_streams(self, *, wait: bool = False) -> bool:
         if bool(getattr(self.panel, "yolo_enabled", False)):
             self._complete_package_detection()
@@ -355,6 +607,20 @@ class CameraStreamLifecycleController:
         self.panel._camera_sync_deadline_monotonic_s = None
         self.panel._camera_sync_transport_override = None
         finalize_session = self.panel._session_recording_active()
+        recording_paths = dict(
+            getattr(self.panel, "video_recording_paths", {}) or {}
+        )
+        if finalize_session and recording_paths:
+            backend_combo = getattr(self.panel, "stream_backend_combo", None)
+            backend = (
+                backend_combo.currentData()
+                if backend_combo is not None
+                else "gstreamer"
+            )
+            self.panel._pending_video_finalization_artifacts = {
+                "paths": recording_paths,
+                "backend": backend,
+            }
         final_clock_sync_snapshot = (
             self.panel._camera_time_sync_snapshot("last_observed_before_stream_stop")
             if finalize_session
@@ -366,10 +632,24 @@ class CameraStreamLifecycleController:
         if wait and not panes_stopped:
             self.panel._log("[종료] 카메라 worker가 아직 종료 중입니다. 다음 종료 시도에서 다시 확인합니다.")
             return False
+        if not panes_stopped:
+            self._schedule_camera_stop_watchdog()
         if finalize_session:
+            sessionless = not bool(
+                getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
+            )
             if bool(getattr(self.panel, "_automatic_session_recording", False)):
                 self.panel.stop_automatic_session_recording(
                     final_clock_sync_snapshot=final_clock_sync_snapshot
+                )
+            elif sessionless:
+                # Manual recording shares the camera resource. Releasing the
+                # panes must also retire its transient owner; otherwise a
+                # stale manual flag can leave the next Measurement queued
+                # forever even though every camera worker has stopped.
+                self.panel._stop_session_recording(
+                    restart_streams=False,
+                    final_clock_sync_snapshot=final_clock_sync_snapshot,
                 )
             else:
                 self.panel.distance_recording_enabled = False
@@ -378,6 +658,11 @@ class CameraStreamLifecycleController:
                 self.panel.record_button.setText("세션 기록 시작")
                 self.panel._log(f"[저장] 카메라 Preview 해제로 세션 기록을 중지했습니다: {self.panel._format_video_recording_paths()}")
                 self.panel.save_distance_history_csv(final_clock_sync_snapshot=final_clock_sync_snapshot)
+        if panes_stopped:
+            self._append_pending_video_finalization_artifacts()
+            finisher = getattr(self.panel, "finish_measurement_run", None)
+            if callable(finisher) and self._measurement_run_state() == "STOPPING":
+                finisher()
         self.panel._clear_detection_state()
         self.panel.camera_connected = False
         self.panel.yolo_enabled = False
@@ -429,6 +714,19 @@ class CameraStreamLifecycleController:
             label.setText(text)
 
     def _clear_detection_state(self) -> None:
+        measurement_owner = getattr(
+            self.panel,
+            "_measurement_view_controller_owner",
+            None,
+        )
+        reset_pairing = getattr(
+            measurement_owner,
+            "reset_detection_pair_coordinator",
+            None,
+        )
+        if callable(reset_pairing):
+            reset_pairing()
+        self.panel._camera_backpressure_degraded = False
         self.panel.latest_left = None
         self.panel.latest_right = None
         self.panel.detection_buffers["left"].clear()

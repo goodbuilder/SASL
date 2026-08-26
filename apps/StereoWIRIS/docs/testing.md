@@ -69,6 +69,55 @@ QT_QPA_PLATFORM=offscreen python3 -m pytest \
 포함하고 `x/y/z`, public `left_camera_*`, `stereo_center_*` alias를 생성하지
 않는 것이다. `source_left_camera_rdf_*`는 source diagnostic으로만 허용한다.
 
+## Legacy startup/session 집중 회귀
+
+새 프로세스가 미완료 spool과 intrinsics를 자동 채택하지 않고, 기록 버튼 시점에만 새 session을
+만드는지 확인한다. 명시적 recovery와 수동 intrinsics 경로가 남아 있는지도 함께 검증한다.
+
+```bash
+cd <SASL_ROOT>/apps/StereoWIRIS
+QT_QPA_PLATFORM=offscreen PYTHONPATH=. ../../.venv/bin/python -m pytest -q \
+  tests/test_stereo.py::test_startup_does_not_invoke_spool_recovery_or_intrinsics_auto_load \
+  tests/test_stereo.py::test_startup_ignores_retryable_spool_and_new_recording_preserves_it \
+  tests/test_stereo.py::test_gui_discovers_and_loads_retryable_pair_spool_after_restart \
+  tests/test_stereo.py::test_gui_starts_new_recording_after_discarding_recovered_session \
+  tests/test_stereo.py::test_recording_stop_waits_for_video_worker_restart_before_session_save
+```
+
+실제 startup에서는 보정 탭이 저장 파일의 존재를 표시할 수 있어도 `active_intrinsics`와 거리
+계산 source는 미적용이어야 한다. 앱 실행만으로 새 session directory가 생기지 않아야 하며 기존
+spool/intrinsics 파일 hash도 변하지 않아야 한다.
+
+## WIRIS preview corruption 집중 회귀
+
+RTP sequence wrap/duplicate/old/SSRC reset, forward gap 및 missing-PTS/DISCONT/CORRUPTED AU
+latch와 clean-intra resume,
+Auto/NVIDIA health 정책, 초기 PLAYING 실패의 0.5/1/2/4초 bounded retry, non-ASCII filesink
+property round trip, plain MP4 mux policy, gap log throttle, immutable process bytes와
+deep-copied QImage identity를 확인한다.
+
+```bash
+cd <SASL_ROOT>/apps/StereoWIRIS
+QT_QPA_PLATFORM=offscreen PYTHONPATH=. ../../.venv/bin/python -m pytest \
+  tests/test_yolo_stream.py -q
+```
+
+실장비 acceptance에서는 앱을 완전히 종료한 뒤 다음 환경변수를 지정한 새 프로세스를
+사용한다.
+
+```bash
+export STEREO_PREVIEW_IDENTITY_LOG=/tmp/wiris-preview-identity.jsonl
+```
+
+Left/Right 동시 YOLO 부하에서 최소 15분 동안 window-id recording과 CPU/GPU/NIC 상태를
+수집한다. JSONL의 `producer_queue_match`와 `queue_qimage_match`는 모두 true,
+`queue_reordered_total`은 0이어야 한다. `queue_dropped_total`은 latest-only preview queue가
+완전 frame을 의도적으로 교체한 경우만 허용한다. 화면 한 장만 정상인 것은 합격 근거가
+아니다. 기록 시작 직전의 non-recording worker PID와 기록용 worker PID가 달라야 하며, 양쪽
+worker는 bounded retry window 안에 PLAYING/첫 frame에 도달하고 `video/raw_left.mp4`와
+`video/raw_right.mp4` 크기가 증가해야 한다. 종료 후 두 MP4 모두 `ffprobe`와 strict software
+full decode(`ffmpeg -v error -xerror -i <file> -f null -`)를 통과해야 한다.
+
 ## 전체 PyQt 테스트 주의점
 
 전체 `tests/test_stereo.py`는 로컬 `stereo_distance_settings.json` 값에 영향을 받을 수 있다. 예를 들어 `rtsp_transport=tcp`가 저장되어 있으면 UDP 기본값을 기대하는 테스트가 실패할 수 있다.

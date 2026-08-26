@@ -62,11 +62,39 @@ UNKNOWN means insufficient evidence. DEGRADED requires a defined rule/reason. ER
 
 ## 10. Camera Status
 
-Potential dimensions: connection, RTSP availability, decoder, frame reception, frame age, FPS, preview. Aggregate LIVE only if actual frames are confirmed.
+Dimensions: connection, RTSP availability, requested decoder mode, actual per-side decoder,
+fallback reason, frame reception, frame age, FPS, and preview. Aggregate LIVE only if actual frames
+are confirmed. Requested NVIDIA/Auto is not GPU success evidence.
+
+- `GPU · nvh264dec`: actual worker reported NVDEC.
+- `CPU · avdec_h264 (selected)`: explicit Software mode, not degraded.
+- `CPU fallback · avdec_h264`: Auto failed NVIDIA and completed the bounded software restart; WARN.
+- `Decoder mismatch`: actual decoder contradicts requested mode without fallback evidence; ERROR.
+- `--`: no active decoder evidence.
+
+Camera workspace owns the primary per-side value, compact CAM tooltip owns short actual/fallback
+detail, and Diagnostics Performance owns GPU model/driver/capability detail. GPU utilization is
+diagnostic only and cannot turn a source LIVE.
 
 ## 11. Pixhawk Status
 
-Potential dimensions: MAVLink connection, heartbeat/telemetry, attitude availability, attitude age, and source. Workstation does not expose a ROS2 transport; Legacy transport semantics remain in the Legacy UI.
+The subscriber owns an immutable per-side MAVLink health snapshot; widgets do not infer health from
+`socket exists`, ping, or one historical heartbeat. Workstation does not expose a ROS2 transport;
+Legacy transport semantics remain in the Legacy UI.
+
+- `DISCONNECTED`: local listener absent.
+- `CONNECTING`: listener open but expected P1/P2 system identity not observed.
+- `QUALIFYING`: expected identity plus fresh heartbeat/ATTITUDE, but less than 10 continuous minutes.
+- `LIVE`: 10 continuous minutes complete and current HB/ATT/ANY evidence remains fresh.
+- `ATTITUDE STALE`: ATTITUDE older than 2 seconds while heartbeat/other traffic remains current.
+- `ETH MAVLINK RX STALLED`: all expected-system RX silent for 10 seconds; RTCM/commands blocked;
+  detail may say PX4/NuttX UDP task deadlock suspected, never proven.
+- `RECOVERING`: expected packet returned after stall/reboot; qualification restarted at zero.
+- `PARAM SYNC`: bounded receive-path reservation; it suppresses false stall and requires fresh
+  post-command HB+ATT before qualification restarts.
+
+Display endpoint, observed/expected sysid, HB/ATT/ANY ages, qualification `mm:ss / 10:00`, and RTCM
+block evidence without resizing cards or moving controls. Only `LIVE` satisfies Pixhawk readiness.
 
 ## 12. GNSS / RTK
 
@@ -88,13 +116,14 @@ Rejection reasons must come from existing logic, not the UI.
 
 ## 15. Recording
 
-Candidate lifecycle: IDLE → STARTING → ACTIVE → STOPPING → SAVED/IDLE, with ERROR where applicable. Exact mapping must be validated against current recording implementation.
+Manual recording: IDLE → STARTING → ACTIVE → STOPPING → IDLE, with DEGRADED/ERROR diagnostics.
+Measurement run: IDLE → QUEUED(optional) → STARTING → RUNNING → STOPPING → IDLE.
 
 The Recording workspace also exposes an advisory protocol projection (not a new
 runtime status key). It evaluates camera LIVE, RTCP/NTP SYNCED, detection RUNNING,
 active calibration, and the selected Pixhawk/GNSS or checkerboard geometry evidence.
 It returns `READY` only when all required checks pass; it never treats a command
-acceptance as proof that a source is live or a session is valid.
+acceptance as proof that a source is live. Storage state is observable but never a Measurement gate.
 
 ## 16. Aggregate Status
 
@@ -122,6 +151,8 @@ Do not let each widget invent its own truth.
 Prevent false success such as CONNECTED because Connect was clicked, RECORDING because button is active, VALID because a number exists, RTK FIX because GNSS exists.
 
 Prevent false failure caused by arbitrary UI timeouts, optional messages, or valid zero values.
+Do not turn USB reboot command acceptance into `RECOVERED` or `LIVE`; expected Ethernet evidence and
+the full new qualification are required.
 
 ## 21. Startup / Shutdown
 

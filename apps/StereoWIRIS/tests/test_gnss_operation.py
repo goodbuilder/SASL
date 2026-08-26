@@ -50,13 +50,21 @@ def test_operation_config_roundtrip_keeps_mode_and_network_identity() -> None:
         site_label="Test field",
         site_address="37.0, 127.0",
         operation_mode=GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE,
-        network=NetworkConfig(caster_host="caster.example", mountpoint="MOUNT"),
+        network=NetworkConfig(
+            caster_host="caster.example",
+            mountpoint="MOUNT",
+            username="field-user",
+            remember_password=True,
+        ),
     )
 
     restored = GnssOperationConfig.from_mapping(config.to_mapping())
 
     assert restored == config
     assert restored.network.mountpoint == "MOUNT"
+    assert restored.network.username == "field-user"
+    assert restored.network.remember_password is True
+    assert "password" not in restored.network.to_mapping()
     assert restored.site_label == "Test field"
     assert restored.site_address == "37.0, 127.0"
 

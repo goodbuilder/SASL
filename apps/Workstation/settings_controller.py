@@ -552,6 +552,14 @@ class WorkstationSettingsController:
                 field_name="calibration_validation_json",
                 allow_empty=True,
             ),
+            "measurement_data_root": portable_workstation_data_path_text(
+                panel._workstation_setting(
+                    "measurement_data_root",
+                    getattr(panel.settings, "measurement_data_root", "measurement_data"),
+                ),
+                data_root=panel.app_root,
+                field_name="measurement_data_root",
+            ),
         }
         panel.settings = AppSettings(
             intrinsics_path=portable_paths["intrinsics_path"],
@@ -612,6 +620,7 @@ class WorkstationSettingsController:
             ),
             calibration_auto_interval_s=panel.calibration_auto_interval_spin.value(),
             calibration_root=portable_paths["calibration_root"],
+            measurement_data_root=portable_paths["measurement_data_root"],
             calibration_validation_mode=str(
                 panel.checkerboard_validation_mode_combo.currentData() or "pixhawk"
             ),
@@ -625,6 +634,12 @@ class WorkstationSettingsController:
             yolo_frame_queue_size=panel.yolo_frame_queue_size_spin.value(),
             rtsp_decoder=panel.decoder_combo.currentData(),
             stream_backend=panel.stream_backend_combo.currentData(),
+            rtsp_reconnect_policy=str(
+                panel._workstation_setting(
+                    "rtsp_reconnect_policy",
+                    getattr(panel.settings, "rtsp_reconnect_policy", "manual"),
+                )
+            ),
             rtsp_transport=panel.rtsp_transport_combo.currentData(),
             camera_sync_history_window_s=panel.camera_sync_history_window_spin.value(),
             camera_sync_receive_pair_max_delta_s=panel.camera_sync_receive_pair_max_delta_spin.value() / 1000.0,

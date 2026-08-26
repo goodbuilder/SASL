@@ -15,13 +15,26 @@ class RelativeAttitude:
     yaw_deg: float
 
 
-def normalize_quaternion(q: Iterable[float]) -> Quaternion:
+def validate_quaternion_finite_nonzero(q: Iterable[float]) -> float:
+    """Raise unless ``q`` is four finite values with a non-degenerate norm.
+
+    Returns the norm so callers that only need validation (not a normalized
+    result) can check a quaternion is usable without paying for the
+    divisions ``normalize_quaternion`` performs.
+    """
+
     w, x, y, z = (float(value) for value in q)
     if not all(isfinite(value) for value in (w, x, y, z)):
         raise ValueError("quaternion must contain four finite values")
     norm = sqrt(w * w + x * x + y * y + z * z)
     if norm <= 1.0e-12:
         raise ValueError("zero-length quaternion")
+    return norm
+
+
+def normalize_quaternion(q: Iterable[float]) -> Quaternion:
+    w, x, y, z = (float(value) for value in q)
+    norm = validate_quaternion_finite_nonzero((w, x, y, z))
     return (w / norm, x / norm, y / norm, z / norm)
 
 
@@ -57,6 +70,20 @@ def _quaternion_multiply_raw(
     )
 
 
+def rotate_vector_by_normalized_quaternion(
+    vector: tuple[float, float, float],
+    q: Quaternion,
+) -> tuple[float, float, float]:
+    """Rotate with a caller-owned unit quaternion without normalizing again."""
+
+    pure = (0.0, float(vector[0]), float(vector[1]), float(vector[2]))
+    rotated = _quaternion_multiply_raw(
+        _quaternion_multiply_raw(q, pure),
+        quaternion_conjugate(q),
+    )
+    return rotated[1], rotated[2], rotated[3]
+
+
 def rotate_vector_by_quaternion(
     vector: tuple[float, float, float],
     q: Iterable[float],
@@ -69,13 +96,10 @@ def rotate_vector_by_quaternion(
     therefore not used for the intermediate pure-vector products here.
     """
 
-    quat = normalize_quaternion(q)
-    pure = (0.0, float(vector[0]), float(vector[1]), float(vector[2]))
-    rotated = _quaternion_multiply_raw(
-        _quaternion_multiply_raw(quat, pure),
-        quaternion_conjugate(quat),
+    return rotate_vector_by_normalized_quaternion(
+        vector,
+        normalize_quaternion(q),
     )
-    return rotated[1], rotated[2], rotated[3]
 
 
 def world_ned_vector_to_body_frd(
@@ -88,9 +112,10 @@ def world_ned_vector_to_body_frd(
     inverse rotation (the conjugate) is required for world NED → body FRD.
     """
 
-    return rotate_vector_by_quaternion(
+    normalized = normalize_quaternion(body_to_world_q)
+    return rotate_vector_by_normalized_quaternion(
         world_vector,
-        quaternion_conjugate(normalize_quaternion(body_to_world_q)),
+        quaternion_conjugate(normalized),
     )
 
 

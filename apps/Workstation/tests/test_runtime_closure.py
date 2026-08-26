@@ -249,6 +249,12 @@ def _valid_runtime_versions(*, include_av: bool = False) -> dict[str, str]:
     return versions
 
 
+def _passing_common_runtime_report():
+    from sasl_common.operator_runtime import Diagnostic, RuntimeReport
+
+    return RuntimeReport((Diagnostic("PASS", "test.common", "fake common runtime ready"),))
+
+
 def test_runtime_requirements_make_av_conditional_and_numpy_strict() -> None:
     from Workstation.__main__ import _runtime_requirements, _runtime_version_errors
 
@@ -267,7 +273,7 @@ def test_runtime_requirements_make_av_conditional_and_numpy_strict() -> None:
     assert errors == ["missing distribution av (required >=11,<16)"]
 
 
-def test_runtime_check_imports_selected_default_capabilities_with_fake_maps(
+def test_runtime_check_imports_app_capabilities_after_common_gate(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     from Workstation.__main__ import _runtime_check, _runtime_requirements
@@ -275,31 +281,24 @@ def test_runtime_check_imports_selected_default_capabilities_with_fake_maps(
     settings = SimpleNamespace(stream_backend="gstreamer")
     requirements = _runtime_requirements(settings)
 
-    class FakeGi:
-        def __init__(self) -> None:
-            self.calls: list[tuple[str, str]] = []
-
-        def require_version(self, name: str, version: str) -> None:
-            self.calls.append((name, version))
-
-    fake_gi = FakeGi()
     imports = {requirement.import_name: object() for requirement in requirements}
     imports.update(
         {
             "sasl_common.lifecycle": object(),
             "Workstation.main_window": object(),
             "Workstation.standalone_gui": object(),
-            "gi": fake_gi,
-            "gi.repository.Gst": object(),
-            "gi.repository.GstRtp": object(),
         }
     )
 
-    assert _runtime_check(settings=settings, versions=_valid_runtime_versions(), importer=imports) == 0
+    assert _runtime_check(
+        settings=settings,
+        versions=_valid_runtime_versions(),
+        importer=imports,
+        common_report=_passing_common_runtime_report(),
+    ) == 0
     output = capsys.readouterr()
     assert "runtime check ok" in output.out
     assert output.err == ""
-    assert fake_gi.calls == [("Gst", "1.0"), ("GstRtp", "1.0")]
 
 
 def test_runtime_check_fails_for_selected_pyav_without_av(
@@ -311,6 +310,7 @@ def test_runtime_check_fails_for_selected_pyav_without_av(
         settings=SimpleNamespace(stream_backend="pyav"),
         versions=_valid_runtime_versions(),
         importer={},
+        common_report=_passing_common_runtime_report(),
     ) == 1
     output = capsys.readouterr()
     assert "missing distribution av" in output.err
@@ -340,7 +340,7 @@ def test_runtime_model_check_requires_bytes_and_validates_default_hash(tmp_path:
     assert _runtime_model_errors(settings, manifest_path=manifest)
 
 
-def test_launcher_help_uses_overridden_cache_without_running_runtime_check(tmp_path: Path) -> None:
+def test_launcher_help_is_dependency_free_and_does_not_create_runtime_state(tmp_path: Path) -> None:
     data_root = tmp_path / "runtime"
     environment = _subprocess_environment(data_root)
     environment["PYTHON_BIN"] = sys.executable
@@ -355,4 +355,4 @@ def test_launcher_help_uses_overridden_cache_without_running_runtime_check(tmp_p
 
     assert "--check" in result.stdout
     assert "runtime check failed" not in result.stderr
-    assert (data_root / ".cache" / "matplotlib").is_dir()
+    assert not data_root.exists()

@@ -1,5 +1,10 @@
 # StereoWIRIS Workstation UI Implementation Plan
 
+> Superseded for Measurement persistence/navigation on 2026-08-26. The active sessionless plan and
+> contracts are in `docs/changes/20260825-long-interval-measurement-workflow/`. Historical Session,
+> package, finalization, recovery, and workbook items below describe the retired implementation and
+> must not be used as current operator behavior.
+
 - Status: Implemented — GO WITH CONDITIONS for the software migration slice; hardware and long-duration finalization remain open
 - Depends on: 00–08 design documents
 - Primary constraint: preserve functionality, keep legacy UI available, and isolate the Workstation owner while removing unused Workstation workflows
@@ -10,6 +15,31 @@ are implemented on `audit/20260808-audit-prompt`. The legacy UI remains the defa
 Workstation uses its own copied `standalone_gui.py`/`standalone_backend.py` owner. See
 [`11_DESIGN_AUDIT_RESULT.md`](11_DESIGN_AUDIT_RESULT.md) for the implementation evidence
 and remaining validation conditions.
+
+### 2026-08-26 Ethernet MAVLink stability slice
+
+The Workstation software now owns explicit GCS `255/190` identity and bounded 1 Hz heartbeat,
+consumer-backed Stock stream requests, per-side HB/ATT/ANY liveness with a 600-second qualification,
+truthful ATTITUDE-only versus all-RX stall status, no false host reconnect, RTCM enqueue/send-lock
+fail-close with separate `blocked_stall` evidence, and operator-confirmed verified-USB side reboot.
+PX4 firmware, `MAV_2_RATE`, parameters, and SD-card configuration are unchanged by this slice.
+
+Software completion does not close the field condition. Required hardware evidence remains: actual
+firmware/sysid/parameter inventory, three independent cold boots of at least 10 minutes, one
+dual-link 60-minute RTCM/full-load soak, symmetric one-side isolation, verified-USB recovery, and a
+new 10-minute post-reboot qualification. `Pixhawk.md` must remain unchanged until all gates pass.
+Automated software evidence currently includes 275 focused passes and a full Workstation result of
+`1224 passed, 1 skipped`. The repository-wide portability command still fails on 12 pre-existing,
+out-of-scope paths; no file in this ETH change packet is reported.
+
+### 2026-08-26 NVIDIA decoder status slice
+
+Camera Preview keeps the existing one-worker-per-side pipeline and Auto fallback lifecycle. The
+persisted operating mode is Auto (NVDEC first, one bounded software fallback). Requested/effective
+selection, actual per-side decoder, fallback reason, and static NVIDIA identity are projected into
+the existing Camera status, CAM tooltips, and Diagnostics Performance; no new global badge,
+worker, queue, rate, affinity, clock, power, or quality policy is introduced. Synthetic NVDEC is
+automated-real evidence; actual dual-WIRIS RTSP remains a hardware/manual acceptance condition.
 
 ## 1. Migration Strategy
 

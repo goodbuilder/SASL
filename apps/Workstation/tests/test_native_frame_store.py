@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 
@@ -160,3 +161,62 @@ def test_async_native_store_does_not_block_gui_timer(monkeypatch, tmp_path: Path
     assert len(ticks) >= 5
     store.acknowledge("request-1")
     assert store.close() is True
+
+
+def test_sessionless_async_native_paths_use_creation_timestamp(tmp_path: Path) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    store = AsyncNativeFrameStore(
+        tmp_path / "measurement_data",
+        timestamp_filenames=True,
+    )
+    completed: list[dict[str, object]] = []
+    store.completed.connect(completed.append)
+
+    scheduled = store.enqueue_pair(
+        request_id="request-time",
+        pair_id="pair-1",
+        purpose="measurement",
+        frames=(
+            (
+                "left",
+                _image(16, 12),
+                {"native_width": 16, "native_height": 12},
+            ),
+        ),
+    )
+    assert scheduled is not None
+    name = Path(str(scheduled["native_left_png_path"])).name
+    assert re.fullmatch(
+        r"\d{8}_\d{6}_\d{9}[+-]\d{4}_pair-1-left\.png",
+        name,
+    )
+
+    deadline_s = time.monotonic() + 2.0
+    while not completed and time.monotonic() < deadline_s:
+        app.processEvents()
+        time.sleep(0.005)
+    assert completed
+    persisted = completed[0]["fields"]["native_left_png_path"]
+    assert persisted == scheduled["native_left_png_path"]
+    assert (tmp_path / "measurement_data" / str(persisted)).is_file()
+    store.acknowledge("request-time")
+    assert store.close() is True
+
+
+def test_native_frame_refuses_to_replace_existing_file(tmp_path: Path) -> None:
+    store = NativeFrameStore(tmp_path / "measurement_data")
+    kwargs = {
+        "side": "left",
+        "purpose": "measurement",
+        "frame_id": "same-frame",
+        "image": _image(8, 6),
+        "metadata": {"native_width": 8, "native_height": 6},
+    }
+    first = store.persist(**kwargs)
+    first_path = tmp_path / "measurement_data" / first.relative_path
+    original = first_path.read_bytes()
+
+    with pytest.raises(OSError, match="refusing to replace"):
+        store.persist(**kwargs)
+
+    assert first_path.read_bytes() == original

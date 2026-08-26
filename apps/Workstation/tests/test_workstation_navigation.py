@@ -5,7 +5,7 @@ from PyQt5 import QtCore, QtWidgets
 from Workstation.navigation import NavigationTree
 
 
-def test_navigation_exposes_one_canonical_sessions_workspace() -> None:
+def test_navigation_exposes_one_canonical_data_workspace() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     tree = NavigationTree()
     root = tree.model.item(0, 0)
@@ -14,7 +14,7 @@ def test_navigation_exposes_one_canonical_sessions_workspace() -> None:
         "Overview",
         "Protocol",
         "Devices",
-        "Sessions",
+        "Data",
         "Calibration",
         "Alignment",
         "Measurement",
@@ -50,10 +50,10 @@ def test_navigation_exposes_one_canonical_sessions_workspace() -> None:
         "devices.pixhawk.p1": "devices.pixhawk",
         "processing.detection": "devices.cameras",
         "processing.synchronization": "devices.time",
-        "tasks.session_details": "tasks.session",
-        "tasks.recording": "tasks.session",
-        "tasks.playback": "tasks.session",
-        "tasks.export": "tasks.session",
+        "tasks.session_details": "tasks.data",
+        "tasks.recording": "tasks.data",
+        "tasks.playback": "tasks.data",
+        "tasks.export": "tasks.data",
         "processing.experiment": "processing.experiment",
     }.items():
         assert tree.select_context(legacy_id)

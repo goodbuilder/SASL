@@ -72,6 +72,7 @@ from Workstation.workstation_core.pose_solvers import (
     solve_spherical_horizon_roll_pitch,
 )
 from Workstation.workstation_core.run_evidence import canonical_json_bytes
+from Workstation.run_evidence_controller import persistence_failure_error
 from Workstation.workstation_core.rtk_geometry import (
     GpsPositionState,
     estimate_rtk_baseline,
@@ -526,6 +527,8 @@ class OpticalPoseController:
         self._pending_wiris_ftp_payload: dict[str, Any] = {}
 
     def _require_open_session_id(self) -> str:
+        if not bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", True)):
+            return "alignment"
         session_id = str(
             getattr(self.panel, "_measurement_session_id", "")
             or getattr(self.panel, "recording_session_id", "")
@@ -542,7 +545,35 @@ class OpticalPoseController:
         return session_id
 
     def reset_workstation_optical_pose_session(self) -> None:
-        """Clear prior-Session Alignment state before a new Session opens."""
+        """Clear the current app-lifetime Alignment state explicitly."""
+
+        if not bool(
+            getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
+        ):
+            writer = getattr(self.panel, "append_workstation_data", None)
+            if callable(writer):
+                writer(
+                    "alignment",
+                    {
+                        "schema": "workstation-alignment-event-v1",
+                        "event_type": "alignment_reset",
+                        "reset_utc_ns": time.time_ns(),
+                        "previous_active_selection_id": (
+                            None
+                            if self._active_selection is None
+                            else self._active_selection.selection_id
+                        ),
+                        "previous_active_profile_hash": str(
+                            getattr(
+                                self.panel,
+                                "_active_optical_pose_profile_hash",
+                                "",
+                            )
+                            or ""
+                        ),
+                    },
+                    priority=True,
+                )
 
         self._candidates.clear()
         self._candidate_priors.clear()
@@ -572,8 +603,13 @@ class OpticalPoseController:
         self._invalidate_measurement_cache()
 
     def _alignment_storage_context(self) -> tuple[str, Path]:
-        """Resolve the Session-owned persistence boundary without changing state."""
+        """Resolve the Alignment persistence boundary without changing state."""
 
+        if not bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", True)):
+            resolver = getattr(self.panel, "_recording_session_dir", None)
+            if not callable(resolver):
+                raise RuntimeError("measurement data directory owner is unavailable")
+            return "alignment", Path(resolver("alignment")) / "alignment"
         session_id = self._require_open_session_id()
         resolver = getattr(self.panel, "_measurement_session_dir", None)
         if not callable(resolver):
@@ -588,6 +624,23 @@ class OpticalPoseController:
     def _persist_session_alignment_snapshot(self) -> Path:
         """Version one immutable selection, then atomically update its pointer."""
 
+        if not bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", True)):
+            _identity, alignment_dir = self._alignment_storage_context()
+            target = alignment_dir.parent / "alignment.jsonl"
+            payload = {
+                "schema": "workstation-alignment-event-v1",
+                "event_type": "active_alignment_updated",
+                "updated_utc_ns": time.time_ns(),
+                "alignment": self.workstation_optical_pose_snapshot(include_frames=False),
+            }
+            encoded = canonical_json_bytes(payload)
+            digest = hashlib.sha256(encoded).hexdigest()
+            writer = getattr(self.panel, "append_workstation_data", None)
+            if callable(writer):
+                writer("alignment", payload, priority=True)
+            setattr(self.panel, "_active_alignment_snapshot_path", str(target))
+            setattr(self.panel, "_active_alignment_snapshot_sha256", digest)
+            return target
         session_id, alignment_dir = self._alignment_storage_context()
         alignment_dir.mkdir(parents=True, exist_ok=True)
         target = alignment_dir / "active_alignment.json"
@@ -1250,12 +1303,15 @@ class OpticalPoseController:
         root.mkdir(parents=True, exist_ok=True)
         ensure = getattr(self.panel, "ensure_workstation_run_evidence", None)
         if callable(ensure):
-            ensure(
+            evidence_result = ensure(
                 "optical_pose_capture_started",
                 {"session_id": session_id},
                 source="OpticalPoseController",
                 coordinate_contract="native OpenCV pixels (u right, v down)",
             )
+            evidence_error = persistence_failure_error(evidence_result)
+            if evidence_error is not None:
+                raise OSError(f"optical-pose evidence setup failed: {evidence_error}")
 
         captured_monotonic_s = time.monotonic()
         profile = self.operating_intrinsics_profile_for_geometry()
@@ -1625,12 +1681,15 @@ class OpticalPoseController:
         root.mkdir(parents=True, exist_ok=True)
         ensure = getattr(self.panel, "ensure_workstation_run_evidence", None)
         if callable(ensure):
-            ensure(
+            evidence_result = ensure(
                 "optical_pose_capture_started",
                 {"session_id": session_id},
                 source="OpticalPoseController",
                 coordinate_contract="native OpenCV pixels (u right, v down)",
             )
+            evidence_error = persistence_failure_error(evidence_result)
+            if evidence_error is not None:
+                raise OSError(f"optical-pose evidence setup failed: {evidence_error}")
 
         captured_monotonic_s = time.monotonic()
         profile = self.operating_intrinsics_profile_for_geometry()
@@ -2433,6 +2492,9 @@ class OpticalPoseController:
                     "crs_wkt": metadata.crs_wkt,
                 },
             )
+            artifact_error = persistence_failure_error(artifact)
+            if artifact_error is not None:
+                raise OSError(f"terrain artifact import failed: {artifact_error}")
         self._terrain_metadata = metadata
         self._terrain_snapshot = {
             **{key: value for key, value in metadata.to_mapping().items() if key != "path"},

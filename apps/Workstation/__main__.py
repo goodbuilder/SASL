@@ -11,9 +11,23 @@ import signal
 import sys
 import tempfile
 import traceback
+from collections.abc import Callable, Mapping
 from importlib import import_module, metadata
 from pathlib import Path
-from typing import Callable, Mapping, NamedTuple
+from typing import NamedTuple
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+COMMON_PYTHON = REPOSITORY_ROOT / "common" / "python"
+if str(COMMON_PYTHON) not in sys.path:
+    sys.path.insert(0, str(COMMON_PYTHON))
+
+from sasl_common.operator_runtime import (
+    DECODER_AUTO,
+    RuntimeReport,
+    check_execution,
+    check_official_interpreter,
+    render_report,
+)
 
 
 class RuntimeRequirement(NamedTuple):
@@ -174,28 +188,12 @@ def _runtime_import_errors(
             "Workstation.standalone_gui",
         )
     )
-    backend = _selected_stream_backend(settings)
-    if backend == "gstreamer":
-        module_names.append("gi")
-
     errors: list[str] = []
-    loaded: dict[str, object] = {}
     for module_name in dict.fromkeys(module_names):
         try:
-            loaded[module_name] = load_module(module_name)
+            load_module(module_name)
         except Exception as exc:
             errors.append(f"cannot import {module_name}: {exc}")
-
-    gi_module = loaded.get("gi")
-    if backend == "gstreamer" and gi_module is not None:
-        try:
-            require_version = getattr(gi_module, "require_version")
-            require_version("Gst", "1.0")
-            require_version("GstRtp", "1.0")
-            load_module("gi.repository.Gst")
-            load_module("gi.repository.GstRtp")
-        except Exception as exc:
-            errors.append(f"GStreamer introspection unavailable: {exc}")
     return errors
 
 
@@ -245,6 +243,7 @@ def _runtime_check(
     versions: Mapping[str, str | None] | None = None,
     importer: Callable[[str], object] | Mapping[str, object] | None = None,
     version_lookup: Callable[[str], str] | None = None,
+    common_report: RuntimeReport | None = None,
 ) -> int:
     try:
         if settings is None:
@@ -255,6 +254,13 @@ def _runtime_check(
     except Exception as exc:
         print(f"SASL Workstation runtime check failed:\n- cannot load settings: {exc}", file=sys.stderr)
         return 1
+
+    runtime_report = common_report or check_execution(
+        str(getattr(settings, "rtsp_decoder", DECODER_AUTO)),
+        root=REPOSITORY_ROOT,
+    )
+    report_text = render_report(runtime_report, title="SASL common operator runtime")
+    print(report_text, file=sys.stderr if runtime_report.exit_code else sys.stdout)
 
     requirements = _runtime_requirements(settings)
     installed_versions = (
@@ -269,11 +275,11 @@ def _runtime_check(
     errors.extend(_runtime_model_errors(settings))
     if not errors:
         errors.extend(_runtime_import_errors(settings, requirements, importer=importer))
-    if errors:
+    if errors or runtime_report.exit_code:
         print("SASL Workstation runtime check failed:", file=sys.stderr)
         for error in errors:
             print(f"- {error}", file=sys.stderr)
-        return 1
+        return runtime_report.exit_code or 1
 
     version_summary = ", ".join(
         f"{requirement.distribution}={installed_versions[requirement.distribution]}"
@@ -320,7 +326,8 @@ def _flush_window_session_state(window: object | None) -> None:
     flusher = getattr(owner, "flush_workstation_run_evidence", None)
     if callable(flusher):
         try:
-            flusher()
+            if flusher() is False:
+                print("Emergency run-evidence flush failed", file=sys.stderr)
         except Exception as exc:  # noqa: BLE001 - emergency path must keep going.
             print(f"Emergency run-evidence flush failed: {exc}", file=sys.stderr)
 
@@ -343,7 +350,8 @@ def _flush_window_session_state(window: object | None) -> None:
         if not callable(flush):
             continue
         try:
-            flush()
+            if flush() is False:
+                print("Emergency recording-spool flush failed", file=sys.stderr)
         except Exception as exc:  # noqa: BLE001 - report every independent spool.
             print(f"Emergency recording-spool flush failed: {exc}", file=sys.stderr)
 
@@ -388,8 +396,28 @@ def main(argv: list[str] | None = None) -> int:
     except (AttributeError, OSError, RuntimeError):
         pass
     args, qt_args = _parser().parse_known_args(sys.argv[1:] if argv is None else argv)
+    interpreter_report = check_official_interpreter(root=REPOSITORY_ROOT)
+    if interpreter_report.exit_code:
+        print(
+            render_report(interpreter_report, title="SASL Workstation startup blocked"),
+            file=sys.stderr,
+        )
+        return interpreter_report.exit_code
     if args.check:
         return _runtime_check()
+
+    # Validate the common mandatory media runtime before importing Qt. An
+    # unavailable optional NVIDIA path is an allowed Auto/software warning;
+    # a saved explicit NVIDIA choice is enforced when the camera is started.
+    startup_report = check_execution(DECODER_AUTO, root=REPOSITORY_ROOT)
+    if startup_report.exit_code:
+        print(
+            render_report(startup_report, title="SASL Workstation startup blocked"),
+            file=sys.stderr,
+        )
+        return startup_report.exit_code
+    if any(item.level == "WARN" for item in startup_report.diagnostics):
+        print(render_report(startup_report, title="SASL Workstation startup warning"))
 
     from PyQt5 import QtWidgets
 

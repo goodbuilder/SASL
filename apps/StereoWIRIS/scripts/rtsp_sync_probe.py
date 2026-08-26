@@ -12,15 +12,16 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst  # noqa: E402
 
 
-def build_pipeline(url: str, latency_ms: int):
+def build_pipeline(url: str, latency_ms: int, *, transport: str, decoder: str):
+    transport = "tcp" if str(transport).strip().lower() == "tcp" else "udp"
+    decoder = "nvh264dec" if str(decoder).strip().lower() in {"nvidia", "nvh264dec"} else "avdec_h264"
     pipeline_text = (
-        f"rtspsrc location={url} latency={latency_ms} protocols=tcp drop-on-latency=true "
+        f"rtspsrc location={url} latency={latency_ms} protocols={transport} drop-on-latency=true "
         "! rtph264depay "
-        "! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
-        "! h264parse "
-        "! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
-        "! avdec_h264 "
-        "! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
+        "! queue max-size-buffers=0 max-size-bytes=0 max-size-time=250000000 "
+        "! h264parse config-interval=-1 "
+        f"! {decoder} "
+        "! queue leaky=downstream max-size-buffers=8 max-size-bytes=0 max-size-time=0 "
         "! videoconvert "
         "! video/x-raw,format=BGR "
         "! appsink name=sink emit-signals=false sync=false max-buffers=1 drop=true"
@@ -28,10 +29,19 @@ def build_pipeline(url: str, latency_ms: int):
     return Gst.parse_launch(pipeline_text)
 
 
-def collect(name: str, url: str, *, duration_s: float, latency_ms: int, results: dict) -> None:
+def collect(
+    name: str,
+    url: str,
+    *,
+    duration_s: float,
+    latency_ms: int,
+    transport: str,
+    decoder: str,
+    results: dict,
+) -> None:
     rows: list[dict[str, float | int | None]] = []
     errors: list[str] = []
-    pipeline = build_pipeline(url, latency_ms)
+    pipeline = build_pipeline(url, latency_ms, transport=transport, decoder=decoder)
     sink = pipeline.get_by_name("sink")
     bus = pipeline.get_bus()
     pipeline.set_state(Gst.State.PLAYING)
@@ -156,6 +166,8 @@ def main() -> int:
     parser.add_argument("--right", default="rtsp://10.0.0.232:8554/visible")
     parser.add_argument("--duration", type=float, default=8.0)
     parser.add_argument("--latency-ms", type=int, default=50)
+    parser.add_argument("--transport", choices=("udp", "tcp"), default="udp")
+    parser.add_argument("--decoder", choices=("software", "nvidia"), default="software")
     args = parser.parse_args()
 
     Gst.init(None)
@@ -164,13 +176,25 @@ def main() -> int:
         threading.Thread(
             target=collect,
             args=("left", args.left),
-            kwargs={"duration_s": args.duration, "latency_ms": args.latency_ms, "results": results},
+            kwargs={
+                "duration_s": args.duration,
+                "latency_ms": args.latency_ms,
+                "transport": args.transport,
+                "decoder": args.decoder,
+                "results": results,
+            },
             daemon=True,
         ),
         threading.Thread(
             target=collect,
             args=("right", args.right),
-            kwargs={"duration_s": args.duration, "latency_ms": args.latency_ms, "results": results},
+            kwargs={
+                "duration_s": args.duration,
+                "latency_ms": args.latency_ms,
+                "transport": args.transport,
+                "decoder": args.decoder,
+                "results": results,
+            },
             daemon=True,
         ),
     ]

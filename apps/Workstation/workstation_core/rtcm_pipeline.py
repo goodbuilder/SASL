@@ -226,10 +226,11 @@ class RtcmDataPlane:
         self._last_frame_monotonic_ns: int | None = None
         self._message_types: Counter[int] = Counter()
         self._injection = {
-            side: {"frames": 0, "bytes": 0, "packets": 0, "fail": 0}
+            side: {"frames": 0, "bytes": 0, "packets": 0, "fail": 0, "blocked_stall": 0}
             for side in ("left", "right", "drone")
         }
         self._injection_dropped_stale = 0
+        self._injection_blocked_stall = 0
         self._last_injection_drop: dict[str, object] | None = None
         self._injection_expected = 0
         self._injection_outcomes = 0
@@ -273,10 +274,11 @@ class RtcmDataPlane:
         self._last_frame_monotonic_ns = None
         self._message_types.clear()
         self._injection = {
-            side: {"frames": 0, "bytes": 0, "packets": 0, "fail": 0}
+            side: {"frames": 0, "bytes": 0, "packets": 0, "fail": 0, "blocked_stall": 0}
             for side in ("left", "right", "drone")
         }
         self._injection_dropped_stale = 0
+        self._injection_blocked_stall = 0
         self._last_injection_drop = None
         self._base_forward_unavailable = 0
 
@@ -471,6 +473,15 @@ class RtcmDataPlane:
             key = str(side)
             if key in self._injection:
                 self._injection[key]["fail"] += 1
+        for blocked in tuple(result.get("blocked_targets") or ()):
+            if not isinstance(blocked, Mapping) or blocked.get("category") != "stall":
+                continue
+            key = str(blocked.get("side") or "")
+            if key in self._injection:
+                self._injection[key]["blocked_stall"] = int(
+                    self._injection[key].get("blocked_stall") or 0
+                ) + 1
+        self._injection_blocked_stall += int(result.get("blocked_stall") or 0)
         dropped = int(result.get("dropped") or 0)
         self._injection_dropped_stale += dropped
         if dropped and str(result.get("drop_reason") or "").startswith("stale-"):
@@ -596,6 +607,7 @@ class RtcmDataPlane:
                 "evidence_persisted": self._evidence_persisted,
                 "evidence_failed": self._evidence_failed,
                 "injection_dropped_stale": self._injection_dropped_stale,
+                "injection_blocked_stall": self._injection_blocked_stall,
                 "last_injection_drop": self._last_injection_drop,
                 "injection_expected": self._injection_expected,
                 "injection_outcomes": self._injection_outcomes,
@@ -690,7 +702,13 @@ def _validate_evidence_append_boundary(
         raise ValueError("final RTCM evidence payload hash mismatch")
     if str(previous.get("schema") or "") != RTCM_EVIDENCE_SCHEMA:
         raise ValueError("unexpected final RTCM evidence schema")
-    if str(previous.get("session_id") or "") != context.session_id:
+    if context.session_id == "measurement-data":
+        if not (
+            str(previous.get("data_owner") or "") == "measurement_data_root"
+            or str(previous.get("session_id") or "") == "measurement-data"
+        ):
+            raise ValueError("RTCM evidence data owner changed within one file pair")
+    elif str(previous.get("session_id") or "") != context.session_id:
         raise ValueError("RTCM evidence session identity changed within one file pair")
     if str(previous.get("source") or "") != record.source or str(
         previous.get("record_kind") or ""
@@ -783,7 +801,6 @@ def append_rtcm_evidence(
         )
         row = {
             "schema": RTCM_EVIDENCE_SCHEMA,
-            "session_id": context.session_id,
             "context_token": context.context_token,
             "sequence": record.sequence,
             "source_sequence": record.source_sequence,
@@ -796,6 +813,10 @@ def append_rtcm_evidence(
             "receive_monotonic_ns": record.receive_monotonic_ns,
             "message_type": record.message_type,
         }
+        if context.session_id == "measurement-data":
+            row["data_owner"] = "measurement_data_root"
+        else:
+            row["session_id"] = context.session_id
         encoded = (
             json.dumps(
                 row,
@@ -906,7 +927,15 @@ def load_rtcm_evidence_high_water(
                     raise ValueError(
                         f"unexpected RTCM evidence schema at {index_path}:{line_number}"
                     )
-                if str(row.get("session_id") or "") != context.session_id:
+                if context.session_id == "measurement-data":
+                    if not (
+                        str(row.get("data_owner") or "") == "measurement_data_root"
+                        or str(row.get("session_id") or "") == "measurement-data"
+                    ):
+                        raise ValueError(
+                            f"RTCM evidence data owner mismatch at {index_path}:{line_number}"
+                        )
+                elif str(row.get("session_id") or "") != context.session_id:
                     raise ValueError(
                         f"RTCM evidence session mismatch at {index_path}:{line_number}"
                     )

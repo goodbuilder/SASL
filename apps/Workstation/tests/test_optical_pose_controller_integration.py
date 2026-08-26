@@ -681,6 +681,44 @@ def test_terrain_pnp_fails_clearly_without_explicit_3d_to_ridge_matches(tmp_path
         )
 
 
+def test_terrain_import_rejects_structured_persistence_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    metadata = TerrainMetadata(
+        path=str(tmp_path / "terrain.tif"),
+        sha256="b" * 64,
+        width=100,
+        height=100,
+        band_count=1,
+        dtype="float32",
+        crs_wkt="LOCAL_CS[test]",
+        affine_gdal=(0.0, 1.0, 0.0, 0.0, 0.0, -1.0),
+        bounds=(0.0, 0.0, 100.0, 100.0),
+        nodata=None,
+        horizontal_datum="WGS84",
+        vertical_datum="ellipsoid",
+        transformer_definition="test",
+        transformer_accuracy_m=0.1,
+    )
+    monkeypatch.setattr(optical_pose_module, "inspect_geotiff", lambda *_args, **_kwargs: metadata)
+    panel = _panel(tmp_path)
+    panel.import_workstation_session_artifact = lambda *_args, **_kwargs: {
+        "schema": "workstation-persistence-failure-v1",
+        "status": "failed",
+        "kind": "artifact_import",
+        "error": "terrain-disk-sentinel",
+    }
+    controller = OpticalPoseController(panel)
+
+    with pytest.raises(OSError, match="terrain-disk-sentinel"):
+        controller.import_workstation_optical_pose_terrain(
+            {"path": str(tmp_path / "terrain.tif"), "vertical_datum": "ellipsoid"}
+        )
+
+    assert controller._terrain_metadata is None
+
+
 def test_drone_yaw_requires_explicit_los_and_preserves_other_dof(tmp_path: Path) -> None:
     panel = _panel(tmp_path)
     controller = OpticalPoseController(panel)

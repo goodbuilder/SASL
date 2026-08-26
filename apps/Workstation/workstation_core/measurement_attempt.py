@@ -46,6 +46,18 @@ CHECKERBOARD_FRAME_CONTRACT = (
 )
 
 DETECTION_METADATA_ALLOWLIST = (
+    "camera_id",
+    "frame_id",
+    "frame_key",
+    "frame_descriptor_sha256",
+    "source_native_frame_id",
+    "native_ring_available",
+    "native_ring_unavailable_reason",
+    "native_width",
+    "native_height",
+    "native_channels",
+    "native_byte_length",
+    "native_pixel_format",
     "source_timestamp_s",
     "timestamp_source",
     "timestamp_reference",
@@ -1481,7 +1493,6 @@ def build_pixhawk_baseline_snapshot(
     left_gps: GpsSnapshot,
     right_gps: GpsSnapshot,
     selected_left_quaternion_wxyz: tuple[float, float, float, float] | None,
-    selected_right_quaternion_wxyz: tuple[float, float, float, float] | None,
     selected_left_attitude_monotonic_s: float | None,
     created_monotonic_s: float,
     detection_midpoint_monotonic_s: float,
@@ -1506,11 +1517,9 @@ def build_pixhawk_baseline_snapshot(
     basis = None
     if usable and ned is not None and selected_left_quaternion_wxyz is not None:
         basis = tuple(selected_left_quaternion_wxyz)
-        right_q = selected_right_quaternion_wxyz or selected_left_quaternion_wxyz
         translation = camera_translation_right_in_left_camera(
             baseline_right_in_left_world_m=ned,
             left_body_to_world_q=selected_left_quaternion_wxyz,
-            right_body_to_world_q=right_q,
             scale_to_m=None,
         )
     return BaselineSnapshot(

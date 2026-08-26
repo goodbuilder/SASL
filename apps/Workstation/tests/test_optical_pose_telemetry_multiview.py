@@ -288,3 +288,32 @@ def test_accumulated_multiview_ignores_blocked_sync_and_revises_same_burst(tmp_p
     assert controller.workstation_optical_pose_snapshot()[
         "drone_rtk_multiview_samples"
     ] == []
+
+
+def test_sessionless_alignment_reset_appends_event_without_deleting_data(tmp_path) -> None:
+    panel = _panel(tmp_path)
+    panel._measurement_session_hierarchy_enabled = False
+    events: list[tuple[str, dict[str, object], bool]] = []
+    panel.append_workstation_data = (
+        lambda stream, payload, *, priority: events.append(
+            (str(stream), dict(payload), bool(priority))
+        )
+        or True
+    )
+    controller = OpticalPoseController(panel)
+
+    controller.reset_workstation_optical_pose_session()
+
+    assert events == [
+        (
+            "alignment",
+            {
+                "schema": "workstation-alignment-event-v1",
+                "event_type": "alignment_reset",
+                "reset_utc_ns": events[0][1]["reset_utc_ns"],
+                "previous_active_selection_id": None,
+                "previous_active_profile_hash": "",
+            },
+            True,
+        )
+    ]

@@ -23,10 +23,12 @@ from Workstation.device_runtime_workers import (
     PixhawkShellCommandWorker,
     PixhawkStreamSetupWorker,
     PixhawkUsbBootstrapWorker,
+    PixhawkUsbRecoveryWorker,
 )
 from Workstation.workstation_core.network import DEFAULT_HOST_ADDRESS
 from Workstation.workstation_core.pixhawk_attitude import (
     DualPixhawkMavlinkSubscriber,
+    USB_MAVLINK_IDENTITY_MAX_AGE_S,
     camera_label_ko,
 )
 from Workstation.workstation_core.px4_attitude_cal_manager import (
@@ -34,13 +36,9 @@ from Workstation.workstation_core.px4_attitude_cal_manager import (
 )
 from Workstation.workstation_core.px4_calibration_groups import px4_calibration_group
 
-# pymavlink's UDP transport (used for Ethernet-connected Pixhawks) has no
-# disconnect notification: unplugging the cable or losing the link leaves
-# ``connections[side]`` and ``_heartbeat_logged`` exactly as they were at the
-# last successful heartbeat. Without this timeout, ``_mavlink_connected_sides``
-# keeps reporting the side as connected forever, so pressing "Connect" again
-# silently no-ops instead of re-establishing the link. See
-# ``DeviceRuntimeController._mavlink_side_is_stale``.
+# Legacy fallback for test doubles/older subscriber adapters that do not yet
+# publish the subscriber-owned all-RX liveness snapshot. Production decisions
+# use the 10-second expected-system packet-silence state instead.
 _MAVLINK_STALE_TIMEOUT_S = 5.0
 
 DEVICE_RUNTIME_CONTROLLER_METHODS = [
@@ -75,6 +73,10 @@ DEVICE_RUNTIME_CONTROLLER_METHODS = [
     "_handle_mavlink_stream_setup_required",
     "_clear_pixhawk_stream_setup_worker",
     "bootstrap_ethernet_mavlink_from_usb",
+    "recover_stalled_pixhawk_via_verified_usb",
+    "_apply_pixhawk_usb_recovery_result",
+    "_pixhawk_usb_recovery_failed",
+    "_clear_pixhawk_usb_recovery_worker",
     "_apply_pixhawk_usb_bootstrap_result",
     "_clear_pixhawk_usb_bootstrap_worker",
     "_temporary_mavlink_heartbeat",
@@ -203,6 +205,7 @@ class DeviceRuntimeController:
             "pixhawk_disconnection_thread",
             "pixhawk_stream_setup_thread",
             "pixhawk_usb_bootstrap_thread",
+            "pixhawk_usb_recovery_thread",
             "pixhawk_persistent_config_thread",
             "pixhawk_rtcm_thread",
         ):
@@ -469,8 +472,24 @@ class DeviceRuntimeController:
     def _mavlink_connected_sides(self) -> set[str]:
         if self.panel.mavlink_pixhawk is None:
             return set()
-        connections = getattr(self.panel.mavlink_pixhawk, "connections", {})
-        heartbeat_sides = getattr(self.panel.mavlink_pixhawk, "_heartbeat_logged", set())
+        subscriber = self.panel.mavlink_pixhawk
+        connections = getattr(subscriber, "connections", {})
+        health_reader = getattr(subscriber, "mavlink_health_snapshot", None)
+        if callable(health_reader):
+            connected: set[str] = set()
+            for side in ("left", "right"):
+                if side not in connections:
+                    continue
+                try:
+                    health = health_reader(side)
+                except Exception:
+                    continue
+                if bool(getattr(health, "identity_verified", False)) and bool(
+                    getattr(health, "command_eligible", False)
+                ):
+                    connected.add(side)
+            return connected
+        heartbeat_sides = getattr(subscriber, "_heartbeat_logged", set())
         try:
             return {side for side in ("left", "right") if side in connections and side in heartbeat_sides}
         except TypeError:
@@ -731,6 +750,210 @@ class DeviceRuntimeController:
         self.panel.pixhawk_usb_bootstrap_thread = None
         self.panel.pixhawk_usb_bootstrap_worker = None
 
+    def _set_pixhawk_usb_recovery_status(self, camera: str, state: str, detail: str) -> None:
+        statuses = getattr(self.panel, "pixhawk_usb_recovery_status", None)
+        if not isinstance(statuses, dict):
+            statuses = {}
+            self.panel.pixhawk_usb_recovery_status = statuses
+        statuses[str(camera)] = {
+            "state": str(state).upper(),
+            "detail": str(detail),
+            "updated_s": time.monotonic(),
+        }
+
+    def _pixhawk_usb_recovery_block_reason(self, camera: str) -> str:
+        if camera not in {"left", "right"}:
+            return f"unknown Pixhawk side: {camera}"
+        recording_active = getattr(self.panel, "_session_recording_active", None)
+        if callable(recording_active) and bool(recording_active()):
+            return "measurement recording is active"
+        run_state = str(getattr(self.panel, "_measurement_run_state", "IDLE") or "IDLE").upper()
+        if run_state in {"QUEUED", "STARTING", "RUNNING", "STOPPING"}:
+            return f"Measurement lifecycle is {run_state}"
+        if getattr(self.panel, "_session_save_thread", None) is not None:
+            return "session save/finalization worker is active"
+        if bool(getattr(self.panel, "_measurement_package_finalize_requested", False)):
+            return "measurement package finalization is pending"
+        if bool(getattr(self.panel, "_session_save_retry_required", False)):
+            return "session save recovery is pending"
+        for attribute, label in (
+            ("pixhawk_connection_thread", "Pixhawk connect"),
+            ("pixhawk_disconnection_thread", "Pixhawk disconnect"),
+            ("pixhawk_stream_setup_thread", "PX4 stream setup"),
+            ("pixhawk_usb_bootstrap_thread", "USB Ethernet bootstrap"),
+            ("pixhawk_persistent_config_thread", "PX4 persistent config"),
+            ("pixhawk_usb_discovery_thread", "USB discovery"),
+            ("pixhawk_usb_recovery_thread", "USB recovery"),
+        ):
+            if getattr(self.panel, attribute, None) is not None:
+                return f"{label} is active"
+        for attribute, label in (
+            ("pixhawk_shell_threads", "PX4 shell/reboot command"),
+            ("pixhawk_parameter_threads", "PX4 parameter command"),
+        ):
+            active = getattr(self.panel, attribute, {}) or {}
+            if active:
+                return f"{label} is active"
+        subscriber = getattr(self.panel, "mavlink_pixhawk", None)
+        health_reader = getattr(subscriber, "mavlink_health_snapshot", None)
+        if not callable(health_reader):
+            return "current Ethernet MAVLink liveness evidence is unavailable"
+        try:
+            health = health_reader(camera)
+        except Exception as exc:
+            return f"Ethernet MAVLink liveness read failed: {exc}"
+        state = str(
+            getattr(
+                getattr(health, "state", None),
+                "value",
+                getattr(health, "state", ""),
+            )
+        )
+        if state != "ETH MAVLINK RX STALLED":
+            return f"verified-USB recovery is allowed only for ETH MAVLINK RX STALLED (current={state or 'UNKNOWN'})"
+        return ""
+
+    def _verified_usb_identity_for_side(
+        self,
+        camera: str,
+        *,
+        now_s: float,
+    ) -> tuple[dict[str, object] | None, str]:
+        expected_system_id = 1 if camera == "left" else 2
+        evidence = getattr(self.panel, "pixhawk_usb_identity_evidence", ()) or ()
+        matching: list[dict[str, object]] = []
+        stale_matching = False
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            try:
+                system_id = int(item.get("system_id"))
+            except (TypeError, ValueError):
+                continue
+            if system_id != expected_system_id:
+                continue
+            observed_s = item.get("observed_monotonic_s")
+            try:
+                age_s = max(0.0, now_s - float(observed_s))
+            except (TypeError, ValueError):
+                stale_matching = True
+                continue
+            if age_s > USB_MAVLINK_IDENTITY_MAX_AGE_S:
+                stale_matching = True
+                continue
+            try:
+                baud = int(item.get("baud") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not str(item.get("device") or "") or baud <= 0:
+                continue
+            if item.get("component_id") is None:
+                continue
+            candidate = dict(item)
+            candidate["identity_age_s"] = age_s
+            matching.append(candidate)
+        if len(matching) > 1:
+            return None, f"sysid {expected_system_id} is present on multiple current USB devices"
+        if not matching:
+            if stale_matching:
+                return None, f"sysid {expected_system_id} USB identity evidence is stale"
+            return None, f"no current unique USB heartbeat for sysid {expected_system_id}"
+        return matching[0], ""
+
+    def recover_stalled_pixhawk_via_verified_usb(self, camera: str) -> bool:
+        if camera not in {"left", "right"}:
+            raise ValueError(f"Unknown Pixhawk side: {camera}")
+        label = self.panel._px4_mag_camera_label(camera)
+        blocked = self._pixhawk_usb_recovery_block_reason(camera)
+        if blocked:
+            detail = f"복구 차단: {blocked}"
+            self._set_pixhawk_usb_recovery_status(camera, "ERROR", detail)
+            self.panel._log(f"[픽스호크] {label} verified-USB 복구 차단: {blocked}")
+            return False
+        evidence, error = self._verified_usb_identity_for_side(camera, now_s=time.monotonic())
+        if evidence is None:
+            detail = (
+                f"{error}. Find USB로 identity를 다시 확인하거나 {label}만 수동 전원 재부팅하세요."
+            )
+            self._set_pixhawk_usb_recovery_status(camera, "ERROR", detail)
+            self.panel._log(f"[픽스호크] {label} verified-USB 복구 불가: {detail}")
+            return False
+        expected_system_id = 1 if camera == "left" else 2
+        device = str(evidence.get("device") or "")
+        component_id = int(evidence.get("component_id") or 0)
+        result = QtWidgets.QMessageBox.question(
+            self.panel,
+            f"{label} verified-USB 재부팅",
+            (
+                f"{label} ETH MAVLink 전체 수신 정지를 복구합니다.\n\n"
+                f"USB: {device}\n"
+                f"MAVLink identity: sysid={expected_system_id}, compid={component_id}\n"
+                "이 USB identity를 worker가 즉시 다시 검증한 뒤 해당 Pixhawk에만 재부팅 명령을 보냅니다.\n"
+                "명령 전송은 복구 성공이 아니며 Ethernet heartbeat+ATTITUDE 10분 검증을 다시 시작합니다.\n\n"
+                "계속할까요?"
+            ),
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if result != QtWidgets.QMessageBox.Yes:
+            self._set_pixhawk_usb_recovery_status(camera, "CANCELLED", "operator가 재부팅을 취소했습니다.")
+            self.panel._log(f"[픽스호크] {label} verified-USB 재부팅을 취소했습니다.")
+            return False
+        thread = QtCore.QThread(self.panel)
+        worker = PixhawkUsbRecoveryWorker(
+            camera=camera,
+            evidence=evidence,
+            expected_system_id=expected_system_id,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self.panel._apply_pixhawk_usb_recovery_result)
+        worker.failed.connect(
+            lambda failure, camera=camera: self.panel._pixhawk_usb_recovery_failed(camera, failure)
+        )
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self.panel._clear_pixhawk_usb_recovery_worker)
+        self.panel.pixhawk_usb_recovery_thread = thread
+        self.panel.pixhawk_usb_recovery_worker = worker
+        self._set_pixhawk_usb_recovery_status(
+            camera,
+            "RUNNING",
+            f"sysid={expected_system_id} USB identity 재검증 후 one-shot reboot 대기",
+        )
+        self.panel._log(
+            f"[픽스호크] {label} verified-USB recovery 시작: {device}, "
+            f"sysid={expected_system_id}, compid={component_id}"
+        )
+        thread.start()
+        return True
+
+    def _apply_pixhawk_usb_recovery_result(self, result: object) -> None:
+        data = dict(result or {})
+        camera = str(data.get("camera") or "")
+        if camera not in {"left", "right"}:
+            return
+        label = self.panel._px4_mag_camera_label(camera)
+        detail = (
+            f"USB reboot command sent to sysid={data.get('system_id')} via {data.get('device')}; "
+            "Ethernet expected-sysid packet 재개 및 10분 qualification 대기"
+        )
+        self._set_pixhawk_usb_recovery_status(camera, "COMMAND_SENT", detail)
+        self.panel._log(
+            f"[픽스호크] {label} {detail}. command send만으로 LIVE/READY로 처리하지 않습니다."
+        )
+
+    def _pixhawk_usb_recovery_failed(self, camera: str, error: str) -> None:
+        label = self.panel._px4_mag_camera_label(camera)
+        detail = f"USB identity 재검증/재부팅 실패: {error}; {label} 수동 전원 재부팅을 사용하세요."
+        self._set_pixhawk_usb_recovery_status(camera, "ERROR", detail)
+        self.panel._log(f"[픽스호크] {label} {detail}")
+
+    def _clear_pixhawk_usb_recovery_worker(self) -> None:
+        self.panel.pixhawk_usb_recovery_thread = None
+        self.panel.pixhawk_usb_recovery_worker = None
+
     def _temporary_mavlink_heartbeat(self, subscriber: DualPixhawkMavlinkSubscriber, camera: str) -> bool:
         connection = getattr(subscriber, "connections", {}).get(camera)
         if connection is None:
@@ -790,7 +1013,7 @@ class DeviceRuntimeController:
             self.panel._log("[픽스호크] MAVLink 연결 해제가 끝난 뒤 다시 연결하세요.")
             return
         target_sides = self.panel._mavlink_target_sides(camera)
-        if all(side in self.panel._mavlink_connected_sides() for side in target_sides):
+        if all(side in self.panel._mavlink_open_sides() for side in target_sides):
             stale_sides = tuple(side for side in target_sides if self._mavlink_side_is_stale(side))
             if not stale_sides:
                 if force_setup and self.panel.mavlink_pixhawk is not None:
@@ -913,18 +1136,24 @@ class DeviceRuntimeController:
         self.panel._refresh_session_toggle_buttons()
 
     def _mavlink_side_is_stale(self, side: str) -> bool:
-        """True if ``side`` has a logged heartbeat but has gone quiet.
+        """True only for confirmed all-RX silence, never ATTITUDE-only stale.
 
-        Only meaningful for a side that ``_mavlink_connected_sides`` already
-        counts as connected. A PARAM/shell worker temporarily reserves the
-        receive path via ``exclusive_command`` and pauses normal ATTITUDE
-        processing for its duration, so a side mid-command is never treated
-        as stale here -- that gap reflects the command, not a dead link.
+        A live host socket is not remote recovery evidence. New subscribers
+        expose the expected-system packet state; the old ATTITUDE timeout is
+        retained only for compatible test/legacy adapters.
         """
 
         subscriber = self.panel.mavlink_pixhawk
         if subscriber is None or side not in getattr(subscriber, "connections", {}):
             return False
+        health_reader = getattr(subscriber, "mavlink_health_snapshot", None)
+        if callable(health_reader):
+            try:
+                health = health_reader(side)
+            except Exception:
+                return False
+            state = getattr(getattr(health, "state", None), "value", getattr(health, "state", ""))
+            return str(state) == "ETH MAVLINK RX STALLED"
         if side in getattr(subscriber, "_active_command_cameras", set()):
             return False
         timestamps = self.panel.pixhawk_attitude_times.get(side)
@@ -938,29 +1167,19 @@ class DeviceRuntimeController:
         stale_sides: Sequence[str],
         force_setup: bool,
     ) -> None:
-        if self.panel.pixhawk_disconnection_thread is not None:
-            self.panel._log("[픽스호크] MAVLink 연결 해제 작업이 이미 진행 중입니다.")
-            return
         label = " / ".join(self.panel._px4_mag_camera_label(side) for side in stale_sides)
         self.panel._log(
-            f"[픽스호크] {label} 응답이 {_MAVLINK_STALE_TIMEOUT_S:.0f}초 넘게 없어 "
-            "연결이 끊긴 것으로 보고 재연결을 시도합니다."
+            f"[픽스호크] {label} Ethernet MAVLink 전체 수신이 정지했습니다. "
+            "host UDP socket 재연결은 PX4-side stall을 복구하지 않으므로 자동 실행하지 않습니다. "
+            "RTCM/추가 명령을 차단하고 verified-USB 또는 named-side 전원 복구를 사용하세요."
         )
-        stale_camera = stale_sides[0] if len(stale_sides) == 1 else None
-        self.disconnect_mavlink_pixhawk(stale_camera)
-        thread = self.panel.pixhawk_disconnection_thread
-        if thread is None:
-            # The subscriber was already gone by the time disconnect ran (it
-            # finished synchronously without starting a worker thread); retry
-            # the connect immediately instead of waiting on a signal that will
-            # never fire.
-            self.connect_mavlink_pixhawk(camera, force_setup=force_setup)
-            return
-        thread.finished.connect(
-            lambda camera=camera, force_setup=force_setup:
-            self.connect_mavlink_pixhawk(camera, force_setup=force_setup),
-            QtCore.Qt.QueuedConnection,
-        )
+        status_label = getattr(self.panel, "pixhawk_connection_label", None)
+        set_text = getattr(status_label, "setText", None)
+        if callable(set_text):
+            set_text(f"픽스호크 MAVLink: {label} ETH RX STALLED · RTCM/명령 차단")
+        refresh_actions = getattr(self.panel, "_refresh_mavlink_side_actions", None)
+        if callable(refresh_actions):
+            refresh_actions()
 
     def disconnect_mavlink_pixhawk(self, camera: str | None = None) -> None:
         if self.panel._session_recording_active():
@@ -1197,6 +1416,28 @@ class DeviceRuntimeController:
         if self.panel.mavlink_pixhawk is None or camera not in self.panel.mavlink_pixhawk.connections:
             self.panel._log(f"[픽스호크] {camera_label_ko(camera)} 재부팅 실패: MAVLink 연결이 없습니다.")
             return
+        health_reader = getattr(self.panel.mavlink_pixhawk, "mavlink_health_snapshot", None)
+        if callable(health_reader):
+            try:
+                health = health_reader(camera)
+            except Exception as exc:
+                self.panel._log(
+                    f"[픽스호크] {camera_label_ko(camera)} 재부팅 차단: liveness 확인 실패 ({exc})"
+                )
+                return
+            state = str(
+                getattr(
+                    getattr(health, "state", None),
+                    "value",
+                    getattr(health, "state", ""),
+                )
+            )
+            if not bool(getattr(health, "command_eligible", False)):
+                self.panel._log(
+                    f"[픽스호크] {camera_label_ko(camera)} Ethernet 재부팅 명령 차단: "
+                    f"state={state or 'UNKNOWN'}. stalled side는 verified-USB recovery를 사용하세요."
+                )
+                return
         result = QtWidgets.QMessageBox.question(
             self.panel,
             f"{camera_label_ko(camera)} PX4 재부팅",

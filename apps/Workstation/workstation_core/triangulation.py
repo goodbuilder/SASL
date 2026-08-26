@@ -13,11 +13,12 @@ from sasl_common.stereo_geometry import (
     triangulate_rays as triangulate_common_rays,
 )
 from Workstation.workstation_core.attitude_geometry import (
+    Quaternion,
     normalize_quaternion,
     quaternion_conjugate,
     quaternion_multiply,
+    rotate_vector_by_normalized_quaternion,
     rotate_vector_by_quaternion,
-    world_ned_vector_to_body_frd,
 )
 from Workstation.workstation_core.calibration import CameraIntrinsics
 from Workstation.workstation_core.coordinate_contract import (
@@ -126,16 +127,13 @@ def camera_translation_right_in_left_camera(
     *,
     baseline_right_in_left_world_m: tuple[float, float, float],
     left_body_to_world_q: Iterable[float],
-    right_body_to_world_q: Iterable[float],
     scale_to_m: float | None = None,
 ) -> tuple[float, float, float] | None:
-    _ = right_body_to_world_q
     try:
-        normalize_quaternion(left_body_to_world_q)
-        normalize_quaternion(right_body_to_world_q)
-        translation_left_body = world_ned_vector_to_body_frd(
+        left_q = normalize_quaternion(left_body_to_world_q)
+        translation_left_body = rotate_vector_by_normalized_quaternion(
             baseline_right_in_left_world_m,
-            left_body_to_world_q,
+            quaternion_conjugate(left_q),
         )
     except (TypeError, ValueError, OverflowError):
         return None
@@ -154,9 +152,28 @@ def right_camera_ray_to_left_camera(
     left_body_to_world_q: Iterable[float],
     right_body_to_world_q: Iterable[float],
 ) -> tuple[float, float, float]:
+    return _right_camera_ray_to_left_camera_normalized(
+        right_ray_camera,
+        left_body_to_world_q=normalize_quaternion(left_body_to_world_q),
+        right_body_to_world_q=normalize_quaternion(right_body_to_world_q),
+    )
+
+
+def _right_camera_ray_to_left_camera_normalized(
+    right_ray_camera: tuple[float, float, float],
+    *,
+    left_body_to_world_q: Quaternion,
+    right_body_to_world_q: Quaternion,
+) -> tuple[float, float, float]:
     right_ray_body = camera_vector_to_body_frd(right_ray_camera)
-    right_ray_world = _rotate(right_body_to_world_q, right_ray_body)
-    right_ray_left_body = world_ned_vector_to_body_frd(right_ray_world, left_body_to_world_q)
+    right_ray_world = rotate_vector_by_normalized_quaternion(
+        right_ray_body,
+        right_body_to_world_q,
+    )
+    right_ray_left_body = rotate_vector_by_normalized_quaternion(
+        right_ray_world,
+        quaternion_conjugate(left_body_to_world_q),
+    )
     return body_frd_vector_to_camera(right_ray_left_body)
 
 
@@ -291,37 +308,37 @@ def triangulate_pixels_with_pixhawk_mount_attempt(
     right_intrinsics: CameraIntrinsics,
     left_body_to_world_q: Iterable[float],
     right_body_to_world_q: Iterable[float],
-    translation_right_in_left_m: tuple[float, float, float],
+    translation_right_in_left_m: tuple[float, float, float] | None,
 ) -> RayTriangulationAttempt:
+    if translation_right_in_left_m is None:
+        return RayTriangulationAttempt(
+            None,
+            "missing_rtk_translation",
+            {"error": "camera translation unavailable for RTK baseline"},
+        )
     try:
-        normalize_quaternion(left_body_to_world_q)
-        normalize_quaternion(right_body_to_world_q)
+        left_q = normalize_quaternion(left_body_to_world_q)
+        right_q = normalize_quaternion(right_body_to_world_q)
     except (TypeError, ValueError, OverflowError) as exc:
         return RayTriangulationAttempt(
             None,
             "invalid_quaternion",
             {"error": str(exc)},
         )
-    if translation_right_in_left_m is None:
-        return RayTriangulationAttempt(
-            None,
-            "invalid_quaternion",
-            {"error": "camera translation unavailable for supplied quaternion"},
-        )
     left_ray = normalized_ray_from_pixel(left_pixel[0], left_pixel[1], left_intrinsics)
     right_ray = normalized_ray_from_pixel(right_pixel[0], right_pixel[1], right_intrinsics)
     right_ray_in_left = normalize_vector(
-        right_camera_ray_to_left_camera(
+        _right_camera_ray_to_left_camera_normalized(
             right_ray,
-            left_body_to_world_q=left_body_to_world_q,
-            right_body_to_world_q=right_body_to_world_q,
+            left_body_to_world_q=left_q,
+            right_body_to_world_q=right_q,
         )
     )
     right_forward_in_left = normalize_vector(
-        right_camera_ray_to_left_camera(
+        _right_camera_ray_to_left_camera_normalized(
             (0.0, 0.0, 1.0),
-            left_body_to_world_q=left_body_to_world_q,
-            right_body_to_world_q=right_body_to_world_q,
+            left_body_to_world_q=left_q,
+            right_body_to_world_q=right_q,
         )
     )
     return triangulate_rays_attempt(
@@ -340,7 +357,7 @@ def triangulate_pixels_with_pixhawk_mount(
     right_intrinsics: CameraIntrinsics,
     left_body_to_world_q: Iterable[float],
     right_body_to_world_q: Iterable[float],
-    translation_right_in_left_m: tuple[float, float, float],
+    translation_right_in_left_m: tuple[float, float, float] | None,
 ) -> RayTriangulationResult | None:
     return triangulate_pixels_with_pixhawk_mount_attempt(
         left_pixel=left_pixel,

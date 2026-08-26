@@ -226,7 +226,13 @@ class HrImportedImage:
                 os.fsync(handle.fileno())
             if _sha256_bytes(temporary.read_bytes()) != self.sha256:
                 raise IOError("materialized HR image SHA-256 verification failed")
-            os.replace(temporary, target)
+            try:
+                os.link(temporary, target)
+            except FileExistsError as exc:
+                raise OSError(
+                    f"refusing to replace existing HR image: {target}"
+                ) from exc
+            temporary.unlink()
             try:
                 directory_descriptor = os.open(
                     str(target.parent),

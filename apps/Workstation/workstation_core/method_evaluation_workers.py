@@ -593,6 +593,7 @@ class MethodEvaluationCoordinator:
         self._worker_generations = {
             method_id: 0 for method_id in MEASUREMENT_METHOD_IDS
         }
+        self._start_requested = self._start_workers
         self._close_requested = False
         self._closed_event = threading.Event()
         self._actor_error = ""
@@ -618,8 +619,13 @@ class MethodEvaluationCoordinator:
         return self._closed_event.is_set()
 
     def start(self) -> None:
-        if self._close_requested:
-            raise RuntimeError("method evaluation coordinator is closed")
+        with self._lock:
+            if self._close_requested or self._closed_event.is_set():
+                raise RuntimeError("method evaluation coordinator is closed")
+            if self._start_requested:
+                return
+            self._start_requested = True
+            self._commands.put(("start", None))
 
     def submit(
         self,
@@ -738,8 +744,10 @@ class MethodEvaluationCoordinator:
             runtime = _MethodEvaluationRuntime(
                 mp_context=self._context,
                 process_target=self._process_target,
-                start_workers=self._start_workers,
+                start_workers=False,
             )
+            if self._start_workers:
+                runtime.start()
             with self._lock:
                 self._worker_generations = runtime.worker_generations
             closing = False
@@ -759,6 +767,9 @@ class MethodEvaluationCoordinator:
                     if command == "close":
                         closing = True
                         break
+                    if command == "start":
+                        runtime.start()
+                        continue
                     if command == "submit":
                         submission = runtime.submit(payload)  # type: ignore[arg-type]
                         if submission.backpressure_bundle is not None:
@@ -786,6 +797,7 @@ class MethodEvaluationCoordinator:
             self._closed_event.set()
 
     def __enter__(self) -> Self:
+        self.start()
         return self
 
     def __exit__(self, *_args: object) -> None:

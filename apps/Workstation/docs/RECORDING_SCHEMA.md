@@ -1,301 +1,171 @@
-# Workstation Recording Schema
+# Workstation Measurement Data Schema
 
 ## Purpose
 
-This document defines the authoritative research-recording contract for
-`apps/Workstation`. It applies to real WIRIS Enterprise, Pixhawk, GNSS/RTK,
-RTCM, ULog, Target Drone, and native-frame evidence. It does not introduce
-Gazebo ground truth or change triangulation, detection, correspondence,
-calibration, RTK gates, NTRIP, PX4 EKF, or optical-pose solvers.
+This document defines the sessionless recording contract for `apps/Workstation`. It covers real
+WIRIS, Pixhawk, GNSS/RTK, RTCM, ULog, Target Drone, native-frame, capture, Alignment, and
+Measurement records. Storage observability is part of the contract; storage success is never a
+Measurement admission condition.
 
-## Identity and ownership
+## Ownership and identity
 
-The hierarchy is:
+There is no persisted Measurement Session, parent/child package, revision, completeness, seal, or
+restart-recovery identity for new data.
 
-```text
-Session <session_id>
-└── MeasurementPackage <measurement_id = mNNNNNN>
-    └── terminal MeasurementAttempt / blocked-pair records
-```
-
-- `session_id` identifies the parent experiment recording container.
-- `measurement_id` continues to identify one `mNNNNNN` package. It is not an
-  attempt ID.
-- `measurement_package_id` is an exact compatibility alias of
-  `measurement_id`.
-- `terminal_record_id` is the stable terminal-row primary key:
-  `attempt:<measurement_attempt_sha256>` or
-  `blocked:<blocked_pair_sha256>`. Pre-contract legacy rows use a deterministic
-  content-based `legacy:<sha256>` key that excludes row position.
-- `geometry_context_id` joins a terminal row to its static geometry context.
-- Camera rows may reference `time_sync_epoch_id`; terminal rows use exact
-  `left_time_sync_epoch_id` and `right_time_sync_epoch_id` when resolvable.
-  The singular ID remains `null` when the two side-specific mappings are not
-  the same epoch.
+- `runtime_generation` identifies one transient Measurement or Manual-record interval when a
+  producer needs correlation. It is not a directory or durability owner.
+- `measurement_attempt_sha256`, method instance IDs, capture IDs, frame IDs, and source packet IDs
+  keep their existing domain meanings.
+- Every stored record receives `recorded_utc_ns` and `recorded_monotonic_ns` unless the producer
+  already supplied them.
+- `session_id`, `parent_session_id`, and `measurement_package_id` are removed recursively before a
+  record is written. `measurement_id` may remain as a transient compatibility correlation field.
 
 ## Physical layout
 
-New writers use the direct session layout:
+`measurement_data_root` is a POSIX-style path relative to `SASL_WORKSTATION_DATA_ROOT`; it defaults
+to `measurement_data`.
 
 ```text
-.local/workstation_data/recordings/<session_id>/
-├── session.json
-├── measurements/
-│   └── mNNNNNN/
-│       ├── measurement.json -> .workstation/publish/current/measurement.json
-│       ├── data -> .workstation/publish/current/data
-│       ├── inputs/methods/<method_id>/frozen_input.json
-│       ├── .spool/                         # includes atomic method bundle retry source
-│       └── .workstation/publish/
-│           ├── current -> generations/<generation_id>
-│           └── generations/<generation_id>/
-│               ├── measurement.json
-│               ├── generation_manifest.json
-│               └── data/
-│                   ├── raw/method_evaluation_bundles.jsonl
-│                   ├── raw/method_results/<method_id>.jsonl
-│                   ├── raw/*.jsonl
-│                   ├── context/*.jsonl
-│                   ├── context.json
-│                   └── *.parquet
-├── review.xlsx                             # derived, regenerable
-└── measurement_session_manifest.json       # sealed ordered child index
+<measurement_data_root>/
+├── events.jsonl
+├── measurements.jsonl
+├── method_evaluations.jsonl
+├── camera_left.jsonl
+├── camera_right.jsonl
+├── px4_left.jsonl
+├── px4_right.jsonl
+├── px4_drone.jsonl
+├── gnss_base.jsonl
+├── geometry_comparisons.jsonl
+├── capture_events.jsonl
+├── alignment.jsonl
+├── artifacts.jsonl
+├── application_log.jsonl
+├── native_frames.jsonl
+├── videos/
+├── images/
+├── frames/
+├── ulog/
+└── raw/gnss/
+    ├── ntrip_transport_chunk.rtcm
+    ├── ntrip_transport_chunk.rtcm.jsonl
+    ├── ntrip_rtcm_frame.rtcm
+    ├── ntrip_rtcm_frame.rtcm.jsonl
+    ├── base_rtcm_frame.rtcm
+    └── base_rtcm_frame.rtcm.jsonl
 ```
 
-`recordings/sessions/<session_id>/` remains a legacy read/recovery boundary.
-New evidence is never silently migrated into or out of that tree.
+Structured files append across runs and are not rotated automatically. No new Measurement folder,
+Parquet generation, `review.xlsx`, package manifest, or publication pointer is produced.
 
-## Authority hierarchy
+## Fixed stream contract
 
-| Artifact | Authority | One record / byte meaning |
-| --- | --- | --- |
-| `data/raw/stereo_measurements.jsonl` | authoritative | one terminal matched-pair outcome, including failed/blocked outcomes |
-| `data/raw/camera_left.jsonl`, `camera_right.jsonl` | authoritative | one GUI-delivered camera-frame observation |
-| `data/raw/px4_left.jsonl`, `px4_right.jsonl` | authoritative | one received PX4 telemetry callback |
-| `data/raw/px4_drone.jsonl` | authoritative when present | one Target/Drone PX4 telemetry callback |
-| `data/raw/gnss_base.jsonl` | authoritative | one Base-GNSS callback |
-| `data/raw/extrinsics_comparison.jsonl` | authoritative analysis evidence when present | one explicitly analysis-only method-comparison observation; never an official Measurement result |
-| `data/raw/method_evaluation_bundles.jsonl` | authoritative atomic method commit/recovery stream | one immutable pair snapshot plus exactly eight terminal outcomes in canonical method order |
-| `data/raw/method_results/<method_id>.jsonl` | authoritative per-method stream | one terminal VALID/ESTIMATED/BLOCKED/FAILED/TIMEOUT/BACKPRESSURE_BLOCKED outcome per committed pair |
-| `data/context/geometry_contexts.jsonl` | authoritative | one unique static geometry/calibration context |
-| `data/context/time_sync_epochs.jsonl` | authoritative | one observed WIRIS RTCP/NTP mapping interval or explicit invalid interval |
-| WIRIS still, native PNG, MP4, `.ulg`, `.rtcm` | authoritative native bytes | exact producer/downloaded bytes; never base64-wrapped into JSON |
-| `context.json`, manifests | authoritative static metadata/index | package identity, contracts, descriptors, and static provenance |
-| `*.parquet` | derived | typed analysis projection retaining complete `row_json` |
-| `review.xlsx` | derived | regenerable operator review |
+| Stream key | File | Priority | Meaning |
+| --- | --- | --- | --- |
+| `events` | `events.jsonl` | yes | transient run, command, and producer events |
+| `measurements` | `measurements.jsonl` | yes | primary terminal pair results, including blocked results |
+| `method_evaluations` | `method_evaluations.jsonl` | yes | atomic eight-method inputs/outcomes and late-result markers |
+| `camera.left/right` | `camera_left/right.jsonl` | no | GUI-delivered camera observations |
+| `px4.left/right/drone` | `px4_left/right/drone.jsonl` | no | P1, P2, and Target telemetry records |
+| `gnss.base` | `gnss_base.jsonl` | no | Base GNSS observations |
+| `geometry.comparisons` | `geometry_comparisons.jsonl` | no | analysis-only geometry comparison rows |
+| `capture.events` | `capture_events.jsonl` | yes | HR/OZ request, outcome, and exact-import events |
+| `alignment` | `alignment.jsonl` | yes | apply/revert/reset projections |
+| `artifacts` | `artifacts.jsonl` | yes | binary allocation/close/import inventory |
+| `application.log` | `application_log.jsonl` | no | redacted recording-time application log |
+| `native.frames` | `native_frames.jsonl` | yes | async native-frame completion/path evidence |
 
-Canonical JSONL is UTF-8, one object per line, `allow_nan=False`, and preserves
-row order and all source/private fields. Each manifest descriptor uses
-`role`, `media_type`, `relative_path`, `size_bytes`, `sha256`, `row_count`,
-`schema_version`, `authoritative`, and `derived_from`. A Parquet
-`derived_from` entry is the exact descriptor of its source JSONL fragment.
+JSONL is UTF-8, one JSON object per line, `allow_nan=False`. Unsupported/non-finite values reject
+only that record. A malformed final historical fragment is retained as one bad line; the writer
+adds a newline and continues. Historical bytes are never rewritten.
 
-Geometry-comparison rows use schema
-`workstation-geometry-comparison-analysis-v1` in namespace
-`analysis/geometry_comparison`. They carry `result_class=analysis_only` and
-`not_measurement_result=true`. Unapplied candidate rows additionally retain the candidate ID/hash,
-candidate and active intrinsics hashes, applicability decision, and quality. A stale K,D identity
-has no comparison coordinates; these rows cannot be promoted into `stereo_measurements.jsonl` or a
-`MeasurementAttempt`.
+`LiveDataRows.replace(index, row)` does not edit the file. It appends a new record carrying
+`_record_operation="replace"` and the same `_record_index`. Readers that want the current-run view
+apply later replace records over earlier append records. Readers that need audit history retain both.
 
-## Eight-method evaluation contract
+## Queue and failure contract
 
-Every matched pair is persisted to native PNG before enqueue and becomes one
-`workstation-frozen-measurement-pair-v1` snapshot. It contains file paths and SHA-256 values,
-detections, K,D/telemetry references, timestamps, sync basis, and reuse flags; QImage and raw pixel
-bytes are forbidden. The same snapshot SHA-256 is carried by all eight requests and outcomes.
+One daemon writer owns the fixed JSONL files.
 
-`pixhawk_rtk_live` is always the primary/representative result. The seven comparison results never
-replace it. Missing structural inputs produce `BLOCKED`, solver exceptions produce `FAILED`, and
-method-local deadline expiry produces `TIMEOUT`. Accuracy/reprojection/uncertainty observations are
-warnings unless a structural/input/observability contract fails.
+- Priority capacity: 256 records.
+- Bulk capacity: 4,096 records.
+- A full priority queue drops the new priority record and increments that stream's drop count.
+- A full bulk queue evicts the oldest queued bulk record and admits the new one.
+- Open/write/fsync failure marks only the affected stream `FAILED`; later records for that stream
+  drop until `Retry Storage` clears the failed state.
+- Serialization failure drops only the malformed record; a later valid record continues normally.
+- `Data > Status` exposes root, writer liveness, pending counts, per-stream state, last error, last
+  write time, written count, and dropped count.
+- `OK`, `DEGRADED`, or `UNAVAILABLE` never disables Measurement.
 
-The primary has a dedicated persistent process. Checkerboard, Horizon, Mountain, Drone Rotation,
-Drone Multi-view, Terrain PnP, and Combined each have an independent persistent process and execute
-concurrently with child OpenCV/NumPy/BLAS threads capped at one. Comparison timeouts are 3/1/3/3/5/
-10/3 seconds respectively and begin at the child's reported worker-start time, never queue entry.
-A crash or timeout restarts only that method worker. The parent waits for all eight outcomes, writes
-the bundle in canonical method order, and only then commits the pair projection. The bounded pending
-capacity is 20 pairs; overflow is retained as `BACKPRESSURE_BLOCKED` rather than dropped.
+## Recording intervals
 
-At Measurement creation, exact operating K,D and the latest successful non-Pixhawk Draft for each
-method are copied under `inputs/methods/<method_id>/`. These are child-local `Frozen Comparison
-Input` values and do not mutate global Alignment Active. A later Draft/profile change applies only
-to the next Measurement.
+Camera/PX4/GNSS/RTCM/Target/application-log bulk records are emitted only while Measurement or
+Manual record is active. Explicit HR/OZ capture/import, ULog import, and Alignment operations append
+their event/artifact records even outside a recording interval.
 
-P1 and P2 GNSS update independently. A side replaces its cache only with finite position and
-`fix_type >= 3`; otherwise the previous valid side remains. Cached values may cross Measurement
-boundaries in one app run and reset at app restart. Outcomes retain each timestamp/age, pair delta,
-fix type, and `reused_inputs`; RTK Fixed is evidence, not a hard runtime gate. With no previous valid
-sample for either side, consuming methods are BLOCKED.
+Target Drone uses a spool-compatible adapter over `px4_drone.jsonl` in sessionless operation.
+Writer refusal does not fail the receive-only MAVLink state machine or suppress its live snapshot.
 
-An FTP pair may declare `command_round_assumed_sync` only when capture ID and command round match
-and both originals were stored, downloaded, and decoded. It stores `pair_delta_s=null` and
-`operator_approved_sync_assumption=true`. This operator-approved assumption may feed R,t but must
-never be described as a measured exposure timestamp.
+## Binary provenance
+
+MP4, WIRIS FTP stills, exact HR imports, native PNGs, and ULogs use local creation-time names:
+
+```text
+YYYYMMDD_HHMMSS_nanoseconds+offset_<label>.<extension>
+```
+
+The UTC offset is explicit. A collision receives `-01`, `-02`, and so on. Publication uses
+no-replace semantics; an existing path is never overwritten.
+
+- Native PNG: decoded native RGB, lossless PNG, native dimensions, no overlay or resize.
+- WIRIS still/import: exact original file bytes plus decode, size, SHA-256, side, serial, purpose,
+  and capture/import time evidence.
+- ULog: exact validated `.ulg` bytes with source/provenance metadata.
+- MP4: camera writer output; artifact events record allocation and best-effort close state.
+- RTCM: exact append-only bytes plus offset, size, SHA-256, source, kind, message type, and host
+  receive clocks in the sibling index.
+
+Binary close/probe/hash completeness is not awaited before the next Measurement.
+
+## Eight-method evaluation
+
+The eight stable method IDs remain `pixhawk_rtk_live`, `checkerboard_stereo`, `horizon_hybrid`,
+`mountain_gnss`, `drone_rtk_rotation_hybrid`, `drone_rtk_multiview`, `terrain_pnp`, and
+`combined_hybrid`.
+
+`pixhawk_rtk_live` remains the representative result. Missing structural inputs produce BLOCKED,
+solver exceptions produce FAILED, deadline expiry produces TIMEOUT, and a full method work queue
+produces BACKPRESSURE_BLOCKED. Comparison outcomes never replace the representative result.
+
+One transient run freezes its method configuration. A callback from an older generation is appended
+with `late=true` and cannot mutate the current UI or current-run row sequence.
 
 ## Coordinate contracts
 
-- Public measurement: `baseline_center_frd`, origin at the midpoint of the
-  left/right optical centers, `[X,Y,Z] = [Front,Right,Down]`, metres.
-- Camera optical: RDF `[Right,Down,Forward]`; pixels are `u` right, `v` down,
-  pixels.
-- PX4 local/world: NED `[North,East,Down]`, metres.
+- Public measurement: `baseline_center_frd`, midpoint of optical centers, `[Front,Right,Down]`, m.
+- Camera optical: RDF `[Right,Down,Forward]`; image pixels `u` right, `v` down.
+- PX4 world/local: NED `[North,East,Down]`, m.
 - PX4 body: FRD `[Front,Right,Down]`.
 - Rotation notation: `R_B_A` means `v_B = R_B_A @ v_A`.
-- Points use rotation plus translation. Ray directions use rotation only.
-- PX4 attitude is Hamilton `quaternion_wxyz`, rotating PX4 body FRD components
-  into world NED.
+- PX4 attitude: Hamilton `quaternion_wxyz`, body FRD into world NED.
 
-No reader may infer a frame from generic `x/y/z`. The canonical attempt keeps
-the complete K/D/R/T, dynamic attitude/GPS/baseline, measurement geometry, and
-the explicit frame/axis contracts that existed at capture.
-
-## Geometry context contract
-
-Method name: `workstation-geometry-context-v1`.
-
-- Purpose: deduplicate and index static calibration/geometry semantics without
-  replacing self-contained `MeasurementAttempt` evidence.
-- Inputs: available left/right K and D, image dimensions, available/applied
-  static R/T, calibration profile paths and hashes, source/operating zoom,
-  method and method-instance IDs, component-source mapping, static baseline
-  model/source contract, and public transform/output contracts.
-- Excluded dynamic inputs: live attitude, live GPS, live RTK baseline values,
-  and geometry hashes containing live components.
-- Output: `gc:<canonical_context_sha256>` plus the canonical context object.
-- Pass criteria: K, D, R, T, profile hash, resolution, method instance, or
-  component-source semantic changes produce a new ID; attitude/GPS/live
-  baseline value changes alone do not; every terminal reference resolves.
-
-Profile paths inside this context are historical provenance only. Content
-hashes and package-relative artifacts, not an old absolute path, are used to
-reopen evidence.
+No reader may infer a frame from generic `x/y/z`, combine MSL and ellipsoid height, or treat
+OpenCV `T_left_to_right_m` as the right-camera origin `C_right_in_left = -R^T T`.
 
 ## Time contract
 
-Clock domains remain distinct:
+Clock domains remain distinct: host monotonic ns, host UTC ns, WIRIS RTCP/NTP, RTP media time, PX4
+boot time, MAVLink `time_usec`, and GPS UTC. A derived UTC value remains labelled as derived; host
+dispatch time never becomes a camera exposure timestamp.
 
-- host `CLOCK_MONOTONIC` integer ns;
-- host UTC/`CLOCK_REALTIME` integer ns;
-- session elapsed time;
-- WIRIS STUS/RTCP/NTP-derived time;
-- RTP media timestamps;
-- PX4 boot/time fields;
-- MAVLink `time_usec`;
-- GPS UTC.
+Later collection should primarily use `recorded_utc_ns`, producer receive/source timestamps, and
+`runtime_generation`. Filename timestamps identify binary creation, not necessarily sensor exposure.
 
-Method name: `workstation-time-sync-epoch-v1`.
+## Legacy data
 
-- Purpose: record factual WIRIS RTCP/NTP mapping history.
-- Inputs: CameraPane `stream_generation`, observed RTP SSRC, RTCP Sender
-  Report fields, explicit RTCP invalid reason, exact host receive clocks, and
-  a hash reference to a successful stored STUS result when available.
-- Output: `tse:<identity_sha256>` epochs and exact side-specific row links.
-- Pass criteria: observed SSRC/generation changes, invalidation, and
-  revalidation create deterministic epochs; missing mapping evidence creates
-  no epoch and leaves the link `null`.
-
-`source_utc_ns` derived from float seconds is explicitly labelled as a
-Decimal/rounding derivation and is never represented as an original camera
-integer clock reading. STUS request UTC and camera exposure UTC are different
-semantics. Camera exposure UTC remains absent unless the camera supplies such
-evidence.
-
-Calibration timing uses `workstation-calibration-timing-evidence-v1` and separates
-`EXPOSURE_TIMESTAMP_VERIFIED`, `CAMERA_TIMESTAMP_VERIFIED`, `HOST_DISPATCH_PROXY`, and `UNKNOWN`.
-`pair_timing_ok` is retained only as a compatibility name for the pair-persistence gate. A host
-dispatch proxy always records `precision_qualified=false` and
-`actual_exposure_verified=false`; no software-only latency bound upgrades it to exposure evidence.
-
-## Native and binary provenance
-
-- WIRIS FTP stills keep the existing fresh-file selection. Downloads use a
-  same-directory temporary file, file fsync, atomic rename, directory fsync,
-  and post-rename size/SHA-256 verification. Records include remote path/name,
-  session-relative local path, side, capture ID, purpose, request clocks, and
-  factual zoom readback when available. The absolute local path is historical
-  provenance only.
-- Native PNG keeps decoded native RGB pixels, lossless PNG, original width and
-  height, no overlay, no resize, and no geometry conversion.
-- ULog remains exact validated `.ulg` bytes. It is not replaced by JSON.
-- RTCM remains exact binary transport/frame bytes plus the offset/hash index.
-- Target Drone remains raw MAVLink JSONL. No simulation truth is added.
-- Secrets, FTP passwords, and NTRIP passwords are never stored. A credential
-  environment-variable name may be retained.
-
-## Crash recovery and publication
-
-Finalization order is: close/fsync spool, materialize rows, write and reread
-canonical JSONL, verify bytes/count/SHA, create and verify derived Parquet,
-write manifests/completeness, atomically replace `current`, validate through
-the published pointer, and only then discard the spool.
-
-JSONL write/validation, Parquet, manifest, or publish failure preserves the
-spool and the previous good generation. A post-publish validation failure
-atomically restores the previous pointer. Direct ledgers quarantine only a
-torn final record; a malformed middle record is a hard failure and is never
-silently skipped.
-
-The method bundle spool is the cross-method recovery authority: one append contains all eight
-outcomes and its snapshot/result hashes. Finalization rejects duplicate/out-of-order bundles or a
-method/hash/identity mismatch, then deterministically splits verified bundles into the eight method
-JSONL files. Empty method streams are still published and declared as required roles.
-
-## Reader and export behavior
-
-Python analysis should call:
-
-```python
-from Workstation.workstation_core.recording_reader import read_measurement_stream
-
-stream = read_measurement_stream(measurement_root, "raw/stereo_measurements")
-rows = stream.rows
-
-terrain = read_measurement_stream(
-    measurement_root,
-    "raw/method_results/terrain_pnp",
-)
-```
-
-For storage-v3 packages the reader verifies and reads JSONL first. It never
-falls back to Parquet when a declared authoritative JSONL is missing or
-corrupt. Parquet-only legacy packages use an explicit compatibility fallback.
-MATLAB can read each JSONL line independently with `jsondecode`; integer ns
-values must remain integer-capable values rather than IEEE-754 identifiers.
-
-`review.xlsx` is a derived view and its failure cannot invalidate a published
-generation. The parent Session manifest stores child order, current generation,
-authoritative JSONL/context hashes, binary inventory, and child manifest hash;
-it does not concatenate a second authoritative session-level JSONL.
-
-The workbook includes one stable worksheet per canonical Measurement method:
-`M_Pixhawk_RTK`, `M_Checkerboard`, `M_Horizon`, `M_Mountain_GNSS`,
-`M_Drone_RTK_Rotation`, `M_Drone_RTK_Multiview`, `M_Terrain_PnP`, and
-`M_Combined`. Each method sheet contains compact rows from that method's authoritative outcome
-stream, including blocked/failure/timeout evidence, plus relevant Geometry and pair-quality fields.
-A method with no evaluated pair remains header-only. These sheets do not replace canonical method
-JSONL, the bundle stream, `stereo_measurements.jsonl`, `geometry_contexts.jsonl`, frozen input JSON,
-Alignment selection JSON, or `run_events.jsonl`.
-
-Method identity migration distinguishes field presence from truthiness. For current rows, a present
-`measurement_method_id` is authoritative and an empty value means explicitly unresolved. Blocked
-pair status, `measurement_geometry_kind=unresolved`, or `blocked_pair_sha256` prohibits fallback.
-Only historical paired-frame v1/v2 rows with the method key genuinely absent may migrate the known
-legacy `distance_mode` aliases; unknown schemas do not migrate.
-
-## MP4 mapping limitation
-
-Camera JSONL rows are GUI-delivered observations. MP4 may be encoded
-pass-through or decoded-frame recording. There is no proven exact 1:1 mapping,
-so `mp4_frame_index_contract` is `not_available`. No reader or manifest may
-claim an exact camera-JSONL/MP4 frame index.
-
-## Backward compatibility
-
-- New storage-v3 packages: verified JSONL authority plus derived Parquet.
-- Previous direct packages: Parquet-only reader fallback.
-- Legacy `recordings/sessions/`: explicit read/recovery fallback.
-- Existing `measurement_attempt_id`, `measurement_attempt_session_id`,
-  `measurement_attempt_sha256`, and `blocked_pair_sha256` remain unchanged.
-- Legacy artifacts are not automatically migrated or rewritten.
+Existing `recordings/<id>/` and `recordings/sessions/<id>/` hierarchies remain untouched. Their old
+Session/package/manifests/Parquet/workbook contracts apply only to those historical trees. New code
+does not scan, recover, seal, convert, or append to them; the Data workspace exposes only a file
+manager link.

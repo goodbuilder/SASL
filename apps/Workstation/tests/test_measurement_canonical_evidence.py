@@ -290,3 +290,173 @@ def test_native_pair_lookup_uses_app_receive_clock_when_pairing_uses_rtcp(
     assert (tmp_path / "rtcp-native-session" / result["native_left_png_path"]).is_file()
     assert (tmp_path / "rtcp-native-session" / result["native_right_png_path"]).is_file()
     assert controller._shutdown_native_frame_stores() is True
+
+
+def test_async_native_frame_result_recovers_after_row_index_cache_eviction(
+    tmp_path,
+) -> None:
+    def pane(side: str, timestamp_s: float, color: str) -> SimpleNamespace:
+        image = QtGui.QImage(8, 6, QtGui.QImage.Format_RGB888)
+        image.fill(QtGui.QColor(color))
+
+        def native_measurement_frame(requested_s: float):
+            return (
+                timestamp_s,
+                image,
+                {
+                    "timestamp_s": timestamp_s,
+                    "timestamp_reference": "app-receive",
+                    "native_width": image.width(),
+                    "native_height": image.height(),
+                    "native_lossless_source": True,
+                    "overlay_applied": False,
+                    "source_native_frame_id": f"native-{side}",
+                },
+            )
+
+        return SimpleNamespace(native_measurement_frame=native_measurement_frame)
+
+    logs: list[str] = []
+    panel = SimpleNamespace(
+        recording_session_id="cache-eviction-session",
+        _recording_session_dir=lambda _session_id: tmp_path / "cache-eviction-session",
+        left_pane=pane("left", 5.0, "red"),
+        right_pane=pane("right", 5.01, "blue"),
+        distance_recording_rows=[],
+        _recording_pair_row_index={},
+        _recording_pending_native_request_rows={},
+        _refresh_recording_table=lambda: None,
+        _log=logs.append,
+    )
+    controller = RecordingController(panel)
+
+    key = ("cache-key", 5.0, 5.01)
+    result = controller._persist_native_detection_pair(
+        left_detection=_detection("left", 5.0),
+        right_detection=_detection("right", 5.01),
+        pair_id="pair-eviction",
+        purpose="accepted-measurement",
+        record_key=key,
+    )
+    assert result["native_pair_status"] == "pending"
+    row = {"session_id": panel.recording_session_id, **result}
+    panel.distance_recording_rows.append(row)
+    controller._track_pending_native_row(0, row)
+
+    deadline_s = time.monotonic() + 2.0
+    while controller.native_frame_persistence_pending_count() and time.monotonic() < deadline_s:
+        time.sleep(0.01)
+    assert controller.native_frame_persistence_pending_count() == 0
+
+    assert panel.distance_recording_rows[0]["native_pair_status"] == "complete"
+    request_id = str(result["native_pair_request_id"])
+    assert request_id not in panel._recording_pending_native_request_rows
+    assert not logs
+    assert controller._shutdown_native_frame_stores() is True
+
+
+def test_early_native_completion_releases_barrier_when_row_binding_never_happens(
+    tmp_path,
+) -> None:
+    def pane(side: str, timestamp_s: float, color: str) -> SimpleNamespace:
+        image = QtGui.QImage(8, 6, QtGui.QImage.Format_RGB888)
+        image.fill(QtGui.QColor(color))
+        return SimpleNamespace(
+            native_measurement_frame=lambda _requested_s: (
+                timestamp_s,
+                image,
+                {
+                    "timestamp_s": timestamp_s,
+                    "timestamp_reference": "app-receive",
+                    "native_width": image.width(),
+                    "native_height": image.height(),
+                    "overlay_applied": False,
+                    "source_native_frame_id": f"native-{side}",
+                },
+            )
+        )
+
+    logs: list[str] = []
+    panel = SimpleNamespace(
+        recording_session_id="early-completion-session",
+        _recording_session_dir=lambda _session_id: tmp_path / "early-completion-session",
+        left_pane=pane("left", 7.0, "red"),
+        right_pane=pane("right", 7.01, "blue"),
+        distance_recording_rows=[],
+        _recording_pair_row_index={},
+        _recording_pending_native_request_rows={},
+        _refresh_recording_table=lambda: None,
+        _log=logs.append,
+    )
+    controller = RecordingController(panel)
+    result = controller._persist_native_detection_pair(
+        left_detection=_detection("left", 7.0),
+        right_detection=_detection("right", 7.01),
+        pair_id="pair-early",
+        purpose="accepted-measurement",
+        record_key=("row-construction-will-fail",),
+    )
+    request_id = str(result["native_pair_request_id"])
+
+    deadline_s = time.monotonic() + 2.0
+    while (
+        request_id not in controller._deferred_native_frame_results
+        and time.monotonic() < deadline_s
+    ):
+        time.sleep(0.01)
+
+    assert request_id in controller._deferred_native_frame_results
+    assert controller.native_frame_persistence_pending_count() == 0
+    assert controller._shutdown_native_frame_stores() is True
+    assert request_id not in controller._deferred_native_frame_results
+    assert any("행 등록 전" in message for message in logs)
+
+
+def test_async_native_frame_stale_completion_cannot_overwrite_newer_request() -> None:
+    logs: list[str] = []
+    panel = SimpleNamespace(
+        recording_session_id="session-1",
+        distance_recording_rows=[
+            {
+                "session_id": "session-1",
+                "native_pair_status": "pending",
+                "native_pair_request_id": "request-new",
+            }
+        ],
+        _recording_pending_native_request_rows={
+            "request-old": ("session-1", 0),
+            "request-new": ("session-1", 0),
+        },
+        _native_frame_async_stores={},
+        _refresh_recording_table=lambda: None,
+        _log=logs.append,
+    )
+    controller = RecordingController(panel)
+    context = {"session_id": "session-1", "record_key": ["same-pair"]}
+
+    controller._handle_async_native_frame_result(
+        {
+            "request_id": "request-old",
+            "context": context,
+            "fields": {
+                "native_pair_status": "complete",
+                "native_left_png_sha256": "old",
+            },
+        }
+    )
+    assert panel.distance_recording_rows[0]["native_pair_status"] == "pending"
+    assert "native_left_png_sha256" not in panel.distance_recording_rows[0]
+
+    controller._handle_async_native_frame_result(
+        {
+            "request_id": "request-new",
+            "context": context,
+            "fields": {
+                "native_pair_status": "complete",
+                "native_left_png_sha256": "new",
+            },
+        }
+    )
+    assert panel.distance_recording_rows[0]["native_pair_status"] == "complete"
+    assert panel.distance_recording_rows[0]["native_left_png_sha256"] == "new"
+    assert not logs

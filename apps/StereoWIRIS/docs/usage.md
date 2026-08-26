@@ -17,7 +17,7 @@ cd <STEREO_WIRIS_APP>
 ./run.sh --maximized      # 최대화 실행
 ./run.sh --start          # YOLO/Depth 스트림 자동 시작
 ./run.sh --wiris-only     # WIRIS 스테레오 창만 실행
-./run.sh --ui workstation  # Workstation shell 실행; 생략하면 legacy UI
+../Workstation/run.sh      # Workstation은 별도 launcher로 실행
 ```
 
 문서 역할:
@@ -64,12 +64,25 @@ The app is designed for this operating sequence:
 
 ## Current Run Flow
 
-For the Legacy UI, launch through `run.sh` so ROS2 and the local PX4 message workspace are
-sourced before the GUI starts. Workstation runtime behavior is MAVLink-only and the launcher
-branches before the ROS2/PX4 overlay bootstrap, so Workstation can be checked or started
-without a ROS2 installation or generated `px4_msgs` overlay. Shared ROS2 Python bindings are
-loaded lazily only when a Legacy ROS2 operation is requested.
-The launcher also tries to install `arp-scan` when it can do so without an interactive sudo password; if that is not possible, the GUI still starts and Auto Detect falls back to TCP scans.
+For the Legacy UI, launch through `run.sh` so the common runtime is checked before ROS2 and the
+canonical PX4 message overlay are sourced. StereoWIRIS and Workstation both accept only the
+repository root `.venv`, created with `--system-site-packages`; app-local, Simulation, system
+Python, manual `dist-packages` `.pth`, and alternate `PYTHON_BIN` fallback are unsupported.
+The launcher never installs apt or pip dependencies. Missing `arp-scan` keeps the bounded TCP
+discovery path available and the manual install command is printed by its diagnostic script.
+
+From the repository root:
+
+```bash
+sudo apt-get update
+grep -Ev '^[[:space:]]*(#|$)' requirements/ubuntu-22.04-operator-runtime.txt | xargs sudo apt-get install
+tools/check_operator_runtime.sh --deployment
+if [[ -d .venv ]]; then mv .venv ".venv.backup-$(date +%Y%m%d-%H%M%S)"; fi
+python3 -m venv --system-site-packages .venv
+.venv/bin/python -m pip install -r requirements.txt
+tools/check_operator_runtime.sh --execution
+apps/StereoWIRIS/run.sh --check --mavlink-only
+```
 
 ```bash
 cd <STEREO_WIRIS_APP>
@@ -82,13 +95,14 @@ Useful options:
 ./run.sh --maximized
 ./run.sh --start        # auto-start YOLO/depth streams
 ./run.sh --wiris-only   # open the standalone WIRIS stereo window
-./run.sh --ui workstation  # launch the Workstation shell; default is legacy
+../Workstation/run.sh     # launch the independent Workstation app
 ```
 
-`--ui legacy`와 `--ui workstation`은 한 프로세스에서 하나의 operational UI만
-선택한다. Legacy UI 구현은 `legacy_gui.py`에 있고 기존 `gui.py`는 호환 alias로 남아 있으며,
-Workstation은
-저장소 루트의 `apps/Workstation/standalone_gui.py`/`StandalonePanelBackend` 경로를 사용한다. lifecycle은
+`--ui legacy`는 Legacy 호환 표기다. Workstation은 같은 프로세스의 UI mode가 아니라
+`apps/Workstation/run.sh`로 시작하는 독립 앱이며, StereoWIRIS launcher의
+`--check --ui workstation` 조합만 호환 runtime-check 경로로 남는다. Legacy UI 구현은
+`legacy_gui.py`에 있고 기존 `gui.py`는 호환 alias로 남아 있으며, Workstation은 저장소 루트의
+`apps/Workstation/standalone_gui.py`/`StandalonePanelBackend` 경로를 사용한다. lifecycle은
 UI-neutral `common/python/sasl_common/lifecycle.py`를 공유하지만 panel/resource owner는 분리되어 있다. 두 UI는 서로의
 panel owner를 import하거나 instantiate하지 않는다. Workstation 복사본은 현재 공유
 measurement/camera/telemetry/calibration/recording 모듈과 저장·좌표 계약을 그대로 사용하며,
@@ -189,7 +203,7 @@ Use this tab for WIRIS/Pixhawk connection controls and field readiness checks.
 - `제어 확인` checks whether each WIRIS `IP Address` accepts TCP commands on its own configured `Telnet port`. It does not change RTSP URLs; if an OSD `IP Address` and RTSP URL host differ, the app logs a warning and leaves the stream settings untouched.
 - `IP Address / IP Mask 변경` contains STIP static-IP controls. `STIP 적용` writes a new OSD `IP Address` and `IP Mask` to the selected WIRIS through its current `IP Address`/`Telnet port`; use it only when the target camera is uniquely identified, preferably with one WIRIS connected.
 - The `RTSP port / 영상` group shows the full `RTSP URL`; its URL port is the OSD `RTSP port`. Its `IP Address` + `RTSP 적용` controls update only the RTSP URL host, while Telnet control settings remain separate.
-- `영상 송출 활성화` sends only the WIRIS Ethernet Mode command to the configured left/right control hosts with each side's control port and LINE termination, waits briefly for the RTSP server to open, then re-runs RTSP frame checks. It does not change GOP; use the WIRIS SDK command controls in `고급 > WIRIS SDK` when GOP must be checked or changed manually.
+- `영상 송출 활성화` sends the WIRIS Ethernet Mode command, then reads and repairs the field-validated visible encoder profile (`bitrate/QP/GOP/IDR = 0/1/90/1`) one field at a time with readback before re-running RTSP frame checks. A readback mismatch fails closed instead of probing a stream with an unknown encoder state.
 - If a saved `Telnet port` is open but returns `ERR` for `GETH`, the app now treats it as the wrong SDK command port, tries the default WIRIS SDK port `2240`, saves the corrected port when `GETH` returns `TRUE/FALSE`, and waits until the RTSP URL port is actually open before checking frames.
 - `영상 수신 확인` checks both TCP port reachability and actual first-frame reception using the selected stream `백엔드`. A camera can report port-open while still failing stream/frame reception.
 - `카메라 Preview 연결` starts left/right camera preview streams without loading YOLO; while connected, the same button changes to `카메라 Preview 해제` and stops camera preview plus any active YOLO stream without disconnecting Pixhawk.
@@ -204,10 +218,18 @@ Use this top-level tab for model, inference-device, and stream processing settin
 - `IoU 임계값`: YOLO non-max suppression IoU threshold.
 - `가중치`: YOLO model weights path. A changed value is persisted by `전체 설정 저장` or when the window closes.
 - `미리보기 폭(px)`: maximum preview image width sent to Qt. Keep this at `1920` for the current 1080p WIRIS stream so Qt receives the encoded frame without an extra resize. YOLO detection still uses the original decoded frame.
-- `RTP 지연(ms)`: GStreamer RTP jitter-buffer latency in milliseconds.
-- `디코더`: RTSP H.264 decoder mode. `NVIDIA` is the default and forces `nvh264dec`; `Auto` tries NVIDIA first and falls back to software; `Software` forces `avdec_h264`.
+- `RTP 지연(ms)`: GStreamer RTP jitter-buffer latency in milliseconds. Use a small value such as `100` for the live visible stream; very large values make receive-rate observations bursty and add seconds of preview delay.
+- `디코더`: RTSP H.264 decoder mode. 기본 `Auto`는 시작 전 capability가 확인된 경우에만
+  `nvh264dec`를 사용하고, 생성 오류·첫 프레임 30초 timeout·live 30초 stall 또는 bus health
+  failure 시 현재 MP4를 정상 종료한 뒤 `avdec_h264`로 한 번 전환한다. 같은 SSRC에서 RTP
+  forward-sequence gap이 관측되면 decoder를 바꾸지 않고 encoded/decoded output을 차단한 뒤,
+  `h264parse`가 확인한 다음 clean non-delta/non-corrupt intra AU의 PTS부터 같은 pipeline 출력을
+  재개한다. parsed AU의 PTS 누락, `DISCONT`, `CORRUPTED` flag도 동일하게 recorder/decoder 전에
+  차단한다. capability가 없으면 처음부터 software를 선택한다. `NVIDIA`는
+  fallback 없이 fail-closed하고 `Software`는 `avdec_h264`를 강제한다.
 - `수신 백엔드`: RTSP receive backend. `GStreamer` gives the best latency/drop/decoder control; `OpenCV/FFmpeg` is a simpler fallback path; `OpenCV Auto` lets OpenCV choose the available capture backend; `PyAV` uses the optional `av` package and reports `pyav-pts` when frame PTS is available.
 - `RTSP 전송`: RTSP media transport. `UDP` is the default for live streams because it avoids TCP receive-queue buildup when decoding falls behind; `TCP` remains available for networks where UDP is blocked or too lossy.
+- The GStreamer H.264 path preserves compressed access units and intra frames in a bounded 250 ms queue and drops only stale decoded raw frames after the decoder. RTP tracking treats 16-bit wrap as contiguous, ignores duplicate/older packets and resets on SSRC change; a forward gap or parsed-AU missing-PTS/DISCONT/CORRUPTED condition latches both encoded and decoded output until a clean-intra PTS reaches the decoder. This keeps invalid AU chains out of both MP4 and preview. A newly built pipeline that alone fails to enter PLAYING is retried after 0.5/1/2/4 seconds; cancellation interrupts the wait and unrelated configuration/authentication errors are not retried. Recording creates the `video/` parent before worker start, serializes paths with GStreamer's double-quoted property syntax rather than shell quoting, and uses plain `mp4mux` because the previous one-second fragmentation produced invalid `mdat` sample offsets on this WIRIS stream. The reported `수신`/`decoded_hz` is a five-second rolling estimate timestamped immediately after a decoded sample is pulled, independent of Qt preview conversion and YOLO inference.
 - `추론 장치`: toggle for Ultralytics/PyTorch inference device. `CPU 추론` passes `cpu`; `CUDA 추론` passes `cuda:0`.
 
 ### 연결 > Pixhawk
@@ -227,7 +249,7 @@ This connection subtab assumes Pixhawk calibration was already completed in QGC 
 - `MAVLink URL 후보` adds common Ethernet UDP listen candidates `udpin:0.0.0.0:14550` and `udpin:0.0.0.0:14551`, plus P1/P2 Ethernet `tcp:<Pixhawk ETH IP>:5760` and `udpout:<Pixhawk ETH IP>:<port>` candidates when Pixhawk ETH IP fields are filled. Apply one to P1/P2, then press `MAVLink 연결`.
 - `USB 연결 탐색` scans `/dev/serial/by-id/*`, `/dev/ttyACM*`, and `/dev/ttyUSB*` using common MAVLink baudrates including `57600`, `115200`, and `921600`. A USB row applies to `USB 제어 포트` for Ethernet bootstrap; a `MAVLink` row from the same device applies the serial device directly to the side's MAVLink URL and baudrate.
 - `MAVLink 연결` opens direct MAVLink links; while connected, the same button changes to `MAVLink 해제`. Rover RTCM injection and PX4 control require MAVLink heartbeat, not only a UDP socket.
-- `P1/P2 ETH MAV 시작(USB)` uses the configured USB control/bootstrap port to send PX4 shell commands that bring up `eth0` and start the Ethernet MAVLink stream toward the current Pixhawk Host IP, then reconnects the app's UDP MAVLink listener. If the saved USB baud is wrong, it tries the fast MAVLink baud candidates `57600`, `115200`, and `921600`; if PX4 rejects `mavlink start -m normal`, it retries the bootstrap stream with `-m onboard -n eth0`.
+- `P1/P2 ETH MAV 시작(USB)`는 USB control endpoint로 side별 `MAV_SYS_ID`와 `MAV_2_*`, `net.cfg`, interface-only `extras.txt`를 저장한 뒤 PX4를 재부팅한다. `MAV_2_CONFIG=1000`이 유일한 Ethernet MAVLink instance owner이며 수동 `mavlink start/stop`은 실행하지 않는다.
 - `ROS2 연결` starts or reuses `MicroXRCEAgent`, then subscribes to available PX4 ROS2 topics; while connected, the same button changes to `ROS2 해제`. ROS2 is the structured telemetry path and does not replace MAVLink RTCM/control.
 - If ROS2 is connected but `sensor_gps` or `sensor_mag` data is not published, the GUI starts the configured MAVLink URL(s) as an auxiliary sensor receiver after startup. This keeps ROS2 attitude/GPS1 data active while using MAVLink `GPS2_RAW` for the GPS2 slot and `SCALED_IMU*` for RM3100 CAN1/CAN2 slots.
 - `픽스호크 Host IP` should be the PC address reachable from the Pixhawk Ethernet/uXRCE network. The field default is `10.0.0.10`; Pixhawk 1/2 Ethernet defaults are `10.0.0.2` and `10.0.0.3`.
@@ -243,7 +265,7 @@ This connection subtab assumes Pixhawk calibration was already completed in QGC 
 Use this top-level tab to define and validate the stereo-camera extrinsic parameters used by measurement. Most alignment subtabs use PX4/GNSS telemetry; `Optical 정렬` additionally uses the current YOLO matched target as a display-only mechanical alignment preview.
 
 - `정렬 > 센서 인식` summarizes Pixhawk, GPS1/GPS2, CAN1/CAN2, baseline, attitude delta, and overall GOOD/WARNING/BAD alignment state.
-- `정렬 > GNSS Base` supports three explicit modes: `현장 Base Survey-in`, `NTRIP 보조 Fixed Base`, and `Network RTK 직접`. The first uses u-blox `CFG-TMODE3`/`NAV-SVIN`; the second feeds NTRIP RTCM into a Base serial receiver, uses the latest Base WGS84 position as the NTRIP `Base GNSS` GGA hint, validates repeated RTK Fixed `NAV-PVT` ellipsoid coordinates, then requires `CFG-TMODE3` ACK, exact ECEF readback, and fresh post-configuration Base RTCM before it becomes active; the third parses NTRIP RTCM3 frames in the app and routes them directly to selected Rover Pixhawk MAVLink links via `GPS_RTCM_DATA`. Mode, per-experiment site/address, GGA policy, datum, caster/serial identity, and rover targets are latched until stop/restart. It keeps RTCM receive/message-type/injection statistics, Rover RTK status, Survey-in progress, convergence trend/ETA, NAV-SAT signal quality, NTRIP state, Base WGS84 coordinate, and operation readiness in the same scrollable workflow. NTRIP credentials are environment-variable based and are not saved in settings. Rover RTK Fixed remains visible evidence and is optional at the default numeric `fix_type >= 3` readiness threshold; both selected Rover RTCM routes must still be active and healthy. Disabling the readiness gate is explicit and leaves a `gate_disabled` metadata warning rather than asserting GNSS readiness.
+- `정렬 > GNSS Base` supports three explicit modes: `현장 Base Survey-in`, `NTRIP 보조 Fixed Base`, and `Network RTK 직접`. The first uses u-blox `CFG-TMODE3`/`NAV-SVIN`; the second feeds NTRIP RTCM into a Base serial receiver, uses the latest Base WGS84 position as the NTRIP `Base GNSS` GGA hint, validates repeated RTK Fixed `NAV-PVT` ellipsoid coordinates, then requires `CFG-TMODE3` ACK, exact ECEF readback, and fresh post-configuration Base RTCM before it becomes active; the third parses NTRIP RTCM3 frames in the app and routes them directly to selected Rover Pixhawk MAVLink links via `GPS_RTCM_DATA`. Mode, per-experiment site/address, GGA policy, datum, caster/serial identity, and rover targets are latched until stop/restart. It keeps RTCM receive/message-type/injection statistics, Rover RTK status, Survey-in progress, convergence trend/ETA, NAV-SAT signal quality, NTRIP state, Base WGS84 coordinate, and operation readiness in the same scrollable workflow. NTRIP Username is non-secret settings data; Password is resolved from current masked input, optional OS keyring, then legacy environment variables and is never saved in settings/evidence. Rover RTK Fixed remains visible evidence and is optional at the default numeric `fix_type >= 3` readiness threshold; both selected Rover RTCM routes must still be active and healthy. Disabling the readiness gate is explicit and leaves a `gate_disabled` metadata warning rather than asserting GNSS readiness.
 - For a changing field location, enter a new site/point and address for every experiment, choose the current caster/provider and mountpoint, and leave fixed-coordinate profile reuse disabled. The recommended absolute-WGS84 defaults are Base USB F9P/HG-C08, Survey-in `300 s` / `0.5 m` for the local fallback, Fixed Base ellipsoid height, and RTCM target `좌/우 Pixhawk`. The Base/rover geodetic contract is WGS84 latitude/longitude plus explicit height datum; local rover baseline fields remain NED `[North, East, Down]` and are not camera RDF, PX4 body FRD, or stereo-center coordinates.
 - `정렬 > 소스 / 품질` shows PX4/GNSS/MAG source readiness and quality summaries.
 - `정렬 > MAG 관리` keeps five Device Type rows for (`BOARD`, `CAN1`, `CAN2`, `GPS1`, `GPS2`) with X/Y/Z, vector norm (`벡터 크기`), selection, health, rate, and source. Priority editing, save, and reboot remain here for normal operation. The CAL_MAG slot/priority table and raw PX4 parameter mapping are moved to `고급 > PX4 MAG`; when only selected telemetry arrives, the role rows explicitly report that their raw samples are still pending.
@@ -300,7 +322,7 @@ Use this tab after `보정` to confirm the geometry that will be used by alignme
 Use this tab to start and monitor object distance.
 
 - `실시간` contains live WIRIS views, stream receive/YOLO Hz status, distance status, recording controls, and a split baseline-center Forward/Right/Down/Range graph. Press `세션 기록 시작` before collecting rows that must be persisted. `YOLO Range` is the Euclidean range from the selected baseline-frame midpoint; no target-telemetry range or truth/error series is produced.
-- `파라미터 > 계산 설정` contains focal length, external-parameter source, measurement pair/class/geometry gates, and the attitude timing policy. The Legacy `시간` tab (or Workstation `Time / Sync`) contains the `카메라 RTCP 동기화 Gate` / `Sync limits` group: frame history, receive skew, RTCP/NTP pair Δt, Sender Report stale age, Sender Report-to-PC offset, clock-rate tolerance, minimum Sender Report count, and warmup timeout. Apply takes effect in the current owner and Save persists the values through the existing total-settings path. `Pixhawk 자세 + GPS/RTK baseline` uses live Pixhawk attitude and GPS/RTK translation; `체커보드 Stereo 외부 파라미터` uses the applied checkerboard `R/T` in the OpenCV optical RDF contract and does not require live Pixhawk/GPS inputs. Pixhawk attitude timing is a display-only, non-blocking diagnostic: sample age above 2 s or pair Δt above 1 s is `STALE`, and sample age above 10 s or pair Δt above 5 s is `VERY_STALE`. The graph records successful ray-triangulated samples even when that status is stale. Matching keeps recent candidates first, then chooses the smaller timestamp delta for accuracy; `disparity_px` remains a bbox horizontal-delta diagnostic in saved rows, not a distance mode. The `내부 파라미터` block uses a collapsible group, while the external-parameter block stays visible and the two blocks are split left/right around the center. Runtime settings are saved from `저장·분석 > 전체 설정 저장`.
+- `파라미터 > 계산 설정` contains focal length, external-parameter source, measurement pair/class/geometry gates, and the attitude timing policy. The Legacy `시간` tab (or Workstation `Time / Sync`) contains the `카메라 RTCP 동기화 Gate` / `Sync limits` group: frame history, receive skew, RTCP/NTP pair Δt, Sender Report stale age, Sender Report-to-PC offset, clock-rate tolerance, minimum Sender Report count, and warmup timeout. These values control the Time/Sync verification diagnostic; an unverified or failed camera-sync state no longer blocks distance pairing. Apply takes effect in the current owner and Save persists the values through the existing total-settings path. `Pixhawk 자세 + GPS/RTK baseline` uses live Pixhawk attitude and GPS/RTK translation; `체커보드 Stereo 외부 파라미터` uses the applied checkerboard `R/T` in the OpenCV optical RDF contract and does not require live Pixhawk/GPS inputs. Pixhawk attitude timing is a display-only, non-blocking diagnostic: sample age above 2 s or pair Δt above 1 s is `STALE`, and sample age above 10 s or pair Δt above 5 s is `VERY_STALE`. The graph records successful ray-triangulated samples even when that status is stale. Matching keeps recent candidates first, then chooses the smaller timestamp delta for accuracy; `disparity_px` remains a bbox horizontal-delta diagnostic in saved rows, not a distance mode. The `내부 파라미터` block uses a collapsible group, while the external-parameter block stays visible and the two blocks are split left/right around the center. Runtime settings are saved from `저장·분석 > 전체 설정 저장`.
 - The active and only measurement method is `two_ray_closest_midpoint`; it undistorts bbox-center pixels, solves both rays in internal `left_camera_rdf`, then records Raw `[Forward, Right, Down, Range]` in `baseline_center_frd`. The origin is the midpoint of the left optical origin and selected right-origin estimate; checkerboard `R/T` supplies the optical-center estimate, while Pixhawk records that the GPS/RTK antenna baseline is an optical-baseline proxy without a calibrated lever arm. Axes use the left-to-right baseline, projected mean optical forward, and `Forward × Right`; Range is recomputed from that midpoint. There is no BBox, 3-D bias, or tracking-filter correction path. Missing pose/intrinsics, pixel-grid mismatch, zero baseline, degenerate frame basis, near-parallel rays, non-positive depth, and non-finite range fail closed with no point.
 - Each validated detection pair creates one immutable, generation/session-scoped `MeasurementAttempt`. A stable `pair_id` combines the generation identity and monotonic sequence. It freezes the selected detections, nearest attitude samples, consecutive GPS pair, applied K/D and zoom/profile content hash, and checkerboard R/T or selected GPS baseline. Class mismatch and unresolved multiple candidates of the selected class are rejected before geometry. Repeated refreshes reuse the same ready attempt; an incomplete attempt can be replaced only when required inputs arrive. In Pixhawk mode, the right-ray rotation, right optical-forward axis, and NED-to-left-RDF translation use the same selected attitude/GPS snapshot; the resulting `baseline_center_frd` instance is scoped to that attempt. Valid rows serialize it instead of querying latest GUI values again.
 - `측정 품질 > 현재 측정 품질` is a display-only panel for the current 3-D ray result. It shows ray gap, midpoint Range, baseline, method, the Raw `baseline_center_frd` point, an explicit source `left_camera_rdf` diagnostic, and a colored Pixhawk attitude timing row with left/right sample age and pair Δt. `FRESH` is green, `STALE` is yellow, and `VERY_STALE` is red. Checkerboard geometry shows `N/A — PIXHAWK ATTITUDE NOT USED`. The main distance line carries only the short `ATT:*` badge; stale timing degrades its display status but does not reject or add a correction to the measurement.
@@ -311,24 +333,32 @@ Use this tab to start and monitor object distance.
 
 `카메라 Preview 연결` and `YOLO 측정 시작` are intentionally separate. Preview connection verifies stream availability and frame rate without loading YOLO. YOLO/depth mode is started only when depth measurement is needed.
 
+For an independent live stream check, run from the repository root:
+
+```bash
+python3 apps/StereoWIRIS/scripts/rtsp_sync_probe.py \
+  --duration 10 --latency-ms 100 --transport udp --decoder nvidia
+```
+
 ### 저장·분석
 
 Use this tab to review the current recording summary, inspect Raw recorded samples, and persist data/settings. It is split into `세션 저장` and `기록 샘플`.
 
 - `세션 저장` contains `세션 파일 저장` and `전체 설정 저장`. `세션 파일 저장`, `세션 기록 중지`, camera Preview disconnect, and normal GUI shutdown finalize the active structured record under the active UI's data root: Workstation uses `.local/workstation_data/recordings/sessions/<session_id>/`, while Legacy uses `apps/StereoWIRIS/recordings/sessions/<session_id>/`. The artifact names remain `<session_id>_session_static.json`, `<session_id>_distance_measurements.csv/.parquet`, `<session_id>_camera_left.csv/.parquet`, `<session_id>_camera_right.csv/.parquet`, `<session_id>_px4_left.csv/.parquet`, `<session_id>_px4_right.csv/.parquet`, and `<session_id>.xlsx`. Raw camera MP4 files remain under the session's `video/` directory.
+- Legacy raw MP4 is a direct H.264 copy in a plain MP4 container and becomes authoritative only after orderly GStreamer EOS and validation. A power loss can leave an unfinalized MP4; do not treat its existence or apparent playback as success. Require ffprobe plus strict software full decode, while the session spool/manifest preserves the failed finalization state.
 - CSV files are compact human-check files. Parquet files carry the same resource rows with typed analysis-friendly storage. The integrated workbook remains a review file with `Summary`, `DistanceMeasurements`, `CameraLeft`, `CameraRight`, `Px4Left`, `Px4Right`, and `CalibrationStatic` sheets. Dedicated `${session_id}_px4_left.xlsx` and `${session_id}_px4_right.xlsx` workbooks split Pixhawk data into `ATTITUDE`, `GPS1`, `GPS2`, `MAG`, `GLOBAL_POSITION`, `LOCAL_POSITION_NED`, `RAW_IMU`, and `MAG_CONFIG` tabs without a Summary or SyncSnapshot tab. Session-level GNSS-relative data is written to `${session_id}_session_rtk.xlsx` in the `GPS_RTK` tab.
 - Pair, GUI-delivered camera, and PX4 callback rows are durably appended under `.spool/` while recording. The GUI table keeps only the most recent 256 pair rows, but final CSV generation reads the complete spool.
 - Final artifacts are prepared in one `.generations/<generation_id>` directory. Stable filenames resolve through the single `published` symlink; replacing that pointer is the session-level publish boundary, so readers see either the previous complete CSV generation or the new complete generation.
 - `session_manifest.json` records preparation, atomic publish, finalized, and retryable failure states. XLSX is derived: an XLSX failure does not prevent the authoritative JSON/CSV/Parquet resource files from being published, and its stable link may remain unresolved until retry succeeds.
-- On successful finalization `.spool/` is removed. If saving or shutdown fails, spool and recovery metadata remain; the next GUI start discovers the newest retryable session, restores its complete pair/camera/PX4 rows, disables new recording, and exposes `세션 파일 저장` as the retry action.
-- A recovered retry uses the original `.spool/session_metadata.json` as the authoritative capture provenance. Current GUI calibration, RTSP URL, timing, and configuration values do not replace it; only final row counts and finalization audit fields are added. Video paths are captured after the session paths have been prepared.
+- On successful finalization `.spool/` is removed. If saving or shutdown fails, spool and recovery metadata remain on disk, but a new Legacy GUI process does not auto-discover or adopt them. Startup stays in a blank session state and `세션 기록 시작` creates a new ID/time anchor and new spool/video paths at button time. Existing retryable spools require the retained explicit recovery utility or a separate forensic/manual procedure; startup does not modify or delete them. Non-finite numeric values are written as blank XLSX cells so an invalid telemetry value does not block workbook finalization.
+- An explicitly recovered retry uses the original `.spool/session_metadata.json` as the authoritative capture provenance. Current GUI calibration, RTSP URL, timing, and configuration values do not replace it; only final row counts and finalization audit fields are added. Video paths are captured after the session paths have been prepared.
 - `<session_id>_distance_measurements.*` contains one row per matched detection pair that entered the measurement pipeline. Its primary time axis is `recording_time_ns`, defined as integer nanoseconds from `세션 기록 시작`. The compact row keeps pair id/status, class, bbox centers/confidence, distance/baseline-center result, baseline, sync delta, quality, and warning code.
 - `<session_id>_camera_left/right.*` contain one row per frame actually delivered to the GUI `frame_changed` callback while the session is active. They are GUI-delivery logs, not complete decoded-stream logs and not one-to-one MP4 frame indexes. Compact rows keep `recording_time_ns`, optional device UTC, image size, timestamp source, RTP timestamp, RTCP sender-report count, receive delay, and timing status.
 - `<session_id>_px4_left/right.*` contain one row per PX4 attitude, vehicle GPS, SensorGps, GNSS-relative, magnetometer, MAG-slot-status, or requested optional MAVLink status message received by the GUI. The only synchronization time axes in PX4 artifacts are `recording_time_ns` (always available host/session timeline) and `gps_utc_time_ns` (GPS-provided UTC generation time when GPS UTC is valid); `gps_utc_source` identifies GPS1 or GPS2. ATTITUDE rows additionally store roll/pitch/yaw rates and `time_boot_ms`. GPS rows fill explicit `gps1_*` or `gps2_*` columns, including position, fix/satellite quality, course heading, ground speed, GPS yaw, and heading accuracy. MAVLink `SCALED_IMU*` rows store magnetometer x/y/z/unit plus acceleration x/y/z, gyro x/y/z, and `time_boot_ms`. Requested `GLOBAL_POSITION_INT`, `LOCAL_POSITION_NED`, `VFR_HUD`, `SYS_STATUS`, `BATTERY_STATUS`, and `RAW_IMU` messages are stored in `mavlink_*` columns. Workstation rows also preserve `mavlink_endpoint`, link-open/heartbeat evidence, link target system/component IDs, and received packet source system/component/sequence/message IDs when the active connection exposes them, so P1/P2 provenance can be checked without changing any value, frame, or time-axis contract. Fields that require ROS2/uORB physical sensor identity, such as MAG device IDs/types/interfaces and selected physical sensor IDs, remain intentionally excluded. `sample_type=mag_slot_status` stores only MAVLink-readable CAL_MAG priority/rotation/enabled/selection status, UAVCAN/EKF2 parameter values, a parameter snapshot JSON, armed state, status, and warning text.
 - Fixed session conditions such as schema, stream URLs, calibration/intrinsics/extrinsics, timestamp contract, video paths, and calculation mode are stored once in `<session_id>_session_static.json` instead of being repeated in every CSV row.
 - `기록 샘플` contains `매칭 프레임쌍 실시간 보기`. Selecting a row shows Raw baseline-center Forward/Right/Down/Range, source left-camera RDF diagnostics, detector pixels, P1/P2 camera/Pixhawk/GNSS geometry provenance, and timing. It does not show target NED truth, axis/range error, or a UAM alignment profile.
 - Recorded YOLO values use `baseline_center_frd`: origin at the midpoint of the left optical origin and selected right-origin estimate, axes `Forward/Right/Down`, public vector `[Forward, Right, Down, Range]`. Checkerboard records the `R/T` optical-center model; Pixhawk records its GPS/RTK antenna baseline as an optical-baseline proxy without a calibrated lever arm. V2 rows use `baseline_center_*` and `raw_baseline_center_*`; they do not emit `x_m/y_m/z_m`, old `left_camera_*`, or `stereo_center_*` public aliases. `source_left_camera_rdf_*` is diagnostic provenance only. Each row records an attempt-scoped frame instance id because Pixhawk/GPS geometry can differ between measurement attempts.
-- Live stereo pairing uses `RTCP/NTP 우선` by default. If the two WIRIS RTCP clocks do not produce a pair inside `최대 Δt`, the app falls back to the common app-receive monotonic clock and labels the pair `app fallback`. This preserves live pairing while keeping the RTCP/NTP/PC-UTC result as a separate diagnostic; an `app fallback` pair must not be treated as an absolute UTC-synchronized pair.
+- When the optional YOLO time-based matching gate is enabled with `RTCP/NTP 우선`, the app uses RTCP/NTP first and falls back to the common app-receive monotonic clock if the camera clocks do not produce a pair inside `최대 Δt`, labeling the pair `app fallback`. With `RTCP/NTP 필수`, missing RTCP/NTP timestamps remain a deliberate user-selected matching failure. Camera Time/Sync verification is separate from this optional pair basis, so an `app fallback` pair must not be treated as an absolute UTC-synchronized pair and an unverified sync state does not by itself block distance measurement.
 - The original session files do not contain `drone_*`, `ulg_*`, or target truth/error fields. A future user-selected drone ULog comparison must be emitted as a separate derived `<session_id>_ulg_comparison.csv/.xlsx` pair without modifying the original session data.
 - `전체 설정 저장` persists current runtime settings to `.local/workstation_data/stereo_distance_settings.json` in Workstation mode or `apps/StereoWIRIS/stereo_distance_settings.json` in Legacy mode. The Legacy schema includes setup camera, WIRIS control, YOLO stream, ROS2, MAVLink, and image-tab FTP/download fields; Workstation keeps schema compatibility but exposes only its MAVLink/PC-UTC/RTCP-NTP controls.
 - Closing the GUI also saves the current settings automatically.
@@ -337,14 +367,14 @@ Use this tab to review the current recording summary, inspect Raw recorded sampl
 
 Use this tab for WIRIS RTC synchronization from PC UTC and for watching the resulting stream clock offset over time. Still-image capture and EXIF comparison live in the 이미지 tab.
 
-- `PC UTC로 시간 설정` sends one shared `STUS` UTC value to both WIRIS RTC targets, reads `GDTI`, then automatically reconnects the active RTSP streams before verification. Synchronization uses TCP interleaving by default so RTCP Sender Reports are not lost on a separate UDP path.
-- Synchronization state is explicit: `reconnecting` → `warming` → `verified` or `failed`. A failed or incomplete check keeps preview available but blocks an absolute-UTC distance result; the failure reason and raw GDTI responses are written to the session metadata.
+- `PC UTC로 시간 설정` sends `STUS` sequentially: it sends the left camera first, waits for its `OK` acknowledgement, then sends the right camera command with a target UTC calculated immediately before that right-side TCP call. If the left acknowledgement is missing or unsuccessful, the right `STUS` is not sent. After the pair succeeds, the app reads `GDTI` and automatically reconnects the active RTSP streams before verification. Synchronization uses TCP interleaving by default so RTCP Sender Reports are not lost on a separate UDP path.
+- Synchronization state is explicit: `reconnecting` → `warming` → `verified` or `failed`. A failed or incomplete check keeps preview and distance pairing available, but its timing evidence must not be described as absolute-UTC proof; the failure reason and raw GDTI responses are written to the session metadata.
 - `RTCP/NTP 동기화 확인` selects recent left/right frames received close together, compares their stream-frame `rtcp_frame_ntp_unix_s` values, and reports each frame's `rtcp_frame_receive_delay_s` separately. The status line also shows the cumulative left/right RTCP Sender Report receive counts (`RTCP SR 수신`). The receive delay includes encoder/network/decoder transit and is not treated as a camera-clock offset. This is a stream-timing diagnostic, not proof that RTCP NTP equals WIRIS `GDTI` or an external absolute UTC reference. The status line refreshes on its own while this tab is visible; the button also writes a snapshot to the log.
 - `RTCP/NTP 오프셋 추이` plots three panels against a seconds-ago axis: `rtcp_frame_receive_delay_s` (transit delay), `rtcp_frame_transport_delay_s` (transport delay), and `rtcp_sr_age_s` (Sender Report anchor age), each for both cameras. Samples are collected regardless of which tab is showing, so the trend is not broken by tab switches.
 - Transit delay contains the camera's absolute clock error, so it grows without bound while that clock drifts, and shrinking it means re-running `STUS` and reconnecting the stream. Transport delay adds the Sender Report's own PC offset back, which cancels the `sr_ntp` term and leaves `(frame arrival - SR arrival) - (media time between them)`; that figure stays flat under clock drift, so use it to judge the actual network/encoder path. Anchor age separates the third case: if it climbs, the anchor stopped refreshing and both delay figures are extrapolated from a stale report.
 - The RTP/RTCP timestamp anchor is taken when the stream starts, so an `STUS` correction only reaches the stream timestamps after the RTSP stream is reconnected. The `PC UTC로 시간 설정` action performs this restart automatically when both streams are active.
 - Verification requires the configured minimum number of fresh Sender Reports per camera (default 2), Sender Report age ≤7 s, a temporally paired left/right frame history within 1 s with receive skew within 350 ms, left/right RTCP/NTP frame timestamp Δt ≤50 ms, RTCP Sender Report-to-PC offset ≤100 ms, and NTP/RTP clock-rate drift within ±0.5%. GDTI is checked against the midpoint of its request/response interval with the camera's 1-second integer resolution (rather than against the older STUS send time); the two GDTI values must agree within 1 second. The warmup window is 30 seconds. Transit delay is retained as a diagnostic and is not confused with clock offset.
-- Timing contract: WIRIS `STUS/GDTI` is the camera body-clock check, RTP is a relative stream counter, and RTCP Sender Report NTP is a stream-derived wall-clock estimate. The app pairs frames by close PC receive time, uses RTCP/NTP delta only for the relative stereo gate, and records RTCP frame transit delay as a transport diagnostic. A stereo pair is within the relative timing criterion when its RTCP/NTP delta is at most the configured `최대 Δt` value, which defaults to 100 ms. Do not use this relative result as proof of synchronization to an external absolute UTC source.
+- Timing contract: WIRIS `STUS/GDTI` is the camera body-clock check, RTP is a relative stream counter, and RTCP Sender Report NTP is a stream-derived wall-clock estimate. If the optional RTCP/NTP pair basis is selected, the app uses RTCP/NTP delta for relative stereo matching and records RTCP frame transit delay as a transport diagnostic; the independent Time/Sync verification result is not a distance gate. A stereo pair is within the relative timing criterion when its RTCP/NTP delta is at most the configured `최대 Δt` value, which defaults to 100 ms. Do not use this relative result as proof of synchronization to an external absolute UTC source.
 
 ### Legacy 이미지
 
@@ -456,8 +486,16 @@ The diagnostic checks host IPs, UDP `8888` / `14550` / `14551`, USB MAVLink cand
 - In `정렬 > GNSS Base`, select the Rover RTCM injection target only after the target Pixhawk MAVLink heartbeat is available.
 - Use `정렬 > Baseline` to confirm GPS1/GPS2 recognition and baseline reliability before measurement.
 - Use `영상 수신 확인` before `카메라 Preview 연결`; require `frame-ok`, not only port-open.
-- Keep `GStreamer` as the default stream backend and `NVIDIA` as the default decoder for low-latency operation. Try `OpenCV Auto` when the explicit GStreamer or OpenCV/FFmpeg paths fail on a PC. Use `PyAV` when the `av` package is installed in the active Python environment.
+- Keep `GStreamer`, `TCP`, and `Auto` as the default stream path. Auto uses `nvh264dec` only when
+  the element can be created and the NVIDIA driver responds; otherwise it reports WARN and starts
+  with mandatory `avdec_h264`. Auto alone performs the one-way runtime fallback after safely
+  finalizing an active MP4. Explicit `NVIDIA` never falls back and refuses camera start with an
+  Auto/Software recovery message when its capability is unavailable.
 - Use `카메라 Preview 연결` to verify both camera streams and Hz before starting YOLO.
+- For a diagnostic acceptance run, set `STEREO_PREVIEW_IDENTITY_LOG` before launching the app.
+  Each emitted preview record contains `frame_seq`, PTS/receive time, RGB size/stride/byte count,
+  producer/queue/QImage SHA-256 equality, QImage `bytesPerLine`, allowed latest-only drops, and
+  reorder counts. Do not enable it for routine operation unless this evidence is needed.
 - Use `YOLO 측정 시작` only when depth measurement is needed.
 - YOLO runs on the latest decoded frame at the configured/adaptive inference rate, while the stream reader continues draining decoded frames independently.
 - During YOLO mode, detection results are produced every inference frame, but preview annotation is drawn only on frames that are actually sent to the GUI and only for the best detection box.
@@ -469,6 +507,9 @@ The diagnostic checks host IPs, UDP `8888` / `14550` / `14551`, USB MAVLink cand
 - Use `CPU 추론` only when GPU inference is unavailable or intentionally disabled. If CUDA prediction fails at runtime, the worker retries on CPU so preview and YOLO can continue when possible.
 - Use the live GPS baseline after confirming both Pixhawks have usable GPS fixes; `eph` and sample age remain visible as diagnostics.
 - Use calibrated intrinsics for real measurements. Default focal and baseline values are placeholders for setup/testing.
+- Legacy startup may show that a zoom-specific intrinsics file exists, but it does not load or apply that
+  file to the active calculation. Before a real measurement, use the calibration/parameter controls to
+  load the current zoom result explicitly and press `계산에 적용`/`적용`.
 - If checkerboard calibration is unavailable, enable `수동 초점거리 사용` and enter the estimated `fx px` for the current WIRIS visible zoom ratio from the tooltip. Treat this as a temporary estimate, not a replacement for per-zoom calibration.
 - Use the connected-state `카메라 Preview 해제`, `ROS2 해제`, and `MAVLink 해제` button states independently when isolating connection issues.
 - Use `전체 설정 저장` or close the GUI normally after changing setup or Pixhawk connection values that should be restored on the next launch.
@@ -479,7 +520,8 @@ The diagnostic checks host IPs, UDP `8888` / `14550` / `14551`, USB MAVLink cand
 
 ## Known Limitations and Workarounds
 
-- Camera RTSP decoding defaults to `NVIDIA` and can also use `Auto` or `Software`. NVIDIA mode requires a working NVIDIA driver and GStreamer `nvh264dec`; if `nvidia-smi` cannot communicate with the driver, use `Auto` or `Software`.
+- Camera RTSP decoding defaults to `Auto` over TCP and can also force `NVIDIA` or `Software`. NVIDIA mode requires a working NVIDIA driver and GStreamer `nvh264dec`. RTP forward gaps gate the current decoder until a parsed clean intra boundary; Auto changes to software only for decoder health failure. An artifact with neither a gap nor a decoder health signal still requires same-bitstream NVIDIA/Software diagnosis.
+- A clean-intra gate cannot reconstruct H.264 reference packets that the WIRIS sender never transmits. On the tested `GEIR=0` firmware, non-delta intra pictures are not true IDR resets; after a loss the operator may see either a fail-closed freeze or later motion corruption. Exact TCP pcap confirmed camera-origin RTP sequence omission. Do not compensate by silently changing QP/bitrate/transport: the tested QP10, SEBR20M, latency500 and UDP variants either retained the problem, timed out, or increased loss/freeze. Keep the restored `0/1/90/0`, TCP/100 ms state pending a vendor sender/IDR fix.
 - Software H.264 decoding skips B-frames to reduce CPU pressure in live mode.
 - `영상 수신 확인` distinguishes `port-closed`, `open-no-frame`, and `frame-ok`; `open-no-frame` usually means the RTSP server is listening but the media path or encoder is not delivering frames.
 - `Telnet port 탐색` and `영상 주소 탐색` can only TCP-scan IP ranges that are currently routed through a local interface; add the camera subnet to the selected interface first when cameras use a different static IP range.
@@ -493,7 +535,9 @@ The diagnostic checks host IPs, UDP `8888` / `14550` / `14551`, USB MAVLink cand
 - During measurement, `검출 없음` frames do not clear the previous valid left/right detections; sparse detections can still form a timestamp-matched distance pair within the configured `최대 Δt`.
 - Every accepted left/right matched detection pair receives one record row, including pairs whose 3D geometry is not yet valid. Use `pair_status`, `measurement_valid`, and `warnings` to distinguish pending/rejected geometry from successful triangulation. `Pixhawk 자세 + GPS/RTK baseline` still needs calibrated intrinsics and live GPS/RTK translation for a valid Raw distance; GPS-only fixes work with degraded accuracy, while RTK Fixed remains the preferred field setup.
 - Stream processing is process-isolated per camera, but total CPU/GPU, memory bandwidth, and RTSP network capacity can still bottleneck the system.
-- `Auto` decoder mode falls back from NVIDIA to software when the NVIDIA decoder cannot be created. It cannot fix missing frames from the RTSP source itself.
+- `Auto` decoder mode starts directly with software when NVIDIA capability is absent and falls
+  back once for a later NVIDIA runtime failure. It cannot fix missing frames from the RTSP source
+  itself. Explicit `NVIDIA` is fail-closed.
 - The RTSP pipeline drops stale buffered frames when it falls behind. This favors current frames over complete historical frame delivery, which is better for live distance measurement.
 - The `PyAV` stream backend depends on the `av` package. If it is missing from a Python environment, the app reports `PyAV 사용 불가` and other backends continue to work.
 - If YOLO dependencies or model loading fail, the measurement stream falls back to camera preview only and reports the failure in the YOLO/camera log. Distance calculation resumes only after YOLO inference produces detections.
@@ -513,18 +557,27 @@ If OpenCV calibration dependencies need repair:
 
 ```bash
 cd <STEREO_WIRIS_APP>
-PYTHON_BIN=.venv/bin/python ./scripts/bootstrap_calibration_deps.sh
+./scripts/bootstrap_calibration_deps.sh
 ```
 
-Or run the bootstrap before opening the GUI:
-
-```bash
-STEREO_BOOTSTRAP_CALIBRATION_DEPS=1 ./run.sh
-```
-
-The bootstrap installs the self-contained OpenCV/NumPy/PyYAML subset in `requirements/calibration.txt` and verifies `import cv2`. The same packages are also listed in `requirements/runtime.txt` because live undistortion/ray geometry and alignment use them.
+This is an explicit operator command, never a launcher side effect. It accepts only the root
+canonical venv and installs the repository runtime referenced by the compatibility
+`requirements/calibration.txt`, then verifies `import cv2`. `scripts/check_calibration_deps.py`
+is the read-only check.
 
 ## Change Log
+
+- 2026-08-26: Added RTP forward-gap detection, decoder-independent clean-intra output recovery,
+  health-only Auto software fallback, bounded initial PLAYING retry, throttled gap summaries, and
+  opt-in producer/queue/QImage identity JSONL. Legacy now starts with a blank session and requires
+  explicit intrinsics load/apply while preserving old spools and calibration files. Recording now
+  creates video parents, round-trips non-ASCII GStreamer paths without literal quotes, and uses
+  strict-decodable non-fragmented MP4 muxing.
+- 2026-08-26: Standardized StereoWIRIS on the repository root
+  `--system-site-packages` venv, added Ubuntu/GStreamer deployment and execution checks, removed
+  launcher apt/pip actions plus app/Simulation/system Python fallback, pinned camera children to
+  the parent interpreter, and made explicit NVIDIA decoder mode fail closed while preserving
+  Auto's MP4-safe software transition.
 
 Entries below describe the state at their original dates. The current contract
 is authoritative: as of 2026-07-24, public measurement is
@@ -539,6 +592,12 @@ only for stereo-rig geometry and diagnostics.
   attempt-scoped `baseline_center_frd` with midpoint Range recomputation.
 - Bumped paired rows to `stereowiris-paired-frame-v2`, added explicit
   `baseline_center_*` fields, and stopped emitting ambiguous coordinate aliases.
+
+### 2026-08-25
+
+- Removed the automatic camera Time/Sync verification gate from distance pairing.
+  The sync status remains recorded as diagnostic evidence, while an optional
+  user-selected RTCP/NTP matching basis continues to control pair timestamps.
 
 ### 2026-07-20
 

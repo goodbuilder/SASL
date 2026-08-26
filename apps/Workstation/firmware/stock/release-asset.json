@@ -1,0 +1,25 @@
+{
+  "schema": "sasl-px4-stock-firmware-artifact-v1",
+  "repository": "PX4/PX4-Autopilot",
+  "release_tag": "v1.17.0",
+  "release_page_url": "https://github.com/PX4/PX4-Autopilot/releases/tag/v1.17.0",
+  "release_api_url": "https://api.github.com/repos/PX4/PX4-Autopilot/releases/tags/v1.17.0",
+  "asset_name": "px4_fmu-v6x_default.px4",
+  "asset_download_url": "https://github.com/PX4/PX4-Autopilot/releases/download/v1.17.0/px4_fmu-v6x_default.px4",
+  "asset_size_bytes": 1824460,
+  "asset_sha256": "8f2c42787163b71e00758205ab0bed9df1669fd26d7a9f42d6f995cbabba0d7f",
+  "px4_package": {
+    "magic": "PX4FWv1",
+    "board_target": "px4_fmu-v6x_default",
+    "board_id": 53,
+    "board_revision": 0,
+    "description": "Firmware for the PX4FMUv6X board",
+    "git_identity": "v1.17.0",
+    "git_hash": "d6f12ad1c4f70ad3230afd7d86e971421e02fef4",
+    "build_time_utc": "2026-05-13T18:36:53Z",
+    "image_size_bytes": 1959920,
+    "image_max_size_bytes": 1966080
+  },
+  "verified_date": "2026-08-25",
+  "verification": "GitHub release API digest equals the downloaded file SHA-256; embedded PX4 package metadata was parsed independently."
+}

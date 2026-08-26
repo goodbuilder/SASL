@@ -225,6 +225,7 @@ def test_integrity_snapshot_tracks_persistence_injection_and_explicit_drops() ->
         "evidence_persisted": 1,
         "evidence_failed": 0,
         "injection_dropped_stale": 3,
+        "injection_blocked_stall": 0,
         "last_injection_drop": None,
         "injection_expected": 1,
         "injection_outcomes": 1,
@@ -238,8 +239,37 @@ def test_integrity_snapshot_tracks_persistence_injection_and_explicit_drops() ->
         "bytes": len(RTCM_1077),
         "packets": 2,
         "fail": 0,
+        "blocked_stall": 0,
     }
     assert snapshot["injection"]["right"]["fail"] == 1
+
+
+def test_integrity_tracks_policy_stall_blocks_separately_from_fail_and_stale() -> None:
+    plane = RtcmDataPlane(started_monotonic_s=1.0)
+    plane.record_injection_result(
+        {
+            "pipeline_sequence": 7,
+            "payload_bytes": len(RTCM_1077),
+            "sent": (("right", 1),),
+            "failed": (),
+            "dropped": 0,
+            "blocked_stall": 1,
+            "blocked_targets": (
+                {
+                    "side": "left",
+                    "category": "stall",
+                    "reason": "ALL_EXPECTED_RX_SILENT",
+                },
+            ),
+        }
+    )
+
+    snapshot = plane.snapshot(now_monotonic_s=2.0)
+    assert snapshot["integrity"]["injection_blocked_stall"] == 1
+    assert snapshot["integrity"]["injection_dropped_stale"] == 0
+    assert snapshot["injection"]["left"]["blocked_stall"] == 1
+    assert snapshot["injection"]["left"]["fail"] == 0
+    assert snapshot["injection"]["right"]["frames"] == 1
 
 
 def test_runtime_reset_clears_transport_stats_without_reusing_sequence() -> None:

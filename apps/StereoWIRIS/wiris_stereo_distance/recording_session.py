@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -352,6 +353,39 @@ def format_video_paths(paths: dict[str, Path]) -> str:
     if not paths:
         return "저장 경로 없음"
     return ", ".join(f"{camera}={path}" for camera, path in paths.items())
+
+
+def raw_video_artifact_errors(
+    paths: dict[str, Path],
+    camera_frame_counts: dict[str, int],
+) -> tuple[str, ...]:
+    """Validate session-owned MP4 evidence when GUI frames were received."""
+
+    errors: list[str] = []
+    for camera in ("left", "right"):
+        if max(0, int(camera_frame_counts.get(camera, 0))) == 0:
+            continue
+        path = paths.get(camera)
+        if path is None:
+            errors.append(f"{camera} MP4 경로 없음")
+            continue
+        try:
+            size_bytes = path.stat().st_size
+        except OSError as exc:
+            errors.append(f"{camera} MP4 읽기 실패: {exc}")
+            continue
+        if size_bytes <= 0:
+            errors.append(f"{camera} MP4가 0바이트입니다: {path}")
+            continue
+        try:
+            with path.open("rb") as stream:
+                header = stream.read(12)
+        except OSError as exc:
+            errors.append(f"{camera} MP4 헤더 읽기 실패: {exc}")
+            continue
+        if len(header) < 12 or header[4:8] != b"ftyp":
+            errors.append(f"{camera} MP4 ftyp 헤더가 잘못되었습니다: {path}")
+    return tuple(errors)
 
 
 @dataclass(frozen=True)
@@ -1254,12 +1288,20 @@ def _write_table(
     for row_index, row in enumerate(rows, start=1):
         for column_index, name in enumerate(columns):
             value = row.get(name)
-            if value is not None:
-                worksheet.write(row_index, column_index, value)
+            safe_value = _xlsx_safe_value(value)
+            if safe_value is not None:
+                worksheet.write(row_index, column_index, safe_value)
     for column_index, name in enumerate(columns):
         worksheet.set_column(
             column_index, column_index, max(14, min(32, len(name) + 2))
         )
+
+
+def _xlsx_safe_value(value: object) -> object | None:
+    """Map non-finite floats to blank XLSX cells instead of invalid numbers."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
 PX4_XLSX_TIME_COLUMNS = (
@@ -1519,8 +1561,9 @@ def _write_key_value_sheet(
     worksheet.write_row(0, 0, ["key", "value"], header_format)
     for row_index, (key, value) in enumerate(entries, start=1):
         worksheet.write(row_index, 0, key)
-        if value is not None:
-            worksheet.write(row_index, 1, value)
+        safe_value = _xlsx_safe_value(value)
+        if safe_value is not None:
+            worksheet.write(row_index, 1, safe_value)
     worksheet.set_column(0, 0, 36)
     worksheet.set_column(1, 1, 64)
 
@@ -1689,9 +1732,38 @@ def discover_retryable_sessions(recordings_root: Path) -> list[Path]:
                 status = str(json.loads(manifest_path.read_text(encoding="utf-8")).get("status", ""))
             except (OSError, ValueError):
                 status = "failed"
-        if status != "finalized":
+        if status not in {"finalized", "discarded"}:
             retryable.append(output_dir)
     return sorted(retryable, key=lambda path: path.name, reverse=True)
+
+
+def discard_retryable_session(
+    output_dir: Path,
+    *,
+    reason: str = "operator_discarded",
+) -> bool:
+    """Discard a retryable session spool while retaining published artifacts."""
+    spool_dir = output_dir / ".spool"
+    if not spool_dir.is_dir():
+        return False
+    shutil.rmtree(spool_dir)
+    manifest_path = output_dir / "session_manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        manifest = {}
+    manifest.update(
+        {
+            "status": "discarded",
+            "phase": "discarded",
+            "retryable": False,
+            "discard_reason": reason,
+            "discarded_at_unix_ns": time.time_ns(),
+        }
+    )
+    _write_manifest(manifest_path, manifest)
+    _cleanup_finalize_orphans(output_dir)
+    return True
 
 
 def load_retryable_session(output_dir: Path) -> RetryableSession:

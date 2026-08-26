@@ -39,6 +39,9 @@ def test_mavlink_shell_command_falls_back_to_respond_without_exclusive() -> None
         count = 8
         data = list(b"nsh> OK\n") + [0] * 62
 
+        def get_type(self):
+            return "SERIAL_CONTROL"
+
     class FakeConnection:
         mavlink = FakeMavlink()
 
@@ -58,7 +61,7 @@ def test_mavlink_shell_command_falls_back_to_respond_without_exclusive() -> None
 
     probe_flags = [call[1] for call in connection.mav.calls if call[2] == 0]
     payload_flags = [call[1] for call in connection.mav.calls if call[2] > 0]
-    assert probe_flags == [6, 2]
+    assert probe_flags == [6, 2, 0]
     assert payload_flags == [2]
     assert result.flag_label == "respond"
     assert "nsh> OK" in result.output

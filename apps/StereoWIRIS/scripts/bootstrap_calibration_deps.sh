@@ -3,38 +3,24 @@ set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SASL_ROOT="$(cd "$APP_DIR/../.." && pwd)"
+CANONICAL_PYTHON="$SASL_ROOT/.venv/bin/python"
 
-resolve_python() {
-  local candidate resolved
-  for candidate in "$@"; do
-    [[ -n "$candidate" ]] || continue
-    if [[ "$candidate" == */* ]]; then
-      if [[ -x "$candidate" ]]; then
-        printf '%s\n' "$candidate"
-        return 0
-      fi
-      continue
-    fi
-    resolved="$(command -v "$candidate" 2>/dev/null || true)"
-    if [[ -n "$resolved" && -x "$resolved" ]]; then
-      printf '%s\n' "$resolved"
-      return 0
-    fi
-  done
-  return 1
-}
-
-PYTHON_BIN="${PYTHON_BIN:-}"
-if [[ -z "$PYTHON_BIN" ]]; then
-  PYTHON_BIN="$(resolve_python "$APP_DIR/.venv/bin/python" "$SASL_ROOT/apps/Simulation/.venv/bin/python" "$SASL_ROOT/.local/legacy/Simulation/.venv/bin/python" python3 python)"
-fi
+PYTHON_BIN="${PYTHON_BIN:-$CANONICAL_PYTHON}"
 REQ_FILE="$APP_DIR/requirements/calibration.txt"
 MARKER="$APP_DIR/.calibration-deps.ok"
 
-if [[ ! -x "$PYTHON_BIN" ]]; then
-  echo "[deps] Python not found or not executable: $PYTHON_BIN" >&2
-  echo "[deps] Set PYTHON_BIN=/path/to/python and retry." >&2
+if [[ ! -x "$CANONICAL_PYTHON" ]]; then
+  echo "FAIL calibration.python: canonical Python is missing: $CANONICAL_PYTHON" >&2
+  echo "  Recovery: cd $SASL_ROOT && python3 -m venv --system-site-packages .venv" >&2
   exit 1
+fi
+if [[ "$PYTHON_BIN" != /* ]]; then
+  PYTHON_BIN="$(realpath -s -m "$PWD/$PYTHON_BIN")"
+fi
+if [[ "$(realpath -s -m "$PYTHON_BIN")" != "$(realpath -s -m "$CANONICAL_PYTHON")" ]]; then
+  echo "FAIL calibration.python: only $CANONICAL_PYTHON is supported" >&2
+  echo "  Recovery: unset PYTHON_BIN" >&2
+  exit 2
 fi
 
 needs_install=0

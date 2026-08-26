@@ -26,7 +26,7 @@ from typing import Any, Mapping
 # the two masked, session-memory UI fields; it is deliberately not a
 # NetworkConfig field and therefore cannot enter settings or evidence JSON.
 DEFAULT_NTRIP_USERNAME = "SASL"
-DEFAULT_NTRIP_SESSION_PASSWORD = "ngii"
+DEFAULT_NTRIP_SESSION_PASSWORD = ""
 
 
 class GnssOperationMode(str, Enum):

@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 import stat
+import threading
 import time
 from typing import Any, Callable, Mapping
 import uuid
@@ -76,6 +77,85 @@ class TargetDroneControllerPhase(str, Enum):
     STOPPED = "STOPPED"
     SEALED = "SEALED"
     FAILED = "FAILED"
+
+
+class _MeasurementDataTargetSpool:
+    """Spool-compatible adapter for the sessionless bounded data writer.
+
+    TargetDroneReceiver can keep its receive/identity state machine while
+    persistence becomes best-effort and type-owned. Rows outside Measurement
+    or Manual record intervals are deliberately ignored.
+    """
+
+    def __init__(self, panel: object, path: Path) -> None:
+        self.panel = panel
+        self.path = Path(path)
+        self._open = False
+        self._row_count = 0
+        self._size_bytes = 0
+        self._lock = threading.RLock()
+
+    @property
+    def is_open(self) -> bool:
+        with self._lock:
+            return self._open
+
+    @property
+    def row_count(self) -> int:
+        with self._lock:
+            return self._row_count
+
+    @property
+    def size_bytes(self) -> int:
+        with self._lock:
+            return self._size_bytes
+
+    def open(self) -> None:
+        with self._lock:
+            self._open = True
+
+    def append(self, row: Mapping[str, Any]) -> None:
+        with self._lock:
+            if not self._open:
+                raise RuntimeError("target-drone data sink is not open")
+        active_reader = getattr(self.panel, "_session_recording_active", None)
+        if not (callable(active_reader) and bool(active_reader())):
+            return
+        writer = getattr(self.panel, "append_workstation_data", None)
+        if not callable(writer):
+            return
+        try:
+            payload = dict(row)
+            encoded_size = len(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            ) + 1
+            accepted = bool(writer("px4.drone", payload, priority=False))
+        except (TypeError, ValueError, OSError):
+            accepted = False
+            encoded_size = 0
+        if accepted:
+            with self._lock:
+                self._row_count += 1
+                self._size_bytes += encoded_size
+
+    def flush(self) -> None:
+        flusher = getattr(self.panel, "flush_workstation_data", None)
+        if callable(flusher):
+            try:
+                flusher()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        with self._lock:
+            self._open = False
+        self.flush()
 
 
 def _mode(value: object) -> TargetDroneMode:
@@ -520,6 +600,13 @@ class TargetDroneController:
         )
 
     def _current_session(self) -> tuple[str, Path]:
+        if not bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", True)):
+            resolver = getattr(self.panel, "_recording_session_dir", None)
+            if not callable(resolver):
+                raise TargetDroneControllerError("measurement data directory owner is unavailable")
+            root = Path(resolver("target-drone")).expanduser().resolve()
+            root.mkdir(parents=True, exist_ok=True)
+            return "measurement-data", root
         session_id = str(getattr(self.panel, "recording_session_id", "") or "").strip()
         if not session_id:
             raise TargetDroneControllerError("recording session ID is not prepared")
@@ -555,6 +642,9 @@ class TargetDroneController:
         runtime_id = f"target-{uuid.uuid4().hex}"
         spool_dir = session_root / ".spool" / "target_drone"
         partial_path = spool_dir / f"{runtime_id}.jsonl.part"
+        sessionless = not bool(
+            getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
+        )
         source_config = self._source_config_factory(request)
         _validate_recv_only_config(source_config, request)
         receiver = self._receiver_factory(
@@ -565,6 +655,14 @@ class TargetDroneController:
             spool_max_rows=request.spool_max_rows,
             spool_max_bytes=request.spool_max_bytes,
             spool_fsync_every_rows=request.spool_fsync_every_rows,
+            spool=(
+                _MeasurementDataTargetSpool(
+                    self.panel,
+                    session_root / "px4_drone.jsonl",
+                )
+                if sessionless
+                else None
+            ),
         )
         self._request = request
         self._receiver = receiver
@@ -739,8 +837,22 @@ class TargetDroneController:
 
     # Mapping-oriented methods are intentionally thin so StandaloneBackend
     # can expose them without owning any MAVLink or filesystem state.
+    def _public_snapshot_mapping(
+        self,
+        snapshot: TargetDroneControllerSnapshot,
+    ) -> dict[str, Any]:
+        result = snapshot.to_mapping()
+        if not bool(
+            getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
+        ):
+            result.pop("session_id", None)
+            result["data_owner"] = "measurement_data_root"
+        return result
+
     def configure_target_drone_stream(self, values: Mapping[str, Any]) -> dict[str, Any]:
-        return self.configure(TargetDroneRuntimeRequest.from_mapping(values)).to_mapping()
+        return self._public_snapshot_mapping(
+            self.configure(TargetDroneRuntimeRequest.from_mapping(values))
+        )
 
     def connect_target_drone_stream(
         self,
@@ -748,10 +860,10 @@ class TargetDroneController:
     ) -> dict[str, Any]:
         if values is not None:
             self.configure(TargetDroneRuntimeRequest.from_mapping(values))
-        return self.start().to_mapping()
+        return self._public_snapshot_mapping(self.start())
 
     def start_target_drone_stream(self) -> dict[str, Any]:
-        return self.start().to_mapping()
+        return self._public_snapshot_mapping(self.start())
 
     def drain_target_drone_stream(
         self,
@@ -762,10 +874,10 @@ class TargetDroneController:
         return self.drain(max_messages=max_messages, max_duration_s=max_duration_s)
 
     def stop_target_drone_stream(self, *, timeout_s: float | None = None) -> dict[str, Any]:
-        return self.stop(timeout_s=timeout_s).to_mapping()
+        return self._public_snapshot_mapping(self.stop(timeout_s=timeout_s))
 
     def target_drone_stream_snapshot(self) -> dict[str, Any]:
-        return self.snapshot().to_mapping()
+        return self._public_snapshot_mapping(self.snapshot())
 
     def target_drone_spool_artifact(self) -> dict[str, Any] | None:
         return None if self._artifact is None else self._artifact.to_mapping()

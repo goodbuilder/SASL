@@ -62,3 +62,44 @@ def test_rtcm_bytes_are_not_written_without_an_open_measurement_package(tmp_path
         record_kind="rtcm_frame",
     )
     assert not (tmp_path / "rtcm-session").exists()
+
+
+def test_sessionless_rtcm_appends_only_while_recording_without_a_session(tmp_path: Path) -> None:
+    recording = {"active": True}
+    panel = SimpleNamespace(
+        _measurement_session_hierarchy_enabled=False,
+        _session_recording_active=lambda: recording["active"],
+        _recording_session_dir=lambda _identity: tmp_path / "measurement_data",
+    )
+    controller = GnssRuntimeController(panel)
+    context = controller._rtcm_evidence_context()
+    assert context.active is True
+    assert context.session_id == "measurement-data"
+
+    controller._append_rtcm_package_evidence(
+        b"first",
+        source="base",
+        record_kind="rtcm_frame",
+    )
+    controller._append_rtcm_package_evidence(
+        b"second",
+        source="base",
+        record_kind="rtcm_frame",
+    )
+    binary = tmp_path / "measurement_data" / "raw" / "gnss" / "base_rtcm_frame.rtcm"
+    assert binary.read_bytes() == b"firstsecond"
+    index_rows = [
+        json.loads(line)
+        for line in binary.with_suffix(".rtcm.jsonl").read_text().splitlines()
+    ]
+    assert all(row["data_owner"] == "measurement_data_root" for row in index_rows)
+    assert all("session_id" not in row for row in index_rows)
+
+    recording["active"] = False
+    assert controller._rtcm_evidence_context().active is False
+    controller._append_rtcm_package_evidence(
+        b"ignored",
+        source="base",
+        record_kind="rtcm_frame",
+    )
+    assert binary.read_bytes() == b"firstsecond"

@@ -19,6 +19,7 @@ from Workstation.workstation_core.measurement_methods import (
     MEASUREMENT_METHOD_LABELS,
     normalize_measurement_method_fallback_order,
 )
+from Workstation.workstation_core.measurement_data_store import STREAM_PATHS
 
 from .components import WorkspaceHeader
 
@@ -40,6 +41,7 @@ class SettingsWorkspace(QtWidgets.QWidget):
         self.backend = backend
         self.invoke_command = invoke_command
         self.settings_widgets: dict[str, QtWidgets.QWidget] = {}
+        self._gnss_network_password_explicit = False
         self._snapshot = self._read_snapshot()
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -56,6 +58,7 @@ class SettingsWorkspace(QtWidgets.QWidget):
         self._build_camera_tab()
         self._build_yolo_tab()
         self._build_pixhawk_tab()
+        self._build_storage_tab()
         self._build_runtime_tab()
         self._build_gnss_tab()
         layout.addWidget(self.tabs, 1)
@@ -408,6 +411,14 @@ class SettingsWorkspace(QtWidgets.QWidget):
                 ],
             )
         )
+        reconnect_policy = self._combo(
+            "rtsp_reconnect_policy",
+            (("Manual", "manual"), ("Automatic", "automatic")),
+        )
+        reconnect_policy.setToolTip(
+            "Manual ends a failed camera worker without nested reconnect loops. "
+            "Automatic restores local RTSP and child-process retries."
+        )
         layout.addWidget(
             self._group(
                 "Stream backend",
@@ -421,6 +432,7 @@ class SettingsWorkspace(QtWidgets.QWidget):
                         ),
                     ),
                     ("RTSP transport", self._combo("rtsp_transport", (("UDP", "udp"), ("TCP interleaved", "tcp")))),
+                    ("Reconnect policy", reconnect_policy),
                 ],
             )
         )
@@ -549,6 +561,81 @@ class SettingsWorkspace(QtWidgets.QWidget):
             )
         )
         layout.addStretch(1)
+
+    def _build_storage_tab(self) -> None:
+        layout = self._tab("Storage")
+        path_edit = self._text(
+            "measurement_data_root",
+            placeholder="measurement_data",
+        )
+        path_edit.setToolTip(
+            "Directory relative to SASL_WORKSTATION_DATA_ROOT. Active capture keeps its "
+            "current owner; an applied change is used by the next capture."
+        )
+        path_row = QtWidgets.QWidget()
+        path_layout = QtWidgets.QHBoxLayout(path_row)
+        path_layout.setContentsMargins(0, 0, 0, 0)
+        path_layout.setSpacing(6)
+        path_layout.addWidget(path_edit, 1)
+        browse = QtWidgets.QPushButton("Browse…")
+        browse.setObjectName("measurementDataRootBrowse")
+        browse.clicked.connect(self._browse_measurement_data_root)
+        path_layout.addWidget(browse)
+        layout.addWidget(
+            self._group(
+                "Availability-first measurement data",
+                [("Data folder", path_row)],
+            )
+        )
+        self.storage_path_status_label = QtWidgets.QLabel(
+            "Storage errors are reported but never disable Measurement Start."
+        )
+        self.storage_path_status_label.setObjectName("compactContract")
+        self.storage_path_status_label.setWordWrap(True)
+        layout.addWidget(self.storage_path_status_label)
+        paths = QtWidgets.QLabel(
+            "Fixed append files: "
+            + ", ".join(sorted({path.as_posix() for path in STREAM_PATHS.values()}))
+            + ". Native video, image, and ULog bytes use creation-time names."
+        )
+        paths.setObjectName("compactContract")
+        paths.setWordWrap(True)
+        paths.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        layout.addWidget(paths)
+        layout.addStretch(1)
+
+    def _browse_measurement_data_root(self) -> None:
+        data_root = self._workstation_data_root()
+        edit = self.settings_widgets["measurement_data_root"]
+        current = Path(str(edit.text() or "measurement_data")).expanduser()
+        if not current.is_absolute():
+            current = data_root / current
+        start = current if current.is_dir() else current.parent
+        if not start.is_dir():
+            start = data_root
+        selected = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Select measurement data folder",
+            str(start),
+        )
+        if not selected:
+            return
+        try:
+            portable = portable_workstation_data_path_text(
+                selected,
+                data_root=data_root,
+                field_name="measurement_data_root",
+            )
+        except ValueError as exc:
+            self.storage_path_status_label.setText(
+                f"Storage folder was not changed: {exc}. Set SASL_WORKSTATION_DATA_ROOT "
+                "to place all Workstation data on another volume."
+            )
+            return
+        edit.setText(portable)
+        self.storage_path_status_label.setText(
+            f"Pending data folder: {portable} · applies to the next capture."
+        )
 
     def _build_runtime_tab(self) -> None:
         layout = self._tab("Runtime / Calibration")
@@ -693,7 +780,7 @@ class SettingsWorkspace(QtWidgets.QWidget):
         site_label = self._text("gnss_site_label", placeholder="Per-experiment site name")
         site_label.setToolTip(
             "실험 장소 또는 측점을 사람이 식별하기 위한 이름입니다. "
-            "GNSS 보정과 거리 계산에는 사용되지 않고 세션 메타데이터로 저장됩니다."
+            "GNSS 보정과 거리 계산에는 사용되지 않고 측정 데이터의 현장 메모로 저장됩니다."
         )
         site_address = self._text(
             "gnss_site_address",
@@ -756,6 +843,9 @@ class SettingsWorkspace(QtWidgets.QWidget):
         self.gnss_network_password_edit = QtWidgets.QLineEdit(DEFAULT_NTRIP_SESSION_PASSWORD)
         self.gnss_network_password_edit.setEchoMode(QtWidgets.QLineEdit.Password)
         self.gnss_network_password_edit.setPlaceholderText("NTRIP password")
+        self.gnss_network_password_edit.textChanged.connect(
+            lambda _text: setattr(self, "_gnss_network_password_explicit", True)
+        )
         self.gnss_network_credential_status_label = QtWidgets.QLabel("--")
         self.gnss_network_forget_password_button = QtWidgets.QPushButton("Forget saved password")
         self.gnss_network_forget_password_button.clicked.connect(

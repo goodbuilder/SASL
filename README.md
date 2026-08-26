@@ -781,14 +781,30 @@ SASL is a stereo-vision surveillance and measurement workspace for two WIRIS cam
 
 ## Current Run Flow
 
-Create one Python environment for the checkout and install the declared runtime:
+Ubuntu 22.04 operators use one repository-root Python environment. PyGObject,
+GStreamer, and ffmpeg are Ubuntu dependencies rather than pip packages:
 
 ```bash
-python3 -m pip install -r requirements.txt
+sudo apt-get update
+grep -Ev '^[[:space:]]*(#|$)' requirements/ubuntu-22.04-operator-runtime.txt | xargs sudo apt-get install
+tools/check_operator_runtime.sh --deployment
+
+# Preserve the old environment for rollback; do not delete it.
+if [[ -d .venv ]]; then mv .venv ".venv.backup-$(date +%Y%m%d-%H%M%S)"; fi
+python3 -m venv --system-site-packages .venv
+.venv/bin/python -m pip install -r requirements.txt
+tools/check_operator_runtime.sh --execution
+apps/Workstation/run.sh --check
+apps/StereoWIRIS/run.sh --check --mavlink-only
 apps/Workstation/run.sh
 ```
 
-`apps/Workstation/run.sh` starts Workstation with `common/python` on its import path. Run `apps/StereoWIRIS/run.sh --ui legacy` for Legacy; Legacy additionally requires the pinned ROS 2/PX4 message overlay prepared by `tools/bootstrap_ros_workspace.sh`. Use `apps/Workstation/run.sh --check` or `apps/StereoWIRIS/run.sh --check --ui legacy` to validate a runtime before opening Qt. Development and CI dependencies are declared in `requirements/dev.txt`.
+Both operator launchers accept only `.venv/bin/python`; setting `PYTHON_BIN` to an app,
+Simulation, or system interpreter is an error. Manual `.pth` injection of
+`/usr/lib/python3/dist-packages` is unsupported. Legacy StereoWIRIS additionally requires the
+pinned ROS 2/PX4 message overlay prepared by `tools/bootstrap_ros_workspace.sh`; its common
+runtime gate runs before that overlay is sourced. Development and CI dependencies are declared
+in `requirements/dev.txt`. Optional PyAV is isolated in `requirements/optional-pyav.txt`.
 
 For the manual cross-zoom calibration flow, open `Pre-run Calibration`. At
 the large-board pose, set both visible cameras to nominal 1×, capture matching
@@ -849,6 +865,16 @@ its generated path, telemetry, XLSX, compact CSVs, and left/right MP4 together.
   `altitude_agl_m=world_up-origin_up`.
 
 ## Operational Rules
+
+- Run `tools/check_operator_runtime.sh --deployment` after OS/package changes and
+  `--execution` after recreating `.venv`. The doctor is read-only: it never runs apt, pip, or
+  creates a venv. Exit `0` means ready or allowed Auto/software operation, `1` means a required
+  dependency is missing, and `2` means an invalid command or interpreter.
+- `apps/Workstation/run.sh --check` and `apps/StereoWIRIS/run.sh --check` add each app's settings,
+  model, and import checks to the common Gst/GstRtp and element factory checks.
+- GStreamer must provide `rtspsrc`, `rtph264depay`, `h264parse`, `queue`, `videoconvert`,
+  `appsink`, `avdec_h264`, `mp4mux`, and `filesink`. `nvh264dec` plus a working NVIDIA driver is
+  optional acceleration; `avdec_h264` remains mandatory in every decoder mode.
 
 - Camera and Pixhawk mapping changes are applied in-memory and reflected across relevant tabs.
 - Stereo parameter lock disables zoom, focus, and resolution controls in the Control tab.
@@ -952,6 +978,12 @@ its generated path, telemetry, XLSX, compact CSVs, and left/right MP4 together.
 
 ## Known Limitations and Workarounds
 
+- NVIDIA availability is checked with both the `nvh264dec` factory and `nvidia-smi`. Auto emits
+  a warning and uses `avdec_h264` when either is unavailable. Explicit NVIDIA mode never falls
+  back to software and rejects camera start with an Auto/Software recovery instruction.
+- A factory/driver startup check is not proof of sustained real-camera decoding. Validate both
+  left/right RTSP streams on target hardware after driver or GStreamer changes.
+
 - Real WIRIS, Pixhawk, RTSP, YOLO, stereo matching, and calibration persistence are not connected yet in this software-only validation slice.
 - LRF polling requires a reachable WIRIS TCP control endpoint and the optional
   laser rangefinder hardware. Without a device response, Alignment correctly
@@ -984,6 +1016,12 @@ its generated path, telemetry, XLSX, compact CSVs, and left/right MP4 together.
   responsible for confirming the actual hardware zoom before measurement.
 
 ## Change Log
+
+- 2026-08-26: Established the canonical Ubuntu 22.04 operator runtime: one root
+  `--system-site-packages` venv, read-only deployment/execution doctor, system-owned
+  PyGObject/GStreamer, root-owned pip manifests, strict launcher/direct-entry gates, explicit
+  decoder capability reporting, NVIDIA fail-closed behavior, and parent-interpreter camera
+  children. Removed launcher apt/pip actions and app/Simulation/system Python fallback.
 
 - 2026-08-13: Added independent Workstation K,D and stereo R,t profiles,
   fixed-intrinsic large-board `R,t only` calculation, manual 1× R,t + 8× K,D

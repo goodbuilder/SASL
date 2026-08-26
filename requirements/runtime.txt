@@ -12,6 +12,7 @@ pymavlink>=2.4.41,<3
 # pyqtgraph 0.14 requires NumPy >=1.25, which conflicts with the SciPy/NumPy
 # reference runtime above.  Keep the compatible 0.13 line explicit.
 pyqtgraph>=0.13,<0.14
+PyOpenGL>=3.1,<4
 packaging>=23,<27
 # Detection is part of the normal Measurement workflow.
 ultralytics>=8.3,<9

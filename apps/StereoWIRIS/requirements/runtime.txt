@@ -1,16 +1,4 @@
-PyQt5
-PyGObject
-ultralytics
-av
-pyserial
-# Required by live image/ray geometry and calibration paths. NumPy remains below
-# 2 because the supported ROS/PyQt/OpenCV environments use the NumPy 1.x ABI.
-numpy<2
-opencv-python<4.10
-PyYAML
-XlsxWriter
-pyarrow
-# 3D triangulation-quality view (measurement_widgets.Triangulation3DView). The
-# widget falls back to a placeholder label if either import fails at runtime.
-pyqtgraph
-PyOpenGL
+# Compatibility entry point. The repository manifest is the only source of
+# truth for dependencies shared by StereoWIRIS and Workstation. PyGObject and
+# GStreamer are Ubuntu packages; PyAV is an optional backend.
+-r ../../../requirements/runtime.txt

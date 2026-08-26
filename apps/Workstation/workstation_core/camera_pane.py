@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import copy
 import math
+import os
 import threading
 import time
 import weakref
 from collections import deque
+from pathlib import Path
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from Workstation.workstation_core.stereo import DetectionObservation
 from Workstation.workstation_core.theme import ACCENT
+from Workstation.workstation_core.native_frame_ring import (
+    FrameKey,
+    SharedNativeFrameRing,
+)
 from Workstation.workstation_core.yolo_stream import (
     DEFAULT_PREVIEW_DISPLAY_RATE_HZ,
     YoloStreamWorker,
@@ -19,6 +25,11 @@ from Workstation.workstation_core.yolo_stream import (
 
 DEFAULT_NATIVE_CALIBRATION_FRAME_MAX_AGE_S = 2.0
 MAX_GUI_PREVIEW_RATE_HZ = DEFAULT_PREVIEW_DISPLAY_RATE_HZ
+GUI_HEARTBEAT_INTERVAL_MS = 250
+CAMERA_STOP_COOPERATIVE_WAIT_MS = 12_000
+CAMERA_STOP_POST_ESCALATION_WAIT_MS = 1_000
+CAMERA_STOP_TERMINATE_AFTER_S = 12.0
+CAMERA_STOP_KILL_AFTER_S = 20.0
 
 
 def infer_camera_timestamp_reference(metadata: dict) -> str:
@@ -42,11 +53,8 @@ def infer_camera_timestamp_reference(metadata: dict) -> str:
 class _AspectRatioPreviewContainer(QtWidgets.QWidget):
     """Sizes its single child to a locked width:height ratio, centered.
 
-    The camera preview label used to fill this container completely, so
-    ``_refresh_pixmap`` had to crop-to-fill whenever the container's ratio
-    drifted from the source frame's ratio -- visually indistinguishable from
-    the picture "zooming in".  Locking the child's own geometry to the
-    source aspect ratio here means that crop is a no-op instead.
+    The label and its pixmap both preserve the source ratio.  No render path
+    is allowed to enlarge-and-crop the decoded camera image.
     """
 
     def __init__(self, child: QtWidgets.QWidget, parent: QtWidgets.QWidget | None = None) -> None:
@@ -144,16 +152,20 @@ class CameraPane(QtWidgets.QGroupBox):
         self.latest_detection: DetectionObservation | None = None
         self.measurement_frame_images: dict[float, QtGui.QImage] = {}
         self.measurement_frame_metadata: dict[float, dict[str, object]] = {}
-        # Native RGB frames can be several MiB each.  Keep only the short
-        # producer-side evidence window needed to bind a matched detection or
-        # a frozen pose burst; durable frames are moved to NativeFrameStore.
+        # Only lightweight descriptors live in the GUI. Native rasters remain
+        # in the bounded shared-memory ring until an exact FrameKey is pinned.
         self.measurement_frame_order: deque[float] = deque(maxlen=16)
+        self.native_frame_ring: SharedNativeFrameRing | None = None
+        self._retired_native_frame_rings: list[SharedNativeFrameRing] = []
+        self.native_frame_descriptors: dict[str, dict[str, object]] = {}
+        self.native_frame_descriptor_order: deque[str] = deque(maxlen=64)
         self.measurement_pair_display_active = False
         self.selected_measurement_frame_timestamp_s: float | None = None
         self.selected_measurement_frame_lookup_delta_s: float | None = None
         self.detection_stream_active = False
         self.stream_generation = 0
         self.current_status = "중지됨"
+        self.recording_finalizations: dict[str, dict[str, object]] = {}
         self._stop_requested_monotonic_s: float | None = None
         self._stop_escalation_level = 0
         self._preview_lock = threading.Lock()
@@ -161,12 +173,23 @@ class CameraPane(QtWidgets.QGroupBox):
         self._preview_submitted = 0
         self._preview_rendered = 0
         self._preview_replaced = 0
+        self._last_preview_age_s: float | None = None
+        self._max_preview_age_s = 0.0
+        self._last_stream_stats: dict[str, object] = {}
+        self._gui_heartbeat_count = 0
+        self._gui_heartbeat_last_s: float | None = None
+        self._gui_heartbeat_max_delay_s = 0.0
         self._preview_frame_callback = None
         self._stream_signal_adapter: _CameraStreamSignalAdapter | None = None
         self._preview_timer = QtCore.QTimer(self)
         self._preview_timer.setTimerType(QtCore.Qt.PreciseTimer)
         self._preview_timer.setInterval(round(1000.0 / MAX_GUI_PREVIEW_RATE_HZ))
         self._preview_timer.timeout.connect(self._drain_preview_frame)
+        self._gui_heartbeat_timer = QtCore.QTimer(self)
+        self._gui_heartbeat_timer.setTimerType(QtCore.Qt.PreciseTimer)
+        self._gui_heartbeat_timer.setInterval(GUI_HEARTBEAT_INTERVAL_MS)
+        self._gui_heartbeat_timer.timeout.connect(self._record_gui_heartbeat)
+        self._gui_heartbeat_timer.start()
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(10, 12, 10, 10)
@@ -195,6 +218,8 @@ class CameraPane(QtWidgets.QGroupBox):
         self.measurement_frame_images.clear()
         self.measurement_frame_metadata.clear()
         self.measurement_frame_order.clear()
+        self.native_frame_descriptors.clear()
+        self.native_frame_descriptor_order.clear()
         self._clear_pending_preview()
         self.measurement_pair_display_active = False
         self.selected_measurement_frame_timestamp_s = None
@@ -208,7 +233,14 @@ class CameraPane(QtWidgets.QGroupBox):
         self.image_label.setText("YOLO 시작 중..." if enable_detection else "카메라 연결 중...")
         self._set_detection_label(None)
         self.thread = QtCore.QThread(self)
-        self.worker = YoloStreamWorker(url=url, enable_detection=enable_detection, **kwargs)
+        self.worker = YoloStreamWorker(
+            url=url,
+            camera_id=self.camera_label,
+            stream_generation=stream_generation,
+            enable_detection=enable_detection,
+            **kwargs,
+        )
+        self.native_frame_ring = self.worker.native_frame_ring
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         pane_ref = weakref.ref(self)
@@ -230,18 +262,18 @@ class CameraPane(QtWidgets.QGroupBox):
         )
         adapter = _CameraStreamSignalAdapter(self, stream_generation)
         self._stream_signal_adapter = adapter
-        # The metadata-rich native signal below supersedes the compatibility
-        # measurement_frame_ready signal.  Connecting both stored every
-        # multi-megabyte raster twice on the GUI thread during detection.
-        self.worker.native_measurement_frame_ready.connect(
-            adapter.native_frame,
-        )
+        # Native rasters remain in the child/shared-memory ring. The GUI gets
+        # only lightweight descriptors through preview/detection metadata.
         self.worker.detection_ready.connect(
             adapter.detection,
         )
         self.worker.stats_ready.connect(
             adapter.stats,
         )
+        # Finalization can arrive after stop() has invalidated the preview
+        # generation and deleted its adapter.  Bind it directly to the pane and
+        # key by the unique recording path instead of treating it as live UI.
+        self.worker.recording_finalized.connect(self._handle_recording_finalized)
         self.worker.status_changed.connect(
             adapter.status,
         )
@@ -280,7 +312,7 @@ class CameraPane(QtWidgets.QGroupBox):
         stopped = thread is None
         if thread is not None:
             if wait:
-                stopped = bool(thread.wait(1500))
+                stopped = bool(thread.wait(CAMERA_STOP_COOPERATIVE_WAIT_MS))
                 if not stopped and worker is not None:
                     # The child process is the resource owner.  Stop it before
                     # considering a QThread fallback; terminating the Qt thread
@@ -288,23 +320,25 @@ class CameraPane(QtWidgets.QGroupBox):
                     force_stop = getattr(worker, "stop", None)
                     if callable(force_stop):
                         force_stop()
-                    stopped = bool(thread.wait(1500))
+                    stopped = bool(thread.wait(CAMERA_STOP_POST_ESCALATION_WAIT_MS))
             else:
                 is_running = getattr(thread, "isRunning", None)
                 stopped = bool(is_running is not None and callable(is_running) and not is_running())
                 if not stopped and worker is not None and self._stop_requested_monotonic_s is not None:
                     elapsed_s = max(0.0, time.monotonic() - self._stop_requested_monotonic_s)
-                    if elapsed_s >= 3.0 and self._stop_escalation_level < 2:
+                    if elapsed_s >= CAMERA_STOP_KILL_AFTER_S and self._stop_escalation_level < 2:
                         kill_child = getattr(worker, "kill_child_process", None)
                         if callable(kill_child):
                             kill_child()
                         self._stop_escalation_level = 2
-                    elif elapsed_s >= 1.5 and self._stop_escalation_level < 1:
+                    elif elapsed_s >= CAMERA_STOP_TERMINATE_AFTER_S and self._stop_escalation_level < 1:
                         terminate_child = getattr(worker, "terminate_child_process", None)
                         if callable(terminate_child):
                             terminate_child()
                         self._stop_escalation_level = 1
         if stopped:
+            self._retire_native_frame_ring(self.native_frame_ring)
+            self.native_frame_ring = None
             self.worker = None
             self.thread = None
             self._stop_requested_monotonic_s = None
@@ -314,6 +348,8 @@ class CameraPane(QtWidgets.QGroupBox):
         self.measurement_frame_images.clear()
         self.measurement_frame_metadata.clear()
         self.measurement_frame_order.clear()
+        self.native_frame_descriptors.clear()
+        self.native_frame_descriptor_order.clear()
         self._clear_pending_preview()
         self.measurement_pair_display_active = False
         self.selected_measurement_frame_timestamp_s = None
@@ -354,6 +390,7 @@ class CameraPane(QtWidgets.QGroupBox):
         frame_metadata.setdefault("source_timestamp_s", None)
         frame_metadata.setdefault("timestamp_source", "app-receive")
         frame_metadata.setdefault("timestamp_reference", infer_camera_timestamp_reference(frame_metadata))
+        self._remember_native_descriptor(frame_metadata)
         if self.measurement_pair_display_active and self.detection_stream_active:
             self.frame_changed.emit(self.camera_label, image, frame_metadata)
             return
@@ -363,6 +400,34 @@ class CameraPane(QtWidgets.QGroupBox):
             self._preview_container.set_aspect_ratio(image.width() / image.height())
         self.frame_changed.emit(self.camera_label, image, frame_metadata)
         self._refresh_pixmap()
+
+    @staticmethod
+    def _frame_key_from_metadata(metadata: object) -> FrameKey | None:
+        if not isinstance(metadata, dict):
+            return None
+        try:
+            key = FrameKey.from_mapping(metadata)
+        except (TypeError, ValueError):
+            return None
+        if not key.camera_id or key.stream_generation <= 0 or key.frame_id <= 0:
+            return None
+        return key
+
+    def _remember_native_descriptor(self, metadata: object) -> None:
+        frame_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        key = self._frame_key_from_metadata(frame_metadata)
+        if key is None:
+            return
+        key_text = key.text
+        if key_text not in self.native_frame_descriptors:
+            if (
+                len(self.native_frame_descriptor_order)
+                == self.native_frame_descriptor_order.maxlen
+            ):
+                old_key = self.native_frame_descriptor_order.popleft()
+                self.native_frame_descriptors.pop(old_key, None)
+            self.native_frame_descriptor_order.append(key_text)
+        self.native_frame_descriptors[key_text] = frame_metadata
 
     def _show_frame_if_current(self, generation: int, image: QtGui.QImage, metadata: object) -> None:
         if generation != self.stream_generation:
@@ -410,6 +475,14 @@ class CameraPane(QtWidgets.QGroupBox):
         if generation != self.stream_generation:
             return
         self._preview_rendered += 1
+        try:
+            frame_timestamp_s = float(metadata.get("timestamp_s"))
+            preview_age_s = max(0.0, time.monotonic() - frame_timestamp_s)
+        except (TypeError, ValueError):
+            preview_age_s = None
+        if preview_age_s is not None:
+            self._last_preview_age_s = preview_age_s
+            self._max_preview_age_s = max(self._max_preview_age_s, preview_age_s)
         self._show_frame(image, metadata)
 
     def _clear_pending_preview(self) -> None:
@@ -427,6 +500,51 @@ class CameraPane(QtWidgets.QGroupBox):
             "replaced": replaced,
             "queued_latest": queued,
             "timer_interval_ms": self._preview_timer.interval(),
+        }
+
+    @staticmethod
+    def _current_process_rss_bytes() -> int:
+        try:
+            resident_pages = int(
+                (Path("/proc/self/statm").read_text(encoding="ascii").split())[1]
+            )
+            return resident_pages * int(os.sysconf("SC_PAGE_SIZE"))
+        except (OSError, ValueError, IndexError):
+            return 0
+
+    @QtCore.pyqtSlot()
+    def _record_gui_heartbeat(self) -> None:
+        now_s = time.monotonic()
+        previous_s = self._gui_heartbeat_last_s
+        if previous_s is not None:
+            expected_interval_s = GUI_HEARTBEAT_INTERVAL_MS / 1000.0
+            delay_s = max(0.0, now_s - previous_s - expected_interval_s)
+            self._gui_heartbeat_max_delay_s = max(
+                self._gui_heartbeat_max_delay_s,
+                delay_s,
+            )
+        self._gui_heartbeat_last_s = now_s
+        self._gui_heartbeat_count += 1
+
+    def backpressure_snapshot(self) -> dict[str, object]:
+        ring_metrics = (
+            self.native_frame_ring.metrics()
+            if self.native_frame_ring is not None
+            else {}
+        )
+        return {
+            **self.preview_delivery_snapshot(),
+            **self._last_stream_stats,
+            **{
+                f"native_ring_{key}": value
+                for key, value in ring_metrics.items()
+                if key not in {"camera_id", "stream_generation"}
+            },
+            "gui_heartbeat_count": self._gui_heartbeat_count,
+            "gui_heartbeat_max_delay_s": self._gui_heartbeat_max_delay_s,
+            "gui_preview_age_s": self._last_preview_age_s,
+            "gui_preview_max_age_s": self._max_preview_age_s,
+            "workstation_rss_bytes": self._current_process_rss_bytes(),
         }
 
     def _store_measurement_frame(
@@ -468,6 +586,94 @@ class CameraPane(QtWidgets.QGroupBox):
         self._store_measurement_frame(timestamp_s, image, frame_metadata)
         self.native_measurement_frame_changed.emit(self.camera_label, frame_metadata, image)
 
+    def _native_ring_for_key(self, key: FrameKey) -> SharedNativeFrameRing | None:
+        candidates = [self.native_frame_ring, *self._retired_native_frame_rings]
+        for ring in candidates:
+            if (
+                ring is not None
+                and ring.camera_id == key.camera_id
+                and ring.stream_generation == key.stream_generation
+            ):
+                return ring
+        return None
+
+    def native_ring_for_frame_key(
+        self,
+        key: FrameKey,
+    ) -> SharedNativeFrameRing | None:
+        return self._native_ring_for_key(key)
+
+    @staticmethod
+    def _qimage_from_native_bgr(
+        data: bytes,
+        *,
+        width: int,
+        height: int,
+    ) -> QtGui.QImage:
+        bytes_per_line = int(width) * 3
+        bgr_format = getattr(QtGui.QImage, "Format_BGR888", None)
+        if bgr_format is not None:
+            return QtGui.QImage(
+                data,
+                int(width),
+                int(height),
+                bytes_per_line,
+                bgr_format,
+            ).copy()
+        return QtGui.QImage(
+            data,
+            int(width),
+            int(height),
+            bytes_per_line,
+            QtGui.QImage.Format_RGB888,
+        ).rgbSwapped()
+
+    def native_frame_for_key(
+        self,
+        key: FrameKey,
+    ) -> tuple[QtGui.QImage, dict[str, object]] | None:
+        """Resolve exactly one native frame; never substitute a nearby frame."""
+
+        ring = self._native_ring_for_key(key)
+        if ring is None:
+            return None
+        lease = ring.pin(key)
+        if lease is None:
+            return None
+        try:
+            snapshot = ring.read(lease)
+        except KeyError:
+            return None
+        finally:
+            ring.release(lease)
+        descriptor = snapshot.descriptor
+        if descriptor.channels != 3:
+            return None
+        image = self._qimage_from_native_bgr(
+            snapshot.data,
+            width=descriptor.width,
+            height=descriptor.height,
+        )
+        metadata = dict(self.native_frame_descriptors.get(key.text, {}))
+        metadata.update(descriptor.to_mapping())
+        metadata.update(
+            {
+                "source_native_frame_id": key.text,
+                "native_lossless_source": True,
+                "overlay_applied": False,
+            }
+        )
+        return image, metadata
+
+    def native_frame_for_detection(
+        self,
+        detection: DetectionObservation,
+    ) -> tuple[QtGui.QImage, dict[str, object]] | None:
+        key = self._frame_key_from_metadata(detection.timestamp_metadata)
+        if key is None:
+            return None
+        return self.native_frame_for_key(key)
+
     def native_measurement_frame(
         self,
         timestamp_s: float,
@@ -476,9 +682,30 @@ class CameraPane(QtWidgets.QGroupBox):
     ) -> tuple[float, QtGui.QImage, dict[str, object]] | None:
         """Return a native, unannotated frame near a detection timestamp."""
 
+        requested = float(timestamp_s)
+        descriptor_candidates: list[tuple[float, FrameKey]] = []
+        for metadata in self.native_frame_descriptors.values():
+            key = self._frame_key_from_metadata(metadata)
+            if key is None:
+                continue
+            try:
+                candidate_s = float(metadata.get("timestamp_s"))
+            except (TypeError, ValueError):
+                continue
+            descriptor_candidates.append((candidate_s, key))
+        if descriptor_candidates:
+            candidate_s, key = min(
+                descriptor_candidates,
+                key=lambda item: abs(item[0] - requested),
+            )
+            if abs(candidate_s - requested) <= float(maximum_delta_s):
+                resolved = self.native_frame_for_key(key)
+                if resolved is not None:
+                    image, metadata = resolved
+                    return candidate_s, image, metadata
+
         if not self.measurement_frame_images:
             return None
-        requested = float(timestamp_s)
         key = min(self.measurement_frame_images, key=lambda candidate: abs(candidate - requested))
         if abs(key - requested) > float(maximum_delta_s):
             return None
@@ -502,6 +729,18 @@ class CameraPane(QtWidgets.QGroupBox):
         call this method so annotations remain on the decoded source grid.
         """
 
+        ring = self.native_frame_ring
+        if ring is not None:
+            descriptor = ring.latest_descriptor()
+            if descriptor is not None:
+                resolved = self.native_frame_for_key(descriptor.key)
+                if resolved is not None:
+                    image, metadata = resolved
+                    return (
+                        float(descriptor.timestamp_s or 0.0),
+                        image,
+                        metadata,
+                    )
         if not self.measurement_frame_order:
             return None
         return self.native_measurement_frame(
@@ -536,6 +775,24 @@ class CameraPane(QtWidgets.QGroupBox):
             "maximum_delta_s",
             allow_zero=True,
         )
+        descriptor_candidates: list[tuple[float, dict[str, object]]] = []
+        for metadata in self.native_frame_descriptors.values():
+            try:
+                candidate_s = float(metadata.get("timestamp_s"))
+            except (TypeError, ValueError):
+                continue
+            descriptor_candidates.append((candidate_s, metadata))
+        if descriptor_candidates:
+            candidate_s, metadata = min(
+                descriptor_candidates,
+                key=lambda item: abs(item[0] - requested),
+            )
+            if abs(candidate_s - requested) <= delta_limit:
+                return self._native_calibration_frame_for_descriptor(
+                    metadata,
+                    maximum_age_s=maximum_age_s,
+                    now_monotonic_s=now_monotonic_s,
+                )
         if not self.measurement_frame_images:
             return None
         key = min(self.measurement_frame_images, key=lambda candidate: abs(candidate - requested))
@@ -560,6 +817,19 @@ class CameraPane(QtWidgets.QGroupBox):
         native frames are rejected with ``None``.
         """
 
+        ring = self.native_frame_ring
+        if ring is not None:
+            descriptor = ring.latest_descriptor()
+            if descriptor is not None:
+                metadata = dict(
+                    self.native_frame_descriptors.get(descriptor.key.text, {})
+                )
+                metadata.update(descriptor.to_mapping())
+                return self._native_calibration_frame_for_descriptor(
+                    metadata,
+                    maximum_age_s=maximum_age_s,
+                    now_monotonic_s=now_monotonic_s,
+                )
         if not self.measurement_frame_order:
             return None
         return self._native_calibration_frame_for_key(
@@ -567,6 +837,46 @@ class CameraPane(QtWidgets.QGroupBox):
             maximum_age_s=maximum_age_s,
             now_monotonic_s=now_monotonic_s,
         )
+
+    def _native_calibration_frame_for_descriptor(
+        self,
+        metadata: dict[str, object],
+        *,
+        maximum_age_s: float,
+        now_monotonic_s: float | None,
+    ) -> tuple[str, QtGui.QImage, dict[str, object]] | None:
+        key = self._frame_key_from_metadata(metadata)
+        if key is None:
+            return None
+        resolved = self.native_frame_for_key(key)
+        if resolved is None:
+            return None
+        image, resolved_metadata = resolved
+        age_limit = self._finite_nonnegative_limit(
+            maximum_age_s,
+            "maximum_age_s",
+            allow_zero=True,
+        )
+        now_s = time.monotonic() if now_monotonic_s is None else float(now_monotonic_s)
+        try:
+            timestamp_s = float(resolved_metadata["timestamp_s"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not math.isfinite(now_s) or not math.isfinite(timestamp_s):
+            return None
+        age_s = now_s - timestamp_s
+        if age_s < 0.0 or age_s > age_limit:
+            return None
+        if resolved_metadata.get("native_lossless_source") is not True:
+            return None
+        if resolved_metadata.get("overlay_applied") is not False:
+            return None
+        resolved_metadata["frame_id"] = key.text
+        resolved_metadata.setdefault(
+            "pixel_contract",
+            "decoded native RGB raster; no resize, crop, or overlay",
+        )
+        return key.text, image, resolved_metadata
 
     @staticmethod
     def _finite_nonnegative_limit(
@@ -636,6 +946,20 @@ class CameraPane(QtWidgets.QGroupBox):
         return frame_id, image.copy(), metadata
 
     def show_measurement_frame_for_detection(self, detection: DetectionObservation) -> bool:
+        exact = self.native_frame_for_detection(detection)
+        if exact is not None:
+            image, metadata = exact
+            self.selected_measurement_frame_timestamp_s = float(
+                metadata.get("timestamp_s", detection.timestamp_s)
+            )
+            self.selected_measurement_frame_lookup_delta_s = 0.0
+            self.show_selected_measurement_frame(image, metadata)
+            return True
+        if self._frame_key_from_metadata(detection.timestamp_metadata) is not None:
+            self.measurement_pair_display_active = False
+            self.selected_measurement_frame_timestamp_s = None
+            self.selected_measurement_frame_lookup_delta_s = None
+            return False
         detection_timestamp_s = float(detection.timestamp_s)
         image = self.measurement_frame_images.get(detection_timestamp_s)
         selected_timestamp_s = detection_timestamp_s if image is not None else None
@@ -700,20 +1024,17 @@ class CameraPane(QtWidgets.QGroupBox):
             return
         target_size = self.image_label.size()
         source_pixmap = QtGui.QPixmap.fromImage(self.latest_image)
-        scaled = source_pixmap.scaled(
-            target_size, QtCore.Qt.KeepAspectRatioByExpanding, QtCore.Qt.SmoothTransformation
+        display_pixmap = source_pixmap.scaled(
+            target_size,
+            QtCore.Qt.KeepAspectRatio,
+            QtCore.Qt.SmoothTransformation,
         )
-        crop_x = max(0, (scaled.width() - target_size.width()) // 2)
-        crop_y = max(0, (scaled.height() - target_size.height()) // 2)
-        display_pixmap = scaled.copy(crop_x, crop_y, target_size.width(), target_size.height())
         if self.latest_detection is not None and not self.measurement_pair_display_active:
             display_pixmap = self._draw_detection_overlay(
                 display_pixmap,
                 self.latest_detection,
-                scale_x=scaled.width() / source_pixmap.width(),
-                scale_y=scaled.height() / source_pixmap.height(),
-                crop_x=crop_x,
-                crop_y=crop_y,
+                scale_x=display_pixmap.width() / source_pixmap.width(),
+                scale_y=display_pixmap.height() / source_pixmap.height(),
             )
         self.image_label.setPixmap(display_pixmap)
 
@@ -783,16 +1104,30 @@ class CameraPane(QtWidgets.QGroupBox):
             dict(timestamp_metadata) if isinstance(timestamp_metadata, dict) else {}
         )
         timestamp_metadata["stream_generation"] = int(generation)
+        self._remember_native_descriptor(timestamp_metadata)
         current_payload["timestamp_metadata"] = timestamp_metadata
         self._handle_detection_payload(current_payload)
 
     def _handle_stats_payload(self, payload: dict) -> None:
-        self.stats_changed.emit(self.camera_label, payload)
+        merged = dict(payload)
+        self._last_stream_stats = merged
+        merged.update(self.backpressure_snapshot())
+        self.stats_changed.emit(self.camera_label, merged)
 
     def _handle_stats_payload_if_current(self, generation: int, payload: dict) -> None:
         if generation != self.stream_generation:
             return
         self._handle_stats_payload(payload)
+
+    @QtCore.pyqtSlot(dict)
+    def _handle_recording_finalized(self, payload: dict) -> None:
+        finalization = dict(payload or {})
+        path = str(finalization.get("path") or "").strip()
+        if not path:
+            return
+        self.recording_finalizations[path] = finalization
+        while len(self.recording_finalizations) > 16:
+            self.recording_finalizations.pop(next(iter(self.recording_finalizations)))
 
     def _set_status(self, status: str) -> None:
         self.current_status = status
@@ -822,9 +1157,30 @@ class CameraPane(QtWidgets.QGroupBox):
         # stream that has already started.
         if self.thread is not thread:
             return
+        self._retire_native_frame_ring(self.native_frame_ring)
+        self.native_frame_ring = None
         self.thread = None
         self.worker = None
         self._preview_frame_callback = None
         self._stream_signal_adapter = None
         self._stop_requested_monotonic_s = None
         self._stop_escalation_level = 0
+
+    def _retire_native_frame_ring(
+        self,
+        ring: SharedNativeFrameRing | None,
+    ) -> None:
+        if ring is not None and ring not in self._retired_native_frame_rings:
+            self._retired_native_frame_rings.append(ring)
+        survivors: list[SharedNativeFrameRing] = []
+        for candidate in self._retired_native_frame_rings:
+            try:
+                active_leases = int(candidate.metrics().get("active_leases", 0))
+            except RuntimeError:
+                active_leases = 0
+            if active_leases > 0:
+                survivors.append(candidate)
+                continue
+            candidate.close()
+            candidate.unlink()
+        self._retired_native_frame_rings = survivors

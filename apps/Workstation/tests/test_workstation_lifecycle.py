@@ -227,7 +227,7 @@ def test_workstation_shell_navigation_and_close() -> None:
         "Overview",
         "Protocol",
         "Devices",
-        "Sessions",
+        "Data",
         "Calibration",
         "Alignment",
         "Measurement",
@@ -261,25 +261,18 @@ def test_workstation_shell_navigation_and_close() -> None:
     assert window.commands.invoke("time.check_sync") is True
     assert backend.calls[-1] == "time_check_sync"
 
-    window.navigation.select_context("tasks.session")
+    window.navigation.select_context("tasks.data")
     app.processEvents()
     assert window.workspace_host.currentWidget().widget() is window.sessions
     assert window.sessions.current_tab_id() == "current"
     assert [
         window.sessions.tabs.tabText(index)
         for index in range(window.sessions.tabs.count())
-    ] == ["Current", "Evidence", "Review"]
-    assert window.inspector.context_label.text() == "Sessions"
-    assert window.session.start_session_button.objectName() == "sessionWorkspaceOpen"
-    button = window.session.start_session_button
-    assert button.isEnabled()
-    center = button.rect().center()
-    assert QtWidgets.QApplication.widgetAt(button.mapToGlobal(center)) is button
-    QtTest.QTest.mouseClick(button, QtCore.Qt.LeftButton, pos=center)
-    app.processEvents()
-    assert backend.calls[-1] == "session.begin"
-    assert window.session.folder_name_label.text() == "20260822_143000_000000001"
-    assert window.session.folder_path_label.text().endswith("/20260822_143000_000000001")
+    ] == ["Status", "Capture"]
+    assert window.inspector.context_label.text() == "Data"
+    assert not window.session.isVisible()
+    assert window.data.open_data_folder_button.objectName() == "dataWorkspaceOpenRoot"
+    assert window.data.retry_storage_button.objectName() == "dataWorkspaceRetryStorage"
 
     window.navigation.select_context("processing.experiment")
     app.processEvents()
@@ -287,7 +280,7 @@ def test_workstation_shell_navigation_and_close() -> None:
     assert window.recording.preflight_group.isVisible()
     assert "recording.toggle" not in window.recording.operation_buttons
     assert "recording.toggle" in window.advanced.operation_buttons
-    assert "session.save" in window.advanced.operation_buttons
+    assert "session.save" not in window.advanced.operation_buttons
     assert "advanced.media.open_video" in window.advanced.operation_buttons
     assert "advanced.media.refresh" not in window.advanced.operation_buttons
     assert "advanced.media.preview" not in window.advanced.operation_buttons
@@ -301,7 +294,7 @@ def test_workstation_shell_navigation_and_close() -> None:
         QtWidgets.QWidget, "measurementPackageNewMeasurement"
     ) is None
     assert window.measurement.control_buttons["detection.toggle"].text() == "측정 시작"
-    assert not window.measurement.finalize_session_button.isHidden()
+    assert window.measurement.finalize_session_button.isHidden()
     assert not window.measurement.findChildren(QtWidgets.QLabel, "measurementResultStatus")
     assert any(
         "baseline_center_frd" in label.text()
@@ -340,7 +333,7 @@ def test_workstation_shell_navigation_and_close() -> None:
         "camera.toggle",
         "detection.toggle",
     }
-    assert "automatic" in window.measurement.session_status_label.text().lower()
+    assert window.measurement.session_status_label.text().startswith("Measurement:")
     assert window.measurement.session_details_button.isEnabled()
     assert (
         window.measurement.session_details_button.parentWidget()
@@ -940,3 +933,96 @@ def test_visible_time_workspace_recomputes_live_sync_summary_after_verification_
     window.close()
     window.deleteLater()
     app.processEvents()
+
+
+def test_target_drone_artifact_linkage_retries_after_terminal_stop() -> None:
+    from Workstation.app_lifecycle_controller import AppLifecycleController
+
+    artifact = {
+        "artifact_id": "target-artifact-1",
+        "absolute_path": "/session/raw/target.jsonl",
+        "size_bytes": 42,
+        "sha256": "a" * 64,
+    }
+
+    class Owner:
+        phase = "RUNNING"
+        stop_calls = 0
+
+        def target_drone_stream_snapshot(self) -> dict[str, object]:
+            return {
+                "phase": self.phase,
+                "worker_alive": self.phase == "RUNNING",
+                "artifact": artifact if self.phase == "SEALED" else None,
+            }
+
+        def stop_target_drone_stream(self, *, timeout_s: float) -> dict[str, object]:
+            assert timeout_s == pytest.approx(1.0)
+            self.stop_calls += 1
+            self.phase = "SEALED"
+            return self.target_drone_stream_snapshot()
+
+    linkage_calls: list[dict[str, object]] = []
+
+    def register(_path: object, **kwargs: object) -> dict[str, object]:
+        linkage_calls.append(dict(kwargs))
+        if len(linkage_calls) == 1:
+            return {
+                "schema": "workstation-persistence-failure-v1",
+                "status": "failed",
+                "kind": "artifact_registration",
+                "error": "disk-sentinel",
+            }
+        return {"relative_path": "raw/target.jsonl"}
+
+    owner = Owner()
+    logs: list[str] = []
+    panel = SimpleNamespace(
+        _target_drone_controller_owner=owner,
+        register_workstation_session_artifact=register,
+        _log=logs.append,
+    )
+    controller = AppLifecycleController(panel)
+
+    assert controller._shutdown_stop_target_drone() is False
+    assert controller._shutdown_stop_target_drone() is True
+    assert owner.stop_calls == 1
+    assert len(linkage_calls) == 2
+    assert linkage_calls[-1]["expected_size_bytes"] == 42
+    assert linkage_calls[-1]["expected_sha256"] == "a" * 64
+    assert any("disk-sentinel" in message for message in logs)
+
+
+def test_shutdown_save_settings_retries_when_run_evidence_flush_returns_false() -> None:
+    from Workstation.app_lifecycle_controller import AppLifecycleController
+
+    calls: list[str] = []
+    panel = SimpleNamespace(
+        flush_workstation_run_evidence=lambda: False,
+        _save_current_settings=lambda: calls.append("settings"),
+        _log=calls.append,
+    )
+
+    assert AppLifecycleController(panel)._shutdown_save_settings() is False
+    assert "settings" in calls
+    assert any("flush 실패" in value for value in calls)
+
+
+def test_emergency_flush_distinguishes_false_from_conventional_none(capsys) -> None:
+    from Workstation.__main__ import _flush_window_session_state
+
+    none_owner = SimpleNamespace(
+        flush_workstation_run_evidence=lambda: None,
+        distance_recording_rows=SimpleNamespace(flush=lambda: None),
+    )
+    _flush_window_session_state(none_owner)
+    assert capsys.readouterr().err == ""
+
+    false_owner = SimpleNamespace(
+        flush_workstation_run_evidence=lambda: False,
+        distance_recording_rows=SimpleNamespace(flush=lambda: False),
+    )
+    _flush_window_session_state(false_owner)
+    error = capsys.readouterr().err
+    assert "Emergency run-evidence flush failed" in error
+    assert "Emergency recording-spool flush failed" in error

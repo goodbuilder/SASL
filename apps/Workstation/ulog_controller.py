@@ -53,6 +53,7 @@ from Workstation.workstation_core.strict_jsonl import (
     append_jsonl_record,
     prepare_jsonl_append,
 )
+from Workstation.workstation_core.measurement_data_store import creation_timestamp_text
 
 
 ULOG_CONTROLLER_METHODS = (
@@ -257,6 +258,7 @@ class SessionULogArtifact:
     ulog_start_timestamp_us: int
     ownership_token_sha256: str | None = None
     coordinate_contract: str = ULOG_COORDINATE_CONTRACT
+    session_membership: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_id", MavlinkSourceId(self.source_id))
@@ -273,10 +275,13 @@ class SessionULogArtifact:
             raise ValueError("ownership_token_sha256 must be a SHA-256 digest")
 
     def to_mapping(self) -> dict[str, Any]:
-        return {
-            "schema": ULOG_ARTIFACT_SCHEMA,
+        result = {
+            "schema": (
+                ULOG_ARTIFACT_SCHEMA
+                if self.session_membership
+                else "workstation-ulog-artifact-v2"
+            ),
             "artifact_id": self.artifact_id,
-            "session_id": self.session_id,
             "source_id": self.source_id.value,
             "source_role": self.source_role,
             "acquisition": self.acquisition.value,
@@ -303,6 +308,9 @@ class SessionULogArtifact:
             "media_type": "application/vnd.px4.ulog",
             "validated": True,
         }
+        if self.session_membership:
+            result["session_id"] = self.session_id
+        return result
 
 
 @dataclass
@@ -327,10 +335,12 @@ class ULogController:
             AutomaticULogBinding | tuple[MavlinkSourceConfig, ULogHardwareAdapter],
         ]
         | None = None,
+        timestamp_filenames: bool = False,
     ) -> None:
         self.session_root = Path(session_root).expanduser().resolve()
         self.session_root.mkdir(parents=True, exist_ok=True)
         self.session_id = _required_text(session_id, "session_id")
+        self.timestamp_filenames = bool(timestamp_filenames)
         self._states: dict[MavlinkSourceId, _AutomaticState] = {}
         self._artifacts: list[SessionULogArtifact] = []
         self._manifest_path = self.session_root / "ulog_artifacts.jsonl"
@@ -586,14 +596,19 @@ class ULogController:
                         artifact.source_id == source for artifact in self._artifacts
                     ),
                 }
-            return {
+            snapshot = {
                 "schema": ULOG_SNAPSHOT_SCHEMA,
-                "session_id": self.session_id,
                 "session_root": str(self.session_root),
+                "timestamp_filenames": self.timestamp_filenames,
                 "coordinate_contract": ULOG_COORDINATE_CONTRACT,
                 "sources": sources,
                 "artifacts": [artifact.to_mapping() for artifact in self._artifacts],
             }
+            if self.timestamp_filenames:
+                snapshot["data_owner"] = "measurement_data_root"
+            else:
+                snapshot["session_id"] = self.session_id
+            return snapshot
 
     def _require_automatic_state(self, source: MavlinkSourceId) -> _AutomaticState:
         try:
@@ -748,24 +763,45 @@ class ULogController:
                     f"ULog validation failed: {details or 'unknown error'}"
                 )
             safe_name = self._safe_ulog_name(original_name)
-            final = source_dir / f"{Path(safe_name).stem}-{validation.sha256[:16]}.ulg"
-            if final.exists():
-                if (
-                    final.stat().st_size != validation.actual_size_bytes
-                    or self._sha256_file(final) != validation.sha256
-                ):
-                    raise ULogControllerError("content-addressed ULog collision")
-                part.unlink()
+            imported_utc_ns = time.time_ns()
+            if self.timestamp_filenames:
+                timestamp_stem = (
+                    f"{creation_timestamp_text(imported_utc_ns)}_"
+                    f"{Path(safe_name).stem}"
+                )
+                sequence = 0
+                while True:
+                    suffix = "" if sequence == 0 else f"-{sequence:02d}"
+                    final = source_dir / f"{timestamp_stem}{suffix}.ulg"
+                    try:
+                        # link+unlink is an atomic no-replace publication in
+                        # the same directory; a collision selects a new name
+                        # and can never erase yesterday's ULog.
+                        os.link(part, final)
+                    except FileExistsError:
+                        sequence += 1
+                        continue
+                    part.unlink()
+                    self._fsync_directory(source_dir)
+                    break
             else:
-                os.replace(part, final)
-                self._fsync_directory(source_dir)
+                final = source_dir / f"{Path(safe_name).stem}-{validation.sha256[:16]}.ulg"
+                if final.exists():
+                    if (
+                        final.stat().st_size != validation.actual_size_bytes
+                        or self._sha256_file(final) != validation.sha256
+                    ):
+                        raise ULogControllerError("content-addressed ULog collision")
+                    part.unlink()
+                else:
+                    os.replace(part, final)
+                    self._fsync_directory(source_dir)
             if (
                 final.stat().st_size != validation.actual_size_bytes
                 or self._sha256_file(final) != validation.sha256
             ):
                 raise ULogControllerError("sealed ULog changed after atomic rename")
 
-            imported_utc_ns = time.time_ns()
             imported_monotonic_ns = time.monotonic_ns()
             artifact_id = str(uuid.uuid4())
             metadata_path = final.with_name(f"{final.name}.{artifact_id}.json")
@@ -795,6 +831,7 @@ class ULogController:
                 ulog_version=int(validation.version),
                 ulog_start_timestamp_us=int(validation.start_timestamp_us),
                 ownership_token_sha256=ownership_token_sha256,
+                session_membership=not self.timestamp_filenames,
             )
             metadata = artifact.to_mapping()
             metadata["validation"] = _validation_mapping(validation)

@@ -284,17 +284,186 @@ def test_close_session_auto_seals_recovered_empty_measurement(tmp_path: Path) ->
     assert verify_measurement_session(tmp_path / "recordings" / session_id).valid
 
 
-def test_close_session_still_requires_active_detection_to_stop(tmp_path: Path) -> None:
+def test_close_session_stops_active_detection_then_saves_and_seals(tmp_path: Path) -> None:
     panel = _panel(tmp_path)
     controller = MeasurementPackageController(panel)
     assert controller.begin_measurement_session(session_id="active-detection-close")
     assert controller.begin_measurement()
     assert controller.begin_measurement_detection()
+    calls: list[str] = []
+    recording = {"active": True}
+
+    def stop_detection() -> None:
+        calls.append("detection.stop")
+        panel.yolo_enabled = False
+        assert controller.complete_measurement_detection()
+
+    def stop_recording() -> bool:
+        calls.append("recording.stop")
+        recording["active"] = False
+        panel._automatic_session_recording = False
+        _write_outputs(panel, valid_count=1)
+        return True
+
+    panel.yolo_enabled = True
+    panel.stop_yolo_detection = stop_detection
+    panel._automatic_session_recording = True
+    panel._session_recording_active = lambda: recording["active"]
+    panel.stop_automatic_session_recording = stop_recording
+    panel._measurement_auto_finalize_enabled = True
+
+    assert controller.measurement_session_snapshot()["can_close_session"] is True
+    assert controller.close_measurement_session() is True
+    assert calls == ["detection.stop", "recording.stop"]
+    assert controller.measurement_session_snapshot()["state"] == "SEALED"
+    assert controller.measurement_package_snapshot()["detection_completed"] is True
+    assert panel._measurement_session_close_requested is False
+    assert verify_measurement_session(
+        tmp_path / "recordings" / "active-detection-close"
+    ).valid
+
+
+def test_close_session_keeps_one_request_pending_while_active_detection_save_drains(
+    tmp_path: Path,
+) -> None:
+    panel = _panel(tmp_path)
+    controller = MeasurementPackageController(panel)
+    assert controller.begin_measurement_session(session_id="active-close-drain")
+    assert controller.begin_measurement()
+    assert controller.begin_measurement_detection()
+    _write_outputs(panel, valid_count=1)
+    panel._session_save_thread = object()
+    calls: list[str] = []
+
+    def stop_detection() -> None:
+        calls.append("detection.stop")
+        panel.yolo_enabled = False
+        assert controller.complete_measurement_detection()
+
+    panel.yolo_enabled = True
+    panel.stop_yolo_detection = stop_detection
+    controller._schedule_finalize_retry = lambda: None  # type: ignore[method-assign]
+    panel._measurement_auto_finalize_enabled = True
+
+    assert controller.close_measurement_session() is False
+    assert controller.measurement_package_snapshot()["state"] == "VERIFYING"
+    assert panel._measurement_session_close_requested is True
+    assert controller.close_measurement_session() is False
+    assert calls == ["detection.stop"]
+
+    panel._session_save_thread = None
+    assert controller._continue_measurement_package_finalization() is True
+    assert controller.measurement_session_snapshot()["state"] == "SEALED"
+    assert panel._measurement_session_close_requested is False
+
+
+def test_close_session_cancels_pending_detection_start_and_seals_empty_child(
+    tmp_path: Path,
+) -> None:
+    panel = _panel(tmp_path)
+    controller = MeasurementPackageController(panel)
+    assert controller.begin_measurement_session(session_id="pending-start-close")
+    assert controller.begin_measurement()
+    assert controller.begin_measurement_detection()
+    panel._pending_camera_start = (True, True)
+    calls: list[str] = []
+
+    def cancel_detection_start() -> None:
+        calls.append("detection.cancel")
+        panel._pending_camera_start = None
+        assert controller.cancel_measurement_detection_start("Session close cancelled start")
+
+    panel.stop_yolo_detection = cancel_detection_start
+    panel.save_distance_history_csv = lambda: _write_outputs(panel, valid_count=0)
+
+    assert controller.close_measurement_session() is True
+    assert calls == ["detection.cancel"]
+    assert controller.measurement_session_snapshot()["state"] == "SEALED"
+    assert controller.measurement_package_snapshot()["detection_started"] is False
+
+
+def test_close_session_reports_runtime_detection_stop_failure_without_sealing(
+    tmp_path: Path,
+) -> None:
+    panel = _panel(tmp_path)
+    controller = MeasurementPackageController(panel)
+    assert controller.begin_measurement_session(session_id="active-close-stop-failure")
+    assert controller.begin_measurement()
+    assert controller.begin_measurement_detection()
+    panel.yolo_enabled = True
+
+    def fail_stop() -> None:
+        raise RuntimeError("injected Detection stop failure")
+
+    panel.stop_yolo_detection = fail_stop
 
     assert controller.close_measurement_session() is False
     assert controller.measurement_session_snapshot()["state"] == "OPEN"
     assert panel._measurement_session_close_requested is False
-    assert "Stop Detection before closing" in controller.measurement_package_snapshot()["detail"]
+    snapshot = controller.measurement_package_snapshot()
+    assert snapshot["state"] == "COLLECTING"
+    assert snapshot["detail"] == "Session close could not stop active Detection"
+    assert snapshot["error"] == "injected Detection stop failure"
+
+
+def test_close_session_completes_recovered_detection_without_a_live_runtime(
+    tmp_path: Path,
+) -> None:
+    panel = _panel(tmp_path)
+    controller = MeasurementPackageController(panel)
+    assert controller.begin_measurement_session(session_id="recovered-active-close")
+    assert controller.begin_measurement()
+    assert controller.begin_measurement_detection()
+    controller.package.transition("RECOVERABLE")
+    controller._set_state("RECOVERABLE", "simulated application restart")
+    panel.save_distance_history_csv = lambda: _write_outputs(panel, valid_count=0)
+
+    assert controller.close_measurement_session() is True
+    assert controller.measurement_package_snapshot()["detection_completed"] is True
+    assert controller.measurement_session_snapshot()["state"] == "SEALED"
+    assert verify_measurement_session(
+        tmp_path / "recordings" / "recovered-active-close"
+    ).valid
+
+
+def test_close_session_button_orchestrates_active_detection_to_closed_folder(
+    tmp_path: Path,
+) -> None:
+    app = QtWidgets.QApplication.instance()
+    assert app is not None
+    panel = _panel(tmp_path)
+    controller = MeasurementPackageController(panel)
+    backend = SimpleNamespace(
+        panel=panel,
+        measurement_session_snapshot=controller.measurement_session_snapshot,
+        measurement_package_snapshot=controller.measurement_package_snapshot,
+        close_measurement_session=controller.close_measurement_session,
+    )
+    workspace = SessionWorkspace(backend, StatusModel())
+    workspace.show()
+    assert controller.begin_measurement_session(session_id="ui-active-close")
+    assert controller.begin_measurement()
+    assert controller.begin_measurement_detection()
+
+    def stop_detection() -> None:
+        panel.yolo_enabled = False
+        assert controller.complete_measurement_detection()
+
+    panel.yolo_enabled = True
+    panel.stop_yolo_detection = stop_detection
+    panel.save_distance_history_csv = lambda: _write_outputs(panel, valid_count=1)
+    workspace.refresh({})
+    assert "Stop active Detection" in workspace.close_session_button.toolTip()
+
+    workspace.close_session_button.click()
+    app.processEvents()
+
+    assert controller.measurement_session_snapshot()["state"] == "SEALED"
+    assert workspace.session_status_label.text() == "Closed"
+    assert not workspace.action_feedback_label.isVisible()
+    workspace.close()
+    workspace.deleteLater()
+    app.processEvents()
 
 
 def test_new_measurement_preserves_evidence_without_alignment_geometry(tmp_path: Path) -> None:

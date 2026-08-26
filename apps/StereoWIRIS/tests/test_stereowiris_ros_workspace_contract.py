@@ -1,12 +1,33 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "run.sh"
+
+
+def _fake_launcher_tree(tmp_path: Path) -> tuple[Path, Path]:
+    repository = tmp_path / "repository"
+    app = repository / "apps" / "StereoWIRIS"
+    app.mkdir(parents=True)
+    runner = app / "run.sh"
+    shutil.copy2(RUNNER, runner)
+    python = repository / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$*\" == *\"sasl_common.operator_runtime\"* ]]; then echo 'common runtime ok'; exit 0; fi\n"
+        "if [[ \"$*\" == *\"-m Workstation\"* ]]; then echo 'Workstation runtime check ok'; exit 0; fi\n"
+        "if [[ \"$1\" == */scripts/check_runtime.py ]]; then echo 'StereoWIRIS runtime check ok'; exit 0; fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    python.chmod(0o755)
+    return repository, runner
 
 
 def test_help_is_dependency_free() -> None:
@@ -37,6 +58,18 @@ def test_runner_uses_only_canonical_stamped_overlay() -> None:
     assert "px4_msgs_ws" not in source
 
 
+def test_runner_uses_only_repository_gui_environment() -> None:
+    source = RUNNER.read_text(encoding="utf-8")
+
+    project_python = '"$SASL_ROOT/.venv/bin/python"'
+    assert project_python in source
+    assert '"$APP_DIR/.venv/bin/python"' not in source
+    assert "Simulation/.venv" not in source
+    assert "python3 python" not in source
+    assert "bootstrap_network_tools.sh" not in source
+    assert "bootstrap_calibration_deps.sh" not in source
+
+
 def test_direct_python_entrypoint_uses_only_canonical_ros_workspace() -> None:
     source = (ROOT / "main.py").read_text(encoding="utf-8")
 
@@ -45,13 +78,14 @@ def test_direct_python_entrypoint_uses_only_canonical_ros_workspace() -> None:
     assert "Path.home()" not in source
 
 
-def test_missing_source_fails_before_network_bootstrap() -> None:
+def test_missing_ros_source_fails_after_common_runtime_gate(tmp_path: Path) -> None:
+    _repository, runner = _fake_launcher_tree(tmp_path)
     env = os.environ.copy()
     env["SASL_ROS_WORKSPACE"] = "/definitely/missing/sasl-workspace"
     env["SASL_MAVLINK_ONLY"] = "0"
     result = subprocess.run(
-        [str(RUNNER), "--check"],
-        cwd=ROOT,
+        [str(runner), "--check"],
+        cwd=runner.parent,
         env=env,
         check=False,
         text=True,
@@ -61,16 +95,20 @@ def test_missing_source_fails_before_network_bootstrap() -> None:
 
     assert result.returncode == 2
     assert "canonical px4_msgs source is missing" in result.stderr
-    source = RUNNER.read_text(encoding="utf-8")
-    assert source.index("require_canonical_px4_msgs_overlay") < source.index("bootstrap_network_tools.sh")
+    assert "common runtime ok" in result.stdout
+    source = runner.read_text(encoding="utf-8")
+    assert source.index('"$PYTHON_BIN" -m sasl_common.operator_runtime') < source.index(
+        'source /opt/ros/humble/setup.bash'
+    )
 
 
-def test_workstation_check_skips_ros_overlay_bootstrap() -> None:
+def test_workstation_check_skips_ros_overlay_bootstrap(tmp_path: Path) -> None:
+    _repository, runner = _fake_launcher_tree(tmp_path)
     env = os.environ.copy()
     env["SASL_ROS_WORKSPACE"] = "/definitely/missing/sasl-workspace"
     result = subprocess.run(
-        [str(RUNNER), "--check", "--ui", "workstation"],
-        cwd=ROOT,
+        [str(runner), "--check", "--ui", "workstation"],
+        cwd=runner.parent,
         env=env,
         check=False,
         text=True,
@@ -83,8 +121,8 @@ def test_workstation_check_skips_ros_overlay_bootstrap() -> None:
     assert "canonical px4_msgs source is missing" not in result.stderr
 
     result_reordered = subprocess.run(
-        [str(RUNNER), "--ui", "workstation", "--check"],
-        cwd=ROOT,
+        [str(runner), "--ui", "workstation", "--check"],
+        cwd=runner.parent,
         env=env,
         check=False,
         text=True,
@@ -94,13 +132,14 @@ def test_workstation_check_skips_ros_overlay_bootstrap() -> None:
     assert result_reordered.returncode == 0, result_reordered.stderr
 
 
-def test_mavlink_only_check_skips_ros_overlay_bootstrap() -> None:
+def test_mavlink_only_check_skips_ros_overlay_bootstrap(tmp_path: Path) -> None:
+    _repository, runner = _fake_launcher_tree(tmp_path)
     env = os.environ.copy()
     env["SASL_ROS_WORKSPACE"] = "/definitely/missing/sasl-workspace"
     env["SASL_MAVLINK_ONLY"] = "1"
     result = subprocess.run(
-        [str(RUNNER), "--check"],
-        cwd=ROOT,
+        [str(runner), "--check"],
+        cwd=runner.parent,
         env=env,
         check=False,
         text=True,

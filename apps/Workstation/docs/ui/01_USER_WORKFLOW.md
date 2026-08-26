@@ -25,7 +25,7 @@ StereoWIRIS shall not assume only one subsystem is used at a time. Typical work 
 10. GNSS/RTK verification
 11. Detection configuration/operation
 12. Diagnostics and fault investigation
-13. Saved-session review and analysis
+13. Type-owned data review and later assembly
 
 These are user jobs, not top-level tabs.
 
@@ -45,12 +45,16 @@ Success: required devices for intended task are connected and providing expected
 
 Field sequence for the Workstation implementation:
 0. Complete Pixhawk Sensor Calibration in QGC outside Workstation.
-1. Connect and verify WIRIS, Pixhawk P1/P2, and Base GNSS.
+1. Connect and verify WIRIS, Pixhawk P1/P2, and Base GNSS. P1/P2 must match expected MAVLink
+   system IDs 1/2 and remain in `QUALIFYING` until HEARTBEAT+ATTITUDE stay continuously fresh for
+   10 minutes; only then may their status become `LIVE`.
 2. Start Base Survey-in or NTRIP. For NTRIP, configure the provider's caster hostname,
    port, mountpoint, TLS setting, GGA policy, and credential environment-variable names in
    `Settings > GNSS`; new field settings use the NGII RTS2 Base-assisted profile.
 3. Set/check WIRIS time synchronization.
-4. Verify RTCM delivery to Left/Right Pixhawk and record numeric `fix_type`; do not assume every condition reaches `RTK_FIXED=6`.
+4. Verify RTCM delivery to each currently eligible Left/Right Pixhawk and record numeric `fix_type`;
+   do not assume every condition reaches `RTK_FIXED=6`. A stalled side must show RTCM blocked while
+   the other side continues independently.
 5. Physically align the P1–P2 baseline.
 6. Physically rotate the assembly to align Roll/Pitch/Yaw.
 7. Repeat steps 5–6 with a new evidence sample.
@@ -72,6 +76,15 @@ that calibration's owned parameters through the connected firmware's `param rese
 the action requires a disarmed vehicle and refreshes the readback after completion. Board
 rotation and `SENS_BOARD_Z_OFF` remain manual parameters and intentionally have no calibration
 reset button.
+
+P1/P2 Ethernet MAVLink state is evidence-driven: `ATTITUDE STALE` retains current heartbeat/other
+traffic and permits only a bounded ATTITUDE request; `ETH MAVLINK RX STALLED` means all expected
+system traffic has been silent for 10 seconds and blocks RTCM/commands without cycling the host
+socket. Recovery is available only on the named stalled side. `Find USB` must have produced one
+fresh unique heartbeat mapping (P1=sysid1, P2=sysid2); the operator confirms side/device/sysid and
+the worker immediately revalidates it before one reboot command. Missing/ambiguous identity or an
+active Measurement/save/finalization yields manual named-side power-cycle guidance. A sent reboot
+is not success: Ethernet must enter `RECOVERING` and pass another 10-minute qualification.
 
 `CAL_MAG*_PRIO` is displayed with the PX4 semantic levels `Uninitialized (-1)`,
 `Disabled (0)`, `Min (1)`, `Low (25)`, `Medium (50)`, `High (75)`, and `Max (100)`.
@@ -135,7 +148,7 @@ The Calibration workspace accepts an arbitrary supported visible zoom in `Select
 can apply it to both cameras, and can query each camera with `GZVV`. Requested and read-back
 values remain separate. A mismatch remains visible as evidence and makes exact operating
 `K,D` inapplicable to derived geometry; it does not prohibit preserving raw camera,
-telemetry, or session evidence.
+telemetry, or Measurement data.
 
 ### Capture HR Still, import, and HR→OZ bridge
 
@@ -143,12 +156,12 @@ The Recording workspace exposes one repeatable `Capture HR Still` action with an
 `Pre`, `Post`, `Checkpoint`, or `Unspecified` purpose. Every press sends `SIHR TRUE`,
 triggers `CPTR` on the left and right cameras, and polls `ICPT` until each camera reports
 completion. The request/result timestamps, left-minus-right request timing, zoom readback,
-SDK responses, and completion state are appended to `<session>/hr_captures.jsonl`.
-A capture failure is evidence and does not block the measurement session.
+SDK responses, and completion state are appended to `capture_events.jsonl`.
+A capture failure is evidence and does not block Measurement.
 
 Capture initially leaves the photos in WIRIS internal storage. After retrieving them by an
 external camera-storage workflow, the operator selects the capture event and explicitly
-imports the left/right files. Workstation copies the exact original bytes into the session
+imports the left/right files. Workstation copies the exact original bytes into the data root
 without image re-encoding, verifies that they decode, and records byte count, SHA-256,
 native resolution, camera side/serial, capture purpose, and import time. Imported HR is
 therefore comparison/PnP evidence, not an automatic replacement for the operating-zoom
@@ -276,34 +289,37 @@ Required visibility:
 - connection/stream
 - FPS
 - selected camera identity
+- requested decoder mode and actual per-side GPU/CPU decoder, including Auto fallback reason
 - recording
 - detection
 - diagnostics
 
 Changing camera parameters should not unnecessarily hide live image.
 
+The field decoder workflow uses Auto by default: start Preview, confirm `GPU · nvh264dec` for both
+sides in Camera Status, and use CAM tooltips/Diagnostics Performance for availability or fallback
+detail. `CPU · avdec_h264 (selected)` is a valid explicit Software choice; `CPU fallback` is a WARN
+that preserves Preview after an NVIDIA failure. YOLO CUDA/CPU and H.264 NVDEC/CPU are separate
+resource statuses.
+
 ## 7. Measurement Operation
 
-The Workstation separates the parent field session from each measurement. The normal operator path is
-`Sessions > Current > Create Session Folder → Measurement > 측정 시작 → 측정 종료`; start creates
-the next child and starts Detection, while stop triggers its automatic save and seal. A sealed child
-leaves the parent open for another `측정 시작`. An optional Pre HR/OZ request lazily creates the
-same draft before Detection instead of requiring a separate New Measurement control. `Close Session` is separate and is available
-only when no child or producer is mutable. The parent ID remains fixed while child IDs advance as
-`m000001`, `m000002`, and so on. A revision adds evidence to one child and does not create another
-Detection interval.
+The normal path is `Measurement > 측정 시작 → 측정 종료`. There is no parent folder, child,
+Finalize, Seal, completeness, or Retry-Save command. The run state is transient:
+`IDLE → QUEUED(optional) → STARTING → RUNNING → STOPPING → IDLE`.
 
-The top-level Session workspace keeps lifecycle and readiness separate. `OPEN` describes the daily
-container; `Evidence collection` and `Valid measurement` are derived operator states for the current
-child. The readiness table contains blockers only. The compact method table always lists all eight
-method categories; missing candidates/profiles remain `BLOCKED` with their required inputs. Clicking
-one method navigates to read-only detail for its blocker, live PX4 body-FRD to world-NED R/P/Y, P1→P2 GNSS NED
-baseline, candidate virtual-FRD/world-NED values, or OpenCV left-to-right RDF `R,t` without merging
-those coordinate contracts.
+Manual record is stopped before Measurement starts and is not resumed. Still capture, camera
+commands, time sync, discovery, and RTSP activation produce `QUEUED`; the start resumes when the
+actual camera owner releases it. Old Session folders and writer failures are never consulted.
+
+The readiness table remains an evidence projection. The compact method table lists all eight method
+categories; missing candidates/profiles remain `BLOCKED` with their required inputs. Clicking one
+method navigates to read-only detail without merging PX4 body-FRD/world-NED, GNSS NED, candidate
+virtual-FRD/world-NED, or OpenCV RDF contracts.
 
 Required visibility:
-- parent session ID/state and child count
-- current measurement ID/state/revision
+- transient Measurement state and generation
+- queued camera-owner reason when present
 - relevant live imagery
 - measurement result and unit
 - validity/quality
@@ -311,16 +327,17 @@ Required visibility:
 - timing/synchronization when relevant
 - RTK/baseline when relevant
 - recording
+- storage state/drop count as non-blocking diagnostics
 
 Distinguish raw/corrected/configured/derived/invalid values.
 
 ## 8. Recording
 
 Required visibility:
-- recording state
-- parent session and current measurement output path
+- Manual/automatic recording state
+- `measurement_data_root` and type-owned paths
 - elapsed time when useful
-- write/save errors
+- per-stream writer error/drop state
 - relevant system state
 
 Before capture, the Recording workspace shows an advisory experiment preflight. The
@@ -333,7 +350,7 @@ preflight also requires a passing physical-alignment result and an explicit fina
 time-sync checkpoint recorded after alignment. `READY`/`BLOCKED` is evidence only and does
 not change the existing recording command.
 
-State candidates: Idle, Starting, Recording, Stopping, Saved, Error.
+State candidates: Idle, Starting, Recording, Stopping, Degraded, Error.
 
 Record command is not proof that data is being written.
 
@@ -344,9 +361,10 @@ frame, profile hash, selection ID, and effective pair boundary; an unprefixed le
 continues to mean the active calculation. Pixhawk-baseline rows retain this dual-profile
 state as explicitly not-applicable rather than mixing GNSS geometry with checkerboard R,t.
 
-The Recording workspace includes a PX4 ULog evidence group for P1, P2, and Target Drone.
-Manual imports copy exact bytes into the session, validate ULog framing/size/SHA-256, and
-record source role, ownership claim, runtime identity, and relative path. Automatic logger
+The Data Capture workspace includes a PX4 ULog group for P1, P2, and Target Drone.
+Manual imports copy exact bytes into the data root using a creation-time no-replace filename,
+validate ULog framing/size/SHA-256, and record source role, ownership claim, runtime identity, and
+relative path. Automatic logger
 capture is only allowed through an injected adapter that proves the same boot/connection,
 correlated command receipt, post-command status, and remote log path; pre-existing or
 ambiguous loggers are never stopped. UAM target ULog is normally `DEFERRED` until the
@@ -401,11 +419,14 @@ Sequence:
 
 Prefer factual messages such as `RTSP port unreachable` over vague `camera unhealthy` unless rule-backed.
 
-## 15. Saved Session Review
+## 15. Data Review and Assembly
 
-Open session/measurement → inspect metadata/samples/plots → compare sources → export/analyze.
-Saved-review identity is `(session_id, measurement_id)` so equal artifact names in sibling
-measurements cannot overwrite one another.
+Open `Data > Status` to inspect fixed stream paths, writer state, last write, and drops. Use the
+file manager or an external analysis tool to join structured rows by UTC/source time and transient
+generation. Binary names carry creation time and explicit UTC offset. Workstation does not generate
+Parquet or `review.xlsx` automatically.
+
+Legacy `recordings/` trees are file-manager-only and are not scanned or recovered.
 
 ## 16. Workflow Priority
 
@@ -413,7 +434,7 @@ Priority A: startup/readiness, live observation, measurement, recording, diagnos
 
 Priority B: hardware connection, camera config, PX4, GNSS/RTK, detection config.
 
-Priority C: calibration, saved-session analysis, advanced configuration.
+Priority C: calibration, later data analysis, advanced configuration.
 
 ## 17. Context Preservation Rules
 
@@ -424,9 +445,12 @@ Priority C: calibration, saved-session analysis, advanced configuration.
 5. Command does not imply successful state.
 6. Advanced workflows may replace Workspace but Global Status/Diagnostics remain available.
 
-## 18. Representative Session
+## 18. Representative Run
 
-Launch → external QGC calibration → internal camera calibration → connect/verify WIRIS, Pixhawk, Base GNSS → Survey-in/NTRIP → initial WIRIS sync → RTCM/fix_type check → physical baseline alignment → physical R/P/Y alignment → repeat evidence → final sync check/resync → confirm YOLO/measurement settings → measure → save → review.
+Launch → external QGC calibration → internal camera calibration → verify Data root → connect/verify
+WIRIS, Pixhawk, Base GNSS → Survey-in/NTRIP → WIRIS sync → RTCM/fix_type check → physical/optical
+Alignment → confirm P1/P2 10-minute qualification → confirm YOLO/Measurement settings → measure → stop → immediately repeat or wait →
+assemble fixed streams later.
 
 ## 19. Failure-Oriented Example
 

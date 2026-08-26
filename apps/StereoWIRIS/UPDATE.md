@@ -1,5 +1,92 @@
 # 업데이트 기록
 
+## v2.3.1 — 2026-08-26 — WIRIS preview RTP gap 손상 차단
+
+- 변경:
+  - 같은 SSRC의 16-bit RTP forward-sequence gap을 depay 입력에서 계측한다.
+  - gap 이후 decoder 종류와 무관하게 output을 BGR/preview queue 전에 latch 차단하고,
+    `h264parse`가 확인한 다음 clean non-delta/non-corrupt intra AU PTS부터 같은 pipeline을
+    재개한다. Auto의 `avdec_h264` 전환은 first-frame/stall/bus health failure에만 유지하고
+    명시적 NVIDIA는 계속 fail-closed다.
+  - primary parsed AU의 PTS 누락, `DISCONT`, `CORRUPTED`도 recorder/decoder 전에 drop하고
+    clean non-delta intra부터 encoded/decoded branch를 함께 재개한다. 장기 MP4의
+    `Buffer has no PTS` mux error와 손상 reference chain의 GUI 방출을 같은 경계에서 차단한다.
+  - first-frame/stall health timeout은 실장비의 clean-intra recovery를 오판하지 않도록 각각
+    30초로 두고, gap/recovery 상태에서는 watchdog 판정을 보류한다.
+  - recording 시작의 worker 교체 직후 새 GStreamer pipeline만 PLAYING 전환에 실패하는 경합은
+    0.5/1/2/4초 bounded retry한다. 중지 요청은 대기를 취소하고 다른 오류는 재시도하지 않는다.
+  - recording path의 `video/` 부모를 worker 시작 전에 생성하고, shell용 `shlex.quote()` 대신
+    GStreamer double-quoted property escaping을 사용한다. 한글 `바탕화면` 경로가 작은따옴표를
+    실제 파일명으로 포함해 filesink ENOENT를 내던 확정 원인을 제거했다.
+  - WIRIS timestamp/sample layout에서 `mdat` fragment box를 H.264 NAL로 오인시킨
+    `mp4mux fragment-duration=1000`을 제거했다. direct H.264 copy와 정상 EOS 계약은 유지하며
+    실제 앱 Left/Right MP4의 ffprobe 및 strict software full decode가 exit 0이다.
+  - Legacy startup의 미완료 spool 자동 복구와 intrinsics 자동 적용을 제거했다. 기존 파일과
+    명시적 recovery/manual load utility는 보존하며 새 session은 기록 버튼 시점에만 만든다.
+  - RTP gap status는 5초 누적 요약으로 제한해 GUI log 폭주를 방지한다.
+  - 검증용 `STEREO_PREVIEW_IDENTITY_LOG`에 producer RGB/process queue/deep-copied QImage
+    SHA-256, size/stride/bytesPerLine, sequence/drop/reorder를 기록한다.
+- 이유:
+  - WIRIS RTP omission 뒤 NVIDIA가 corrupt flag 없는 concealment frame을 출력해 GUI에
+    macroblock과 이전-frame 잔상을 보였기 때문이다.
+  - 기록 시작 고착은 decoder나 RTSP가 아니라 filesink location serialization의 literal quote와
+    누락된 parent directory 때문이었고, 저장 파일 strict-decode 실패에는 fragmented MP4 sample
+    offset 손상이 별도로 존재했기 때문이다.
+- 확인:
+  - `tests/test_yolo_stream.py` 집중 회귀 `63 passed`.
+  - startup/session/video-parent 집중 PyQt 회귀 `4 passed`; 별도 startup/recovery 묶음 `5 passed`.
+  - 비-GUI StereoWIRIS tests `408 passed`.
+  - session `20260826_154943_612706709`: 실제 앱 Left 501,460,047 bytes/71.2922초와
+    Right 429,074,882 bytes가 ffprobe 및 `ffmpeg -xerror` full decode exit 0.
+- 남은 검증:
+  - 최신 930초 motion run에서 macroblock 대신 clean-intra 대기 freeze가 Left 23회/81.633초,
+    Right 15회/78.578초 발생해 실시간 responsiveness는 FAIL이다.
+  - TCP late packet 무제한 보존은 약 108초에 3.2초 지연이 누적돼 원복했다.
+  - 다음 검증은 별도 승인 후 bitrate 0을 유지한 QP `1 -> 5` 일시 A/B와 즉시 원복이다.
+
+## v2.3.0 — 2026-08-26 — 공식 GStreamer 운영 런타임 통합
+
+- 변경:
+  - 두 운영 앱의 Python을 저장소 루트 `.venv` 하나로 고정하고, 공식 생성 방식을
+    `python3 -m venv --system-site-packages .venv`로 정했다.
+  - Ubuntu system dependency manifest와 read-only deployment/execution doctor를 추가했다.
+  - launcher의 apt/pip 자동 설치와 앱/Simulation/system Python fallback, 수동 `.pth` 지원을 제거했다.
+  - Gst/GstRtp와 필수 pipeline element의 factory find/make, NVIDIA driver, requested/effective
+    decoder를 검사한다. Auto만 software 전환을 허용하고 NVIDIA는 fail-closed한다.
+  - camera multiprocessing child를 부모 `sys.executable`에 고정했다.
+- 이유:
+  - pip와 Ubuntu native ABI가 섞인 비재현 환경과 설정과 다른 silent decoder fallback을 없애기 위해서다.
+- 확인:
+  - 공통 runtime/launcher/decoder 집중 테스트 `93 passed`.
+  - Workstation runtime/recovery 집중 테스트 `21 passed`.
+  - deployment doctor는 현재 PC의 `python3.10-venv` 누락을 exit 1로 검출했다.
+- 남은 위험:
+  - 실제 좌/우 WIRIS RTSP를 NVIDIA/software로 지속 실행하는 hardware/manual 검증이 필요하다.
+
+## v2.2.7 — 2026-08-25 — 현장 recorder/MAVLink/NTRIP/preview 안정화
+
+- Legacy 기록 시작의 hidden MAG PARAM readback을 제거하고 마지막 수동 cache만 증거로 사용한다.
+- camera child parent-death guard, recorder 종료 barrier, MP4 검증과 latest-only preview를 적용한다.
+- PX4 Ethernet은 `MAV_2_CONFIG=1000` 단일 owner만 사용하고 exact duplicate packet은 downstream 전에 무시한다.
+- NTRIP direct credential과 optional keyring을 Legacy에 추가하며 password는 settings/evidence에 기록하지 않는다.
+- RTSP 기본을 TCP+Auto로 맞추고 `nvh264dec` first-frame/stall 실패를 `avdec_h264`로 전환한다.
+
+## v2.2.6 — 2026-08-25 — Legacy WIRIS STUS 좌측 ACK 기반 순차 전송
+
+- 변경:
+  - 양쪽 STUS를 병렬로 호출하지 않고 왼쪽 → 오른쪽 순서로 직렬 전송한다.
+  - 왼쪽 카메라의 STUS `OK` 응답을 확인한 뒤에만 오른쪽 STUS를 전송한다. 왼쪽 응답 실패·빈 응답·예외 시 오른쪽 명령은 전송하지 않는다.
+  - 오른쪽 STUS payload의 UTC는 오른쪽 제어 TCP 호출 직전 시각과 해당 카메라 RTT/2 보정으로 계산한다.
+  - 전송 순서와 왼쪽 ACK 결과를 `_last_wiris_pc_utc_sync` 및 Time 탭 상태에 기록한다.
+- 이유:
+  - 두 카메라의 명령 도착/처리 순서를 명확히 하고, 왼쪽 시간 동기화 확인 이후 오른쪽 시간을 설정하기 위해서다.
+- 확인:
+  - STUS 순서·왼쪽 ACK 성공/실패 집중 회귀 — `6 passed`.
+  - Legacy 전체 pytest(`QT_QPA_PLATFORM=offscreen python3 -m pytest -q`) — `628 passed, 2 warnings`.
+  - `python3 -m compileall -q wiris_stereo_distance tests` 및 `git diff --check` 통과.
+- 남은 위험:
+  - 실제 WIRIS 장비에서의 `OK` 응답 지연, TCP timeout, 카메라별 RTT 변동은 현장 장비로 추가 확인해야 한다.
+
 ## Alignment 입력·카메라 레이아웃·optical pose 후보 — 2026-08-14
 
 - Alignment 상단의 `Device prerequisites`를 큰 고정 게이트 카드에서 읽기 전용 요약과 접을 수 있는 상세 snapshot으로 바꿨다. 실제 입력 소유자는 `Devices`이며, 선택한 method가 요구하는 입력만 owner가 판정한다.

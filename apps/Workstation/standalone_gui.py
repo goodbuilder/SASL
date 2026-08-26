@@ -283,11 +283,14 @@ from Workstation.workstation_core.yolo_stream import (
     DECODER_AUTO,
     DECODER_NVIDIA,
     DECODER_SOFTWARE,
+    NVIDIA_H264_DECODER,
+    SOFTWARE_H264_DECODER,
     DEFAULT_PREVIEW_DISPLAY_RATE_HZ,
     DEFAULT_RTSP_LATENCY_MS,
     DEFAULT_YOLO_WEIGHTS,
     build_gst_pipeline_text,
     decoder_candidates,
+    default_yolo_max_rate_hz,
     STREAM_BACKEND_GSTREAMER,
     STREAM_BACKEND_OPENCV,
     STREAM_BACKEND_OPENCV_AUTO,
@@ -295,6 +298,7 @@ from Workstation.workstation_core.yolo_stream import (
     RTSP_TRANSPORT_TCP,
     RTSP_TRANSPORT_UDP,
     normalize_decoder_mode,
+    recording_integrity_contract,
     normalize_rtsp_transport,
     normalize_stream_backend,
 )
@@ -399,7 +403,7 @@ RECORDING_KEY_CACHE_LIMIT = 1024
 # independent and continues to retry an interrupted live RTSP endpoint.
 CAMERA_AUTO_CONNECT_MAX_ATTEMPTS = 1
 CAMERA_AUTO_CONNECT_RETRY_DELAY_MS = 1_500
-RTSP_STREAM_CHECK_TIMEOUT_S = 12.0
+RTSP_STREAM_CHECK_TIMEOUT_S = 30.0
 
 
 def _format_visible_zoom_fx_estimates() -> str:
@@ -431,6 +435,7 @@ from Workstation.workstation_core.runtime_camera_status import (
     format_signed_ms_compact,
     format_unix_timestamp_compact,
     infer_runtime_camera_timestamp_reference,
+    read_nvidia_runtime_identity,
 )
 
 
@@ -732,6 +737,7 @@ class WirisControlCheckWorker(QtCore.QObject):
 
 from Workstation.device_runtime_workers import (
     PixhawkUsbDiscoveryWorker,
+    PixhawkUsbRecoveryWorker,
     CameraNetworkDiscoveryWorker,
     CameraNetworkAddressApplyWorker,
     InterfaceStatusWorker,
@@ -775,6 +781,10 @@ from Workstation.app_lifecycle_controller import (
     APP_LIFECYCLE_METHODS,
     AppLifecycleController,
 )
+from Workstation.data_storage_controller import (
+    DATA_STORAGE_CONTROLLER_METHODS,
+    DataStorageController,
+)
 from Workstation.camera_time_sync_controller import (
     CAMERA_RTCP_MAX_PC_OFFSET_S,
     CAMERA_RTCP_PAIR_MAX_DELTA_S,
@@ -797,9 +807,9 @@ from Workstation.camera_stream_controller import (
     CAMERA_STREAM_LIFECYCLE_METHODS,
     CameraStreamLifecycleController,
 )
-from Workstation.measurement_package_controller import (
-    MEASUREMENT_PACKAGE_METHODS,
-    MeasurementPackageController,
+from Workstation.measurement_run_controller import (
+    MEASUREMENT_RUN_METHODS,
+    MeasurementRunController,
 )
 
 
@@ -863,6 +873,7 @@ from Workstation.recording_controller import (
 from Workstation.run_evidence_controller import (
     RUN_EVIDENCE_CONTROLLER_METHODS,
     RunEvidenceController,
+    report_recoverable_persistence_failure,
 )
 from Workstation.optical_pose_controller import (
     OPTICAL_POSE_CONTROLLER_METHODS,
@@ -1002,6 +1013,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     calibration_capture_event = QtCore.pyqtSignal(object)
     calibration_diagnostics_changed = QtCore.pyqtSignal(object)
     measurement_package_changed = QtCore.pyqtSignal(object)
+    _threadsafe_log_requested = QtCore.pyqtSignal(str)
 
     def event(self, event: QtCore.QEvent) -> bool:  # noqa: N802 - Qt override.
         # A number of embedded/test workflows use deleteLater() instead of a
@@ -1030,6 +1042,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         settings_path: str | Path | None = None,
     ) -> None:
         super().__init__()
+        # Some runtime callbacks (notably the NTRIP GGA provider) execute in a
+        # device worker thread.  Route their log requests back through the
+        # panel's owning Qt thread before touching any QPlainTextEdit.
+        self._threadsafe_log_requested.connect(
+            self._log,
+            QtCore.Qt.QueuedConnection,
+        )
         self.app_root = Path(APP_ROOT if app_root is None else app_root).expanduser().resolve()
         self.settings_path = Path(
             self.app_root / WORKSTATION_SETTINGS_PATH.name
@@ -1146,6 +1165,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.yolo_enabled = False
         self._camera_start_request_generation = 0
         self._pending_camera_start: tuple[bool, bool] | None = None
+        self._camera_stop_watchdog_generation = 0
         self.camera_auto_detect_thread: QtCore.QThread | None = None
         self.camera_auto_detect_worker: CameraAutoDetectWorker | None = None
         self._camera_auto_connect_attempt = 0
@@ -1189,6 +1209,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.interface_status_worker: InterfaceStatusWorker | None = None
         self.pixhawk_usb_discovery_thread: QtCore.QThread | None = None
         self.pixhawk_usb_discovery_worker: PixhawkUsbDiscoveryWorker | None = None
+        self.pixhawk_usb_recovery_thread: QtCore.QThread | None = None
+        self.pixhawk_usb_recovery_worker: PixhawkUsbRecoveryWorker | None = None
+        self.pixhawk_usb_identity_evidence: list[dict[str, object]] = []
+        self.pixhawk_usb_recovery_status: dict[str, dict[str, object]] = {}
         self.pixhawk_host_ip_discovery_thread: QtCore.QThread | None = None
         self.pixhawk_host_ip_discovery_worker: PixhawkHostIpDiscoveryWorker | None = None
         self.pixhawk_connection_thread: QtCore.QThread | None = None
@@ -1231,6 +1255,19 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_network_status_line = ""
         self.gnss_network_last_error = ""
         self.gnss_network_reconnect_count = 0
+        # The password widgets carry a masked deployment fallback, but it is
+        # not an explicit operator choice until textChanged fires or the
+        # Settings workspace hands over an edited value.  Credential
+        # resolution uses this marker so a keyring secret can take priority.
+        self._gnss_ntrip_session_password_explicit = False
+        # Set whenever _gnss_gga_provider() returns None instead of a
+        # sentence (e.g. no fresh rover position for the configured GGA
+        # policy); cleared on the next sentence it actually produces. A VRS
+        # caster silently withholds RTCM without periodic GGA, so this is
+        # the only signal that distinguishes "transport connected but caster
+        # is waiting on GGA" from a genuinely dead link.
+        self._gnss_last_gga_skip_reason = ""
+        self._gnss_last_gga_skip_monotonic_s: float | None = None
         self.gnss_network_rtcm_parser = Rtcm3StreamParser()
         self.gnss_coordinate_samples: deque[GnssCoordinateSample] = deque(maxlen=2400)
         # Latest Base position is a WGS84 geodetic sample used only for the
@@ -1306,13 +1343,15 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         # automatic measurement lifecycle. Manual/advanced evidence capture
         # remains compatible with the existing explicit session controls.
         self._automatic_session_recording = False
+        self._manual_recording_active = False
+        self._pending_measurement_run_start = False
         self._recording_mode = "manual"
         # The Workstation UI uses the explicit Begin Session -> Detection ->
         # Finalize package contract.  Bare controller test doubles and legacy
         # non-UI callers omit this flag and retain the automatic-session
         # compatibility path.
-        self._measurement_package_explicit_lifecycle = True
-        self._measurement_session_hierarchy_enabled = True
+        self._measurement_package_explicit_lifecycle = False
+        self._measurement_session_hierarchy_enabled = False
         self._measurement_session = None
         self._measurement_session_id = ""
         self._measurement_session_state = "IDLE"
@@ -1323,7 +1362,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
         self._measurement_package = None
         self._measurement_package_state = "IDLE"
-        self._measurement_package_detail = "Begin Session to collect evidence"
+        self._measurement_package_detail = "Ready for Measurement"
         self._measurement_package_error = ""
         self._measurement_package_detection_started = False
         self._measurement_package_detection_completed = False
@@ -1362,6 +1401,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.recording_origin_gps: GpsSnapshot | None = None
         self.recording_reference_baseline_ned_m: tuple[float, float, float] | None = None
         self._recording_pair_row_index: dict[tuple[object, ...], int] = {}
+        # In-flight native-frame completions are joined by their unique request
+        # ID, independently of the bounded detection-pair lookup cache.
+        self._recording_pending_native_request_rows: dict[
+            str, tuple[str, int]
+        ] = {}
         self.video_recording_enabled = False
         self.video_recording_paths: dict[str, Path] = {}
         self._last_distance_history_key: tuple[object, ...] | None = None
@@ -1398,6 +1442,19 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "left": None,
             "right": None,
         }
+        self.decoder_fallback_reasons: dict[str, str] = {"left": "", "right": ""}
+        self.decoder_selection_status: dict[str, object] = {
+            "requested": str(self.settings.rtsp_decoder or DECODER_AUTO),
+            "effective": None,
+            "candidates": (),
+            "allowed": None,
+            "degraded": False,
+            "reason": "not probed for this process",
+            "nvidia_available": None,
+        }
+        self.nvidia_runtime_identity = read_nvidia_runtime_identity()
+        self._runtime_decoder_override: str | None = None
+        self._last_logged_camera_states: dict[str, tuple[str, float]] = {}
         self.pixhawk_attitude_times = {
             "left": deque(maxlen=240),
             "right": deque(maxlen=240),
@@ -1779,6 +1836,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.decoder_combo.addItem("NVIDIA", DECODER_NVIDIA)
         self.decoder_combo.addItem("Software (avdec_h264)", DECODER_SOFTWARE)
         self._set_combo_data(self.decoder_combo, self.settings.rtsp_decoder)
+        self.decoder_combo.currentIndexChanged.connect(self._handle_decoder_mode_changed)
         self.stream_backend_combo = QtWidgets.QComboBox()
         self.stream_backend_combo.addItem("GStreamer", STREAM_BACKEND_GSTREAMER)
         self.stream_backend_combo.addItem("OpenCV/FFmpeg", STREAM_BACKEND_OPENCV)
@@ -3174,11 +3232,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         runtime_controls.setHorizontalSpacing(6)
         runtime_controls.setVerticalSpacing(6)
         runtime_controls.addWidget(self.start_button, 0, 0)
-        self.record_button = QtWidgets.QPushButton("세션 기록 시작")
+        self.record_button = QtWidgets.QPushButton("수동 기록 시작")
         self.record_button.clicked.connect(self.toggle_session_recording)
         self.clear_history_button = QtWidgets.QPushButton("그래프/기록 초기화")
         self.clear_history_button.clicked.connect(self.clear_distance_history)
-        self.record_button.setText("세션 기록 시작")
+        self.record_button.setText("수동 기록 시작")
         self.clear_history_button.setText("그래프/기록 초기화")
         runtime_action_buttons = (
             self.start_button,
@@ -3295,23 +3353,23 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         triangulation_quality_layout.addWidget(point_group)
         self._clear_triangulation_quality("3D ray triangulation 대기 중")
 
-        save_group = QtWidgets.QGroupBox("세션 파일 / 설정")
+        save_group = QtWidgets.QGroupBox("데이터 / 설정")
         save_form = QtWidgets.QGridLayout(save_group)
-        self.save_history_button = QtWidgets.QPushButton("세션 파일 저장")
+        self.save_history_button = QtWidgets.QPushButton("데이터 flush")
         self.save_history_button.clicked.connect(self.save_distance_history_csv)
         self.save_history_button.setToolTip(
-            "현재 측정을 canonical JSONL 원본과 derived Parquet으로 확정합니다. "
-            "review.xlsx는 세션 종료 시 갱신됩니다."
+            "백그라운드 append writer에 flush를 요청합니다. "
+            "저장 성공 여부는 다음 측정 시작을 차단하지 않습니다."
         )
         self.save_settings_button = QtWidgets.QPushButton("전체 설정 저장")
         self.save_settings_button.clicked.connect(self.save_current_settings_from_ui)
-        self.save_history_button.setText("세션 파일 저장")
+        self.save_history_button.setText("데이터 flush")
         self.save_settings_button.setText("전체 설정 저장")
         self.session_summary_label = QtWidgets.QLabel("아직 기록된 매칭 프레임쌍이 없습니다.")
         self.session_summary_label.setObjectName("statusStrip")
         self.session_summary_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         self.session_summary_label.setWordWrap(True)
-        self.recording_status_label = QtWidgets.QLabel("세션 기록: 중지")
+        self.recording_status_label = QtWidgets.QLabel("데이터 기록: 중지")
         self.recording_status_label.setObjectName("statusStrip")
         self.recording_status_label.setWordWrap(True)
         self.recording_status_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
@@ -3320,8 +3378,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         save_form.addWidget(self.session_summary_label, 1, 0, 1, 2)
         save_form.addWidget(self.recording_status_label, 2, 0, 1, 2)
         save_layout.addWidget(save_group)
+        self.save_history_button.hide()
 
-        self.recording_table_group = QtWidgets.QGroupBox("저장될 세션 review.xlsx 미리보기")
+        self.recording_table_group = QtWidgets.QGroupBox("현재 기록 메모리 미리보기")
         recording_table_layout = QtWidgets.QVBoxLayout(self.recording_table_group)
         self.recording_sheet_tabs = QtWidgets.QTabWidget()
         self.recording_sheet_tabs.setDocumentMode(True)
@@ -3367,7 +3426,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 LifecycleStep("stop-drone-telemetry", lambda: self._shutdown_stop_drone_telemetry()),
                 LifecycleStep("stop-runtime-workers", lambda: self.stop_all(wait=False)),
                 LifecycleStep("stop-auxiliary-workers", lambda: self._shutdown_stop_auxiliary_workers()),
-                LifecycleStep("wait-session-save", lambda: self._wait_for_session_save()),
+                LifecycleStep(
+                    "close-measurement-data-writer",
+                    lambda: self.close_workstation_data(timeout_s=0.25),
+                ),
                 LifecycleStep("save-settings", lambda: self._shutdown_save_settings()),
             ]
         )
@@ -3535,7 +3597,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.start_button.setText("YOLO 측정 중지" if self.yolo_enabled else "YOLO 측정 시작")
         self._set_button_role(self.start_button, "danger" if self.yolo_enabled else "primary")
 
-        self.record_button.setText("세션 기록 중지" if self._session_recording_active() else "세션 기록 시작")
+        self.record_button.setText("수동 기록 중지" if self._session_recording_active() else "수동 기록 시작")
         self._set_button_role(self.record_button, "danger" if self._session_recording_active() else "success")
 
         connected_mavlink_sides = self._mavlink_open_sides()
@@ -3806,8 +3868,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.distance_label: "현재 거리 추정값, 계산 방식, 동기화 품질, 경고를 자세히 표시합니다.",
             self.start_button: "YOLO 검출과 3D 거리 측정을 시작하거나, 측정 중이면 Pixhawk 연결은 유지한 채 카메라 Preview로 돌아갑니다.",
             self.record_button: (
-                "세션 기록을 시작하거나 중지합니다. 켜면 좌/우 영상 MP4와 측정·카메라·"
-                "Pixhawk·GNSS 타임라인을 같은 session id에 기록합니다."
+                "측정 밖에서 수동 기록을 시작하거나 중지합니다. 좌/우 MP4는 "
+                "생성 시각 파일명으로 저장되고, 구조화 데이터는 유형별 JSONL에 append됩니다."
             ),
             self.clear_history_button: "거리 그래프와 아직 저장하지 않은 메모리 기록을 지웁니다.",
             self.runtime_distance_graph_group: "baseline_center_frd Forward/Right/Down/Range 이력 그래프 영역을 접거나 펼칩니다.",
@@ -3817,10 +3879,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "왼쪽 클릭: 점의 Forward/Right/Down과 midpoint 기준 Range를 표시합니다.\n"
                 "오른쪽 클릭: 해당 점을 삭제합니다."
             ),
-            self.save_history_button: "현재 측정을 typed Parquet과 context.json으로 확정하고 세션 통합 review.xlsx를 갱신합니다.",
+            self.save_history_button: "유형별 append writer에 flush를 요청합니다.",
             self.save_settings_button: "현재 내부 파라미터 경로와 전체 런타임 설정을 저장합니다.",
-            self.recording_status_label: "메모리 내 세션 기록 상태와 매칭 프레임쌍 수입니다.",
-            self.recording_sheet_tabs: "저장될 세션 review.xlsx의 주요 시트 구성으로 현재 기록을 미리 보여줍니다.",
+            self.recording_status_label: "메모리 기록, 매칭 프레임쌍, append writer 상태입니다.",
+            self.recording_sheet_tabs: "현재 실행에서 수집된 기록을 미리 보여줍니다.",
             self.recording_sample_detail: "선택한 매칭 프레임쌍의 전체 내부 기록 필드를 표시합니다.",
             self.wiris_log: "WIRIS, 카메라 Preview 연결, 보정, 시간 확인 메시지 로그입니다.",
             self.camera_yolo_log: "YOLO, 거리 측정, 저장 메시지 로그입니다.",
@@ -4584,6 +4646,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_ntrip_password_edit = QtWidgets.QLineEdit(DEFAULT_NTRIP_SESSION_PASSWORD)
         self.gnss_ntrip_password_edit.setEchoMode(QtWidgets.QLineEdit.Password)
         self.gnss_ntrip_password_edit.setPlaceholderText("NTRIP password")
+        self.gnss_ntrip_password_edit.textChanged.connect(
+            lambda _text: setattr(
+                self,
+                "_gnss_ntrip_session_password_explicit",
+                True,
+            )
+        )
         self.gnss_ntrip_remember_checkbox = QtWidgets.QCheckBox("Remember password securely")
         self.gnss_ntrip_credential_status_label = QtWidgets.QLabel("--")
         self.gnss_ntrip_forget_password_button = QtWidgets.QPushButton("Forget saved password")
@@ -4906,9 +4975,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "max_frame_bytes": 0,
             "message_types": {},
             "injection": {
-                "left": {"frames": 0, "bytes": 0, "packets": 0, "fail": 0},
-                "right": {"frames": 0, "bytes": 0, "packets": 0, "fail": 0},
-                "drone": {"frames": 0, "bytes": 0, "packets": 0, "fail": 0},
+                "left": {"frames": 0, "bytes": 0, "packets": 0, "fail": 0, "blocked_stall": 0},
+                "right": {"frames": 0, "bytes": 0, "packets": 0, "fail": 0, "blocked_stall": 0},
+                "drone": {"frames": 0, "bytes": 0, "packets": 0, "fail": 0, "blocked_stall": 0},
             },
         }
 
@@ -6787,22 +6856,29 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         weights_path = resolve_workstation_data_path(
             self.weights_edit.text().strip() or DEFAULT_YOLO_WEIGHTS
         )
+        device = self.device_edit.text().strip()
         return {
             "weights_path": str(weights_path),
-            "device": self.device_edit.text().strip(),
+            "device": device,
             "input_size": self.input_size_spin.value(),
             "conf_threshold": self.conf_spin.value(),
             "iou_threshold": self.iou_spin.value(),
             "class_gate_enabled": self.yolo_gate_class_checkbox.isChecked(),
             "class_gate": self.yolo_gate_class_edit.text().strip(),
-            "max_rate_hz": 0.0,
+            "max_rate_hz": default_yolo_max_rate_hz(device),
             "display_rate_hz": DEFAULT_PREVIEW_DISPLAY_RATE_HZ,
             "preview_max_width": self.preview_width_spin.value(),
             "rtsp_latency_ms": self.rtsp_latency_spin.value(),
             "event_queue_size": self.yolo_event_queue_size_spin.value(),
             "frame_queue_size": self.yolo_frame_queue_size_spin.value(),
-            "decoder": self.decoder_combo.currentData(),
+            "decoder": self._runtime_decoder_override or self.decoder_combo.currentData(),
             "stream_backend": self.stream_backend_combo.currentData(),
+            "rtsp_reconnect_policy": str(
+                self._workstation_setting(
+                    "rtsp_reconnect_policy",
+                    getattr(self.settings, "rtsp_reconnect_policy", "manual"),
+                )
+            ),
             "rtsp_transport": (
                 self._camera_sync_transport_override
                 or self.rtsp_transport_combo.currentData()
@@ -6821,15 +6897,18 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         }
 
     def _recording_session_dir(self, stamp: str | None = None) -> Path:
-        selected = stamp or self.recording_session_id
-        root = self._measurement_session_dir(selected)
-        if (
-            bool(getattr(self, "_measurement_session_hierarchy_enabled", False))
-            and str(getattr(self, "_measurement_session_id", "") or "") == str(selected or "")
-            and str(getattr(self, "_measurement_id", "") or "")
-        ):
-            return root / "measurements" / str(self._measurement_id)
-        return root
+        # Compatibility name only: new writes have one type-owned data root,
+        # never a timestamped Session directory.
+        reader = getattr(self, "data_storage_snapshot", None)
+        if callable(reader):
+            snapshot = reader()
+            if isinstance(snapshot, dict) and snapshot.get("root"):
+                return Path(str(snapshot["root"]))
+        configured = str(
+            self._workstation_setting("measurement_data_root", "measurement_data")
+            or "measurement_data"
+        )
+        return resolve_workstation_data_path(configured)
 
     def _measurement_session_dir(self, session_id: str | None = None) -> Path:
         selected = session_id or self._measurement_session_id or self.recording_session_id
@@ -6842,12 +6921,45 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         return self.app_root / "recordings"
 
     def _prepare_video_recording_paths(self) -> None:
-        output_dir = self._recording_session_dir(self.recording_session_id)
-        self.video_recording_paths = {
-            "left": output_dir / "video" / "raw_left.mp4",
-            "right": output_dir / "video" / "raw_right.mp4",
-        }
-        output_dir.mkdir(parents=True, exist_ok=True)
+        allocator = getattr(self, "allocate_workstation_data_artifact", None)
+        created_utc_ns = time.time_ns()
+        paths: dict[str, Path] = {}
+        for side in ("left", "right"):
+            try:
+                if not callable(allocator):
+                    raise RuntimeError("data artifact allocator is unavailable")
+                paths[side] = Path(
+                    allocator(
+                        "videos",
+                        label=side,
+                        suffix=".mp4",
+                        utc_ns=created_utc_ns,
+                    )
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                self._log(
+                    f"[저장] {side} video path unavailable; Measurement continues: {exc}"
+                )
+        self.video_recording_paths = paths
+        recording_contract = recording_integrity_contract(
+            self.stream_backend_combo.currentData()
+        )
+        writer = getattr(self, "append_workstation_data", None)
+        if callable(writer):
+            for side, path in paths.items():
+                writer(
+                    "artifacts",
+                    {
+                        "event_type": "video_path_allocated",
+                        "side": side,
+                        "path": str(path),
+                        "media_type": "video/mp4",
+                        "stream_backend": self.stream_backend_combo.currentData(),
+                        **recording_contract,
+                        "creation_requested_utc_ns": created_utc_ns,
+                    },
+                    priority=True,
+                )
 
     def _format_video_recording_paths(self) -> str:
         return format_video_paths(self.video_recording_paths)
@@ -6916,7 +7028,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def auto_connect_wiris(self) -> bool | None:
         if self._session_recording_active():
-            self._log("[카메라] 세션 기록 중에는 WIRIS 자동 연결을 시작할 수 없습니다.")
+            self._log("[카메라] 데이터 기록 중에는 WIRIS 자동 연결을 시작할 수 없습니다.")
             return False
         self._camera_auto_connect_retry_generation += 1
         self._camera_auto_connect_attempt = 0
@@ -6929,7 +7041,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         """Enable configured WIRIS streams without a blocking network-wide scan."""
 
         if self._session_recording_active():
-            self._log("[카메라] --start: 세션 기록 중이어서 startup 카메라 연결을 건너뜁니다.")
+            self._log("[카메라] --start: 데이터 기록 중이어서 startup 카메라 연결을 건너뜁니다.")
             return
         self._startup_camera_sequence_pending = True
         self.auto_wiris_connect_pending = True
@@ -7113,7 +7225,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if mode == "auto_connect" and self._session_recording_active():
             self._cancel_auto_wiris_connect_retry()
             self.camera_connection_label.setText("WIRIS auto connect: recording is active")
-            self._log("[카메라] 탐색 중 세션 기록이 시작되어 자동 후보 적용과 프리뷰 연결을 건너뛰었습니다.")
+            self._log("[카메라] 탐색 중 데이터 기록이 시작되어 자동 후보 적용과 프리뷰 연결을 건너뛰었습니다.")
             return
         if not (host_interfaces or rtsp_candidates or control_candidates or verified_control_candidates):
             self.workstation_camera_discovery_status = "FOUND 0 ENDPOINTS"
@@ -7327,7 +7439,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         """Apply a discovered camera endpoint selected by the Workstation surface."""
 
         if self._session_recording_active():
-            self._log("[카메라] 세션 기록 중에는 카메라 네트워크/Left/Right 후보를 적용할 수 없습니다.")
+            self._log("[카메라] 데이터 기록 중에는 카메라 네트워크/Left/Right 후보를 적용할 수 없습니다.")
             return False
         if isinstance(row, bool) or not isinstance(row, int) or not 0 <= row < len(self._camera_candidate_rows):
             self._log("[카메라] 적용할 탐색 후보가 올바르지 않습니다.")
@@ -7824,22 +7936,61 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         data = dict(result or {}) if isinstance(result, dict) else {}
         candidates = list(data.get("candidates") or [])
         found = list(data.get("found") or [])
+        identities: list[dict[str, object]] = []
+        for item in found:
+            if isinstance(item, dict):
+                identity = dict(item)
+            else:
+                try:
+                    device, baud = item
+                except (TypeError, ValueError):
+                    continue
+                identity = {
+                    "device": str(device),
+                    "resolved_device": str(device),
+                    "baud": int(baud),
+                    "system_id": None,
+                    "component_id": None,
+                    "observed_monotonic_s": None,
+                }
+            identities.append(identity)
+        self.pixhawk_usb_identity_evidence = identities
         rows: list[dict[str, object]] = []
-        found_by_device = {device: baud for device, baud in found}
+        found_by_device = {
+            str(identity.get("device") or ""): identity
+            for identity in identities
+            if str(identity.get("device") or "")
+        }
         for device in candidates:
-            baud = found_by_device.get(device, "")
-            if baud:
-                status = "MAVLink heartbeat"
+            identity = found_by_device.get(str(device), {})
+            baud = identity.get("baud", "") if isinstance(identity, dict) else ""
+            system_id = identity.get("system_id") if isinstance(identity, dict) else None
+            component_id = identity.get("component_id") if isinstance(identity, dict) else None
+            if baud and system_id is not None and component_id is not None:
+                status = f"MAVLink heartbeat sysid={system_id} compid={component_id}"
+            elif baud:
+                status = "MAVLink heartbeat (identity unavailable; recovery disabled)"
             else:
                 status = self._usb_pixhawk_probe_status(device)
-            rows.append({"kind": "USB", "value": device, "baud": baud, "status": status})
+            row = {
+                "kind": "USB",
+                "value": device,
+                "baud": baud,
+                "status": status,
+                "system_id": system_id,
+                "component_id": component_id,
+                "observed_monotonic_s": identity.get("observed_monotonic_s") if isinstance(identity, dict) else None,
+            }
+            rows.append(row)
             if baud:
                 rows.append(
                     {
                         "kind": "MAVLink",
                         "value": device,
                         "baud": baud,
-                        "status": "USB serial direct",
+                        "status": f"USB serial direct sysid={system_id if system_id is not None else '--'}",
+                        "system_id": system_id,
+                        "component_id": component_id,
                     }
                 )
         if not rows:
@@ -7888,7 +8039,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         """Apply a discovered endpoint selected by the Workstation surface."""
 
         if self._session_recording_active():
-            self._log("[픽스호크] 세션 기록 중에는 Pixhawk Host/P1/P2 후보를 적용할 수 없습니다.")
+            self._log("[픽스호크] 데이터 기록 중에는 Pixhawk Host/P1/P2 후보를 적용할 수 없습니다.")
             return False
         if source not in {"pc", "mavlink"} or target not in {"host", "left", "right"}:
             self._log("[픽스호크] 후보 source 또는 적용 대상이 올바르지 않습니다.")
@@ -7921,7 +8072,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def swap_cameras(self) -> bool | None:
         if self._session_recording_active():
-            self._log("[카메라] 세션 기록 중에는 Left/Right 카메라 매핑을 교체할 수 없습니다.")
+            self._log("[카메라] 데이터 기록 중에는 Left/Right 카메라 매핑을 교체할 수 없습니다.")
             return False
         cameras_running = self.camera_connected or bool(self.left_pane.worker or self.right_pane.worker)
         detection_was_enabled = self.yolo_enabled
@@ -7937,7 +8088,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def swap_pixhawks(self) -> bool | None:
         if self._session_recording_active():
-            self._log("[픽스호크] 세션 기록 중에는 P1/P2 Pixhawk 매핑을 교체할 수 없습니다.")
+            self._log("[픽스호크] 데이터 기록 중에는 P1/P2 Pixhawk 매핑을 교체할 수 없습니다.")
             return False
         mavlink_connected_sides = self._mavlink_open_sides()
         for side in ("left", "right"):
@@ -8153,7 +8304,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._log(f"[카메라] 알 수 없는 재활성화 대상입니다: {camera}")
             return False
         if self._session_recording_active():
-            self._log("[카메라] 세션 기록 중에는 카메라 RTSP 재활성화를 실행할 수 없습니다.")
+            self._log("[카메라] 데이터 기록 중에는 카메라 RTSP 재활성화를 실행할 수 없습니다.")
             return False
         if self.rtsp_enable_thread is not None or self.rtsp_check_thread is not None:
             self._log("[카메라] 다른 RTSP 확인/활성화 작업이 진행 중입니다.")
@@ -8458,7 +8609,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             state = "connected" if age_s < 2.0 else "stale"
             state_text = "연결" if state == "connected" else "지연"
             parts.append(f"{camera_display_name(camera)}={state_text} {self._sample_hz(timestamps):.1f} Hz")
-        self.camera_connection_label.setText(f"카메라: {', '.join(parts)}")
+        prefix = (
+            "BACKPRESSURE/DEGRADED | "
+            if bool(getattr(self, "_camera_backpressure_degraded", False))
+            else ""
+        )
+        self.camera_connection_label.setText(
+            f"{prefix}카메라: {', '.join(parts)}"
+        )
         self._update_runtime_camera_stats_labels(now_s)
         self._refresh_operation_header()
 
@@ -8584,6 +8742,15 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 f"{format_runtime_camera_stats(camera, stats, self._sample_hz(timestamps), stale=not (has_recent_stats or has_recent_frame))}"
                 f" | live: {format_runtime_camera_timestamp_compact(live_metadata)}"
             )
+            pending_reader = getattr(
+                self,
+                "native_frame_persistence_pending_count",
+                None,
+            )
+            evidence_pending = (
+                int(pending_reader()) if callable(pending_reader) else 0
+            )
+            status_text += f" | Evidence W{evidence_pending}"
             tooltip_text = f"{status_text}\nlive 전체 시각: {format_runtime_camera_timestamp(live_metadata)}"
             label.setText(status_text)
             label.setToolTip(tooltip_text)
@@ -8600,12 +8767,47 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         stats = dict(payload or {})
         stats["timestamp_s"] = time.monotonic()
         self.camera_stream_stats[camera] = stats
+        degraded = any(
+            int(stats.get(key, 0) or 0) > 0
+            for key in (
+                "native_ring_dropped",
+                "metadata_dropped",
+                "control_dropped",
+            )
+        ) or float(stats.get("gui_preview_age_s", 0.0) or 0.0) > 0.5
+        self._camera_backpressure_degraded = bool(
+            degraded
+            or getattr(self, "_camera_backpressure_degraded", False)
+        )
         self._update_camera_connection_status()
 
     def _update_pixhawk_connection_status(self) -> None:
         now_s = time.monotonic()
         parts = []
+        health_reader = getattr(self.mavlink_pixhawk, "mavlink_health_snapshot", None)
         for camera in ("left", "right"):
+            if callable(health_reader):
+                try:
+                    health = health_reader(camera, now_s=now_s)
+                except Exception:
+                    health = None
+                if health is not None:
+                    state = str(
+                        getattr(
+                            getattr(health, "state", None),
+                            "value",
+                            getattr(health, "state", "UNKNOWN"),
+                        )
+                    )
+                    if state in {"QUALIFYING", "RECOVERING"}:
+                        elapsed_s = max(0, int(getattr(health, "qualification_elapsed_s", 0.0)))
+                        required_s = max(1, int(getattr(health, "qualification_required_s", 600.0)))
+                        state = (
+                            f"{state} {elapsed_s // 60:02d}:{elapsed_s % 60:02d} / "
+                            f"{required_s // 60:02d}:{required_s % 60:02d}"
+                        )
+                    parts.append(f"{camera_display_name(camera)}={state}")
+                    continue
             timestamps = self.pixhawk_attitude_times[camera]
             if not timestamps:
                 parts.append(f"{camera_display_name(camera)}=대기")
@@ -8614,7 +8816,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             state = "connected" if age_s < 1.0 else "stale"
             state_text = "연결" if state == "connected" else "지연"
             parts.append(f"{camera_display_name(camera)}={state_text} {self._sample_hz(timestamps):.1f} Hz")
-        self.pixhawk_connection_label.setText(f"픽스호크 자세: {', '.join(parts)}")
+        text = f"픽스호크 MAVLink: {', '.join(parts)}"
+        if self.pixhawk_connection_label.text() != text:
+            self.pixhawk_connection_label.setText(text)
         self._refresh_operation_header()
 
     def _set_focal_override_enabled(self, enabled: bool) -> None:
@@ -9407,6 +9611,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         ]
 
     def _matched_detection_pair(self):
+        if bool(getattr(self, "_detection_pair_coordinator_active", False)):
+            return getattr(self, "_coordinated_detection_pair", None)
         now_s = time.monotonic()
         advisories: list[str] = []
         if self._camera_sync_gate_active() and self.camera_sync_status != CAMERA_SYNC_STATUS_VERIFIED:
@@ -9527,9 +9733,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         painter = QtGui.QPainter(annotated)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
         if found and corners:
-            pen = QtGui.QPen(QtGui.QColor(SUCCESS), 3)
+            pen = QtGui.QPen(QtGui.QColor(ACCENT), 3)
             painter.setPen(pen)
-            painter.setBrush(QtGui.QBrush(QtGui.QColor(SUCCESS)))
+            painter.setBrush(QtGui.QBrush(QtGui.QColor(ACCENT)))
             columns, rows = self._checkerboard_config().pattern_size
             if len(corners) == columns * rows:
                 for row in range(rows):
@@ -9691,6 +9897,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._run_evidence_controller_owner = owner
         return owner
 
+    def _data_storage_controller(self):
+        owner = getattr(self, "_data_storage_controller_owner", None)
+        if owner is None:
+            owner = DataStorageController(self)
+            self._data_storage_controller_owner = owner
+        return owner
+
     def _optical_pose_controller(self):
         owner = getattr(self, "_optical_pose_controller_owner", None)
         if owner is None:
@@ -9754,11 +9967,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._camera_stream_lifecycle_controller_owner = owner
         return owner
 
-    def _measurement_package_controller(self):
-        owner = getattr(self, "_measurement_package_controller_owner", None)
+    def _measurement_run_controller(self):
+        owner = getattr(self, "_measurement_run_controller_owner", None)
         if owner is None:
-            owner = MeasurementPackageController(self)
-            self._measurement_package_controller_owner = owner
+            owner = MeasurementRunController(self)
+            self._measurement_run_controller_owner = owner
         return owner
 
     def _wiris_control_controller(self):
@@ -9900,6 +10113,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def import_workstation_session_artifact(self, *args: Any, **kwargs: Any) -> Any: ...
         def register_workstation_session_artifact(self, *args: Any, **kwargs: Any) -> Any: ...
         def flush_workstation_run_evidence(self, *args: Any, **kwargs: Any) -> Any: ...
+        def append_workstation_data(self, *args: Any, **kwargs: Any) -> Any: ...
+        def data_storage_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
+        def retry_data_storage(self, *args: Any, **kwargs: Any) -> Any: ...
+        def allocate_workstation_data_artifact(self, *args: Any, **kwargs: Any) -> Any: ...
+        def flush_workstation_data(self, *args: Any, **kwargs: Any) -> Any: ...
+        def close_workstation_data(self, *args: Any, **kwargs: Any) -> Any: ...
         def reset_workstation_optical_pose_session(self, *args: Any, **kwargs: Any) -> Any: ...
         def workstation_optical_pose_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
         def register_workstation_optical_pose_candidate(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -10077,6 +10296,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def _handle_mavlink_stream_setup_required(self, *args: Any, **kwargs: Any) -> Any: ...
         def _clear_pixhawk_stream_setup_worker(self, *args: Any, **kwargs: Any) -> Any: ...
         def bootstrap_ethernet_mavlink_from_usb(self, *args: Any, **kwargs: Any) -> Any: ...
+        def recover_stalled_pixhawk_via_verified_usb(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _apply_pixhawk_usb_recovery_result(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _pixhawk_usb_recovery_failed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_pixhawk_usb_recovery_worker(self, *args: Any, **kwargs: Any) -> Any: ...
         def _apply_pixhawk_usb_bootstrap_result(self, *args: Any, **kwargs: Any) -> Any: ...
         def _clear_pixhawk_usb_bootstrap_worker(self, *args: Any, **kwargs: Any) -> Any: ...
         def _temporary_mavlink_heartbeat(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -10254,36 +10477,31 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def connect_cameras(self, *args: Any, **kwargs: Any) -> Any: ...
         def start_yolo(self, *args: Any, **kwargs: Any) -> Any: ...
         def stop_yolo_detection(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _resume_queued_measurement_start(self, *args: Any, **kwargs: Any) -> Any: ...
         def _start_camera_streams(self, *args: Any, **kwargs: Any) -> Any: ...
         def _schedule_camera_start_retry(self, *args: Any, **kwargs: Any) -> Any: ...
         def _cancel_pending_camera_start(self, *args: Any, **kwargs: Any) -> Any: ...
         def stop_yolo_streams(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _schedule_camera_stop_watchdog(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _cancel_camera_stop_watchdog(self, *args: Any, **kwargs: Any) -> Any: ...
         def _stop_camera_panes(self, *args: Any, **kwargs: Any) -> Any: ...
         def _clear_calibration_previews(self, *args: Any, **kwargs: Any) -> Any: ...
         def _clear_detection_state(self, *args: Any, **kwargs: Any) -> Any: ...
         def stop_all(self, *args: Any, **kwargs: Any) -> Any: ...
-        def begin_measurement_session(self, *args: Any, **kwargs: Any) -> Any: ...
-        def measurement_session_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
-        def measurement_package_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
-        def activate_measurement_package_source(self, *args: Any, **kwargs: Any) -> Any: ...
-        def begin_measurement_detection(self, *args: Any, **kwargs: Any) -> Any: ...
-        def cancel_measurement_detection_start(self, *args: Any, **kwargs: Any) -> Any: ...
-        def complete_measurement_detection(self, *args: Any, **kwargs: Any) -> Any: ...
-        def finalize_measurement_package(self, *args: Any, **kwargs: Any) -> Any: ...
-        def _continue_measurement_package_finalization(self, *args: Any, **kwargs: Any) -> Any: ...
-        def _handle_measurement_rtcm_evidence_drained(self, *args: Any, **kwargs: Any) -> Any: ...
+        def measurement_run_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
+        def queue_measurement_start(self, *args: Any, **kwargs: Any) -> Any: ...
+        def begin_measurement_run(self, *args: Any, **kwargs: Any) -> Any: ...
+        def confirm_measurement_running(self, *args: Any, **kwargs: Any) -> Any: ...
+        def request_measurement_stop(self, *args: Any, **kwargs: Any) -> Any: ...
+        def finish_measurement_run(self, *args: Any, **kwargs: Any) -> Any: ...
+        def cancel_measurement_start(self, *args: Any, **kwargs: Any) -> Any: ...
         def begin_measurement(self, *args: Any, **kwargs: Any) -> Any: ...
         def begin_next_measurement(self, *args: Any, **kwargs: Any) -> Any: ...
-        def close_measurement_session(self, *args: Any, **kwargs: Any) -> Any: ...
-        def begin_measurement_revision(self, *args: Any, **kwargs: Any) -> Any: ...
-        def verify_measurement_package(self, *args: Any, **kwargs: Any) -> Any: ...
-        def verify_session(self, *args: Any, **kwargs: Any) -> Any: ...
-        def begin_session(self, *args: Any, **kwargs: Any) -> Any: ...
-        def end_measurement(self, *args: Any, **kwargs: Any) -> Any: ...
-        def seal_session(self, *args: Any, **kwargs: Any) -> Any: ...
-        def close_session(self, *args: Any, **kwargs: Any) -> Any: ...
-        def create_revision(self, *args: Any, **kwargs: Any) -> Any: ...
-        def verify_package(self, *args: Any, **kwargs: Any) -> Any: ...
+        def begin_measurement_detection(self, *args: Any, **kwargs: Any) -> Any: ...
+        def complete_measurement_detection(self, *args: Any, **kwargs: Any) -> Any: ...
+        def cancel_measurement_detection_start(self, *args: Any, **kwargs: Any) -> Any: ...
+        def measurement_package_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
+        def measurement_session_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
         def zoom_command_text(self, *args: Any, **kwargs: Any) -> Any: ...
         def selected_zoom_target(self, *args: Any, **kwargs: Any) -> Any: ...
         def zoom_hosts(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -10350,7 +10568,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def clear_distance_history(self) -> None:
         if self._session_save_thread is not None:
-            self.recording_status_label.setText("세션 기록: 저장 중에는 기록을 초기화할 수 없습니다")
+            self.recording_status_label.setText("데이터 기록: 저장 중에는 기록을 초기화할 수 없습니다")
             return
         self.distance_history.clear()
         self.distance_recording_rows.clear()
@@ -10377,6 +10595,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 spool_root / "method_evaluation_bundles.jsonl"
             )
         self._recording_pair_row_index.clear()
+        self._recording_pending_native_request_rows.clear()
         if not self.distance_recording_enabled:
             self.distance_recording_started_monotonic_s = None
         self._last_distance_history_key = None
@@ -11843,7 +12062,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.camera_connection_label.setText(STARTUP_CAMERA_STATUS)
         self.pixhawk_connection_label.setText(STARTUP_PIXHAWK_STATUS)
         self._log(STARTUP_READY_MESSAGE)
-        self._recover_retryable_recording_session()
+        # Historical Session/retry evidence is file-manager-only and never
+        # participates in new Measurement admission.
         if self.auto_start_pixhawk:
             QtCore.QTimer.singleShot(500, self._auto_start_pixhawk)
         if self.auto_start:
@@ -11884,10 +12104,69 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.connect_mavlink_pixhawk()
 
     def _log_state(self, camera: str, state: str) -> None:
-        self._log(f"[카메라] {self._camera_name_ko(camera)} 스트림 상태: {state}")
+        if state.startswith("DECODER_FALLBACK_REQUIRED:"):
+            self._handle_runtime_decoder_fallback(camera, state)
+            return
         decoder = self._extract_active_decoder_from_state(state)
         if decoder is not None:
             self._set_active_stream_decoder(camera, decoder)
+        now_s = time.monotonic()
+        previous_state, previous_s = self._last_logged_camera_states.get(
+            camera,
+            ("", float("-inf")),
+        )
+        if state == previous_state and now_s - previous_s < 30.0:
+            return
+        self._last_logged_camera_states[camera] = (state, now_s)
+        self._log(f"[카메라] {self._camera_name_ko(camera)} 스트림 상태: {state}")
+
+    def _handle_runtime_decoder_fallback(self, camera: str, state: str) -> None:
+        requested = str(self.decoder_combo.currentData() or DECODER_AUTO)
+        if requested != DECODER_AUTO:
+            reason = state.removeprefix("DECODER_FALLBACK_REQUIRED:").strip()
+            self._log(
+                f"[카메라] NVIDIA mode decoder failure: {reason}; software fallback은 금지됩니다. "
+                "Auto 또는 Software로 변경하세요."
+            )
+            self.stop_yolo_streams()
+            return
+        if self._runtime_decoder_override == "software":
+            return
+        reason = state.removeprefix("DECODER_FALLBACK_REQUIRED:").strip()
+        recording_active = bool(self._session_recording_active())
+        detection_enabled = bool(self.yolo_enabled) and not recording_active
+        self._runtime_decoder_override = "software"
+        trigger = self._camera_name_ko(camera)
+        self.decoder_fallback_reasons.update(
+            left=f"{trigger}: {reason}",
+            right=f"{trigger}: {reason}",
+        )
+        self._log(
+            f"[카메라] {self._camera_name_ko(camera)} nvh264dec 비정상: "
+            f"{reason}; 현재 MP4를 종료하고 avdec_h264로 전환합니다."
+        )
+        self.stop_yolo_streams()
+        QtCore.QTimer.singleShot(
+            0,
+            lambda: self._start_camera_streams(
+                enable_detection=detection_enabled,
+                switch_to_depth=detection_enabled,
+            ),
+        )
+
+    def _handle_decoder_mode_changed(self, _index: int) -> None:
+        self._runtime_decoder_override = None
+        self.decoder_fallback_reasons.update(left="", right="")
+        requested = str(self.decoder_combo.currentData() or DECODER_AUTO)
+        self.decoder_selection_status = {
+            "requested": requested,
+            "effective": None,
+            "candidates": (),
+            "allowed": None,
+            "degraded": False,
+            "reason": "mode changed; applies on next stream start",
+            "nvidia_available": self.decoder_selection_status.get("nvidia_available"),
+        }
 
     def _camera_name_ko(self, camera: str) -> str:
         return camera_display_name(camera)
@@ -11906,12 +12185,46 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if self.active_stream_decoders.get(camera) == normalized:
             return
         self.active_stream_decoders[camera] = normalized
+        if normalized == NVIDIA_H264_DECODER:
+            self.decoder_fallback_reasons[camera] = ""
+        elif normalized == SOFTWARE_H264_DECODER and str(self.decoder_combo.currentData()) == DECODER_SOFTWARE:
+            self.decoder_fallback_reasons[camera] = ""
+
+    def _report_recoverable_persistence_failure(self, message: str) -> None:
+        report_recoverable_persistence_failure(self, message)
 
     def _log(self, text: str) -> None:
+        if QtCore.QThread.currentThread() != self.thread():
+            self._threadsafe_log_requested.emit(str(text))
+            return
+        if (
+            not bool(getattr(self, "_measurement_session_hierarchy_enabled", False))
+            and bool(self._session_recording_active())
+        ):
+            writer = getattr(self, "append_workstation_data", None)
+            if callable(writer):
+                try:
+                    from Workstation.workstation_core.package_provenance import redact_secrets
+
+                    writer(
+                        "application.log",
+                        {
+                            "message": redact_secrets(str(text)),
+                            "source": "Workstation._log",
+                        },
+                        priority=False,
+                    )
+                except (OSError, TypeError, ValueError):
+                    pass
         package_state = str(
             getattr(self, "_measurement_package_state", "IDLE") or "IDLE"
         ).upper()
-        if package_state in {"COLLECTING", "POST_CAPTURE", "VERIFYING", "RECOVERABLE"}:
+        if bool(getattr(self, "_measurement_session_hierarchy_enabled", False)) and package_state in {
+            "COLLECTING",
+            "POST_CAPTURE",
+            "VERIFYING",
+            "RECOVERABLE",
+        }:
             session_id = str(getattr(self, "recording_session_id", "") or "")
             if session_id:
                 try:
@@ -11987,6 +12300,9 @@ _CONTROLLER_DELEGATE_BINDINGS: tuple[ControllerDelegateBinding, ...] = (
     ControllerDelegateBinding(CameraTimeSyncController, "_camera_time_sync_controller", CAMERA_TIME_SYNC_METHODS),
     ControllerDelegateBinding(RecordingController, "_recording_controller", RECORDING_CONTROLLER_METHODS),
     ControllerDelegateBinding(RunEvidenceController, "_run_evidence_controller", RUN_EVIDENCE_CONTROLLER_METHODS),
+    ControllerDelegateBinding(
+        DataStorageController, "_data_storage_controller", DATA_STORAGE_CONTROLLER_METHODS
+    ),
     ControllerDelegateBinding(OpticalPoseController, "_optical_pose_controller", OPTICAL_POSE_CONTROLLER_METHODS),
     ControllerDelegateBinding(TargetDroneController, "_target_drone_controller", TARGET_DRONE_CONTROLLER_METHODS),
     ControllerDelegateBinding(
@@ -12009,9 +12325,9 @@ _CONTROLLER_DELEGATE_BINDINGS: tuple[ControllerDelegateBinding, ...] = (
         CameraStreamLifecycleController, "_camera_stream_lifecycle_controller", CAMERA_STREAM_LIFECYCLE_METHODS
     ),
     ControllerDelegateBinding(
-        MeasurementPackageController,
-        "_measurement_package_controller",
-        MEASUREMENT_PACKAGE_METHODS,
+        MeasurementRunController,
+        "_measurement_run_controller",
+        MEASUREMENT_RUN_METHODS,
     ),
     ControllerDelegateBinding(WirisControlController, "_wiris_control_controller", WIRIS_CONTROL_METHODS),
     ControllerDelegateBinding(AppLifecycleController, "_app_lifecycle_controller", APP_LIFECYCLE_METHODS),

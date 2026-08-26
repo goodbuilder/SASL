@@ -3,46 +3,61 @@
 ## Purpose
 
 This package provides the operator Workstation for synchronized stereo-camera capture,
-calibration, measurement, Pixhawk/GNSS evidence, and recording. It owns its runtime and UI
-independently from the Legacy application. Calibration capture, calculation, load, save, and apply
-can run before a parent session exists, using the configured reusable calibration root. Explicit
-`Create Session Folder` has no device, synchronization, calibration, method, or Alignment
-readiness gate; it allocates the timestamp-named container. The top-level `Sessions`
-workspace combines `Current`, `Evidence`, and `Review` without changing backend ownership.
-`Current` shows the folder lifecycle and ordered children, `Evidence` projects the active package
-and capture/ULog evidence, and `Review` opens saved session/measurement artifacts.
-Calibration performed after opening and all
-Alignment evidence are Session-shared, while an active pre-session profile is snapshotted into each
-Measurement package that uses it. Every measurement is automatically saved and sealed as one
-portable evidence folder, and closing the parent session seals the ordered child-manifest inventory.
-Session-shared Calibration and Alignment selections are versioned as immutable content-addressed
-files. Compatibility aliases may move, but every Measurement copies the exact selected bytes and
-SHA-256 into its own input evidence before those bytes can affect a valid result.
-Measurement readiness, geometry-method inputs, Detection, and retry-save controls remain in the
-`Measurement` workspace; stored artifacts remain in `Sessions > Review`. High-rate RTCM
-and camera-preview traffic is isolated from the Qt GUI thread: full-fidelity routing/evidence stays
-on worker-owned data paths, while the UI consumes bounded latest-state snapshots. Hidden camera
-panes retain only the latest implicitly shared `QImage` and do not perform QPixmap conversion or
-smooth scaling; calibration overlays remain explicitly throttled. Every child
-Measurement also owns an immutable all-method input boundary, including explicit per-camera
-Roll/Pitch/Yaw and North/East/Down fill decisions. Finalization is fail-closed: the
-session save must complete, measurement-scoped RTCM must be drained and semantically verified,
-and every package artifact must pass containment and hash checks before a manifest can be sealed.
-The derived session `review.xlsx` keeps the common operator sheets and adds one stable worksheet
-for each of the eight Measurement geometry methods, populated from that method's authoritative
-per-pair outcome stream.
+calibration, Measurement, Pixhawk/GNSS evidence, and recording. It owns its runtime and UI
+independently from the Legacy application.
+
+As of 2026-08-26, the operational Measurement Session lifecycle is removed. There is no Create,
+Open, Close, Finalize, Seal, recovery, completeness, or package gate before a Measurement can
+start. `Measurement` owns only the transient states `IDLE`, `QUEUED`, `STARTING`, `RUNNING`,
+`STOPPING`, and `ERROR`. Persisted data never owns admission to those states. An old open or
+recoverable Session directory is inert historical data and cannot disable `측정 시작`.
+
+Structured records append to fixed, type-owned files beneath one relative
+`measurement_data_root`. Videos, still images, native PNGs, and ULogs use their own creation-time
+filename with local UTC offset and never replace an existing file. Each row retains its UTC,
+monotonic, and available source-clock evidence, so an operator can collect or join records later.
+Storage failures and bounded-queue drops are visible in `Data > Status`, but do not stop camera,
+Detection, GNSS/RTCM routing, target telemetry, or the next Measurement. Result/event queues are
+reserved ahead of bulk camera/PX4/GNSS traffic.
+
+The top-level `Data` workspace exposes writer health, fixed paths, capture tools, the current data
+folder, and a file-manager link to untouched legacy `recordings/`. It does not scan, recover, or
+mutate legacy Session catalogs. Alignment is app-lifetime state: Apply persists an append-only
+Alignment event, and the active Alignment remains available across Measurements until Revert,
+`Reset Alignment`, or application restart.
 
 Runtime fault isolation keeps one callback, device, camera child, or evidence writer failure from
-silently taking down unrelated links. Qt callback exceptions are logged and trigger a best-effort
-session flush; bounded device/worker queues expose timeout, retry, partial-success, and recoverable
-storage states instead of blocking the GUI indefinitely.
+silently taking down unrelated links. High-rate camera, PX4, GNSS, RTCM, and target traffic stays
+on bounded worker-owned paths while the Qt UI consumes latest-state snapshots.
+
+Calibration now presents a StereoWIRIS-style primary workflow while retaining the full Workstation
+calibration implementation. The default surface exposes only `촬영`, `계산·적용`, and
+`프로파일`; file selection, photo-set roots, per-view diagnostics, subset evidence, checkerboard
+setup, and raw K,D/R,t details remain available under the collapsed `고급 캘리브레이션` area.
 
 ## Current Run Flow
 
-From the repository root, run `./apps/Workstation/run.sh --check`, then start the UI with
-`./apps/Workstation/run.sh`. The check validates declared dependency versions, Workstation
-imports, the selected GStreamer/PyAV backend, and the approved default YOLO model's size and
-SHA-256 against `model-manifest.json`; it exits nonzero on a missing or incompatible boundary.
+From the repository root, install the Ubuntu manifest and create the one supported venv before
+running the app:
+
+```bash
+sudo apt-get update
+grep -Ev '^[[:space:]]*(#|$)' requirements/ubuntu-22.04-operator-runtime.txt | xargs sudo apt-get install
+tools/check_operator_runtime.sh --deployment
+if [[ -d .venv ]]; then mv .venv ".venv.backup-$(date +%Y%m%d-%H%M%S)"; fi
+python3 -m venv --system-site-packages .venv
+.venv/bin/python -m pip install -r requirements.txt
+tools/check_operator_runtime.sh --execution
+./apps/Workstation/run.sh --check
+./apps/Workstation/run.sh
+```
+
+The launcher accepts only repository `.venv/bin/python`; app-local, Simulation, system Python,
+manual `dist-packages` `.pth`, and arbitrary `PYTHON_BIN` fallback are unsupported. `--check`
+validates the interpreter, declared dependency versions, Workstation imports/settings/model,
+Gst/GstRtp typelibs, required pipeline element find/make, and the selected decoder. It prints
+`PASS/WARN/FAIL`, selected/effective decoder, missing elements, Ubuntu packages, and recovery
+commands before returning the shared `0/1/2` exit contract.
 Use `--no-start` to open without camera discovery or preview and `--start-pixhawk` to connect the
 configured Pixhawk endpoints after launch.
 
@@ -55,11 +70,31 @@ If a camera child process itself exits unexpectedly, its owner reports
 `스트림 프로세스 크래시 복구 중`, restarts it with bounded backoff, and stops after three
 consecutive failed recoveries with an explicit manual-restart alarm.
 
+For the normal calibration flow, open `Calibration`, use `촬영` to confirm the actual zoom and
+collect diverse checkerboard views, use `계산·적용` to calculate and save K,D (and R,t when
+needed), then use `프로파일` to load and apply the verified bundle. Open `고급 캘리브레이션`
+only when selecting exact photo files, reviewing quality reasons, changing board/setup parameters,
+or inspecting persisted profile evidence.
+
 The field dual-Pixhawk profile uses Workstation `10.0.0.10/24`, P1/Left
 `10.0.0.2:14550` with MAVLink system ID `1`, and P2/Right `10.0.0.3:14551` with system ID `2`.
 Save each board's Ethernet profile over USB once, reboot it, then verify both heartbeats with USB
 removed. The exact parameters, SD-card files, recovery sequence, and field checks are recorded in
 [`Pixhawk.md`](Pixhawk.md).
+
+At runtime Workstation identifies itself on both Ethernet links as MAVLink GCS `255/190` and sends
+at most one GCS heartbeat per side per second after the expected peer is observed. A new or rebooted
+P1/P2 link remains `QUALIFYING` until expected-system HEARTBEAT and ATTITUDE stay continuously fresh
+for 10 minutes. `ATTITUDE STALE` means other MAVLink traffic is still arriving; `ETH MAVLINK RX
+STALLED` means all expected-system traffic has been silent for 10 seconds. Only `LIVE` passes the
+Pixhawk readiness gate.
+
+Camera Preview uses the persisted H.264 decoder mode. The supported field default is `Auto`: when
+the NVIDIA driver and GStreamer `nvh264dec` element are both usable, Auto starts NVDEC first; if
+that decoder fails its launch/first-frame/live-frame checks, Workstation finalizes the current
+output and performs one bounded `avdec_h264` software restart. The Camera workspace reports the
+observed per-side result as `GPU · nvh264dec`, `CPU · avdec_h264 (selected)`, or
+`CPU fallback · avdec_h264`; requested mode alone is never success evidence.
 
 Runtime state defaults to `.local/workstation_data` at the repository root. To keep it on another
 volume, set an absolute data root before both checking and launching; relative overrides are
@@ -81,7 +116,7 @@ GStreamer is the default stream backend. Install the optional PyAV overlay only 
 settings profile uses PyAV:
 
 ```bash
-python3 -m pip install -r apps/Workstation/requirements-pyav.txt
+.venv/bin/python -m pip install -r requirements/optional-pyav.txt
 ```
 
 Keep the persisted WIRIS visible-stream encoder profile at bitrate `0`, QP `17`, GOP `30`,
@@ -91,61 +126,40 @@ the Workstation enables or reactivates Ethernet/RTSP mode, it sends that profile
 camera and verifies all four SDK readbacks before probing the stream. Edit the profile under
 `Settings > YOLO / RTSP > WIRIS visible encoder profile`.
 
-`Sessions > Current > Create Session Folder` creates
-`recordings/YYYYMMDD_HHMMSS_nanoseconds/` using the local date and creation time. It directly calls
-the Session-folder backend and does not inspect cameras, Pixhawks, Drone Telemetry, time
-synchronization, Calibration, Methods, or Alignment; it
-may be used before those inputs are ready. After creation, verify that `State` reads
-`Ready for saving` and that `Folder name`, `Created`, and `Storage path` identify the intended
-directory. The action is unavailable only while an existing parent is open or another lifecycle
-operation prevents safe ownership of new outputs.
+Choose `Settings > Storage > Data folder` before field work. The value must be relative to
+`SASL_WORKSTATION_DATA_ROOT`; the default is `measurement_data`. `Data > Status` shows every fixed
+file, writer state, dropped-row count, last write, and error. `Retry Storage` retries failed streams,
+but it is never a prerequisite for Measurement.
 
-Calibration can be completed before or after `Create Session Folder`. Before a Session exists, capture,
-calculation, load, save, and apply use the configured reusable calibration root. After a Session is
-open, new calibration runs and loaded-profile copies are stored as Session-shared assets. Alignment
-capture remains Session-owned. Approved K,D/R,t bytes are published under content-addressed
-`profiles/` paths; `intrinsics.json` and per-zoom filenames remain compatibility aliases rather than
-Measurement evidence identities. A `Pre` HR/OZ capture lazily creates a Measurement draft; otherwise
-`측정 시작` creates the next child immediately before Detection. Child creation is lifecycle-only
-and does not require geometry readiness, so Pre and blocked evidence retain the correct owner. Before Detection produces a
-valid result, apply the intended operating-zoom `K,D` and an eligible stereo `R,t`/Alignment source,
-connect and verify the required devices, wait for the intended camera synchronization state, and
-check the separate
-`Evidence collection` and `Valid measurement` projections in `Measurement`, and resolve its
-blockers. Every matched pair is evaluated by Pixhawk, Checkerboard, Horizon, Mountain, Drone
-Rotation, Drone Multi-view, Terrain, and Combined against one shared immutable snapshot. The
-representative result is always `Pixhawk attitude + GPS/RTK`; another method is never promoted when
-that primary method is blocked or fails. Overview shows all eight methods as read-only cards with
-READY/ACTIVE/BLOCKED/FAILED/TIMEOUT/REUSED state, the first blocker plus `+N more`, and per-Measurement
-VALID/BLOCKED/FAILED counters. Clicking a card opens Measurement details without changing a method.
-Press `측정 시작` once and
-`측정 종료` when that Measurement is complete. Measurement stop automatically
-publishes that Measurement's typed Parquet generation, drains its producers, and requests sealing;
-the `Retry Measurement Save` action is reserved for recoverable failures. The session-level
-`review.xlsx` remains pending until `Close Session` creates the integrated workbook once from all
-sealed measurements. Review `M_Pixhawk_RTK`, `M_Checkerboard`, `M_Horizon`, `M_Mountain_GNSS`,
-`M_Drone_RTK_Rotation`, `M_Drone_RTK_Multiview`, `M_Terrain_PnP`, and `M_Combined` for the
-method-specific projections; a header-only method tab means that Measurement contains no evaluated
-pair for the method. Automatic finalization waits for capture, video, all pending eight-method
-barriers, and the real session-save worker, closes and
-drains that measurement's RTCM evidence context, verifies its binary/index high-water, and only
-then seals the current child revision as `SEALED_COMPLETE` or `SEALED_INCOMPLETE`. A save/drain or
-semantic-integrity failure leaves the child `RECOVERABLE` without a new manifest. Press `측정 시작`
-again after sealing to create the next isolated child (`m000002`, `m000003`, ...), or return to
-`Sessions > Current > Close Session`. Close automatically saves and seals an empty or Post-Capture current
-Measurement before sealing the ordered parent index. If Detection is still running, stop it first;
-save or integrity failure leaves the Session open and recoverable. `Review Stored Files` switches
-to `Sessions > Review`, which reviews children by the composite session/measurement identity. A
-revision adds late evidence to the same measurement and never grants another Detection interval.
-`Protocol` owns Preflight; target Drone/UAM reference connectivity remains in
-`Sessions > Current`, and manual recording remains an advanced fallback under `Advanced > Files`.
+Calibration can be completed at any time against the reusable calibration root. Alignment can
+also be captured and applied before or between Measurements. The active Alignment is reused until
+`Revert active pose`, `Reset Alignment`, or application restart; starting or ending a Measurement
+does not clear it.
 
-Session folder state and Measurement readiness are intentionally independent. `OPEN` means only
-that the displayed directory owns subsequent outputs; it does not claim that devices, calibration,
-or a valid geometry method are ready, and opening it never waives downstream checks. The Session
-workspace never polls device or geometry-method readiness. Per-method readiness, blockers, frozen
-source values, and their PX4 FRD/NED, GNSS NED, candidate virtual-FRD/NED, or OpenCV RDF contracts
-remain in Measurement/Alignment projections and persisted pair evidence.
+For an ordinary run:
+
+1. Connect the intended WIRIS, P1/P2, GNSS/RTCM, and optional Target Drone inputs.
+2. Apply the intended operating-zoom `K,D` and stereo `R,t`/Alignment source, then inspect
+   readiness. Missing geometry may make a result BLOCKED, but it does not prevent data collection.
+3. Press `측정 시작`. If Manual record is active, Workstation stops it first and queues this start.
+   If a still capture, camera command, time sync, discovery, or RTSP activation owns the cameras,
+   the transient run shows `QUEUED` and starts automatically when that owner releases them.
+4. Press `측정 종료` when finished. Camera/Detection/video owners stop and the run returns to
+   `IDLE`; no save, hash, manifest, RTCM drain, review workbook, or previous data state can delay the
+   next start.
+5. Repeat whenever needed, including after long gaps. Join the type-owned records later using their
+   per-row timestamps and transient `runtime_generation` where present.
+
+Every matched pair is still evaluated independently by Pixhawk, Checkerboard, Horizon, Mountain,
+Drone Rotation, Drone Multi-view, Terrain, and Combined against the frozen inputs for that run.
+The representative result remains `Pixhawk attitude + GPS/RTK`; another method is not promoted
+when the primary method is blocked or fails. Result and method events append immediately to their
+fixed JSONL streams. No automatic Parquet or `review.xlsx` is produced.
+
+Manual recording remains under `Advanced > Files`. It uses the same fixed structured streams and
+timestamped binary paths. Starting Measurement stops Manual record and does not resume it after the
+Measurement. Explicit HR/OZ capture, ULog import, and Alignment actions remain available from
+`Data > Capture` even outside a Measurement and always append their own event records.
 
 For checkerboard calibration, select the calibration zoom, command both cameras to that
 zoom, confirm the actual zoom readback, and capture checkerboard observations. A capture over
@@ -228,8 +242,8 @@ always retains `precision_qualified=false`. Malformed K,D, stale/unknown/disagre
 native-raster mismatch remain hard failures.
 
 Field measurement blocks only missing/ambiguous correspondence, missing or malformed K,D/R,t,
-same-Measurement telemetry absence for live geometry, non-finite/frame-invalid inputs, impossible
-two-ray geometry, lifecycle conflicts, persistence integrity failures, unapplied geometry
+current-run telemetry absence for live geometry, non-finite/frame-invalid inputs, impossible
+two-ray geometry, an already-running camera interval, unapplied geometry
 candidates, and missing/mismatched candidate-to-active K,D identity. RTCP/NTP availability, pair
 delta, vertical delta, telemetry age, GNSS fix/accuracy/readiness, and nominal K,D remain visible
 advisories while a finite result is recorded as `ESTIMATED`.
@@ -240,8 +254,8 @@ Auto capture rejects a pair when either camera's checkerboard pose is effectivel
 an already accepted pose. Move the board across the image, change distance and roll, and introduce safe
 yaw/pitch perspective instead of collecting many fronto-parallel repeats.
 
-In Calibration's shared input area, select a saved calibration session and review its matching Left/Right
-files in `계산에 사용할 사진`. The table previews the session candidates until the operator fixes
+In Calibration's shared input area, select a saved calibration photo set and review its matching Left/Right
+files in `계산에 사용할 사진`. The table previews the photo-set candidates until the operator fixes
 independent Left and Right selections with the two file-selection buttons. The selected Photo set
 is sent as both the owner calibration root and calculation/validation root in the same setup
 transaction, so the worker scans the exact dataset shown in the table.
@@ -295,24 +309,24 @@ saved only as non-applicable attempt evidence; doing so never promotes active ca
 
 `Capture HR Still` can be pressed repeatedly whenever the operator needs high-resolution evidence.
 Each press enables visible-HR still storage, captures one photo on each camera, and waits
-for both cameras to report completion. `Capture OZ Still` sits beside it in `Sessions > Evidence`
+for both cameras to report completion. `Capture OZ Still` sits beside it in `Data > Capture`
 and uses the same `Pre`/`Post`/`Checkpoint` purpose selector. It sends `SIVI TRUE`, `CPTR`,
 and polls `ICPT` on both cameras for a camera-native visible/OZ still; the field camera
 configuration is expected to provide the higher-resolution FHD evidence. Use `Pre` before
 measurement and `Post` after measurement when this camera-local evidence is needed. Both
-capture paths are independent of the RTSP/MP4 session video.
+capture paths are independent of timestamped RTSP/MP4 recording.
 
 For network RTK, open `Settings > GNSS`, select either network-assisted fixed-base or
 direct network RTK operation, and confirm the caster hostname, port, mountpoint, TLS setting,
 GGA policy, and direct Username/Password fields. A newly created settings file starts with the
 NGII RTS2 Base-assisted profile: `RTS2.ngii.go.kr:2101`, mountpoint `VRS-RTCM32`, Base GNSS
-GGA, WGS84 ellipsoid height, RTCM routing to both left and right Pixhawk rovers, Username
-`SASL`, and masked session Password `ngii`. The runtime owner receives the same credential
-defaults during launch, so `Start NTRIP` can use them even if Settings was never opened.
-Editing either field overrides its default; after editing the Settings workspace, press `Apply`
-or `Save` before starting NTRIP so the masked Password reaches the runtime owner. Other compatible
-casters remain configurable; existing custom provider configurations are preserved, while retired
-legacy values are migrated to the NGII profile when loaded.
+GGA, WGS84 ellipsoid height, RTCM routing to both left and right Pixhawk rovers, and Username
+`SASL`. The masked Password starts empty. Credential resolution uses the current UI Password
+first, then the OS keyring, then configured legacy environment variables. After editing the
+Settings Password, press `Apply` or `Save` before starting NTRIP so that explicit value reaches the
+runtime owner. Other compatible casters remain configurable; existing custom provider
+configurations are preserved, while retired legacy values are migrated to the NGII profile when
+loaded.
 
 The legacy environment-variable fields remain an optional fallback. They contain variable
 *names*, not credential values. To use that path, clear the direct Password, press `Apply`, and
@@ -454,12 +468,12 @@ local file paths, and failure messages, so a completed `Capture HR Still (FTP)` 
 be verified without searching through unrelated camera and Pixhawk messages.
 New settings enable `Enable FTP download` by default; the left/right WIRIS FTP credentials and
 remote directory still need to match the camera configuration. Leaving `Remote dir` as `/` now
-discovers the camera's `/ssd/*/img`, `/sdcard/*/img`, or `/flashd/*/img` session folders and
+discovers the camera's `/ssd/*/img`, `/sdcard/*/img`, or `/flashd/*/img` image directories and
 selects the channel-appropriate latest still; FTP connection setup retries once and defaults to
 a 30-second per-camera timeout.
 Raw FTP downloads are separated as `<timestamp>/calib_capture/HR/left|right` for HR and
 `<timestamp>/calib_capture/OZ/left|right` for OZ; validated calibration PNGs remain in the
-session root's `left/` and `right/` directories.
+selected photo set's `left/` and `right/` directories.
 Before each FTP still capture, the worker snapshots the remote image list and accepts only a
 file that appears or changes after `CPTR`; it never falls back to an older still when the camera
 has not finished publishing the new file.
@@ -488,7 +502,8 @@ the frame/Drone GNSS clock domain is verified, the delta is within the configure
 and the exact frozen operating `K,D` is geometry-applicable. Incomplete or unverified bindings are
 retained as `BLOCKED` audit evidence and are never passed to the solver.
 
-The `Drone RTK Multi-view R,t` tab consumes the Session's accumulated READY target pairs directly;
+The `Drone RTK Multi-view R,t` tab consumes READY target pairs accumulated since the last
+`Reset Alignment` directly;
 its normal UI path does not open or require a JSON file. Capture and annotate at least four Frozen
 pairs in `Drone Rotation`, move the Drone through varied three-dimensional positions, then press
 `Solve Drone RTK Multi-view R,t`. All samples must share the same exact operating
@@ -508,11 +523,9 @@ An incomplete or not-yet-recorded mark stays visible and remains bound to its or
 identity; it is never silently reused as a pixel from the new frame, and `Clear` is required before
 discarding that unfinished operator work.
 
-When the session is saved, the static JSON also stores the frozen-frame artifact identities,
-complete automatic proposals, accepted points, current annotation payload, Drone RTK capture
-history, accumulated multi-view samples, and provenance.
-Native pixels remain in the session frame artifacts; the append-only `run_events.jsonl` keeps
-the full proposal, approval, annotation-update, and multi-view sample-revision audit events.
+Alignment updates append frozen-frame artifact identities, complete automatic proposals, accepted
+points, current annotation payload, Drone RTK capture history, accumulated multi-view samples, and
+provenance to `alignment.jsonl`/event streams. Native pixels remain timestamped data-root artifacts.
 
 Run the Workstation regression suite from `apps/Workstation` with:
 
@@ -528,12 +541,32 @@ python3 tools/check_portable_paths.py
 
 ## Inputs/Outputs and Interfaces
 
+- The simple Calibration controls dispatch the existing `calibration.*` command IDs; they do not
+  implement a second solver or persistence path. `calibration.run_intrinsic`,
+  `calibration.run_extrinsics`, Save/Load, and `calibration.apply_bundle` therefore retain the same
+  frozen photo-set, quality, zoom, native-raster, immutable-profile, and rollback contracts as the
+  advanced controls.
+
+- `detection.toggle` is an always-available operator request shared by the Measurement button,
+  menu, and toolbar. Presentation state never disables one surface independently of another. The
+  backend return value and lifecycle/status evidence remain authoritative: an unsafe duplicate
+  interval, active manual writer, unfinished save, missing RTSP URL, or identical Left/Right stream
+  is rejected without starting a producer.
+
 - Dual-Pixhawk Ethernet input is received on `udpin:0.0.0.0:14550` for P1/Left and
-  `udpin:0.0.0.0:14551` for P2/Right. Custom CAN magnetometer telemetry uses MAVLink message
-  `SASL_CAN_MAG` (ID `180`) and distinguishes CAN1/CAN2 with its `can_port` field. The subscriber
-  requests that stream at 20 Hz and, if the initial interval request is lost, retries only
-  `SASL_CAN_MAG` after two seconds, up to three total attempts; the first dedicated sample stops
-  further retries.
+  `udpin:0.0.0.0:14551` for P2/Right, with expected system IDs `1` and `2`. Operational connections
+  explicitly use GCS source `255/190`. The Stock default profile requests only consumer-backed
+  standard messages: ATTITUDE, SYS_STATUS, GPS_RAW_INT/GPS2_RAW, GPS_RTK/GPS2_RTK,
+  SCALED_IMU/2/3, DEBUG_VECT, RAW_IMU, LOCAL_POSITION_NED, GLOBAL_POSITION_INT, VFR_HUD, and
+  BATTERY_STATUS. It does not request or retry private `SASL_CAN_MAG`; an unsolicited custom-firmware
+  sample remains decodable for compatibility. Each `udpin` endpoint is exclusively owned: connection fails with an explicit
+  port-in-use error if another Workstation, StereoWIRIS process, QGC session, or leaked worker has
+  already bound it, and the live pymavlink socket disables later address reuse. If heartbeat stays
+  live while `ATTITUDE` is absent or older than two seconds, Workstation re-requests the 30 Hz
+  `ATTITUDE` interval up to three times, waits ten seconds, and repeats the bounded recovery cycle;
+  a fresh `ATTITUDE` sample immediately clears that outage cycle. When all expected-system RX is
+  silent for 10 seconds, stream/parameter commands and RTCM are fail-closed instead of cycling the
+  host socket.
 - Each Pixhawk exposes both `GPS_RAW_INT` (GPS1) and `GPS2_RAW` (GPS2). The Pixhawk workspace
   shows all four receiver rows, including MSL/ellipsoid altitude, HDOP/VDOP, H/V accuracy, fix,
   satellites, and age. Its bottom P1/P2 antenna selectors independently choose the receiver used
@@ -545,126 +578,62 @@ python3 tools/check_portable_paths.py
   `3ef5736aabdaec9047cf97b0cd5eefa2cfc074672c3ae43776c3f0e12d2349ce`. It retains the custom
   CAN1/CAN2-to-MAVLink path and guards MAVLink signing status lookup against null instance slots.
 - Measurement result evidence schema v2 adds `policy_id=field_measurement_v1`,
-  `validity=VALID|ESTIMATED|INVALID`, `hard_block_reasons`, and `advisory_reasons`. Paired Parquet
-  rows expose the same decision as `measurement_policy_id`, `measurement_validity`,
-  `measurement_hard_block_reasons`, and `measurement_advisory_reasons`. The compatibility
+  `validity=VALID|ESTIMATED|INVALID`, `hard_block_reasons`, and `advisory_reasons`. The fixed
+  `measurements.jsonl` stream preserves the same decision and the compatibility
   `measurement_valid` field remains true for both computed `VALID` and `ESTIMATED` results.
 
 - The canonical runtime root is `.local/workstation_data/` at the repository root, or the path in
-  `SASL_WORKSTATION_DATA_ROOT`. It owns `stereo_distance_settings.json`, `recordings/`,
-  `calibration/`, `models/`, and runtime caches. The five persistent asset fields—intrinsics,
-  detector weights, calibration root, validation root, and validation JSON—are normalized to
-  data-root-relative POSIX paths. Known legacy values remain readable, but the next production Save
-  refuses machine-external directories and never writes a checkout/user-home absolute path.
-- New sessions live directly under `.local/workstation_data/recordings/<session-id>/`. The
-  timestamp-based session ID is allocated only by explicit `Sessions > Current > Create Session Folder`; an
-  app-run ID is recorded separately so one session can be recovered across application restarts.
-  `measurement_session_snapshot` supplies the visible folder basename, absolute `session_dir`,
-  local open date/time metadata, lifecycle state, and exact recovery error. Existing
-  `recordings/sessions/<session-id>/` trees remain read/recovery compatible but are never used for
-  new writes; a duplicate ID across both layouts fails closed. Opening this parent has no readiness
-  input interface and consumes no device, synchronization, calibration, method, or Alignment state.
-- Pre-session Calibration uses the configured reusable calibration root, normally
-  `.local/workstation_data/calibration/`. Session-shared Calibration runs live under
-  `<session-id>/calibration/<run-time>/`, including synchronized left/right photos, computed
-  intrinsic JSON files, and immutable copies of any operator-loaded intrinsic JSON. Approved
-  intrinsics and extrinsics are additionally published under
-  `profiles/intrinsics/<kind>-<sha256>.json` and
-  `profiles/extrinsics/<kind>-<sha256>.json`; mutable compatibility aliases are never used as the
-  child evidence identity. Calibration run
-  caches are keyed by parent Session ID, so a second Session in the same application process cannot
-  reuse the first Session's writable path. The exact active pre-session profile file is copied into
-  a child package's `inputs/calibration/active/` evidence when that Measurement starts.
-  Alignment captures/profiles and their native-frame/run-event evidence remain outside
-  `measurements/` at the same Session root; applying or reverting Alignment atomically updates
-  `alignment/active_alignment.json` as a pointer/projection. Every applied or reverted selection is
-  retained under `alignment/selections/alignment-<sha256>.json`, and the active immutable selection
-  is copied into each consuming child under `inputs/alignment/active/`.
-- Each measurement lives under
-  `<session-id>/measurements/mNNNNNN/`; its spool, video, captures, recording generation,
-  results, and revisions never share a writable path with a sibling measurement.
-  Measurement-start method inputs are copied independently to
-  `inputs/methods/<method_id>/frozen_input.json` for all eight canonical IDs.
-  Artifact registration resolves real paths against that child root and rejects absolute escapes,
-  `..` traversal, and symlink resolution into a sibling or parent-owned path.
-- Each child `revisions/rNNNN/package_manifest.json` uses schema
-  `workstation-measurement-package-v1`. It inventories measurement-relative artifact paths, roles,
-  producer/source identity, required/present/missing/failed state, byte size, SHA-256, media/schema
-  information, and evidence completeness. `package_manifest.sha256` seals the canonical manifest;
-  `latest_revision.json` points to the current revision and each later revision hashes its
-  predecessor. Parent `measurement_session_manifest.json` uses schema
-  `workstation-measurement-session-v1` and hashes every latest child manifest plus session-shared
-  evidence. Schema version 2 additionally indexes each child's order/current recording generation,
-  authoritative JSONL/context fragment hashes, and native binary artifact inventory without
-  concatenating a second parent-level authoritative stream; version 1 remains readable.
-- Each finalized measurement publishes one `data` link backed by
-  `.workstation/publish/current`. Canonical `data/raw/*.jsonl` and
-  `data/context/{geometry_contexts,time_sync_epochs}.jsonl` are the authoritative structured
-  records. `measurement_pairs.parquet`, `camera_timeline.parquet`,
-  `pixhawk_timeline.parquet`, `gnss_base_timeline.parquet`, and
-  `geometry_comparison.parquet` are verified derived analysis views. `context.json` and
-  `measurement.json` record the atomic generation, authority/derived-from contract, schemas, row
-  counts, sizes, and hashes. Default CSV, per-Pixhawk XLSX, and per-measurement XLSX files are not
-  emitted.
-- `data/raw/method_evaluation_bundles.jsonl` is the atomic recovery/commit authority for one
-  snapshot's eight terminal outcomes. Finalization validates each bundle hash and materializes one
-  independently verified stream at `data/raw/method_results/<method_id>.jsonl` for every canonical
-  method, including empty streams. `data/raw/stereo_measurements.jsonl` remains the representative
-  Pixhawk attitude + GNSS/RTK projection and is never replaced by a comparison result.
-- `recordings/<session-id>/review.xlsx` is the one operator-facing integrated workbook. It combines
-  Session, Measurements, Results, Quality, Geometry, Devices, Captures, Warnings, and Files views
-  across all finalized child measurements. It also creates one stable `M_*` worksheet for each of
-  the eight canonical Measurement methods. Each method sheet reads that method's outcome JSONL and
-  combines its terminal status/result summary with relevant Geometry and pair-quality fields;
-  methods with no evaluated pair are header-only. A legacy blocked result whose
-  `measurement_method_id` is empty remains in `Results` and is
-  not inherited into any `M_*` sheet from the Measurement summary. It is derived and regenerable;
-  workbook failure never invalidates verified authoritative JSONL/native evidence.
-- Each evaluated measurement pair—valid, rejected, unresolved, or blocked—retains its primary
-  canonical input/result/readiness JSON in `data/raw/stereo_measurements.jsonl` plus all eight
-  self-contained method attempts/results in the method bundle/result streams. `terminal_record_id`
-  is stable across finalization retry,
-  and `geometry_context_id` plus side-specific time-sync epoch IDs resolve into the child context
-  registries. Derived Parquet stable typed columns support analysis, while `row_json` preserves
-  every dynamic source field.
-  Its exact left/right decoded source pixels are stored as lossless, no-overlay native PNGs.
-  PNG encoding, fsync, and delayed decode/dimension verification run on a bounded daemon writer;
-  the GUI records a deterministic pending path and finalization waits until every queued request
-  has published a complete, missing, or failed terminal result.
-- `measurement-method-snapshot-v1` supplies the Measurement operator view without creating a second
-  geometry owner. Runtime `method_capabilities` remains instance-driven, while the additive
-  `method_catalog` always contains all eight stable method IDs. Every available capability carries
-  readiness/reasons, component-source mapping, required inputs, and a read-only `input_values`
-  projection. Missing candidates/profiles become blocked catalog rows and their values remain
-  `null`; the projection
-  never fabricates a candidate pose or merges PX4 FRD/NED, GNSS NED, candidate virtual-FRD/NED,
-  and OpenCV RDF values.
-- Continuous `video/raw_left.mp4` and `video/raw_right.mp4` are hashed only after their size and
-  modification time stabilize. Bounded `ffprobe` metadata records codec, frame count, dimensions,
-  FPS, duration, recording backend, and encoding provenance. Probe and optional full-stream decode
-  run on a dedicated verification thread while the UI/status timers continue; sealing waits for
-  the worker's terminal descriptors.
-- The package copies active calibration/Alignment profile inputs, the selected calibration source
-  images and metadata reachable from those profiles, redacted effective settings, Git/software provenance,
-  device evidence, application logs, ULogs, target/drone telemetry, and exact RTCM bytes when the
-  corresponding source is active. ULogs and Target Drone files already sealed inside the
-  measurement are registered in place by path/size/SHA rather than copied again under `assets/`.
-- YOLO detector weights remain runtime-owned under the Workstation data root. Session and
-  Measurement packages do not copy the model into `inputs/models/`, do not register an
-  `active_yolo_model` artifact, and do not make model-file presence part of evidence completeness.
-  The selected portable model path can still appear in the redacted effective-settings snapshot.
+  `SASL_WORKSTATION_DATA_ROOT`. It owns `stereo_distance_settings.json`, `measurement_data/`,
+  `calibration/`, `models/`, historical `recordings/`, and runtime caches. Persistent asset and data
+  folder settings are normalized to data-root-relative POSIX paths.
+- New Measurement data uses the relative `measurement_data_root` setting, default
+  `measurement_data`. Hand-edited absolute or escaping values fall back to that safe default and
+  report `DEGRADED`; they do not reject Measurement.
+- Structured files have stable type ownership and append across application restarts:
+
+  | Stream | Fixed relative file |
+  | --- | --- |
+  | run/capture events | `events.jsonl`, `capture_events.jsonl` |
+  | primary pair results | `measurements.jsonl` |
+  | eight-method bundles/outcomes | `method_evaluations.jsonl` |
+  | camera observations | `camera_left.jsonl`, `camera_right.jsonl` |
+  | rig and target PX4 | `px4_left.jsonl`, `px4_right.jsonl`, `px4_drone.jsonl` |
+  | Base GNSS | `gnss_base.jsonl` |
+  | analysis comparisons | `geometry_comparisons.jsonl` |
+  | Alignment changes | `alignment.jsonl` |
+  | binary inventory/logs | `artifacts.jsonl`, `native_frames.jsonl`, `application_log.jsonl` |
+
+- The writer removes Session membership fields, adds host UTC and monotonic record timestamps, and
+  preserves producer coordinate/source-clock fields. A torn final JSONL fragment is left as one bad
+  historical line; the next valid append begins on a new line. Files are not rotated automatically.
+- Priority streams (`events`, results, method evaluations, captures, Alignment, artifacts, native
+  frames) use a reserved bounded queue. Bulk camera/PX4/GNSS rows use a separate bounded queue whose
+  oldest queued item may be dropped under overload. Each stream reports its own state/error/drop
+  count and can be retried independently.
+- MP4, WIRIS still downloads, exact HR imports, native PNGs, and ULogs use
+  `YYYYMMDD_HHMMSS_nanoseconds+offset_<label>.<ext>`. Collision suffixes are added and publication
+  refuses replacement, so yesterday's `..._left.mp4` cannot be erased by a later capture.
+- Exact RTCM correction bytes append only while Measurement or Manual record is active under
+  `raw/gnss/{ntrip_transport_chunk,ntrip_rtcm_frame,base_rtcm_frame}.rtcm`, with a fixed sibling
+  offset/hash JSONL index. RTCM evidence failure is diagnostic; injection/routing and Measurement
+  admission remain independent.
+- Calibration continues to use its reusable calibration root and content-addressed profiles.
+  Calibration photo-set “sessions” are calibration-domain groupings only; they are not Measurement
+  Session gates. Alignment events append to the data root and the active in-memory pose spans runs
+  until Revert, Reset, or restart.
+- Existing `recordings/<id>/` and `recordings/sessions/<id>/` trees are never scanned or recovered
+  by the new workflow. `Data > Status > Open Legacy Recordings Folder` exposes them read-only through
+  the file manager. Old manifests, Parquet, and `review.xlsx` remain untouched but no new instance is
+  generated automatically.
+- `measurement-method-snapshot-v1` still supplies the live Measurement view. Runtime
+  `method_capabilities` remains instance-driven while `method_catalog` lists all eight method IDs;
+  missing inputs become explicit BLOCKED outcomes rather than invented pose data.
+- YOLO detector weights remain runtime-owned under the Workstation data root and are not copied into
+  Measurement data.
 - The default detector is `.local/workstation_data/models/yolov8m.pt`. Runtime model download is
   disabled: provision the approved bytes whose size and SHA-256 match `model-manifest.json` before
   launch. Relative custom model paths resolve under the canonical runtime root; enumerated legacy
   defaults remain readable without migration.
-- Active RTCM evidence is append-only under `<measurement-root>/raw/gnss/`. Raw NTRIP chunks are
-  stored in `ntrip_transport_chunk.rtcm`; parsed NTRIP and Base frames use
-  `ntrip_rtcm_frame.rtcm` and `base_rtcm_frame.rtcm`. Each binary has a sibling `.rtcm.jsonl`
-  index containing global `sequence`, per-source `source_sequence`, byte offset/size, SHA-256,
-  producer receive UTC/monotonic nanoseconds, source, record kind, and RTCM message type. Recovery
-  verifies contiguous offsets, every indexed hash, and the absence of unindexed binary tails
-  before selecting the next sequence.
-
 - Intrinsics profiles contain per-camera OpenCV `K,D`, source zoom, calibration-quality snapshot,
   and solver diagnostics. Diagnostics include effective view IDs, normalized checkerboard view
   geometry, per-view errors, OpenCV intrinsic/extrinsic standard deviations, deterministic subset
@@ -678,11 +647,10 @@ python3 tools/check_portable_paths.py
 - Calibration images are per-camera checkerboard observations grouped by capture ID under the
   active calibration root. Timing-eligible matching observations form stereo pairs; an over-limit
   capture remains in the independent left/right `K,D` inputs with `stereo_pair_saved=false` and
-  `intrinsics_only_sides`, and is excluded from `R,t`. Before `Create Session Folder`, the configured
-  reusable root is used directly. While a Session is
-  open, manual/FTP runs use `<session-id>/calibration/<timestamp>`, while Auto capture uses that
-  run's `calib_capture/AutoCapture` child. JSON profile paths are selected independently in the
-  Calibration UI. `calibration_pair_selection.json` v2 stores only Photo-set-relative paths;
+  `intrinsics_only_sides`, and is excluded from `R,t`. Manual, FTP, and Auto capture all use the
+  configured reusable calibration root; Measurement start/stop never changes that owner. JSON
+  profile paths are selected independently in the Calibration UI.
+  `calibration_pair_selection.json` v2 stores only Photo-set-relative paths;
   unresolved legacy paths block calculation and are never replaced by an all-photo fallback.
 - Each capture metadata record identifies the exact source frame, source/native dimensions,
   preview dimensions, saved dimensions, crop/scale contract, overlay state, SHA-256, timing gate,
@@ -695,7 +663,7 @@ python3 tools/check_portable_paths.py
   image file `mtime`; the UI always labels which source was used.
 - `Capture HR Still` photos are created with `SIHR TRUE` + `CPTR`; `ICPT` is polled for completion.
   When WIRIS FTP is enabled, the worker lists the camera storage before capture, downloads only
-  a new/changed post-CPTR image into the open session, and validates it during package finalization.
+  a new/changed post-CPTR image into the data root and validates the downloaded bytes immediately.
   The left/right `CPTR` dispatches share a capture ID and barrier; their host monotonic delta is the
   explicit FTP pairing basis. It is classified as `HOST_DISPATCH_PROXY`: it may permit pair
   persistence but always has `precision_qualified=false` and
@@ -703,21 +671,20 @@ python3 tools/check_portable_paths.py
   is `CAMERA_TIMESTAMP_VERIFIED`; only explicitly verified per-camera exposure fields can become
   `EXPOSURE_TIMESTAMP_VERIFIED`. If FTP is disabled or fails, the
   still remains camera-local until an exact HR file is imported.
-- Each button press appends one JSON object to the current session's
-  `hr_captures.jsonl`; downloaded/imported image bytes remain separate session artifacts.
+- Each button press appends one JSON object to `capture_events.jsonl`; downloaded/imported image
+  bytes remain separate timestamped artifacts.
 - `Capture OZ Still` photos are created with `SIVI TRUE` + `CPTR`; `ICPT` is polled separately from
   HR and RTSP recording. With FTP enabled, fresh left/right originals are downloaded into the
-  session and retain the same capture-ID/dispatch pairing evidence; otherwise they remain
+  data root and retain the same capture-ID/dispatch pairing evidence; otherwise they remain
   camera-local.
-- Each OZ button press appends one JSON object to the current session's `oz_captures.jsonl`;
-  `session_static.json` exposes the aggregate as `metadata.oz_photo_capture`, and
-  `run_events.jsonl` records an `oz_capture_event`. Event files contain evidence values while
+- Each OZ button press appends an `oz_capture_event` object to `capture_events.jsonl`. Event rows
+  contain evidence values while
   image bytes remain independently hashed artifacts.
 - NTRIP inputs are a provider-independent caster hostname (without `http://` or `https://`),
-  TCP port, mountpoint, optional TLS flag, GGA policy, direct Username, masked session Password,
-  and optional legacy environment-variable names. An untouched launch supplies direct defaults
-  `SASL`/`ngii`; operator edits replace them. The active Password is not saved in the settings
-  file or evidence, although the deployment default is plaintext in the source tree.
+  TCP port, mountpoint, optional TLS flag, GGA policy, direct Username, masked runtime Password,
+  and optional legacy environment-variable names. Username may have a non-secret deployment
+  default, but Password starts empty and must come from the current UI, OS keyring, or legacy
+  environment fallback. It is never stored in settings, source defaults, logs, or evidence.
 - The NGII RTS2 Base-assisted route is `NGII NTRIP → StereoDistance PC → USB/Serial → Base
   F9P` during Base initialization. After the fixed Base coordinate is confirmed, local RTCM
   follows `Base F9P → StereoDistance PC → Ethernet/MAVLink GPS_RTCM_DATA → Left/Right
@@ -744,25 +711,24 @@ python3 tools/check_portable_paths.py
   `optical_pose_auto_suggestion_accepted` events. The complete native point sets are retained
   in those event payloads, while `optical_pose_annotations_updated` records the committed
   annotation and `AUTO_ACCEPTED`/`MANUAL_EDITED` state.
-- `session_static.json` stores the JSON-safe `metadata.optical_pose` projection. It references
-  `run_events.jsonl`, `native_frames.jsonl`, and
-  `frames/optical-pose-burst`; it never embeds QImage/UI objects.
+- `alignment.jsonl` stores JSON-safe Alignment update/reset events and references timestamped native
+  frame paths; it never embeds QImage/UI objects.
 - Measurement-method snapshots use stable IDs (`pixhawk_rtk_live`, `checkerboard_stereo`,
   `horizon_hybrid`, `mountain_gnss`, `drone_rtk_rotation_hybrid`,
   `drone_rtk_multiview`, `terrain_pnp`, and `combined_hybrid`). Legacy preferred/fallback settings
   remain readable for old packages, but new all-method execution does not use them to replace the
   fixed Pixhawk/RTK representative result.
-- Every child package metadata record freezes `measurement_method_fill_policy` and
-  `measurement_frozen_comparison_inputs` under schema `measurement-method-config-v1`. The fill
-  policy is keyed by method and then by
+- Every transient run freezes `measurement_method_fill_policy` and
+  `measurement_frozen_comparison_inputs` under schema `measurement-method-config-v1`; the values
+  are attached to append-only result/method records rather than a package. The fill policy is keyed by method and then by
   `<left|right>.<roll_deg|pitch_deg|yaw_deg|north_m|east_m|down_m>`, with values `live_pixhawk`,
-  `live_gnss`, or `none`. Restart recovery reloads this child-owned policy rather than current
-  global Settings.
+  `live_gnss`, or `none`. Application restart begins a new transient run and does not recover an
+  unfinished package.
 - Measurement rows record `measurement_method_id`, method instance ID, geometry SHA-256,
   `measurement_geometry_kind`, selection reason, and the left/right per-DOF component-source
   mapping in addition to the legacy triangulation source fields. `geometry_kind` distinguishes
   the math kernel (`relative_pose`/`live_pixhawk_mount`) from the independently evaluated method.
-- Visible settings ownership is split by lifecycle: Calibration owns the applied Intrinsics,
+- Visible settings ownership is split by domain: Calibration owns the applied Intrinsics,
   `Settings > YOLO / RTSP` owns the canonical `yolo_input_size`, and Measurement Settings owns
   confidence, IoU, and pair-gate values. Legacy backend aliases remain readable for compatibility
   but are not duplicated as visible controls.
@@ -774,6 +740,24 @@ python3 tools/check_portable_paths.py
 
 ## Operational Rules
 
+- Treat the three simple Calibration tabs as an ordered workflow, not as a quality bypass.
+  `FAIL` continues to block Apply, `WARNING` still requires explicit review/confirmation in
+  `고급 캘리브레이션`, and a zoom or native-raster mismatch remains a hard failure. The
+  advanced area is presentation-only disclosure; collapsing it never disables its underlying
+  command state or changes the active calibration.
+
+- Camera Preview defaults to RTSP TCP with Auto decoder. Auto uses `nvh264dec` only when its
+  factory can be created and `nvidia-smi` confirms a working driver; otherwise it reports WARN and
+  starts with mandatory `avdec_h264`. If NVIDIA later hits a launch error, five-second first-frame
+  timeout, or three-second live-frame stall, Auto switches once after the active MP4 is finalized;
+  the same output path is never reopened. Explicit `NVIDIA` has no software fallback and camera
+  start is rejected until the operator selects Auto/Software or repairs the NVIDIA runtime.
+- Read decoder state in `Devices > Cameras` first. `Decoder LEFT/RIGHT` is the primary actual
+  pipeline evidence; compact CAM L/R tooltips include the same actual/fallback state, while
+  `Diagnostics > Performance` shows GPU model/driver, NVDEC availability, requested/effective
+  candidates, and per-side detail. `CUDA` shown for YOLO inference is a separate resource decision
+  and does not prove that H.264 decode uses NVDEC.
+
 - Never issue `mavlink stop` as part of USB Ethernet recovery or persistent startup. On affected
   PX4 v1.17 custom firmware, stopping and restarting a live instance can leave a sparse instance
   slot that the signing callback dereferences and hard-fault task `mavlink_rcv_if2`. Do not issue a
@@ -783,6 +767,25 @@ python3 tools/check_portable_paths.py
   unicast and broadcast packets immediately after boot, before any host MAVLink packet is sent,
   indicate competing instances. Keep QGC closed while Workstation owns UDP ports `14550` and
   `14551`.
+- Treat each Workstation `udpin` port as single-owner state. Do not run Workstation and StereoWIRIS
+  against the same `14550`/`14551` listeners simultaneously. A second owner now fails at connect
+  instead of silently sharing pymavlink's reusable socket; close the other application or leaked
+  worker and retry. If heartbeat remains current but `ATTITUDE` becomes stale, leave the connection
+  open while the bounded interval re-request runs and inspect its recovery/failure log before
+  power-cycling the Pixhawk.
+- Treat `ETH MAVLINK RX STALLED` as a remote PX4-side service failure, not as proof that the NIC,
+  ping, or host UDP socket is down. Workstation keeps only the 1 Hz GCS recovery probe, blocks new
+  RTCM/stream/parameter traffic to that side, and leaves the other side running. Re-pressing Connect
+  does not close/reopen the host socket as a claimed recovery.
+- The stall recovery command is enabled only for the named stalled side. Run `Find USB` immediately
+  before recovery; Workstation requires one unique USB heartbeat mapping (P1=sysid 1, P2=sysid 2),
+  no older than 30 seconds, asks the operator to confirm the side/device/sysid, and revalidates it in
+  the one-shot worker before sending reboot. Missing, stale, duplicate, or changed identity; active
+  Measurement/recording/save/finalization; or another PX4 command fails closed. USB command send is
+  not success: Ethernet must enter `RECOVERING` and complete a fresh 10-minute qualification.
+- USB Ethernet profile persistence and runtime stall recovery are separate operations. The verified
+  recovery command writes no PX4 parameter/config/file and never flashes firmware. Automatic reboot
+  is not supported.
 - While Workstation performs the automatic PX4 calibration-parameter readback after a side's first
   heartbeat, that side's normal ATTITUDE/GNSS receive loop is intentionally reserved. Its status
   shows `PARAM SYNC` with detail `PX4 파라미터 조회 중 (정상)` instead of falsely reporting
@@ -819,48 +822,40 @@ python3 tools/check_portable_paths.py
   and FTP captures over `Max Live pair Δt` still save every side whose checkerboard validation
   succeeds, mark those files `INTRINSICS ONLY`, and exclude them from stereo `R,t`. Auto capture
   consumes each new frame identity once and counts only timing-eligible two-sided captures as
-  valid stereo pairs. Calibration session/manifest `pair_count` uses the same R,t-eligibility
+  valid stereo pairs. Calibration photo-set manifest `pair_count` uses the same R,t-eligibility
   rule; K,D-only files remain visible in the selected Photo set without inflating that count.
 - FTP calibration pairing never borrows the current RTSP preview clock. Both cameras must report
   the same capture ID, the synchronized-CPTR-dispatch contract, and per-camera dispatch timestamps;
   the absolute dispatch delta must satisfy the configured pair gate. These host timestamps prove
   trigger proximity only. Metadata continues to mark the camera exposure time as unknown. An FTP
   capture outside the dispatch gate is retained for per-camera `K,D` only.
-- `Sessions > Current > Create Session Folder` has no device, synchronization, Calibration,
-  Methods, or Alignment readiness gate. It only allocates the parent and is constrained by lifecycle
-  conflicts such as an already-open parent, active measurement/recording work, or an unfinished
-  save retry. A successful click must show the exact folder basename, local creation time, and
-  absolute path. A backend `False` return or exception remains visible as a Session-folder error
-  across status polling instead of appearing as a no-op. Calibration capture/load/save is available
-  before opening and uses the reusable calibration root; Alignment capture remains Session-owned.
-  `Measurement > 측정 시작` atomically creates the next child and starts Detection. It is constrained
-  only by parent/child lifecycle and producer ownership; missing Alignment, exact K,D, GNSS,
-  synchronization, or a ready method does not block child creation. Those conditions are displayed
-  and enforced when a pair is promoted to a valid MeasurementAttempt, while blocked raw evidence
-  remains in that child. Detection can run once per Measurement; `측정 종료` automatically saves,
-  verifies, and seals that child. `Retry Measurement Save` is the explicit recovery path. A `Pre`
-  HR/OZ capture before start may lazily create the same draft child; start reuses it instead of
-  allocating another ID.
-- Persisted lifecycle, derived readiness, and evidence completeness are separate. Session
-  `Ready for saving` means only that its folder is open. In Measurement, `Evidence collection`
-  checks the open parent/current child, camera pair, and synchronization, while `Valid measurement`
-  additionally requires at least one complete geometry method. A blocked validity projection does
-  not suppress raw/Pre evidence collection.
+- `측정 시작` is gated only by live command/resource facts: valid distinct Left/Right RTSP inputs,
+  no already-running transient Measurement, and availability of the camera resource. It never
+  reads old Session state, legacy manifests, storage completeness, writer health, or save-retry
+  flags.
+- Camera-resource contention produces `QUEUED`, not failure. Manual record is stopped first;
+  still capture, Alignment/Calibration capture, WIRIS commands/time/zoom/image format, camera
+  discovery, RTSP check, activation, and reactivation are polled until they release the cameras.
+  Manual record is not resumed automatically.
+- A run transitions `IDLE → STARTING → RUNNING → STOPPING → IDLE`. `측정 종료` releases live
+  owners and requests writer flush without waiting for save, hash, probe, RTCM drain, package, or
+  workbook completion. A new run can start immediately after the actual camera workers stop.
+- Structured data is recorded only while Measurement or Manual record is active. Explicit capture,
+  import, and Alignment commands always append their own event even outside those intervals.
+- Storage is best-effort. A setup/open/write/serialization/fsync failure drops the affected record
+  or pauses only that stream and is reported in `Data`; it never stops the recorder or raises through
+  a Qt callback into Measurement admission. `Retry Storage` clears failed-stream state.
+- Native PNG completion is joined to its append-only recording row by the unique async request ID,
+  independently of the 1024-pair lookup cache. A stale completion for an older request cannot
+  overwrite a newer pending request for the same pair. The disk-I/O barrier is acknowledged when
+  the writer finishes even if row projection must be deferred, so a later row-construction failure
+  cannot hold the next run open. Drone RTK Multi-view `BLOCKED` samples stay in audit evidence
+  but are not considered collected; only `READY` samples clear the target editor when the next
+  Frozen burst arrives.
 - The Measurement view displays all eight frozen/live source values independently. Missing method
   instances remain visible as blocked catalog rows, while each pair persists one atomic bundle with
   method ID, instance ID, component sources, geometry hash, status, warnings, and worker timing for
-  every method. `review.xlsx` method sheets read those streams directly; a method-less legacy
-  blocked pair remains only in the common Results view.
-- A parent remains `OPEN` after a child is sealed. Another child may start only after the current
-  child is sealed. `Close Session` automatically persists and seals a lifecycle-only empty child
-  or a completed Post-Capture child before closing the parent. An active Detection interval must be
-  stopped first, and any save, drain, or integrity failure leaves the parent open rather than
-  publishing a false-success Session manifest.
-- Evidence completeness and measurement validity are independent. A session with no valid range
-  can be `SEALED_COMPLETE` when every expected artifact explaining that outcome exists; a valid
-  range can be `SEALED_INCOMPLETE` when a required original is missing.
-- Required evidence is source-driven. A source activated at any point in the session remains an
-  expectation even if it produces zero rows. A source never activated is `not_applicable`.
+  every method. No automatic workbook or Parquet materialization follows run stop.
 - Calibration quality and evidence preservation are separate. `WARNING` and `FAIL` calculation
   attempts are saved under `attempts/` without changing active aliases or settings. `WARNING`
   requires confirmation before Apply and `FAIL` cannot be applied. Any applied PASS/confirmed
@@ -871,62 +866,31 @@ python3 tools/check_portable_paths.py
   snapshots exact operating K,D plus the latest successful Draft for each comparison method without
   altering global Active. Missing Draft or creation-time K,D mismatch becomes that method's BLOCKED
   evidence rather than a reason to substitute another method.
-- Session is the field-work grouping boundary; Measurement is the atomic writable, retry, and seal
-  boundary; Revision is append-only late evidence for the same Measurement and never grants a
-  second Detection interval.
-- Requesting HR/OZ makes both exact camera originals required. A timeout, one-sided download,
-  invalid image, size/hash mismatch, or missing file is preserved and seals the package
-  `SEALED_INCOMPLETE`; it never fabricates a successful pair.
-- Automatic Measurement finalization does not discard a failed save. Its durable order is session-save completion,
-  measurement-scoped RTCM close/drain acknowledgement, RTCM binary/index semantic verification,
-  artifact inventory/readback, then manifest seal. Save, drain, manifest, write, or probe errors
-  leave the package and spool `RECOVERABLE` and create no false-success manifest. A torn final spool
-  record is quarantined while its valid prefix is retained; malformed interior rows remain a hard
-  error. Retrying resumes the unfinished boundary instead of regenerating already manifested parent
-  review bytes.
-- Live recording spools and heterogeneous event ledgers remain JSONL because they must append and
-  recover a valid prefix after interruption. Successful finalization first writes and rereads
-  canonical JSONL, then creates typed Parquet as a derived view, validates the published generation,
-  and only then deletes the temporary spool. CSV is available only as an explicit future/export
-  boundary, not a default source of truth.
-- Sealed revisions are immutable. Additional evidence requires `Create Revision`; a new manifest
-  inventories the complete current folder and includes the preceding manifest hash. Adding an
-  unlisted regular evidence file without a revision makes latest-package verification fail.
-- Settings/provenance snapshots redact passwords, tokens, embedded URL credentials, and absolute
-  machine paths. Multiline secret-bearing diff hunks are omitted fail-closed. Environment-variable
-  names are retained, but credential values are never read into the package. Recovered
-  session-relative and FTP-local artifact paths must remain beneath the active session root;
-  package finalization never imports an arbitrary host path.
-- Persistent settings path rules do not rewrite sealed evidence. Historical source paths may remain
-  as provenance, but replay and preview must use package-relative artifact paths and verified hashes.
-  `/dev`, `/opt`, bounded `/tmp`, and camera-side `/` remain explicit machine/device contracts rather
-  than portable asset fields.
+- Requesting HR/OZ does not create a parent or draft. Success, timeout, one-sided download, invalid
+  image, and import failure each append an explicit capture event. Exact downloaded/imported bytes
+  use timestamp names and are never overwritten.
+- Settings and event projections redact passwords, tokens, and embedded URL credentials. Persistent
+  data paths remain relative to `SASL_WORKSTATION_DATA_ROOT`; `/dev`, `/opt`, bounded `/tmp`, and
+  camera-side `/` remain explicit machine/device interfaces.
 - Canonical capture/event rows are append-only evidence. Hiding a graph row changes only the view,
-  a torn final JSONL write is quarantined while a malformed middle line is a hard failure, and
-  preview opens only after the artifact's recorded byte size and SHA-256 have been reverified.
-- Spool and run-evidence `OSError` failures stop recording, retain the working spool, and expose a
-  retryable/`RECOVERABLE` session error without escaping a GUI timer callback. Run-event JSONL
-  appends flush to the kernel immediately but batch `fsync` at session/manifest/shutdown barriers;
-  native PNG and video verification each have their own asynchronous durability barrier.
+  and a malformed historical line is not rewritten. The next record always appends after a newline.
 - Full-rate RTCM envelopes enter a 4,096-item bounded worker queue. A full queue applies producer
-  backpressure rather than silently discarding evidence. The separate Pixhawk delivery queue is
+  backpressure within the RTCM worker rather than the GUI. The separate Pixhawk delivery queue is
   latest-relevant and bounded: a replaced correction returns its exact pipeline sequence as an
   explicit stale drop, while the original received bytes remain in evidence.
 - An RTCM correction older than two seconds at the injection boundary is not sent to Pixhawk. Its
   bytes, source timestamp, hash, sequence, targets, age, and `stale-before-injection` outcome remain
-  observable. Evidence-write, recovery-index, and unconfirmed-delivery failures make an active
-  measurement retryable/`RECOVERABLE`; they are never presented as successful delivery.
-- Every RTCM envelope freezes its session root, measurement context token, and routing context when
-  enqueued. Paired binary/index writes use explicit offsets, flush/readback checks, and rollback on
-  failure; reconnect retires the prior subscriber generation. A measurement-specific drain ACK
-  proves that all sequences through the acknowledged high-water have terminal evidence and delivery
-  outcomes while leaving the global RTCM pipeline available for the next child measurement.
+  observable. Evidence-write, recovery-index, and unconfirmed-delivery failures remain diagnostics;
+  they are never presented as successful delivery and never create a save-retry gate.
+- Every RTCM envelope freezes its data-root context and routing context when enqueued. Paired
+  binary/index writes use explicit offsets, flush/readback checks, and rollback on failure; reconnect
+  retires the prior subscriber generation. Routing remains available after an evidence failure.
 - NTRIP, RTCM pipeline, and Base GNSS worker results that update status labels, logs, tables, or
   evidence projections are always queued onto the Qt GUI thread. Direct cross-thread connections
   are limited to documented lock/queue adapters that never access widgets.
-- Shutdown stops NTRIP and Base producers first, drains RTCM ingress and evidence, waits for every
+- Shutdown stops NTRIP and Base producers first, drains RTCM ingress, waits for every
   Pixhawk injection outcome (or records the exact unconfirmed sequences after the bounded timeout),
-  and only then disconnects MAVLink/runtime workers and finalizes the session. Window close remains
+  and only then disconnects MAVLink/runtime workers and closes the data writer. Window close remains
   non-blocking and retryable during the cooperative phase. A five-second process-wide close
   deadline then flushes evidence, terminates any remaining camera child, requests interruption on
   outstanding `QThread`s, and bounds the final forced wait to one additional second.
@@ -1029,16 +993,17 @@ python3 tools/check_portable_paths.py
   responses, completion state, camera-local/FTP/import storage state, and selected
   `Pre`/`Post`/`Checkpoint` purpose.
 - `Capture OZ Still` and `Capture HR Still` share the purpose selector but cannot run simultaneously. They
-  do not start or stop RTSP/MP4 session recording.
+  do not start or stop RTSP/MP4 recording.
 - Each `Capture OZ Still` event records its sequence ID, timestamp, active zoom readback, left/right
   camera responses, completion state, selected purpose, and per-side camera-local/FTP state.
 - A caster host and mountpoint are required only when starting an NTRIP operation. The
   NGII RTS2 profile supplies them for new settings; an explicitly selected custom provider
   must supply its own values before starting.
-- An untouched NTRIP UI uses Username `SASL` and masked Password `ngii`. The runtime owner is
-  initialized before Settings is opened. A Password changed or cleared in `Settings > GNSS`
-  takes effect only after `Apply` or `Save`; clearing it enables the keyring/legacy-environment
-  fallback instead of silently restoring the deployment default in that running session.
+- An untouched NTRIP UI uses Username `SASL` and an empty masked Password. An explicit runtime edit
+  has highest priority; otherwise a saved keyring credential and then configured legacy environment
+  credentials are resolved. A Password changed or cleared in `Settings > GNSS` takes effect only after
+  `Apply` or `Save`. On `HTTP/1.1 401 Unauthorized`, verify the selected host/mountpoint/username
+  and which credential source was intended instead of assuming a transport or RTCM fault.
 - A caster HTTP response is not proof that corrections are usable. Check `RTCM_ACTIVE`, the
   last chunk/RTCM ages, and the P1/P2 RTCM distribution rows before starting a measurement.
 - NTRIP monitoring reports color/state and retains the error in the evidence projection; it
@@ -1057,8 +1022,8 @@ python3 tools/check_portable_paths.py
   duplicate, or near-collinear Mountain suggestions remain overlay-only and never replace
   existing manual points. Editing an accepted point changes its provenance display to
   `MANUAL_EDITED`.
-- Saving or retrying a session refreshes the optical-pose persistence projection, so suggestions
-  created after recording starts are not lost from recovery metadata.
+- Applying, reverting, or resetting Alignment appends its persistence projection independently of
+  Measurement start/stop.
 - Method readiness is independent. A frozen static Checkerboard or full Optical-Pose Draft is not
   blocked because live GNSS/Pixhawk inputs needed by another method are missing. GNSS/Pixhawk gates
   are evaluated only for methods that consume those live components; frozen Draft identity and K,D
@@ -1097,15 +1062,29 @@ hardware, treat a bounded-concurrency or sequential diagnostic mode as a reviewe
 change and rerun lifecycle, timeout, and throughput tests before deployment. Never hide the symptom
 by silently dropping a method or increasing the queue beyond 20.
 
-The corrected 2026-08-24 bench check used Ethernet subscriber endpoints while USB supplied board
-power. After removing the manual start from both `extras.txt` files and rebooting, P1/P2 each sent
-one broadcast stream. A 30-second real Workstation subscriber run received both heartbeats, both
-CAN1/CAN2 `SASL_CAN_MAG` streams, P1 ATTITUDE/GPS counts `1761/294`, and P2 counts `1738/290`, with
-no connection/status errors. This supersedes the earlier provisional 45-second warm-state result,
-but it is not a USB-removed or long-duration field soak. P1 runs the patched custom v6X artifact;
-P2 still runs the earlier custom firmware and may retain the latent null-slot defect, so P2 should
-receive the same patched artifact during a maintenance window.
-The current captured receiver state also showed P1 GPS1/P2 GPS1 MSL altitudes near `108.30/100.29 m`
+The 2026-08-25 check used Stock Stable PX4 v1.17 on both boards. Direct PX4 shell readback showed
+one Ethernet UDP instance per board (`14550` for system ID 1 and `14551` for system ID 2),
+`MAV_2_CONFIG=1000`, and an `extras.txt` containing only board-specific `ifup`/`ifconfig` lines.
+Independent four-second listeners received P1/P2 heartbeat counts `5/5`, ATTITUDE counts
+`169/167`, GPS1 counts `29/28`, and GPS2 counts `28/28`. This verifies current standard MAVLink
+production and supersedes the earlier statement that P2 still required the patched custom image.
+Stock firmware does not emit private `SASL_CAN_MAG`, and this short observation is not a
+USB-removed or long-duration field soak; per-CAN identity display therefore remains unavailable
+and sustained link qualification is still required.
+The 2026-08-26 runtime-stall investigation instead captured actual P1/P2 boot evidence identifying
+PX4 1.14.3 (`1dacb4cdef2d7145754fc788fa8dc482eed74b40`). At the implementation resume point both
+boards answered ping but returned no Ethernet MAVLink heartbeat and no USB device was present, so
+their current firmware could not be re-read. The untracked `firmware/stock/` v1.17.0 bundle is not
+installation evidence. Re-read `AUTOPILOT_VERSION`, sysids, and `MAV_2_*` values after safe recovery
+before hardware qualification.
+
+The observed reboot-only recovery, alive host network/USB evidence, valid RTCM frames, and repeatable
+roughly 5.5-minute all-RX silence match the still-open PX4 issue
+[#25956](https://github.com/PX4/PX4-Autopilot/issues/25956), which describes a NuttX UDP
+`MavlinkReceiver`/IOB exhaustion deadlock under high traffic. This remains a high-confidence cause
+inference, not an onboard stack-trace proof. The Workstation changes mitigate load, detect/isolate
+the failure, and provide a guarded recovery; they do not patch PX4 firmware.
+The earlier captured receiver state also showed P1 GPS1/P2 GPS1 MSL altitudes near `108.30/100.29 m`
 (`~8.01 m` difference) while P2 GPS1/GPS2 differed by `~8.83 m`. This is receiver-solution or
 physical antenna/configuration evidence, not a Workstation datum conversion; verify antenna mapping,
 correction delivery, and RTK Fixed convergence before accepting the baseline.
@@ -1117,6 +1096,13 @@ collection still require bench and field soak verification with the intended har
 MAVLink send result is transport evidence, not proof that the remote receiver accepted and used the
 correction.
 
+Synthetic NVIDIA qualification on the current RTX 4050/driver 595.84 decoded 1920x1080@30 H.264
+through `nvh264dec` with CUDA-memory output. An unconstrained fast-loop stress drove the dedicated
+decoder engine to 78–100%; this is deliberately not a normal realtime workload, not whole-GPU
+utilization, and not an operating ceiling. Real Left/Right WIRIS RTSP decoder utilization,
+first-frame latency, sustained frame rate, drops, thermal behavior, and fallback recovery remain
+the field acceptance evidence.
+
 Camera JSONL rows describe GUI-delivered frame observations, while MP4 may be encoded pass-through
 or decoded-frame recording. No exact 1:1 frame index is currently proven;
 `mp4_frame_index_contract=not_available` is the authoritative limitation. Use the exact native PNG
@@ -1126,6 +1112,11 @@ Nominal intrinsics fallback uses an ideal centered pinhole and the WIRIS 1280x72
 table scaled independently to the current native width and height. It does not model per-camera
 principal-point offset, lens distortion, crop, temperature, focus, or unit-to-unit variation. Use
 it to keep estimated geometry workflows available, not as precision or calibration evidence.
+
+The simple Calibration surface intentionally omits exact photo selection and the full reason-code
+table. When automatic selection is unsuitable, a quality result is `WARNING`/`FAIL`, or an operator
+must approve a warning, expand `고급 캘리브레이션` and complete the existing detailed workflow;
+the simple surface does not provide an override.
 
 The operational bitrate `0`, QP `17`, GOP `30`, IDR `1` profile uses constant-quality mode to avoid
 the visible macroblocking observed with bitrate `1`. Constant-quality mode can increase bandwidth,
@@ -1139,30 +1130,30 @@ the camera link, while TCP can expose camera-side RTSP service resets or startup
 changing transport alone is not an approved performance fix. Restart the Workstation after changing
 the decoder, transport, or pipeline code so existing child processes do not retain the prior setup.
 
-The Session folder panel is a software projection of `measurement_session_snapshot`. Its displayed
-basename, creation time, and path identify the selected storage owner, but do not prove that every
-later producer successfully wrote an artifact. Confirm producer-specific results in Measurement and
-`Sessions > Evidence / Review`, and retain the sealed manifests. `Create Session Folder` intentionally
-performs no readiness verification, so `Ready for saving`/`OPEN` must never be treated as proof that
-remote devices are the intended physical endpoints or that a valid Measurement can begin.
-`Close Session` is a one-action workflow only after Detection has stopped. It may remain in
-`VERIFYING` while writers, RTCM evidence, persistence, and hashes drain; a failure intentionally
-leaves the child `RECOVERABLE` and the parent open for `Retry Measurement Save`.
+The type-owned append model deliberately provides no transactional “all evidence for one
+Measurement” package. A power loss or queue overload can leave some streams present and others
+missing; inspect `Data > Status`, `dropped_records`, and per-stream errors before later analysis.
+This is the accepted tradeoff for never losing a measurement opportunity to an unfinished save.
 
-Content-addressed `profiles/` and `alignment/selections/` files are the durable identities used by
-new Measurements. The older `intrinsics.json`, `intrinsics_zoom_XX.json`, extrinsics aliases, and
-`alignment/active_alignment.json` remain compatibility/current-selection projections and may be
-updated. External tools must use the immutable path/hash recorded in the child manifest rather than
-assuming an alias still represents an earlier Measurement.
+The always-enabled Measurement command is request availability, not evidence readiness. It may
+still reject invalid/identical RTSP URLs or an already-running transient run, and it queues while an
+actual camera owner is busy. Inspect the transient Run detail rather than looking for a Session or
+save-recovery state.
 
-The unified Sessions workspace is implemented as Current, Evidence, and Review tabs. Alignment,
-Measurement, global docks, Overview, and Settings remain separate owner-backed surfaces.
+Content-addressed Calibration profiles remain durable identities. Alignment selection is now
+app-lifetime state backed by append-only `alignment.jsonl`; it is not automatically restored after
+restart. Save any reusable extrinsics profile separately when it must survive restart, and use
+`Reset Alignment` when the current in-memory state should be cleared without deleting stored data.
 
-The launcher's `--check` intentionally rejects an installed environment outside
-`requirements/runtime.txt`. On a host with NumPy 1.25+ or pyqtgraph 0.14+, create/use a compatible
-environment (the supported constraints currently select NumPy 1.23.5–1.24.x and pyqtgraph 0.13.x)
-instead of bypassing the check. PyAV is optional and must be installed from
-`requirements-pyav.txt` only when that backend is selected.
+`Data` has only `Status` and `Capture` tabs. Legacy Session folders are available through
+`Open Legacy Recordings Folder` in the file manager; Workstation does not catalog, verify, recover,
+or convert them automatically.
+
+The launcher's `--check` intentionally rejects an interpreter outside the repository `.venv` and
+an installed environment outside `requirements/runtime.txt`. On a host with NumPy 1.25+ or
+pyqtgraph 0.14+, back up and recreate the canonical venv with the supported constraints (currently
+NumPy 1.23.5–1.24.x and pyqtgraph 0.13.x) instead of bypassing the check. PyAV is optional and must
+be installed from root `requirements/optional-pyav.txt` only when that backend is selected.
 
 A clean checkout does not download model weights. Copy the approved `yolov8m.pt` into
 `.local/workstation_data/models/` (or the selected data root's `models/` directory) and require
@@ -1186,18 +1177,10 @@ An explicit `stereo_pair_saved=false` or `pair_persistence_allowed=false` always
 matching images K,D-only. Malformed capture metadata is not silently promoted and the existing
 zoom/evidence gate blocks calculation until it is repaired.
 
-`review.xlsx` intentionally contains operator-sized summaries rather than every high-rate camera,
-Pixhawk, or GNSS sample. Use typed Parquet for high-rate analysis, canonical `row_json` replay, and
-`data/raw/method_results/*.jsonl` for complete per-method outcomes. Parquet readers must preserve
-signed `int64` nanosecond fields; the workbook
-renders nanosecond timestamps and hashes as text to avoid Excel's numeric precision limit. If
-workbook generation fails, reopen/regenerate it from the verified Parquet generation.
-
-The eight `M_*` worksheets are filtered derived views, not evidence authority. Their rows come from
-the separate `data/raw/method_results/<method_id>.jsonl` streams and include BLOCKED/FAILED/TIMEOUT
-as well as valid results. They do not replace the atomic bundle, `stereo_measurements.jsonl`,
-`geometry_contexts.jsonl`, frozen input files, Alignment selections, or `run_events.jsonl`.
-Method-less legacy blocked rows appear only in the common Results view.
+Workstation no longer generates `review.xlsx` or typed Parquet automatically. Later analysis must
+read the fixed JSONL streams, interpret append/replace operations by `_record_index`, retain signed
+nanosecond timestamps, and join records by time and transient generation where appropriate. Any
+spreadsheet or Parquet conversion is an explicit downstream task and is not an evidence authority.
 
 The Workstation does not prove that a stereo rig's physical transform remains valid as the
 lenses change zoom. Validate every intended A→B combination externally and retain that
@@ -1221,8 +1204,8 @@ When both downloaded/decoded sides share one capture ID and command round, Measu
 operator-approved simultaneous-exposure assumption for R,t; the stored warning and null measured
 delta must remain visible in analysis.
 
-Solved optical-pose Drafts remain session-memory objects unless their extrinsics profile is
-explicitly saved. A Measurement opened before restart can freeze the latest successful Draft even
+Solved optical-pose Drafts remain application-memory objects unless their extrinsics profile is
+explicitly saved. A Measurement started before restart can freeze the latest successful Draft even
 when it is not global Active; after restart, an unsaved Horizon/Mountain/Drone/Terrain Draft must be
 solved again. Hybrid methods remain BLOCKED until their required live Pixhawk attitude exists and
 both GNSS sides have supplied at least one valid 3D position; old valid GNSS may be reused and is
@@ -1243,48 +1226,46 @@ Automatic HR/OZ retrieval requires working FTP credentials and a camera director
 listed. The freshness guard never substitutes an older still when a new post-CPTR file does not
 appear. HR supports exact manual file import; OZ currently relies on automatic FTP retrieval.
 When either control/FTP endpoint is missing or a capture times out, the event and any successful
-side are retained, but the requested capture source keeps the sealed package incomplete.
+side are retained; no completeness state or package gate is created.
 
-Package manifests use SHA-256 chaining for integrity and change detection, not operator identity
-or legal non-repudiation. There is no electronic signature, organization PKI integration, bundled
-source tree, virtual environment, or container image. Reproduction therefore requires a compatible
-Workstation checkout identified by the recorded Git/software provenance.
+There is no automatic manifest hash chain, electronic signature, organization PKI integration,
+bundled source tree, virtual environment, or container image for the new append streams. Record
+hashes remain useful for local artifact identification, not legal non-repudiation.
 
-Video package verification waits for stable bytes and runs bounded `ffprobe`; optional full-stream
-decode runs off the GUI thread but finalization still waits for it and each side retains a
-300-second decode timeout. It is not enabled for every automatic Measurement finalization because
-long recordings remain expensive. The queue/supervisor/write-timeout regressions use mock or local
-process boundaries; validate sustained RSS, blocked removable storage, USB serial timeout, dual
-camera recovery, camera FTP, and automatic ULog collection with actual field hardware before
-treating those boundaries as field-qualified.
+Video files are closed by their camera writer and inventoried best-effort; Measurement stop does
+not wait for `ffprobe` or full-stream decode. Validate sustained RSS, blocked removable storage,
+USB serial timeout, dual-camera recovery, camera FTP, and automatic ULog collection with actual
+field hardware before treating those boundaries as field-qualified.
 
-Automatic restart recovery resumes an open hierarchical session only when exactly one such session
-is discoverable. Its interrupted active measurement is marked `RECOVERABLE`; if several open
-sessions exist, Workstation refuses to guess and reports that explicit recovery is required.
+There is no Measurement restart recovery. An interrupted run ends with the process; existing bytes
+remain in the fixed streams, and a new app run starts from transient `IDLE` without inspecting old
+Session directories.
 
 NTRIP mountpoints are entered manually; the Workstation does not currently browse a
 caster's source table. Provider-specific authentication methods beyond standard Basic
 authentication are not supported.
 
-The built-in NTRIP Password default is plaintext source configuration and must not be treated as
-a protected secret. Anyone who can read the checkout can read it, and the non-empty session
-default takes priority over a keyring or legacy environment credential. For a different account,
-replace Username/Password in the UI and press `Apply`, or clear Password to select the stored/env
-fallback. Rotate the provider credential and change the deployment constant when the shared
-default is no longer appropriate.
+There is no built-in NTRIP Password. A session Password has highest priority and is never written
+to settings/evidence; the OS keyring is the only persistent password store. On a host without a
+usable keyring backend, enter the Password again for each application run.
 
 If the status is `CONNECTED_NO_DATA` or `STREAMING`, verify the mountpoint and caster's
 actual RTCM output. If it is `RTCM_STALE`/`STALE`, inspect the configured read/correction age,
 the caster stream, and the downstream Base/Pixhawk route separately; a live TCP session can
 exist while valid RTCM or downstream injection is unavailable.
 
-The 4,096-envelope ingress capacity, 96-request Pixhawk injection queue, 2-second stale-injection
-limit, 0.5-second UI snapshot interval, and 15 Hz preview cap are currently code-level operational
-limits rather than Settings controls. Slow evidence storage intentionally propagates backpressure;
-if the field input rate cannot be sustained, stop the measurement and preserve the reported
-integrity failure instead of increasing queues without a load test. Unit and simulated end-to-end
-tests verify byte/order/hash preservation and bounded UI updates, but long-duration dual-camera +
+The 4,096-envelope RTCM ingress capacity, 96-request Pixhawk injection queue, 2-second
+stale-injection limit, 0.5-second UI snapshot interval, 4,096-row bulk data queue, 256-row priority
+data queue, and 15 Hz preview cap are currently code-level operational limits rather than Settings
+controls. Bulk overload drops older queued bulk rows and increments `dropped_records`; priority
+results/events have a separate reservation but can also drop if their own queue is exhausted. Unit
+and simulated end-to-end tests verify bounded behavior, but long-duration dual-camera +
 live-caster + three-Pixhawk operation still requires a field soak test before qualification.
+For this Ethernet MAVLink mitigation specifically, software tests are insufficient for a resolved
+claim. Required hardware evidence is three independent cold boots with at least 10 minutes each,
+one dual-P1/P2 60-minute full-load soak with RTCM and normal Workstation load, symmetric one-side
+isolation, and verified-USB recovery with another 10-minute post-reboot qualification. Until all
+of those pass, do not describe the field issue as resolved or update `Pixhawk.md` with a remedy.
 The two camera decoder child processes may still consume substantial CPU while Preview is active;
 this is expected producer-side work and is separate from GUI responsiveness. Stop Preview when
 video is not required. If a build predating 2026-08-23 was force-quit, terminate its orphaned
@@ -1366,12 +1347,77 @@ frozen Mountain image.
 
 ## Change Log
 
+- 2026-08-26: Made Auto the approved GPU-first Camera Preview policy and exposed requested versus
+  actual H.264 decode truth without a new dashboard. Existing Camera `Decoder LEFT/RIGHT` now
+  distinguishes GPU NVDEC, explicitly selected CPU, and CPU fallback; CAM status detail/tooltip
+  carries fallback evidence; Diagnostics Performance reports NVIDIA identity, NVDEC availability,
+  selection candidates, and per-side actual decoder. Worker count, queues, stream rate/quality,
+  recording paths, and explicit NVIDIA fail-closed behavior are unchanged.
+
+- 2026-08-26: Implemented the software side of P1/P2 Ethernet MAVLink stall mitigation without
+  changing PX4 firmware, parameters, or SD-card configuration. Added explicit GCS `255/190` and
+  bounded 1 Hz heartbeat, a consumer-backed Stock stream profile, per-side HB/ATT/ANY liveness,
+  10-minute qualification, truthful ATTITUDE-stale versus all-RX-stalled status, no false host
+  reconnect, RTCM send-boundary fail-close with separate `blocked_stall` evidence, and
+  operator-confirmed unique-sysid USB reboot with immediate worker revalidation. Hardware
+  3-cycle/60-minute/isolation/recovery acceptance remains pending; `Pixhawk.md` is intentionally
+  unchanged. Root-venv verification passed 275 focused tests and the full Workstation suite
+  (`1224 passed, 1 skipped`). The repository portability check still reports the same 12
+  pre-existing violations outside this change; the changed ETH packet introduces none.
+
+- 2026-08-26: Removed the operational Measurement Session/package lifecycle. Measurement now uses
+  transient `IDLE/QUEUED/STARTING/RUNNING/STOPPING/ERROR` state and never consults prior Session or
+  storage integrity to admit a run. Added one relative `measurement_data_root`, fixed type-owned
+  JSONL/RTCM files, reserved result/event queues, per-stream failure/drop status and retry,
+  creation-time collision-free names for MP4/images/native PNG/ULog, app-lifetime Alignment with an
+  explicit Reset event, and best-effort target telemetry in `px4_drone.jsonl`. Replaced Sessions
+  navigation with `Data > Status/Capture`; legacy recordings are file-manager-only. Automatic save,
+  seal, recovery, Parquet, and `review.xlsx` generation are detached from the new workflow.
+
+- 2026-08-26: Made the repository root `.venv` created with `--system-site-packages` the only
+  supported Workstation interpreter. Added the read-only Ubuntu/GStreamer doctor and strict
+  `--check`, removed system Python fallback, separated optional PyAV, pinned camera children to
+  `sys.executable`, made Auto's software degradation explicit, and made NVIDIA mode fail closed.
+
+- 2026-08-25: Unified Legacy/Workstation recorder ownership, single-owner PX4 MAVLink setup,
+  exact duplicate suppression, secure NTRIP credentials, TCP+Auto `nvh264dec` runtime fallback,
+  and latest-only preview behavior. Removed the plaintext NTRIP password default.
+
+- 2026-08-25: Prevented intermittent NTRIP authentication from using an untouched masked
+  deployment Password ahead of a saved keyring or configured environment credential; only an
+  explicit operator edit now has session-level priority. Made each MAVLink `udpin` endpoint
+  exclusive so another application or leaked worker produces an actionable port-in-use failure,
+  and added bounded `ATTITUDE` interval recovery while heartbeat remains live. Stock Stable
+  P1/P2 shell readback showed one Ethernet instance per board with clean `extras.txt`; independent
+  four-second captures received ATTITUDE `169/167`, GPS1 `29/28`, and GPS2 `28/28`. Runtime check
+  passed; full Workstation suite: `1157 passed, 1 skipped`.
+
+- 2026-08-24: Replaced the default Calibration presentation with a StereoWIRIS-style
+  `촬영 → 계산·적용 → 프로파일` workflow and moved the existing session/file selection,
+  setup, diagnostics, quality evidence, and K,D/R,t details under a collapsed
+  `고급 캘리브레이션` disclosure. All simple actions route to the existing Workstation
+  controllers, and quality-gated duplicate Apply controls share the same enabled state. Full
+  Workstation suite: `1137 passed, 1 skipped`.
+
+- 2026-08-24: Removed all presentation-level disabling of the Measurement start/stop command.
+  The Measurement button and its shared QAction now remain consistent and always clickable across
+  lifecycle, saving, and manual-recording states, while backend RTSP, writer, single-interval, and
+  package-integrity checks continue to reject unsafe transitions with evidence. Full Workstation
+  suite: `1136 passed, 1 skipped`.
+
 - 2026-08-24: Preserved timing-rejected manual, Auto, and FTP checkerboard captures as independent
   per-camera K,D observations. Capture metadata and UI now identify `INTRINSICS ONLY` files, Auto
   retains each new pose without increasing its valid-stereo counter, and both full calibration and
   `R,t only` filter explicit timing rejections after automatic or manual selection. Legacy photo
   sets without timing-decision fields remain compatible as `LEGACY_UNVERIFIED`. Full Workstation
   suite: `1134 passed, 1 skipped`.
+
+- 2026-08-24: Closed the Workstation global-review regressions in worker deferred start, structured
+  persistence-failure propagation, Target Drone/ULog/terrain finalization, crash/shutdown flush,
+  RTK failure classification, Drone Multi-view editor rollover, and asynchronous native-frame row
+  completion. Quaternion transforms now normalize each attitude once, repeated Pixhawk/YOLO error
+  reporting shares one message-aware throttle, and PARAM_VALUE polling shares one receive loop.
+  Full Workstation suite: `1120 passed, 1 skipped`.
 
 - 2026-08-24: Hardened Workstation runtime isolation and shutdown across Qt, Pixhawk/GNSS, WIRIS,
   camera children, Measurement evaluators, and evidence storage. Added a non-aborting Qt exception
@@ -1463,10 +1509,9 @@ frozen Mountain image.
   FTP pairing evidence without claiming an exposure timestamp, and stopped method-less blocked
   results from inheriting the Measurement summary method in `review.xlsx`.
 
-- 2026-08-24: Added deployment NTRIP UI/runtime defaults `SASL`/`ngii`. Direct Start NTRIP now
-  receives them even when Settings is untouched; operator edits still override them, while the
-  masked Password remains excluded from settings/evidence JSON. Documented that the convenience
-  default is plaintext source configuration rather than secure credential storage.
+- 2026-08-24: Added deployment NTRIP UI/runtime fields. The 2026-08-25 hardening removed the
+  historical plaintext password convenience default; operator session/keyring/env credentials
+  remain excluded from settings/evidence JSON.
 
 - 2026-08-24: Removed background same-IP retries from the initial manual `Connect cameras` flow.
   Each click now performs one discovery/activation/frame-verification attempt and reports failure;

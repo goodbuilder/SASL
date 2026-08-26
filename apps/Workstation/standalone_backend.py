@@ -48,38 +48,14 @@ class StandalonePanelBackend(QtCore.QObject):
     def toggle_recording(self) -> Any:
         return self._call("toggle_session_recording")
 
-    def save_session(self) -> Any:
-        return self._call("save_distance_history_csv")
+    def data_storage_snapshot(self) -> Any:
+        return self._call("data_storage_snapshot")
 
-    def begin_measurement_session(self) -> Any:
-        return self._call("begin_measurement_session")
+    def retry_data_storage(self) -> Any:
+        return self._call("retry_data_storage")
 
-    def measurement_session_snapshot(self) -> Any:
-        return self._call("measurement_session_snapshot")
-
-    def measurement_package_snapshot(self) -> Any:
-        return self._call("measurement_package_snapshot")
-
-    def finalize_measurement_package(self) -> Any:
-        return self._call("finalize_measurement_package")
-
-    def begin_next_measurement(self) -> Any:
-        return self._call("begin_next_measurement")
-
-    def begin_measurement(self) -> Any:
-        return self._call("begin_measurement")
-
-    def close_measurement_session(self) -> Any:
-        return self._call("close_measurement_session")
-
-    def begin_measurement_revision(self) -> Any:
-        return self._call("begin_measurement_revision")
-
-    def verify_measurement_package(self) -> Any:
-        return self._call("verify_measurement_package")
-
-    def verify_measurement_session(self) -> Any:
-        return self._call("verify_session")
+    def measurement_run_snapshot(self) -> Any:
+        return self._call("measurement_run_snapshot")
 
     def optical_pose_snapshot(self, *, include_frames: bool = True) -> Any:
         return self._call(
@@ -203,6 +179,9 @@ class StandalonePanelBackend(QtCore.QObject):
     def optical_pose_revert(self, payload: dict[str, object] | None = None) -> Any:
         return self._call("revert_workstation_optical_pose", dict(payload or {}))
 
+    def optical_pose_reset(self) -> Any:
+        return self._call("reset_workstation_optical_pose_session")
+
     def target_drone_configure(self, payload: dict[str, object]) -> Any:
         return self._call("configure_target_drone_stream", dict(payload))
 
@@ -298,9 +277,9 @@ class StandalonePanelBackend(QtCore.QObject):
         return self._call("reset_px4_calibration_group", camera, group)
 
     def pixhawk_recover_eth_mavlink(self, camera: str) -> Any:
-        """Recover one PX4 Ethernet MAVLink stream through its USB shell path."""
+        """Operator-confirmed reboot through a freshly verified side USB identity."""
 
-        return self._call("bootstrap_ethernet_mavlink_from_usb", camera)
+        return self._call("recover_stalled_pixhawk_via_verified_usb", camera)
 
     def pixhawk_discover_usb(self) -> Any:
         return self._call("discover_usb_pixhawk_connections")

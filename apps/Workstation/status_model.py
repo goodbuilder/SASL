@@ -13,6 +13,7 @@ from Workstation.workstation_core.gnss_monitor import (
     NtripHealthState,
     evaluate_ntrip_health,
 )
+from Workstation.workstation_core.runtime_camera_status import decoder_presentation
 
 
 # LRF reads are on-demand (a manual Alignment button click), not a
@@ -232,13 +233,34 @@ class BackendStatusAdapter(QtCore.QObject):
             state, severity, detail = "STARTING", StatusSeverity.WARN, pane_state or "first frame 대기"
         else:
             state, severity, detail = "STOPPED", StatusSeverity.UNKNOWN, "no frame evidence"
+        decoder_combo = getattr(panel, "decoder_combo", None)
+        requested_decoder = (
+            decoder_combo.currentData()
+            if decoder_combo is not None and callable(getattr(decoder_combo, "currentData", None))
+            else getattr(getattr(panel, "settings", None), "rtsp_decoder", "auto")
+        )
+        active_decoders = getattr(panel, "active_stream_decoders", {}) or {}
+        fallback_reasons = getattr(panel, "decoder_fallback_reasons", {}) or {}
+        decoder = decoder_presentation(
+            requested_mode=requested_decoder,
+            active_decoder=(active_decoders.get(side) if isinstance(active_decoders, Mapping) else None),
+            runtime_override=getattr(panel, "_runtime_decoder_override", None),
+            fallback_reason=(fallback_reasons.get(side) if isinstance(fallback_reasons, Mapping) else ""),
+        )
+        detail = f"{detail}; decoder={decoder.value_text}"
+        if decoder.fallback_active and decoder.detail:
+            detail += f"; {decoder.detail}"
+        if decoder.severity == "warn" and severity is StatusSeverity.OK:
+            severity = StatusSeverity.WARN
+        elif decoder.severity == "bad":
+            severity = StatusSeverity.BAD
         self.model.set_status(
             f"camera.{side}",
             label,
             state,
             severity,
             detail=detail,
-            source=f"CameraPane[{side}].current_status + frame_changed",
+            source=f"CameraPane[{side}].current_status + frame_changed + active_stream_decoders",
             age_s=age_s,
             clock="app_receive_monotonic",
             observed_monotonic_s=now_s,
@@ -475,21 +497,96 @@ class BackendStatusAdapter(QtCore.QObject):
         subscriber = getattr(panel, "mavlink_pixhawk", None)
         active_command_cameras = getattr(subscriber, "_active_command_cameras", ()) or ()
         command_active = side in active_command_cameras
-        if command_active:
+        health_reader = getattr(subscriber, "mavlink_health_snapshot", None)
+        try:
+            health = health_reader(side, now_s=now_s) if callable(health_reader) else None
+        except Exception:
+            health = None
+        if command_active or getattr(health, "active_command", None):
             state, severity = "PARAM SYNC", StatusSeverity.OK
             detail = "PX4 파라미터 조회 중 (정상)"
+            projected_age_s = None
+            source = "MAVLink exclusive command reservation"
+        elif health is not None:
+            state = str(getattr(getattr(health, "state", None), "value", getattr(health, "state", "UNKNOWN")))
+            severity = {
+                "DISCONNECTED": StatusSeverity.UNKNOWN,
+                "CONNECTING": StatusSeverity.WARN,
+                "QUALIFYING": StatusSeverity.WARN,
+                "LIVE": StatusSeverity.OK,
+                "ATTITUDE STALE": StatusSeverity.WARN,
+                "ETH MAVLINK RX STALLED": StatusSeverity.BAD,
+                "RECOVERING": StatusSeverity.WARN,
+                "ERROR": StatusSeverity.BAD,
+            }.get(state, StatusSeverity.UNKNOWN)
+            qualification_elapsed_s = max(0.0, float(getattr(health, "qualification_elapsed_s", 0.0)))
+            qualification_required_s = max(1.0, float(getattr(health, "qualification_required_s", 600.0)))
+            shown_elapsed_s = min(qualification_elapsed_s, qualification_required_s)
+            elapsed_minutes, elapsed_seconds = divmod(int(shown_elapsed_s), 60)
+            required_minutes, required_seconds = divmod(int(qualification_required_s), 60)
+            qualification_text = (
+                f"{elapsed_minutes:02d}:{elapsed_seconds:02d} / "
+                f"{required_minutes:02d}:{required_seconds:02d}"
+            )
+
+            def age_text(name: str) -> str:
+                value = getattr(health, name, None)
+                if value is None:
+                    return "--"
+                value = max(0.0, float(value))
+                return f"{value:.2f}s" if value < 10.0 else f"{value:.1f}s"
+
+            detail_parts = [
+                f"endpoint={getattr(health, 'endpoint', '') or '--'}",
+                (
+                    f"sysid={getattr(health, 'observed_system_id', '--')}"
+                    f"/{getattr(health, 'expected_system_id', '--')}"
+                ),
+                f"HB={age_text('heartbeat_rx_age_s')}",
+                f"ATT={age_text('attitude_rx_age_s')}",
+                f"ANY={age_text('any_rx_age_s')}",
+            ]
+            if state in {"QUALIFYING", "RECOVERING"}:
+                detail_parts.append(f"qualification={qualification_text}")
+            if state == "ATTITUDE STALE":
+                detail_parts.append("bounded ATTITUDE request only")
+            if state == "ETH MAVLINK RX STALLED":
+                detail_parts.extend(
+                    (
+                        "RTCM blocked",
+                        "PX4/NuttX UDP task deadlock suspected (high-confidence inference)",
+                    )
+                )
+            stall_reason = str(getattr(health, "stall_reason", "") or "")
+            if stall_reason and stall_reason not in {"QUALIFICATION", "RECOVERY_QUALIFICATION"}:
+                detail_parts.append(f"reason={stall_reason}")
+            detail = "; ".join(detail_parts)
+            projected_age_s = (
+                getattr(health, "attitude_rx_age_s", None)
+                if state == "ATTITUDE STALE"
+                else getattr(health, "any_rx_age_s", None)
+            )
+            source = "subscriber-owned immutable MAVLink liveness snapshot"
         elif age_s is not None and float(age_s) < 2.0:
             state, severity = "LIVE", StatusSeverity.OK
             detail = f"{transport} attitude age {float(age_s):.2f} s"
+            projected_age_s = float(age_s)
+            source = "legacy MAVLink heartbeat + attitude sample"
         elif age_s is not None:
             state, severity = "STALE", StatusSeverity.WARN
             detail = f"{transport} attitude age {float(age_s):.2f} s"
+            projected_age_s = float(age_s)
+            source = "legacy MAVLink heartbeat + attitude sample"
         elif side in mavlink_sides:
             state, severity = "CONNECTED", StatusSeverity.WARN
             detail = "MAVLink heartbeat; attitude sample 대기 또는 stale"
+            projected_age_s = None
+            source = "legacy MAVLink heartbeat + attitude sample"
         else:
             state, severity = "DISCONNECTED", StatusSeverity.UNKNOWN
             detail = "heartbeat/sample evidence 없음"
+            projected_age_s = None
+            source = "legacy MAVLink heartbeat + attitude sample"
         extrinsics = getattr(panel, "latest_extrinsics", {}) or {}
         extrinsic = extrinsics.get(side) if isinstance(extrinsics, dict) else None
         if extrinsic is not None:
@@ -505,12 +602,8 @@ class BackendStatusAdapter(QtCore.QObject):
             state,
             severity,
             detail=detail,
-            source=(
-                "MAVLink exclusive command reservation"
-                if command_active
-                else "MAVLink heartbeat + attitude sample"
-            ),
-            age_s=None if age_s is None else float(age_s),
+            source=source,
+            age_s=None if projected_age_s is None else float(projected_age_s),
             clock="app_receive_monotonic",
             observed_monotonic_s=now_s,
         )
@@ -782,6 +875,44 @@ class BackendStatusAdapter(QtCore.QObject):
         )
 
     def _refresh_recording(self, panel: object, now_s: float) -> None:
+        if not bool(getattr(panel, "_measurement_session_hierarchy_enabled", True)):
+            active = bool(_safe_call(panel, "_session_recording_active", default=False))
+            manual = bool(getattr(panel, "_manual_recording_active", False))
+            storage_reader = getattr(panel, "data_storage_snapshot", None)
+            try:
+                storage = storage_reader() if callable(storage_reader) else {}
+            except Exception:
+                storage = {}
+            storage_state = str(storage.get("state") or "UNAVAILABLE").upper()
+            dropped = int(storage.get("dropped_records") or 0)
+            if active:
+                state = "ACTIVE"
+                severity = (
+                    StatusSeverity.OK
+                    if storage_state == "OK" and not dropped
+                    else StatusSeverity.WARN
+                )
+                detail = "manual data recording" if manual else "Measurement data recording"
+            elif storage_state in {"DEGRADED", "UNAVAILABLE"} or dropped:
+                state, severity, detail = (
+                    "DEGRADED",
+                    StatusSeverity.WARN,
+                    "data storage unavailable or incomplete",
+                )
+            else:
+                state, severity, detail = "IDLE", StatusSeverity.UNKNOWN, "capture idle"
+            detail = f"{detail}; storage={storage_state}; dropped={dropped}"
+            self.model.set_status(
+                "recording",
+                "REC",
+                state,
+                severity,
+                detail=detail,
+                source="MeasurementDataStore + live recording owner",
+                clock="per-record UTC/source clocks",
+                observed_monotonic_s=now_s,
+            )
+            return
         save_thread = getattr(panel, "_session_save_thread", None)
         retry = bool(getattr(panel, "_session_save_retry_required", False))
         active = bool(_safe_call(panel, "_session_recording_active", default=False))

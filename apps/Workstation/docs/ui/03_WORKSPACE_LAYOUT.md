@@ -58,7 +58,7 @@ Default width candidate: 280–340 px, initial ~300 px, minimum ~240 px. Context
 
 The Status group remains common where a source-backed channel exists. The section below it
 changes its title and field labels for the active context (for example Camera pair, Base
-operation, Physical alignment, or Recording session). Selecting a supported table row or
+operation, Physical alignment, or Data recording). Selecting a supported table row or
 engineering value temporarily switches that section to Selection details. Inspector values
 remain read-only projections and preserve the producer's frame, unit, and timestamp contract.
 
@@ -97,21 +97,18 @@ RTCP/NTP sync limits, and check stream evidence. Workstation timing evidence inc
 RTC/STUS-GDTI, live RTCP/NTP frame metadata, and the editable sync-limit contract; still-image
 capture, FTP, and EXIF comparison remain Legacy-only.
 
-## 15. Session and Measurement Workspaces
+## 15. Data and Measurement Workspaces
 
-Sessions is the top-level field-work surface. `Current` owns `Create Session Folder` and
-`Close Session` and shows the stable parent plus ordered `mNNNNNN` children. Measurement owns one
-`측정 시작`/`측정 종료` control: start creates the next child when needed and begins Detection;
-stop uses the automatic save/seal path. Lifecycle remains separate from the derived Evidence
-collection/Valid measurement readiness.
-The readiness table shows blockers only. Its compact method table always lists all eight categories;
-the selected-method detail shows actual rotation/translation inputs and preserves their PX4, GNSS
-NED, candidate virtual-FRD/NED, or OpenCV RDF contracts. The current next action is the only
-visually promoted lifecycle control.
+`Data` is the top-level storage/capture surface with `Status` and `Capture` tabs. Status owns the
+fixed stream table, writer/queue/drop state, data-folder access, Retry Storage, and a file-manager
+link to legacy recordings. Capture owns Target reference, HR/OZ events/import, and ULog tools. It
+does not expose Session lifecycle, package completeness, saved review, or legacy catalog rows.
 
-Measurement correlates live image/target, Detection, current quality, public result, timing, and
-history. Active/finalizing recording gates prevent preview interruption, overlapping children,
-and premature sealing.
+Measurement owns one `측정 시작`/`측정 종료` control and transient
+`IDLE/QUEUED/STARTING/RUNNING/STOPPING/ERROR` status. The control stays enabled when storage is
+degraded. Actual camera contention appears as QUEUED and resumes automatically. The readiness and
+method tables remain evidence projections and preserve PX4, GNSS NED, candidate virtual-FRD/NED,
+and OpenCV RDF contracts.
 
 ## 16. Calibration Workspace
 
@@ -130,7 +127,7 @@ values are shown with their PX4 semantic label and raw number. These values reta
 sensor-axis/board-parameter contract and are not converted to NED, ENU, or camera frames.
 Base GNSS presents the Base receiver, Survey-in/NTRIP, discovered receiver candidates, and
 RTCM delivery; Alignment presents physical sampling and iteration evidence. Detection remains
-with Cameras, and saved Recording/Review/Files is exposed once as Recording / Review.
+with Cameras, writer/capture status is Data, and Manual record/video files are Advanced.
 The Alignment page places compact readiness and shared frozen native left/right annotation views
 below the page header. The previews are side by side when each can retain at least 560 px width and
 stack vertically otherwise. Below them, promoted `Horizon`, `Mountain + GNSS`, `Terrain PnP`,
@@ -138,13 +135,13 @@ stack vertically otherwise. Below them, promoted `Horizon`, `Mountain + GNSS`, `
 `R,t methods` structure. Candidate residuals/side-specific observability and immutable Apply/Revert
 remain in one common review area: right of the tabs at widths of at least 1200 px and below them on
 narrower screens. Overview shows eight read-only method cards and Measurement shows all frozen/live
-method details; Pixhawk/RTK remains the fixed representative. Alignment is not a second calibration owner.
+method details; Pixhawk/RTK remains the fixed representative. Alignment Apply/Revert/Reset is
+app-lifetime state and is not a second calibration owner.
 The Alignment evidence keeps raw RTK NED `[N,E,D]` and the separate P1 body-FRD
 `[F,R,D]` projection in adjacent groups so the operator can use the intuitive P1
 orientation without confusing it with camera optical RDF or public measurement output.
-Sessions keeps Target reference connectivity, HR purpose/import events, and a PX4 ULog evidence
-table. Saved review uses a composite session/measurement key so
-siblings remain independently selectable. UAM target telemetry is shown as deferred rather
+Data Capture keeps Target reference connectivity, HR purpose/import events, and a PX4 ULog table.
+UAM target telemetry is shown as deferred rather
 than erroneous; target Drone data is a separate receive-only source and never replaces P1/P2
 attitude, GNSS baseline, or nominal stereo geometry.
 

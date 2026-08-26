@@ -181,3 +181,111 @@ def test_recording_stop_waits_for_method_bundle_barrier(
     assert panel._method_evaluation_stop_retry_scheduled is True
     assert "barrier" in panel.recording_status_label.text
     assert scheduled and scheduled[0][0] == 100
+
+
+def test_recording_stop_rejects_target_artifact_failure_result() -> None:
+    logs: list[str] = []
+    saves: list[str] = []
+    target_owner = SimpleNamespace(
+        target_drone_stream_snapshot=lambda: {
+            "phase": "SEALED",
+            "worker_alive": False,
+            "artifact": {
+                "absolute_path": "/session/raw/target.jsonl",
+                "size_bytes": 42,
+                "sha256": "a" * 64,
+            },
+        }
+    )
+    panel = SimpleNamespace(
+        pnp_photo_capture_thread=None,
+        oz_photo_capture_thread=None,
+        _measurement_view_controller_owner=None,
+        _native_frame_async_stores={},
+        _session_recording_active=lambda: False,
+        _workstation_ulog_controller=None,
+        flush_workstation_run_evidence=lambda: True,
+        _target_drone_controller_owner=target_owner,
+        register_workstation_session_artifact=lambda *_args, **_kwargs: {
+            "schema": "workstation-persistence-failure-v1",
+            "status": "failed",
+            "kind": "artifact_registration",
+            "error": "target-disk-sentinel",
+        },
+        recording_status_label=_WidgetState(),
+        distance_recording_enabled=True,
+        video_recording_enabled=True,
+        save_distance_history_csv=lambda **_kwargs: saves.append("saved"),
+        _log=logs.append,
+    )
+
+    RecordingController(panel)._stop_session_recording(restart_streams=False)
+
+    assert panel.distance_recording_enabled is True
+    assert panel.video_recording_enabled is True
+    assert saves == []
+    assert "target-disk-sentinel" in panel.recording_status_label.text
+    assert any("target-disk-sentinel" in message for message in logs)
+
+
+def test_sessionless_manual_stop_releases_owner_and_never_waits_for_save() -> None:
+    calls: list[str] = []
+    events: list[tuple[str, dict[str, object]]] = []
+    panel = SimpleNamespace(
+        _measurement_session_hierarchy_enabled=False,
+        _method_evaluation_accepting=True,
+        distance_recording_enabled=True,
+        video_recording_enabled=True,
+        distance_recording_started_monotonic_s=1.0,
+        _manual_recording_active=True,
+        _recording_mode="manual",
+        recording_session_id="manual-generation",
+        distance_recording_rows=[],
+        camera_recording_rows={"left": [], "right": []},
+        px4_recording_rows={"left": [], "right": []},
+        gnss_base_recording_rows=[],
+        extrinsics_comparison_recording_rows=[],
+        method_evaluation_bundle_rows=[],
+        video_recording_paths={},
+        record_button=_WidgetState(),
+        camera_connected=False,
+        append_workstation_data=lambda stream, payload, **_kwargs: events.append(
+            (stream, dict(payload))
+        ),
+        flush_workstation_data=lambda: calls.append("flush"),
+        _sync_rtcm_evidence_context=lambda: calls.append("rtcm-context"),
+        _resume_queued_measurement_start=lambda: calls.append("resume"),
+        _refresh_recording_status_label=lambda: calls.append("status"),
+        _refresh_operation_header=lambda: calls.append("header"),
+        _log=lambda _message: None,
+    )
+
+    RecordingController(panel)._stop_session_recording(restart_streams=False)
+
+    assert panel.distance_recording_enabled is False
+    assert panel.video_recording_enabled is False
+    assert panel._manual_recording_active is False
+    assert calls[:3] == ["rtcm-context", "flush", "resume"]
+    assert any(
+        stream == "events" and payload["event_type"] == "recording_stopped"
+        for stream, payload in events
+    )
+
+
+def test_sessionless_row_setup_falls_back_to_memory_when_writer_setup_fails() -> None:
+    class BrokenStorage:
+        @property
+        def store(self):
+            raise OSError("unwritable data root")
+
+    logs: list[str] = []
+    panel = SimpleNamespace(
+        _data_storage_controller=lambda: BrokenStorage(),
+        _log=logs.append,
+    )
+
+    rows = RecordingController(panel)._new_live_rows("measurements", priority=True)
+    rows.append({"result": "VALID"})
+
+    assert list(rows) == [{"result": "VALID"}]
+    assert any("Measurement continues" not in value and "측정 계속" in value for value in logs)

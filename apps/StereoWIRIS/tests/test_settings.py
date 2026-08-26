@@ -25,11 +25,17 @@ def test_load_settings_defaults_when_missing(tmp_path: Path) -> None:
     assert settings.left_control_host == "10.0.0.231"
     assert settings.right_control_host == "10.0.0.232"
     assert settings.wiris_control_timeout_s == 5.0
+    assert (
+        settings.wiris_visible_encoder_bitrate,
+        settings.wiris_visible_encoder_qp,
+        settings.wiris_visible_encoder_gop,
+        settings.wiris_visible_encoder_idr,
+    ) == (0, 1, 90, 1)
     assert settings.yolo_input_size == 416
     assert settings.preview_width == 1920
     assert settings.yolo_event_queue_size == 128
     assert settings.yolo_frame_queue_size == 2
-    assert settings.rtsp_decoder == "nvidia"
+    assert settings.rtsp_decoder == "auto"
     assert settings.stream_backend == "gstreamer"
     assert settings.rtsp_transport == "tcp"
     assert settings.camera_sync_history_window_s == 1.0

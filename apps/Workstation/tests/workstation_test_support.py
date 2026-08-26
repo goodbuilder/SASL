@@ -134,6 +134,9 @@ class _FakeBackend:
             last_distance_quality="BAD",
             last_distance_status="거리: 좌/우 검출 매칭 대기 중",
             recording_session_id="",
+            _measurement_session_hierarchy_enabled=False,
+            _measurement_run_state="IDLE",
+            _manual_recording_active=False,
             distance_history=[],
             left_url_edit=QtWidgets.QLineEdit("rtsp://left"),
             right_url_edit=QtWidgets.QLineEdit("rtsp://right"),
@@ -169,6 +172,7 @@ class _FakeBackend:
             },
         )
         self.panel._session_recording_active = lambda: bool(self.panel.recording_active)
+        self.panel.data_storage_snapshot = self.data_storage_snapshot
 
     def toggle_camera(self) -> None:
         self.calls.append("camera")
@@ -181,6 +185,30 @@ class _FakeBackend:
 
     def save_session(self) -> None:
         self.calls.append("save")
+
+    def measurement_run_snapshot(self) -> dict[str, object]:
+        return {
+            "state": str(self.panel._measurement_run_state),
+            "detail": "ready",
+            "storage": self.data_storage_snapshot(),
+        }
+
+    def data_storage_snapshot(self) -> dict[str, object]:
+        return {
+            "state": "OK",
+            "root": "/tmp/measurement_data",
+            "priority_pending": 0,
+            "bulk_pending": 0,
+            "dropped_records": 0,
+            "streams": {},
+        }
+
+    def retry_data_storage(self) -> dict[str, object]:
+        self.calls.append("retry_data_storage")
+        return self.data_storage_snapshot()
+
+    def optical_pose_reset(self) -> None:
+        self.calls.append("optical_pose_reset")
 
     def capture_pnp_hr_photos(self) -> bool:
         self.calls.append("hr_capture")

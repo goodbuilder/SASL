@@ -242,6 +242,72 @@ def test_uam_is_deferred_without_worker_link_spool_or_artifact(tmp_path):
     assert controller.drain_target_drone_stream() == 0
 
 
+def test_sessionless_target_uses_fixed_best_effort_stream_only_while_recording(tmp_path):
+    connection = FakeConnection(
+        FakeMessage("HEARTBEAT", seq=1),
+        [
+            FakeMessage(
+                "ATTITUDE",
+                seq=2,
+                time_boot_ms=123,
+                roll=0.1,
+                pitch=-0.2,
+                yaw=0.3,
+            )
+        ],
+    )
+    accepted: list[tuple[str, dict[str, object]]] = []
+    recording = {"active": True}
+    panel = FakePanel(tmp_path)
+    panel._measurement_session_hierarchy_enabled = False
+    panel._session_recording_active = lambda: recording["active"]
+    panel.append_workstation_data = (
+        lambda stream, payload, **_kwargs: accepted.append(
+            (str(stream), dict(payload))
+        )
+        or True
+    )
+    panel.flush_workstation_data = lambda: True
+    controller = _controller(panel, FakeMavutil(connection))
+
+    controller.configure_target_drone_stream(
+        {
+            "mode": "DRONE",
+            "endpoint": "udp:127.0.0.1:14570",
+            "expected_system_id": 42,
+            "expected_component_id": 1,
+        }
+    )
+    controller.start_target_drone_stream()
+    _wait_for(
+        lambda: controller.target_drone_stream_snapshot()["accepted_message_count"] == 1
+    )
+    stopped = controller.stop_target_drone_stream(timeout_s=1.0)
+
+    assert stopped["phase"] == "STOPPED"
+    assert stopped["artifact"] is None
+    assert stopped["data_owner"] == "measurement_data_root"
+    assert "session_id" not in stopped
+    assert accepted
+    assert {stream for stream, _row in accepted} == {"px4.drone"}
+    assert any(row.get("record_kind") == "telemetry" for _stream, row in accepted)
+    assert not (tmp_path / "target-drone" / ".spool").exists()
+
+    # A writer refusal remains a data-quality signal, not a receiver error.
+    recording["active"] = False
+    panel.append_workstation_data = lambda *_args, **_kwargs: False
+    second_connection = FakeConnection(FakeMessage("HEARTBEAT", seq=3))
+    controller = _controller(panel, FakeMavutil(second_connection))
+    controller.configure_target_drone_stream(
+        {"mode": "DRONE", "endpoint": "udp:127.0.0.1:14570"}
+    )
+    controller.start_target_drone_stream()
+    _wait_for(
+        lambda: controller.target_drone_stream_snapshot()["stream_state"] == "STREAMING"
+    )
+    assert controller.stop_target_drone_stream(timeout_s=1.0)["phase"] == "STOPPED"
+
+
 def test_seal_detects_post_stop_byte_tampering(tmp_path):
     connection = FakeConnection(FakeMessage("HEARTBEAT"))
     panel = FakePanel(tmp_path)

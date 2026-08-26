@@ -26,7 +26,10 @@ from Workstation.workstation_core.network import (
 )
 from Workstation.workstation_core.pixhawk_attitude import (
     DualPixhawkMavlinkSubscriber,
+    MAVLINK_GCS_SOURCE_COMPONENT,
+    MAVLINK_GCS_SOURCE_SYSTEM,
     MavlinkShellCommandResult,
+    UsbMavlinkIdentity,
     probe_usb_mavlink_devices,
     usb_mavlink_device_candidates,
 )
@@ -64,8 +67,117 @@ class PixhawkUsbDiscoveryWorker(QtCore.QObject):
         except Exception as exc:
             self.failed.emit(str(exc))
         else:
-            self.discovered.emit({"candidates": candidates, "found": found})
+            normalized = [
+                item.to_mapping()
+                if isinstance(item, UsbMavlinkIdentity)
+                else {
+                    "device": str(item[0]),
+                    "resolved_device": str(item[0]),
+                    "baud": int(item[1]),
+                    "system_id": None,
+                    "component_id": None,
+                    "observed_monotonic_s": None,
+                }
+                for item in found
+            ]
+            self.discovered.emit({"candidates": candidates, "found": normalized})
         finally:
+            self.finished.emit()
+
+
+class PixhawkUsbRecoveryWorker(QtCore.QObject):
+    """Revalidate one USB heartbeat identity, send one reboot, and close."""
+
+    completed = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        *,
+        camera: str,
+        evidence: dict[str, object],
+        expected_system_id: int,
+        timeout_s: float = 1.5,
+    ) -> None:
+        super().__init__()
+        self.camera = str(camera)
+        self.evidence = dict(evidence)
+        self.expected_system_id = int(expected_system_id)
+        self.timeout_s = max(0.1, float(timeout_s))
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        connection = None
+        try:
+            from pymavlink import mavutil
+
+            device = str(self.evidence.get("device") or "")
+            baud = int(self.evidence.get("baud") or 0)
+            if not device or baud <= 0:
+                raise RuntimeError("verified USB device/baud evidence is missing")
+            connection = mavutil.mavlink_connection(
+                device,
+                baud=baud,
+                autoreconnect=False,
+                robust_parsing=True,
+                source_system=MAVLINK_GCS_SOURCE_SYSTEM,
+                source_component=MAVLINK_GCS_SOURCE_COMPONENT,
+            )
+            connection.mav.heartbeat_send(
+                mavutil.mavlink.MAV_TYPE_GCS,
+                mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                0,
+                0,
+                mavutil.mavlink.MAV_STATE_ACTIVE,
+            )
+            heartbeat = connection.wait_heartbeat(timeout=self.timeout_s)
+            if heartbeat is None:
+                raise RuntimeError("USB heartbeat revalidation timed out; reboot not sent")
+            system_id = int(heartbeat.get_srcSystem())
+            component_id = int(heartbeat.get_srcComponent())
+            if system_id != self.expected_system_id:
+                raise RuntimeError(
+                    f"USB system ID changed: expected {self.expected_system_id}, got {system_id}; reboot not sent"
+                )
+            recorded_component = self.evidence.get("component_id")
+            if recorded_component is not None and int(recorded_component) != component_id:
+                raise RuntimeError(
+                    f"USB component ID changed: expected {int(recorded_component)}, got {component_id}; reboot not sent"
+                )
+            connection.mav.command_long_send(
+                system_id,
+                component_id,
+                mavutil.mavlink.MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
+            result = {
+                "camera": self.camera,
+                "device": device,
+                "resolved_device": str(self.evidence.get("resolved_device") or device),
+                "baud": baud,
+                "system_id": system_id,
+                "component_id": component_id,
+                "revalidated_monotonic_s": time.monotonic(),
+                "command_sent": True,
+            }
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.completed.emit(result)
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
             self.finished.emit()
 
 
@@ -481,7 +593,14 @@ class PixhawkRtcmInjectionWorker(QtCore.QObject):
         self.subscriber = subscriber
         self.max_queue = max(1, int(max_queue))
         self.max_injection_age_s = max(0.0, float(max_injection_age_s))
-        self._queue: deque[tuple[tuple[str, ...], bytes, dict[str, object]]] = deque()
+        self._queue: deque[
+            tuple[
+                tuple[str, ...],
+                bytes,
+                dict[str, object],
+                dict[str, dict[str, object]],
+            ]
+        ] = deque()
         self._queue_lock = threading.Lock()
         self._draining = False
 
@@ -535,15 +654,16 @@ class PixhawkRtcmInjectionWorker(QtCore.QObject):
         frame = bytes(payload or b"")
         if not target_sides or not frame:
             return
+        enqueued_health = self._capture_target_health(target_sides)
         with self._queue_lock:
             dropped = 0
             dropped_metadata: list[dict[str, object]] = []
             while len(self._queue) >= self.max_queue:
-                _old_sides, _old_payload, old_metadata = self._queue.popleft()
+                _old_sides, _old_payload, old_metadata, _old_health = self._queue.popleft()
                 if old_metadata:
                     dropped_metadata.append(dict(old_metadata))
                 dropped += 1
-            self._queue.append((target_sides, frame, dict(metadata)))
+            self._queue.append((target_sides, frame, dict(metadata), enqueued_health))
             should_start = not self._draining
             if should_start:
                 self._draining = True
@@ -567,38 +687,118 @@ class PixhawkRtcmInjectionWorker(QtCore.QObject):
                     QtCore.Qt.QueuedConnection,
                 )
 
+    @staticmethod
+    def _state_text(health: object) -> str:
+        state = getattr(health, "state", "")
+        return str(getattr(state, "value", state) or "")
+
+    def _health_snapshot(self, side: str) -> object | None:
+        reader = getattr(self.subscriber, "mavlink_health_snapshot", None)
+        if not callable(reader):
+            return None
+        try:
+            return reader(str(side))
+        except Exception:
+            return None
+
+    def _health_record(self, health: object) -> dict[str, object]:
+        return {
+            "eligible": bool(getattr(health, "rtcm_eligible", False)),
+            "connection_generation": int(getattr(health, "connection_generation", 0) or 0),
+            "state": self._state_text(health),
+            "last_target_rx_age_s": getattr(health, "any_rx_age_s", None),
+            "stall_reason": str(getattr(health, "stall_reason", "") or ""),
+        }
+
+    def _capture_target_health(self, sides: tuple[str, ...]) -> dict[str, dict[str, object]]:
+        captured: dict[str, dict[str, object]] = {}
+        for side in sides:
+            health = self._health_snapshot(side)
+            if health is not None:
+                captured[side] = self._health_record(health)
+        return captured
+
+    def _blocked_target(
+        self,
+        side: str,
+        *,
+        health: object | None = None,
+        record: dict[str, object] | None = None,
+        reason: str | None = None,
+    ) -> dict[str, object]:
+        values = dict(record or (self._health_record(health) if health is not None else {}))
+        state = str(values.get("state") or "")
+        category = "stall" if state == "ETH MAVLINK RX STALLED" else "liveness"
+        if reason == "connection-generation-changed":
+            category = "generation"
+        return {
+            "side": str(side),
+            "category": category,
+            "reason": str(reason or values.get("stall_reason") or state or "target-mavlink-ineligible"),
+            "state": state,
+            "last_target_rx_age_s": values.get("last_target_rx_age_s"),
+            "connection_generation": int(values.get("connection_generation") or 0),
+        }
+
     @QtCore.pyqtSlot()
     def _drain_one(self) -> None:
         with self._queue_lock:
             if not self._queue:
                 self._draining = False
                 return
-            sides, payload, metadata = self._queue.popleft()
+            sides, payload, metadata, enqueued_health = self._queue.popleft()
         sent: list[tuple[str, int]] = []
         failed: list[tuple[str, str]] = []
         stale_targets: list[str] = []
+        blocked_targets: list[dict[str, object]] = []
         delivery_monotonic_s_by_target: dict[str, float] = {}
         receive_monotonic_ns = int(metadata.get("receive_monotonic_ns") or 0)
         last_age_s = 0.0
         for index, side in enumerate(sides):
+            initial_health = enqueued_health.get(side)
+            if initial_health is not None and not bool(initial_health.get("eligible", False)):
+                blocked_targets.append(self._blocked_target(side, record=initial_health))
+                continue
             try:
-                with self.subscriber.exclusive_command(side):
-                    # exclusive_command may itself wait behind another device
-                    # operation. Re-evaluate only after acquiring it so this
-                    # check is immediately adjacent to the physical send.
-                    if receive_monotonic_ns > 0:
-                        last_age_s = max(
-                            0.0,
-                            (time.monotonic_ns() - receive_monotonic_ns)
-                            / 1_000_000_000.0,
+                if receive_monotonic_ns > 0:
+                    last_age_s = max(
+                        0.0,
+                        (time.monotonic_ns() - receive_monotonic_ns)
+                        / 1_000_000_000.0,
+                    )
+                if (
+                    receive_monotonic_ns > 0
+                    and self.max_injection_age_s > 0.0
+                    and last_age_s > self.max_injection_age_s
+                ):
+                    stale_targets.extend(str(value) for value in sides[index:])
+                    break
+                guarded_sender = getattr(self.subscriber, "send_rtcm_data_if_eligible", None)
+                if callable(guarded_sender):
+                    expected_generation = (
+                        None
+                        if initial_health is None
+                        else int(initial_health.get("connection_generation") or 0)
+                    )
+                    outcome = dict(
+                        guarded_sender(
+                            side,
+                            payload,
+                            expected_generation=expected_generation,
                         )
-                    if (
-                        receive_monotonic_ns > 0
-                        and self.max_injection_age_s > 0.0
-                        and last_age_s > self.max_injection_age_s
-                    ):
-                        stale_targets.extend(str(value) for value in sides[index:])
-                        break
+                        or {}
+                    )
+                    if not bool(outcome.get("sent", False)):
+                        blocked_targets.append(
+                            self._blocked_target(
+                                side,
+                                health=outcome.get("health"),
+                                reason=str(outcome.get("block_reason") or "target-mavlink-ineligible"),
+                            )
+                        )
+                        continue
+                    packet_count = int(outcome.get("packet_count") or 0)
+                else:
                     packet_count = int(self.subscriber.send_rtcm_data(side, payload) or 0)
                 sent.append((side, packet_count))
                 delivery_monotonic_s_by_target[side] = time.monotonic()
@@ -627,6 +827,41 @@ class PixhawkRtcmInjectionWorker(QtCore.QObject):
                     "terminal_outcome": "stale" if not sent else "partial-stale",
                 }
             )
+        if blocked_targets:
+            blocked_sides = tuple(str(item["side"]) for item in blocked_targets)
+            blocked_stall = sum(1 for item in blocked_targets if item.get("category") == "stall")
+            blocked_generation = sum(1 for item in blocked_targets if item.get("category") == "generation")
+            target_ages = {
+                str(item["side"]): item.get("last_target_rx_age_s")
+                for item in blocked_targets
+            }
+            target_generations = {
+                str(item["side"]): int(item.get("connection_generation") or 0)
+                for item in blocked_targets
+            }
+            result.update(
+                {
+                    "blocked_targets": tuple(blocked_targets),
+                    "blocked_stall": blocked_stall,
+                    "blocked_generation": blocked_generation,
+                    "target_rx_age_s": target_ages,
+                    "target_connection_generations": target_generations,
+                }
+            )
+            if not stale_targets:
+                result.update(
+                    {
+                        "drop_reason": (
+                            "target-mavlink-stalled"
+                            if blocked_stall
+                            else "target-mavlink-generation-changed"
+                            if blocked_generation
+                            else "target-mavlink-ineligible"
+                        ),
+                        "dropped_targets": blocked_sides,
+                        "terminal_outcome": "blocked" if not sent else "partial-blocked",
+                    }
+                )
         self.injected.emit(result)
         QtCore.QTimer.singleShot(0, self._drain_one)
 
@@ -639,7 +874,7 @@ class PixhawkRtcmInjectionWorker(QtCore.QObject):
             pending = tuple(self._queue)
             self._queue.clear()
         outcomes: list[dict[str, object]] = []
-        for sides, payload, metadata in pending:
+        for sides, payload, metadata, _enqueued_health in pending:
             outcome: dict[str, object] = {
                 "payload_bytes": len(payload),
                 "sent": (),

@@ -33,6 +33,7 @@ WORKSTATION_SETTINGS_PATH = WORKSTATION_DATA_ROOT / "stereo_distance_settings.js
 WORKSTATION_RECORDINGS_ROOT = WORKSTATION_DATA_ROOT / "recordings"
 WORKSTATION_CALIBRATION_ROOT = WORKSTATION_DATA_ROOT / "calibration"
 WORKSTATION_MODELS_ROOT = WORKSTATION_DATA_ROOT / "models"
+WORKSTATION_MEASUREMENT_DATA_ROOT = WORKSTATION_DATA_ROOT / "measurement_data"
 
 PORTABLE_SETTINGS_PATH_FIELDS = (
     "intrinsics_path",
@@ -40,6 +41,7 @@ PORTABLE_SETTINGS_PATH_FIELDS = (
     "calibration_root",
     "calibration_validation_root",
     "calibration_validation_json",
+    "measurement_data_root",
 )
 
 
@@ -189,6 +191,7 @@ __all__ = [
     "WORKSTATION_RECORDINGS_ROOT",
     "WORKSTATION_CALIBRATION_ROOT",
     "WORKSTATION_MODELS_ROOT",
+    "WORKSTATION_MEASUREMENT_DATA_ROOT",
     "PORTABLE_SETTINGS_PATH_FIELDS",
     "portable_workstation_data_path_text",
     "workstation_settings_portability_errors",

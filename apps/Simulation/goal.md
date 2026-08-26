@@ -39,6 +39,235 @@
 3. 진단 smoke에서 낮춘 unique camera-source `10 Hz` gate를 최종 `15 Hz`로
    회복하고, 좌/우 모두 PASS를 입증한다.
 
+## 2026-08-26 20-run 자세오차 측정 실행 조건
+
+이 campaign은 **최종 camera-source 15 Hz qualification이 아니라**, 현재 검증된
+6-waypoint/10 Hz camera-source gate에서 자세오차별 거리 측정값을 수집하는 20-run이다.
+YOLO update 최소 15 Hz와 inference p95 66.7 ms 이하는 그대로 유지한다.
+
+### 고정 실험 계약
+
+- source commit: `c439799` (`feat(simulation): stabilize attitude sweep guidance and evidence`)
+- trajectory: `center,zigzag`
+- 각 trajectory별 case:
+  - baseline 1회
+  - right optical roll `0.2,0.5,1.0°`
+  - right optical pitch `0.2,0.5,1.0°`
+  - right optical yaw `0.2,0.5,1.0°`
+- 총 case: `2 × (1 + 9) = 20`
+- repetition: 각 non-zero 조건 1회
+- 실행 순서: `--ordered`
+- guidance: `velocity_only`
+- 요청 속도: `2.0 m/s`, horizontal ramp `1.0 s`, vertical ramp `2.5 s`
+- waypoint hold: 5초, 분석 window는 마지막 3초
+- hold 안정성:
+  - 3D position-error p95 `<= 1 m`
+  - `abs(roll), abs(pitch) <= 15°`
+- camera/YOLO/overlay 요청률: 각각 `20 Hz`
+- 진단용 unique camera-source/overlay 최소 gate: `10 Hz`
+- YOLO 최소 update median: `15 Hz`
+- YOLO inference p95 최대: `66.7 ms`
+- 모델/SDF와 protected geometry hash는 모든 20 case에서 동일해야 한다.
+
+20-run에서는 현재 양안 거리 sample이 검증된 다음 6개 world RFU waypoint만 사용한다.
+기본 8개 중 화면 밖인 7/8번은 포함하지 않는다.
+
+```text
+R,F,U
+0,415,154
+0,365,137
+0,315,121
+0,265,104
+0,215,88
+0,165,71
+```
+
+zigzag는 같은 Front/Up을 유지하고 기존 40% stereo-overlap 규칙으로 Right만 생성한다.
+
+### 실행 전 확인
+
+1. 다른 `run_operator_view`, PX4, Gazebo, rqt/RViz session이 없어야 한다.
+2. `nvidia-smi`가 RTX 4050과 driver를 정상 출력해야 한다.
+3. `.venv/bin/python`에서 `torch.cuda.is_available() == True`이고 CUDA tensor 생성이
+   성공해야 한다.
+4. 최소 약 `5 GB`의 여유 공간을 확보한다. 2-case smoke 실측은 약 `430 MB`였고,
+   20 case 예상량은 약 `4.3 GB`다. 2026-08-26 확인 당시 여유 공간은 약 `1.1 TB`였다.
+5. 예상 총 실행 시간은 약 `2시간`이다. GUI/RViz/rqt는 각 case에서 표시되고 case
+   종료 시 다음 case를 위해 다시 시작된다.
+6. `--skip-colcon-build --skip-px4-build`는 commit `c439799`의 검증된 build/install을
+   그대로 재사용할 때만 사용한다. source/build가 달라졌으면 두 옵션을 제거한다.
+
+### 실행 명령
+
+output directory는 반드시 존재하지 않는 새 경로를 사용한다.
+
+```bash
+env SWEEP_MIN_OVERLAY_HZ=10 \
+  ./run_auto_attitude_sweep.sh \
+    --axes roll,pitch,yaw \
+    --values-deg 0.2,0.5,1.0 \
+    --repetitions 1 \
+    --trajectories center,zigzag \
+    --waypoint-count 6 \
+    --waypoints-rfu-m '0,415,154;0,365,137;0,315,121;0,265,104;0,215,88;0,165,71' \
+    --ordered \
+    --keep-going \
+    --guidance-mode velocity_only \
+    --camera-hz 20 \
+    --yolo-hz 20 \
+    --overlay-hz 20 \
+    --skip-colcon-build \
+    --skip-px4-build \
+    --output-dir "recordings/attitude-20run-$(date +%Y%m%d_%H%M%S)" \
+    -- \
+    --ramp-s 1.0 \
+    --vertical-ramp-s 2.5
+```
+
+동일 조건의 plan-only 검증은 2026-08-26에
+`trajectories=2 conditions=9 cases=20`으로 PASS했다.
+
+### 완료 판정 및 산출물
+
+다음을 모두 만족해야 20-run 측정 campaign을 PASS로 보고한다.
+
+- `sweep_manifest.tsv`: 20행 모두 `PASS`
+- `SWEEP_FINALIZED_VALID` 존재, `SWEEP_FINALIZED_INVALID` 부재
+- `sweep_validation.json`: `valid=true`, `case_count=20`, `passed_case_count=20`
+- `waypoint_attitude_distance_errors.csv`: `20 × 6 = 120` data rows
+- trajectory별 baseline 1개와 non-zero comparison 9개, 전체 comparison 18개
+- 모든 case의 `guidance_mode=velocity_only`
+- 모든 case의 waypoint hold-analysis index가 `[1,2,3,4,5,6]`
+- 모든 case의 operator `progress.json`이 `state=finalized`
+- 좌/우 MP4가 양수 frame/duration이고 recorder/ffprobe frame count가 일치
+- queue overflow `0`, shutdown drain `SUCCESS`
+- 실제 CUDA FP16 backend log 존재
+
+중간 case가 실패해도 `--keep-going`으로 나머지를 수집한다. 실패 artifact를 삭제하거나
+같은 output directory에 재실행하지 말고, 원인을 보고한 뒤 새 directory에서 retry한다.
+이 20-run 결과를 camera-source 15 Hz 최종 qualification으로 표현하지 않는다.
+
+### 2026-08-26 attempt 1 중단 증거와 재개 조건
+
+- 보존 output:
+  `recordings/attitude-20run-20260826_131752`
+- manifest:
+  - center baseline `FAIL`
+  - center roll 0.2° `FAIL`(중단 요청으로 hold 미완료)
+  - center roll 0.5° 시작 직후 campaign 중단; manifest row 없음
+- baseline 실측:
+  - YOLO median `9.842 Hz` (`>=15 Hz` 실패)
+  - inference p95 `120.041 ms` (`<=66.7 ms` 실패)
+  - left/right unique camera-source `5.224/5.145 Hz` (`>=10 Hz` 실패)
+  - waypoint 5 finite nominal/GT sample `0`
+- 원인: Simulation 외부의 `wiris_stereo_distance.legacy_gui` PID `396894`가
+  multiprocessing GPU worker PID `399790/399792`를 동시 실행했다. 두 worker는
+  각 CPU 약 100%와 NVIDIA compute memory를 사용해 Simulation YOLO/Gazebo/recorder와
+  경합했다. Workstation 자체는 이전 PASS smoke와 공존했으므로 중단 대상이
+  아니며, StereoWIRIS legacy camera/YOLO worker만 중지해야 한다.
+- 조치: 무효 20-run을 계속하지 않고 Simulation campaign만 안전하게 중단했다.
+  사용자의 Workstation/StereoWIRIS 프로세스는 자동으로 종료하지 않았다.
+- retry 전 필수 확인:
+  1. StereoWIRIS에서 camera/YOLO stream을 중지하거나 legacy GUI를 종료한다.
+  2. `nvidia-smi --query-compute-apps` 결과에 PID `399790/399792` 또는 대체 WIRIS
+     inference worker가 없어야 한다.
+  3. Simulation/PX4/Gazebo/rqt/RViz 프로세스가 없음을 확인한다.
+  4. 기존 attempt 1 directory를 재사용하지 말고 새
+     `recordings/attitude-20run-<timestamp>` directory에서 20 case 전체를 처음부터 실행한다.
+  5. 첫 baseline 종료 직후 YOLO median/inference p95/camera-source rate/6 waypoint
+     sample count를 확인하고 PASS일 때만 나머지 19 case를 계속한다.
+
+### 2026-08-26 attempt 2/3 추가 진단과 재개 조건
+
+attempt 1 후 StereoWIRIS GPU worker를 중지하고 두 번 더 새 directory에서
+baseline을 실행했지만, 모두 inference p95 gate 하나만 실패했다.
+
+- attempt 2: `recordings/attitude-20run-20260826_133238`
+  - baseline YOLO median `15.367 Hz` PASS
+  - inference p95 `97.902 ms` FAIL
+  - left/right unique camera-source `10.046/11.038 Hz` PASS
+  - waypoint 1~6 finite distance sample 모두 존재
+  - StereoWIRIS legacy GUI가 GPU worker는 없었지만 CPU 약 50%를 사용했다.
+- attempt 3: `recordings/attitude-20run-20260826_134142`
+  - baseline YOLO median `16.803 Hz` PASS
+  - inference p95 `98.516 ms` FAIL
+  - left/right unique camera-source `12.168/11.758 Hz` PASS
+  - waypoint 1~6 finite distance sample 모두 존재
+  - StereoWIRIS legacy GUI/worker가 모두 종료된 후에도 inference p95만 실패했다.
+- 독립 batch=2 GPU benchmark:
+  `recordings/attitude20-preflight-benchmark-20260826_135000.json`
+  - accepted `true`
+  - pair throughput `159.525 Hz`
+  - wall p95 `7.057 ms`
+  - CUDA FP16 / RTX 4050 / 동일 model SHA-256
+
+결론: GPU/model 자체가 아니라 Simulation의 Gazebo/PX4/rqt/RViz/recorder와 desktop
+백그라운드 앱이 동시 실행될 때의 CPU scheduling/thermal 경합이 남은 원인이다.
+실패 run의 90~180초 구간에 inference p95가 `148~158 ms`로 급증했다가
+다시 회복했고, CPU package는 실행 중 `95°C`, 종료 30초 후에도 `80°C`였다.
+종료 후 주요 백그라운드 부하는 Orca 약 46%, Workstation 약 25%, Firefox 및
+content process 합계 약 100% CPU였다.
+
+다음 retry 전에는 다음을 추가로 만족해야 한다.
+
+1. StereoWIRIS legacy GUI/worker는 계속 종료 상태여야 한다.
+2. Workstation과 Firefox를 종료한다. 화면 읽기 기능을 사용하지 않는다면 Orca도
+   중지한다. 이 프로세스는 사용자 확인 없이 자동 종료하지 않는다.
+3. 2026-08-26 사용자 지정에 따라 Simulation 시작 전 CPU package 온도는
+   `90°C` 이하를 합격 기준으로 사용하고,
+   load average가 충분히 낮아졌는지 확인한다.
+4. 독립 benchmark p95 `<= 66.7 ms`를 다시 PASS한 뒤 새 directory에서 시작한다.
+5. 첫 baseline이 YOLO median/inference p95/camera-source/6-waypoint sample gate를 모두
+   PASS해야 나머지 19 case를 계속한다.
+
+## 2026-08-26 terminal handoff checkpoint
+
+이 checkpoint는 Codex terminal을 종료한 뒤 다음 session에서 같은 20-run을 이어가기
+위해 작성했다.
+
+- checkpoint 시간: `2026-08-26T15:02:57+09:00`
+- Simulation source HEAD: `c439799`
+- `apps/Simulation` source diff: `goal.md` 문서만 modified; Simulation 코드는
+  commit `c439799` 그대로이다.
+- 기존 Goal thread: `01a0392f-0487-7d60-8312-89399340cb79`
+- Goal status: `blocked`(완료 아님). 다음 session에서 사용자가 재개하면 이 문서의
+  최신 계약으로 Goal을 다시 시작/재개한다.
+- 현재 background 상태:
+  - Simulation/PX4/Gazebo/rqt/RViz/waypoint mission 프로세스 없음
+  - NVIDIA compute-app 없음
+  - StereoWIRIS legacy GUI PID `501423`은 idle 상태이고 GPU worker는 없음
+  - CPU package `75°C`; 사용자 최신 시작 기준 `<=90°C` PASS
+- 독립 GPU preflight PASS:
+  - `recordings/attitude20-preflight-benchmark-20260826_140500.json`
+  - accepted `true`, CUDA FP16, batch=2 p95 `9.167 ms`
+- 보존된 무효/중단 campaign(삭제/재사용 금지):
+  - `recordings/attitude-20run-20260826_131752`
+  - `recordings/attitude-20run-20260826_133238`
+  - `recordings/attitude-20run-20260826_134142`
+  - `recordings/attitude-20run-20260826_141011`
+- attempt 4 (`..._141011`)은 baseline 실행 중 StereoWIRIS GPU worker와 별도
+  `pytest -q tests`가 동시 생성되어 즉시 중단했다. 합격 case는 없다.
+
+다음 session에 보낼 재개 요청:
+
+> `apps/Simulation/goal.md를 전체 읽고 terminal handoff checkpoint부터 /goal을 새로 생성하거나 재개해서 20-run 실험 데이터를 완성해줘.`
+
+재개 시 최우선 작업:
+
+1. StereoWIRIS legacy GUI가 GPU multiprocessing worker를 다시 생성하지 않는지 30초 이상
+   관찰한다.
+2. 별도 `pytest -q tests` 또는 다른 CPU/GPU 고부하 task가 없음을 확인한다.
+3. CPU package `<=90°C`, CUDA tensor PASS, NVIDIA compute-app 없음을 확인한다.
+4. 독립 benchmark p95 `<=66.7 ms`를 다시 확인한다.
+5. 기존 attempt directory를 재사용하지 말고 새 timestamp directory에서 baseline을
+   실행한다.
+6. baseline의 YOLO median `>=15 Hz`, inference p95 `<=66.7 ms`, left/right unique
+   camera-source `>=10 Hz`, waypoint 1~6 finite sample, hold/guidance/finalization이 모두
+   PASS일 때만 나머지 19 case를 계속한다.
+
+완료 기준은 위 `2026-08-26 20-run 자세오차 측정 실행 조건`의 20/20 PASS,
+120-row CSV, 18 comparisons, velocity-only/hold/finalization/CUDA 증거를 그대로 유지한다.
+
 이 문서는 `/home/moontaehyung/바탕화면/SASL-20260821/apps/Simulation`에서
 재부팅 직후 새 Goal의 objective로 사용한다.
 

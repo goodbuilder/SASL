@@ -35,6 +35,12 @@ class AppSettings:
     right_control_port: int = 2240
     # The left camera's SDK can acknowledge read commands after roughly 2 s.
     wiris_control_timeout_s: float = 5.0
+    # Field-validated WIRIS visible encoder profile. RTSP enable reapplies
+    # changed fields and verifies each readback before frame probing.
+    wiris_visible_encoder_bitrate: int = 0
+    wiris_visible_encoder_qp: int = 1
+    wiris_visible_encoder_gop: int = 90
+    wiris_visible_encoder_idr: int = 1
     yolo_device: str = "cpu"
     yolo_input_size: int = 416
     yolo_conf_threshold: float = 0.5
@@ -54,7 +60,7 @@ class AppSettings:
     rtsp_latency_ms: int = 50
     yolo_event_queue_size: int = 128
     yolo_frame_queue_size: int = 2
-    rtsp_decoder: str = "nvidia"
+    rtsp_decoder: str = "auto"
     stream_backend: str = "gstreamer"
     # TCP interleaving keeps RTCP Sender Reports on the RTSP control channel;
     # use it as the safe default for absolute camera-clock verification.
@@ -149,6 +155,22 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
             payload.get("right_control_port", payload.get("wiris_control_port", AppSettings.right_control_port))
         ),
         wiris_control_timeout_s=float(payload.get("wiris_control_timeout_s", AppSettings.wiris_control_timeout_s)),
+        wiris_visible_encoder_bitrate=max(
+            0,
+            min(2**32 - 1, int(payload.get("wiris_visible_encoder_bitrate", AppSettings.wiris_visible_encoder_bitrate))),
+        ),
+        wiris_visible_encoder_qp=max(
+            0,
+            min(51, int(payload.get("wiris_visible_encoder_qp", AppSettings.wiris_visible_encoder_qp))),
+        ),
+        wiris_visible_encoder_gop=max(
+            0,
+            min(32767, int(payload.get("wiris_visible_encoder_gop", AppSettings.wiris_visible_encoder_gop))),
+        ),
+        wiris_visible_encoder_idr=max(
+            0,
+            min(2**32 - 1, int(payload.get("wiris_visible_encoder_idr", AppSettings.wiris_visible_encoder_idr))),
+        ),
         yolo_device=str(payload.get("yolo_device", AppSettings.yolo_device)),
         yolo_input_size=int(payload.get("yolo_input_size", AppSettings.yolo_input_size)),
         yolo_conf_threshold=float(payload.get("yolo_conf_threshold", AppSettings.yolo_conf_threshold)),

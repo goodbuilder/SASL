@@ -1,11 +1,24 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+COMMON_PYTHON = REPOSITORY_ROOT / "common" / "python"
+if str(COMMON_PYTHON) not in sys.path:
+    sys.path.insert(0, str(COMMON_PYTHON))
+
+from sasl_common.operator_runtime import check_official_interpreter, render_report
+
+interpreter = check_official_interpreter(root=REPOSITORY_ROOT)
+if interpreter.exit_code:
+    print(render_report(interpreter, title="Calibration runtime blocked"), file=sys.stderr)
+    raise SystemExit(interpreter.exit_code)
 
 try:
     import cv2
     import numpy as np
-except Exception as exc:
+except Exception as exc:  # noqa: BLE001 - report native OpenCV/NumPy loader failures.
     print(f"OpenCV calibration dependencies unavailable: {exc}", file=sys.stderr)
     raise SystemExit(1)
 

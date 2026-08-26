@@ -31,11 +31,11 @@ StereoWIRIS를 산업용/엔지니어링 Workstation UI로 재설계하기 위�
 현재 구현된 Workstation은 저장소 루트 `apps/Workstation/`의 `standalone_gui.py`/`standalone_backend.py`
 런타임 owner를 사용한다. Legacy 구현은 `legacy_gui.py`에 있고 `gui.py`는 호환 alias로 남는다. lifecycle 순서 제어만
 UI-neutral `common/python/sasl_common/lifecycle.py`로 공유하며 panel/resource owner와 runtime data root는 분리한다. Workstation 설정과
-recordings는 `.local/workstation_data/` 아래, Legacy 설정과 recordings는 `apps/StereoWIRIS/` 아래에 저장된다. 두 경로는 shared domain 모듈과
+새 측정 데이터는 `.local/workstation_data/measurement_data/` 아래, 기존 recordings는 그대로 남고, Legacy 설정과 recordings는 `apps/StereoWIRIS/` 아래에 저장된다. 두 경로는 shared domain 모듈과
 저장·좌표 계약만 공유한다. Workstation에는 기존 CameraPane 신호를 재사용한 Camera/Measurement 프리뷰,
 측정 품질, detection, RTCP/NTP 동기화, GNSS/RTK NED baseline, recording/FPS 증거와 함께
-Alignment/Pixhawk/GNSS 표, Calibration profile/intrinsics/R/T 표, Recording/Review/Export
-session/artifact 표가 포함됩니다. Pre-run Calibration에는 좌/우 라이브 카메라 프리뷰가
+Alignment/Pixhawk/GNSS 표, Calibration profile/intrinsics/R/T 표, Data writer/capture
+표가 포함됩니다. Pre-run Calibration에는 좌/우 라이브 카메라 프리뷰가
 표시되고, 체커보드가 검출되면 프레임 위에 코너 그리드와 검출 상태가 표시됩니다. 프리뷰
 하단에서 카메라/검출 및 캘리브레이션 작업 버튼을 바로 조작할 수 있습니다.
 Inspector와 Diagnostics도 같은 `EvidenceAdapter` source를
@@ -46,16 +46,15 @@ validation 실행도 동일한 owner-backed facade로 제공합니다. Calibrati
 measurement tuning, playback/export와 실제 RTSP/Pixhawk/GNSS 장비·장시간 writer 종료는
 별도 조건입니다.
 
-Measurement 실행은 상위 세션과 개별 측정을 분리합니다. `Sessions > Current`의
-`Create Session Folder`는 날짜·시간 기반 작업 폴더를 열고, `Measurement > 측정 시작`은 그 아래
-`measurements/mNNNNNN`을 생성한 뒤 Detection을 시작합니다. Pre HR/OZ 요청이 먼저 있으면
-같은 child를 지연 생성하고 측정 시작이 재사용합니다. Measurement 화면은 현재 child의 증거 수집/유효 측정
-준비 상태를 차단 원인 중심으로 표시합니다. 모든 측정 방식은 항상 보이며, 선택한 방식의
-실제 입력값·출처·좌표계만 상세 영역에 표시합니다. Detection,
-spool, 영상, 캡처, 결과, revision은 현재 child에만 기록되며 `측정 종료`의 자동 저장·봉인 뒤 같은
-세션에서 다음 측정 시작이 새 child를 만듭니다. `Close Session`은 모든 child manifest SHA-256과
-세션 공통 증거를 상위 manifest에 봉인합니다. 저장 리뷰도 `(session_id, measurement_id)`를
-키로 사용합니다.
+Measurement 실행은 persisted Session 없이 transient
+`IDLE/QUEUED/STARTING/RUNNING/STOPPING/ERROR` 상태만 사용합니다. `측정 시작`은 기존
+OPEN/RECOVERABLE 데이터와 writer 오류를 검사하지 않습니다. 수동 기록은 먼저 중지하고,
+실제 카메라 작업이 진행 중이면 QUEUED로 기다렸다가 자동 시작합니다. 구조화 자료는
+`measurement_data_root`의 유형별 고정 JSONL에 append되고 MP4/사진/native PNG/ULog는
+생성 시각과 UTC offset 파일명을 사용하며 기존 파일을 덮어쓰지 않습니다. `측정 종료`는
+실제 카메라 owner를 해제한 뒤 즉시 다음 실행이 가능하며 Parquet, review.xlsx, manifest,
+Finalize/Seal/Retry Save를 기다리지 않습니다. `Data > Status/Capture`는 writer 상태와 캡처
+도구만 제공하고 기존 recordings는 file manager에서만 엽니다.
 
 Optical Pose는 현재 Horizon, Mountain + GNSS, Terrain PnP, Drone RTK Rotation,
 Drone RTK Multi-view R,t, References, Combine 방식별 탭으로 분리됩니다. Measurement는

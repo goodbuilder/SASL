@@ -236,7 +236,7 @@ def test_workstation_shutdown_orders_runtime_stop_before_settings_save(
         "stop-drone-telemetry",
         "stop-runtime-workers",
         "stop-auxiliary-workers",
-        "wait-session-save",
+        "close-measurement-data-writer",
         "save-settings",
     )
     panel.close()
@@ -256,7 +256,7 @@ def test_workstation_exposes_complete_system_settings_surface() -> None:
     app.processEvents()
     settings = window.settings_workspace
     assert window.workspace_host.currentWidget().widget() is settings
-    assert settings.tabs.count() == 5
+    assert settings.tabs.count() == 6
     assert not any(
         "Units/frames" in label.text()
         for label in settings.findChildren(QtWidgets.QLabel)
@@ -270,6 +270,7 @@ def test_workstation_exposes_complete_system_settings_surface() -> None:
         "pixhawk_host_address",
         "pixhawk_ethernet_mode",
         "intrinsics_path",
+        "measurement_data_root",
         "gnss_operation_mode",
         "gnss_network_caster_host",
         "gnss_network_tls",
@@ -297,7 +298,7 @@ def test_workstation_exposes_complete_system_settings_surface() -> None:
     assert settings.settings_widgets["yolo_input_size"].value() == 416
     assert "next Detection start" in settings.settings_widgets["yolo_input_size"].toolTip()
     assert "hostname only" in settings.settings_widgets["gnss_network_caster_host"].placeholderText()
-    assert "세션 메타데이터" in settings.settings_widgets["gnss_site_label"].toolTip()
+    assert "측정 데이터의 현장 메모" in settings.settings_widgets["gnss_site_label"].toolTip()
     assert "기록용" in settings.settings_widgets["gnss_site_address"].toolTip()
 
     operation_mode = settings.settings_widgets["gnss_operation_mode"]
@@ -335,9 +336,13 @@ def test_workstation_exposes_complete_system_settings_surface() -> None:
     settings.settings_widgets["gnss_route_right_enabled"].setChecked(True)
     settings.settings_widgets["gnss_route_drone_enabled"].setChecked(True)
     settings.settings_widgets["gnss_require_drone_rtk_fixed"].setChecked(True)
+    reconnect_policy = settings.settings_widgets["rtsp_reconnect_policy"]
+    reconnect_policy.setCurrentIndex(reconnect_policy.findData("automatic"))
     payload = settings.settings_payload()
     assert payload["interface_name"] == "enx-workstation"
     assert payload["yolo_input_size"] == 736
+    assert "rtsp_pipeline_profile" not in payload
+    assert payload["rtsp_reconnect_policy"] == "automatic"
     assert payload["gnss_operation"]["require_drone_rtk_fixed"] is True
     assert payload["gnss_operation"]["routing"]["left_enabled"] is False
     assert payload["gnss_operation"]["routing"]["right_enabled"] is True
@@ -356,10 +361,19 @@ def test_workstation_exposes_complete_system_settings_surface() -> None:
     assert window.commands.invoke("settings.apply") is True
     assert backend.calls[-1][0] == "settings_apply"
     assert window.commands.invoke("settings.save") is True
-    assert backend.calls[-3][0] == "set_gnss_ntrip_session_password"
+    # The untouched masked deployment fallback is presentation state, not an
+    # explicit password edit.  Do not hand it to the runtime owner where it
+    # would shadow a saved keyring credential after restart.
+    assert not any(
+        call[0] == "set_gnss_ntrip_session_password"
+        for call in backend.calls
+        if isinstance(call, tuple)
+    )
     assert backend.calls[-2][0] == "settings_apply"
     assert backend.calls[-2][1]["interface_name"] == "enx-workstation"
     assert backend.calls[-2][1]["yolo_input_size"] == 736
+    assert "rtsp_pipeline_profile" not in backend.calls[-2][1]
+    assert backend.calls[-2][1]["rtsp_reconnect_policy"] == "automatic"
     assert backend.calls[-1] == "settings_save"
     window.close()
     app.processEvents()

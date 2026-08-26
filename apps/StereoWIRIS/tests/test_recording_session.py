@@ -1,5 +1,6 @@
 import csv
 import json
+import math
 from pathlib import Path
 from xml.etree import ElementTree
 from zipfile import ZipFile
@@ -7,6 +8,7 @@ from zipfile import ZipFile
 from wiris_stereo_distance.recording_session import (
     CAMERA_TIMELINE_COMPACT_COLUMNS,
     compact_px4_timeline_rows,
+    discard_retryable_session,
     DISTANCE_MEASUREMENT_COLUMNS,
     GNSS_BASE_COMPACT_COLUMNS,
     PX4_TIMELINE_COMPACT_COLUMNS,
@@ -14,6 +16,7 @@ from wiris_stereo_distance.recording_session import (
     discover_retryable_sessions,
     format_video_paths,
     load_retryable_session,
+    raw_video_artifact_errors,
     raw_video_paths,
     save_session_files,
     session_dir,
@@ -41,6 +44,28 @@ def test_format_video_paths_handles_empty_and_populated_paths() -> None:
         format_video_paths({"left": Path("/tmp/session/video/raw_left.mp4")})
         == "left=/tmp/session/video/raw_left.mp4"
     )
+
+
+def test_raw_video_artifact_validation_requires_mp4_for_received_frames(tmp_path) -> None:
+    left = tmp_path / "raw_left.mp4"
+    right = tmp_path / "raw_right.mp4"
+    left.write_bytes(b"\x00\x00\x00\x20ftypisom")
+    right.write_bytes(b"")
+
+    errors = raw_video_artifact_errors(
+        {"left": left, "right": right},
+        {"left": 12, "right": 8},
+    )
+
+    assert not any("left" in error for error in errors)
+    assert any("right MP4가 0바이트" in error for error in errors)
+
+
+def test_raw_video_artifact_validation_ignores_camera_without_frames(tmp_path) -> None:
+    assert raw_video_artifact_errors(
+        {"left": tmp_path / "missing.mp4"},
+        {"left": 0, "right": 0},
+    ) == ()
 
 
 def test_compact_px4_timeline_preserves_mag_samples_and_slot_status() -> None:
@@ -816,6 +841,32 @@ def test_xlsx_failure_keeps_all_authoritative_csvs_and_retry_manifest(tmp_path, 
     assert manifest["artifacts"]["session.xlsx"] == "failed"
 
 
+def test_xlsx_writes_nonfinite_values_as_blank_cells(tmp_path) -> None:
+    saved = save_session_files(
+        tmp_path / "nonfinite",
+        metadata={"session_id": "nonfinite", "calibration": {"invalid": math.nan}},
+        pair_rows=[
+            {
+                "sample_index": 0,
+                "session_elapsed_s": 0.0,
+                "distance_m": math.inf,
+            }
+        ],
+        px4_rows={
+            "left": [
+                {
+                    "sample_type": "mavlink_vfr_hud",
+                    "mavlink_vfr_airspeed_m_s": math.nan,
+                }
+            ]
+        },
+    )
+
+    assert saved.finalized is True
+    manifest = json.loads(saved.manifest.read_text(encoding="utf-8"))
+    assert manifest["status"] == "finalized"
+
+
 def test_csv_prepare_failure_does_not_replace_any_authoritative_csv(tmp_path, monkeypatch) -> None:
     import wiris_stereo_distance.recording_session as recording_session
 
@@ -969,6 +1020,28 @@ def test_retryable_session_discovery_and_pair_row_recovery(tmp_path) -> None:
     assert len(recovered.pair_rows) == 5
     assert [row["sample_index"] for row in recovered.pair_rows] == list(range(5))
     assert recovered.metadata["session_id"] == "recover-me"
+
+
+def test_discard_retryable_session_removes_spool_and_stops_recovery(tmp_path) -> None:
+    recordings_root = tmp_path / "recordings"
+    output_dir = recordings_root / "sessions" / "discard-me"
+    rows = SpoolRows()
+    rows.bind(output_dir / ".spool" / "pair_rows.jsonl")
+    rows.append({"sample_index": 0})
+    rows.close()
+    write_recovery_metadata(output_dir, {"session_id": "discard-me"})
+    (output_dir / "session_manifest.json").write_text(
+        json.dumps({"status": "failed", "retryable": True}), encoding="utf-8"
+    )
+
+    assert discover_retryable_sessions(recordings_root) == [output_dir]
+    assert discard_retryable_session(output_dir, reason="test_discard") is True
+    assert not (output_dir / ".spool").exists()
+    manifest = json.loads((output_dir / "session_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "discarded"
+    assert manifest["retryable"] is False
+    assert manifest["discard_reason"] == "test_discard"
+    assert discover_retryable_sessions(recordings_root) == []
 
 
 def test_retry_cleans_finalize_and_preparing_orphans(tmp_path) -> None:

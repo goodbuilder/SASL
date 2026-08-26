@@ -94,6 +94,14 @@ from Workstation.workstation_core.method_evaluation import (
 from Workstation.workstation_core.method_evaluation_workers import (
     MethodEvaluationCoordinator,
 )
+from Workstation.workstation_core.detection_pair_coordinator import (
+    DetectionPairCoordinator,
+    PairingPolicy,
+)
+from Workstation.workstation_core.preview_measurement_worker import (
+    PreviewMeasurementCoordinator,
+    PreviewMeasurementResult,
+)
 from Workstation.workstation_core.measurement_widgets import triangulation_3d_scene_points
 from Workstation.workstation_core.rtk_geometry import (
     GpsPairReadiness,
@@ -187,6 +195,14 @@ class MeasurementViewController:
         self._retiring_method_evaluation_coordinators: list[
             MethodEvaluationCoordinator
         ] = []
+        self._detection_pair_coordinator: DetectionPairCoordinator | None = None
+        self._detection_pair_timer: QtCore.QTimer | None = None
+        self._pairing_policy_token: tuple[object, ...] | None = None
+        self._pairing_policy_revision = 0
+        self._preview_measurement_coordinator: PreviewMeasurementCoordinator | None = None
+        self._preview_measurement_timer: QtCore.QTimer | None = None
+        self._preview_measurement_results: dict[str, PreviewMeasurementResult] = {}
+        self._preview_measurement_pending: set[str] = set()
 
     def _ensure_method_evaluation_coordinator(self) -> MethodEvaluationCoordinator:
         coordinator = self._method_evaluation_coordinator
@@ -219,15 +235,45 @@ class MeasurementViewController:
             if not retiring.closed:
                 remaining.append(retiring)
         self._retiring_method_evaluation_coordinators = remaining
-        return not remaining
+        detection_timer = self._detection_pair_timer
+        if detection_timer is not None:
+            detection_timer.stop()
+            detection_timer.deleteLater()
+            self._detection_pair_timer = None
+        detection_coordinator = self._detection_pair_coordinator
+        self._detection_pair_coordinator = None
+        detection_closed = (
+            True
+            if detection_coordinator is None
+            else detection_coordinator.close()
+        )
+        preview_timer = self._preview_measurement_timer
+        if preview_timer is not None:
+            preview_timer.stop()
+            preview_timer.deleteLater()
+            self._preview_measurement_timer = None
+        preview_coordinator = self._preview_measurement_coordinator
+        self._preview_measurement_coordinator = None
+        preview_closed = (
+            True
+            if preview_coordinator is None
+            else preview_coordinator.close()
+        )
+        self._preview_measurement_results.clear()
+        self._preview_measurement_pending.clear()
+        return not remaining and detection_closed and preview_closed
 
     def _measurement_method_state(self) -> None:
         panel = self.panel
         measurement_id = str(getattr(panel, "_measurement_id", "") or "")
         package = getattr(panel, "_measurement_package", None)
-        config_token = (measurement_id, id(package) if package is not None else 0)
+        run_metadata = getattr(panel, "_measurement_run_metadata", None)
+        config_owner = package if package is not None else run_metadata
+        config_token = (measurement_id, id(config_owner) if config_owner is not None else 0)
         if getattr(panel, "_measurement_method_config_token", None) != config_token:
-            metadata: dict[str, object] = {}
+            metadata: dict[str, object] = (
+                dict(run_metadata) if isinstance(run_metadata, Mapping) else {}
+            )
             snapshotter = getattr(package, "snapshot", None)
             if measurement_id and callable(snapshotter):
                 try:
@@ -1706,6 +1752,161 @@ class MeasurementViewController:
         )
         self.panel._record_blocked_measurement_pair(blocked)
 
+    def _ensure_detection_pair_coordinator(self) -> DetectionPairCoordinator:
+        coordinator = self._detection_pair_coordinator
+        if coordinator is None:
+            coordinator = DetectionPairCoordinator()
+            self._detection_pair_coordinator = coordinator
+        if (
+            self._detection_pair_timer is None
+            and QtCore.QCoreApplication.instance() is not None
+        ):
+            parent = self.panel if isinstance(self.panel, QtCore.QObject) else None
+            timer = QtCore.QTimer(parent)
+            timer.setInterval(20)
+            timer.timeout.connect(self._poll_detection_pairs)
+            timer.start()
+            self._detection_pair_timer = timer
+        return coordinator
+
+    def _pairing_policy_snapshot(self) -> PairingPolicy:
+        token = (
+            str(self.panel._yolo_time_basis()),
+            float(self.panel._yolo_pair_max_delta_s()),
+            float(self.panel._yolo_vertical_max_delta_px()),
+            bool(self.panel._camera_sync_gate_active()),
+        )
+        if token != self._pairing_policy_token:
+            self._pairing_policy_token = token
+            self._pairing_policy_revision += 1
+        return PairingPolicy(
+            timestamp_basis=token[0],
+            max_delta_s=token[1],
+            max_vertical_delta_px=token[2],
+            allow_app_fallback=True,
+            revision=self._pairing_policy_revision,
+        )
+
+    def _poll_detection_pairs(self) -> None:
+        coordinator = self._detection_pair_coordinator
+        if coordinator is None:
+            return
+        result = coordinator.poll_latest()
+        if result is None:
+            return
+        self.panel._detection_pair_coordinator_active = True
+        self.panel._coordinated_detection_pair = result.pair
+        self.panel._last_correspondence_rejection_reason = result.rejection_reason
+        self.panel._last_pair_advisories = result.advisories
+        self.panel._runtime_pair_uses_app_fallback = result.uses_app_fallback
+        self.panel._detection_pair_metrics = coordinator.metrics()
+        self.panel._refresh_distance()
+        self.panel._refresh_optical_alignment_view()
+
+    def reset_detection_pair_coordinator(self) -> None:
+        coordinator = self._detection_pair_coordinator
+        self._detection_pair_coordinator = None
+        if coordinator is not None:
+            coordinator.close()
+        self.panel._detection_pair_coordinator_active = False
+        self.panel._coordinated_detection_pair = None
+        self.panel._detection_pair_metrics = {}
+        preview_coordinator = self._preview_measurement_coordinator
+        self._preview_measurement_coordinator = None
+        if preview_coordinator is not None:
+            preview_coordinator.close()
+        self._preview_measurement_results.clear()
+        self._preview_measurement_pending.clear()
+        self.panel._latest_preview_measurement_result = None
+        self.panel._latest_preview_pair_identity = None
+
+    def _ensure_preview_measurement_coordinator(
+        self,
+    ) -> PreviewMeasurementCoordinator:
+        coordinator = self._preview_measurement_coordinator
+        if coordinator is None:
+            coordinator = PreviewMeasurementCoordinator()
+            self._preview_measurement_coordinator = coordinator
+        if (
+            self._preview_measurement_timer is None
+            and QtCore.QCoreApplication.instance() is not None
+        ):
+            parent = self.panel if isinstance(self.panel, QtCore.QObject) else None
+            timer = QtCore.QTimer(parent)
+            timer.setInterval(20)
+            timer.timeout.connect(self._poll_preview_measurements)
+            timer.start()
+            self._preview_measurement_timer = timer
+        return coordinator
+
+    def _poll_preview_measurements(self) -> None:
+        coordinator = self._preview_measurement_coordinator
+        if coordinator is None:
+            return
+        result = coordinator.poll_latest()
+        if result is None:
+            return
+        self._preview_measurement_pending.discard(result.key)
+        self._preview_measurement_results[result.key] = result
+        while len(self._preview_measurement_results) > 8:
+            self._preview_measurement_results.pop(
+                next(iter(self._preview_measurement_results))
+            )
+        self.panel._preview_measurement_metrics = coordinator.metrics()
+        self.panel._latest_preview_measurement_result = result
+        if result.attempt is not None:
+            self.panel._latest_preview_pair_identity = (
+                str(
+                    result.attempt.left_detection.timestamp_metadata.get(
+                        "frame_key",
+                        result.attempt.left_detection.app_receive_monotonic_s,
+                    )
+                ),
+                str(
+                    result.attempt.right_detection.timestamp_metadata.get(
+                        "frame_key",
+                        result.attempt.right_detection.app_receive_monotonic_s,
+                    )
+                ),
+            )
+        self.panel._refresh_distance()
+        self.panel._refresh_optical_alignment_view()
+
+    def _preview_optical_payload(self, pair: object) -> dict[str, object]:
+        expected_dy_px, _expected_source, _expected_level = (
+            self.panel._optical_alignment_expected_dy_px()
+        )
+        mean_fy_px, _fy_source = self.panel._optical_alignment_mean_focal_px("y")
+        mean_fx_px, _fx_source = self.panel._optical_alignment_mean_focal_px("x")
+        return {
+            "left_center": tuple(pair.left.center),
+            "right_center": tuple(pair.right.center),
+            "expected_dy_px": expected_dy_px,
+            "mean_fy_px": mean_fy_px,
+            "mean_fx_px": mean_fx_px,
+            "target_distance_m": self.panel.optical_target_distance_spin.value(),
+            "left_pair_timestamp_s": self.panel._yolo_match_timestamp_s(pair.left),
+            "right_pair_timestamp_s": self.panel._yolo_match_timestamp_s(pair.right),
+        }
+
+    def _preview_measurement_result(
+        self,
+        attempt: MeasurementAttempt,
+        pair: object,
+    ) -> PreviewMeasurementResult | None:
+        key = attempt.canonical_sha256()
+        cached = self._preview_measurement_results.get(key)
+        if cached is not None:
+            return cached
+        if key not in self._preview_measurement_pending:
+            self._preview_measurement_pending.add(key)
+            self._ensure_preview_measurement_coordinator().submit(
+                key=key,
+                attempt=attempt,
+                optical_payload=self._preview_optical_payload(pair),
+            )
+        return None
+
     def _update_detection(self, camera: str, detection: DetectionObservation | None) -> None:
         if camera == "left":
             self.panel.latest_left = detection
@@ -1713,8 +1914,11 @@ class MeasurementViewController:
             self.panel.latest_right = detection
         if detection is not None:
             self.panel.detection_buffers[camera].add(detection)
-        self.panel._refresh_distance()
-        self.panel._refresh_optical_alignment_view()
+        self._ensure_detection_pair_coordinator().submit(
+            camera,
+            detection,
+            self._pairing_policy_snapshot(),
+        )
 
     def _checkerboard_translation_right_in_left_m(self) -> tuple[float, float, float] | None:
         calibration = self.panel.active_intrinsics
@@ -2149,41 +2353,51 @@ class MeasurementViewController:
 
         left_center_x, left_center_y = pair.left.center
         right_center_x, right_center_y = pair.right.center
-        observed_dx_px = float(left_center_x) - float(right_center_x)
-        observed_dy_px = float(left_center_y) - float(right_center_y)
         expected_dy_px, expected_dy_source, expected_dy_level = self.panel._optical_alignment_expected_dy_px()
-        dy_residual_px = None if expected_dy_px is None else observed_dy_px - expected_dy_px
         mean_fy_px, fy_source = self.panel._optical_alignment_mean_focal_px("y")
         mean_fx_px, fx_source = self.panel._optical_alignment_mean_focal_px("x")
-        vertical_error_mrad = None if dy_residual_px is None or mean_fy_px is None else dy_residual_px / mean_fy_px * 1000.0
-        vertical_level = self.panel._optical_alignment_level_from_mrad(vertical_error_mrad)
-
-        left_timestamp_s = self.panel._yolo_match_timestamp_s(pair.left)
-        right_timestamp_s = self.panel._yolo_match_timestamp_s(pair.right)
-        camera_delta_s = (
-            None if left_timestamp_s is None or right_timestamp_s is None else abs(left_timestamp_s - right_timestamp_s)
+        target_distance_m = self.panel.optical_target_distance_spin.value()
+        current_identity = (
+            str(pair.left.timestamp_metadata.get("frame_key") or pair.left.timestamp_s),
+            str(pair.right.timestamp_metadata.get("frame_key") or pair.right.timestamp_s),
         )
-        try:
-            attempt = self.panel._build_measurement_attempt(pair)
-            geometry_result = calculate_measurement_geometry(attempt)
-        except (TypeError, ValueError) as exc:
-            attempt = None
-            geometry_result = None
-            geometry_error = str(exc)
-        else:
-            geometry_error = ""
-
+        preview_result = getattr(
+            self.panel,
+            "_latest_preview_measurement_result",
+            None,
+        )
+        if (
+            not isinstance(preview_result, PreviewMeasurementResult)
+            or getattr(self.panel, "_latest_preview_pair_identity", None)
+            != current_identity
+        ):
+            try:
+                optical_attempt = self.panel._build_measurement_attempt(pair)
+            except (TypeError, ValueError):
+                optical_attempt = None
+            if optical_attempt is not None:
+                self._preview_measurement_result(optical_attempt, pair)
+            self.panel._set_health_label(
+                self.panel.optical_alignment_status_label,
+                "Optical alignment: measurement worker 계산 중",
+                "idle",
+            )
+            return
+        metrics = dict(preview_result.optical_metrics)
+        observed_dx_px = metrics.get("observed_dx_px")
+        observed_dy_px = metrics.get("observed_dy_px")
+        dy_residual_px = metrics.get("dy_residual_px")
+        vertical_error_mrad = metrics.get("vertical_error_mrad")
+        expected_disparity_px = metrics.get("expected_disparity_px")
+        yaw_residual_px = metrics.get("yaw_residual_px")
+        yaw_error_mrad = metrics.get("yaw_error_mrad")
+        camera_delta_s = metrics.get("camera_delta_s")
+        vertical_level = self.panel._optical_alignment_level_from_mrad(vertical_error_mrad)
+        attempt = preview_result.attempt
+        geometry_result = preview_result.geometry_result
+        geometry_error = preview_result.error
         baseline_m = 0.0 if attempt is None else attempt.baseline_m
         baseline_source = "waiting" if attempt is None else attempt.baseline_source
-        target_distance_m = self.panel.optical_target_distance_spin.value()
-        expected_disparity_px = None
-        yaw_residual_px = None
-        yaw_error_mrad = None
-        if mean_fx_px is not None and baseline_m > 0.0 and target_distance_m > 0.0:
-            expected_disparity_mag_px = mean_fx_px * baseline_m / target_distance_m
-            expected_disparity_px = expected_disparity_mag_px if observed_dx_px >= 0.0 else -expected_disparity_mag_px
-            yaw_residual_px = observed_dx_px - expected_disparity_px
-            yaw_error_mrad = yaw_residual_px / mean_fx_px * 1000.0
         yaw_level = self.panel._optical_alignment_level_from_mrad(yaw_error_mrad)
         overall_level = self.panel._optical_alignment_overall_level((vertical_level, yaw_level))
 
@@ -2475,6 +2689,10 @@ class MeasurementViewController:
                 )
                 or {}
             )
+        if native_fields.get("native_pair_status") == "EVIDENCE_FRAME_UNAVAILABLE":
+            raise ValueError(
+                "EVIDENCE_FRAME_UNAVAILABLE: exact selected native frame is no longer available"
+            )
         capture_sync = self._ftp_command_round_sync(pair)
         if not capture_sync:
             capture_sync = {
@@ -2660,9 +2878,6 @@ class MeasurementViewController:
                     selected_left_quaternion_wxyz=(
                         None if left_attitude is None else left_attitude.quaternion_wxyz
                     ),
-                    selected_right_quaternion_wxyz=(
-                        None if right_attitude is None else right_attitude.quaternion_wxyz
-                    ),
                     selected_left_attitude_monotonic_s=(
                         None if left_attitude is None else left_attitude.timestamp_s
                     ),
@@ -2793,12 +3008,10 @@ class MeasurementViewController:
         usable, _reason = self.panel._gps_baseline_usable_for_translation(baseline)
         if not usable:
             return None
-        right_ext = self.panel.latest_extrinsics.get("right")
         world_vector = (baseline.north_m, baseline.east_m, baseline.down_m)
         return camera_translation_right_in_left_camera(
             baseline_right_in_left_world_m=world_vector,
             left_body_to_world_q=left_ext.q,
-            right_body_to_world_q=right_ext.q if right_ext is not None else left_ext.q,
             scale_to_m=None,
         )
 
@@ -2808,13 +3021,11 @@ class MeasurementViewController:
         left_ext = self.panel.latest_extrinsics.get("left")
         if left_ext is None:
             return None
-        right_ext = self.panel.latest_extrinsics.get("right")
         world_vector = (baseline.north_m, baseline.east_m, baseline.down_m)
         scale_to_m = self.panel.baseline_spin.value() if hasattr(self.panel, "baseline_spin") else None
         return camera_translation_right_in_left_camera(
             baseline_right_in_left_world_m=world_vector,
             left_body_to_world_q=left_ext.q,
-            right_body_to_world_q=right_ext.q if right_ext is not None else left_ext.q,
             scale_to_m=scale_to_m,
         )
 
@@ -3013,7 +3224,6 @@ class MeasurementViewController:
                 translation_right_in_left_m = camera_translation_right_in_left_camera(
                     baseline_right_in_left_world_m=world_vector,
                     left_body_to_world_q=left_ext.q,
-                    right_body_to_world_q=right_ext.q if right_ext is not None else left_ext.q,
                     scale_to_m=None,
                 )
                 pixhawk_attempt = triangulate_pixels_with_pixhawk_mount_attempt(
@@ -3318,6 +3528,31 @@ class MeasurementViewController:
         identity = (bundle.pair_id, bundle.request_generation)
         if identity in committed:
             return
+        sessionless = not bool(
+            getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
+        )
+        current_generation = str(
+            getattr(self.panel, "_measurement_run_generation", "") or ""
+        )
+        run_state = str(
+            getattr(self.panel, "_measurement_run_state", "IDLE") or "IDLE"
+        ).upper()
+        if sessionless and (
+            bundle.measurement_id != current_generation or run_state != "RUNNING"
+        ):
+            writer = getattr(self.panel, "append_workstation_data", None)
+            if callable(writer):
+                writer(
+                    "method_evaluations",
+                    {
+                        **bundle.to_record(),
+                        "late": True,
+                        "current_runtime_generation": current_generation,
+                    },
+                    priority=True,
+                )
+            committed.add(identity)
+            return
         primary = bundle.primary
         attempt: MeasurementAttempt | None = None
         if primary.attempt_payload:
@@ -3602,9 +3837,31 @@ class MeasurementViewController:
                 }
             )
 
+        preview_result = self._preview_measurement_result(attempt, pair)
+        if preview_result is None:
+            self.panel._clear_triangulation_quality("measurement worker 계산 중")
+            self.panel._set_distance_text(
+                "거리: measurement worker 계산 중",
+                quality="WARNING",
+                detail="GUI는 계산하지 않고 latest worker 결과를 기다립니다.",
+            )
+            return
+        if preview_result.error or preview_result.geometry_result is None:
+            self.panel._clear_triangulation_quality("measurement worker 실패")
+            self.panel._set_distance_text(
+                f"거리: measurement worker 실패 | {preview_result.error}",
+                quality="ERROR",
+            )
+            return
+        attempt = preview_result.attempt or attempt
+        self.panel._latest_preview_measurement_result = preview_result
+        self.panel._latest_preview_pair_identity = (
+            str(pair.left.timestamp_metadata.get("frame_key") or pair.left.timestamp_s),
+            str(pair.right.timestamp_metadata.get("frame_key") or pair.right.timestamp_s),
+        )
         baseline_m = attempt.baseline_m
         baseline_source = attempt.baseline_source
-        geometry_result = calculate_measurement_geometry(attempt)
+        geometry_result = preview_result.geometry_result
         match = geometry_result.match
         triangulated = geometry_result.triangulated
         estimate = geometry_result.estimate

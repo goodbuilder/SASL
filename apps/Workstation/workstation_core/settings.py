@@ -112,13 +112,13 @@ class AppSettings:
     right_control_port: int = 2240
     # The left camera's SDK can acknowledge read commands after roughly 2 s.
     wiris_control_timeout_s: float = 5.0
-    # Persist the field-tested visible-stream encoder profile.  The camera
+    # Persist the field-validated visible-stream encoder profile. The camera
     # worker reapplies and reads back these values whenever Ethernet/RTSP mode
     # is enabled or reactivated.
-    wiris_visible_encoder_bitrate: int = 1
-    wiris_visible_encoder_qp: int = 17
-    wiris_visible_encoder_gop: int = 30
-    wiris_visible_encoder_idr: int = 1
+    wiris_visible_encoder_bitrate: int = 0
+    wiris_visible_encoder_qp: int = 1
+    wiris_visible_encoder_gop: int = 90
+    wiris_visible_encoder_idr: int = 0
     # WIRIS Enterprise's onboard FTP server, reached over the same host as
     # the TCP command channel above (different port only). Used to retrieve
     # a captured HR/OZ still after the camera reports it stored.
@@ -170,6 +170,7 @@ class AppSettings:
     calibration_pair_max_delta_s: float = 0.100
     calibration_auto_interval_s: float = 1.0
     calibration_root: str = DEFAULT_CALIBRATION_ROOT
+    measurement_data_root: str = "measurement_data"
     calibration_validation_mode: str = "pixhawk"
     calibration_validation_root: str = DEFAULT_CALIBRATION_ROOT
     calibration_validation_json: str = DEFAULT_INTRINSICS_PATH
@@ -181,6 +182,9 @@ class AppSettings:
     yolo_frame_queue_size: int = 2
     rtsp_decoder: str = "auto"
     stream_backend: str = "gstreamer"
+    # A failed camera child exits and waits for an operator/controller-owned
+    # reconnect. "automatic" restores the former nested retry behavior.
+    rtsp_reconnect_policy: str = "manual"
     # Interleaved TCP avoids the unrecoverable H.264 gaps seen when UDP loses
     # SPS/PPS or keyframe packets. Operators can still opt into UDP explicitly.
     rtsp_transport: str = "tcp"
@@ -488,6 +492,9 @@ def load_settings(
             min(10.0, float(payload.get("calibration_auto_interval_s", AppSettings.calibration_auto_interval_s))),
         ),
         calibration_root=calibration_root,
+        measurement_data_root=str(
+            payload.get("measurement_data_root", AppSettings.measurement_data_root)
+        ),
         calibration_validation_mode=calibration_validation_mode,
         calibration_validation_root=calibration_validation_root,
         calibration_validation_json=calibration_validation_json,
@@ -517,6 +524,12 @@ def load_settings(
         ),
         rtsp_decoder=str(payload.get("rtsp_decoder", AppSettings.rtsp_decoder)),
         stream_backend=str(payload.get("stream_backend", AppSettings.stream_backend)),
+        rtsp_reconnect_policy=str(
+            payload.get(
+                "rtsp_reconnect_policy",
+                AppSettings.rtsp_reconnect_policy,
+            )
+        ),
         rtsp_transport=str(payload.get("rtsp_transport", AppSettings.rtsp_transport)),
         camera_sync_history_window_s=max(
             0.1,

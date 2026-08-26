@@ -445,7 +445,6 @@ def test_workstation_shell_smoke_uses_standalone_backend_without_devices() -> No
     assert [name for name, _args in calls] == [
         "auto_connect_wiris",
         "discover_usb_pixhawk_connections",
-        "set_gnss_ntrip_session_password",
         "apply_workstation_system_settings",
         "save_current_settings_from_ui",
     ]
@@ -453,12 +452,49 @@ def test_workstation_shell_smoke_uses_standalone_backend_without_devices() -> No
     window._select_context("tasks.session_details")
     app.processEvents()
     assert window.workspace_host.currentWidget().widget() is window.sessions
-    assert window._current_context == "tasks.session"
-    assert window.navigation.currentIndex().data(QtCore.Qt.UserRole) == "tasks.session"
-    assert window.sessions.current_tab_id() == "review"
-    assert window.inspector.context_label.text() == "Sessions"
+    assert window._current_context == "tasks.data"
+    assert window.navigation.currentIndex().data(QtCore.Qt.UserRole) == "tasks.data"
+    assert window.sessions.current_tab_id() == "current"
+    assert window.inspector.context_label.text() == "Data"
     window.close()
     app.processEvents()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_old_recoverable_session_and_unavailable_storage_never_disable_measurement_start() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    backend.panel._measurement_session_state = "RECOVERABLE"
+    backend.panel._measurement_session_id = "20260823_194605_395747300"
+    backend.panel.recording_session_id = "20260823_194605_395747300"
+    backend.data_storage_snapshot = lambda: {
+        "state": "UNAVAILABLE",
+        "root": "/unwritable/measurement_data",
+        "priority_pending": 0,
+        "bulk_pending": 0,
+        "dropped_records": 4,
+        "streams": {},
+        "error": "permission denied",
+    }
+    window = WorkstationMainWindow(backend=backend)
+    window.show()
+    app.processEvents()
+
+    window._refresh_from_status(window.status_adapter.model.snapshot())
+    assert window.commands.action("detection.toggle").isEnabled()
+    assert window.measurement.control_buttons["detection.toggle"].isEnabled()
+    assert window.commands.invoke("detection.toggle") is True
+    assert "detection" in backend.calls
+    assert window.navigation.select_context("tasks.data")
+    app.processEvents()
+    assert window.navigation.currentIndex().data(QtCore.Qt.UserRole) == "tasks.data"
+    assert not any(
+        button.isVisible() and "Session" in button.text()
+        for button in window.data.findChildren(QtWidgets.QPushButton)
+    )
+
+    window.close()
     window.deleteLater()
     app.processEvents()
 
@@ -481,11 +517,11 @@ def test_protocol_selection_is_read_only_and_recording_fallback_is_visible() -> 
 
     window.measurement.session_details_button.click()
     app.processEvents()
-    assert window._current_context == "tasks.session"
+    assert window._current_context == "tasks.data"
     assert window.workspace_host.currentWidget().widget() is window.sessions
-    assert window.navigation.currentIndex().data(QtCore.Qt.UserRole) == "tasks.session"
-    assert window.sessions.current_tab_id() == "review"
-    assert window.inspector.context_label.text() == "Sessions"
+    assert window.navigation.currentIndex().data(QtCore.Qt.UserRole) == "tasks.data"
+    assert window.sessions.current_tab_id() == "current"
+    assert window.inspector.context_label.text() == "Data"
     window._select_context("tasks.advanced")
     window.advanced.tabs.setCurrentIndex(3)
     app.processEvents()
@@ -677,7 +713,7 @@ def test_stale_measurement_is_not_rendered_as_valid_in_overview_or_measurement()
     window.deleteLater()
     app.processEvents()
 
-def test_session_catalog_scans_are_throttled_during_status_refresh(monkeypatch) -> None:
+def test_sessionless_data_workspace_never_scans_legacy_session_catalog(monkeypatch) -> None:
     from Workstation.status_model import StatusModel
     from Workstation.workspaces import AdvancedWorkspace, RecordingWorkspace
 
@@ -693,18 +729,18 @@ def test_session_catalog_scans_are_throttled_during_status_refresh(monkeypatch) 
     status_model = StatusModel()
 
     recording = RecordingWorkspace(backend, status_model, lambda: None)
-    assert len(calls) == 1
+    assert len(calls) == 0
     for _ in range(10):
         recording.refresh({})
-    assert len(calls) == 1
+    assert len(calls) == 0
     recording.refresh_sessions(force=True)
-    assert len(calls) == 2
+    assert len(calls) == 0
 
     advanced = AdvancedWorkspace(backend, status_model)
-    assert len(calls) == 2
+    assert len(calls) == 0
     for _ in range(10):
         advanced.refresh({})
-    assert len(calls) == 2
+    assert len(calls) == 0
     assert not hasattr(advanced, "media_session_combo")
     assert not hasattr(advanced, "media_artifact_combo")
 
@@ -825,7 +861,7 @@ def test_polled_table_updates_preserve_selected_row() -> None:
     table.deleteLater()
     app.processEvents()
 
-def test_recording_workspace_reviews_saved_csv_without_frame_conversion(tmp_path, monkeypatch) -> None:
+def test_data_workspace_leaves_legacy_session_files_for_file_manager_only(tmp_path, monkeypatch) -> None:
     from Workstation.workstation_core import settings as settings_module
 
     monkeypatch.setattr(settings_module, "APP_ROOT", tmp_path)
@@ -843,17 +879,21 @@ def test_recording_workspace_reviews_saved_csv_without_frame_conversion(tmp_path
         '"artifact_roles":{"session-1_distance_measurements.csv":"distance_measurements_csv"}}',
         encoding="utf-8",
     )
+    before = (generation_dir / "session-1_distance_measurements.csv").read_bytes()
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     window = WorkstationMainWindow(backend=_FakeBackend())
     window.show()
     app.processEvents()
-    assert window.recording.session_selector.count() == 1
-    assert window.recording.session_selector.currentData() == "session-1"
-    assert window.recording.artifact_selector.currentData() == "session-1_distance_measurements.csv"
-    assert window.recording.review_model.rowCount() == 1
-    assert window.recording.review_model.item(0, 1).text() == "2"
-    assert "no NED/ENU" in window.recording.review_status_label.toolTip()
+    assert window.recording.session_selector.count() == 0
+    assert [
+        window.recording.tabs.tabText(index)
+        for index in range(window.recording.tabs.count())
+    ] == ["Status", "Capture"]
+    assert window.recording.open_legacy_recordings_button.text() == (
+        "Open Legacy Recordings Folder"
+    )
+    assert (generation_dir / "session-1_distance_measurements.csv").read_bytes() == before
     window.close()
     app.processEvents()
     window.deleteLater()

@@ -51,3 +51,54 @@ def test_run_evidence_oserror_becomes_recording_failure_not_callback_exception(
     assert panel._session_save_retry_required is True
     assert "read-only-sentinel" in panel._session_save_last_error
     assert panel.logs
+
+
+def test_session_prepared_failure_stops_artifact_write(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from Workstation.workstation_core.run_evidence import RunEvidenceLedger
+
+    calls: list[str] = []
+
+    def fail_setup(*_args, **_kwargs):
+        calls.append("session_prepared")
+        raise OSError("setup-sentinel")
+
+    def unexpected_import(*_args, **_kwargs):
+        calls.append("artifact_import")
+        raise AssertionError("artifact write must not run after setup failure")
+
+    monkeypatch.setattr(RunEvidenceLedger, "append_event", fail_setup)
+    monkeypatch.setattr(RunEvidenceLedger, "import_artifact", unexpected_import)
+    panel = _panel(tmp_path, "A")
+
+    result = RunEvidenceController(panel).import_workstation_session_artifact(
+        tmp_path / "source.bin",
+        role="capture/raw",
+    )
+
+    assert result["status"] == "failed"
+    assert result["error"] == "setup-sentinel"
+    assert calls == ["session_prepared"]
+
+
+def test_session_switch_keeps_old_ledger_when_flush_fails(tmp_path: Path) -> None:
+    panel = _panel(tmp_path, "A")
+    controller = RunEvidenceController(panel)
+    controller.ensure_workstation_run_evidence("started")
+    old_ledger = controller.ledger
+    assert old_ledger is not None
+
+    def fail_flush() -> None:
+        raise OSError("flush-sentinel")
+
+    old_ledger.flush = fail_flush  # type: ignore[method-assign]
+    panel.recording_session_id = "B"
+
+    result = controller.ensure_workstation_run_evidence("started")
+
+    assert result["status"] == "failed"
+    assert result["kind"] == "run_event_setup"
+    assert controller.ledger is old_ledger
+    assert controller.ledger.root == (tmp_path / "A").resolve()

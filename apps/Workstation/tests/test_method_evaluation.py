@@ -32,6 +32,9 @@ from Workstation.workstation_core.method_evaluation import (
 from Workstation.workstation_core.method_evaluation_workers import (
     MethodEvaluationCoordinator,
 )
+from Workstation.workstation_core.preview_measurement_worker import (
+    PreviewMeasurementCoordinator,
+)
 from Workstation.workstation_core.recording_reader import read_measurement_stream
 from Workstation.workstation_core.recording_session import (
     SpoolRows,
@@ -147,6 +150,40 @@ def _request(
         blocked_reasons=blocked_reasons,
         enqueued_monotonic_ns=1_000,
     )
+
+
+def test_preview_geometry_and_optical_math_run_in_latest_only_worker() -> None:
+    coordinator = PreviewMeasurementCoordinator()
+    attempt = _attempt()
+    try:
+        coordinator.submit(
+            key=attempt.canonical_sha256(),
+            attempt=attempt,
+            optical_payload={
+                "left_center": (340.0, 240.0),
+                "right_center": (300.0, 238.0),
+                "expected_dy_px": 0.0,
+                "mean_fy_px": 900.0,
+                "mean_fx_px": 900.0,
+                "target_distance_m": 9.0,
+            },
+        )
+        deadline = time.monotonic() + 2.0
+        result = None
+        while time.monotonic() < deadline and result is None:
+            result = coordinator.poll_latest()
+            time.sleep(0.005)
+        assert result is not None
+        assert result.error == ""
+        assert result.geometry_result is not None
+        assert result.optical_metrics["observed_dx_px"] == 40.0
+        assert result.optical_metrics["observed_dy_px"] == 2.0
+        assert result.optical_metrics["vertical_error_mrad"] == pytest.approx(
+            2.0 / 900.0 * 1000.0
+        )
+        assert coordinator.metrics()["request_capacity"] == 1
+    finally:
+        assert coordinator.close()
 
 
 def _blocked_requests(
@@ -421,6 +458,58 @@ def test_seven_comparison_workers_run_independently_and_timed_out_worker_restart
         coordinator.close()
         assert time.monotonic() - close_started_s < 0.05
         assert coordinator.wait_closed(10.0)
+
+
+def test_deferred_start_actually_starts_workers() -> None:
+    """``start_workers=False`` defers spawning until ``.start()`` is called.
+
+    Regression guard: ``start()`` on the actor facade previously only raised
+    when already closed and otherwise did nothing, so a coordinator built
+    with ``start_workers=False`` could never actually start its workers.
+    """
+
+    coordinator = MethodEvaluationCoordinator(
+        mp_context=multiprocessing.get_context("spawn"),
+        process_target=_slow_horizon_worker,
+        start_workers=False,
+    )
+    bundle = None
+    try:
+        coordinator.start()
+        assert coordinator.submit(_blocked_requests(1)).accepted is True
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline and bundle is None:
+            polled = coordinator.poll()
+            if polled.completed_bundles:
+                bundle = polled.completed_bundles[0]
+                break
+            time.sleep(0.01)
+
+        assert bundle is not None
+        assert len(bundle.outcomes) == len(MEASUREMENT_METHOD_IDS)
+    finally:
+        coordinator.close()
+        assert coordinator.wait_closed(10.0)
+
+
+def test_context_manager_starts_deferred_workers_once() -> None:
+    coordinator = MethodEvaluationCoordinator(
+        mp_context=multiprocessing.get_context("spawn"),
+        process_target=_slow_horizon_worker,
+        start_workers=False,
+    )
+
+    with coordinator:
+        coordinator.start()
+        deadline = time.monotonic() + 3.0
+        while (
+            not all(value >= 1 for value in coordinator.worker_generations.values())
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert all(value == 1 for value in coordinator.worker_generations.values())
+
+    assert coordinator.closed
 
 
 def test_gui_bundle_commit_reuses_worker_geometry_without_recalculation(

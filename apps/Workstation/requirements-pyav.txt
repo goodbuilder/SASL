@@ -1,5 +1,2 @@
-# Optional PyAV stream backend.  The default GStreamer profile does not need
-# this package; select stream_backend=pyav only after installing this overlay.
--r ../../requirements/runtime.txt
-
-av>=11,<16
+# Compatibility entry point for the repository-owned optional backend.
+-r ../../requirements/optional-pyav.txt

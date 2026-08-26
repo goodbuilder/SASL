@@ -671,6 +671,63 @@ def test_network_rtk_direct_routes_ntrip_rtcm_without_base_serial(monkeypatch) -
     _ = app
 
 
+def test_legacy_ntrip_direct_password_is_runtime_only(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.gnss_ntrip_username_edit.setText("field-user")
+    widget.gnss_ntrip_password_edit.setText("field-secret")
+
+    config = widget._build_gnss_operation_config()
+    resolved = widget._resolve_ntrip_credentials(config.network)
+
+    assert resolved.username == "field-user"
+    assert resolved.password == "field-secret"
+    assert resolved.source == "session"
+    mapping = config.to_mapping()
+    assert mapping["network"]["username"] == "field-user"
+    assert "password" not in mapping["network"]
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_legacy_ntrip_worker_reuses_explicit_credentials(monkeypatch) -> None:
+    import wiris_stereo_distance.gui as gui
+
+    seen = []
+
+    class FakeClient:
+        def __init__(self, _config, *, username=None, password=None):
+            seen.append((username, password))
+            self.stats = None
+
+        def connect(self, *, gga_sentence=None):
+            raise RuntimeError("stop-after-first-attempt")
+
+        def close(self):
+            return None
+
+        def wait_for_reconnect(self, stop_event):
+            stop_event.set()
+            return False
+
+    monkeypatch.setattr(gui, "NtripClient", FakeClient)
+    worker = gui.NtripNetworkWorker(
+        config=gui.NetworkConfig(caster_host="caster", mountpoint="MOUNT"),
+        username="field-user",
+        password="field-secret",
+    )
+
+    worker.run()
+
+    assert seen == [("field-user", "field-secret"), ("field-user", "field-secret")]
+
+
 def test_network_assisted_fixed_base_promotes_repeated_fixed_coordinate(monkeypatch) -> None:
     from PyQt5 import QtWidgets
 
@@ -1331,6 +1388,28 @@ def test_camera_pane_overlays_latest_detection_bbox_on_live_preview() -> None:
     _ = app
 
 
+def test_legacy_camera_preview_inbox_renders_only_latest_frame() -> None:
+    from PyQt5 import QtGui, QtWidgets
+
+    from wiris_stereo_distance.camera_pane import CameraPane
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    pane = CameraPane("left")
+    pane.stream_generation = 3
+    first = QtGui.QImage(8, 6, QtGui.QImage.Format_RGB888)
+    first.fill(QtGui.QColor(10, 0, 0))
+    latest = QtGui.QImage(8, 6, QtGui.QImage.Format_RGB888)
+    latest.fill(QtGui.QColor(90, 0, 0))
+
+    pane._submit_preview_frame_for_generation(3, first, {"sequence": 1})
+    pane._submit_preview_frame_for_generation(3, latest, {"sequence": 2})
+    pane._drain_preview_frame()
+
+    assert pane.current_image().pixelColor(0, 0).red() == 90
+    pane.deleteLater()
+    _ = app
+
+
 def test_camera_pane_does_not_overlay_bbox_while_reviewing_measurement_snapshot() -> None:
     from PyQt5 import QtGui, QtWidgets
 
@@ -1668,9 +1747,88 @@ def test_mavlink_configure_streams_sends_px4_shell_commands() -> None:
 
     assert "".join(sent) == (
         "param set MAV_SYS_ID 1\n"
-        "mavlink start -x -u 14550 -t 192.168.0.254 -o 14550 -r 2000000 -m normal\n"
-        "mavlink status\n"
+        "param set MAV_2_CONFIG 1000\n"
+        "param set MAV_2_MODE 0\n"
+        "param set MAV_2_BROADCAST 1\n"
+        "param set MAV_2_REMOTE_PRT 14550\n"
+        "param set MAV_2_UDP_PRT 14550\n"
+        "param set MAV_2_RATE 2000000\n"
+        "param save\n"
     )
+
+
+def test_mavlink_duplicate_raw_packet_is_ignored() -> None:
+    from types import SimpleNamespace
+
+    from wiris_stereo_distance.pixhawk_attitude import DualPixhawkMavlinkSubscriber
+
+    class Message:
+        roll = 0.1
+        pitch = 0.2
+        yaw = 0.3
+        time_boot_ms = 10
+
+        def get_type(self):
+            return "ATTITUDE"
+
+        def get_msgbuf(self):
+            return b"same-mavlink-packet"
+
+    class Connection:
+        def __init__(self):
+            self.messages = [Message(), Message()]
+
+        def recv_match(self, **_kwargs):
+            return self.messages.pop(0) if self.messages else None
+
+    subscriber = DualPixhawkMavlinkSubscriber(left_url="udp:fake", right_url="")
+    subscriber.connections["left"] = Connection()
+    attitudes = []
+    subscriber.extrinsic_changed.connect(lambda _side, state: attitudes.append(state))
+
+    subscriber.spin_once()
+
+    assert len(attitudes) == 1
+
+
+def test_legacy_param_read_defers_attitude_instead_of_dropping_it() -> None:
+    from wiris_stereo_distance.pixhawk_attitude import DualPixhawkMavlinkSubscriber
+
+    class Message:
+        def __init__(self, message_type, **values):
+            self._message_type = message_type
+            self.__dict__.update(values)
+
+        def get_type(self):
+            return self._message_type
+
+    class Mav:
+        def param_request_read_send(self, *_args):
+            return None
+
+    class Connection:
+        target_system = 1
+        target_component = 1
+        mav = Mav()
+
+        def __init__(self):
+            self.messages = [
+                Message("ATTITUDE", roll=0.1, pitch=0.2, yaw=0.3, time_boot_ms=1),
+                Message("PARAM_VALUE", param_id="TEST", param_value=3.5, param_type=9),
+            ]
+
+        def recv_match(self, **_kwargs):
+            return self.messages.pop(0) if self.messages else None
+
+    subscriber = DualPixhawkMavlinkSubscriber(left_url="udp:fake", right_url="")
+    subscriber.connections["left"] = Connection()
+    attitudes = []
+    subscriber.extrinsic_changed.connect(lambda _side, state: attitudes.append(state))
+
+    assert subscriber.read_param("left", "TEST", timeout_s=0.1) == pytest.approx(3.5)
+    assert attitudes == []
+    subscriber.spin_once()
+    assert len(attitudes) == 1
 
 
 def test_mavlink_subscriber_starts_and_stops_selected_side(monkeypatch) -> None:
@@ -2245,8 +2403,11 @@ def test_usb_bootstrap_starts_ethernet_mavlink_without_changing_udp_url(monkeypa
     assert sent and sent[0][0] == "left"
     command = sent[0][1]
     assert "ifconfig eth0 10.0.0.2 netmask 255.255.255.0 up" in command
-    assert "mavlink stop -u 14550" in command
-    assert "mavlink start -x -u 14550 -o 14550 -t 10.0.0.10 -r 2000000 -m normal" in command
+    assert "param set MAV_2_CONFIG 1000" in command
+    assert "param set MAV_2_REMOTE_PRT 14550" in command
+    assert "mavlink stop" not in command
+    assert "mavlink start" not in command
+    assert command.endswith("reboot")
 
     widget.deleteLater()
     _ = app
@@ -3311,8 +3472,8 @@ def test_ros2_connections_are_split_by_pixhawk_side(monkeypatch) -> None:
     _ = app
 
 
-def test_camera_pane_stop_requests_worker_without_blocking_thread_wait() -> None:
-    from PyQt5 import QtCore, QtWidgets
+def test_camera_pane_stop_keeps_worker_owned_until_thread_finishes() -> None:
+    from PyQt5 import QtWidgets
 
     from wiris_stereo_distance.camera_pane import CameraPane
 
@@ -3324,30 +3485,247 @@ def test_camera_pane_stop_requests_worker_without_blocking_thread_wait() -> None
         def request_stop(self) -> None:
             calls.append("request_stop")
 
-        def stop(self) -> None:
-            raise AssertionError("blocking stop must not be called")
-
     class FakeThread:
-        def wait(self, _timeout=None):
-            raise AssertionError("thread wait must not be called for normal stop")
+        running = True
 
-        def quit(self) -> None:
-            raise AssertionError("thread quit must not be called for normal stop")
+        def isRunning(self) -> bool:
+            return self.running
 
     pane.worker = FakeWorker()
     pane.thread = FakeThread()
+    owned_worker = pane.worker
+    owned_thread = pane.thread
 
     started_s = time.monotonic()
-    pane.stop()
+    assert pane.stop() is False
     elapsed_s = time.monotonic() - started_s
 
     assert elapsed_s < 0.05
     assert calls == ["request_stop"]
+    assert pane.worker is owned_worker
+    assert pane.thread is owned_thread
+
+    owned_thread.running = False
+    assert pane.stop() is True
     assert pane.worker is None
     assert pane.thread is None
 
     pane.deleteLater()
     _ = app
+
+
+def test_camera_pane_start_does_not_replace_a_stopping_worker(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    from wiris_stereo_distance import camera_pane
+    from wiris_stereo_distance.camera_pane import CameraPane
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    pane = CameraPane("left")
+    calls: list[str] = []
+
+    class FakeWorker:
+        def request_stop(self) -> None:
+            calls.append("request_stop")
+
+    class FakeThread:
+        def isRunning(self) -> bool:
+            return True
+
+    pane.worker = FakeWorker()
+    pane.thread = FakeThread()
+    monkeypatch.setattr(
+        camera_pane,
+        "YoloStreamWorker",
+        lambda **_kwargs: pytest.fail("replacement worker started before teardown"),
+    )
+
+    assert pane.start_stream(
+        "rtsp://camera.invalid/visible",
+        enable_detection=False,
+    ) is False
+    assert calls == ["request_stop"]
+
+    pane.worker = None
+    pane.thread = None
+    pane.deleteLater()
+    _ = app
+
+
+def test_legacy_camera_mode_switch_restarts_only_after_workers_stop(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui, "APP_ROOT", tmp_path)
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = gui.WirisStereoDistancePanel()
+    callbacks: list[object] = []
+    monkeypatch.setattr(
+        gui.QtCore.QTimer,
+        "singleShot",
+        lambda _delay_ms, callback: callbacks.append(callback),
+    )
+    panel._ensure_camera_host_ip = lambda _reason: None
+    stopped = {"value": False}
+    starts: list[tuple[str, bool]] = []
+    panel.left_pane.stop = lambda *, wait=False: stopped["value"]
+    panel.right_pane.stop = lambda *, wait=False: stopped["value"]
+    panel.left_pane.start_stream = (
+        lambda _url, *, enable_detection, **_kwargs: starts.append(("left", enable_detection)) or True
+    )
+    panel.right_pane.start_stream = (
+        lambda _url, *, enable_detection, **_kwargs: starts.append(("right", enable_detection)) or True
+    )
+
+    assert panel._start_camera_streams(
+        enable_detection=True,
+        switch_to_depth=True,
+    ) is True
+    assert panel._pending_camera_start == (True, True)
+    assert starts == []
+    assert len(callbacks) == 1
+
+    stopped["value"] = True
+    callbacks.pop(0)()
+
+    assert panel._pending_camera_start is None
+    assert starts == [("left", True), ("right", True)]
+    assert panel.camera_connected is True
+    assert panel.yolo_enabled is True
+
+    panel.camera_connected = False
+    panel.left_pane.worker = None
+    panel.left_pane.thread = None
+    panel.right_pane.worker = None
+    panel.right_pane.thread = None
+    panel.deleteLater()
+    app.processEvents()
+
+
+def test_recording_stop_waits_for_video_worker_restart_before_session_save(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui, "APP_ROOT", tmp_path)
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = gui.WirisStereoDistancePanel()
+    panel.distance_recording_enabled = True
+    panel.video_recording_enabled = True
+    panel.camera_connected = True
+    callbacks: list[object] = []
+    saves: list[dict[str, object] | None] = []
+    panel._camera_time_sync_snapshot = lambda _reason: None
+    panel._start_camera_streams = (
+        lambda *, enable_detection, switch_to_depth, after_started=None: callbacks.append(after_started) or True
+    )
+    panel.save_distance_history_csv = (
+        lambda *, final_clock_sync_snapshot=None: saves.append(final_clock_sync_snapshot)
+    )
+
+    panel._stop_session_recording()
+
+    assert panel._session_save_waiting_for_video is True
+    assert saves == []
+    assert len(callbacks) == 1
+
+    callbacks.pop()()
+
+    assert panel._session_save_waiting_for_video is False
+    assert saves == [None]
+
+    panel.camera_connected = False
+    panel.deleteLater()
+    app.processEvents()
+
+
+def test_session_save_rejects_zero_byte_video_after_camera_frames(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui, "APP_ROOT", tmp_path)
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = gui.WirisStereoDistancePanel()
+    panel.recording_session_id = "zero-video"
+    panel._raw_video_validation_required = True
+    left_path = tmp_path / "recordings" / "sessions" / "zero-video" / "video" / "raw_left.mp4"
+    left_path.parent.mkdir(parents=True)
+    left_path.write_bytes(b"")
+    panel.video_recording_paths = {"left": left_path}
+    panel.camera_recording_rows = {"left": [{}], "right": []}
+
+    panel.save_distance_history_csv()
+
+    assert panel._session_save_thread is None
+    assert panel._session_save_retry_required is True
+    assert "0바이트" in panel.recording_status_label.text()
+
+    panel.deleteLater()
+    app.processEvents()
+
+
+def test_preview_disconnect_waits_for_video_workers_before_session_save(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui, "APP_ROOT", tmp_path)
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = gui.WirisStereoDistancePanel()
+    callbacks: list[object] = []
+    monkeypatch.setattr(
+        gui.QtCore.QTimer,
+        "singleShot",
+        lambda _delay_ms, callback: callbacks.append(callback),
+    )
+    stopped = {"value": False}
+    panel.left_pane.stop = lambda *, wait=False: stopped["value"]
+    panel.right_pane.stop = lambda *, wait=False: stopped["value"]
+    panel.distance_recording_enabled = True
+    panel.video_recording_enabled = True
+    panel.camera_connected = True
+    panel._camera_time_sync_snapshot = lambda _reason: None
+    saves: list[object] = []
+    panel.save_distance_history_csv = (
+        lambda *, final_clock_sync_snapshot=None: saves.append(final_clock_sync_snapshot)
+    )
+
+    assert panel.stop_yolo_streams(wait=False) is False
+    assert panel._session_save_waiting_for_video is True
+    assert saves == []
+    assert len(callbacks) == 1
+
+    stopped["value"] = True
+    callbacks.pop()()
+
+    assert panel._session_save_waiting_for_video is False
+    assert saves == [None]
+
+    panel.camera_connected = False
+    panel.left_pane.worker = None
+    panel.left_pane.thread = None
+    panel.right_pane.worker = None
+    panel.right_pane.thread = None
+    panel.deleteLater()
+    app.processEvents()
 
 
 def test_mavlink_connection_routes_sensor_signals_to_alignment(monkeypatch) -> None:
@@ -5984,6 +6362,14 @@ def test_enable_wiris_rtsp_uses_line_terminator_and_delayed_stream_check(monkeyp
         sent.append((command.host, command.command, command.terminator))
         if command.command == gui.GET_ETHERNET_MODE_COMMAND:
             return "TRUE"
+        if command.command == "GEBR VISIBLE":
+            return "0"
+        if command.command == "GEQZ VISIBLE":
+            return "1"
+        if command.command == "GEGS VISIBLE":
+            return "90"
+        if command.command == "GEIR VISIBLE":
+            return "1"
         return "OK"
 
     checked = []
@@ -5997,8 +6383,16 @@ def test_enable_wiris_rtsp_uses_line_terminator_and_delayed_stream_check(monkeyp
     assert sent == [
         ("10.0.0.231", gui.GET_ETHERNET_MODE_COMMAND, gui.LINE_TERMINATOR),
         ("10.0.0.231", gui.SET_ETHERNET_MODE_COMMAND, gui.LINE_TERMINATOR),
+        ("10.0.0.231", "GEBR VISIBLE", gui.LINE_TERMINATOR),
+        ("10.0.0.231", "GEQZ VISIBLE", gui.LINE_TERMINATOR),
+        ("10.0.0.231", "GEGS VISIBLE", gui.LINE_TERMINATOR),
+        ("10.0.0.231", "GEIR VISIBLE", gui.LINE_TERMINATOR),
         ("10.0.0.232", gui.GET_ETHERNET_MODE_COMMAND, gui.LINE_TERMINATOR),
         ("10.0.0.232", gui.SET_ETHERNET_MODE_COMMAND, gui.LINE_TERMINATOR),
+        ("10.0.0.232", "GEBR VISIBLE", gui.LINE_TERMINATOR),
+        ("10.0.0.232", "GEQZ VISIBLE", gui.LINE_TERMINATOR),
+        ("10.0.0.232", "GEGS VISIBLE", gui.LINE_TERMINATOR),
+        ("10.0.0.232", "GEIR VISIBLE", gui.LINE_TERMINATOR),
     ]
     assert checked == [True]
 
@@ -6050,6 +6444,14 @@ def test_enable_wiris_rtsp_auto_applies_camera_ip_before_commands(monkeypatch) -
         sent.append((command.host, command.command, command.terminator))
         if command.command == gui.GET_ETHERNET_MODE_COMMAND:
             return "TRUE"
+        if command.command == "GEBR VISIBLE":
+            return "0"
+        if command.command == "GEQZ VISIBLE":
+            return "1"
+        if command.command == "GEGS VISIBLE":
+            return "90"
+        if command.command == "GEIR VISIBLE":
+            return "1"
         return "OK"
 
     checked = []
@@ -6066,8 +6468,16 @@ def test_enable_wiris_rtsp_auto_applies_camera_ip_before_commands(monkeypatch) -
     assert sent == [
         ("10.0.0.231", gui.GET_ETHERNET_MODE_COMMAND, gui.LINE_TERMINATOR),
         ("10.0.0.231", gui.SET_ETHERNET_MODE_COMMAND, gui.LINE_TERMINATOR),
+        ("10.0.0.231", "GEBR VISIBLE", gui.LINE_TERMINATOR),
+        ("10.0.0.231", "GEQZ VISIBLE", gui.LINE_TERMINATOR),
+        ("10.0.0.231", "GEGS VISIBLE", gui.LINE_TERMINATOR),
+        ("10.0.0.231", "GEIR VISIBLE", gui.LINE_TERMINATOR),
         ("10.0.0.232", gui.GET_ETHERNET_MODE_COMMAND, gui.LINE_TERMINATOR),
         ("10.0.0.232", gui.SET_ETHERNET_MODE_COMMAND, gui.LINE_TERMINATOR),
+        ("10.0.0.232", "GEBR VISIBLE", gui.LINE_TERMINATOR),
+        ("10.0.0.232", "GEQZ VISIBLE", gui.LINE_TERMINATOR),
+        ("10.0.0.232", "GEGS VISIBLE", gui.LINE_TERMINATOR),
+        ("10.0.0.232", "GEIR VISIBLE", gui.LINE_TERMINATOR),
     ]
     assert checked == [True]
 
@@ -6103,6 +6513,14 @@ def test_enable_wiris_rtsp_recovers_from_open_but_wrong_telnet_port(monkeypatch)
             return "FALSE"
         if command.command == gui.SET_ETHERNET_MODE_COMMAND and command.port == gui.DEFAULT_ZOOM_CONTROL_PORT:
             return "OK"
+        if command.command == "GEBR VISIBLE":
+            return "0"
+        if command.command == "GEQZ VISIBLE":
+            return "1"
+        if command.command == "GEGS VISIBLE":
+            return "90"
+        if command.command == "GEIR VISIBLE":
+            return "1"
         return "ERR"
 
     checked = []
@@ -6176,6 +6594,14 @@ def test_enable_wiris_rtsp_returns_before_slow_network_commands_finish(monkeypat
 
     def slow_send(command):
         time.sleep(0.25)
+        if command.command == "GEBR VISIBLE":
+            return "0"
+        if command.command == "GEQZ VISIBLE":
+            return "1"
+        if command.command == "GEGS VISIBLE":
+            return "90"
+        if command.command == "GEIR VISIBLE":
+            return "1"
         return "TRUE" if command.command == gui.GET_ETHERNET_MODE_COMMAND else "OK"
 
     monkeypatch.setattr(gui, "send_tcp_line", slow_send)
@@ -6187,7 +6613,7 @@ def test_enable_wiris_rtsp_returns_before_slow_network_commands_finish(monkeypat
 
     assert elapsed_s < 0.1
     assert widget.rtsp_enable_thread is not None
-    assert process_events_until(app, lambda: widget.rtsp_enable_thread is None, timeout_s=2.0)
+    assert process_events_until(app, lambda: widget.rtsp_enable_thread is None, timeout_s=5.0)
 
     widget.deleteLater()
     _ = app
@@ -6236,7 +6662,16 @@ def test_enable_wiris_rtsp_replaces_missing_camera_interface(monkeypatch) -> Non
     monkeypatch.setattr(
         gui,
         "send_tcp_line",
-        lambda command: "TRUE" if command.command == gui.GET_ETHERNET_MODE_COMMAND else "OK",
+        lambda command: (
+            "TRUE"
+            if command.command == gui.GET_ETHERNET_MODE_COMMAND
+            else {
+                "GEBR VISIBLE": "0",
+                "GEQZ VISIBLE": "1",
+                "GEGS VISIBLE": "90",
+                "GEIR VISIBLE": "1",
+            }.get(command.command, "OK")
+        ),
     )
     monkeypatch.setattr(gui, "check_tcp_port", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(gui, "RTSP_ENABLE_SETTLE_DELAY_MS", 0)
@@ -8165,6 +8600,7 @@ def test_yolo_matching_gate_prefers_camera_rtcp_time(monkeypatch) -> None:
     widget.apply_intrinsics_to_distance()
     widget.distance_mode_combo.setCurrentIndex(widget.distance_mode_combo.findData("pixhawk"))
     widget.yolo_gate_matching_checkbox.setChecked(True)
+    widget.yolo_gate_time_delta_checkbox.setChecked(True)
     widget.yolo_gate_time_delta_spin.setValue(0.05)
     widget.yolo_gate_vertical_delta_spin.setValue(100.0)
     widget.yolo_gate_time_basis_combo.setCurrentIndex(widget.yolo_gate_time_basis_combo.findData("camera_rtcp"))
@@ -8220,6 +8656,7 @@ def test_yolo_matching_gate_falls_back_to_app_receive_time_when_rtcp_pair_drifts
     widget = gui.WirisStereoDistancePanel()
     now_s = time.monotonic()
     widget.yolo_gate_matching_checkbox.setChecked(True)
+    widget.yolo_gate_time_delta_checkbox.setChecked(True)
     widget.yolo_gate_time_delta_spin.setValue(0.05)
     widget.yolo_gate_time_basis_combo.setCurrentIndex(widget.yolo_gate_time_basis_combo.findData("camera_rtcp"))
 
@@ -8240,6 +8677,41 @@ def test_yolo_matching_gate_falls_back_to_app_receive_time_when_rtcp_pair_drifts
     assert widget._runtime_pair_uses_app_fallback is True
     assert abs(pair.delta_s - 0.010) < 1e-6
     assert widget._selected_pair_sync_summary(pair.left, pair.right) == ("app fallback", None)
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_camera_sync_status_does_not_gate_live_distance_pair(monkeypatch) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.camera_connected = True
+    widget.camera_sync_status = gui.CAMERA_SYNC_STATUS_FAILED
+    widget.yolo_gate_matching_checkbox.setChecked(False)
+    now_s = time.monotonic()
+
+    widget._update_detection(
+        "left",
+        detection("left", x1=690, y1=340, x2=710, y2=380, t=now_s - 0.010),
+    )
+    widget._update_detection(
+        "right",
+        detection("right", x1=640, y1=340, x2=660, y2=380, t=now_s),
+    )
+
+    pair = widget._matched_detection_pair()
+
+    assert pair is not None
+    assert widget._last_correspondence_rejection_reason == ""
+    assert widget._yolo_time_basis() == "detection"
+    assert widget._effective_yolo_time_basis() == "detection"
 
     widget.deleteLater()
     _ = app
@@ -8526,6 +8998,99 @@ def test_wiris_pc_time_uses_camera_rtt_compensation_for_both_cameras(monkeypatch
     assert widget._last_wiris_pc_utc_sync["result"] == "success"
     assert "STUS RTT 보정" in widget.wiris_command_status_label.text()
     assert "명령 UTC 차이" in widget.wiris_command_status_label.text()
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_wiris_stus_sends_right_after_left_ack_with_late_target_time(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    target_hosts = {label: host for label, host in widget.zoom_hosts("both")}
+    sent_stus = []
+    clock_s = 1_800_000_000.0
+
+    def fake_time() -> float:
+        nonlocal clock_s
+        value = clock_s
+        clock_s += 0.500
+        return value
+
+    def fake_rtt(self, **_kwargs):
+        return {
+            "command": "HIWS",
+            "samples_s": [0.010, 0.010, 0.010],
+            "median_s": 0.010,
+            "errors": [],
+        }
+
+    def fake_send_tcp_line(command):
+        if command.command.startswith("STUS "):
+            sent_stus.append((command.host, command.command))
+        return "OK"
+
+    monkeypatch.setattr(gui.time, "time", fake_time)
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_measure_wiris_control_rtt", fake_rtt)
+    monkeypatch.setattr(gui, "send_tcp_line", fake_send_tcp_line)
+
+    widget.set_selected_wiris_time_from_pc(target="both")
+
+    evidence = widget._last_wiris_pc_utc_sync
+    assert [host for host, _command in sent_stus] == [target_hosts["left"], target_hosts["right"]]
+    assert evidence["stus_send_order"] == ["left", "right"]
+    assert evidence["stus_left_ack_received"] is True
+    assert evidence["requested_utc_by_camera"]["right"] > evidence["requested_utc_by_camera"]["left"]
+    assert "right waits for left STUS OK" in widget.clock_sync_summary_text.toPlainText()
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_wiris_stus_does_not_send_right_when_left_ack_fails(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    target_hosts = {label: host for label, host in widget.zoom_hosts("both")}
+    sent_stus = []
+
+    monkeypatch.setattr(
+        gui.WirisStereoDistancePanel,
+        "_measure_wiris_control_rtt",
+        lambda self, **_kwargs: {
+            "command": "HIWS",
+            "samples_s": [0.010],
+            "median_s": 0.010,
+            "errors": [],
+        },
+    )
+
+    def fake_send_tcp_line(command):
+        if command.command.startswith("STUS "):
+            sent_stus.append(command.host)
+            return "ERR" if command.host == target_hosts["left"] else "OK"
+        return "OK"
+
+    monkeypatch.setattr(gui, "send_tcp_line", fake_send_tcp_line)
+
+    widget.set_selected_wiris_time_from_pc(target="both")
+
+    evidence = widget._last_wiris_pc_utc_sync
+    assert sent_stus == [target_hosts["left"]]
+    assert evidence["stus_send_order"] == ["left"]
+    assert evidence["stus_left_ack_received"] is False
+    assert evidence["result"] == "failed"
+    assert "right" not in evidence["requested_utc_by_camera"]
+    assert "오른쪽" in widget.wiris_command_status_label.text()
+    assert "미전송" in widget.wiris_command_status_label.text()
 
     widget.deleteLater()
     _ = app
@@ -10365,6 +10930,90 @@ def test_live_save_worker_finishes_before_panel_close_is_accepted(tmp_path, monk
     _ = app
 
 
+def test_startup_does_not_invoke_spool_recovery_or_intrinsics_auto_load(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        gui.WirisStereoDistancePanel,
+        "_recover_retryable_recording_session",
+        lambda self: calls.append("spool") or False,
+    )
+    monkeypatch.setattr(
+        gui.WirisStereoDistancePanel,
+        "_auto_load_intrinsics",
+        lambda self: calls.append("intrinsics"),
+    )
+    monkeypatch.setattr(gui, "interface_addresses", lambda _name: "test-interface")
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+
+    for _ in range(5):
+        app.processEvents()
+
+    assert calls == []
+    assert widget.recording_session_id == ""
+    assert widget.active_intrinsics is None
+    widget.deleteLater()
+    _ = app
+
+
+def test_startup_ignores_retryable_spool_and_new_recording_preserves_it(tmp_path, monkeypatch) -> None:
+    import json
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.recording_session import SpoolRows, write_recovery_metadata
+
+    old_output = tmp_path / "recordings" / "sessions" / "old-retryable-session"
+    rows = SpoolRows(preview_limit=2, supports_updates=True)
+    rows.bind(old_output / ".spool" / "pair_rows.jsonl")
+    rows.append({"sample_index": 0, "session_elapsed_s": 0.0})
+    rows.close()
+    metadata_path = write_recovery_metadata(
+        old_output,
+        {"session_id": "old-retryable-session", "session_started_unix_ns": 1},
+    )
+    (old_output / "session_manifest.json").write_text(
+        json.dumps({"status": "failed", "retryable": True}), encoding="utf-8"
+    )
+    original_metadata = metadata_path.read_bytes()
+    monkeypatch.setattr(gui, "APP_ROOT", tmp_path)
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_auto_load_intrinsics", lambda self: None)
+    monkeypatch.setattr(gui, "interface_addresses", lambda _name: "test-interface")
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    for _ in range(5):
+        app.processEvents()
+
+    assert widget.recording_session_id == ""
+    assert widget._recovered_session_metadata is None
+    assert sorted(path.name for path in (tmp_path / "recordings" / "sessions").iterdir()) == [
+        "old-retryable-session"
+    ]
+
+    widget._start_session_recording()
+
+    assert widget.recording_session_id != "old-retryable-session"
+    assert (tmp_path / "recordings" / "sessions" / widget.recording_session_id / ".spool").is_dir()
+    assert metadata_path.read_bytes() == original_metadata
+    assert (old_output / ".spool").is_dir()
+    widget.distance_recording_enabled = False
+    widget.video_recording_enabled = False
+    for row_store in (
+        widget.distance_recording_rows,
+        *widget.camera_recording_rows.values(),
+        *widget.px4_recording_rows.values(),
+        widget.gnss_base_recording_rows,
+    ):
+        if hasattr(row_store, "close"):
+            row_store.close()
+    widget.deleteLater()
+    _ = app
+
+
 def test_gui_discovers_and_loads_retryable_pair_spool_after_restart(tmp_path, monkeypatch) -> None:
     import json
     import time
@@ -10412,7 +11061,7 @@ def test_gui_discovers_and_loads_retryable_pair_spool_after_restart(tmp_path, mo
     assert widget.recording_session_id == "restart-session"
     assert len(widget.distance_recording_rows) == 6
     assert recording_sheet(widget, "DistanceMeasurements").rowCount() == 6
-    assert widget.record_button.isEnabled() is False
+    assert widget.record_button.isEnabled() is True
     assert widget.save_history_button.isEnabled() is True
     widget.left_url_edit.setText("rtsp://changed-after-restart/live")
     widget.save_distance_history_csv()
@@ -10432,6 +11081,52 @@ def test_gui_discovers_and_loads_retryable_pair_spool_after_restart(tmp_path, mo
     assert "rtsp://original-camera/live" in shared_strings
     assert "/capture/original/raw_left.mp4" in shared_strings
     assert "rtsp://changed-after-restart/live" not in shared_strings
+    widget.deleteLater()
+    _ = app
+
+
+def test_gui_starts_new_recording_after_discarding_recovered_session(tmp_path, monkeypatch) -> None:
+    import json
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.recording_session import SpoolRows, write_recovery_metadata
+
+    output_dir = tmp_path / "recordings" / "sessions" / "discard-before-new-session"
+    rows = SpoolRows(preview_limit=2, supports_updates=True)
+    rows.bind(output_dir / ".spool" / "pair_rows.jsonl")
+    rows.append({"sample_index": 0, "session_elapsed_s": 0.0})
+    rows.close()
+    write_recovery_metadata(
+        output_dir,
+        {"session_id": "discard-before-new-session", "session_started_unix_ns": 1},
+    )
+    (output_dir / "session_manifest.json").write_text(
+        json.dumps({"status": "failed", "retryable": True}), encoding="utf-8"
+    )
+    monkeypatch.setattr(gui, "APP_ROOT", tmp_path)
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+
+    assert widget._recover_retryable_recording_session() is True
+    assert widget.record_button.isEnabled() is True
+    widget._start_session_recording()
+
+    assert widget.recording_session_id != "discard-before-new-session"
+    assert widget._session_recording_active() is True
+    assert not (output_dir / ".spool").exists()
+    manifest = json.loads((output_dir / "session_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "discarded"
+    assert manifest["discard_reason"] == "operator_started_new_session"
+    for row_store in (
+        widget.distance_recording_rows,
+        *widget.camera_recording_rows.values(),
+        *widget.px4_recording_rows.values(),
+        widget.gnss_base_recording_rows,
+    ):
+        if hasattr(row_store, "close"):
+            row_store.close()
     widget.deleteLater()
     _ = app
 
@@ -10456,6 +11151,8 @@ def test_session_start_recovery_metadata_includes_prepared_video_paths(tmp_path,
     assert metadata["left_video_path"].endswith("/video/raw_left.mp4")
     assert metadata["right_video_path"].endswith("/video/raw_right.mp4")
     assert metadata["left_video_path"] == str(widget.video_recording_paths["left"])
+    assert widget.video_recording_paths["left"].parent.is_dir()
+    assert widget.video_recording_paths["right"].parent.is_dir()
     widget.distance_recording_enabled = False
     for rows in (
         widget.distance_recording_rows,
@@ -10464,6 +11161,81 @@ def test_session_start_recovery_metadata_includes_prepared_video_paths(tmp_path,
     ):
         if hasattr(rows, "close"):
             rows.close()
+    widget.deleteLater()
+    _ = app
+
+
+def test_session_start_never_reads_px4_mag_params_on_gui_thread(tmp_path, monkeypatch) -> None:
+    import json
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui, "APP_ROOT", tmp_path)
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget._px4_mag_manager_has_data_source = lambda _side: True
+    widget._sync_px4_mag_manager_store = lambda _side: True
+
+    def unexpected_readback():
+        raise AssertionError("session start attempted blocking MAG PARAM readback")
+
+    widget.px4_mag_managers["left"].refresh = unexpected_readback
+    widget.px4_mag_managers["right"].refresh = unexpected_readback
+
+    widget._start_session_recording()
+
+    metadata_path = (
+        tmp_path
+        / "recordings"
+        / "sessions"
+        / widget.recording_session_id
+        / ".spool"
+        / "session_metadata.json"
+    )
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["mag_param_snapshot_status"] == {
+        "left": {"status": "unavailable", "captured_monotonic_s": None},
+        "right": {"status": "unavailable", "captured_monotonic_s": None},
+    }
+
+    widget.distance_recording_enabled = False
+    widget.video_recording_enabled = False
+    for rows in (
+        widget.distance_recording_rows,
+        *widget.camera_recording_rows.values(),
+        *widget.px4_recording_rows.values(),
+        widget.gnss_base_recording_rows,
+    ):
+        if hasattr(rows, "close"):
+            rows.close()
+    widget.deleteLater()
+    _ = app
+
+
+def test_decoder_fallback_ends_active_recording_before_software_restart(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    stopped = []
+    widget.distance_recording_enabled = True
+    widget.video_recording_enabled = True
+    widget._stop_session_recording = lambda: stopped.append(True)
+
+    widget._handle_runtime_decoder_fallback(
+        "left",
+        "DECODER_FALLBACK_REQUIRED: nvh264dec decoded-frame stall",
+    )
+
+    assert widget._runtime_decoder_override == "software"
+    assert stopped == [True]
+    widget.distance_recording_enabled = False
+    widget.video_recording_enabled = False
     widget.deleteLater()
     _ = app
 

@@ -28,6 +28,7 @@ def test_visible_encoder_profile_settings_round_trip_and_clamp(tmp_path: Path) -
             wiris_visible_encoder_qp=17,
             wiris_visible_encoder_gop=30,
             wiris_visible_encoder_idr=1,
+            rtsp_reconnect_policy="automatic",
         ),
         path,
     )
@@ -38,7 +39,7 @@ def test_visible_encoder_profile_settings_round_trip_and_clamp(tmp_path: Path) -
         loaded.wiris_visible_encoder_gop,
         loaded.wiris_visible_encoder_idr,
     ) == (5, 17, 30, 1)
-
+    assert loaded.rtsp_reconnect_policy == "automatic"
     payload = json.loads(path.read_text())
     payload.update(
         wiris_visible_encoder_bitrate=-1,
@@ -54,6 +55,18 @@ def test_visible_encoder_profile_settings_round_trip_and_clamp(tmp_path: Path) -
         clamped.wiris_visible_encoder_gop,
         clamped.wiris_visible_encoder_idr,
     ) == (0, 51, 32767, 0)
+
+
+def test_default_visible_encoder_profile_matches_field_validated_wiris_profile() -> None:
+    from Workstation.workstation_core.settings import AppSettings
+
+    settings = AppSettings()
+    assert (
+        settings.wiris_visible_encoder_bitrate,
+        settings.wiris_visible_encoder_qp,
+        settings.wiris_visible_encoder_gop,
+        settings.wiris_visible_encoder_idr,
+    ) == (0, 1, 90, 0)
 
 def test_workstation_camera_sync_readiness_uses_imported_finite_check() -> None:
     from Workstation.camera_time_sync_controller import CameraTimeSyncController
@@ -193,6 +206,17 @@ def test_class_gate_settings_are_forwarded_to_the_yolo_worker(
 
     assert kwargs["class_gate_enabled"] is True
     assert kwargs["class_gate"] == "person"
+    assert "rtsp_pipeline_profile" not in kwargs
+    assert kwargs["rtsp_reconnect_policy"] == "manual"
+
+    panel.apply_workstation_system_settings(
+        {
+            "rtsp_reconnect_policy": "automatic",
+        }
+    )
+    overridden = panel.yolo_kwargs()
+    assert "rtsp_pipeline_profile" not in overridden
+    assert overridden["rtsp_reconnect_policy"] == "automatic"
     panel._shutdown_coordinator = LifecycleCoordinator([])
     panel.close()
     panel.deleteLater()
@@ -378,7 +402,7 @@ def test_auto_wiris_completion_preserves_manual_preview_mode(
 
     assert calls == ["cancel", expected_call]
 
-def test_detection_mode_switch_is_rejected_while_live_camera_is_recording(
+def test_manual_record_is_stopped_and_measurement_start_is_queued(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -389,26 +413,71 @@ def test_detection_mode_switch_is_rejected_while_live_camera_is_recording(
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     panel = standalone_gui.WirisStereoDistancePanel(app_root=tmp_path)
     panel.distance_recording_enabled = True
+    panel._manual_recording_active = True
     panel.camera_connected = True
     starts: list[tuple[bool, bool]] = []
+    stops: list[bool] = []
     monkeypatch.setattr(
         panel,
         "_start_camera_streams",
         lambda *, enable_detection, switch_to_depth: starts.append((enable_detection, switch_to_depth)),
     )
+    monkeypatch.setattr(
+        panel,
+        "_stop_session_recording",
+        lambda *, restart_streams=False: stops.append(restart_streams),
+    )
 
-    assert panel.toggle_yolo_detection() is False
-    assert starts == []
-    assert "세션 기록 중" in panel.camera_yolo_log.toPlainText()
-
-    panel.camera_connected = False
     assert panel.toggle_yolo_detection() is None
+    assert starts == []
+    assert stops == [False]
+    assert panel.measurement_run_snapshot()["state"] == "QUEUED"
+
+    panel._manual_recording_active = False
+    panel.distance_recording_enabled = False
+    assert panel._resume_queued_measurement_start() is True
+    app.processEvents()
     assert starts == [(True, True)]
 
     panel._shutdown_coordinator = LifecycleCoordinator([])
     panel.close()
     panel.deleteLater()
     app.processEvents()
+
+
+@pytest.mark.parametrize(
+    "busy_attribute",
+    (
+        "rtsp_enable_thread",
+        "camera_auto_detect_thread",
+        "calibration_wiris_oz_capture_thread",
+        "optical_pose_wiris_ftp_thread",
+    ),
+)
+def test_measurement_start_queues_while_camera_resource_is_busy(
+    monkeypatch: pytest.MonkeyPatch,
+    busy_attribute: str,
+) -> None:
+    from Workstation.camera_stream_controller import CameraStreamLifecycleController
+
+    queued: list[str] = []
+    timers: list[object] = []
+    panel = SimpleNamespace(
+        _manual_recording_active=False,
+        queue_measurement_start=lambda reason: queued.append(str(reason)),
+    )
+    setattr(panel, busy_attribute, object())
+    monkeypatch.setattr(
+        QtCore.QTimer,
+        "singleShot",
+        lambda _delay, callback: timers.append(callback),
+    )
+
+    assert CameraStreamLifecycleController(panel).start_yolo() is None
+    assert queued
+    assert panel._pending_measurement_run_start is True
+    assert len(timers) == 1
+
 
 def test_recording_owner_rejects_camera_swap_and_clock_reconnect(
     monkeypatch: pytest.MonkeyPatch,
@@ -515,9 +584,24 @@ def test_camera_workspace_uses_hidden_diagnostics_height_without_cropping_previe
 def test_devices_camera_status_shows_active_decoder_per_side_only() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     backend = _FakeBackend()
-    backend.panel.active_stream_decoders = {
-        "left": "nvh264dec",
-        "right": "avdec_h264",
+    backend.panel.active_stream_decoders = {"left": "nvh264dec", "right": "nvh264dec"}
+    backend.panel.decoder_fallback_reasons = {"left": "", "right": ""}
+    backend.panel.decoder_combo = SimpleNamespace(currentData=lambda: "auto")
+    backend.panel._runtime_decoder_override = None
+    backend.panel.decoder_selection_status = {
+        "requested": "auto",
+        "effective": "nvh264dec",
+        "candidates": ("nvh264dec", "avdec_h264"),
+        "allowed": True,
+        "degraded": False,
+        "reason": "",
+        "nvidia_available": True,
+    }
+    backend.panel.nvidia_runtime_identity = {
+        "model": "NVIDIA GeForce RTX 4050 Laptop GPU",
+        "driver_version": "595.84",
+        "gpu_uuid": "GPU-sentinel",
+        "bus_location": "0000:01:00.0",
     }
     window = WorkstationMainWindow(backend=backend)
     window.status_adapter.stop()
@@ -526,8 +610,47 @@ def test_devices_camera_status_shows_active_decoder_per_side_only() -> None:
     window.camera.refresh(window.status_adapter.model.snapshot())
     app.processEvents()
 
-    assert window.camera.decoder_values["left"].value.text() == "nvh264dec"
-    assert window.camera.decoder_values["right"].value.text() == "avdec_h264"
+    assert window.camera.decoder_values["left"].value.text() == "GPU · nvh264dec"
+    assert window.camera.decoder_values["right"].value.text() == "GPU · nvh264dec"
+    preview_button = window.camera.operation_buttons["camera.toggle"]
+    preview_button.setFocus()
+    app.processEvents()
+    gpu_geometry = (
+        window.camera.decoder_values["left"].geometry(),
+        window.camera.decoder_values["right"].geometry(),
+        tuple(window.camera.workspace_splitter.sizes()),
+    )
+
+    backend.panel.decoder_combo = SimpleNamespace(currentData=lambda: "software")
+    backend.panel.active_stream_decoders = {"left": "avdec_h264", "right": "avdec_h264"}
+    window.camera.refresh(window.status_adapter.model.snapshot())
+    assert window.camera.decoder_values["left"].value.text() == "CPU · avdec_h264 (selected)"
+    assert window.camera.decoder_values["right"].value.text() == "CPU · avdec_h264 (selected)"
+
+    backend.panel.decoder_combo = SimpleNamespace(currentData=lambda: "auto")
+    backend.panel._runtime_decoder_override = "software"
+    backend.panel.decoder_fallback_reasons = {
+        "left": "왼쪽: first-frame timeout",
+        "right": "왼쪽: first-frame timeout",
+    }
+    window.camera.refresh(window.status_adapter.model.snapshot())
+    assert window.camera.decoder_values["left"].value.text() == "CPU fallback · avdec_h264"
+    assert "first-frame timeout" in window.camera.decoder_values["left"].toolTip()
+    app.processEvents()
+    fallback_geometry = (
+        window.camera.decoder_values["left"].geometry(),
+        window.camera.decoder_values["right"].geometry(),
+        tuple(window.camera.workspace_splitter.sizes()),
+    )
+    assert fallback_geometry == gpu_geometry
+    assert QtWidgets.QApplication.focusWidget() is preview_button
+
+    window.diagnostics._refresh_performance(window.status_adapter.model.snapshot())
+    performance_text = window.diagnostics.performance_view.toPlainText()
+    assert "NVIDIA GeForce RTX 4050 Laptop GPU" in performance_text
+    assert "Driver: 595.84" in performance_text
+    assert "NVDEC available: True" in performance_text
+    assert "CPU fallback · avdec_h264" in performance_text
 
     backend.panel.active_stream_decoders = {"left": None, "right": None}
     window.camera.refresh(window.status_adapter.model.snapshot())
@@ -538,6 +661,30 @@ def test_devices_camera_status_shows_active_decoder_per_side_only() -> None:
     app.processEvents()
     window.deleteLater()
     app.processEvents()
+
+
+def test_camera_status_tooltip_warns_on_auto_decoder_fallback() -> None:
+    from Workstation.status_model import BackendStatusAdapter, StatusSeverity
+
+    panel = SimpleNamespace(
+        left_pane=SimpleNamespace(current_status="playing"),
+        camera_connected=True,
+        camera_frame_times={"left": [99.9]},
+        decoder_combo=SimpleNamespace(currentData=lambda: "auto"),
+        active_stream_decoders={"left": "avdec_h264"},
+        decoder_fallback_reasons={"left": "nvh264dec first-frame timeout"},
+        _runtime_decoder_override="software",
+    )
+    adapter = BackendStatusAdapter(SimpleNamespace(panel=panel))
+
+    adapter._refresh_camera(panel, "left", "CAM L", now_s=100.0)
+
+    status = adapter.model.record("camera.left")
+    assert status is not None
+    assert status.state == "LIVE"
+    assert status.severity == StatusSeverity.WARN
+    assert "decoder=CPU fallback · avdec_h264" in status.detail
+    assert "first-frame timeout" in status.detail
 
 def test_wiris_control_probe_worker_keeps_socket_checks_off_ui_path(monkeypatch) -> None:
     from Workstation import standalone_gui
@@ -1192,6 +1339,89 @@ def test_camera_mode_switch_restarts_after_workers_stop_without_blocking(
     panel.deleteLater()
     app.processEvents()
 
+def test_camera_disconnect_watchdog_retries_wedged_stop_until_it_exits(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from Workstation import standalone_gui
+
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_auto_load_intrinsics", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = standalone_gui.WirisStereoDistancePanel(app_root=tmp_path)
+    callbacks: list[object] = []
+    monkeypatch.setattr(
+        standalone_gui.QtCore.QTimer,
+        "singleShot",
+        lambda _delay_ms, callback: callbacks.append(callback),
+    )
+    stopped = {"value": False}
+    panel.left_pane.stop = lambda *, wait=False: stopped["value"]
+    panel.right_pane.stop = lambda *, wait=False: stopped["value"]
+
+    # A worker that does not exit on the first cooperative stop must not be
+    # abandoned in "종료 대기 중" forever; a watchdog keeps retrying it.
+    assert panel.stop_yolo_streams(wait=False) is False
+    assert len(callbacks) == 1
+
+    callbacks.pop(0)()
+    assert len(callbacks) == 1
+
+    stopped["value"] = True
+    callbacks.pop(0)()
+    assert callbacks == []
+
+    panel._shutdown_coordinator = LifecycleCoordinator([])
+    panel.close()
+    panel.deleteLater()
+    app.processEvents()
+
+
+def test_camera_start_cancels_stale_disconnect_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from Workstation import standalone_gui
+
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_auto_load_intrinsics", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = standalone_gui.WirisStereoDistancePanel(app_root=tmp_path)
+    callbacks: list[object] = []
+    monkeypatch.setattr(
+        standalone_gui.QtCore.QTimer,
+        "singleShot",
+        lambda _delay_ms, callback: callbacks.append(callback),
+    )
+    panel.left_pane.stop = lambda *, wait=False: False
+    panel.right_pane.stop = lambda *, wait=False: False
+
+    assert panel.stop_yolo_streams(wait=False) is False
+    pending_watchdog = callbacks.pop(0)
+
+    # A fresh connect takes over teardown of the stale worker (via its own
+    # _stop_camera_panes/_schedule_camera_start_retry); the leftover
+    # watchdog tick from the earlier disconnect must not call stop() again
+    # on the pane it no longer owns.
+    panel.left_url_edit.setText("rtsp://left")
+    panel.right_url_edit.setText("rtsp://right")
+    post_start_stop_calls: list[str] = []
+    panel.left_pane.stop = lambda *, wait=False: post_start_stop_calls.append("left") or True
+    panel.right_pane.stop = lambda *, wait=False: post_start_stop_calls.append("right") or True
+    panel.left_pane.start_stream = lambda _url, **_kwargs: True
+    panel.right_pane.start_stream = lambda _url, **_kwargs: True
+    panel._start_camera_streams(enable_detection=False, switch_to_depth=False)
+    calls_from_start = list(post_start_stop_calls)
+
+    pending_watchdog()
+    assert post_start_stop_calls == calls_from_start
+
+    panel._shutdown_coordinator = LifecycleCoordinator([])
+    panel.close()
+    panel.deleteLater()
+    app.processEvents()
+
+
 def test_camera_start_keeps_healthy_side_when_other_side_start_fails(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1493,7 +1723,7 @@ def test_workstation_camera_pane_shutdown_is_cooperative_and_retryable(
 
     assert pane.stop(wait=True) is True
     assert calls == ["request_stop", "stop"]
-    assert thread.wait_calls == [1500, 1500]
+    assert thread.wait_calls == [12000, 1000]
     assert pane.worker is None
     assert pane.thread is None
 
@@ -1507,10 +1737,10 @@ def test_workstation_camera_pane_shutdown_is_cooperative_and_retryable(
     assert pane.thread is thread
 
     pane._stop_requested_monotonic_s = 10.0
-    monkeypatch.setattr(camera_pane.time, "monotonic", lambda: 11.6)
+    monkeypatch.setattr(camera_pane.time, "monotonic", lambda: 22.1)
     assert pane.stop(wait=False) is False
     assert calls[-2:] == ["request_stop", "terminate"]
-    monkeypatch.setattr(camera_pane.time, "monotonic", lambda: 13.1)
+    monkeypatch.setattr(camera_pane.time, "monotonic", lambda: 30.1)
     assert pane.stop(wait=False) is False
     assert calls[-2:] == ["request_stop", "kill"]
 
@@ -1519,3 +1749,124 @@ def test_workstation_camera_pane_shutdown_is_cooperative_and_retryable(
     assert pane.thread is None
     pane.deleteLater()
     app.processEvents()
+
+
+def test_runtime_decoder_fallback_stops_recording_and_restarts_software_preview(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from PyQt5 import QtCore
+
+    from Workstation.standalone_gui import WirisStereoDistancePanel
+
+    events = []
+    panel = SimpleNamespace(
+        _runtime_decoder_override=None,
+        decoder_fallback_reasons={"left": "", "right": ""},
+        decoder_combo=SimpleNamespace(currentData=lambda: "auto"),
+        _session_recording_active=lambda: True,
+        yolo_enabled=True,
+        _camera_name_ko=lambda _camera: "왼쪽",
+        _log=lambda text: events.append(("log", text)),
+        stop_yolo_streams=lambda: events.append(("stop",)),
+        _start_camera_streams=lambda **kwargs: events.append(("start", kwargs)),
+    )
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _delay, callback: callback())
+
+    WirisStereoDistancePanel._handle_runtime_decoder_fallback(
+        panel,
+        "left",
+        "DECODER_FALLBACK_REQUIRED: nvh264dec first-frame timeout",
+    )
+
+    assert panel._runtime_decoder_override == "software"
+    assert "first-frame timeout" in panel.decoder_fallback_reasons["left"]
+    assert panel.decoder_fallback_reasons["left"] == panel.decoder_fallback_reasons["right"]
+    assert ("stop",) in events
+    assert ("start", {"enable_detection": False, "switch_to_depth": False}) in events
+
+
+def test_decoder_start_policy_records_requested_effective_and_capability(monkeypatch) -> None:
+    from Workstation import camera_stream_controller
+    from Workstation.camera_stream_controller import CameraStreamLifecycleController
+
+    def selection(requested):
+        if requested == "auto":
+            return SimpleNamespace(
+                requested="auto",
+                effective="nvh264dec",
+                candidates=("nvh264dec", "avdec_h264"),
+                allowed=True,
+                degraded=False,
+                reason="",
+            )
+        raise AssertionError(requested)
+
+    monkeypatch.setattr(camera_stream_controller, "current_decoder_selection", selection)
+    panel = SimpleNamespace(
+        stream_backend_combo=SimpleNamespace(currentData=lambda: "gstreamer"),
+        decoder_combo=SimpleNamespace(currentData=lambda: "auto"),
+        _runtime_decoder_override=None,
+        decoder_fallback_reasons={"left": "old", "right": "old"},
+        _log=lambda _text: None,
+        camera_connection_label=SimpleNamespace(setText=lambda _text: None),
+    )
+
+    assert CameraStreamLifecycleController(panel)._apply_decoder_start_policy() is True
+    assert panel.decoder_selection_status == {
+        "requested": "auto",
+        "effective": "nvh264dec",
+        "candidates": ("nvh264dec", "avdec_h264"),
+        "allowed": True,
+        "degraded": False,
+        "reason": "",
+        "nvidia_available": True,
+    }
+    assert panel.decoder_fallback_reasons == {"left": "", "right": ""}
+
+
+def test_decoder_start_policy_preserves_runtime_fallback_reason(monkeypatch) -> None:
+    from Workstation import camera_stream_controller
+    from Workstation.camera_stream_controller import CameraStreamLifecycleController
+
+    auto = SimpleNamespace(
+        requested="auto",
+        effective="nvh264dec",
+        candidates=("nvh264dec", "avdec_h264"),
+        allowed=True,
+        degraded=False,
+        reason="",
+    )
+    monkeypatch.setattr(camera_stream_controller, "current_decoder_selection", lambda _requested: auto)
+    panel = SimpleNamespace(
+        stream_backend_combo=SimpleNamespace(currentData=lambda: "gstreamer"),
+        decoder_combo=SimpleNamespace(currentData=lambda: "auto"),
+        _runtime_decoder_override="software",
+        decoder_fallback_reasons={
+            "left": "왼쪽: nvh264dec first-frame timeout",
+            "right": "왼쪽: nvh264dec first-frame timeout",
+        },
+    )
+
+    assert CameraStreamLifecycleController(panel)._apply_decoder_start_policy() is True
+    assert panel.decoder_selection_status["effective"] == "avdec_h264"
+    assert panel.decoder_selection_status["degraded"] is True
+    assert "first-frame timeout" in panel.decoder_selection_status["reason"]
+    assert panel.decoder_selection_status["nvidia_available"] is True
+
+
+def test_decoder_mode_change_clears_process_local_fallback_evidence() -> None:
+    from Workstation.standalone_gui import WirisStereoDistancePanel
+
+    panel = SimpleNamespace(
+        _runtime_decoder_override="software",
+        decoder_fallback_reasons={"left": "sentinel", "right": "sentinel"},
+        decoder_combo=SimpleNamespace(currentData=lambda: "auto"),
+        decoder_selection_status={"nvidia_available": True},
+    )
+
+    WirisStereoDistancePanel._handle_decoder_mode_changed(panel, 0)
+
+    assert panel._runtime_decoder_override is None
+    assert panel.decoder_fallback_reasons == {"left": "", "right": ""}
+    assert panel.decoder_selection_status["requested"] == "auto"
+    assert panel.decoder_selection_status["effective"] is None

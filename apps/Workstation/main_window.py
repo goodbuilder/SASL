@@ -29,11 +29,11 @@ from .workspaces import (
     CameraWorkspace,
     CalibrationWorkspace,
     DiagnosticsContent,
+    DataWorkspace,
     ExperimentWorkspace,
     MeasurementWorkspace,
     OverviewWorkspace,
     PixhawkWorkspace,
-    SessionsWorkspace,
     TelemetryWorkspace,
     TimeWorkspace,
 )
@@ -114,15 +114,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 "Advanced/manual fallback; normal Measurement runs record automatically.",
                 "recording",
                 self._toggle_recording,
-            )
-        )
-        self.commands.register(
-            CommandSpec(
-                "session.save",
-                "Retry session save",
-                "Retry or manually finalize an advanced/recovered session without changing the measurement schema.",
-                "data",
-                self._save_session,
             )
         )
         for command_id, text, tooltip, category, handler in (
@@ -247,15 +238,15 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             ),
             (
                 "pixhawk.recover_eth_mavlink.p1",
-                "P1 ETH MAV",
-                "Use the configured P1 USB control port to persist one parameter-owned Ethernet MAVLink instance, reboot PX4, then reconnect UDP telemetry.",
+                "Recover P1 via USB",
+                "For a confirmed P1 ETH RX stall, revalidate a unique USB heartbeat sysid=1, ask for confirmation, reboot only P1, then require 10-minute requalification.",
                 "device",
                 lambda: self._pixhawk_recover_eth_mavlink("left"),
             ),
             (
                 "pixhawk.recover_eth_mavlink.p2",
-                "P2 ETH MAV",
-                "Use the configured P2 USB control port to persist one parameter-owned Ethernet MAVLink instance, reboot PX4, then reconnect UDP telemetry.",
+                "Recover P2 via USB",
+                "For a confirmed P2 ETH RX stall, revalidate a unique USB heartbeat sysid=2, ask for confirmation, reboot only P2, then require 10-minute requalification.",
                 "device",
                 lambda: self._pixhawk_recover_eth_mavlink("right"),
             ),
@@ -707,7 +698,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             "camera.toggle",
             "detection.toggle",
             "recording.toggle",
-            "session.save",
             "camera.discover_host_ip",
             "camera.auto_connect",
             "camera.check_rtsp",
@@ -866,7 +856,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             self.commands.invoke,
             lambda: self._select_context("tasks.recording"),
         )
-        self.recording = SessionsWorkspace(
+        self.recording = DataWorkspace(
             self.backend,
             self.status_adapter.model,
             lambda: self._select_context("tasks.advanced"),
@@ -874,6 +864,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             open_measurement=lambda: self._select_context("processing.measurement"),
         )
         self.sessions = self.recording
+        self.data = self.recording
         self.session = self.recording.current_session
         self.experiment.attach_run_preparation(
             self.recording.preflight_group,
@@ -882,10 +873,10 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self.recording.hr_command_requested.connect(self._handle_hr_command)
         self.recording.ulog_command_requested.connect(self._handle_ulog_command)
         self.recording.inspection_requested.connect(
-            lambda selection: self._inspect_selection("tasks.session", selection)
+            lambda selection: self._inspect_selection("tasks.data", selection)
         )
         self.session.inspection_requested.connect(
-            lambda selection: self._inspect_selection("tasks.session", selection)
+            lambda selection: self._inspect_selection("tasks.data", selection)
         )
         self.pixhawk = PixhawkWorkspace(
             self.backend,
@@ -1183,6 +1174,8 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 result = self.backend.optical_pose_apply_candidate(values)
             elif command_id == "alignment.pose.revert":
                 result = self.backend.optical_pose_revert(values)
+            elif command_id == "alignment.pose.reset":
+                result = self.backend.optical_pose_reset()
             elif command_id == "alignment.pose.capture_burst":
                 # Native burst acquisition is retained as an explicit owner
                 # boundary; capture cannot be faked from the downscaled UI.
@@ -1387,7 +1380,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             self.restoreState(bytes(state))
         context = str(self._ui_settings.value("last_context", "overview") or "overview")
         self.navigation.select_context(context)
-        if canonical_context_id(context) == "tasks.session":
+        if canonical_context_id(context) == "tasks.data":
             review_contexts = {
                 "tasks.recording",
                 "tasks.session_details",
@@ -1398,7 +1391,9 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 self._ui_settings.value("sessions_tab", "current") or "current"
             )
             self.sessions.select_tab(
-                "review" if context in review_contexts else saved_tab
+                "current" if canonical_context_id(context) == "tasks.data" else (
+                    "review" if context in review_contexts else saved_tab
+                )
             )
 
     def _save_ui_state(self) -> None:
@@ -1460,7 +1455,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             page = "time"
         elif context_id in {"processing.measurement"}:
             page = "measurement"
-        elif context_id == "tasks.session":
+        elif context_id == "tasks.data":
             page = "sessions"
             review_contexts = {
                 "tasks.recording",
@@ -1468,9 +1463,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 "tasks.playback",
                 "tasks.export",
             }
-            sessions_tab = (
-                "review" if requested_context in review_contexts else "current"
-            )
+            sessions_tab = "current"
             self.sessions.select_tab(sessions_tab)
         elif context_id in {"devices.pixhawk", "devices.pixhawk.p1", "devices.pixhawk.p2"}:
             page = "pixhawk"
@@ -1525,9 +1518,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
 
     def _toggle_recording(self) -> object:
         return self.backend.toggle_recording()
-
-    def _save_session(self) -> object:
-        return self.backend.save_session()
 
     def _camera_discover_host_ip(self) -> object:
         return self.backend.camera_discover_host_ip()
@@ -1742,11 +1732,12 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         # in settings_payload()'s JSON-safe dict (see NetworkConfig /
         # ntrip_credentials.py). It needs its own explicit handoff here,
         # where both this workspace and the backend are in scope.
-        password_applied = self.backend.set_gnss_ntrip_session_password(
-            self.settings_workspace.gnss_network_password_edit.text()
-        )
-        if password_applied is False:
-            raise RuntimeError("NTRIP session password apply was rejected")
+        if bool(getattr(self.settings_workspace, "_gnss_network_password_explicit", False)):
+            password_applied = self.backend.set_gnss_ntrip_session_password(
+                self.settings_workspace.gnss_network_password_edit.text()
+            )
+            if password_applied is False:
+                raise RuntimeError("NTRIP session password apply was rejected")
         return self.backend.apply_workstation_system_settings(self.settings_workspace.settings_payload())
 
     def _settings_save(self) -> object:
@@ -1859,10 +1850,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         recording_state = recording.state if recording else "IDLE"
         recording_locked = recording_state in {"ACTIVE", "FINALIZING"}
         panel = getattr(self.backend, "panel", self.backend)
-        camera_running = bool(getattr(panel, "camera_connected", False)) or any(
-            status is not None and status.state in {"LIVE", "STARTING"}
-            for status in (snapshot.get("camera.left"), snapshot.get("camera.right"))
-        )
         clock_change_active = getattr(panel, "wiris_time_sync_thread", None) is not None
         automatic_recording = bool(
             getattr(panel, "_automatic_session_recording", False)
@@ -1937,35 +1924,24 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                         f"pixhawk.reset_calibration.{side_code}.{calibration.key}",
                         side in disarmed_open_sides and not recording_locked,
                     )
-        bootstrap_active = getattr(panel, "pixhawk_usb_bootstrap_thread", None) is not None
-        for command_id in (
-            "pixhawk.recover_eth_mavlink.p1",
-            "pixhawk.recover_eth_mavlink.p2",
-        ):
-            self.commands.set_enabled(command_id, not recording_locked and not bootstrap_active)
+        recovery_active = getattr(panel, "pixhawk_usb_recovery_thread", None) is not None
+        for side_code, side in (("p1", "left"), ("p2", "right")):
+            self.commands.set_enabled(
+                f"pixhawk.recover_eth_mavlink.{side_code}",
+                not recording_locked
+                and not recovery_active
+                and pixhawk_state_by_side.get(side) == "ETH MAVLINK RX STALLED",
+            )
         self.commands.set_enabled("time.set_pc", not recording_locked)
-        # Recording may be armed before cameras are live; samples begin when
-        # the source streams become available. Once a stream is running, a
-        # mode switch would reopen the active session's video paths.
-        self.commands.set_enabled(
-            "detection.toggle",
-            self.measurement.control_buttons["detection.toggle"].isEnabled()
-            and not (
-                recording_locked
-                and camera_running
-                and not bool(getattr(panel, "_automatic_session_recording", False))
-            ),
-        )
+        # Never hide a Measurement start/stop request behind presentation
+        # state.  The backend command boundary owns the fail-closed checks and
+        # reports why an unsafe lifecycle or writer transition was rejected.
+        self.commands.set_enabled("detection.toggle", True)
         self.commands.set_enabled(
             "recording.toggle",
             not automatic_recording
             and recording_state not in {"FINALIZING", "RECOVERABLE"}
             and (recording_locked or not clock_change_active),
-        )
-        has_session_data = bool(getattr(panel, "recording_session_id", "")) or bool(getattr(panel, "distance_history", []))
-        self.commands.set_enabled(
-            "session.save",
-            not recording_locked and (has_session_data or recording_state == "RECOVERABLE"),
         )
         camera_state = snapshot.get("camera.left")
         self.commands.set_text("camera.toggle", "Stop preview" if camera_state and camera_state.state in {"LIVE", "STARTING"} else "Preview")

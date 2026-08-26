@@ -64,7 +64,7 @@ snapshot 시점에 같은 인터페이스에는 `10.41.10.1/24`, `192.168.0.254/
 | Bitrate | `GEBR VISIBLE` | `0` | `0` |
 | QP | `GEQZ VISIBLE` | `1` | `1` |
 | GOP | `GEGS VISIBLE` | `90` | `90` |
-| IDR interval | `GEIR VISIBLE` | `2` | `2` |
+| IDR interval | `GEIR VISIBLE` | `1` | `1` |
 | Slice-size | `GSSS` | `0` | `0` |
 
 `bitrate=0`은 constant-quality mode이며 QP가 유효한 조건이다. Bitrate에 대해서는 테스트 중
@@ -147,7 +147,7 @@ wiris_control_timeout_s: 5.0
 wiris_visible_encoder_bitrate: 0
 wiris_visible_encoder_qp: 1
 wiris_visible_encoder_gop: 90
-wiris_visible_encoder_idr: 2
+wiris_visible_encoder_idr: 1
 preview_width: 1280
 rtsp_latency_ms: 100
 rtsp_decoder: software
@@ -162,8 +162,8 @@ FTP는 양쪽 모두 enabled, port `21`, user `wiris-enterprise`, remote directo
 
 ### 장비와 Workstation의 정합성
 
-장비 visible profile과 canonical Workstation 저장값을 공통 `0/1/90/2`로 맞췄다.
-현재 저장 schema는 좌/우 encoder profile을 분리하지 않으므로 양쪽 모두 IDR 2를 사용한다.
+장비 visible profile과 canonical Workstation 저장값은 공통 `0/1/90/1`을 사용한다.
+현재 저장 schema는 좌/우 encoder profile을 분리하지 않으므로 양쪽 모두 IDR 1을 사용한다.
 코드의 dataclass fallback 기본값은 별도이며, 현장 운용에서는 위 canonical JSON이 source of truth다.
 
 ### Encoder-profile 재전송 방지 코드

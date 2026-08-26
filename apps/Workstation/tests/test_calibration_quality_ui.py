@@ -41,6 +41,31 @@ def _dispose(workspace: CalibrationWorkspace) -> None:
     application.processEvents()
 
 
+def test_simple_calibration_is_default_and_routes_existing_commands() -> None:
+    invoked: list[str] = []
+    backend = _QualityBackend({"state": "PASS", "reasons": ()})
+    workspace = CalibrationWorkspace(
+        backend,
+        lambda: None,
+        lambda command: invoked.append(command) or True,
+    )
+
+    assert [
+        workspace.simple_calibration_tabs.tabText(index)
+        for index in range(workspace.simple_calibration_tabs.count())
+    ] == ["촬영", "계산·적용", "프로파일"]
+    assert workspace.advanced_calibration_toggle.isChecked() is False
+    assert workspace.advanced_calibration_content.isHidden()
+
+    workspace.simple_calibration_buttons["calibration.run_intrinsic"][0].click()
+    workspace.simple_calibration_buttons["calibration.apply_bundle"][0].click()
+
+    assert invoked == ["calibration.run_intrinsic", "calibration.apply_bundle"]
+    workspace.advanced_calibration_toggle.setChecked(True)
+    assert workspace.advanced_calibration_content.isHidden() is False
+    _dispose(workspace)
+
+
 def test_calibration_quality_pass_displays_source_metrics_and_coverage_grid() -> None:
     backend = _QualityBackend(
         {
@@ -108,10 +133,18 @@ def test_calibration_quality_warning_requires_explicit_confirmation_and_resets()
     )
     assert not workspace.calibration_quality_warning_checkbox.isHidden()
     assert all(not workspace.operation_buttons[command].isEnabled() for command in GATED_COMMANDS)
+    assert all(
+        not button.isEnabled()
+        for button in workspace.simple_calibration_buttons["calibration.apply_bundle"]
+    )
 
     assert workspace.confirm_calibration_quality_warning(True) is True
     assert workspace.calibration_quality_warning_checkbox.isChecked()
     assert all(workspace.operation_buttons[command].isEnabled() for command in GATED_COMMANDS)
+    assert all(
+        button.isEnabled()
+        for button in workspace.simple_calibration_buttons["calibration.apply_bundle"]
+    )
     assert "acknowledged" in workspace.calibration_quality_gate_label.text()
 
     backend.snapshot.update(
@@ -141,6 +174,10 @@ def test_calibration_quality_fail_allows_attempt_save_but_blocks_apply() -> None
 
     assert workspace.calibration_quality_values["state"].value.text() == "FAIL"
     assert all(not workspace.operation_buttons[command].isEnabled() for command in GATED_COMMANDS)
+    assert all(
+        not button.isEnabled()
+        for button in workspace.simple_calibration_buttons["calibration.apply_bundle"]
+    )
     assert all(workspace.operation_buttons[command].isEnabled() for command in EVIDENCE_SAVE_COMMANDS)
     assert "Save preserves an attempt" in workspace.calibration_quality_gate_label.text()
     assert not workspace.operation_buttons["calibration.run_intrinsic"].isEnabled()

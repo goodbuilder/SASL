@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import struct
 from pathlib import Path
 
@@ -314,6 +315,40 @@ def test_manual_expected_hash_mismatch_leaves_no_session_artifact(tmp_path):
     assert not tuple((tmp_path / "session").rglob("*.part"))
     assert not tuple((tmp_path / "session").rglob("*.ulg"))
     assert controller.ulog_snapshot()["artifacts"] == []
+
+
+def test_sessionless_ulog_uses_creation_timestamp_and_never_overwrites(tmp_path):
+    payload = _valid_ulog()
+    original = tmp_path / "flight.ulg"
+    original.write_bytes(payload)
+    controller = ULogController(
+        tmp_path / "measurement_data",
+        "measurement-data",
+        timestamp_filenames=True,
+    )
+
+    first = controller.import_manual_ulog("p1", original)
+    second = controller.import_manual_ulog("p1", original)
+
+    first_path = Path(controller.ulog_snapshot()["session_root"]) / first["relative_path"]
+    second_path = Path(controller.ulog_snapshot()["session_root"]) / second["relative_path"]
+    assert first_path != second_path
+    assert first_path.read_bytes() == payload
+    assert second_path.read_bytes() == payload
+    assert re.fullmatch(
+        r"\d{8}_\d{6}_\d{9}[+-]\d{4}_flight(?:-\d{2})?\.ulg",
+        first_path.name,
+    )
+    assert controller.ulog_snapshot()["timestamp_filenames"] is True
+    assert "session_id" not in first
+    assert "session_id" not in controller.ulog_snapshot()
+    metadata = json.loads(
+        (
+            Path(controller.ulog_snapshot()["session_root"])
+            / first["metadata_relative_path"]
+        ).read_text(encoding="utf-8")
+    )
+    assert "session_id" not in metadata
 
 
 def test_ulog_artifact_ledger_recovers_torn_tail_before_append(tmp_path):
