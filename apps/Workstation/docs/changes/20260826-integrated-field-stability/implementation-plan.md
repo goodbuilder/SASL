@@ -8,6 +8,8 @@ new device setting, firmware change, destructive recovery or unrelated feature n
 ## Slices and dependencies
 
 1. Freeze repo/runtime/device/settings baseline and consolidate prior packet evidence.
+   Before any StereoWIRIS Legacy hardware run, prove launch/connect/Preview/record cannot auto-apply
+   the conflicting repo encoder profile.
 2. Run independent short probes: RTSP/NVDEC, MAVLink, NTRIP/RTCM, STUS, admission/restart,
    MP4/evidence, GUI/resource/shutdown.
 3. For each failure, prove the smallest layer, add a regression, implement the minimal slice, and
@@ -42,4 +44,6 @@ approved experiment and restored/read back afterward.
 - Stop source edits on a new scope/ownership/device-setting requirement and request approval.
 - Ask the user for the named physical action when USB, power-cycle, motion target or antenna change
   is required.
+- Stop before a Legacy hardware run if any path can apply the stale `0/1/90/1` profile; do not use
+  runtime experimentation to discover this mutation.
 - Do not begin the final soak with any required `FAIL`, `NOT_RUN` or unresolved `BLOCKED` slice.

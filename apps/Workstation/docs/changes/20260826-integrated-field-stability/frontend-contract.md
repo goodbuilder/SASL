@@ -18,6 +18,10 @@ control waits for the backend/external postcondition defined in `backend-contrac
 - STUS shows ACK/reconnect/warmup and live pair delta/SR-PC/SR age/clock quality.
 - Measurement/recording shows IDLE/QUEUED/STARTING/RUNNING/STOPPING/ERROR with factual storage detail.
 
+The Measurement Start control remains available when MAVLink, NTRIP/GNSS, STUS or storage is
+unready. The selected method/result surface shows the exact missing input and never labels the
+result valid. Only an active camera/resource transition may queue Start.
+
 ## Errors and recovery actions
 
 Messages name the failed side, boundary, last valid age/result and next safe operator action. They do

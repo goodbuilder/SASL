@@ -7,14 +7,16 @@
 | R1 | clean and sustained dual RTSP/NVDEC | fresh-client decode, RTP/RTCP/pcap, frames | FAIL baseline: initial PPS absent; long run NOT_RUN |
 | R2 | corruption/freeze-free motion | periodic images + identity and gap events | NOT_RUN |
 | R3 | sustained STUS sync | ACK targets, new workers, RTCP series | NOT_RUN |
-| R4 | P1/P2 MAVLink qualification | raw inbound HB/ATT/ANY and side state | NOT_RUN current boot |
-| R5 | SASL/NGII authentication/RTCM | raw HTTP status, CRC-valid RTCM and injection ACK/counters | NOT_RUN |
+| R4 | P1/P2 MAVLink qualification | raw inbound HB/ATT/ANY and side state | FAIL: both 6 s heartbeat timeout while ping alive |
+| R5 | SASL/NGII authentication/RTCM | raw HTTP status, CRC-valid RTCM and injection ACK/counters | BLOCKED pending operator session credential entry |
 | R6 | Measurement admission and restart | UI action through new run ID/files | NOT_RUN hardware |
 | R7 | dual MP4 finalization | size series, ffprobe, strict full decode | NOT_RUN current candidate |
 | R8 | exact evidence identity | FrameKey plus durable readback hash | NOT_RUN hardware |
 | R9 | bounded GUI/resources | time-series RSS/queues/GPU/latency/cleanup | NOT_RUN hardware |
 | R10 | canonical reproducible runtime | doctor/launchers/root venv | NOT_RUN current baseline |
 | R11 | final integrated acceptance | 3 cold boots + 60-minute full load + failure isolation | NOT_RUN |
+| R12 | method-specific readiness without global Start gate | current-zoom K,D/R,t, correspondence, attitude/GNSS/STUS permutations | NOT_RUN |
+| R13 | no unapproved camera setting mutation | code-path audit + pre/post readback for each hardware app | NOT_RUN; config/docs conflict found |
 
 ## Focused test evidence
 
@@ -29,6 +31,10 @@ residuals must remain visible.
 
 Initial target: RTX 4050 driver 595.84, about 1 TiB free storage. Both cameras recovered to
 1280x720 `nvh264dec` CUDA-memory output in separate 12-second probes. No integrated time series yet.
+
+Read-only current-boot MAVLink diagnostic: both `udpin:0.0.0.0:14550/14551` listeners were free,
+then each waited six seconds and received no heartbeat; result `NOT_CONNECTED`. No USB candidate was
+present, so firmware/sysid/`MAV_2_*` identity remains unverified.
 
 ## Feature isolation and contract evidence
 

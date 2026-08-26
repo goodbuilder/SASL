@@ -5,8 +5,8 @@ status: implementing
 mode: backend-coupled
 updated: 2026-08-26
 baseline_ref: c4397995d864576c966702cfd3c398b6032f8990
-last_completed: "Integrated scope, approval, baseline and requirement-to-evidence matrix recorded"
-next_question: null
+last_completed: "MAVLink passive gate failed on both sides; Workstation opened for P1 USB and NTRIP session credential setup"
+next_question: "Connect only P1 USB and Apply the SASL/NGII session password in Settings > GNSS, then confirm both actions"
 read_next:
   - docs/changes/20260826-integrated-field-stability/approval-summary.md
   - docs/changes/20260826-integrated-field-stability/implementation-plan.md
@@ -42,3 +42,5 @@ The user explicitly started the previously designed goal. Preserve all existing 
 prior packet decisions. Short independent probes precede any 60-minute soak. No device setting,
 firmware, reboot/power-cycle or destructive recovery is approved. Six GPT-5.6-sol ultra read-only
 audits are in progress; merge their findings into this packet before selecting the first source slice.
+The integrated 60-minute soak is Workstation-only; StereoWIRIS Legacy has separate focused blank
+restart/new-session/MP4 gates and never owns hardware concurrently with Workstation.

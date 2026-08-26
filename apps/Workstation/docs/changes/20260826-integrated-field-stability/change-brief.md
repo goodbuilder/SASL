@@ -6,7 +6,8 @@
 SASL/NGII NTRIP, STUS 시간 동기, Measurement 시작, MP4와 native evidence 저장이
 장시간 함께 동작해야 한다. 장애가 나면 성공처럼 보이지 않고 side와 실패 계층, 복구
 조치가 명확해야 한다. 문제별 짧은 qualification을 모두 통과한 최종 후보만 60분
-full-load soak에 들어간다.
+full-load soak에 들어간다. StereoWIRIS Legacy는 Workstation과 동시에 장비를 소유하지
+않고, blank restart/new session/MP4 경로를 별도 집중 gate로 검증한다.
 
 ## Motivation
 
@@ -26,6 +27,9 @@ MAVLink가 약 5분 30초 뒤 멎었고, NTRIP은 잘못 선택된 credential로
 - SASL/NGII `RTS2.ngii.go.kr:2101`, `VRS-RTCM32`, credential selection, HTTP status,
   RTCM3 receive and per-side injection evidence.
 - Sessionless Measurement admission, blank restart, new run identity, storage isolation.
+- StereoWIRIS Legacy blank startup, fresh `세션 기록 시작`, and its recording finalization.
+- Method-specific readiness: missing current-zoom intrinsics, stereo R,t, correspondence, attitude,
+  GNSS/RTK or synchronization blocks only the dependent valid result, not Measurement lifecycle.
 - Dual MP4 creation/growth/EOS/strict decode and exact FrameKey/hash evidence.
 - Bounded shared-memory/queue/RSS behavior, responsive control and complete cleanup.
 - Canonical root runtime/launcher readiness required to reproduce the field result.
@@ -46,3 +50,7 @@ each sustain at least 10 minutes. The final candidate must sustain 60 minutes un
 dual-Pixhawk, NTRIP/RTCM, YOLO/measurement, recording and evidence load with no required failure.
 An app mitigation is not a camera/PX4 firmware fix. A required `FAIL`, `NOT_RUN`, or unresolved
 `BLOCKED` prevents completion.
+
+Measurement Start remains available despite MAVLink, GNSS/NTRIP, STUS or best-effort storage
+failure. A method that depends on an unavailable input must fail closed with the exact reason and
+must not publish a valid result.

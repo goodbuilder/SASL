@@ -8,6 +8,10 @@
 - NTRIP succeeds only after HTTP 200 and CRC-valid RTCM data, not TCP connect alone.
 - Measurement/recording succeeds only after the new run owns resources and durable outputs advance.
 
+Measurement lifecycle admission depends only on camera/resource transition safety. MAVLink,
+GNSS/NTRIP, STUS, intrinsics, stereo R,t, correspondence and storage health are not global Start
+gates. They are method-input/result-validity gates and must emit exact rejection/advisory reasons.
+
 ## State, ownership, and concurrency
 
 One Workstation process owns both RTSP streams, UDP 14550/14551, camera controls and writers during
