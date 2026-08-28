@@ -909,6 +909,7 @@ def test_manual_rtsp_reactivation_stays_pending_until_new_idr_frame() -> None:
         _rtsp_reactivation_stop_generation=1,
         _rtsp_reactivation_generation=3,
         _camera_integrity_unavailable_sides={"right"},
+        _measurement_camera_rejoin_expected_generations={},
         left_pane=Pane(running=True),
         right_pane=Pane(running=False),
         left_url_edit=SimpleNamespace(text=lambda: "rtsp://left/visible"),
@@ -946,8 +947,96 @@ def test_manual_rtsp_reactivation_stays_pending_until_new_idr_frame() -> None:
     ]
     assert panel.camera_connected is True  # healthy left only
     assert panel._camera_integrity_unavailable_sides == {"right"}
-    assert labels[-1] == "camera RTSP reactivate: right=H264 IDR verification pending"
-    assert any("IDR/exact-PTS" in message for message in logs)
+    assert labels[-1] == "camera RTSP reactivate: right=current-frame verification pending"
+    assert any("current frame" in message for message in logs)
+
+
+def test_measurement_camera_rejoin_retries_recording_and_uses_new_segment(
+    tmp_path: Path,
+) -> None:
+    from Workstation.standalone_gui import WirisStereoDistancePanel
+
+    starts: list[dict[str, object]] = []
+    transitions: list[tuple[str, str]] = []
+    new_path = tmp_path / "right-rejoin.mp4"
+
+    class Pane:
+        worker = None
+        thread = None
+        detection_stream_active = False
+        stream_generation = 7
+
+        def start_stream(self, url: str, **kwargs: object) -> bool:
+            starts.append({"url": url, **kwargs})
+            self.worker = object()
+            self.thread = object()
+            return True
+
+    panel = SimpleNamespace(
+        _rtsp_reactivation_side="right",
+        _rtsp_reactivation_enable_detection=True,
+        _rtsp_reactivation_stop_timer=SimpleNamespace(stop=lambda: None),
+        _rtsp_reactivation_stop_generation=1,
+        _rtsp_reactivation_generation=3,
+        _measurement_run_state="RUNNING",
+        _measurement_camera_rejoin_expected_generations={},
+        _camera_integrity_unavailable_sides=set(),
+        left_pane=Pane(),
+        right_pane=Pane(),
+        left_url_edit=SimpleNamespace(text=lambda: "rtsp://left/visible"),
+        right_url_edit=SimpleNamespace(text=lambda: "rtsp://right/visible"),
+        camera_frame_times={"left": [], "right": []},
+        camera_frame_metadata={"left": {}, "right": {}},
+        camera_frame_metadata_history={"left": [], "right": []},
+        camera_stream_stats={"left": {}, "right": {}},
+        active_stream_decoders={"left": None, "right": None},
+        _camera_sync_transport_override=None,
+        _camera_name_ko=lambda side: side,
+        _set_camera_sync_state=lambda *_args: None,
+        tabs=SimpleNamespace(setCurrentIndex=lambda _index: None),
+        depth_tab_index=1,
+        yolo_kwargs=lambda _camera: {"decoder": "software"},
+        video_recording_paths={},
+        _video_recording_allocation_sizes={},
+        video_recording_enabled=False,
+        recording_active=False,
+        _session_recording_active=lambda: panel.recording_active,
+        start_automatic_session_recording=lambda: (
+            setattr(panel, "recording_active", True)
+            or panel.video_recording_paths.update(right=new_path)
+            or True
+        ),
+        allocate_measurement_video_segment=lambda _side: (_ for _ in ()).throw(
+            AssertionError("initial rejoin segment must be reused")
+        ),
+        _video_recording_kwargs=lambda camera: (
+            {"record_video_path": str(panel.video_recording_paths[camera])}
+            if camera in panel.video_recording_paths
+            else {}
+        ),
+        measurement_source_transition=lambda source, state, _detail: transitions.append(
+            (source, state)
+        ),
+        camera_connection_label=SimpleNamespace(setText=lambda _text: None),
+        _log=lambda _message: None,
+        _refresh_session_toggle_buttons=lambda: None,
+        _refresh_operation_header=lambda: None,
+        camera_connected=False,
+        yolo_enabled=False,
+    )
+
+    WirisStereoDistancePanel._finish_camera_rtsp_reactivation(panel, True)
+
+    assert starts == [
+        {
+            "url": "rtsp://right/visible",
+            "enable_detection": True,
+            "decoder": "software",
+            "record_video_path": str(new_path),
+        }
+    ]
+    assert panel.video_recording_enabled is True
+    assert panel._measurement_camera_rejoin_expected_generations == {"right": 7}
 
 
 def test_worker_shutdown_preserves_mp4_eos_window_before_escalation(monkeypatch) -> None:

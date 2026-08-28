@@ -406,7 +406,7 @@ def test_auto_wiris_completion_preserves_manual_preview_mode(
 
     assert calls == ["cancel", expected_call]
 
-def test_manual_record_is_stopped_and_measurement_start_is_queued(
+def test_manual_record_stop_does_not_delay_measurement_observation_start(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -435,7 +435,9 @@ def test_manual_record_is_stopped_and_measurement_start_is_queued(
     assert panel.toggle_yolo_detection() is None
     assert starts == []
     assert stops == [False]
-    assert panel.measurement_run_snapshot()["state"] == "QUEUED"
+    snapshot = panel.measurement_run_snapshot()
+    assert snapshot["state"] == "RUNNING"
+    assert snapshot["sources"]["camera.left"]["state"] == "WAITING_RESOURCE"
 
     panel._manual_recording_active = False
     panel.distance_recording_enabled = False

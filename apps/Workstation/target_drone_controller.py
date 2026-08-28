@@ -590,6 +590,14 @@ class TargetDroneController:
         self._phase = TargetDroneControllerPhase.UNCONFIGURED
         self._artifact: TargetDroneSpoolArtifact | None = None
 
+    def _publish_measurement_source(self, state: str, detail: str) -> None:
+        publisher = getattr(self.panel, "measurement_source_transition", None)
+        if callable(publisher):
+            try:
+                publisher("target", state, detail)
+            except (RuntimeError, TypeError, ValueError):
+                pass
+
     @staticmethod
     def _default_source_config(request: TargetDroneRuntimeRequest) -> MavlinkSourceConfig:
         return MavlinkSourceConfig.target_drone(
@@ -689,6 +697,9 @@ class TargetDroneController:
         if self._worker is None:
             self._worker = self._worker_factory(self._receiver)
         self._phase = TargetDroneControllerPhase.STARTING
+        self._publish_measurement_source(
+            "WAITING_RESOURCE", "Target telemetry worker start requested"
+        )
         self._worker.start()
         return self.snapshot()
 
@@ -704,10 +715,17 @@ class TargetDroneController:
             return 0
         if self._artifact is not None:
             raise TargetDroneControllerError("sealed target-drone spool cannot be drained")
-        return self._receiver.drain(
+        accepted_before = self._receiver.snapshot().accepted_message_count
+        drained = self._receiver.drain(
             max_messages=_positive_int(max_messages, "max_messages"),
             max_duration_s=_positive_float(max_duration_s, "max_duration_s"),
         )
+        accepted_after = self._receiver.snapshot().accepted_message_count
+        if accepted_after > accepted_before:
+            self._publish_measurement_source(
+                "LIVE", "verified Target telemetry message received"
+            )
+        return drained
 
     def stop(self, *, timeout_s: float | None = None) -> TargetDroneControllerSnapshot:
         self._assert_session_unchanged()
@@ -717,6 +735,7 @@ class TargetDroneController:
         if self._request.mode == TargetDroneMode.UAM:
             self._receiver.stop(drain=False)
             self._phase = TargetDroneControllerPhase.DEFERRED
+            self._publish_measurement_source("LEFT", "Target telemetry stopped")
             return self.snapshot()
         try:
             if self._worker is None:
@@ -725,6 +744,9 @@ class TargetDroneController:
                 stream_snapshot = self._worker.stop(timeout_s=timeout_s)
         except Exception:
             self._phase = TargetDroneControllerPhase.FAILED
+            self._publish_measurement_source(
+                "UNAVAILABLE", "Target telemetry stop failed"
+            )
             raise
         self._phase = (
             TargetDroneControllerPhase.FAILED
@@ -733,6 +755,14 @@ class TargetDroneController:
                 TargetDroneStreamState.IDENTITY_MISMATCH,
             )
             else TargetDroneControllerPhase.STOPPED
+        )
+        self._publish_measurement_source(
+            "UNAVAILABLE"
+            if self._phase == TargetDroneControllerPhase.FAILED
+            else "LEFT",
+            "Target telemetry failed"
+            if self._phase == TargetDroneControllerPhase.FAILED
+            else "Target telemetry stopped",
         )
         if self._partial_spool_path is not None and self._partial_spool_path.is_file():
             self._artifact = self._seal_spool(stream_snapshot)

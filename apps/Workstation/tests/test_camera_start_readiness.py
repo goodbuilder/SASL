@@ -79,18 +79,18 @@ def test_qthread_start_waits_for_current_generation_frames_before_running(
 
     assert panel.camera_connected is False
     assert panel.yolo_enabled is False
-    assert panel.measurement_run_snapshot()["state"] == "STARTING"
+    assert panel.measurement_run_snapshot()["state"] == "RUNNING"
 
     panel.left_pane.frame_changed.emit(
         "left", image, _frame_metadata(panel, "left")
     )
     assert panel.camera_connected is False
-    assert panel.measurement_run_snapshot()["state"] == "STARTING"
+    assert panel.measurement_run_snapshot()["state"] == "RUNNING"
 
     stale_right = _frame_metadata(panel, "right")
     stale_right["stream_generation"] = int(stale_right["stream_generation"]) - 1
     panel.right_pane.frame_changed.emit("right", image, stale_right)
-    assert panel.measurement_run_snapshot()["state"] == "STARTING"
+    assert panel.measurement_run_snapshot()["state"] == "RUNNING"
 
     panel.right_pane.frame_changed.emit(
         "right", image, _frame_metadata(panel, "right")
@@ -100,6 +100,54 @@ def test_qthread_start_waits_for_current_generation_frames_before_running(
     assert snapshot["active_sides"] == ["left", "right"]
     assert panel.camera_connected is True
     assert panel.yolo_enabled is True
+
+
+def test_invalid_camera_configuration_does_not_reject_observation_run(
+    readiness_panel,
+) -> None:
+    panel, _callbacks = readiness_panel
+    panel.left_url_edit.setText("")
+
+    assert panel.start_yolo() is None
+
+    snapshot = panel.measurement_run_snapshot()
+    assert snapshot["state"] == "RUNNING"
+    assert snapshot["sources"]["camera.left"]["state"] == "UNAVAILABLE"
+    assert snapshot["sources"]["camera.right"]["state"] == "UNAVAILABLE"
+
+
+def test_recording_start_failure_does_not_reject_camera_observation(
+    readiness_panel,
+) -> None:
+    panel, _callbacks = readiness_panel
+    starts: list[dict[str, object]] = []
+    panel.start_automatic_session_recording = lambda: False
+    panel._start_camera_streams = lambda **kwargs: starts.append(dict(kwargs)) or True
+
+    assert panel.start_yolo() is None
+
+    snapshot = panel.measurement_run_snapshot()
+    assert snapshot["state"] == "RUNNING"
+    assert snapshot["sources"]["recording.left"]["state"] == "UNAVAILABLE"
+    assert snapshot["sources"]["recording.right"]["state"] == "UNAVAILABLE"
+    assert starts == [{"enable_detection": True, "switch_to_depth": True}]
+
+
+def test_zero_camera_observation_can_stop_and_immediately_restart(
+    readiness_panel,
+) -> None:
+    panel, _callbacks = readiness_panel
+    panel.left_url_edit.setText("")
+    assert panel.start_yolo() is None
+    first = panel.measurement_run_snapshot()["generation"]
+    assert panel.camera_connected is False
+
+    panel.stop_yolo_detection()
+
+    assert panel.measurement_run_snapshot()["state"] == "IDLE"
+    assert panel.start_yolo() is None
+    assert panel.measurement_run_snapshot()["state"] == "RUNNING"
+    assert panel.measurement_run_snapshot()["generation"] != first
 
 
 def test_first_frame_timeout_keeps_ready_side_as_partial_measurement(
@@ -146,7 +194,7 @@ def test_fatal_source_start_status_keeps_only_the_frame_ready_side(
     assert "right unavailable" in panel.camera_connection_label.text()
 
 
-def test_worker_replacement_wait_has_bounded_measurement_rollback(
+def test_worker_replacement_timeout_keeps_observation_running(
     readiness_panel,
 ) -> None:
     panel, callbacks = readiness_panel
@@ -158,18 +206,19 @@ def test_worker_replacement_wait_has_bounded_measurement_rollback(
     panel.right_pane.stop = lambda *, wait=False: False
 
     assert panel._start_camera_streams(enable_detection=True, switch_to_depth=False)
-    assert panel.measurement_run_snapshot()["state"] == "STARTING"
+    assert panel.measurement_run_snapshot()["state"] == "RUNNING"
     panel._camera_start_retry_deadline_s = 0.0
 
     _delay_ms, retry = callbacks.pop(0)
     retry()
 
-    assert panel.measurement_run_snapshot()["state"] == "ERROR"
+    assert panel.measurement_run_snapshot()["state"] == "RUNNING"
+    assert panel.measurement_run_snapshot()["sources"]["camera.left"]["state"] == "UNAVAILABLE"
     assert panel._automatic_session_recording is False
     assert panel.camera_connected is False
 
 
-def test_no_first_frame_rolls_back_automatic_recording_and_leaves_retry_available(
+def test_no_first_frame_stops_recording_but_keeps_observation_running(
     readiness_panel,
 ) -> None:
     panel, _callbacks = readiness_panel
@@ -190,14 +239,13 @@ def test_no_first_frame_rolls_back_automatic_recording_and_leaves_retry_availabl
     panel._poll_camera_start_readiness(int(readiness["generation"]))
 
     snapshot = panel.measurement_run_snapshot()
-    assert snapshot["state"] == "ERROR"
-    assert "first decoded frame" in snapshot["error"]
+    assert snapshot["state"] == "RUNNING"
+    assert snapshot["sources"]["camera.left"]["state"] == "UNAVAILABLE"
     assert panel.camera_connected is False
     assert panel._automatic_session_recording is False
     assert panel.distance_recording_enabled is False
     assert panel.video_recording_enabled is False
-    assert panel.begin_measurement_run() is True
-    assert panel.measurement_run_snapshot()["state"] == "STARTING"
+    assert panel.begin_measurement_run() is False
 
 
 def test_dual_decoder_start_rejection_stops_automatic_recording(
@@ -220,13 +268,13 @@ def test_dual_decoder_start_rejection_stops_automatic_recording(
         "left",
         "DECODER_FALLBACK_REQUIRED: nvh264dec first-frame timeout",
     )
-    assert panel.measurement_run_snapshot()["state"] == "STARTING"
+    assert panel.measurement_run_snapshot()["state"] == "RUNNING"
     panel._handle_runtime_decoder_fallback(
         "right",
         "DECODER_FALLBACK_REQUIRED: nvh264dec first-frame timeout",
     )
 
-    assert panel.measurement_run_snapshot()["state"] == "ERROR"
+    assert panel.measurement_run_snapshot()["state"] == "RUNNING"
     assert panel._automatic_session_recording is False
     assert panel.distance_recording_enabled is False
     assert panel.video_recording_enabled is False
@@ -328,7 +376,7 @@ def test_one_video_writer_failure_is_partial_and_keeps_measurement_running(
     assert panel.video_recording_enabled is True
 
 
-def test_explicit_start_rejection_moves_measurement_to_error_and_stops_auto_recording() -> None:
+def test_explicit_start_rejection_keeps_measurement_and_stops_auto_recording() -> None:
     from types import SimpleNamespace
 
     from Workstation.camera_stream_controller import CameraStreamLifecycleController
@@ -369,7 +417,8 @@ def test_explicit_start_rejection_moves_measurement_to_error_and_stops_auto_reco
 
     result = CameraStreamLifecycleController(panel).start_yolo()
 
-    assert result is False
-    assert run.state == "ERROR"
+    assert result is None
+    assert run.state == "RUNNING"
     assert panel._automatic_session_recording is False
-    assert calls[:2] == ["streams.stop", "recording.stop"]
+    assert calls[0] == "recording.stop"
+    assert "streams.stop" not in calls

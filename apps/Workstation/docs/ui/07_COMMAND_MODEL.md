@@ -88,12 +88,14 @@ that save never updates the active alias, persisted settings, or Measurement geo
 still requires explicit confirmation before Apply; `FAIL` cannot be applied. Structural validation
 of K,D/R,t and exact operating-profile applicability remain hard Apply gates.
 
-`측정 시작` creates only a transient run and then starts Detection. It does not require a parent,
-save completion, storage health, Alignment, exact K,D, GNSS, or a ready method. Missing geometry
-blocks a valid result while matched raw evidence remains available. Manual record is stopped first;
-actual camera-resource contention creates QUEUED and resumes automatically. The shared button/QAction
-is never disabled by Session/storage state. Invalid RTSP inputs or duplicate live intervals are
-rejected with an operator-visible reason.
+`측정 시작` immediately creates a transient observation run. It does not require a parent, save
+completion, storage health, camera, P1/P2, GNSS/NTRIP, Target, Alignment, exact K,D, or a ready
+method. Missing or invalid source configuration marks only that source unavailable; method-local
+gates still block unsupported results. Manual recording and busy camera resources transition only
+their branches while the run remains RUNNING. A duplicate active run is still rejected.
+
+Camera rejoin allocates a new MP4 segment. File existence produces `SAVED/PARTIAL/FAILED` without
+claiming usability. Finalization, integrity or artifact enqueue failure never stops or gates a run.
 
 ## 14. Detection / Recording / Calibration Separation
 

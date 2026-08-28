@@ -1283,6 +1283,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._auto_wiris_enabled_cameras: set[tuple[str, str]] = set()
         self._rtsp_reactivation_side: str | None = None
         self._rtsp_reactivation_enable_detection = False
+        self._rtsp_reactivation_previous_video_path: Path | None = None
+        self._measurement_camera_rejoin_expected_generations: dict[str, int] = {}
         self._rtsp_reactivation_generation = 0
         self._rtsp_reactivation_stop_generation: int | None = None
         self._rtsp_reactivation_stop_timer = QtCore.QTimer(self)
@@ -7086,45 +7088,20 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         return self.app_root / "recordings"
 
     def _prepare_video_recording_paths(self) -> None:
-        allocator = getattr(self, "allocate_workstation_data_artifact", None)
         created_utc_ns = time.time_ns()
         paths: dict[str, Path] = {}
         for side in ("left", "right"):
             try:
-                if not callable(allocator):
-                    raise RuntimeError("data artifact allocator is unavailable")
-                paths[side] = Path(
-                    allocator(
-                        "videos",
-                        label=side,
-                        suffix=".mp4",
-                        utc_ns=created_utc_ns,
-                    )
-                )
+                allocator = getattr(self, "allocate_measurement_video_segment", None)
+                path = allocator(side, utc_ns=created_utc_ns) if callable(allocator) else None
+                if path is None:
+                    raise RuntimeError("video segment allocator is unavailable")
+                paths[side] = Path(path)
             except (OSError, RuntimeError, TypeError, ValueError) as exc:
                 self._log(
                     f"[저장] {side} video path unavailable; Measurement continues: {exc}"
                 )
         self.video_recording_paths = paths
-        recording_contract = recording_integrity_contract(
-            self.stream_backend_combo.currentData()
-        )
-        writer = getattr(self, "append_workstation_data", None)
-        if callable(writer):
-            for side, path in paths.items():
-                writer(
-                    "artifacts",
-                    {
-                        "event_type": "video_path_allocated",
-                        "side": side,
-                        "path": str(path),
-                        "media_type": "video/mp4",
-                        "stream_backend": self.stream_backend_combo.currentData(),
-                        **recording_contract,
-                        "creation_requested_utc_ns": created_utc_ns,
-                    },
-                    priority=True,
-                )
 
     def _format_video_recording_paths(self) -> str:
         return format_video_paths(self.video_recording_paths)
@@ -8474,8 +8451,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if isinstance(stus_operation, dict) and stus_operation.get("active"):
             self._log("[카메라] STUS closed-loop 중 RTSP 재활성화를 거부했습니다.")
             return False
-        if self._session_recording_active():
-            self._log("[카메라] 데이터 기록 중에는 카메라 RTSP 재활성화를 실행할 수 없습니다.")
+        if self._session_recording_active() and not bool(
+            getattr(self, "_automatic_session_recording", False)
+        ):
+            self._log(
+                "[카메라] 수동 기록 중에는 RTSP 재활성화를 실행할 수 없습니다. "
+                "Measurement 관측 중 source 복구만 허용됩니다."
+            )
             return False
         if self.rtsp_enable_thread is not None or self.rtsp_check_thread is not None:
             self._log("[카메라] 다른 RTSP 확인/활성화 작업이 진행 중입니다.")
@@ -8489,12 +8471,35 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._cancel_auto_wiris_connect_retry()
 
         self._rtsp_reactivation_side = camera
-        self._rtsp_reactivation_enable_detection = bool(self.yolo_enabled)
+        run_state = str(
+            getattr(self, "_measurement_run_state", "IDLE") or "IDLE"
+        ).upper()
+        self._rtsp_reactivation_enable_detection = bool(
+            self.yolo_enabled or run_state == "RUNNING"
+        )
+        self._rtsp_reactivation_previous_video_path = (
+            Path(self.video_recording_paths[camera])
+            if self._session_recording_active()
+            and camera in self.video_recording_paths
+            else None
+        )
         self._rtsp_reactivation_generation += 1
         generation = self._rtsp_reactivation_generation
         self._rtsp_reactivation_stop_generation = generation
         self._rtsp_reactivation_stop_timer.stop()
         camera_name = self._camera_name_ko(camera)
+        source_publisher = getattr(self, "measurement_source_transition", None)
+        if callable(source_publisher) and run_state == "RUNNING":
+            source_publisher(
+                f"camera.{camera}",
+                "WAITING_RESOURCE",
+                "manual RTSP reactivation requested",
+            )
+            source_publisher(
+                f"recording.{camera}",
+                "WAITING_RESOURCE",
+                "camera recovery pending",
+            )
         self._log(
             f"[카메라] {camera_name} RTSP 재활성화를 시작합니다: "
             "스트림 정리 → GETH 확인 → 비활성 시만 SETH TRUE → 프레임 확인 → Preview 재연결 "
@@ -8528,6 +8533,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             pane.stop(wait=False)
             self._rtsp_reactivation_stop_timer.start()
             return
+        previous_video_path = self._rtsp_reactivation_previous_video_path
+        if previous_video_path is not None:
+            recorder = getattr(self, "record_measurement_video_segment_presence", None)
+            if callable(recorder):
+                recorder(
+                    camera,
+                    previous_video_path,
+                    detail="camera side stopped for manual RTSP reactivation",
+                )
+            self._rtsp_reactivation_previous_video_path = None
         self._rtsp_reactivation_stop_timer.stop()
         self._rtsp_reactivation_stop_generation = None
         self._start_rtsp_enable_worker(target_labels=(camera,), reactivate=True)
@@ -8601,6 +8616,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if not success:
             self._log(f"[카메라] {camera_name} RTSP 재활성화 실패: {detail or 'frame check failed'}")
             self.camera_connection_label.setText(f"camera RTSP reactivate: {camera}=failed")
+            source_publisher = getattr(self, "measurement_source_transition", None)
+            if callable(source_publisher):
+                source_publisher(
+                    f"camera.{camera}", "UNAVAILABLE", str(detail or "frame check failed")
+                )
+                source_publisher(
+                    f"recording.{camera}", "UNAVAILABLE", str(detail or "frame check failed")
+                )
             self._refresh_operation_header()
             return
 
@@ -8618,6 +8641,47 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             CAMERA_SYNC_STATUS_NOT_VERIFIED,
             f"{camera_name} RTSP가 재활성화되어 RTCP/NTP 검증이 필요합니다.",
         )
+        recording_active_reader = getattr(self, "_session_recording_active", None)
+        recording_active = bool(
+            callable(recording_active_reader) and recording_active_reader()
+        )
+        recording_started_for_rejoin = False
+        run_state = str(
+            getattr(self, "_measurement_run_state", "IDLE") or "IDLE"
+        ).upper()
+        if not recording_active and run_state == "RUNNING":
+            recording_starter = getattr(self, "start_automatic_session_recording", None)
+            try:
+                recording_started_for_rejoin = bool(
+                    callable(recording_starter) and recording_starter()
+                )
+            except Exception as exc:
+                self._log(f"[저장] 카메라 재합류 recording 준비 실패: {exc}")
+                recording_started_for_rejoin = False
+            recording_active = bool(
+                callable(recording_active_reader) and recording_active_reader()
+            )
+        if recording_active:
+            allocator = getattr(self, "allocate_measurement_video_segment", None)
+            new_path = (
+                self.video_recording_paths.get(camera)
+                if recording_started_for_rejoin
+                else allocator(camera)
+                if callable(allocator)
+                else None
+            )
+            if new_path is not None:
+                self.video_recording_paths[camera] = Path(new_path)
+                self._video_recording_allocation_sizes[camera] = 0
+                self.video_recording_enabled = True
+        elif run_state == "RUNNING":
+            source_publisher = getattr(self, "measurement_source_transition", None)
+            if callable(source_publisher):
+                source_publisher(
+                    f"recording.{camera}",
+                    "UNAVAILABLE",
+                    "recording could not join recovered camera",
+                )
         started = pane.start_stream(
             url,
             enable_detection=enable_detection,
@@ -8629,6 +8693,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.camera_connection_label.setText(f"camera RTSP reactivate: {camera}=preview-start-failed")
             self._refresh_operation_header()
             return
+        pending_rejoins = getattr(
+            self, "_measurement_camera_rejoin_expected_generations", None
+        )
+        if not isinstance(pending_rejoins, dict):
+            pending_rejoins = {}
+            self._measurement_camera_rejoin_expected_generations = pending_rejoins
+        pending_rejoins[camera] = int(getattr(pane, "stream_generation", -1))
         integrity_pending = camera in set(
             getattr(self, "_camera_integrity_unavailable_sides", ()) or ()
         )
@@ -8662,18 +8733,21 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 )
             )
             self.camera_connection_label.setText(
-                f"camera RTSP reactivate: {camera}=H264 IDR verification pending"
+                f"camera RTSP reactivate: {camera}=current-frame verification pending"
             )
             self._log(
                 f"[카메라] {camera_name} Preview worker는 재시작했지만 "
-                "LIVE는 newer-generation H264 IDR/exact-PTS frame 후에만 회복합니다."
+                "LIVE는 newer-generation current frame 후에만 회복합니다."
             )
             self._refresh_session_toggle_buttons()
             self._refresh_operation_header()
             return
-        self.camera_connected = bool(self.left_pane.worker or self.right_pane.worker)
-        self.yolo_enabled = bool(enable_detection)
-        self._log(f"[카메라] {camera_name} RTSP 프레임 확인 완료. 해당 Preview를 다시 연결했습니다.")
+        self.camera_connection_label.setText(
+            f"camera RTSP reactivate: {camera}=current-frame verification pending"
+        )
+        self._log(
+            f"[카메라] {camera_name} worker를 재시작했고 current-generation frame을 기다립니다."
+        )
         self._refresh_session_toggle_buttons()
         self._refresh_operation_header()
 
@@ -10263,6 +10337,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def _is_clock_sync_tab_visible(self, *args: Any, **kwargs: Any) -> Any: ...
         def refresh_clock_sync_status(self, *args: Any, **kwargs: Any) -> Any: ...
         def _refresh_recording_status_label(self, *args: Any, **kwargs: Any) -> Any: ...
+        def allocate_measurement_video_segment(self, *args: Any, **kwargs: Any) -> Any: ...
+        def record_measurement_video_segment_presence(self, *args: Any, **kwargs: Any) -> Any: ...
+        def measurement_video_segments_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
         def video_recording_start_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
         def _set_video_recording_start_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
         def _recording_table_value(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -10737,6 +10814,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def measurement_run_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
         def queue_measurement_start(self, *args: Any, **kwargs: Any) -> Any: ...
         def begin_measurement_run(self, *args: Any, **kwargs: Any) -> Any: ...
+        def measurement_source_transition(self, *args: Any, **kwargs: Any) -> Any: ...
         def confirm_measurement_running(self, *args: Any, **kwargs: Any) -> Any: ...
         def request_measurement_stop(self, *args: Any, **kwargs: Any) -> Any: ...
         def finish_measurement_run(self, *args: Any, **kwargs: Any) -> Any: ...

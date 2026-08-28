@@ -615,8 +615,10 @@ def test_detection_lifecycle_starts_and_stops_automatic_session() -> None:
         _start_camera_streams=lambda **kwargs: blocked_calls.append(kwargs),
         _log=lambda message: blocked_calls.append(message),
     )
-    assert CameraStreamLifecycleController(blocked_panel).start_yolo() is False
-    assert blocked_calls == []
+    assert CameraStreamLifecycleController(blocked_panel).start_yolo() is None
+    assert blocked_calls == [
+        {"enable_detection": True, "switch_to_depth": True}
+    ]
 
 def test_automatic_session_controller_uses_noninteractive_start_and_stop() -> None:
     from Workstation.recording_controller import RecordingController

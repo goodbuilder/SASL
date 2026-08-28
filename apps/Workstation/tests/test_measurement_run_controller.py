@@ -43,12 +43,13 @@ def test_old_recoverable_session_and_storage_failure_do_not_block_measurement() 
     controller = MeasurementRunController(panel)
 
     assert controller.begin_measurement_run() is True
-    assert controller.state == "STARTING"
+    assert controller.state == "RUNNING"
     assert panel._measurement_id.startswith("run-")
+    assert controller.confirm_measurement_running(()) is True
     assert controller.confirm_measurement_running(("left", "right")) is True
     assert controller.state == "RUNNING"
     assert controller.request_measurement_stop() is True
-    assert controller.state == "STOPPING"
+    assert controller.state == "IDLE"
     assert controller.finish_measurement_run() is True
     assert controller.state == "IDLE"
     assert panel._measurement_id == ""
@@ -62,6 +63,7 @@ def test_sequential_runs_receive_new_transient_generations_without_package_state
     first = panel._measurement_run_generation
     assert controller.confirm_measurement_running(("left",))
     assert controller.request_measurement_stop()
+    assert controller.state == "IDLE"
     assert controller.finish_measurement_run()
     assert controller.begin_measurement_run()
     second = panel._measurement_run_generation
@@ -69,6 +71,7 @@ def test_sequential_runs_receive_new_transient_generations_without_package_state
     assert panel._measurement_session_state == "RECOVERABLE"
     assert [payload["event_type"] for _stream, payload in panel._events] == [
         "measurement_start_requested",
+        "measurement_source_transition",
         "measurement_stopped",
         "measurement_start_requested",
     ]
@@ -80,30 +83,113 @@ def test_busy_start_is_queued_and_duplicate_live_start_is_rejected() -> None:
     assert controller.queue_measurement_start("camera time sync")
     assert controller.state == "QUEUED"
     assert controller.begin_measurement_run()
-    assert controller.state == "STARTING"
+    assert controller.state == "RUNNING"
     assert controller.begin_measurement_run() is False
 
 
-def test_failed_start_retires_generation_but_keeps_next_start_available() -> None:
+def test_failed_camera_start_keeps_observation_generation_running() -> None:
     panel = _panel()
     controller = MeasurementRunController(panel)
     assert controller.begin_measurement_run()
-    failed_generation = panel._measurement_run_generation
+    generation = panel._measurement_run_generation
 
     assert controller.fail_measurement_start("no current-generation frame")
 
     snapshot = controller.measurement_run_snapshot()
-    assert snapshot["state"] == "ERROR"
-    assert snapshot["generation"] == ""
-    assert snapshot["error"] == "no current-generation frame"
-    assert panel._measurement_run_last_generation == failed_generation
+    assert snapshot["state"] == "RUNNING"
+    assert snapshot["generation"] == generation
+    assert snapshot["error"] == ""
+    assert snapshot["sources"]["camera.left"]["state"] == "UNAVAILABLE"
+    assert snapshot["sources"]["camera.right"]["state"] == "UNAVAILABLE"
     assert [payload["event_type"] for _stream, payload in panel._events] == [
         "measurement_start_requested",
-        "measurement_start_failed",
+        "measurement_source_transition",
+        "measurement_source_transition",
+        "measurement_source_transition",
+        "measurement_source_transition",
     ]
+    assert controller.begin_measurement_run() is False
+
+
+def test_sources_join_and_leave_without_owning_run_state() -> None:
+    panel = _panel(storage_accepts=False)
+    controller = MeasurementRunController(panel)
     assert controller.begin_measurement_run()
-    assert controller.state == "STARTING"
-    assert panel._measurement_run_generation != failed_generation
+
+    assert controller.measurement_source_transition(
+        "pixhawk.left", "LIVE", "fresh expected-system packet"
+    )
+    event_count = len(panel._events)
+    assert controller.measurement_source_transition(
+        "pixhawk.left", "LIVE", "fresh expected-system packet"
+    )
+    assert len(panel._events) == event_count
+    assert controller.measurement_source_transition(
+        "camera.left", "LIVE", "current-generation frame"
+    )
+    assert controller.measurement_source_transition(
+        "camera.left", "UNAVAILABLE", "frame timeout"
+    )
+
+    snapshot = controller.measurement_run_snapshot()
+    assert snapshot["state"] == "RUNNING"
+    assert snapshot["sources"]["pixhawk.left"]["state"] == "LIVE"
+    assert snapshot["sources"]["camera.left"]["state"] == "UNAVAILABLE"
+    assert snapshot["sources"]["camera.left"]["joined_monotonic_ns"] is not None
+    assert snapshot["sources"]["camera.left"]["left_monotonic_ns"] is not None
+
+
+def test_stop_boundary_immediately_admits_a_new_run_before_old_teardown() -> None:
+    panel = _panel(storage_accepts=False)
+    controller = MeasurementRunController(panel)
+    assert controller.begin_measurement_run()
+    first = panel._measurement_run_generation
+
+    assert controller.request_measurement_stop()
+    assert controller.state == "IDLE"
+    assert panel._measurement_run_last_generation == first
+    assert controller.begin_measurement_run()
+    assert controller.state == "RUNNING"
+    assert panel._measurement_run_generation != first
+
+    # A late old-owner completion is now a harmless no-op and cannot clear
+    # the current observation generation.
+    current = panel._measurement_run_generation
+    assert controller.finish_measurement_run(first) is True
+    assert panel._measurement_run_generation == current
+
+
+def test_persistence_exceptions_never_gate_start_stop_or_next_run() -> None:
+    panel = _panel()
+
+    def fail_append(*_args: object, **_kwargs: object) -> bool:
+        raise OSError("storage offline")
+
+    def fail_flush() -> bool:
+        raise OSError("flush offline")
+
+    panel.append_workstation_data = fail_append
+    panel.flush_workstation_data = fail_flush
+    panel._measurement_view_controller_owner = SimpleNamespace(
+        close_method_evaluation_workers=lambda: (_ for _ in ()).throw(
+            RuntimeError("old worker teardown failed")
+        )
+    )
+    panel._measurement_view_controller = lambda: (_ for _ in ()).throw(
+        RuntimeError("method settings unavailable")
+    )
+    controller = MeasurementRunController(panel)
+
+    assert controller.begin_measurement_run()
+    first = panel._measurement_run_generation
+    assert controller.state == "RUNNING"
+    assert controller.request_measurement_stop()
+    assert controller.state == "IDLE"
+    assert panel._measurement_run_last_generation == first
+    assert panel._measurement_run_generation == ""
+    assert controller.begin_measurement_run()
+    assert controller.state == "RUNNING"
+    assert panel._measurement_run_generation != first
 
 
 def test_real_panel_ignores_old_session_and_prepares_type_owned_paths(
@@ -135,7 +221,7 @@ def test_real_panel_ignores_old_session_and_prepares_type_owned_paths(
     )
 
     assert panel.start_yolo() is None
-    assert panel.measurement_run_snapshot()["state"] == "STARTING"
+    assert panel.measurement_run_snapshot()["state"] == "RUNNING"
     assert starts == [{"enable_detection": True, "switch_to_depth": True}]
     assert panel.data_storage_snapshot()["root"] == str(tmp_path / "measurement_data")
     assert all(path.parent == tmp_path / "measurement_data" / "videos" for path in panel.video_recording_paths.values())

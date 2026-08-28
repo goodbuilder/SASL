@@ -1498,6 +1498,9 @@ class CameraWorkspace(QtWidgets.QWidget):
         recording_locked = recording is not None and recording.state in {"ACTIVE", "FINALIZING"}
         self._recording_locked = recording_locked
         panel = getattr(self.backend, "panel", self.backend)
+        camera_recovery_allowed = not recording_locked or bool(
+            getattr(panel, "_automatic_session_recording", False)
+        )
         active_decoders = getattr(panel, "active_stream_decoders", {})
         if not isinstance(active_decoders, Mapping):
             active_decoders = {}
@@ -1546,7 +1549,7 @@ class CameraWorkspace(QtWidgets.QWidget):
         for command_id in ("camera.reactivate_left", "camera.reactivate_right"):
             button = self.operation_buttons.get(command_id)
             if button is not None:
-                button.setEnabled(not recording_locked and not rtsp_operation_active)
+                button.setEnabled(camera_recovery_allowed and not rtsp_operation_active)
         connection = evidence.camera_connection_candidates()
         camera_discovery_status = str(connection.get("status", "NOT RUN") or "NOT RUN")
         self.discovery_status.set_value(
@@ -3116,19 +3119,45 @@ class MeasurementWorkspace(QtWidgets.QWidget):
                 storage = {"state": "UNAVAILABLE", "error": str(exc)}
             state = str(run.get("state") or "IDLE").upper()
             detail = str(run.get("detail") or run.get("error") or "")
+            sources = run.get("sources")
+            sources = sources if isinstance(sources, Mapping) else {}
+            source_counts = {
+                source_state: sum(
+                    1
+                    for value in sources.values()
+                    if isinstance(value, Mapping)
+                    and str(value.get("state") or "").upper() == source_state
+                )
+                for source_state in ("LIVE", "PENDING", "WAITING_RESOURCE", "UNAVAILABLE")
+            }
+            source_summary = (
+                f"live={source_counts['LIVE']} · wait="
+                f"{source_counts['PENDING'] + source_counts['WAITING_RESOURCE']} · "
+                f"unavailable={source_counts['UNAVAILABLE']}"
+            )
             self._set_run_status_text(
                 self.session_status_label,
-                f"Measurement: {state}",
-                detail=f"Measurement: {state}" + (f" · {detail}" if detail else ""),
+                f"Measurement: {state} · {source_summary}",
+                detail=(
+                    f"Measurement: {state} · {source_summary}"
+                    + (f" · {detail}" if detail else "")
+                ),
             )
             recording = "MANUAL" if bool(
                 getattr(panel, "_manual_recording_active", False)
             ) else "MEASUREMENT" if bool(
                 getattr(panel, "_automatic_session_recording", False)
             ) else "IDLE"
+            presence = str(
+                getattr(panel, "_last_recording_presence_state", "IDLE") or "IDLE"
+            )
             self._set_run_status_text(
                 self.measurement_status_label,
-                f"Recording: {recording}",
+                f"Recording: {recording if recording != 'IDLE' else presence}",
+                detail=(
+                    f"Recording: {recording if recording != 'IDLE' else presence} · "
+                    "SAVED means file presence only; playback integrity is not verified"
+                ),
             )
             next_text = {
                 "IDLE": "Next: 측정 시작",
@@ -3148,11 +3177,13 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             pending = int(storage.get("priority_pending") or 0) + int(
                 storage.get("bulk_pending") or 0
             )
+            retry_pending = int(storage.get("essential_retry_pending") or 0)
             self._set_run_status_text(
                 self.evidence_summary_label,
-                f"Storage: {storage_state} · drop={dropped}",
+                f"Storage: {storage_state} · retry={retry_pending} · drop={dropped}",
                 detail=(
-                    f"Storage: {storage_state} · pending={pending} · dropped={dropped} · "
+                    f"Storage: {storage_state} · pending={pending} · "
+                    f"essential retry={retry_pending} · dropped={dropped} · "
                     f"root={storage.get('root', '--')}"
                 ),
             )
@@ -3393,12 +3424,25 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         camera_state = camera.state if camera else "STOPPED"
         detection_state = detection.state if detection else "DISABLED"
         recording_state = recording.state if recording else "IDLE"
+        run_reader = getattr(self.backend, "measurement_run_snapshot", None)
+        if not callable(run_reader):
+            run_reader = getattr(panel, "measurement_run_snapshot", None)
+        try:
+            run_snapshot = run_reader() if callable(run_reader) else {}
+        except Exception:
+            run_snapshot = {}
+        run_state = str(
+            run_snapshot.get("state") if isinstance(run_snapshot, Mapping) else ""
+        ).upper()
         recording_locked = recording_state in {"ACTIVE", "FINALIZING"}
         self.control_buttons["camera.toggle"].setText(
             "Stop preview" if camera_state in {"LIVE", "STARTING"} else "Preview"
         )
         self.control_buttons["detection.toggle"].setText(
-            "측정 종료" if detection_state in {"RUNNING", "STARTING"} else "측정 시작"
+            "측정 종료"
+            if run_state in {"RUNNING", "STOPPING"}
+            or detection_state in {"RUNNING", "STARTING"}
+            else "측정 시작"
         )
         self.control_buttons["camera.toggle"].setEnabled(not recording_locked)
         # Keep the operator command available in every lifecycle state.  The
@@ -4055,6 +4099,9 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         recording = snapshot.get("recording")
         self._recording_locked = recording is not None and recording.state in {"ACTIVE", "FINALIZING"}
         panel = getattr(self.backend, "panel", self.backend)
+        source_connection_allowed = not self._recording_locked or bool(
+            getattr(panel, "_automatic_session_recording", False)
+        )
         open_sides = getattr(panel, "_mavlink_open_sides", None)
         connected_sides = set(open_sides()) if callable(open_sides) else set()
         connection_in_progress = getattr(panel, "pixhawk_connection_thread", None) is not None
@@ -4065,10 +4112,10 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         )
         connection_active = bool(connected_sides) or connection_in_progress or status_connected
         self.operation_buttons["pixhawk.connect_mavlink"].setEnabled(
-            self._invoke_command_available and not self._recording_locked and not connection_active
+            self._invoke_command_available and source_connection_allowed and not connection_active
         )
         self.operation_buttons["pixhawk.disconnect_mavlink"].setEnabled(
-            self._invoke_command_available and not self._recording_locked and connection_active
+            self._invoke_command_available and source_connection_allowed and connection_active
         )
         for side in ("left", "right"):
             self.operation_buttons[f"pixhawk.open_shell.{side}"].setEnabled(

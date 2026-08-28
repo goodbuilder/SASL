@@ -117,7 +117,13 @@ Rejection reasons must come from existing logic, not the UI.
 ## 15. Recording
 
 Manual recording: IDLE → STARTING → ACTIVE → STOPPING → IDLE, with DEGRADED/ERROR diagnostics.
-Measurement run: IDLE → QUEUED(optional) → STARTING → RUNNING → STOPPING → IDLE.
+Measurement enters RUNNING immediately after its in-memory generation/time boundary is frozen.
+Source states (`PENDING/WAITING_RESOURCE/LIVE/UNAVAILABLE/LEFT`) are independent and never own run
+admission.
+
+The compact post-run recording state is presence-only: `SAVED`, `PARTIAL`, or `FAILED`. Its detail
+explicitly says playback integrity is not verified. Recorder, artifact or storage failure never
+changes Measurement state or prevents the next run.
 
 The Recording workspace also exposes an advisory protocol projection (not a new
 runtime status key). It evaluates camera LIVE, RTCP/NTP SYNCED, detection RUNNING,

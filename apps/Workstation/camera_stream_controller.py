@@ -250,6 +250,20 @@ class CameraStreamLifecycleController:
             "ERROR": "RECOVERABLE",
         }.get(self._measurement_run_state(), "IDLE")
 
+    def _publish_measurement_source(
+        self,
+        source_id: str,
+        state: str,
+        detail: str,
+    ) -> bool:
+        publisher = getattr(self.panel, "measurement_source_transition", None)
+        if not callable(publisher):
+            return False
+        try:
+            return bool(publisher(source_id, state, detail))
+        except (RuntimeError, TypeError, ValueError):
+            return False
+
     def _uses_explicit_package_lifecycle(self) -> bool:
         return bool(getattr(self.panel, "_measurement_package_explicit_lifecycle", False))
 
@@ -293,7 +307,7 @@ class CameraStreamLifecycleController:
             suffix = f" · {detail}" if detail else ""
             self.panel._log(f"[YOLO] Measurement 시작 준비가 거부되었습니다{suffix}")
             return False
-        return self._measurement_run_state() == "STARTING"
+        return self._measurement_run_state() in {"STARTING", "RUNNING"}
 
     def _reserve_package_detection(self) -> bool:
         if not self._prepare_package_for_detection(self._measurement_package_state()):
@@ -353,9 +367,18 @@ class CameraStreamLifecycleController:
         return ""
 
     def _queue_measurement_start(self, reason: str) -> None:
-        queue_start = getattr(self.panel, "queue_measurement_start", None)
-        if callable(queue_start):
-            queue_start(reason)
+        if self._measurement_run_state() == "RUNNING":
+            for side in ("left", "right"):
+                self._publish_measurement_source(
+                    f"camera.{side}", "WAITING_RESOURCE", reason
+                )
+                self._publish_measurement_source(
+                    f"recording.{side}", "WAITING_RESOURCE", reason
+                )
+        else:
+            queue_start = getattr(self.panel, "queue_measurement_start", None)
+            if callable(queue_start):
+                queue_start(reason)
         self.panel._pending_measurement_run_start = True
 
         def retry() -> None:
@@ -407,8 +430,14 @@ class CameraStreamLifecycleController:
         if bool(getattr(self.panel, "_shutdown_in_progress", False)):
             self.panel._log("[YOLO] application shutdown is in progress; Measurement start rejected")
             return False
-        if not self._detection_inputs_valid():
+        if not self._reserve_package_detection():
+            self.panel._log("[YOLO] 측정 시작 준비가 거부되었습니다: live run state를 확인하세요.")
             return False
+        if not self._detection_inputs_valid():
+            fail = getattr(self.panel, "fail_measurement_start", None)
+            if callable(fail):
+                fail("camera input configuration is unavailable")
+            return None
         if bool(getattr(self.panel, "_manual_recording_active", False)):
             self._queue_measurement_start("stopping Manual record")
             stopper = getattr(self.panel, "_stop_session_recording", None)
@@ -419,23 +448,19 @@ class CameraStreamLifecycleController:
         if busy_reason:
             self._queue_measurement_start(busy_reason)
             return None
-        if not self._reserve_package_detection():
-            self.panel._log("[YOLO] 측정 시작 준비가 거부되었습니다: live run state를 확인하세요.")
-            return False
         if not self.panel._session_recording_active():
             try:
                 started = self.panel.start_automatic_session_recording()
             except Exception as exc:
                 self.panel._log(f"[저장] 자동 데이터 기록 준비 실패: {exc}")
-                cancel = getattr(self.panel, "cancel_measurement_detection_start", None)
-                if callable(cancel):
-                    cancel(str(exc))
-                return False
+                started = False
             if started is False:
-                cancel = getattr(self.panel, "cancel_measurement_detection_start", None)
-                if callable(cancel):
-                    cancel("measurement recording could not start")
-                return False
+                for side in ("left", "right"):
+                    self._publish_measurement_source(
+                        f"recording.{side}",
+                        "UNAVAILABLE",
+                        "measurement recording could not start",
+                    )
         stream_result = self.panel._start_camera_streams(
             enable_detection=True, switch_to_depth=True
         )
@@ -444,7 +469,7 @@ class CameraStreamLifecycleController:
                 "camera/decoder start request was rejected",
                 enable_detection=True,
             )
-            return False
+            return None
         return None
 
     def stop_yolo_detection(self) -> None:
@@ -459,7 +484,14 @@ class CameraStreamLifecycleController:
             self.panel.stop_yolo_streams()
             return
         if not self.panel.camera_connected:
-            self.panel._log("[YOLO] 연결된 카메라 스트림이 없어 중지할 YOLO가 없습니다.")
+            self._complete_package_detection()
+            if bool(getattr(self.panel, "_automatic_session_recording", False)):
+                stopper = getattr(self.panel, "stop_automatic_session_recording", None)
+                if callable(stopper):
+                    stopper(restart_streams=False)
+            self.panel._log(
+                "[YOLO] 카메라 없이 진행 중인 Measurement 관측 구간을 종료했습니다."
+            )
             return
         if not self.panel.yolo_enabled:
             self.panel._log("[YOLO] 이미 중지 상태입니다. 카메라 프리뷰는 유지 중입니다.")
@@ -622,6 +654,17 @@ class CameraStreamLifecycleController:
         )
         self.panel._video_start_readiness = None
         state = str(snapshot.get("state") or "FAILED")
+        for side, row in rows.items():
+            if row.get("state") == "RUNNING":
+                self._publish_measurement_source(
+                    f"recording.{side}", "LIVE", "positive MP4 byte growth observed"
+                )
+            elif row.get("state") == "FAILED":
+                self._publish_measurement_source(
+                    f"recording.{side}",
+                    "UNAVAILABLE",
+                    str(row.get("detail") or "video recording unavailable"),
+                )
         if state in {"FAILED", "PARTIAL"}:
             self.panel._log(
                 f"[저장] 영상 녹화 시작 상태: {state}; "
@@ -680,6 +723,17 @@ class CameraStreamLifecycleController:
             "deadline_monotonic_s": time.monotonic()
             + CAMERA_START_READINESS_TIMEOUT_S,
         }
+        for side in unavailable:
+            self._publish_measurement_source(
+                f"camera.{side}",
+                "UNAVAILABLE",
+                "camera worker did not accept start",
+            )
+            self._publish_measurement_source(
+                f"recording.{side}",
+                "UNAVAILABLE",
+                "camera worker did not accept start",
+            )
         waiting = ", ".join(started_sides)
         suffix = f"; unavailable={','.join(unavailable)}" if unavailable else ""
         self.panel.camera_connection_label.setText(
@@ -708,6 +762,15 @@ class CameraStreamLifecycleController:
         current_generation = int(getattr(pane, "stream_generation", -1))
         if observed_generation != current_generation:
             return
+        pending_rejoins = getattr(
+            self.panel, "_measurement_camera_rejoin_expected_generations", None
+        )
+        manual_rejoin_ready = bool(
+            isinstance(pending_rejoins, dict)
+            and pending_rejoins.get(camera) == observed_generation
+        )
+        if manual_rejoin_ready:
+            pending_rejoins.pop(camera, None)
         unavailable_sides = set(
             getattr(self.panel, "_camera_integrity_unavailable_sides", ()) or ()
         )
@@ -746,7 +809,7 @@ class CameraStreamLifecycleController:
         if not isinstance(readiness, dict) or camera not in readiness.get(
             "started_sides", ()
         ):
-            if integrity_recovered:
+            if integrity_recovered or manual_rejoin_ready:
                 self._mark_live_camera_side_recovered(camera)
             return
         if camera in dict(readiness.get("failed_sides") or {}):
@@ -940,10 +1003,16 @@ class CameraStreamLifecycleController:
                         )
                     else:
                         set_state(
-                            "ERROR",
-                            "Measurement camera unavailable",
-                            str(reason),
+                            "RUNNING",
+                            "Measurement observing; all cameras unavailable",
                         )
+
+        self._publish_measurement_source(
+            f"camera.{camera}", "UNAVAILABLE", str(reason)
+        )
+        self._publish_measurement_source(
+            f"recording.{camera}", "UNAVAILABLE", str(reason)
+        )
 
         clear_pair = getattr(self.panel, "_clear_measurement_pair_display", None)
         if callable(clear_pair):
@@ -1024,6 +1093,19 @@ class CameraStreamLifecycleController:
         if callable(log):
             log(
                 f"[카메라] {camera} newer-generation H264 IDR/exact-PTS frame verified"
+            )
+        self._publish_measurement_source(
+            f"camera.{camera}",
+            "LIVE",
+            "newer-generation current frame confirmed after manual recovery",
+        )
+        if bool(getattr(self.panel, "video_recording_enabled", False)) and camera in dict(
+            getattr(self.panel, "video_recording_paths", {}) or {}
+        ):
+            self._publish_measurement_source(
+                f"recording.{camera}",
+                "LIVE",
+                "new video segment joined after manual camera recovery",
             )
         for refresh_name in (
             "_update_runtime_camera_stats_labels",
@@ -1195,12 +1277,17 @@ class CameraStreamLifecycleController:
                     failed_rows[str(side)] = row
                 self._set_video_start_rows(failed_rows, detail=failure)
         self._cancel_video_start_readiness(mark_idle=False)
-        stopper = getattr(self.panel, "stop_yolo_streams", None)
+        stopper = getattr(self.panel, "_stop_camera_panes", None)
+        panes_stopped = True
         if callable(stopper):
             try:
-                stopper(wait=False)
+                panes_stopped = bool(stopper(clear_previews=True, wait=False))
             except TypeError:
-                stopper()
+                panes_stopped = bool(stopper(clear_previews=True))
+        if not panes_stopped:
+            watchdog = getattr(self.panel, "_schedule_camera_stop_watchdog", None)
+            if callable(watchdog):
+                watchdog()
         if bool(getattr(self.panel, "_automatic_session_recording", False)):
             stop_recording = getattr(
                 self.panel, "stop_automatic_session_recording", None
@@ -1298,6 +1385,17 @@ class CameraStreamLifecycleController:
         if not panes_stopped:
             self.panel.camera_connected = False
             self.panel.yolo_enabled = False
+            for side in ("left", "right"):
+                self._publish_measurement_source(
+                    f"camera.{side}",
+                    "WAITING_RESOURCE",
+                    "previous camera worker is still stopping",
+                )
+                self._publish_measurement_source(
+                    f"recording.{side}",
+                    "WAITING_RESOURCE",
+                    "previous camera worker is still stopping",
+                )
             self.panel._schedule_camera_start_retry(enable_detection, switch_to_depth)
             return True
 
@@ -1435,7 +1533,7 @@ class CameraStreamLifecycleController:
             if not (left_stopped and right_stopped):
                 QtCore.QTimer.singleShot(250, retry)
                 return
-            if not self._append_pending_video_finalization_artifacts():
+            if not self._append_pending_video_presence_artifacts():
                 QtCore.QTimer.singleShot(250, retry)
                 return
             finisher = getattr(self.panel, "finish_measurement_run", None)
@@ -1572,8 +1670,120 @@ class CameraStreamLifecycleController:
         if any(str(side) not in recorded_sides for side in paths):
             return False
         flush = getattr(self.panel, "flush_workstation_data", None)
-        if callable(flush) and flush() is False:
-            return False
+        if callable(flush):
+            try:
+                flush()
+            except Exception:
+                pass
+        self.panel._pending_video_finalization_artifacts = None
+        return True
+
+    def _append_pending_video_presence_artifacts(self) -> bool:
+        """Record file presence without making persistence a teardown gate."""
+
+        pending = getattr(self.panel, "_pending_video_finalization_artifacts", None)
+        if not isinstance(pending, dict):
+            return True
+        paths = pending.get("paths")
+        if not isinstance(paths, dict):
+            self.panel._pending_video_finalization_artifacts = None
+            return True
+        backend = str(pending.get("backend") or "gstreamer")
+        runtime_generation = str(pending.get("runtime_generation") or "")
+        append = getattr(self.panel, "append_workstation_data", None)
+        presence_recorder = getattr(
+            self.panel, "record_measurement_video_segment_presence", None
+        )
+        for raw_side, raw_path in paths.items():
+            side = str(raw_side)
+            path = Path(raw_path).expanduser()
+            pane = getattr(self.panel, f"{side}_pane", None)
+            finalizations = getattr(pane, "recording_finalizations", {})
+            payload = (
+                dict(finalizations.get(str(path), {}))
+                if isinstance(finalizations, dict)
+                else {}
+            )
+            try:
+                present = path.is_file()
+                size_bytes = path.stat().st_size if present else 0
+            except OSError:
+                present = False
+                size_bytes = 0
+            detail = str(
+                payload.get("detail")
+                or "worker exited without recording-finalization evidence"
+            )
+            validation_status = str(
+                payload.get("integrity_validation_status") or "NOT_RUN"
+            ).upper()
+            validated_usable = bool(
+                validation_status == "PASS"
+                and payload.get("recording_usable") is True
+                and payload.get("recording_integrity_verified") is True
+            )
+            artifact = {
+                "event_type": "video_finalized",
+                "runtime_generation": runtime_generation,
+                "side": side,
+                "path": str(path),
+                "media_type": "video/mp4",
+                "stream_backend": str(payload.get("stream_backend") or backend),
+                **recording_integrity_contract(
+                    str(payload.get("stream_backend") or backend)
+                ),
+                **payload,
+                "success": bool(payload.get("success", False)),
+                "container_finalization_success": bool(
+                    payload.get(
+                        "container_finalization_success",
+                        payload.get("success", False),
+                    )
+                ),
+                "finalization_success": bool(payload.get("success", False)),
+                "finalization_detail": detail,
+                "present": present,
+                "presence_state": "SAVED" if present else "FAILED",
+                "size_bytes": size_bytes,
+                "integrity_validation_status": (
+                    "PASS" if validated_usable else "NOT_RUN"
+                ),
+                "recording_usable": validated_usable,
+            }
+            if callable(presence_recorder):
+                try:
+                    presence_recorder(
+                        side,
+                        path,
+                        detail=detail,
+                        runtime_generation=runtime_generation,
+                    )
+                except Exception:
+                    pass
+            if callable(append):
+                try:
+                    append("artifacts", artifact, priority=True)
+                except Exception:
+                    pass
+            finalization_evidence = getattr(
+                self.panel,
+                "_measurement_package_video_finalization_evidence",
+                None,
+            )
+            if not isinstance(finalization_evidence, dict):
+                finalization_evidence = {}
+                self.panel._measurement_package_video_finalization_evidence = (
+                    finalization_evidence
+                )
+            finalization_evidence[side] = dict(artifact)
+            if isinstance(finalizations, dict):
+                finalizations.pop(str(path), None)
+        flush = getattr(self.panel, "flush_workstation_data", None)
+        if callable(flush):
+            try:
+                flush()
+            except Exception:
+                pass
         self.panel._pending_video_finalization_artifacts = None
         return True
 
@@ -1613,6 +1823,11 @@ class CameraStreamLifecycleController:
             self.panel._pending_video_finalization_artifacts = {
                 "paths": recording_paths,
                 "backend": backend,
+                "runtime_generation": str(
+                    getattr(self.panel, "recording_session_id", "")
+                    or getattr(self.panel, "_measurement_run_generation", "")
+                    or ""
+                ),
             }
         final_clock_sync_snapshot = (
             self.panel._camera_time_sync_snapshot("last_observed_before_stream_stop")
@@ -1653,7 +1868,7 @@ class CameraStreamLifecycleController:
                 self.panel.save_distance_history_csv(final_clock_sync_snapshot=final_clock_sync_snapshot)
         finalization_recorded = True
         if panes_stopped:
-            finalization_recorded = self._append_pending_video_finalization_artifacts()
+            finalization_recorded = self._append_pending_video_presence_artifacts()
             finisher = getattr(self.panel, "finish_measurement_run", None)
             if (
                 finalization_recorded

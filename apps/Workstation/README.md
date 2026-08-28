@@ -6,11 +6,13 @@ This package provides the operator Workstation for synchronized stereo-camera ca
 calibration, Measurement, Pixhawk/GNSS evidence, and recording. It owns its runtime and UI
 independently from the Legacy application.
 
-As of 2026-08-26, the operational Measurement Session lifecycle is removed. There is no Create,
-Open, Close, Finalize, Seal, recovery, completeness, or package gate before a Measurement can
-start. `Measurement` owns only the transient states `IDLE`, `QUEUED`, `STARTING`, `RUNNING`,
-`STOPPING`, and `ERROR`. Persisted data never owns admission to those states. An old open or
-recoverable Session directory is inert historical data and cannot disable `측정 시작`.
+As of 2026-08-29, Measurement is an observation interval rather than a package-completion
+transaction. There is no Create, Open, Close, Finalize, Seal, recovery, completeness, source-
+readiness, media-integrity, or storage gate before a Measurement can start. Pressing `측정 시작`
+freezes a new run identity/time and immediately enters `RUNNING`, including with zero available
+sources. Camera, P1/P2, Base GNSS/NTRIP, Target and recording join or leave independently.
+Persisted data never owns admission. An old open or recoverable Session directory is inert
+historical data and cannot disable `측정 시작`.
 After an abnormal process exit, restart likewise leaves the incomplete run as inert append-only
 history and creates a new runtime generation only when the operator presses `측정 시작` again.
 
@@ -21,6 +23,11 @@ monotonic, and available source-clock evidence, so an operator can collect or jo
 Storage failures and bounded-queue drops are visible in `Data > Status`, but do not stop camera,
 Detection, GNSS/RTCM routing, target telemetry, or the next Measurement. Result/event queues are
 reserved ahead of bulk camera/PX4/GNSS traffic.
+
+If an essential stream (`events`, `measurements`, or `method_evaluations`) cannot write, the
+background owner retains FIFO records in a 256-record/8 MiB reserve and retries with bounded
+backoff. Video and high-rate telemetry are never accumulated without bound; their drops remain
+visible and the observation continues.
 
 The top-level `Data` workspace exposes writer health, fixed paths, capture tools, the current data
 folder, and a file-manager link to untouched legacy `recordings/`. It does not scan, recover, or
@@ -584,10 +591,14 @@ python3 tools/check_portable_paths.py
   advanced controls.
 
 - `detection.toggle` is an always-available operator request shared by the Measurement button,
-  menu, and toolbar. Presentation state never disables one surface independently of another. The
-  backend return value and lifecycle/status evidence remain authoritative: an unsafe duplicate
-  interval, active manual writer, unfinished save, missing RTSP URL, or identical Left/Right stream
-  is rejected without starting a producer.
+  menu, and toolbar. Presentation state never disables one surface independently of another. A
+  duplicate active run is rejected, but an active manual writer, busy camera, missing RTSP URL,
+  identical Left/Right stream, missing device, storage error, or old finalization cannot reject the
+  observation interval. Those conditions affect only their source branch and method results.
+- `measurement_run_snapshot()` exposes additive `sources` entries with
+  `PENDING/WAITING_RESOURCE/LIVE/UNAVAILABLE/LEFT`, join/leave clocks, and factual detail. Every
+  persisted transition carries `runtime_generation` so late callbacks cannot mutate or masquerade
+  as the next run.
 
 - Dual-Pixhawk Ethernet input is received on `udpin:0.0.0.0:14550` for P1/Left and
   `udpin:0.0.0.0:14551` for P2/Right, with expected system IDs `1` and `2`. Operational connections
@@ -646,9 +657,15 @@ python3 tools/check_portable_paths.py
   frames) use a reserved bounded queue. Bulk camera/PX4/GNSS rows use a separate bounded queue whose
   oldest queued item may be dropped under overload. Each stream reports its own state/error/drop
   count and can be retried independently.
+- Essential write failures retain FIFO `events`, `measurements`, and `method_evaluations` within
+  the 256-record/8 MiB reserve. Automatic retry uses per-stream 1–30 second backoff; `Retry Storage`
+  requests an immediate retry. Reserve overflow rejects the newest row and increments its drop
+  count without blocking a producer or Measurement.
 - MP4, WIRIS still downloads, exact HR imports, native PNGs, and ULogs use
   `YYYYMMDD_HHMMSS_nanoseconds+offset_<label>.<ext>`. Collision suffixes are added and publication
   refuses replacement, so yesterday's `..._left.mp4` cannot be erased by a later capture.
+  A recovered camera adds a side-specific segment with the same run generation and a new segment
+  index rather than reopening an earlier file.
 - Exact RTCM correction bytes append only while Measurement or Manual record is active under
   `raw/gnss/{ntrip_transport_chunk,ntrip_rtcm_frame,base_rtcm_frame}.rtcm`, with a fixed sibling
   offset/hash JSONL index. RTCM evidence failure is diagnostic; injection/routing and Measurement
@@ -798,18 +815,17 @@ python3 tools/check_portable_paths.py
   `Diagnostics > Performance` shows GPU model/driver, NVDEC availability, requested/effective
   candidates, and per-side detail. `CUDA` shown for YOLO inference is a separate resource decision
   and does not prove that H.264 decode uses NVDEC.
-- A camera QThread/process launch is only a `STARTING` request. Workstation sets a side LIVE only
+- A camera QThread/process launch is only a source-level `STARTING` request. Workstation sets a
+  side LIVE only
   after a decoded frame carrying that pane's current stream generation reaches the GUI boundary.
-  Measurement remains `STARTING` until every accepted side has that frame ACK. After 35 seconds, a
-  side without an ACK is stopped; a verified opposite side may continue as an explicit partial
-  Measurement, while no verified side rolls the attempt back to `ERROR`. A later Measurement Start
-  remains available.
+  The Measurement run is already `RUNNING`; after 35 seconds a side without an ACK is stopped and
+  marked `UNAVAILABLE`. Zero, one, or two verified sides never roll back the observation interval.
 - MP4 readiness is independent from Measurement readiness. The recording projection reports
   `video=STARTING` until each allocated side-specific path exists and grows beyond its allocation
   size, then reports provisional `RUNNING`; one failed side is `PARTIAL`, and no growing side is
-  `FAILED`. EOS/container completion remains provisional until the asynchronous finalized-file
-  validator checks first-VCL IDR, sample/decoded equality, reference continuity, sample timing and
-  rate.
+  `FAILED`. A recovered side writes a new no-overwrite segment. Online post-run state is presence-only:
+  `SAVED` means both sides produced a file, `PARTIAL` means only some files exist, and `FAILED`
+  means none exist. These labels do not claim playback or integrity verification.
   Video failure never turns a frame-ready Measurement back from `RUNNING`, but Workstation does not
   claim video recording is active and preserves the per-side failure evidence.
 - Before a real soak, run the strict synthetic queue/evidence/cleanup gate from the SASL root:
@@ -1236,13 +1252,12 @@ MAVLink send result is transport evidence, not proof that the remote receiver ac
 correction.
 
 A clean shutdown resource report proves only the Workstation-owned thread/process/socket/shared-
-memory postconditions that the application can inspect. It does not prove an MP4 is usable;
-`ffprobe` plus strict full software decode are necessary but not sufficient because both passed the
-defective real field files. Final acceptance also requires first-VCL IDR, MP4 sample/software-decode
-equality, supported reference-frame continuity, contiguous positive sample timing including the
-final sample, and sane frame-rate metadata. OS `SIGKILL`, power
-loss, or a machine reset bypasses the cooperative EOS path, so the resulting MP4 may remain
-incomplete even though Linux parent-death handling prevents a camera decode child from surviving.
+memory postconditions that the application can inspect. Workstation's `SAVED` label proves only
+that the expected MP4 paths exist; it deliberately sets unreviewed output to
+`integrity_validation_status=NOT_RUN` and does not claim `recording_usable`. Review playback or
+integrity later with OS/offline tools. This never upgrades `source_media_integrity_verified` and
+cannot repair information already lost in the camera/RTP stream. OS `SIGKILL`, power loss, or a
+machine reset bypasses cooperative close, so an existing MP4 may still be incomplete.
 
 Synthetic NVIDIA qualification on the current RTX 4050/driver 595.84 decoded 1920x1080@30 H.264
 through `nvh264dec` with CUDA-memory output. An unconstrained fast-loop stress drove the dedicated
@@ -1522,6 +1537,12 @@ live on the panel at solve time -- a later live-GPS change cannot silently retar
 frozen Mountain image.
 
 ## Change Log
+
+- 2026-08-29: Made Measurement observation-first. Start immediately opens a run with zero or more
+  sources; camera, Pixhawk, Base GNSS/NTRIP, Target and recording join independently. Added manual
+  camera rejoin with non-overwriting MP4 segments, bounded FIFO retry for essential structured
+  evidence, presence-only `SAVED/PARTIAL/FAILED`, and removed artifact/integrity persistence from
+  current- and next-run admission.
 
 - 2026-08-27: Reproduced the operator runtime in a separate official Ubuntu 22.04 KVM guest and
   made the external model provisioning step explicit. Added the missing system `python3-cairo`

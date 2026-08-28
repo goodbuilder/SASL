@@ -211,6 +211,16 @@ class GnssRuntimeController:
             package_signal.connect(self._handle_measurement_package_changed)
             panel._rtcm_package_signal_connected = True
 
+    def _publish_measurement_source(
+        self, source_id: str, state: str, detail: str
+    ) -> None:
+        publisher = getattr(self.panel, "measurement_source_transition", None)
+        if callable(publisher):
+            try:
+                publisher(source_id, state, detail)
+            except (RuntimeError, TypeError, ValueError):
+                pass
+
     def _handle_measurement_package_changed(self, _snapshot: object) -> None:
         self._sync_rtcm_evidence_context()
 
@@ -1300,6 +1310,7 @@ class GnssRuntimeController:
 
         self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], message, tone)
         self.panel._log(f"[GNSS] NTRIP 시작 거부: {message}")
+        self._publish_measurement_source("ntrip", "UNAVAILABLE", str(message))
 
     def _rollback_ntrip_start_setup(self, message: str) -> None:
         """Undo the UI/state reservation when no network worker was started."""
@@ -1403,6 +1414,9 @@ class GnssRuntimeController:
         self.panel.gnss_active_operation_config = config
         self.panel.gnss_network_connected = False
         self.panel.gnss_network_phase = "CONNECTING"
+        self._publish_measurement_source(
+            "ntrip", "WAITING_RESOURCE", "NTRIP caster connect requested"
+        )
         self.panel.gnss_network_stats = None
         self.panel.gnss_network_status_line = ""
         self.panel.gnss_network_last_error = ""
@@ -1484,6 +1498,7 @@ class GnssRuntimeController:
         thread = self.panel.gnss_network_thread
         self.panel.gnss_network_connected = False
         self.panel.gnss_network_phase = "STOPPED"
+        self._publish_measurement_source("ntrip", "LEFT", "NTRIP stopped")
         self.panel._gnss_ntrip_pending_credential = None
         self.panel._gnss_ntrip_active_credential_source = ""
         self.panel._gnss_ntrip_active_credential_key = None
@@ -1577,6 +1592,9 @@ class GnssRuntimeController:
         self.panel.gnss_network_stats = stats
         self.panel.gnss_network_last_error = ""
         self.panel.gnss_network_status_line = str(status_line)
+        self._publish_measurement_source(
+            "ntrip", "PENDING", f"caster connected: {status_line}; RTCM pending"
+        )
         # NtripNetworkWorker reconnects transparently on any transient stream
         # drop (a caster closing the connection, a network blip) and
         # re-emits ``connected`` every time -- including well after the
@@ -1615,6 +1633,10 @@ class GnssRuntimeController:
         if not isinstance(chunk, (bytes, bytearray)):
             return
         payload = bytes(chunk)
+        if payload:
+            self._publish_measurement_source(
+                "ntrip", "LIVE", "NTRIP transport bytes received"
+            )
         self._append_rtcm_package_evidence(payload, source="ntrip", record_kind="transport_chunk")
         mode = self.panel._gnss_active_operation_config().operation_mode
         frames = self.panel.gnss_network_rtcm_parser.feed(payload)
@@ -1681,6 +1703,7 @@ class GnssRuntimeController:
         auth_failed = "401" in str(message) or "unauthorized" in str(message).lower()
         self.panel.gnss_network_phase = "HTTP_AUTH_FAILED" if auth_failed else "ERROR"
         self.panel.gnss_network_last_error = str(message)
+        self._publish_measurement_source("ntrip", "UNAVAILABLE", str(message))
         text = str(message)
         # 401 means the caster rejected the credentials; it is deliberately
         # not asserted here whether the username or the password was wrong.
@@ -1703,6 +1726,9 @@ class GnssRuntimeController:
         self.panel.gnss_network_connected = False
         self.panel.gnss_network_phase = "RECONNECTING"
         self.panel.gnss_network_last_error = str(message)
+        self._publish_measurement_source(
+            "ntrip", "WAITING_RESOURCE", f"NTRIP reconnecting: {message}"
+        )
         self.panel.gnss_network_reconnect_count = int(
             getattr(self.panel, "gnss_network_reconnect_count", 0) or 0
         ) + 1
@@ -2179,8 +2205,14 @@ class GnssRuntimeController:
         port = self.panel.gnss_base_serial_port_edit.text().strip()
         if not port:
             self.panel._set_health_label(self.panel.gnss_base_status_labels["connection"], "serial port 필요", "bad")
+            self._publish_measurement_source(
+                "gnss.base", "UNAVAILABLE", "Base GNSS serial port is missing"
+            )
             return
         baud = int(self.panel.gnss_base_baud_spin.value())
+        self._publish_measurement_source(
+            "gnss.base", "WAITING_RESOURCE", "Base GNSS serial connect requested"
+        )
         self.panel._set_health_label(self.panel.gnss_base_status_labels["connection"], f"connecting {port} @ {baud}", "warn")
         self.panel._set_health_label(self.panel.gnss_base_status_labels["rtcm_rx"], "raw bytes 대기 중", "idle")
         self.panel._reset_gnss_base_rtcm_stats()
@@ -2401,6 +2433,9 @@ class GnssRuntimeController:
         self.panel._set_gnss_base_quality_waiting("NAV-SAT 대기 중")
         self.panel._set_health_label(self.panel.gnss_base_status_labels["base_position"], "Base WGS84 위치 샘플 대기 중", "idle")
         self.panel._handle_gnss_operation_mode_changed()
+        self._publish_measurement_source(
+            "gnss.base", "PENDING", f"serial connected {port} @ {baud}; data pending"
+        )
 
     def _handle_gnss_base_serial_stats(self, total_bytes: int, rate_bps: float, age_s: float) -> None:
         age_text = "no data" if age_s < 0.0 else f"age={age_s:.1f}s"
@@ -2410,6 +2445,10 @@ class GnssRuntimeController:
             f"raw={total_bytes} bytes | {rate_bps:.1f} B/s | {age_text}",
             level,
         )
+        if rate_bps > 0.0 and 0.0 <= age_s < 2.0:
+            self._publish_measurement_source(
+                "gnss.base", "LIVE", "fresh Base GNSS serial bytes received"
+            )
 
     def _handle_gnss_base_serial_failed(self, message: str) -> None:
         self.panel.gnss_base_serial_connected = False
@@ -2423,6 +2462,7 @@ class GnssRuntimeController:
         self.panel._set_health_label(self.panel.gnss_base_status_labels["base_position"], "Base WGS84 위치 없음", "idle")
         self.panel.gnss_base_survey_start_button.setEnabled(False)
         self.panel.gnss_base_survey_stop_button.setEnabled(False)
+        self._publish_measurement_source("gnss.base", "UNAVAILABLE", str(message))
         if self.panel.gnss_operation_gate_active:
             self.panel._gnss_transition(GnssOperationState.DEGRADED, f"Base serial failure: {message}")
         else:
@@ -2444,6 +2484,7 @@ class GnssRuntimeController:
         self.panel._set_health_label(self.panel.gnss_base_status_labels["base_position"], "Base WGS84 위치 없음", "idle")
         self.panel.gnss_base_survey_start_button.setEnabled(False)
         self.panel.gnss_base_survey_stop_button.setEnabled(False)
+        self._publish_measurement_source("gnss.base", "LEFT", str(message))
         if self.panel.gnss_operation_gate_active:
             self.panel._gnss_transition(GnssOperationState.DEGRADED, f"Base serial disconnected: {message}")
         else:

@@ -1866,6 +1866,8 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         automatic_recording = bool(
             getattr(panel, "_automatic_session_recording", False)
         )
+        camera_recovery_allowed = not recording_locked or automatic_recording
+        source_connection_allowed = not recording_locked or automatic_recording
         # These controls are safety gates shared by several hidden pages, so
         # keep their enabled state current without rebuilding those pages.
         self.measurement.refresh_run_controls(snapshot, panel)
@@ -1883,7 +1885,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         for command_id in ("camera.reactivate_left", "camera.reactivate_right"):
             button = self.camera.operation_buttons.get(command_id)
             if button is not None:
-                button.setEnabled(not recording_locked and not rtsp_operation_active)
+                button.setEnabled(camera_recovery_allowed and not rtsp_operation_active)
         time_set_button = self.time_workspace.operation_buttons.get("time.set_pc")
         if time_set_button is not None:
             time_set_button.setEnabled(not recording_locked and not clock_change_active)
@@ -1895,10 +1897,10 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self.commands.set_enabled("camera.auto_connect", not recording_locked)
         self.commands.set_enabled("camera.swap", not recording_locked)
         self.commands.set_enabled("camera.save_settings", not recording_locked)
-        self.commands.set_enabled("camera.reactivate_left", not recording_locked and not rtsp_operation_active)
-        self.commands.set_enabled("camera.reactivate_right", not recording_locked and not rtsp_operation_active)
+        self.commands.set_enabled("camera.reactivate_left", camera_recovery_allowed and not rtsp_operation_active)
+        self.commands.set_enabled("camera.reactivate_right", camera_recovery_allowed and not rtsp_operation_active)
         self.commands.set_enabled("alignment.swap_pixhawks", not recording_locked)
-        self.commands.set_enabled("pixhawk.toggle_mavlink", not recording_locked)
+        self.commands.set_enabled("pixhawk.toggle_mavlink", source_connection_allowed)
         pixhawk_state_by_side = {
             side: str(snapshot.get(f"pixhawk.{side}").state).upper()
             for side in ("left", "right")
@@ -1917,8 +1919,8 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         pixhawk_connected = bool(open_sides)
         pixhawk_connecting = getattr(panel, "pixhawk_connection_thread", None) is not None
         pixhawk_active = pixhawk_connected or pixhawk_connecting
-        self.commands.set_enabled("pixhawk.connect_mavlink", not recording_locked and not pixhawk_active)
-        self.commands.set_enabled("pixhawk.disconnect_mavlink", not recording_locked and pixhawk_active)
+        self.commands.set_enabled("pixhawk.connect_mavlink", source_connection_allowed and not pixhawk_active)
+        self.commands.set_enabled("pixhawk.disconnect_mavlink", source_connection_allowed and pixhawk_active)
         managers = getattr(panel, "px4_mag_managers", {}) or {}
         disarmed_open_sides = {
             side

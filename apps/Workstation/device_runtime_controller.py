@@ -125,9 +125,26 @@ class DeviceRuntimeController:
     def __init__(self, panel):
         self.panel = panel
 
+    def _publish_measurement_source(
+        self, source_id: str, state: str, detail: str
+    ) -> None:
+        publisher = getattr(self.panel, "measurement_source_transition", None)
+        if callable(publisher):
+            try:
+                publisher(source_id, state, detail)
+            except (RuntimeError, TypeError, ValueError):
+                pass
+
+    def _source_connection_allowed_during_recording(self) -> bool:
+        if not self.panel._session_recording_active():
+            return True
+        return bool(getattr(self.panel, "_automatic_session_recording", False))
+
     def toggle_mavlink_connection(self, camera: str | None = None) -> bool | None:
-        if self.panel._session_recording_active():
-            self.panel._log("[픽스호크] 세션 기록 중에는 Pixhawk MAVLink 연결을 변경할 수 없습니다.")
+        if not self._source_connection_allowed_during_recording():
+            self.panel._log(
+                "[픽스호크] 수동 기록 중에는 MAVLink 연결을 변경할 수 없습니다."
+            )
             return False
         if camera is None:
             if self.panel._mavlink_open_sides():
@@ -1072,13 +1089,19 @@ class DeviceRuntimeController:
         )
 
     def connect_mavlink_pixhawk(self, camera: str | None = None, *, force_setup: bool = False) -> None:
-        if self.panel._session_recording_active():
-            self.panel._log("[픽스호크] 세션 기록 중에는 Pixhawk MAVLink 연결을 변경할 수 없습니다.")
+        if not self._source_connection_allowed_during_recording():
+            self.panel._log(
+                "[픽스호크] 수동 기록 중에는 MAVLink 연결을 변경할 수 없습니다."
+            )
             return
         if getattr(self.panel, "pixhawk_disconnection_thread", None) is not None:
             self.panel._log("[픽스호크] MAVLink 연결 해제가 끝난 뒤 다시 연결하세요.")
             return
         target_sides = self.panel._mavlink_target_sides(camera)
+        for side in target_sides:
+            self._publish_measurement_source(
+                f"pixhawk.{side}", "WAITING_RESOURCE", "MAVLink connect requested"
+            )
         if all(side in self.panel._mavlink_open_sides() for side in target_sides):
             stale_sides = tuple(side for side in target_sides if self._mavlink_side_is_stale(side))
             if not stale_sides:
@@ -1172,10 +1195,22 @@ class DeviceRuntimeController:
                 f"픽스호크 MAVLink: {ok_label} 연결됨, 실패: {fail_label}"
             )
             self.panel._log(f"[픽스호크] MAVLink 부분 연결: 성공={ok_label}, 실패={fail_label}")
+            for side in ok_sides:
+                self._publish_measurement_source(
+                    f"pixhawk.{side}", "PENDING", "MAVLink socket open; data pending"
+                )
+            for side, error in failed_sides.items():
+                self._publish_measurement_source(
+                    f"pixhawk.{side}", "UNAVAILABLE", str(error)
+                )
         else:
             label = " / ".join(self.panel._px4_mag_camera_label(side) for side in target_sides)
             self.panel.pixhawk_connection_label.setText(f"픽스호크 MAVLink: {label} 세션 시작, 데이터 대기 중")
             self.panel._log(f"[픽스호크] {label} MAVLink 세션이 시작됐습니다. 데이터 수신을 기다립니다.")
+            for side in target_sides:
+                self._publish_measurement_source(
+                    f"pixhawk.{side}", "PENDING", "MAVLink socket open; data pending"
+                )
         self.panel._request_mavlink_eth0_status(tuple(target_sides))
         self.panel.refresh_px4_mag_manager()
         self.panel.refresh_px4_attitude_cal_status()
@@ -1199,6 +1234,10 @@ class DeviceRuntimeController:
         label = " / ".join(self.panel._px4_mag_camera_label(side) for side in target_sides)
         self.panel.pixhawk_connection_label.setText(f"pixhawk MAVLink {label}: failed ({error})")
         self.panel._log(f"[픽스호크] {label} MAVLink 연결 실패: {error}")
+        for side in target_sides:
+            self._publish_measurement_source(
+                f"pixhawk.{side}", "UNAVAILABLE", str(error)
+            )
         self.panel._refresh_operation_header()
 
     def _clear_pixhawk_connection_worker(self) -> None:
@@ -1253,8 +1292,10 @@ class DeviceRuntimeController:
             refresh_actions()
 
     def disconnect_mavlink_pixhawk(self, camera: str | None = None) -> None:
-        if self.panel._session_recording_active():
-            self.panel._log("[픽스호크] 세션 기록 중에는 Pixhawk MAVLink 연결을 변경할 수 없습니다.")
+        if not self._source_connection_allowed_during_recording():
+            self.panel._log(
+                "[픽스호크] 수동 기록 중에는 MAVLink 연결을 변경할 수 없습니다."
+            )
             return
         if getattr(self.panel, "pixhawk_connection_thread", None) is not None:
             self.panel._log("[픽스호크] MAVLink 연결 작업이 끝난 뒤 연결을 해제하세요.")
@@ -1339,6 +1380,10 @@ class DeviceRuntimeController:
         for side in target_sides:
             self.panel.pixhawk_attitude_times[side].clear()
             self.panel._px4_calibration_auto_refreshed_sides.discard(side)
+        for side in target_sides:
+            self._publish_measurement_source(
+                f"pixhawk.{side}", "LEFT", "MAVLink disconnected"
+            )
         self.panel._clear_px4_mag_manager_connection_state(camera)
         self.panel._clear_px4_attitude_cal_connection_state(camera)
         self.panel._refresh_session_toggle_buttons()

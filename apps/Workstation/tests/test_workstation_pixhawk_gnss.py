@@ -303,6 +303,28 @@ def test_pixhawk_connect_disconnect_operations_do_not_overlap() -> None:
     assert any("연결 작업이 끝난 뒤" in message for message in logs)
 
 
+def test_pixhawk_source_connection_is_allowed_only_for_automatic_measurement_recording() -> None:
+    from Workstation.device_runtime_controller import DeviceRuntimeController
+
+    calls: list[str] = []
+    panel = SimpleNamespace(
+        _session_recording_active=lambda: True,
+        _automatic_session_recording=False,
+        _mavlink_open_sides=lambda: set(),
+        connect_mavlink_pixhawk=lambda *_args: calls.append("connect"),
+        disconnect_mavlink_pixhawk=lambda *_args: calls.append("disconnect"),
+        _log=lambda message: calls.append(str(message)),
+    )
+    controller = DeviceRuntimeController(panel)
+
+    assert controller.toggle_mavlink_connection("left") is False
+    assert "connect" not in calls
+
+    panel._automatic_session_recording = True
+    assert controller.toggle_mavlink_connection("left") is None
+    assert calls[-1] == "connect"
+
+
 def test_all_rx_stall_does_not_cycle_host_socket_as_remote_recovery(monkeypatch) -> None:
     from Workstation import device_runtime_controller
     from Workstation.device_runtime_controller import DeviceRuntimeController

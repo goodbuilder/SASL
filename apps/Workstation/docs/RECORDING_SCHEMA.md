@@ -92,8 +92,10 @@ One daemon writer owns the fixed JSONL files.
 - Bulk capacity: 4,096 records.
 - A full priority queue drops the new priority record and increments that stream's drop count.
 - A full bulk queue evicts the oldest queued bulk record and admits the new one.
-- Open/write/fsync failure marks only the affected stream `FAILED`; later records for that stream
-  drop until `Retry Storage` clears the failed state.
+- Open/write/fsync failure marks only the affected stream `FAILED`. `events`, `measurements`, and
+  `method_evaluations` enter one FIFO retry reserve capped at 256 encoded records and 8 MiB, with
+  1–30 second automatic backoff and immediate `Retry Storage`; overflow rejects the newest record.
+  Other streams keep their existing drop behavior.
 - Serialization failure drops only the malformed record; a later valid record continues normally.
 - `Data > Status` exposes root, writer liveness, pending counts, per-stream state, last error, last
   write time, written count, and dropped count.
@@ -123,9 +125,16 @@ no-replace semantics; an existing path is never overwritten.
 - WIRIS still/import: exact original file bytes plus decode, size, SHA-256, side, serial, purpose,
   and capture/import time evidence.
 - ULog: exact validated `.ulg` bytes with source/provenance metadata.
-- MP4: camera writer output; artifact events record allocation and best-effort close state.
+- MP4: camera writer output. Recovery allocates a new
+  `runtime_generation`/side/segment-index path instead of reopening an earlier file. Artifact
+  events record allocation, writer detail, file presence, queue drops and timing.
 - RTCM: exact append-only bytes plus offset, size, SHA-256, source, kind, message type, and host
   receive clocks in the sibling index.
+
+Online post-run classification is file-presence only. Both sides present is `SAVED`, some present
+is `PARTIAL`, and none present is `FAILED`. Unreviewed output records
+`integrity_validation_status=NOT_RUN` and `recording_usable=false`; `SAVED` is not a playback or
+integrity claim. Later OS/offline review never participates in Measurement admission.
 
 Binary close/probe/hash completeness is not awaited before the next Measurement.
 

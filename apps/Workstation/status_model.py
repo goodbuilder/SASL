@@ -920,7 +920,29 @@ class BackendStatusAdapter(QtCore.QObject):
                     "data storage unavailable or incomplete",
                 )
             else:
-                state, severity, detail = "IDLE", StatusSeverity.UNKNOWN, "capture idle"
+                presence = str(
+                    getattr(panel, "_last_recording_presence_state", "IDLE") or "IDLE"
+                ).upper()
+                if presence == "SAVED":
+                    state, severity, detail = (
+                        "SAVED",
+                        StatusSeverity.OK,
+                        "recording files present; playback integrity not verified",
+                    )
+                elif presence == "PARTIAL":
+                    state, severity, detail = (
+                        "PARTIAL",
+                        StatusSeverity.WARN,
+                        "some recording files present; playback integrity not verified",
+                    )
+                elif presence == "FAILED":
+                    state, severity, detail = (
+                        "FAILED",
+                        StatusSeverity.BAD,
+                        "no recording file present",
+                    )
+                else:
+                    state, severity, detail = "IDLE", StatusSeverity.UNKNOWN, "capture idle"
             detail = f"{detail}; storage={storage_state}; dropped={dropped}"
             self.model.set_status(
                 "recording",

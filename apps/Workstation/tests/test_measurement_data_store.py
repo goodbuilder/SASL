@@ -120,6 +120,150 @@ def test_one_failed_stream_does_not_block_priority_results_and_can_retry(tmp_pat
     assert store.close(timeout_s=2.0)
 
 
+def test_essential_failed_stream_buffers_and_replays_in_fifo_order(tmp_path: Path) -> None:
+    bad_path = tmp_path / "measurements.jsonl"
+    bad_path.mkdir()
+    store = MeasurementDataStore(
+        tmp_path,
+        fsync_interval_s=10.0,
+        retry_reserve_capacity=4,
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    original_write = store._write
+
+    def pause_first_write(item):
+        if not entered.is_set():
+            entered.set()
+            release.wait(timeout=2.0)
+        original_write(item)
+
+    store._write = pause_first_write
+    assert store.enqueue("measurements", {"sequence": 1})
+    assert entered.wait(timeout=1.0)
+    assert store.enqueue("measurements", {"sequence": 2})
+    assert store.enqueue("measurements", {"sequence": 3})
+    release.set()
+    _wait_for(
+        lambda: store.snapshot()["streams"]["measurements"]["state"] == "FAILED"
+    )
+    _wait_for(lambda: store.snapshot()["essential_retry_pending"] == 3)
+
+    bad_path.rmdir()
+    store.retry_failed()
+    _wait_for(
+        lambda: store.snapshot()["streams"]["measurements"]["written_records"] == 3
+    )
+    assert store.close(timeout_s=2.0)
+    rows = [json.loads(line) for line in bad_path.read_text().splitlines()]
+    assert [row["sequence"] for row in rows] == [1, 2, 3]
+
+
+def test_retry_fifo_keeps_older_writer_queue_record_ahead_of_direct_reserve(
+    tmp_path: Path,
+) -> None:
+    bad_path = tmp_path / "measurements.jsonl"
+    bad_path.mkdir()
+    store = MeasurementDataStore(
+        tmp_path,
+        fsync_interval_s=10.0,
+        retry_reserve_capacity=4,
+    )
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    first_failed = threading.Event()
+    release_writer = threading.Event()
+    original_write = store._write
+
+    def control_first_write(item):
+        if not first_entered.is_set():
+            first_entered.set()
+            assert release_first.wait(timeout=1.0)
+            original_write(item)
+            first_failed.set()
+            assert release_writer.wait(timeout=1.0)
+            return
+        original_write(item)
+
+    store._write = control_first_write
+    assert store.enqueue("measurements", {"sequence": 1})
+    assert first_entered.wait(timeout=1.0)
+    assert store.enqueue("measurements", {"sequence": 2})
+    release_first.set()
+    assert first_failed.wait(timeout=1.0)
+    assert store.enqueue("measurements", {"sequence": 3})
+    release_writer.set()
+    _wait_for(lambda: store.snapshot()["essential_retry_pending"] == 3)
+
+    bad_path.rmdir()
+    store.retry_failed()
+    _wait_for(
+        lambda: store.snapshot()["streams"]["measurements"]["written_records"] == 3
+    )
+    assert store.close(timeout_s=2.0)
+    rows = [json.loads(line) for line in bad_path.read_text().splitlines()]
+    assert [row["sequence"] for row in rows] == [1, 2, 3]
+
+
+def test_retry_of_one_essential_stream_is_not_blocked_by_another_failed_stream(
+    tmp_path: Path,
+) -> None:
+    events_path = tmp_path / "events.jsonl"
+    measurements_path = tmp_path / "measurements.jsonl"
+    events_path.mkdir()
+    measurements_path.mkdir()
+    store = MeasurementDataStore(tmp_path, fsync_interval_s=10.0)
+    assert store.enqueue("events", {"sequence": 1})
+    assert store.enqueue("measurements", {"sequence": 2})
+    _wait_for(
+        lambda: store.snapshot()["streams"]["events"]["state"] == "FAILED"
+        and store.snapshot()["streams"]["measurements"]["state"] == "FAILED"
+        and store.snapshot()["essential_retry_pending"] == 2
+    )
+
+    measurements_path.rmdir()
+    with store._state_lock:
+        store._states["measurements"].state = "IDLE"
+        store._states["measurements"].last_error = ""
+        store._next_retry_monotonic_s["measurements"] = None
+        store._next_retry_monotonic_s["events"] = time.monotonic() + 60.0
+    store._drain_retry_reserve()
+    _wait_for(
+        lambda: store.snapshot()["streams"]["measurements"]["written_records"] == 1
+    )
+    assert store.snapshot()["streams"]["events"]["state"] == "FAILED"
+    assert store.snapshot()["essential_retry_pending"] == 1
+
+    events_path.rmdir()
+    store.retry_failed()
+    _wait_for(lambda: store.snapshot()["streams"]["events"]["written_records"] == 1)
+    assert store.close(timeout_s=2.0)
+
+
+def test_essential_retry_reserve_is_bounded_and_rejects_newest(tmp_path: Path) -> None:
+    bad_path = tmp_path / "events.jsonl"
+    bad_path.mkdir()
+    store = MeasurementDataStore(
+        tmp_path,
+        fsync_interval_s=10.0,
+        retry_reserve_capacity=2,
+    )
+    assert store.enqueue("events", {"sequence": 1})
+    _wait_for(lambda: store.snapshot()["streams"]["events"]["state"] == "FAILED")
+    assert store.enqueue("events", {"sequence": 2})
+    assert store.enqueue("events", {"sequence": 3}) is False
+    snapshot = store.snapshot()
+    assert snapshot["essential_retry_pending"] == 2
+    assert snapshot["streams"]["events"]["dropped_records"] == 1
+
+    bad_path.rmdir()
+    store.retry_failed()
+    _wait_for(lambda: store.snapshot()["streams"]["events"]["written_records"] == 2)
+    assert store.close(timeout_s=2.0)
+    rows = [json.loads(line) for line in bad_path.read_text().splitlines()]
+    assert [row["sequence"] for row in rows] == [1, 2]
+
+
 def test_bulk_overload_drops_bulk_without_consuming_reserved_result_queue(tmp_path: Path) -> None:
     store = MeasurementDataStore(
         tmp_path,

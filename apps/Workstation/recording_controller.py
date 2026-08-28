@@ -166,6 +166,8 @@ _RECORDING_START_STATE_ATTRIBUTES = (
     "video_recording_paths",
     "_video_recording_allocation_sizes",
     "_video_recording_start_snapshot",
+    "_measurement_video_segments",
+    "_last_recording_presence_state",
 )
 
 
@@ -255,6 +257,9 @@ def new_measurement_attempt_generation_id(session_id: str = "") -> str:
 
 RECORDING_CONTROLLER_METHODS = [
     "_refresh_recording_status_label",
+    "allocate_measurement_video_segment",
+    "record_measurement_video_segment_presence",
+    "measurement_video_segments_snapshot",
     "video_recording_start_snapshot",
     "_set_video_recording_start_snapshot",
     "_recording_table_value",
@@ -350,6 +355,292 @@ class RecordingController:
         self._pending_hr_requests: dict[str, dict[str, object]] = {}
         self._pending_oz_requests: dict[str, dict[str, object]] = {}
         self._deferred_native_frame_results: dict[str, dict[str, object]] = {}
+        if not hasattr(panel, "_measurement_video_segments"):
+            panel._measurement_video_segments = {"left": [], "right": []}
+        if not isinstance(
+            getattr(panel, "_measurement_video_segments_by_generation", None), dict
+        ):
+            panel._measurement_video_segments_by_generation = {}
+        if not isinstance(
+            getattr(panel, "_recording_presence_state_by_generation", None), dict
+        ):
+            panel._recording_presence_state_by_generation = {}
+        if not hasattr(panel, "_last_recording_presence_state"):
+            panel._last_recording_presence_state = "IDLE"
+        current_generation = str(
+            getattr(panel, "recording_session_id", "")
+            or getattr(panel, "_measurement_run_generation", "")
+            or ""
+        )
+        if current_generation:
+            registry = panel._measurement_video_segments_by_generation
+            registry.setdefault(current_generation, panel._measurement_video_segments)
+
+    def _video_segment_registry(self) -> dict[str, dict[str, list[dict[str, object]]]]:
+        registry = getattr(
+            self.panel, "_measurement_video_segments_by_generation", None
+        )
+        if not isinstance(registry, dict):
+            registry = {}
+            self.panel._measurement_video_segments_by_generation = registry
+        return registry
+
+    def _begin_measurement_video_generation(
+        self, generation: str
+    ) -> dict[str, list[dict[str, object]]]:
+        normalized = str(generation or "manual")
+        segments: dict[str, list[dict[str, object]]] = {
+            "left": [],
+            "right": [],
+        }
+        registry = self._video_segment_registry()
+        registry[normalized] = segments
+        self.panel._measurement_video_segments = segments
+        states = getattr(
+            self.panel, "_recording_presence_state_by_generation", None
+        )
+        if not isinstance(states, dict):
+            states = {}
+            self.panel._recording_presence_state_by_generation = states
+        states[normalized] = "IDLE"
+        self.panel._last_recording_presence_state = "IDLE"
+        # Persistence owns history. Keep only a small runtime window so
+        # repeated observations cannot grow GUI memory without bound.
+        while len(registry) > 16:
+            oldest = next(iter(registry))
+            if oldest == normalized:
+                break
+            registry.pop(oldest, None)
+            states.pop(oldest, None)
+        return segments
+
+    def measurement_video_segments_snapshot(self) -> dict[str, object]:
+        generation = str(
+            getattr(self.panel, "recording_session_id", "")
+            or getattr(self.panel, "_measurement_run_generation", "")
+            or getattr(self.panel, "_measurement_run_last_generation", "")
+            or ""
+        )
+        registry = self._video_segment_registry()
+        segments = registry.get(generation, {}) if generation else getattr(
+            self.panel, "_measurement_video_segments", {}
+        )
+        states = getattr(
+            self.panel, "_recording_presence_state_by_generation", {}
+        )
+        state = (
+            str(states.get(generation) or "IDLE")
+            if generation and isinstance(states, dict)
+            else str(
+                getattr(self.panel, "_last_recording_presence_state", "IDLE")
+                or "IDLE"
+            )
+        )
+        return {
+            "schema": "workstation-video-segments-v1",
+            "runtime_generation": generation,
+            "state": state,
+            "sides": {
+                side: [dict(row) for row in tuple(dict(segments or {}).get(side, ()))]
+                for side in ("left", "right")
+            },
+        }
+
+    def allocate_measurement_video_segment(
+        self,
+        side: str,
+        *,
+        utc_ns: int | None = None,
+    ) -> Path | None:
+        camera = str(side)
+        if camera not in {"left", "right"}:
+            raise ValueError(f"unsupported camera side: {side}")
+        allocator = getattr(self.panel, "allocate_workstation_data_artifact", None)
+        if not callable(allocator):
+            return None
+        generation = str(
+            getattr(self.panel, "recording_session_id", "")
+            or getattr(self.panel, "_measurement_run_generation", "")
+            or "manual"
+        )
+        registry = self._video_segment_registry()
+        segments = registry.get(generation)
+        if not isinstance(segments, dict):
+            segments = {"left": [], "right": []}
+            registry[generation] = segments
+        active_generation = str(
+            getattr(self.panel, "recording_session_id", "")
+            or getattr(self.panel, "_measurement_run_generation", "")
+            or ""
+        )
+        if generation == active_generation:
+            self.panel._measurement_video_segments = segments
+        side_segments = segments.setdefault(camera, [])
+        segment_index = len(side_segments) + 1
+        short_generation = generation.removeprefix("run-")[:12] or "manual"
+        created_utc_ns = time.time_ns() if utc_ns is None else int(utc_ns)
+        try:
+            path = Path(
+                allocator(
+                    "videos",
+                    label=(
+                        f"{camera}-{short_generation}-segment-{segment_index:02d}"
+                    ),
+                    suffix=".mp4",
+                    utc_ns=created_utc_ns,
+                )
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            logger = getattr(self.panel, "_log", None)
+            if callable(logger):
+                logger(
+                    f"[저장] {camera} video segment path unavailable; "
+                    f"Measurement continues: {exc}"
+                )
+            return None
+        row = {
+            "segment_id": f"{generation}:{camera}:{segment_index}",
+            "segment_index": segment_index,
+            "side": camera,
+            "path": str(path),
+            "state": "ALLOCATED",
+            "created_utc_ns": created_utc_ns,
+            "created_monotonic_ns": time.monotonic_ns(),
+            "closed_utc_ns": None,
+            "closed_monotonic_ns": None,
+            "file_present": False,
+            "size_bytes": 0,
+        }
+        side_segments.append(row)
+        writer = getattr(self.panel, "append_workstation_data", None)
+        if callable(writer):
+            try:
+                writer(
+                    "artifacts",
+                    {
+                        "event_type": "video_segment_allocated",
+                        "runtime_generation": generation,
+                        **dict(row),
+                        "media_type": "video/mp4",
+                    },
+                    priority=True,
+                )
+            except Exception:
+                pass
+        publisher = getattr(self.panel, "measurement_source_transition", None)
+        if callable(publisher):
+            publisher(
+                f"recording.{camera}",
+                "WAITING_RESOURCE",
+                f"video segment {segment_index} allocated",
+            )
+        return path
+
+    def record_measurement_video_segment_presence(
+        self,
+        side: str,
+        path: str | Path,
+        *,
+        detail: str = "",
+        runtime_generation: str | None = None,
+    ) -> dict[str, object]:
+        camera = str(side)
+        source_path = Path(path).expanduser()
+        try:
+            present = source_path.is_file()
+            size_bytes = source_path.stat().st_size if present else 0
+        except OSError:
+            present = False
+            size_bytes = 0
+        if camera not in {"left", "right"}:
+            raise ValueError(f"unsupported camera side: {side}")
+        generation = str(
+            runtime_generation
+            or getattr(self.panel, "recording_session_id", "")
+            or getattr(self.panel, "_measurement_run_generation", "")
+            or "unknown"
+        )
+        registry = self._video_segment_registry()
+        segments = registry.get(generation)
+        if not isinstance(segments, dict):
+            segments = {"left": [], "right": []}
+            registry[generation] = segments
+        active_generation = str(
+            getattr(self.panel, "recording_session_id", "")
+            or getattr(self.panel, "_measurement_run_generation", "")
+            or ""
+        )
+        if generation == active_generation:
+            self.panel._measurement_video_segments = segments
+        side_segments = segments.setdefault(camera, [])
+        row = next(
+            (
+                value
+                for value in reversed(side_segments)
+                if str(value.get("path") or "") == str(source_path)
+            ),
+            None,
+        )
+        if row is None:
+            row = {
+                "segment_id": f"{generation}:{camera}:{len(side_segments) + 1}",
+                "segment_index": len(side_segments) + 1,
+                "side": camera,
+                "path": str(source_path),
+                "created_utc_ns": None,
+                "created_monotonic_ns": None,
+            }
+            side_segments.append(row)
+        row.update(
+            state="SAVED" if present else "FAILED",
+            closed_utc_ns=time.time_ns(),
+            closed_monotonic_ns=time.monotonic_ns(),
+            file_present=present,
+            size_bytes=size_bytes,
+            detail=str(detail),
+        )
+        side_present = {
+            candidate: any(
+                bool(value.get("file_present"))
+                for value in tuple(dict(segments or {}).get(candidate, ()))
+            )
+            for candidate in ("left", "right")
+        }
+        aggregate = (
+            "SAVED"
+            if all(side_present.values())
+            else "PARTIAL"
+            if any(side_present.values())
+            else "FAILED"
+        )
+        states = getattr(
+            self.panel, "_recording_presence_state_by_generation", None
+        )
+        if not isinstance(states, dict):
+            states = {}
+            self.panel._recording_presence_state_by_generation = states
+        states[generation] = aggregate
+        if not active_generation or active_generation == generation:
+            self.panel._last_recording_presence_state = aggregate
+        writer = getattr(self.panel, "append_workstation_data", None)
+        if callable(writer):
+            try:
+                writer(
+                    "artifacts",
+                    {
+                        "event_type": "video_segment_closed",
+                        "runtime_generation": generation,
+                        **dict(row),
+                        "media_type": "video/mp4",
+                        "presence_state": aggregate,
+                        "integrity_validation_status": "NOT_RUN",
+                        "recording_usable": False,
+                    },
+                    priority=True,
+                )
+            except Exception:
+                pass
+        return dict(row)
 
     def _handle_recording_spool_error(self, exc: OSError) -> None:
         message = f"recording spool write failed: {exc}"
@@ -413,7 +704,8 @@ class RecordingController:
             dropped = int(storage.get("dropped_records") or 0)
             self.panel.recording_status_label.setText(
                 f"데이터 기록: {'진행 중' if active else '중지'} · mode={mode} · "
-                f"video={video_state} · storage={storage_state} · "
+                f"video={video_state if active else getattr(self.panel, '_last_recording_presence_state', 'IDLE')} · "
+                f"storage={storage_state} · "
                 f"pairs={len(self.panel.distance_recording_rows)}"
                 + (f" · dropped={dropped}" if dropped else "")
             )
@@ -495,19 +787,22 @@ class RecordingController:
         )
         append = getattr(self.panel, "append_workstation_data", None)
         if changed and callable(append):
-            append(
-                "events",
-                {
-                    "event_type": "video_start_state_changed",
-                    "runtime_generation": str(
-                        getattr(self.panel, "recording_session_id", "") or ""
-                    ),
-                    "state": aggregate,
-                    "detail": str(detail),
-                    "sides": copy.deepcopy(normalized_sides),
-                },
-                priority=True,
-            )
+            try:
+                append(
+                    "events",
+                    {
+                        "event_type": "video_start_state_changed",
+                        "runtime_generation": str(
+                            getattr(self.panel, "recording_session_id", "") or ""
+                        ),
+                        "state": aggregate,
+                        "detail": str(detail),
+                        "sides": copy.deepcopy(normalized_sides),
+                    },
+                    priority=True,
+                )
+            except Exception:
+                pass
         refresher = getattr(self.panel, "_refresh_recording_status_label", None)
         if refresh and changed and callable(refresher):
             refresher()
@@ -1103,6 +1398,7 @@ class RecordingController:
             getattr(self.panel, "_measurement_run_generation", "") or ""
         )
         self.panel.recording_session_id = generation or f"manual-{uuid.uuid4().hex}"
+        self._begin_measurement_video_generation(self.panel.recording_session_id)
         self.panel._pnp_session_prepared = False
         self.panel._session_save_finalized = False
         self.panel._measurement_attempt_generation_id = new_measurement_attempt_generation_id(
@@ -1483,7 +1779,10 @@ class RecordingController:
                 self.panel, "_sync_rtcm_evidence_context", None
             )
             if callable(sync_rtcm_context):
-                sync_rtcm_context()
+                try:
+                    sync_rtcm_context()
+                except Exception:
+                    pass
             was_manual = bool(getattr(self.panel, "_manual_recording_active", False))
             self.panel._manual_recording_active = False
             for rows in (
@@ -1496,23 +1795,29 @@ class RecordingController:
             ):
                 closer = getattr(rows, "close", None)
                 if callable(closer):
-                    closer()
+                    try:
+                        closer()
+                    except Exception:
+                        pass
             append = getattr(self.panel, "append_workstation_data", None)
             if callable(append):
-                append(
-                    "events",
-                    {
-                        "event_type": "recording_stopped",
-                        "recording_mode": str(
-                            getattr(self.panel, "_recording_mode", "manual") or "manual"
-                        ),
-                        "runtime_generation": str(
-                            getattr(self.panel, "recording_session_id", "") or ""
-                        ),
-                        "was_manual": was_manual,
-                    },
-                    priority=True,
-                )
+                try:
+                    append(
+                        "events",
+                        {
+                            "event_type": "recording_stopped",
+                            "recording_mode": str(
+                                getattr(self.panel, "_recording_mode", "manual") or "manual"
+                            ),
+                            "runtime_generation": str(
+                                getattr(self.panel, "recording_session_id", "") or ""
+                            ),
+                            "was_manual": was_manual,
+                        },
+                        priority=True,
+                    )
+                except Exception:
+                    pass
                 for side, raw_path in (
                     getattr(self.panel, "video_recording_paths", {}) or {}
                 ).items():
@@ -1525,10 +1830,11 @@ class RecordingController:
                         if isinstance(finalizations, dict)
                         else {}
                     )
-                    h264_copy = str(backend or "").strip().lower() in {
-                        "gst",
-                        "gstreamer",
-                    }
+                    default_contract = recording_integrity_contract(backend)
+                    encoding_mode = str(
+                        finalization.get("recording_encoding_mode")
+                        or default_contract["recording_encoding_mode"]
+                    )
                     integrity_pass = bool(
                         finalization.get("integrity_schema")
                         == H264_MP4_INTEGRITY_SCHEMA
@@ -1536,6 +1842,10 @@ class RecordingController:
                         and finalization.get("recording_usable") is True
                         and finalization.get("recording_integrity_verified") is True
                     )
+                    h264_copy = str(backend or "").strip().lower() in {
+                        "gst",
+                        "gstreamer",
+                    }
                     integrity_status = str(
                         finalization.get("integrity_validation_status")
                         or ("PENDING" if not finalization else "FAIL")
@@ -1568,39 +1878,78 @@ class RecordingController:
                         or (h264_copy and finalization.get("success") is True)
                         else "pending"
                     )
-                    append(
-                        "artifacts",
-                        {
-                            "event_type": "video_closed",
-                            "side": str(side),
-                            "path": str(path),
-                            "media_type": "video/mp4",
-                            "stream_backend": backend,
-                            **recording_integrity_contract(backend),
-                            "container_finalization_success": bool(
-                                finalization.get(
-                                    "container_finalization_success",
-                                    finalization.get("success", False),
-                                )
-                            ),
-                            "integrity_validation_status": integrity_status,
-                            "recording_integrity_verified": bool(integrity_pass),
-                            "recording_usable": bool(integrity_pass),
-                            "integrity_failure_reasons": integrity_failure_reasons,
-                            "finalization_state": finalization_state,
-                            "finalization_detail": str(
-                                finalization.get("detail") or ""
-                            ),
-                            "present": path.is_file(),
-                            "size_bytes": path.stat().st_size if path.is_file() else 0,
-                        },
-                        priority=True,
+                    presence_row = self.record_measurement_video_segment_presence(
+                        str(side),
+                        path,
+                        detail=str(finalization.get("detail") or "recording stopped"),
+                        runtime_generation=str(
+                            getattr(self.panel, "recording_session_id", "") or ""
+                        ),
                     )
+                    present = bool(presence_row.get("file_present"))
+                    size_bytes = max(0, int(presence_row.get("size_bytes") or 0))
+                    validated_usable = integrity_pass
+                    try:
+                        append(
+                            "artifacts",
+                            {
+                                "event_type": "video_closed",
+                                "runtime_generation": str(
+                                    getattr(self.panel, "recording_session_id", "")
+                                    or ""
+                                ),
+                                "side": str(side),
+                                "path": str(path),
+                                "media_type": "video/mp4",
+                                "stream_backend": backend,
+                                **default_contract,
+                                "recording_encoding_mode": encoding_mode,
+                                "recording_integrity_scope": str(
+                                    finalization.get("recording_integrity_scope")
+                                    or default_contract["recording_integrity_scope"]
+                                ),
+                                "container_finalization_success": bool(
+                                    finalization.get(
+                                        "container_finalization_success",
+                                        finalization.get("success", False),
+                                    )
+                                ),
+                                "integrity_validation_status": integrity_status,
+                                "recording_integrity_verified": bool(integrity_pass),
+                                "recording_usable": bool(integrity_pass),
+                                "source_media_integrity_verified": bool(
+                                    finalization.get(
+                                        "source_media_integrity_verified",
+                                        False,
+                                    )
+                                ),
+                                "recording_file_integrity_verified": bool(
+                                    finalization.get(
+                                        "recording_file_integrity_verified",
+                                        integrity_pass,
+                                    )
+                                ),
+                                "integrity_failure_reasons": integrity_failure_reasons,
+                                "finalization_state": finalization_state,
+                                "finalization_detail": str(
+                                    finalization.get("detail") or ""
+                                ),
+                                "present": present,
+                                "presence_state": "SAVED" if present else "FAILED",
+                                "size_bytes": size_bytes,
+                            },
+                            priority=True,
+                        )
+                    except Exception:
+                        pass
             self.panel.recording_session_id = ""
             self.panel._recording_mode = "idle"
             flush = getattr(self.panel, "flush_workstation_data", None)
             if callable(flush):
-                flush()
+                try:
+                    flush()
+                except Exception:
+                    pass
             record_button = getattr(self.panel, "record_button", None)
             setter = getattr(record_button, "setText", None)
             if callable(setter):

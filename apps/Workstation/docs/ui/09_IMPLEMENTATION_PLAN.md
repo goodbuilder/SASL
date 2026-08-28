@@ -41,6 +41,14 @@ the existing Camera status, CAM tooltips, and Diagnostics Performance; no new gl
 worker, queue, rate, affinity, clock, power, or quality policy is introduced. Synthetic NVDEC is
 automated-real evidence; actual dual-WIRIS RTSP remains a hardware/manual acceptance condition.
 
+### 2026-08-29 observation-first admission slice
+
+Measurement opens its transient generation/time boundary immediately with zero or more sources.
+Camera, Pixhawk, Base GNSS/NTRIP, Target and recording publish independent transitions; manual
+camera recovery rejoins with a new MP4 segment. Essential structured records have a bounded retry
+reserve, while media integrity and artifact persistence never gate the current or next run. No
+Session/package, catalog, revalidation UI or new media worker is introduced.
+
 ## 1. Migration Strategy
 
 > New UI, copied owner, shared domain modules; Legacy retained as an independent runtime.

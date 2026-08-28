@@ -61,6 +61,13 @@ class SensorPresentationController:
         # ATTITUDE packets into the two-camera attitude/baseline surfaces.
         if camera not in self.panel.attitude_buffers:
             return
+        publisher = getattr(self.panel, "measurement_source_transition", None)
+        if callable(publisher):
+            publisher(
+                f"pixhawk.{camera}",
+                "LIVE",
+                "fresh expected-system ATTITUDE received",
+            )
         age_ms = max(0.0, time.monotonic() - extrinsic.timestamp_s) * 1000.0
         px4_text = f", px4_t={extrinsic.px4_timestamp_s:.3f}" if extrinsic.px4_timestamp_s is not None else ""
         self.panel.latest_extrinsics[camera] = extrinsic
@@ -138,6 +145,13 @@ class SensorPresentationController:
     def _update_gps(self, camera: str, gps: GpsPositionState) -> None:
         self.panel.latest_gps[camera] = gps
         if camera in {"left", "right"}:
+            publisher = getattr(self.panel, "measurement_source_transition", None)
+            if callable(publisher):
+                publisher(
+                    f"pixhawk.{camera}",
+                    "LIVE",
+                    "fresh expected-system GPS received",
+                )
             self.panel.gnss_monitor.update_position(camera, gps)
         elif camera.endswith("_GPS2"):
             # Keep the secondary receiver under its explicit side/source key

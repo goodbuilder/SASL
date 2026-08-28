@@ -304,13 +304,17 @@ resource statuses.
 
 ## 7. Measurement Operation
 
-The normal path is `Measurement > 측정 시작 → 측정 종료`. There is no parent folder, child,
-Finalize, Seal, completeness, or Retry-Save command. The run state is transient:
-`IDLE → QUEUED(optional) → STARTING → RUNNING → STOPPING → IDLE`.
+The normal path is `Measurement > 측정 시작 → 측정 종료`. Measurement is an observation
+interval: Start freezes its generation/time and immediately enters `RUNNING`, including with zero
+available sources. Camera, P1/P2, Base GNSS/NTRIP, Target and recording join or leave independently.
 
-Manual record is stopped before Measurement starts and is not resumed. Still capture, camera
-commands, time sync, discovery, and RTSP activation produce `QUEUED`; the start resumes when the
-actual camera owner releases it. Old Session folders and writer failures are never consulted.
+Manual record is stopped asynchronously and is not resumed. A competing camera owner makes only
+the camera/recording sources wait; the run and available telemetry start immediately. An actual
+failed camera rejoins only after the operator uses its side Reactivate action and a newer-generation
+current frame is observed. Recovered video uses a new no-overwrite MP4 segment. Old Session,
+writer, artifact and integrity state is never consulted for current- or next-run admission.
+
+Existing method-specific accuracy, identity, calibration and coordinate gates still govern results.
 
 The readiness table remains an evidence projection. The compact method table lists all eight method
 categories; missing candidates/profiles remain `BLOCKED` with their required inputs. Clicking one

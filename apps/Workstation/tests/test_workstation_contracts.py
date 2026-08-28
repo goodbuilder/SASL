@@ -334,6 +334,16 @@ def test_workstation_recording_gate_protects_preview_mapping_and_save() -> None:
     assert window.commands.invoke("pixhawk.toggle_mavlink") is False
     assert backend.calls == calls_before_disabled_invoke
 
+    backend.panel._automatic_session_recording = True
+    window._refresh_from_status(window.status_adapter.model.snapshot())
+    app.processEvents()
+    assert window.commands.action("camera.reactivate_left").isEnabled()
+    assert window.commands.action("camera.reactivate_right").isEnabled()
+    assert window.commands.action("pixhawk.toggle_mavlink").isEnabled()
+    assert not window.commands.action("camera.swap").isEnabled()
+    assert not window.commands.action("pixhawk.reset_level_calibration").isEnabled()
+    backend.panel._automatic_session_recording = False
+
     backend.panel.camera_connected = True
     window.status_adapter.refresh()
     app.processEvents()

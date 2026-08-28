@@ -14,6 +14,7 @@ import queue
 import re
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -53,6 +54,11 @@ PRIORITY_STREAMS = frozenset(
         "native.frames",
     }
 )
+ESSENTIAL_RETRY_STREAMS = frozenset(
+    {"events", "measurements", "method_evaluations"}
+)
+RETRY_RESERVE_MAX_BYTES = 8 * 1024 * 1024
+_FSYNC = os.fsync
 
 _SESSION_MEMBERSHIP_FIELDS = frozenset(
     {"session_id", "parent_session_id", "measurement_package_id"}
@@ -151,11 +157,15 @@ class MeasurementDataStore:
         priority_capacity: int = 256,
         bulk_capacity: int = 4096,
         fsync_interval_s: float = 1.0,
+        retry_reserve_capacity: int = 256,
+        retry_reserve_max_bytes: int = RETRY_RESERVE_MAX_BYTES,
     ) -> None:
         self.root = Path(root).expanduser().resolve(strict=False)
         self.priority_capacity = max(1, int(priority_capacity))
         self.bulk_capacity = max(1, int(bulk_capacity))
         self.fsync_interval_s = max(0.05, float(fsync_interval_s))
+        self.retry_reserve_capacity = max(1, int(retry_reserve_capacity))
+        self.retry_reserve_max_bytes = max(1024, int(retry_reserve_max_bytes))
         self._priority: queue.Queue[_QueuedRecord] = queue.Queue(
             maxsize=self.priority_capacity
         )
@@ -165,6 +175,12 @@ class MeasurementDataStore:
         self._states = {name: _StreamState() for name in STREAM_PATHS}
         self._handles: dict[str, Any] = {}
         self._state_lock = threading.RLock()
+        self._retry_reserve: deque[_QueuedRecord] = deque()
+        self._retry_reserve_bytes = 0
+        self._retry_backoff_s = {name: 1.0 for name in STREAM_PATHS}
+        self._next_retry_monotonic_s: dict[str, float | None] = {
+            name: None for name in STREAM_PATHS
+        }
         self._stop_requested = threading.Event()
         self._flush_requested = threading.Event()
         self._thread = threading.Thread(
@@ -197,11 +213,6 @@ class MeasurementDataStore:
             raise ValueError(f"unknown measurement data stream: {name}")
         now_utc_ns = time.time_ns()
         now_monotonic_ns = time.monotonic_ns()
-        with self._state_lock:
-            state = self._states[name]
-            if state.state == "FAILED":
-                state.dropped_records += 1
-                return False
         try:
             record = {
                 str(key): _json_safe(item)
@@ -231,6 +242,12 @@ class MeasurementDataStore:
                 state.last_error = f"record rejected: {exc}"
             return False
         queued = _QueuedRecord(name, encoded, now_monotonic_ns)
+        with self._state_lock:
+            retry_stream_pending = any(
+                item.stream == name for item in self._retry_reserve
+            )
+            if self._states[name].state == "FAILED" or retry_stream_pending:
+                return self._reserve_retry_unlocked(queued)
         use_priority = name in PRIORITY_STREAMS if priority is None else bool(priority)
         target = self._priority if use_priority else self._bulk
         try:
@@ -270,6 +287,10 @@ class MeasurementDataStore:
                 self._states[name].state = "IDLE"
                 self._states[name].last_error = ""
                 self._close_handle(name)
+            for name in failed:
+                self._next_retry_monotonic_s[name] = None
+                self._retry_backoff_s[name] = 1.0
+        self._drain_retry_reserve()
 
     def request_flush(self) -> None:
         self._flush_requested.set()
@@ -288,6 +309,14 @@ class MeasurementDataStore:
                 }
                 for name, state in self._states.items()
             }
+            retry_pending = len(self._retry_reserve)
+            retry_bytes = self._retry_reserve_bytes
+            retry_deadlines = {
+                name: value
+                for name, value in self._next_retry_monotonic_s.items()
+                if value is not None
+            }
+            next_retry = min(retry_deadlines.values(), default=None)
         failed = sum(1 for value in streams.values() if value["state"] == "FAILED")
         dropped = sum(int(value["dropped_records"]) for value in streams.values())
         writer_alive = self.alive
@@ -308,6 +337,10 @@ class MeasurementDataStore:
             "bulk_capacity": self.bulk_capacity,
             "dropped_records": dropped,
             "writer_alive": writer_alive,
+            "essential_retry_pending": retry_pending,
+            "essential_retry_bytes": retry_bytes,
+            "next_retry_monotonic_s": next_retry,
+            "next_retry_by_stream": retry_deadlines,
             "streams": streams,
         }
 
@@ -339,6 +372,8 @@ class MeasurementDataStore:
                     and self._bulk.empty()
                 ):
                     break
+                self._maybe_retry_failed()
+                self._drain_retry_reserve()
                 item = self._next_record()
                 if item is not None:
                     self._write(item)
@@ -350,13 +385,17 @@ class MeasurementDataStore:
         finally:
             self._flush_all()
             with self._state_lock:
+                while self._retry_reserve:
+                    item = self._retry_reserve.popleft()
+                    self._retry_reserve_bytes -= len(item.payload)
+                    self._states[item.stream].dropped_records += 1
                 for name in tuple(self._handles):
                     self._close_handle(name)
 
     def _write(self, item: _QueuedRecord) -> None:
         with self._state_lock:
             if self._states[item.stream].state == "FAILED":
-                self._states[item.stream].dropped_records += 1
+                self._reserve_retry_unlocked(item)
                 return
         try:
             handle = self._handle(item.stream)
@@ -367,6 +406,8 @@ class MeasurementDataStore:
                 )
         except OSError as exc:
             self._mark_failed(item.stream, str(exc))
+            with self._state_lock:
+                self._reserve_retry_unlocked(item)
             return
         with self._state_lock:
             state = self._states[item.stream]
@@ -374,6 +415,8 @@ class MeasurementDataStore:
             state.last_error = ""
             state.last_write_utc_ns = time.time_ns()
             state.written_records += 1
+            self._retry_backoff_s[item.stream] = 1.0
+            self._next_retry_monotonic_s[item.stream] = None
 
     def _handle(self, stream: str):
         with self._state_lock:
@@ -401,8 +444,93 @@ class MeasurementDataStore:
             state = self._states[stream]
             state.state = "FAILED"
             state.last_error = str(error)
-            state.dropped_records += 1
             self._close_handle(stream)
+            if self._next_retry_monotonic_s[stream] is None:
+                self._next_retry_monotonic_s[stream] = (
+                    time.monotonic() + self._retry_backoff_s[stream]
+                )
+
+    def _reserve_retry_unlocked(
+        self,
+        item: _QueuedRecord,
+    ) -> bool:
+        if item.stream not in ESSENTIAL_RETRY_STREAMS:
+            self._states[item.stream].dropped_records += 1
+            return False
+        item_bytes = len(item.payload)
+        if item_bytes > self.retry_reserve_max_bytes:
+            self._states[item.stream].dropped_records += 1
+            return False
+        # Items can arrive here by two paths: a producer can observe FAILED
+        # and reserve a new record directly, while older records already in
+        # the writer queue reach the reserve later. Keep enqueue-time order so
+        # the direct path cannot overtake those older records.
+        insert_at = len(self._retry_reserve)
+        for index, pending in enumerate(self._retry_reserve):
+            if item.enqueued_monotonic_ns < pending.enqueued_monotonic_ns:
+                insert_at = index
+                break
+        self._retry_reserve.insert(insert_at, item)
+        self._retry_reserve_bytes += item_bytes
+        accepted = True
+        while self._retry_reserve and (
+            len(self._retry_reserve) > self.retry_reserve_capacity
+            or self._retry_reserve_bytes > self.retry_reserve_max_bytes
+        ):
+            evicted = self._retry_reserve.pop()
+            self._retry_reserve_bytes -= len(evicted.payload)
+            self._states[evicted.stream].dropped_records += 1
+            if evicted is item:
+                accepted = False
+        return accepted
+
+    def _maybe_retry_failed(self) -> None:
+        now = time.monotonic()
+        with self._state_lock:
+            due_streams = {
+                name
+                for name, due in self._next_retry_monotonic_s.items()
+                if due is not None and now >= due
+            }
+            if not due_streams:
+                return
+            for name, state in self._states.items():
+                if name in due_streams and state.state == "FAILED":
+                    state.state = "IDLE"
+                    state.last_error = ""
+                    self._close_handle(name)
+                if name in due_streams:
+                    self._next_retry_monotonic_s[name] = None
+                    self._retry_backoff_s[name] = min(
+                        30.0, self._retry_backoff_s[name] * 2.0
+                    )
+
+    def _drain_retry_reserve(self) -> None:
+        while True:
+            with self._state_lock:
+                if not self._retry_reserve:
+                    return
+                candidate_index = next(
+                    (
+                        index
+                        for index, pending in enumerate(self._retry_reserve)
+                        if self._states[pending.stream].state != "FAILED"
+                    ),
+                    None,
+                )
+                if candidate_index is None:
+                    return
+                item = self._retry_reserve[candidate_index]
+                try:
+                    self._priority.put_nowait(item)
+                except queue.Full:
+                    return
+                if (
+                    candidate_index < len(self._retry_reserve)
+                    and self._retry_reserve[candidate_index] is item
+                ):
+                    del self._retry_reserve[candidate_index]
+                    self._retry_reserve_bytes -= len(item.payload)
 
     def _flush_all(self) -> None:
         with self._state_lock:
@@ -410,7 +538,7 @@ class MeasurementDataStore:
         for stream, handle in handles:
             try:
                 handle.flush()
-                os.fsync(handle.fileno())
+                _FSYNC(handle.fileno())
             except OSError as exc:
                 self._mark_failed(stream, f"flush failed: {exc}")
 
@@ -525,6 +653,7 @@ class LiveDataRows(Sequence[dict[str, Any]]):
 __all__ = [
     "DATA_RECORD_SCHEMA",
     "DATA_STORE_SCHEMA",
+    "ESSENTIAL_RETRY_STREAMS",
     "MeasurementDataStore",
     "LiveDataRows",
     "PRIORITY_STREAMS",
