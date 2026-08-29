@@ -1202,6 +1202,61 @@ python3 tools/check_portable_paths.py
 
 ## Known Limitations and Workarounds
 
+### NVIDIA NVDEC unavailable after `s2idle` resume — observed 2026-08-29
+
+On the qualified RTX 4050 laptop, an active dual-`nvh264dec` Preview did not survive one lid-close
+`s2idle` cycle under Linux `6.8.0-138` and the NVIDIA `595.84` open kernel module. The NVIDIA
+systemd hooks were installed, enabled and successful: `nvidia-suspend.service` completed before
+sleep at 12:56, and `nvidia-resume.service` completed after wake at 14:00. This was therefore not a
+missing-hook or missing-package failure.
+
+Immediately after resume, the kernel reported `Xid 31` GPU MMU `FAULT_PDE` virtual-read faults for
+both independent camera decoder workers (`pid=60967/60969`). A subsequent driver `modprobe` channel
+faulted as well. UVM then reported global fatal error `0x60`, and `Xid 154` changed the required
+recovery action to `Node Reboot Required`. The strongest current cause inference is a
+suspend/resume video-memory or CUDA/UVM page-table restore failure, likely a driver/platform timing
+boundary triggered while two NVDEC contexts were active. Xid 31 can also represent an application
+or hardware defect, so one resume-correlated event does not prove the ultimate NVIDIA-driver root
+cause; recurrence after a cold boot or outside suspend requires separate NVIDIA/hardware analysis.
+[NVIDIA's Xid catalog](https://docs.nvidia.com/deploy/xid-errors/analyzing-xid-catalog.html) defines
+Xid 31 as a GPU memory page fault and Xid 154 as the recovery action selected for the accompanying
+error.
+
+The host selects `[s2idle]` even though `deep` is available. NVIDIA `595.84` documentation warns
+that some `s2idle` systems have a resume timing issue and lists `deep` as the interim workaround;
+changing the system sleep mode still requires an independent laptop/driver qualification rather
+than an application default.
+[NVIDIA Linux power-management documentation](https://download.nvidia.com/XFree86/Linux-x86_64/595.84/README/powermanagement.html)
+also explains why active video-memory allocations must be preserved across suspend.
+
+The post-fault symptoms are intentionally explicit:
+
+- `nvidia-smi` can still identify the GPU through the management interface, but reports
+  `GPU Recovery Action: Reboot`; this is not proof that CUDA/NVDEC can create a context.
+- Loading GStreamer's installed `nvcodec` plugin fails CUDA initialization with `0x64`
+  (`CUDA_ERROR_NO_DEVICE=100`). The plugin consequently registers no usable `nvh264dec` factory,
+  and `gst-inspect-1.0 nvh264dec` reports `No such element or plugin`.
+- Camera `Auto` records `gst_parse_error: no element "nvh264dec"` per side and correctly falls back
+  to `avdec_h264`. The observed UI showed both sides as `CPU fallback`, about `5.9 Hz`, with one side
+  becoming `STALE` under the extra CPU load.
+- App or Preview restart alone cannot recover this fatal driver state. The current Auto worker also
+  keeps its proven CPU override for that generation instead of repeatedly probing a failed GPU.
+- This failure is independent of WIRIS GOP/RTP/IDR behavior; the camera streams merely kept active
+  GPU contexts present when the suspend boundary was crossed.
+
+Immediate recovery is a full OS reboot, followed by a fresh Preview start so `Auto` can request
+`nvh264dec` again. Until a suspend/resume strategy is independently qualified, stop Preview before
+closing the lid or suspending the host. A future application mitigation may consume systemd-logind
+`PrepareForSleep`, stop GPU workers before suspend, and create new worker/CUDA contexts only after
+resume; that behavior is not implemented today. Useful read-only diagnostics are:
+
+```bash
+journalctl -k -b | rg 'NVRM: Xid|global fatal error'
+nvidia-smi -q | rg 'Driver Version|GPU Recovery Action'
+GST_DEBUG_NO_COLOR=1 GST_DEBUG='nvcodec*:7,cuda*:7' gst-inspect-1.0 nvh264dec
+cat /sys/power/mem_sleep
+```
+
 The seven comparison processes deliberately run concurrently while Pixhawk/RTK has its own worker.
 On a CPU- or storage-constrained workstation, simultaneous OpenCV startup, native-PNG writes, and
 Terrain/Multi-view solves can increase evaluation duration, trigger method-local timeouts, or fill
@@ -1537,6 +1592,11 @@ live on the panel at solve time -- a later live-GPS change cannot silently retar
 frozen Mountain image.
 
 ## Change Log
+
+- 2026-08-29: Documented the observed NVIDIA `595.84`/Linux 6.8 `s2idle` resume failure with two
+  active NVDEC workers: paired Xid 31 MMU faults, UVM fatal error, Xid 154 reboot requirement,
+  GStreamer CUDA-init failure, truthful CPU fallback symptoms, reboot-only recovery, and the
+  current stop-Preview-before-suspend operational workaround.
 
 - 2026-08-29: Made Measurement observation-first. Start immediately opens a run with zero or more
   sources; camera, Pixhawk, Base GNSS/NTRIP, Target and recording join independently. Added manual
