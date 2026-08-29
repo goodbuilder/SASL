@@ -1538,7 +1538,7 @@ class EvidenceAdapter:
         if not isinstance(grouped, Mapping):
             grouped = {"mavlink": getattr(self.panel, "_pixhawk_candidate_rows", ()) or ()}
         candidates: list[dict[str, object]] = []
-        for source in ("pc", "mavlink"):
+        for source in ("network", "pc", "mavlink"):
             rows = grouped.get(source, ()) or ()
             for source_row, row in enumerate(rows):
                 if not isinstance(row, Mapping):
@@ -1552,15 +1552,45 @@ class EvidenceAdapter:
                         "baud": _integer(row.get("baud")),
                         "status": str(row.get("status", "") or ""),
                         "interface": str(row.get("interface", "") or ""),
+                        "candidate_id": str(row.get("candidate_id", "") or ""),
+                        "carrier": str(row.get("carrier", "") or ""),
+                        "local_cidr": str(row.get("local_cidr", "") or ""),
+                        "local_ip": str(row.get("local_ip", "") or ""),
+                        "p1_route": str(row.get("p1_route", "") or ""),
+                        "p2_route": str(row.get("p2_route", "") or ""),
+                        "p1_route_state": str(row.get("p1_route_state", "") or ""),
+                        "p2_route_state": str(row.get("p2_route_state", "") or ""),
+                        "p1_endpoint": str(row.get("p1_endpoint", "") or ""),
+                        "p2_endpoint": str(row.get("p2_endpoint", "") or ""),
+                        "mac": str(row.get("mac", "") or ""),
+                        "driver": str(row.get("driver", "") or ""),
+                        "device_path": str(row.get("device_path", "") or ""),
                     }
                 )
         return {
             "candidates": tuple(candidates),
             "discovery_active": any(
                 getattr(self.panel, name, None) is not None
-                for name in ("pixhawk_usb_discovery_thread", "pixhawk_host_ip_discovery_thread")
+                for name in (
+                    "pixhawk_usb_discovery_thread",
+                    "pixhawk_host_ip_discovery_thread",
+                    "pixhawk_network_discovery_thread",
+                )
             ),
             "status": str(getattr(self.panel, "workstation_pixhawk_discovery_status", "NOT RUN") or "NOT RUN"),
+            "assignments": {
+                side: {
+                    **dict(
+                        (getattr(self.panel, "pixhawk_network_assignments", {}) or {}).get(side)
+                        or {}
+                    ),
+                    **dict(
+                        (getattr(self.panel, "pixhawk_network_assignment_status", {}) or {}).get(side)
+                        or {}
+                    ),
+                }
+                for side in ("left", "right")
+            },
             "contract": "Host/serial/MAVLink endpoint metadata; no attitude, position, or baseline values",
         }
 

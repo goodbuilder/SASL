@@ -194,7 +194,12 @@ wrapper. The workflow is:
    pair with capture-time Drone/P1/P2 GNSS for JSON-free multi-view `R,t`.
    The corresponding
    `Auto Horizon Roll/Pitch` and `Auto Mountain PnP` buttons remain available after manual
-   marking; they run the owner solver over the frozen evidence. Horizon candidates own only
+   marking; they run the owner solver over the frozen evidence. Review the automatic overlay before
+   `Use suggestion`. For Horizon and Mountain, `GOOD`/`LOW_CONFIDENCE` remains quality evidence
+   and does not decide copy permission. Horizon copy requires exactly two current-frame finite
+   in-frame endpoints per side separated by at least 25% of native width. Mountain copy requires at
+   least four current-frame finite unique/distributed paired points after exclusions. Structurally
+   blocked proposals remain overlay-only. Horizon candidates own only
    Roll/Pitch because a horizon cannot observe Yaw. Use Mountain PnP or live target-Drone
    RTK with explicit camera/target line of sight for Yaw. Terrain PnP also requires a
    declared vertical datum; a skyline alone is not promoted to a 3-D correspondence or

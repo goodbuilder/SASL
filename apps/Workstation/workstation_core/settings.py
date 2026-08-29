@@ -206,6 +206,13 @@ class AppSettings:
     right_mavlink_url: str = "udpin:0.0.0.0:14551"
     left_mavlink_baud: int = 57600
     right_mavlink_baud: int = 57600
+    # Machine-local operator assignments.  Interface names are deliberately
+    # persisted as device contracts, not portable asset paths.  A replacement
+    # NIC with a different name must be reassigned from Find network.
+    left_mavlink_interface: str = ""
+    right_mavlink_interface: str = ""
+    left_mavlink_local_address: str = ""
+    right_mavlink_local_address: str = ""
     # The third Pixhawk link is an active telemetry/correction endpoint for
     # the drone.  It is deliberately separate from the receive-only target
     # drone artifact path.
@@ -588,6 +595,18 @@ def load_settings(
         right_mavlink_url=str(payload.get("right_mavlink_url", AppSettings.right_mavlink_url)),
         left_mavlink_baud=int(payload.get("left_mavlink_baud", AppSettings.left_mavlink_baud)),
         right_mavlink_baud=int(payload.get("right_mavlink_baud", AppSettings.right_mavlink_baud)),
+        left_mavlink_interface=str(
+            payload.get("left_mavlink_interface", AppSettings.left_mavlink_interface)
+        ),
+        right_mavlink_interface=str(
+            payload.get("right_mavlink_interface", AppSettings.right_mavlink_interface)
+        ),
+        left_mavlink_local_address=str(
+            payload.get("left_mavlink_local_address", AppSettings.left_mavlink_local_address)
+        ),
+        right_mavlink_local_address=str(
+            payload.get("right_mavlink_local_address", AppSettings.right_mavlink_local_address)
+        ),
         drone_telemetry_url=str(payload.get("drone_telemetry_url", AppSettings.drone_telemetry_url)),
         drone_telemetry_baud=int(payload.get("drone_telemetry_baud", AppSettings.drone_telemetry_baud)),
         drone_telemetry_rtcm_forward=bool(

@@ -1,11 +1,13 @@
 # Pixhawk P1/P2 Ethernet MAVLink 설정
 
 이 문서는 `apps/Workstation` 현장 운용용 P1/P2 Pixhawk MAVLink 설정값과 복구 절차를 기록한다.
-기준일: 2026-08-24 (Asia/Seoul)
+기준일: 2026-08-29 (Asia/Seoul)
 
 ## 1. 네트워크 기준값
 
-Ethernet 인터페이스는 카메라와 Pixhawk가 연결된 `enx588694fce07e`를 사용한다.
+인터페이스 이름은 USB NIC의 MAC에 따라 바뀔 수 있으므로 계약값으로 고정하지 않는다.
+현재 field-qualified 배선은 카메라 NIC와 Pixhawk NIC를 분리하지만, Workstation UI는
+P1/P2에 같은 NIC 또는 서로 다른 NIC를 operator가 배정할 수 있다.
 
 | 장치 | IPv4 주소 | MAVLink UDP 포트 | MAVLink system ID |
 |---|---:|---:|---:|
@@ -25,12 +27,30 @@ MAVLink baud:        57600
 MAVLink stream rate: 2000000
 ```
 
-PC의 실제 주소를 확인한다.
+PC의 실제 주소와 route를 확인한다.
 
 ```bash
-ip -brief addr show enx588694fce07e
+ip -brief addr
+ip route get 10.0.0.2
+ip route get 10.0.0.3
 ip route
 ```
+
+### Workstation `Find network` / Assign / Connect
+
+1. Pixhawk 화면에서 `Find network`를 누른다.
+2. 후보 표에서 NIC와 current local IPv4를 선택한다. 표 행은 NIC 후보이며 P1/P2 route를 섞어
+   표시하지 않는다.
+3. `Assign P1` 또는 `Assign P2`로 side별 NIC+endpoint를 저장한다.
+4. 분리된 P1/P2 assignment card에서 각자의 State/NIC/Local IPv4/Endpoint/Route를 확인한다.
+5. `Connect`를 누른다.
+
+탐색과 Connect preflight는 read-only다. Workstation은 IP/route/NetworkManager profile을
+추가하거나 바꾸지 않는다. 배정한 local 주소가 NIC에 없거나 `.2/.3` route의 실제 `dev/src`가
+배정과 다르면 해당 side만 실패한다. P1/P2 partial connection은 허용하며 정상 side는 유지한다.
+마지막 interface name은 저장되지만 교체 NIC가 다른 `enx...` 이름을 받으면 자동 remap하지 않으므로
+다시 Find/Assign한다. Camera와 Pixhawk가 같은 NIC를 사용해도 UI 경고/gate는 없지만, 과거 shared-L2
+RTSP 부하에서 ETH MAVLink stall이 재현됐으므로 장시간 field 안정성 증거와는 구분한다.
 
 ## 2. PX4 MAVLink 파라미터
 
@@ -182,9 +202,10 @@ instance가 생길 수 있으므로 사용하지 않는다.
 ### 네트워크
 
 ```bash
-ping -I enx588694fce07e -c 3 10.0.0.2
-ping -I enx588694fce07e -c 3 10.0.0.3
-ip neigh show dev enx588694fce07e
+ip route get 10.0.0.2
+ip route get 10.0.0.3
+ping -c 3 10.0.0.2
+ping -c 3 10.0.0.3
 ```
 
 ### Workstation UDP socket
@@ -199,7 +220,7 @@ ATTITUDE/GPS 수신을 확인한다.
 ### raw Ethernet packet
 
 ```bash
-sudo tcpdump -ni enx588694fce07e -nn \
+sudo tcpdump -ni <ASSIGNED_NIC> -nn \
   'udp port 14550 or udp port 14551'
 ```
 

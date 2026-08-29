@@ -31,10 +31,14 @@ from Workstation.workstation_core.calibration import (
 )
 from Workstation.workstation_core.native_frame_store import NativeFrameArtifact, NativeFrameStore
 from Workstation.workstation_core.optical_pose_auto_select import (
+    HORIZON_MIN_ENDPOINT_SEPARATION_FRACTION,
     MountainAutoSelection,
     AutoSelectionResult,
     auto_select_horizon,
     auto_select_mountain,
+    validate_horizon_suggestion_points,
+    validate_mountain_point_distribution,
+    validate_mountain_suggestion_points,
 )
 from Workstation.workstation_core.operating_intrinsics import (
     OperatingCameraEvidence,
@@ -1904,6 +1908,8 @@ class OpticalPoseController:
                 "input_hashes": value.get("input_hashes"),
                 "failure_reason": value.get("failure_reason", ""),
                 "eligible": value.get("eligible", False),
+                "copy_eligible": value.get("copy_eligible", False),
+                "copy_block_reason": value.get("copy_block_reason", ""),
                 # Preserve the complete native-point proposal in the
                 # append-only event, not only its review summary.
                 "suggestion": value,
@@ -2179,6 +2185,25 @@ class OpticalPoseController:
             )
             for side, result in results.items()
         }
+        try:
+            validate_horizon_suggestion_points(
+                results["left"].points,
+                results["right"].points,
+                left_image_size=(
+                    self._frozen_frames["left"]["artifact"].width,
+                    self._frozen_frames["left"]["artifact"].height,
+                ),
+                right_image_size=(
+                    self._frozen_frames["right"]["artifact"].width,
+                    self._frozen_frames["right"]["artifact"].height,
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            copy_eligible = False
+            copy_block_reason = str(exc)
+        else:
+            copy_eligible = True
+            copy_block_reason = ""
         both_eligible = set(results) == {"left", "right"} and all(
             results[side].eligible for side in ("left", "right")
         )
@@ -2200,6 +2225,10 @@ class OpticalPoseController:
             "inlier_count": inliers,
             "residual_px": max(residuals) if residuals else None,
             "eligible": both_eligible,
+            # Detector quality remains evidence; copy permission is the
+            # independent native-endpoint structure contract above.
+            "copy_eligible": copy_eligible,
+            "copy_block_reason": copy_block_reason,
             "failure_reason": "; ".join(dict.fromkeys(failure_reasons)),
             "warnings": [
                 *applicability_warnings,
@@ -2291,6 +2320,14 @@ class OpticalPoseController:
                 "right", result.right, self._frozen_frames["right"], annotation_key="ridge_polyline"
             ),
         }
+        try:
+            validate_mountain_suggestion_points(result.left.points, result.right.points)
+        except (TypeError, ValueError) as exc:
+            copy_eligible = False
+            copy_block_reason = str(exc)
+        else:
+            copy_eligible = True
+            copy_block_reason = ""
         warnings = [*applicability_warnings, *result.warnings]
         if baseline_warning:
             warnings.append(f"GNSS baseline unavailable during suggestion: {baseline_warning}")
@@ -2316,6 +2353,10 @@ class OpticalPoseController:
             "match_count": result.match_count,
             "residual_px": result.residual_px,
             "eligible": bool(result.eligible and baseline_ned is not None),
+            # Mountain point-copy permission is structural and deliberately
+            # independent from detector confidence and GNSS solve readiness.
+            "copy_eligible": copy_eligible,
+            "copy_block_reason": copy_block_reason,
             "failure_reason": result.failure_reason or baseline_warning,
             "warnings": warnings,
             "sides": sides,
@@ -2332,6 +2373,163 @@ class OpticalPoseController:
         }
         return suggestion
 
+    @staticmethod
+    def _append_auto_copy_quality_warning(
+        accepted: dict[str, Any],
+        *,
+        mode_label: str,
+    ) -> None:
+        quality_state = str(accepted.get("state") or "UNKNOWN").upper()
+        if quality_state == "GOOD":
+            return
+        warning = (
+            f"operator copied a structurally usable {mode_label} suggestion with quality state "
+            f"{quality_state}; detector confidence remains warning evidence"
+        )
+        raw_warnings = accepted.get("warnings")
+        warnings = (
+            [str(value) for value in raw_warnings]
+            if isinstance(raw_warnings, (tuple, list))
+            else []
+        )
+        if warning not in warnings:
+            warnings.append(warning)
+        accepted["warnings"] = warnings
+
+    def _validated_horizon_suggestion_for_acceptance(
+        self,
+        suggestion: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Return a current-frame, structurally validated Horizon copy payload."""
+
+        sides = suggestion.get("sides")
+        if not isinstance(sides, Mapping):
+            raise ValueError("Horizon suggestion is missing left/right endpoints")
+        parsed: dict[str, tuple[tuple[float, float], ...]] = {}
+        image_sizes: dict[str, tuple[int, int]] = {}
+        for side in ("left", "right"):
+            row = sides.get(side)
+            if not isinstance(row, Mapping):
+                raise ValueError(f"Horizon suggestion is missing {side} endpoints")
+            self._validate_annotation_identity(side, row)
+            annotation = dict(row)
+            annotation["horizon_line"] = row.get(
+                "points", row.get("horizon_line", ())
+            )
+            parsed[side] = self._annotation_points(annotation, "horizon_line")
+            image_sizes[side] = (
+                int(annotation["source_width_px"]),
+                int(annotation["source_height_px"]),
+            )
+
+        left_points, right_points = validate_horizon_suggestion_points(
+            parsed["left"],
+            parsed["right"],
+            left_image_size=image_sizes["left"],
+            right_image_size=image_sizes["right"],
+            minimum_separation_fraction=self._HORIZON_MIN_ENDPOINT_SEPARATION_FRACTION,
+        )
+        accepted = json.loads(json.dumps(suggestion, ensure_ascii=False))
+        accepted_sides = accepted.get("sides")
+        if not isinstance(accepted_sides, dict):
+            raise ValueError("Horizon suggestion is missing left/right endpoints")
+        for side, points in (("left", left_points), ("right", right_points)):
+            row = accepted_sides.get(side)
+            if not isinstance(row, dict):
+                raise ValueError(f"Horizon suggestion is missing {side} endpoints")
+            normalized = [{"u_px": u, "v_px": v} for u, v in points]
+            row["points"] = normalized
+            row["horizon_line"] = list(normalized)
+            row["original_point_count"] = 2
+            row["retained_point_count"] = 2
+        accepted["copy_eligible"] = True
+        accepted["copy_block_reason"] = ""
+        accepted["original_point_count"] = 2
+        accepted["retained_point_count"] = 2
+        accepted["validated_input_sha256"] = _payload_sha256(
+            {
+                "coordinate_contract": "native OpenCV pixels; u right, v down",
+                "left": accepted_sides["left"]["points"],
+                "right": accepted_sides["right"]["points"],
+            }
+        )
+        self._append_auto_copy_quality_warning(accepted, mode_label="Horizon")
+        return accepted
+
+    def _validated_mountain_suggestion_for_acceptance(
+        self,
+        suggestion: Mapping[str, Any],
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Return an immutable, structurally validated Mountain copy payload."""
+
+        sides = suggestion.get("sides")
+        if not isinstance(sides, Mapping):
+            raise ValueError("Mountain suggestion is missing paired left/right points")
+        parsed: dict[str, tuple[tuple[float, float], ...]] = {}
+        for side in ("left", "right"):
+            row = sides.get(side)
+            if not isinstance(row, Mapping):
+                raise ValueError(f"Mountain suggestion is missing {side} points")
+            self._validate_annotation_identity(side, row)
+            annotation = dict(row)
+            annotation["ridge_polyline"] = row.get(
+                "points", row.get("ridge_polyline", ())
+            )
+            parsed[side] = self._annotation_points(annotation, "ridge_polyline")
+
+        raw_exclusions = payload.get("excluded_point_indices", ())
+        if raw_exclusions is None:
+            raw_exclusions = ()
+        if not isinstance(raw_exclusions, (tuple, list)):
+            raise ValueError("Mountain excluded point indices must be a list")
+        left_points, right_points, excluded = validate_mountain_suggestion_points(
+            parsed["left"],
+            parsed["right"],
+            excluded_indices=raw_exclusions,
+        )
+
+        accepted = json.loads(json.dumps(suggestion, ensure_ascii=False))
+        accepted_sides = accepted.get("sides")
+        if not isinstance(accepted_sides, dict):
+            raise ValueError("Mountain suggestion is missing paired left/right points")
+        excluded_set = set(excluded)
+        original_count = len(parsed["left"])
+        for side, points in (("left", left_points), ("right", right_points)):
+            row = accepted_sides.get(side)
+            if not isinstance(row, dict):
+                raise ValueError(f"Mountain suggestion is missing {side} points")
+            filtered = [{"u_px": u, "v_px": v} for u, v in points]
+            row["points"] = filtered
+            row["ridge_polyline"] = list(filtered)
+            confidences = row.get("point_confidences")
+            if isinstance(confidences, list) and len(confidences) == original_count:
+                row["point_confidences"] = [
+                    value
+                    for index, value in enumerate(confidences)
+                    if index not in excluded_set
+                ]
+            elif confidences is not None:
+                row["point_confidences"] = []
+            row["original_point_count"] = original_count
+            row["retained_point_count"] = len(points)
+
+        accepted["copy_eligible"] = True
+        accepted["copy_block_reason"] = ""
+        accepted["excluded_point_indices"] = list(excluded)
+        accepted["original_point_count"] = original_count
+        accepted["retained_point_count"] = len(left_points)
+        accepted["filtered_input_sha256"] = _payload_sha256(
+            {
+                "coordinate_contract": "same-order native OpenCV pixels; u right, v down",
+                "excluded_point_indices": list(excluded),
+                "left": accepted_sides["left"]["points"],
+                "right": accepted_sides["right"]["points"],
+            }
+        )
+        self._append_auto_copy_quality_warning(accepted, mode_label="Mountain")
+        return accepted
+
     def accept_workstation_optical_pose_suggestion(
         self,
         payload: Mapping[str, Any],
@@ -2344,12 +2542,15 @@ class OpticalPoseController:
         suggestion = self._auto_suggestions.get(suggestion_id)
         if suggestion is None:
             raise ValueError(f"unknown automatic optical-pose suggestion: {suggestion_id}")
-        if not bool(suggestion.get("eligible", False)) or str(suggestion.get("state", "")) != "GOOD":
-            raise ValueError(
-                "automatic suggestion is not eligible; low-confidence or incomplete suggestions "
-                "remain overlay-only and do not replace manual annotations"
+        mode = str(suggestion.get("mode") or "").lower()
+        if mode == "mountain":
+            accepted = self._validated_mountain_suggestion_for_acceptance(
+                suggestion, payload
             )
-        accepted = json.loads(json.dumps(suggestion, ensure_ascii=False))
+        elif mode == "horizon":
+            accepted = self._validated_horizon_suggestion_for_acceptance(suggestion)
+        else:
+            raise ValueError(f"unsupported automatic optical-pose suggestion mode: {mode!r}")
         accepted["provenance_state"] = "AUTO_ACCEPTED"
         accepted["accepted_utc_ns"] = time.time_ns()
         self._last_accepted_auto_suggestion = accepted
@@ -2505,7 +2706,9 @@ class OpticalPoseController:
         return self.workstation_optical_pose_snapshot()
 
     _HORIZON_CLICK_UNCERTAINTY_PX = 1.0
-    _HORIZON_MIN_ENDPOINT_SEPARATION_FRACTION = 0.25
+    _HORIZON_MIN_ENDPOINT_SEPARATION_FRACTION = (
+        HORIZON_MIN_ENDPOINT_SEPARATION_FRACTION
+    )
     _HORIZON_MODELS = ("flat_local", "spherical_geometric")
 
     def _solve_horizon_roll_pitch(
@@ -4535,37 +4738,7 @@ class OpticalPoseController:
     ) -> None:
         """Fail closed for duplicate or nearly one-dimensional Mountain clicks."""
 
-        if len(points) < 4:
-            raise ValueError(
-                f"GNSS + Mountain requires at least four left/right u,v correspondence pairs ({side})"
-            )
-        unique: list[tuple[float, float]] = []
-        for point in points:
-            if all(
-                math.hypot(point[0] - other[0], point[1] - other[1]) >= 1.0
-                for other in unique
-            ):
-                unique.append(point)
-        if len(unique) < 4:
-            raise ValueError(
-                f"GNSS + Mountain {side} points contain duplicate/near-duplicate observations"
-            )
-        mean_u = sum(point[0] for point in unique) / len(unique)
-        mean_v = sum(point[1] for point in unique) / len(unique)
-        xx = sum((point[0] - mean_u) ** 2 for point in unique)
-        yy = sum((point[1] - mean_v) ** 2 for point in unique)
-        xy = sum((point[0] - mean_u) * (point[1] - mean_v) for point in unique)
-        trace = xx + yy
-        determinant = max(0.0, xx * yy - xy * xy)
-        if trace <= 1.0e-12:
-            raise ValueError(f"GNSS + Mountain {side} points are coincident")
-        discriminant = max(0.0, trace * trace - 4.0 * determinant)
-        minimum = 0.5 * (trace - math.sqrt(discriminant))
-        maximum = 0.5 * (trace + math.sqrt(discriminant))
-        if maximum <= 1.0e-12 or minimum / maximum < 1.0e-3:
-            raise ValueError(
-                f"GNSS + Mountain {side} points are near-collinear; distribute at least four features over the image"
-            )
+        validate_mountain_point_distribution(points, side=side)
 
     @staticmethod
     def _sample_horizon_pixels(

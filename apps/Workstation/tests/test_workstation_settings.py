@@ -568,6 +568,15 @@ def test_workstation_every_flat_app_setting_has_an_editable_surface() -> None:
         "pixhawk_left_gnss_source",
         "pixhawk_right_gnss_source",
     }
+    pixhawk_workspace_owned_settings = {
+        # These machine-local values are selected by Find network + Assign
+        # P1/P2 in the Pixhawk workspace.  Free-form Settings edits would
+        # bypass the route evidence bound to that operator selection.
+        "left_mavlink_interface",
+        "right_mavlink_interface",
+        "left_mavlink_local_address",
+        "right_mavlink_local_address",
+    }
     flat_fields = {field.name for field in fields(AppSettings)} - {"gnss_operation"}
 
     assert flat_fields - system_keys == (
@@ -577,6 +586,7 @@ def test_workstation_every_flat_app_setting_has_an_editable_surface() -> None:
         | retired_calibration_settings
         | compatibility_only_settings
         | custom_measurement_method_settings
+        | pixhawk_workspace_owned_settings
     )
     assert set(measurement_aliases.values()) <= measurement_keys
     assert {

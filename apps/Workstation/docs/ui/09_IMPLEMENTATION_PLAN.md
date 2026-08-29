@@ -16,6 +16,18 @@ Workstation uses its own copied `standalone_gui.py`/`standalone_backend.py` owne
 [`11_DESIGN_AUDIT_RESULT.md`](11_DESIGN_AUDIT_RESULT.md) for the implementation evidence
 and remaining validation conditions.
 
+### 2026-08-29 Pixhawk network assignment slice
+
+Pixhawk `Find network` uses a bounded read-only worker to inventory physical wired links, global
+IPv4 addresses and side-specific kernel `dev/src` route evidence. The compact workspace table lets
+the operator select one NIC/address candidate; independent P1/P2 cards show each assigned
+State/NIC/Local IPv4/Endpoint/Route. Assign persists the last side selection with additive settings
+fields. Connect preflights each disconnected side independently; it never
+mutates host or PX4 networking. Existing custom endpoint/USB paths, expected sysid, 60-second
+qualification, stalled-side RTCM gating and verified-USB recovery remain authoritative.
+Same/different and Camera-shared NIC choices are accepted without a UI topology warning; field
+stability remains a separate hardware evidence boundary.
+
 ### 2026-08-26 Ethernet MAVLink stability slice
 
 The Workstation software now owns explicit GCS `255/190` identity and bounded 1 Hz heartbeat,

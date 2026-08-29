@@ -17,6 +17,7 @@ from PyQt5 import QtCore
 from Workstation.workstation_core.network import (
     DEFAULT_HOST_ADDRESS,
     apply_interface_address,
+    discover_pixhawk_network_candidates,
     discover_host_interface_candidates,
     interface_addresses,
     local_ipv4_interfaces,
@@ -302,6 +303,44 @@ class PixhawkHostIpDiscoveryWorker(QtCore.QObject):
             self.failed.emit(str(exc))
         else:
             self.discovered.emit(tuple(interfaces))
+        finally:
+            self.finished.emit()
+
+
+class PixhawkNetworkDiscoveryWorker(QtCore.QObject):
+    """Read wired NIC/address/route candidates without mutating host networking."""
+
+    discovered = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        *,
+        p1_peer: str,
+        p2_peer: str,
+        p1_endpoint: str,
+        p2_endpoint: str,
+    ) -> None:
+        super().__init__()
+        self.p1_peer = str(p1_peer)
+        self.p2_peer = str(p2_peer)
+        self.p1_endpoint = str(p1_endpoint)
+        self.p2_endpoint = str(p2_endpoint)
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            candidates = discover_pixhawk_network_candidates(
+                p1_peer=self.p1_peer,
+                p2_peer=self.p2_peer,
+                p1_endpoint=self.p1_endpoint,
+                p2_endpoint=self.p2_endpoint,
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.discovered.emit(tuple(candidate.to_mapping() for candidate in candidates))
         finally:
             self.finished.emit()
 

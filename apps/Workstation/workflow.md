@@ -63,6 +63,11 @@ Alignment는 앱 실행 수명을 따른다.
 - `Revert active pose`는 이전 적용 상태로 돌린다.
 - `Reset Alignment`는 후보, frozen frame, annotation, 관측, active pose를 메모리에서 지우고 `alignment_reset` 이벤트를 append한다. 기존 파일은 삭제하지 않는다.
 - 앱을 재시작하면 저장된 Alignment를 자동 복구하지 않는다. 재사용이 필요하면 extrinsics 프로파일을 별도로 저장한다.
+- Horizon/Mountain `Use suggestion`은 `GOOD`/`LOW_CONFIDENCE` 품질 상태와 무관하게
+  사용할 수 있다. Horizon은 현재 frozen identity와 좌·우 각각 정확히 2개의 유한한
+  in-frame endpoint 및 image width 25% 이상 간격이 필요하다. Mountain은 exclusion 적용 후
+  좌·우 동일 순서의 유한한 native `(u,v)`가 4쌍 이상이고 중복/공선이 아니어야 한다.
+- 이 동작은 점을 annotation buffer로 복사할 뿐이며 Solve/Apply를 자동 실행하지 않는다.
 
 ## 4. 측정 시작
 

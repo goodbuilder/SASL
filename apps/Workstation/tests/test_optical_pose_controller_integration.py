@@ -9,11 +9,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from PyQt5 import QtGui
+from PyQt5 import QtGui, QtWidgets
 
 import Workstation.optical_pose_controller as optical_pose_module
 from Workstation.optical_pose_controller import OpticalPoseController
 from Workstation.measurement_view_controller import MeasurementViewController
+from Workstation.workspaces import OpticalPosePane
 from Workstation.workstation_core.calibration import (
     CameraIntrinsics,
     CheckerboardConfig,
@@ -31,7 +32,10 @@ from Workstation.workstation_core.rtk_geometry import GpsPositionState, ned_delt
 from Workstation.workstation_core.terrain import TerrainMetadata
 from Workstation.workstation_core.measurement_methods import HORIZON_HYBRID
 from Workstation.workstation_core.measurement_attempt import AttitudeSnapshot, GpsSnapshot
-from Workstation.workstation_core.optical_pose_auto_select import AutoSelectionResult
+from Workstation.workstation_core.optical_pose_auto_select import (
+    AutoSelectionResult,
+    MountainAutoSelection,
+)
 
 
 def _image() -> QtGui.QImage:
@@ -595,7 +599,7 @@ def test_auto_select_job_keeps_owner_state_until_ui_commit_and_rejects_stale_res
         controller.commit_workstation_optical_pose_auto_selection(stale_suggestion)
 
 
-def test_horizon_auto_suggestion_requires_both_sides_to_be_eligible(
+def test_horizon_auto_suggestion_separates_quality_from_copy_structure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -635,8 +639,62 @@ def test_horizon_auto_suggestion_requires_both_sides_to_be_eligible(
 
     assert suggestion["state"] == "LOW_CONFIDENCE"
     assert suggestion["eligible"] is False
+    assert suggestion["copy_eligible"] is True
+    assert suggestion["copy_block_reason"] == ""
     assert suggestion["sides"]["left"]["eligible"] is True
     assert suggestion["sides"]["right"]["eligible"] is False
+
+
+def test_mountain_auto_suggestion_separates_quality_from_copy_structure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = OpticalPoseController(_panel(tmp_path))
+    controller.capture_workstation_optical_pose_burst({})
+    left_points = (
+        (10.0, 20.0),
+        (120.0, 210.0),
+        (260.0, 55.0),
+        (430.0, 300.0),
+    )
+    right_points = tuple((u + 5.0, v - 2.0) for u, v in left_points)
+    side_results = tuple(
+        AutoSelectionResult(
+            mode="mountain",
+            state="LOW_CONFIDENCE",
+            detection_method="fixture",
+            points=points,
+            inlier_count=4,
+            confidence=0.20,
+            spatial_rank=2,
+            eligible=False,
+            failure_reason="match_confidence_below_acceptance_threshold",
+        )
+        for points in (left_points, right_points)
+    )
+    result = MountainAutoSelection(
+        left=side_results[0],
+        right=side_results[1],
+        state="LOW_CONFIDENCE",
+        detection_method="fixture",
+        match_count=4,
+        inlier_count=4,
+        confidence=0.20,
+        eligible=False,
+        failure_reason="match_confidence_below_acceptance_threshold",
+    )
+    monkeypatch.setattr(
+        optical_pose_module,
+        "auto_select_mountain",
+        lambda *_args, **_kwargs: result,
+    )
+
+    suggestion = controller._compute_auto_select_mountain({})
+
+    assert suggestion["state"] == "LOW_CONFIDENCE"
+    assert suggestion["eligible"] is False
+    assert suggestion["copy_eligible"] is True
+    assert suggestion["copy_block_reason"] == ""
 
 
 def test_combined_pose_requires_explicit_candidate_ids(tmp_path: Path) -> None:
@@ -1122,6 +1180,222 @@ def _mountain_annotations(snapshot: dict[str, object]):
         {"u_px": 530.0, "v_px": 225.0},
     ]
     return annotations
+
+
+def _mountain_auto_suggestion(
+    frozen: dict[str, object],
+    *,
+    suggestion_id: str,
+    state: str = "LOW_CONFIDENCE",
+) -> dict[str, object]:
+    annotations = _mountain_annotations(frozen)
+    annotations["left"]["ridge_polyline"].append({"u_px": 600.0, "v_px": 80.0})
+    annotations["right"]["ridge_polyline"].append({"u_px": 610.0, "v_px": 75.0})
+    return {
+        "schema": "optical-pose-auto-suggestion-v1",
+        "suggestion_id": suggestion_id,
+        "mode": "mountain",
+        "state": state,
+        "provenance_state": "AUTO_PROPOSED",
+        "detection_method": "fixture",
+        "confidence": 0.20,
+        "eligible": False,
+        "copy_eligible": True,
+        "failure_reason": "match_confidence_below_acceptance_threshold",
+        "warnings": [],
+        "sides": {
+            side: {
+                **annotations[side],
+                "points": list(annotations[side]["ridge_polyline"]),
+                "point_confidences": [0.9, 0.8, 0.7, 0.6, 0.5],
+            }
+            for side in ("left", "right")
+        },
+    }
+
+
+def test_low_confidence_mountain_suggestion_accepts_filtered_structural_points(
+    tmp_path: Path,
+) -> None:
+    panel = _panel(tmp_path)
+    controller = OpticalPoseController(panel)
+    frozen = controller.capture_workstation_optical_pose_burst({})
+    suggestion = _mountain_auto_suggestion(
+        frozen, suggestion_id="auto-mountain-low-confidence"
+    )
+    controller._record_auto_suggestion(suggestion)
+
+    snapshot = controller.accept_workstation_optical_pose_suggestion(
+        {
+            "suggestion_id": "auto-mountain-low-confidence",
+            "excluded_point_indices": [1],
+        }
+    )
+
+    accepted = snapshot["accepted_auto_suggestion"]
+    assert accepted["state"] == "LOW_CONFIDENCE"
+    assert accepted["eligible"] is False
+    assert accepted["copy_eligible"] is True
+    assert accepted["excluded_point_indices"] == [1]
+    assert accepted["original_point_count"] == 5
+    assert accepted["retained_point_count"] == 4
+    assert len(accepted["filtered_input_sha256"]) == 64
+    assert accepted["sides"]["left"]["points"] == [
+        suggestion["sides"]["left"]["points"][index]
+        for index in (0, 2, 3, 4)
+    ]
+    assert snapshot["annotation_review"]["annotations"]["right"]["ridge_polyline"] == [
+        suggestion["sides"]["right"]["points"][index]
+        for index in (0, 2, 3, 4)
+    ]
+    assert "LOW_CONFIDENCE" in " ".join(accepted["warnings"])
+    event_name, event_payload = panel.events[-1]
+    assert event_name == "optical_pose_auto_suggestion_accepted"
+    assert event_payload["suggestion"]["excluded_point_indices"] == [1]
+    assert event_payload["suggestion"]["filtered_input_sha256"] == accepted[
+        "filtered_input_sha256"
+    ]
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    pane = OpticalPosePane()
+    pane.apply_snapshot(snapshot)
+    assert len(pane.annotation_views["left"].annotation_points("ridge")) == 4
+    assert len(pane.annotation_views["right"].annotation_points("ridge")) == 4
+    assert "LOW_CONFIDENCE" in pane.auto_suggestion_status_label.text()
+    assert "AUTO_ACCEPTED" in pane.auto_suggestion_status_label.text()
+    assert not pane.use_suggestion_button.isEnabled()
+    pane.deleteLater()
+    app.processEvents()
+
+
+def test_mountain_suggestion_acceptance_rejects_invalid_exclusion(
+    tmp_path: Path,
+) -> None:
+    controller = OpticalPoseController(_panel(tmp_path))
+    frozen = controller.capture_workstation_optical_pose_burst({})
+    controller._record_auto_suggestion(
+        _mountain_auto_suggestion(frozen, suggestion_id="auto-mountain-invalid-exclusion")
+    )
+
+    with pytest.raises(ValueError, match="out of range"):
+        controller.accept_workstation_optical_pose_suggestion(
+            {
+                "suggestion_id": "auto-mountain-invalid-exclusion",
+                "excluded_point_indices": [99],
+            }
+        )
+
+
+def test_mountain_suggestion_acceptance_rejects_stale_frozen_identity(
+    tmp_path: Path,
+) -> None:
+    controller = OpticalPoseController(_panel(tmp_path))
+    frozen = controller.capture_workstation_optical_pose_burst({})
+    suggestion = _mountain_auto_suggestion(
+        frozen, suggestion_id="auto-mountain-stale-copy"
+    )
+    controller.capture_workstation_optical_pose_burst({})
+    # Adversarially restore the stale proposal to prove acceptance does not
+    # rely only on Capture's normal suggestion-clear behavior.
+    controller._auto_suggestions[suggestion["suggestion_id"]] = suggestion
+
+    with pytest.raises(ValueError, match="frame_id does not match frozen evidence"):
+        controller.accept_workstation_optical_pose_suggestion(
+            {"suggestion_id": "auto-mountain-stale-copy"}
+        )
+
+
+def test_low_confidence_horizon_suggestion_accepts_structural_endpoints(
+    tmp_path: Path,
+) -> None:
+    panel = _panel(tmp_path)
+    controller = OpticalPoseController(panel)
+    frozen = controller.capture_workstation_optical_pose_burst({})
+    annotations = _annotations(frozen)
+    suggestion = {
+        "suggestion_id": "auto-horizon-low-confidence",
+        "mode": "horizon",
+        "state": "LOW_CONFIDENCE",
+        "eligible": False,
+        "confidence": 0.20,
+        "failure_reason": "skyline_line_support_below_acceptance_threshold",
+        "warnings": [],
+        "sides": {
+            side: {
+                **annotations[side],
+                "points": list(annotations[side]["horizon_line"]),
+            }
+            for side in ("left", "right")
+        },
+    }
+    controller._record_auto_suggestion(suggestion)
+
+    snapshot = controller.accept_workstation_optical_pose_suggestion(
+        {"suggestion_id": "auto-horizon-low-confidence"}
+    )
+
+    accepted = snapshot["accepted_auto_suggestion"]
+    assert accepted["state"] == "LOW_CONFIDENCE"
+    assert accepted["eligible"] is False
+    assert accepted["copy_eligible"] is True
+    assert len(accepted["validated_input_sha256"]) == 64
+    assert "LOW_CONFIDENCE" in " ".join(accepted["warnings"])
+    assert len(snapshot["annotation_review"]["annotations"]["left"]["horizon_line"]) == 2
+    event_name, event_payload = panel.events[-1]
+    assert event_name == "optical_pose_auto_suggestion_accepted"
+    assert event_payload["suggestion"]["validated_input_sha256"] == accepted[
+        "validated_input_sha256"
+    ]
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    pane = OpticalPosePane()
+    pane.apply_snapshot(snapshot)
+    assert len(pane.annotation_views["left"].annotation_points("horizon")) == 2
+    assert len(pane.annotation_views["right"].annotation_points("horizon")) == 2
+    assert "LOW_CONFIDENCE" in pane.auto_suggestion_status_label.text()
+    assert "AUTO_ACCEPTED" in pane.auto_suggestion_status_label.text()
+    pane.deleteLater()
+    app.processEvents()
+
+
+def test_horizon_suggestion_acceptance_rejects_short_or_stale_endpoints(
+    tmp_path: Path,
+) -> None:
+    controller = OpticalPoseController(_panel(tmp_path))
+    frozen = controller.capture_workstation_optical_pose_burst({})
+    annotations = _annotations(frozen)
+    suggestion = {
+        "suggestion_id": "auto-horizon-structural-block",
+        "mode": "horizon",
+        "state": "LOW_CONFIDENCE",
+        "eligible": False,
+        "sides": {
+            side: {
+                **annotations[side],
+                "points": [
+                    {"u_px": 20.0, "v_px": 210.0},
+                    {"u_px": 100.0, "v_px": 212.0},
+                ],
+            }
+            for side in ("left", "right")
+        },
+    }
+    controller._record_auto_suggestion(suggestion)
+    with pytest.raises(ValueError, match="25% of image width"):
+        controller.accept_workstation_optical_pose_suggestion(
+            {"suggestion_id": "auto-horizon-structural-block"}
+        )
+
+    stale = copy.deepcopy(suggestion)
+    stale["suggestion_id"] = "auto-horizon-stale-copy"
+    for side in ("left", "right"):
+        stale["sides"][side]["points"] = list(annotations[side]["horizon_line"])
+    controller.capture_workstation_optical_pose_burst({})
+    controller._auto_suggestions[stale["suggestion_id"]] = stale
+    with pytest.raises(ValueError, match="frame_id does not match frozen evidence"):
+        controller.accept_workstation_optical_pose_suggestion(
+            {"suggestion_id": "auto-horizon-stale-copy"}
+        )
 
 
 def test_gnss_mountain_uses_capture_time_baseline_not_live_gps(tmp_path: Path) -> None:

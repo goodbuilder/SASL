@@ -126,32 +126,58 @@ def test_mountain_auto_point_exclusion_is_paired_and_sent_for_acceptance() -> No
     suggestion = {
         "suggestion_id": "mountain-1",
         "mode": "mountain",
-        "state": "GOOD",
-        "eligible": True,
+        "state": "LOW_CONFIDENCE",
+        "eligible": False,
+        "copy_eligible": True,
+        "failure_reason": "match_confidence_below_acceptance_threshold",
         "sides": {
-            side: {
-                "points": [(10.0, 20.0), (30.0, 40.0), (50.0, 60.0), (70.0, 80.0), (90.0, 100.0)],
+            "left": {
+                "frame_id": "left-frame",
+                "image_sha256": "1" * 64,
+                "source_width_px": 640,
+                "source_height_px": 480,
+                "points": [(10.0, 20.0), (120.0, 210.0), (260.0, 55.0), (430.0, 300.0), (620.0, 110.0)],
                 "point_confidences": [0.9, 0.8, 0.7, 0.6, 0.5],
-            }
-            for side in ("left", "right")
+            },
+            "right": {
+                "frame_id": "right-frame",
+                "image_sha256": "2" * 64,
+                "source_width_px": 640,
+                "source_height_px": 480,
+                "points": [(15.0, 18.0), (125.0, 208.0), (265.0, 53.0), (435.0, 298.0), (625.0, 108.0)],
+                "point_confidences": [0.9, 0.8, 0.7, 0.6, 0.5],
+            },
         },
     }
     pane.set_auto_suggestions([suggestion])
 
+    assert pane.use_suggestion_button.isEnabled()
+    assert "LOW_CONFIDENCE" in pane.auto_suggestion_status_label.text()
+    assert "COPY READY" in pane.auto_suggestion_status_label.text()
+
     pane._on_suggestion_point_right_clicked("left", "ridge", 1)
 
-    expected = tuple(
+    expected_left = tuple(
         SourcePixel(*point)
-        for point in ((10.0, 20.0), (50.0, 60.0), (70.0, 80.0), (90.0, 100.0))
+        for point in ((10.0, 20.0), (260.0, 55.0), (430.0, 300.0), (620.0, 110.0))
     )
-    assert pane.annotation_views["left"].suggestion_points("ridge") == expected
-    assert pane.annotation_views["right"].suggestion_points("ridge") == expected
+    expected_right = tuple(
+        SourcePixel(*point)
+        for point in ((15.0, 18.0), (265.0, 53.0), (435.0, 298.0), (625.0, 108.0))
+    )
+    assert pane.annotation_views["left"].suggestion_points("ridge") == expected_left
+    assert pane.annotation_views["right"].suggestion_points("ridge") == expected_right
     assert pane.command_payload("alignment.pose.use_suggestion")["excluded_point_indices"] == [1]
     assert "excluded pairs 1" in pane.auto_suggestion_metrics_label.text()
 
     # A periodic owner snapshot must not restore the operator-excluded pair.
     pane.set_auto_suggestions([suggestion])
-    assert pane.annotation_views["left"].suggestion_points("ridge") == expected
+    assert pane.annotation_views["left"].suggestion_points("ridge") == expected_left
+    assert pane.use_suggestion_button.isEnabled()
+
+    pane._on_suggestion_point_right_clicked("left", "ridge", 0)
+    assert not pane.use_suggestion_button.isEnabled()
+    assert "COPY BLOCKED" in pane.auto_suggestion_status_label.text()
     pane.deleteLater()
     app.processEvents()
 

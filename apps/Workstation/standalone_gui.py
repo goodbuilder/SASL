@@ -1330,6 +1330,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.pixhawk_usb_recovery_status: dict[str, dict[str, object]] = {}
         self.pixhawk_host_ip_discovery_thread: QtCore.QThread | None = None
         self.pixhawk_host_ip_discovery_worker: PixhawkHostIpDiscoveryWorker | None = None
+        self.pixhawk_network_discovery_thread: QtCore.QThread | None = None
+        self.pixhawk_network_discovery_worker: QtCore.QObject | None = None
+        self._pending_pixhawk_network_assignment: dict[str, dict[str, object]] = {}
         self.pixhawk_connection_thread: QtCore.QThread | None = None
         self.pixhawk_connection_worker: PixhawkConnectionWorker | None = None
         self.pixhawk_disconnection_thread: QtCore.QThread | None = None
@@ -2096,6 +2099,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._pixhawk_candidate_rows: list[dict[str, object]] = []
         self._pixhawk_candidate_rows_by_source: dict[str, list[dict[str, object]]] = {
             "pc": [],
+            "network": [],
             "mavlink": [],
         }
         self.workstation_pixhawk_discovery_status = "NOT RUN"
@@ -2155,6 +2159,27 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.right_pixhawk_eth_ip_edit = QtWidgets.QLineEdit(self.settings.right_pixhawk_eth_ip)
         self.left_mavlink_url_edit = QtWidgets.QLineEdit(self.settings.left_mavlink_url)
         self.right_mavlink_url_edit = QtWidgets.QLineEdit(self.settings.right_mavlink_url)
+        self.pixhawk_network_assignments: dict[str, dict[str, str]] = {
+            "left": {
+                "interface": str(getattr(self.settings, "left_mavlink_interface", "") or ""),
+                "local_address": str(
+                    getattr(self.settings, "left_mavlink_local_address", "") or ""
+                ),
+            },
+            "right": {
+                "interface": str(getattr(self.settings, "right_mavlink_interface", "") or ""),
+                "local_address": str(
+                    getattr(self.settings, "right_mavlink_local_address", "") or ""
+                ),
+            },
+        }
+        self.pixhawk_network_assignment_status: dict[str, dict[str, str]] = {
+            side: {
+                "state": "ASSIGNED" if values["interface"] else "LEGACY AUTO ROUTE",
+                "detail": "saved operator assignment" if values["interface"] else "no explicit NIC assignment",
+            }
+            for side, values in self.pixhawk_network_assignments.items()
+        }
         self.left_mavlink_baud_spin = self._build_mavlink_baud_spin()
         self.left_mavlink_baud_spin.setValue(self.settings.left_mavlink_baud)
         self.right_mavlink_baud_spin = self._build_mavlink_baud_spin()
@@ -7926,17 +7951,24 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def _pixhawk_candidate_source_for_kind(self, kind: str) -> str:
         if kind == "PC_IP":
             return "pc"
+        if kind == "NETWORK":
+            return "network"
         return "mavlink"
 
     def _sync_legacy_pixhawk_candidate_rows(self) -> None:
         self._pixhawk_candidate_rows = [
             *self._pixhawk_candidate_rows_by_source.get("pc", []),
+            *self._pixhawk_candidate_rows_by_source.get("network", []),
             *self._pixhawk_candidate_rows_by_source.get("mavlink", []),
         ]
 
     def _set_pixhawk_candidate_rows(self, rows: list[dict[str, object]], *, source: str | None = None) -> None:
         if source is None:
-            grouped: dict[str, list[dict[str, object]]] = {"pc": [], "mavlink": []}
+            grouped: dict[str, list[dict[str, object]]] = {
+                "pc": [],
+                "network": [],
+                "mavlink": [],
+            }
             for entry in rows:
                 grouped[self._pixhawk_candidate_source_for_kind(str(entry.get("kind", "")))].append(entry)
             self._pixhawk_candidate_rows_by_source = grouped
@@ -8256,6 +8288,17 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.left_pixhawk_bootstrap_baud_spin.setValue(
             int(self._swap_spinbox_value(self.left_pixhawk_bootstrap_baud_spin, self.right_pixhawk_bootstrap_baud_spin))
         )
+        assignments = getattr(self, "pixhawk_network_assignments", {})
+        if isinstance(assignments, dict):
+            left_assignment = dict(assignments.get("left") or {})
+            assignments["left"] = dict(assignments.get("right") or {})
+            assignments["right"] = left_assignment
+        assignment_status = getattr(self, "pixhawk_network_assignment_status", {})
+        if isinstance(assignment_status, dict):
+            left_status = dict(assignment_status.get("left") or {})
+            assignment_status["left"] = dict(assignment_status.get("right") or {})
+            assignment_status["right"] = left_status
+        self._save_current_settings()
         self._log("[픽스호크] Pixhawk 1/2 MAVLink 매핑을 교체했습니다.")
         for side in ("left", "right"):
             if side in mavlink_connected_sides:
@@ -10592,6 +10635,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def _pixhawk_host_ip_discovery_failed(self, *args: Any, **kwargs: Any) -> Any: ...
         def _clear_pixhawk_host_ip_discovery(self, *args: Any, **kwargs: Any) -> Any: ...
         def _append_pixhawk_host_ip_candidates(self, *args: Any, **kwargs: Any) -> Any: ...
+        def discover_pixhawk_network(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _apply_pixhawk_network_discovery(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _pixhawk_network_discovery_failed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_pixhawk_network_discovery(self, *args: Any, **kwargs: Any) -> Any: ...
+        def assign_pixhawk_network_candidate(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _commit_pixhawk_network_assignment(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _pixhawk_network_preflight(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _pixhawk_connect_preflight_sides(self, *args: Any, **kwargs: Any) -> Any: ...
         def apply_pc_camera_ip(self, *args: Any, **kwargs: Any) -> Any: ...
         def _apply_camera_network_address_result(self, *args: Any, **kwargs: Any) -> Any: ...
         def _camera_network_apply_failed(self, *args: Any, **kwargs: Any) -> Any: ...

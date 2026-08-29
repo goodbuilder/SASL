@@ -72,6 +72,7 @@ BACKEND_FACADE_METHODS = (
     "pixhawk_discover_mavlink_candidates",
     "pixhawk_discover_host_ip",
     "pixhawk_apply_candidate",
+    "pixhawk_assign_network_candidate",
     "gnss_base_discover",
     "gnss_base_apply_candidate",
     "gnss_base_connect",

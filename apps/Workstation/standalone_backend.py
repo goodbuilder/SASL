@@ -285,13 +285,16 @@ class StandalonePanelBackend(QtCore.QObject):
         return self._call("discover_usb_pixhawk_connections")
 
     def pixhawk_discover_mavlink_candidates(self) -> Any:
-        return self._call("discover_mavlink_url_candidates")
+        return self._call("discover_pixhawk_network")
 
     def pixhawk_discover_host_ip(self) -> Any:
         return self._call("discover_pc_pixhawk_ip")
 
     def pixhawk_apply_candidate(self, source: str, row: int, target: str) -> Any:
         return self._call("apply_pixhawk_candidate", source, row, target)
+
+    def pixhawk_assign_network_candidate(self, candidate_id: str, side: str) -> Any:
+        return self._call("assign_pixhawk_network_candidate", candidate_id, side)
 
     def gnss_base_discover(self) -> Any:
         return self._call("discover_gnss_base_serial_ports")

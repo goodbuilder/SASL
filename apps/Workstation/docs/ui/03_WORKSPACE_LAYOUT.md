@@ -118,7 +118,9 @@ opens the Workstation `Advanced` preview tab rather than exposing the internal o
 ## 17. Pixhawk / GNSS / Detection / Recording / Analysis
 
 Pixhawk, Base GNSS, and Alignment have separate Workstation pages. Pixhawk presents P1/P2
-attitude, rover fix numbers, and NED/FRD baseline evidence. Its `Pixhawk Parameters`
+attitude, rover fix numbers, and NED/FRD baseline evidence. Directly below Connection it keeps a
+bounded, horizontally scrollable NIC/address/route candidate table plus stable P1/P2 assignment
+summaries; live status refresh must not rebuild that table or move its selection. Its `Pixhawk Parameters`
 group has P1/P2 tabs, each split into Accelerometer, Gyroscope, Compass/Magnetometer,
 Level Horizon, and manual Board Orientation groups. The first four groups provide a guarded
 reset button that sends PX4 `param reset` only for that group's parameters and then refreshes

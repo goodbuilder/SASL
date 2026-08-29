@@ -260,7 +260,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             (
                 "pixhawk.discover_mavlink_candidates",
                 "Find network links",
-                "Generate Ethernet MAVLink URL candidates without changing the selected P1/P2 endpoints.",
+                "Read wired NIC, IPv4 and P1/P2 kernel-route choices without changing host networking.",
                 "device",
                 self._pixhawk_discover_mavlink_candidates,
             ),
@@ -1919,7 +1919,15 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         pixhawk_connected = bool(open_sides)
         pixhawk_connecting = getattr(panel, "pixhawk_connection_thread", None) is not None
         pixhawk_active = pixhawk_connected or pixhawk_connecting
-        self.commands.set_enabled("pixhawk.connect_mavlink", source_connection_allowed and not pixhawk_active)
+        configured_reader = getattr(panel, "_configured_mavlink_sides", None)
+        configured_sides = (
+            set(configured_reader()) if callable(configured_reader) else {"left", "right"}
+        )
+        has_disconnected_target = bool(configured_sides - open_sides)
+        self.commands.set_enabled(
+            "pixhawk.connect_mavlink",
+            source_connection_allowed and not pixhawk_connecting and has_disconnected_target,
+        )
         self.commands.set_enabled("pixhawk.disconnect_mavlink", source_connection_allowed and pixhawk_active)
         managers = getattr(panel, "px4_mag_managers", {}) or {}
         disarmed_open_sides = {

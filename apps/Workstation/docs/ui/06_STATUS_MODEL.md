@@ -82,6 +82,11 @@ The subscriber owns an immutable per-side MAVLink health snapshot; widgets do no
 `socket exists`, ping, or one historical heartbeat. Workstation does not expose a ROS2 transport;
 Legacy transport semantics remain in the Legacy UI.
 
+The Pixhawk workspace separately projects network assignment evidence: `LEGACY AUTO ROUTE`,
+`ASSIGNED`, `REASSIGN REQUIRED`, `LINK DOWN`, `ADDRESS MISSING`, `NO ROUTE`, `ROUTE MISMATCH`,
+`ENDPOINT INVALID`, and `PORT IN USE`. These states describe the host-side prerequisite and never
+promote a side to CONNECTING/LIVE. Same-NIC topology is not a warning/status dimension.
+
 - `DISCONNECTED`: local listener absent.
 - `CONNECTING`: listener open but expected P1/P2 system identity not observed.
 - `QUALIFYING`: expected identity plus fresh heartbeat/ATTITUDE, but less than 10 continuous minutes.

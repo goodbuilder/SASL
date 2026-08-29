@@ -275,6 +275,9 @@ class _FakeBackend:
     def pixhawk_apply_candidate(self, source: str, row: int, target: str) -> None:
         self.calls.append(("pixhawk_apply_candidate", source, row, target))
 
+    def pixhawk_assign_network_candidate(self, candidate_id: str, side: str) -> None:
+        self.calls.append(("pixhawk_assign_network_candidate", candidate_id, side))
+
     def gnss_base_discover(self) -> None:
         self.calls.append("gnss_base_discover")
 

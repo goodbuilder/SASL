@@ -108,10 +108,23 @@ removed. The exact parameters, SD-card files, recovery sequence, and field check
 The current field wiring isolates camera and Pixhawk Layer-2 traffic on separate NICs. Cameras use
 `enx588694fce07e` with `10.0.0.11/32` and preferred-source host routes to `.231/.232`; P1/P2 use
 the replacement RTL8156B `enx0023a40a2e39` with `10.0.0.10/24` and `.2/.3` routes. Neither device
-profile supplies a default route. Do not move camera and Pixhawk traffic back onto one broadcast
-domain: that topology reproduced a persistent dual-PX4 MAVLink service stall under RTSP load.
-Both Workstation and Legacy defaults now preserve this split; a clean or reset settings file no
-longer proposes the Pixhawk NIC's `.10/24` address for the camera interface.
+profile supplies a default route. This remains the field-qualified topology because a shared
+camera/Pixhawk broadcast domain reproduced a persistent dual-PX4 MAVLink service stall under RTSP
+load. The UI nevertheless permits the same physical NIC to be assigned to Camera and Pixhawk
+without a topology warning or readiness gate; that selectable layout is not a claim of sustained
+field stability. Both Workstation and Legacy defaults preserve the split, and a clean or reset
+settings file does not propose the Pixhawk NIC's `.10/24` address for the camera interface.
+
+On the Pixhawk page, `Find network` performs a read-only inventory of physical wired NICs, their
+current IPv4 addresses, carrier state, and the kernel-selected P1/P2 routes. It never adds an IP,
+route, NetworkManager profile, or default gateway. The candidate table shows only NIC/local-address
+choices and their P1/P2 assignment labels; it does not mix both routes/endpoints into one row.
+Select a row and press `Assign P1` or `Assign P2`. Independent P1/P2 cards then show that side's
+State, NIC, Local IPv4, Endpoint and Route, and the last assignment is saved. P1/P2 may share a NIC
+or use different NICs. `Connect` re-reads each selected side's existing address and
+`destination -> dev/src` route before opening its MAVLink socket. A missing interface/address,
+link-down, or route mismatch fails only that side; an independently valid side remains connected.
+Replacing a NIC changes its `enx...` name, so run `Find network` and Assign that side again.
 
 At runtime Workstation identifies itself on both Ethernet links as MAVLink GCS `255/190`. Connect
 immediately seeds each configured peer with one GCS heartbeat to break PX4's pre-identity broadcast
@@ -436,8 +449,11 @@ the promoted method tabs, then press `Capture Live Pair`. The
 `Auto-select Horizon` and `Auto-select Mountain` actions analyze only those
 immutable native left/right frames with the exact frozen operating `K,D`. Review the dashed
 overlay and quality strip, then press `Use suggestion` before running the existing Horizon or
-Mountain solver. Automatic selection never applies `R,t` by itself. The manual Horizon,
-Mountain, and Target modes remain available as a fallback.
+Mountain solver. Horizon/Mountain `GOOD`/`LOW_CONFIDENCE` is quality evidence rather than copy
+permission: `Use suggestion` is available whenever current-frame native points remain structurally
+usable. Horizon requires exactly two in-frame endpoints per side separated by at least 25% of image
+width; Mountain requires paired unique/distributed points after exclusions. Automatic selection
+never applies `R,t` by itself. The manual Horizon, Mountain, and Target modes remain available.
 
 Auto-selection runs in a background worker so the Workstation window remains responsive while
 Horizon/Mountain image analysis is running. Both automatic-selection buttons are disabled during
@@ -759,7 +775,9 @@ python3 tools/check_portable_paths.py
   skyline line. Mountain suggestions use OpenCV SIFT, or ORB when SIFT is unavailable, followed
   by mutual ratio matching, RANSAC epipolar filtering, and spatially distributed point selection.
 - Automatic suggestion evidence includes `detection_method`, `confidence`, `match_count`/
-  `inlier_count`, `residual_px`, `eligible`, and `failure_reason`. Creation and approval are
+  `inlier_count`, `residual_px`, `eligible`, `copy_eligible`, `copy_block_reason`, and
+  `failure_reason`. Mountain approval also records the shared exclusion indices, original/retained
+  pair counts, and canonical filtered-input SHA-256. Creation and approval are
   recorded as `optical_pose_auto_suggestion_created` and
   `optical_pose_auto_suggestion_accepted` events. The complete native point sets are retained
   in those event payloads, while `optical_pose_annotations_updated` records the committed
@@ -1169,10 +1187,13 @@ python3 tools/check_portable_paths.py
 - Auto-select Horizon/Mountain is CPU-heavy SIFT/gradient work but runs off the Qt UI thread;
   wait for the `RUNNING` status to clear before starting another optical-pose action. A stale
   result from an older frozen burst is rejected instead of being added to the current overlay.
-- `GOOD` and eligible suggestions may be approved. `NO_DATA`, `LOW_CONFIDENCE`, incomplete,
-  duplicate, or near-collinear Mountain suggestions remain overlay-only and never replace
-  existing manual points. Editing an accepted point changes its provenance display to
-  `MANUAL_EDITED`.
+- Horizon and Mountain `Use suggestion` ignore detector quality state/confidence while preserving
+  them as visible and persisted evidence. Horizon owner validation requires current frozen
+  identities/dimensions and exactly two finite in-frame endpoints per side separated by at least
+  25% of native width. Mountain requires equal ordered Left/Right counts and at least four finite
+  in-frame unique/distributed pairs after shared exclusions. `NO_DATA` normally has no usable
+  points and remains structurally blocked; incomplete, stale, out-of-range, duplicate or degenerate
+  proposals remain blocked. Editing accepted points changes provenance to `MANUAL_EDITED`.
 - Applying, reverting, or resetting Alignment appends its persistence projection independently of
   Measurement start/stop.
 - Method readiness is independent. A frozen static Checkerboard or full Optical-Pose Draft is not
@@ -1522,13 +1543,16 @@ the settings file. Use Base receiver discovery or confirm the connected F9P devi
 firmware before field operation.
 
 Automatic Horizon detection can confuse clouds, trees, roofs, or multiple strong boundaries
-with the sky/terrain edge; inspect its confidence, residual, and overlay before approval. Only
-a physical/geometric horizon compatible with the selected `horizon_model` is a valid input --
-a mountain ridge, building skyline, or tree line is not; use the Mountain method for a ridge.
+with the sky/terrain edge; inspect its confidence, residual, and overlay before approval. Quality
+does not block copying, and structural endpoint readiness does not prove the detected line is a
+physical horizon. Use manual endpoints when the overlay is wrong. Only a physical/geometric horizon
+compatible with the selected `horizon_model` is valid -- a mountain ridge, building skyline, or
+tree line is not; use the Mountain method for a ridge.
 Automatic Mountain matching depends on shared visible texture and can be weak in fog,
 low-texture terrain, vegetation, or repeated patterns; a failure or low-confidence result
-should be handled with manual clicks. Mountain auto-selection does not create terrain heights
-or 3-D PnP correspondences and does not replace the GNSS-baseline rotation solver. Terrain PnP
+must still be reviewed. A structurally usable low-confidence proposal may be copied for editing;
+otherwise use manual clicks. Mountain auto-selection does not create terrain heights or 3-D PnP
+correspondences and does not replace the GNSS-baseline rotation solver. Terrain PnP
 still requires explicit 3-D object points and an imported GeoTIFF with a declared vertical
 datum.
 
@@ -1592,6 +1616,11 @@ live on the panel at solve time -- a later live-GPS change cannot silently retar
 frozen Mountain image.
 
 ## Change Log
+
+- 2026-08-29: Removed Horizon detector quality from `Use suggestion` permission while retaining
+  `GOOD`/`LOW_CONFIDENCE`, confidence, residual and reason text/evidence. Owner/UI validation now
+  requires current frozen identity, exactly two finite in-frame endpoints per side and the existing
+  25%-width separation; explicit Solve/Apply remain unchanged.
 
 - 2026-08-29: Documented the observed NVIDIA `595.84`/Linux 6.8 `s2idle` resume failure with two
   active NVDEC workers: paired Xid 31 MMU faults, UVM fatal error, Xid 154 reboot requirement,

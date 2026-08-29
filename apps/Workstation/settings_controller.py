@@ -73,6 +73,16 @@ class WorkstationSettingsController:
         """Apply the complete Workstation system-settings surface to owner widgets."""
 
         panel = self.panel
+        previous_pixhawk_network_values: dict[str, tuple[str, str]] = {}
+        for side in ("left", "right"):
+            peer_edit = getattr(panel, f"{side}_pixhawk_eth_ip_edit", None)
+            endpoint_edit = getattr(panel, f"{side}_mavlink_url_edit", None)
+            if peer_edit is None or endpoint_edit is None:
+                continue
+            previous_pixhawk_network_values[side] = (
+                peer_edit.text().strip(),
+                endpoint_edit.text().strip(),
+            )
 
         def has(name: str) -> bool:
             return name in values and values[name] is not None
@@ -165,6 +175,22 @@ class WorkstationSettingsController:
         }
         for name, attribute in simple_text.items():
             set_text(name, attribute)
+
+        assignments = getattr(panel, "pixhawk_network_assignments", {})
+        assignment_status = getattr(panel, "pixhawk_network_assignment_status", {})
+        for side in previous_pixhawk_network_values:
+            peer_edit = getattr(panel, f"{side}_pixhawk_eth_ip_edit")
+            endpoint_edit = getattr(panel, f"{side}_mavlink_url_edit")
+            current = (peer_edit.text().strip(), endpoint_edit.text().strip())
+            if current == previous_pixhawk_network_values[side]:
+                continue
+            if isinstance(assignments, dict):
+                assignments[side] = {"interface": "", "local_address": ""}
+            if isinstance(assignment_status, dict):
+                assignment_status[side] = {
+                    "state": "LEGACY AUTO ROUTE",
+                    "detail": "peer/endpoint changed in Settings; explicit NIC assignment cleared",
+                }
 
         if has("drone_telemetry_url"):
             panel.drone_telemetry_url = str(values["drone_telemetry_url"] or "")
@@ -656,6 +682,26 @@ class WorkstationSettingsController:
             right_mavlink_url=panel.right_mavlink_url_edit.text().strip(),
             left_mavlink_baud=panel.left_mavlink_baud_spin.value(),
             right_mavlink_baud=panel.right_mavlink_baud_spin.value(),
+            left_mavlink_interface=str(
+                (getattr(panel, "pixhawk_network_assignments", {}).get("left") or {}).get(
+                    "interface", ""
+                )
+            ),
+            right_mavlink_interface=str(
+                (getattr(panel, "pixhawk_network_assignments", {}).get("right") or {}).get(
+                    "interface", ""
+                )
+            ),
+            left_mavlink_local_address=str(
+                (getattr(panel, "pixhawk_network_assignments", {}).get("left") or {}).get(
+                    "local_address", ""
+                )
+            ),
+            right_mavlink_local_address=str(
+                (getattr(panel, "pixhawk_network_assignments", {}).get("right") or {}).get(
+                    "local_address", ""
+                )
+            ),
             drone_telemetry_url=str(getattr(panel, "drone_telemetry_url", "") or ""),
             drone_telemetry_baud=int(getattr(panel, "drone_telemetry_baud", 57_600)),
             drone_telemetry_rtcm_forward=bool(getattr(panel, "drone_telemetry_rtcm_forward", True)),

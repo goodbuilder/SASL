@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import socket
 import subprocess
@@ -8,6 +9,7 @@ from collections.abc import Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from ipaddress import IPv4Address, IPv4Interface, IPv4Network, ip_interface
+from pathlib import Path
 
 
 DEFAULT_INTERFACE = "enx588694fce07e"
@@ -25,6 +27,7 @@ DEFAULT_RTSP_SCAN_WORKERS = 64
 DEFAULT_TCP_PORT_SCAN_WORKERS = 256
 PKEXEC_TIMEOUT_SECONDS = 15.0
 INTERFACE_STATUS_TIMEOUT_SECONDS = 2.0
+PIXHAWK_NETWORK_COMMAND_TIMEOUT_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,95 @@ class ArpScanReport:
     returncode: int | None
     hosts: tuple[str, ...] = ()
     error: str = ""
+
+
+@dataclass(frozen=True)
+class PixhawkRouteEvidence:
+    """Kernel-selected route for one configured Pixhawk peer.
+
+    This is readback evidence only.  Discovery and validation never add an
+    address, route, NetworkManager profile, or default gateway.
+    """
+
+    peer: str
+    requested_source: str = ""
+    interface: str = ""
+    source: str = ""
+    gateway: str = ""
+    error: str = ""
+
+    @property
+    def available(self) -> bool:
+        return bool(self.interface) and not self.error
+
+    def status_for(self, interface_name: str, local_ip: str = "") -> str:
+        if not self.available:
+            return "NO ROUTE"
+        if self.interface != str(interface_name):
+            return "ROUTE MISMATCH"
+        if local_ip and self.source and self.source != str(local_ip):
+            return "SOURCE MISMATCH"
+        return "ROUTE OK"
+
+    def summary_for(self, interface_name: str, local_ip: str = "") -> str:
+        state = self.status_for(interface_name, local_ip)
+        if state != "ROUTE OK":
+            suffix = f" · {self.error}" if self.error else ""
+            if self.interface:
+                suffix += f" · dev={self.interface} src={self.source or '--'}"
+            return f"{state}{suffix}"
+        via = f" via {self.gateway}" if self.gateway else ""
+        return f"ROUTE OK · {self.interface} src={self.source or '--'}{via}"
+
+
+@dataclass(frozen=True)
+class PixhawkNetworkCandidate:
+    """One operator-selectable wired NIC/local-address combination."""
+
+    candidate_id: str
+    interface: str
+    ifindex: int | None
+    carrier: str
+    local_cidr: str
+    local_ip: str
+    mac: str
+    driver: str
+    device_path: str
+    p1_route: PixhawkRouteEvidence
+    p2_route: PixhawkRouteEvidence
+    p1_endpoint: str
+    p2_endpoint: str
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "candidate_id": self.candidate_id,
+            "interface": self.interface,
+            "ifindex": self.ifindex,
+            "carrier": self.carrier,
+            "local_cidr": self.local_cidr,
+            "local_ip": self.local_ip,
+            "mac": self.mac,
+            "driver": self.driver,
+            "device_path": self.device_path,
+            "p1_route": self.p1_route.summary_for(self.interface, self.local_ip),
+            "p2_route": self.p2_route.summary_for(self.interface, self.local_ip),
+            "p1_route_state": self.p1_route.status_for(self.interface, self.local_ip),
+            "p2_route_state": self.p2_route.status_for(self.interface, self.local_ip),
+            "p1_route_interface": self.p1_route.interface,
+            "p2_route_interface": self.p2_route.interface,
+            "p1_route_source": self.p1_route.source,
+            "p2_route_source": self.p2_route.source,
+            "p1_endpoint": self.p1_endpoint,
+            "p2_endpoint": self.p2_endpoint,
+        }
+
+
+@dataclass(frozen=True)
+class PixhawkAssignmentValidation:
+    ok: bool
+    state: str
+    detail: str
+    route: PixhawkRouteEvidence | None = None
 
 
 def rtsp_host_port(url: str) -> tuple[str, int]:
@@ -739,6 +831,257 @@ def wired_interface_names() -> tuple[str, ...]:
             continue
         names.append(name)
     return tuple(names)
+
+
+def _run_ip_json(args: list[str]) -> list[dict[str, object]]:
+    try:
+        result = subprocess.run(
+            ["ip", "-j", *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=PIXHAWK_NETWORK_COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"Timed out reading kernel network state after "
+            f"{PIXHAWK_NETWORK_COMMAND_TIMEOUT_SECONDS:.1f}s: ip -j {' '.join(args)}"
+        ) from exc
+    if result.returncode != 0:
+        error = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(error or f"ip -j {' '.join(args)} failed with rc={result.returncode}")
+    try:
+        payload = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"ip -j {' '.join(args)} returned invalid JSON: {exc}") from exc
+    if not isinstance(payload, list):
+        raise RuntimeError(f"ip -j {' '.join(args)} returned a non-list payload")
+    return [row for row in payload if isinstance(row, dict)]
+
+
+def _interface_carrier(interface_name: str, link: dict[str, object]) -> str:
+    carrier_path = Path("/sys/class/net") / interface_name / "carrier"
+    try:
+        raw = carrier_path.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError):
+        raw = ""
+    if raw == "1":
+        return "UP"
+    if raw == "0":
+        return "DOWN"
+    operstate = str(link.get("operstate") or "").upper()
+    if operstate in {"UP", "DOWN"}:
+        return operstate
+    flags = {str(flag).upper() for flag in (link.get("flags") or ())}
+    return "UP" if "LOWER_UP" in flags else "UNKNOWN"
+
+
+def _interface_device_identity(interface_name: str) -> tuple[str, str]:
+    device = Path("/sys/class/net") / interface_name / "device"
+    try:
+        device_path = str(device.resolve(strict=True))
+    except OSError:
+        device_path = ""
+    driver = ""
+    try:
+        driver = (device / "driver").resolve(strict=True).name
+    except OSError:
+        pass
+    return driver, device_path
+
+
+def _wired_link_inventory() -> list[dict[str, object]]:
+    links: list[dict[str, object]] = []
+    for row in _run_ip_json(["link", "show"]):
+        interface_name = str(row.get("ifname") or "").split("@", 1)[0]
+        if not interface_name or _skip_interface(interface_name):
+            continue
+        if str(row.get("link_type") or "").lower() == "loopback":
+            continue
+        driver, device_path = _interface_device_identity(interface_name)
+        links.append(
+            {
+                "interface": interface_name,
+                "ifindex": row.get("ifindex") if isinstance(row.get("ifindex"), int) else None,
+                "carrier": _interface_carrier(interface_name, row),
+                "mac": str(row.get("address") or ""),
+                "driver": driver,
+                "device_path": device_path,
+            }
+        )
+    return links
+
+
+def _global_ipv4_inventory() -> dict[str, list[IPv4Interface]]:
+    addresses: dict[str, list[IPv4Interface]] = {}
+    for row in _run_ip_json(["-4", "addr", "show", "scope", "global"]):
+        interface_name = str(row.get("ifname") or "").split("@", 1)[0]
+        if not interface_name:
+            continue
+        for info in row.get("addr_info") or ():
+            if not isinstance(info, dict) or str(info.get("family") or "") != "inet":
+                continue
+            local = str(info.get("local") or "")
+            prefixlen = info.get("prefixlen")
+            try:
+                address = ip_interface(f"{local}/{int(prefixlen)}")
+            except (TypeError, ValueError):
+                continue
+            if isinstance(address, IPv4Interface):
+                addresses.setdefault(interface_name, []).append(address)
+    return {
+        interface_name: _dedupe_interfaces(interface_addresses)
+        for interface_name, interface_addresses in addresses.items()
+    }
+
+
+def pixhawk_route_evidence(peer_host: str, *, requested_source: str = "") -> PixhawkRouteEvidence:
+    try:
+        peer = str(IPv4Address(str(peer_host).strip()))
+    except ValueError as exc:
+        return PixhawkRouteEvidence(
+            peer=str(peer_host),
+            requested_source=str(requested_source),
+            error=f"invalid peer IPv4: {exc}",
+        )
+    source = str(requested_source).strip().split("/", 1)[0]
+    if source:
+        try:
+            source = str(IPv4Address(source))
+        except ValueError as exc:
+            return PixhawkRouteEvidence(
+                peer=peer,
+                requested_source=str(requested_source),
+                error=f"invalid source IPv4: {exc}",
+            )
+    args = ["-4", "route", "get", peer]
+    if source:
+        args.extend(("from", source))
+    try:
+        rows = _run_ip_json(args)
+    except (RuntimeError, TimeoutError) as exc:
+        return PixhawkRouteEvidence(peer=peer, requested_source=source, error=str(exc))
+    if not rows:
+        return PixhawkRouteEvidence(peer=peer, requested_source=source, error="no route result")
+    row = rows[0]
+    return PixhawkRouteEvidence(
+        peer=peer,
+        requested_source=source,
+        interface=str(row.get("dev") or ""),
+        source=str(row.get("prefsrc") or row.get("src") or ""),
+        gateway=str(row.get("gateway") or ""),
+        error="" if row.get("dev") else "route result has no device",
+    )
+
+
+def discover_pixhawk_network_candidates(
+    *,
+    p1_peer: str,
+    p2_peer: str,
+    p1_endpoint: str,
+    p2_endpoint: str,
+) -> list[PixhawkNetworkCandidate]:
+    """Return every physical wired NIC/address choice without changing host state."""
+
+    links = _wired_link_inventory()
+    addresses = _global_ipv4_inventory()
+    route_cache: dict[tuple[str, str], PixhawkRouteEvidence] = {}
+
+    def route(peer: str, source: str) -> PixhawkRouteEvidence:
+        key = (str(peer), str(source))
+        if key not in route_cache:
+            route_cache[key] = pixhawk_route_evidence(peer, requested_source=source)
+        return route_cache[key]
+
+    candidates: list[PixhawkNetworkCandidate] = []
+    for link in links:
+        interface_name = str(link["interface"])
+        interface_addresses = addresses.get(interface_name) or [None]
+        for address in interface_addresses:
+            local_cidr = "" if address is None else str(address)
+            local_ip = "" if address is None else str(address.ip)
+            ifindex = link.get("ifindex") if isinstance(link.get("ifindex"), int) else None
+            candidate_id = f"{ifindex if ifindex is not None else '-'}:{interface_name}:{local_cidr or '-'}"
+            candidates.append(
+                PixhawkNetworkCandidate(
+                    candidate_id=candidate_id,
+                    interface=interface_name,
+                    ifindex=ifindex,
+                    carrier=str(link.get("carrier") or "UNKNOWN"),
+                    local_cidr=local_cidr,
+                    local_ip=local_ip,
+                    mac=str(link.get("mac") or ""),
+                    driver=str(link.get("driver") or ""),
+                    device_path=str(link.get("device_path") or ""),
+                    p1_route=route(p1_peer, local_ip),
+                    p2_route=route(p2_peer, local_ip),
+                    p1_endpoint=str(p1_endpoint),
+                    p2_endpoint=str(p2_endpoint),
+                )
+            )
+    return sorted(
+        candidates,
+        key=lambda item: (item.interface, item.local_cidr == "", item.local_cidr),
+    )
+
+
+def validate_pixhawk_network_assignment(
+    *,
+    interface_name: str,
+    local_address: str,
+    peer_host: str,
+    endpoint: str,
+) -> PixhawkAssignmentValidation:
+    interface_name = str(interface_name).strip()
+    if not interface_name:
+        return PixhawkAssignmentValidation(True, "LEGACY AUTO ROUTE", "no explicit NIC assignment")
+    try:
+        links = {str(row["interface"]): row for row in _wired_link_inventory()}
+    except (RuntimeError, TimeoutError) as exc:
+        return PixhawkAssignmentValidation(False, "NETWORK READ ERROR", str(exc))
+    link = links.get(interface_name)
+    if link is None:
+        return PixhawkAssignmentValidation(False, "INTERFACE MISSING", f"{interface_name} does not exist")
+    if str(link.get("carrier") or "UNKNOWN") == "DOWN":
+        return PixhawkAssignmentValidation(False, "LINK DOWN", f"{interface_name} has no carrier")
+    local_ip = str(local_address).strip().split("/", 1)[0]
+    if not local_ip:
+        return PixhawkAssignmentValidation(
+            False,
+            "ADDRESS MISSING",
+            f"{interface_name} assignment has no local IPv4 address",
+        )
+    try:
+        local_ip = str(IPv4Address(local_ip))
+    except ValueError as exc:
+        return PixhawkAssignmentValidation(False, "ADDRESS INVALID", str(exc))
+    try:
+        addresses = _global_ipv4_inventory()
+    except (RuntimeError, TimeoutError) as exc:
+        return PixhawkAssignmentValidation(False, "NETWORK READ ERROR", str(exc))
+    if local_ip not in {str(address.ip) for address in addresses.get(interface_name, ())}:
+        return PixhawkAssignmentValidation(
+            False,
+            "ADDRESS MISSING",
+            f"{local_ip} is not assigned to {interface_name}",
+        )
+    if not str(endpoint).strip():
+        return PixhawkAssignmentValidation(False, "ENDPOINT INVALID", "MAVLink endpoint is empty")
+    route = pixhawk_route_evidence(peer_host, requested_source=local_ip)
+    state = route.status_for(interface_name, local_ip)
+    if state != "ROUTE OK":
+        return PixhawkAssignmentValidation(
+            False,
+            state,
+            route.summary_for(interface_name, local_ip),
+            route,
+        )
+    return PixhawkAssignmentValidation(
+        True,
+        "ROUTE OK",
+        route.summary_for(interface_name, local_ip),
+        route,
+    )
 
 
 def _skip_interface(name: str, *, include_wireless: bool = False) -> bool:

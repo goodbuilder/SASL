@@ -131,6 +131,7 @@ class AppLifecycleController:
             "interface_status_thread",
             "pixhawk_usb_discovery_thread",
             "pixhawk_host_ip_discovery_thread",
+            "pixhawk_network_discovery_thread",
             "drone_telemetry_usb_discovery_thread",
             "rtsp_check_thread",
             "rtsp_enable_thread",

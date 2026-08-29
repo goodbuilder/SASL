@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from PyQt5 import QtCore
+
 from Workstation.tests.workstation_test_support import (
     BackendStatusAdapter,
     contextmanager,
@@ -2031,6 +2033,23 @@ def test_camera_and_pixhawk_discovery_candidates_are_visible_and_assignable() ->
         },
     ]
     backend.panel._pixhawk_candidate_rows_by_source = {
+        "network": [
+            {
+                "kind": "NETWORK",
+                "candidate_id": "5:enp5s0:192.168.1.10/24",
+                "interface": "enp5s0",
+                "carrier": "UP",
+                "local_cidr": "192.168.1.10/24",
+                "local_ip": "192.168.1.10",
+                "p1_route": "ROUTE OK · enp5s0 src=192.168.1.10",
+                "p2_route": "ROUTE OK · enp5s0 src=192.168.1.10",
+                "p1_route_state": "ROUTE OK",
+                "p2_route_state": "ROUTE OK",
+                "p1_endpoint": "udpin:0.0.0.0:14550",
+                "p2_endpoint": "udpin:0.0.0.0:14551",
+                "status": "LINK UP · P1 ROUTE OK · P2 ROUTE OK",
+            }
+        ],
         "pc": [
             {
                 "kind": "PC_IP",
@@ -2048,6 +2067,20 @@ def test_camera_and_pixhawk_discovery_candidates_are_visible_and_assignable() ->
             }
         ],
     }
+    backend.panel.pixhawk_network_assignments = {
+        "left": {"interface": "", "local_address": ""},
+        "right": {"interface": "", "local_address": ""},
+    }
+    backend.panel.pixhawk_network_assignment_status = {
+        "left": {"state": "LEGACY AUTO ROUTE", "detail": "no explicit NIC assignment"},
+        "right": {"state": "LEGACY AUTO ROUTE", "detail": "no explicit NIC assignment"},
+    }
+    backend.panel.left_mavlink_url_edit = SimpleNamespace(
+        text=lambda: "udpin:0.0.0.0:14550"
+    )
+    backend.panel.right_mavlink_url_edit = SimpleNamespace(
+        text=lambda: "udpin:0.0.0.0:14551"
+    )
     backend.panel.workstation_camera_discovery_status = "FOUND 2 ENDPOINTS"
     backend.panel.workstation_pixhawk_discovery_status = "FOUND 2 ENDPOINTS"
     window = WorkstationMainWindow(backend=backend)
@@ -2072,19 +2105,68 @@ def test_camera_and_pixhawk_discovery_candidates_are_visible_and_assignable() ->
     assert backend.calls[-1] == ("camera_apply_candidate", 1, "left")
 
     window.pixhawk.refresh(window.status_adapter.model.snapshot())
-    assert window.pixhawk.candidate_model.rowCount() == 2
+    assert window.pixhawk.candidate_model.rowCount() == 3
+    assert window.pixhawk.candidate_model.columnCount() == 5
+    assert [
+        window.pixhawk.candidate_model.headerData(
+            column, QtCore.Qt.Horizontal, QtCore.Qt.DisplayRole
+        )
+        for column in range(window.pixhawk.candidate_model.columnCount())
+    ] == ["Source", "NIC / Device", "Link", "Local IPv4", "Assigned"]
     assert window.pixhawk.discovery_status.value.text() == "FOUND 2 ENDPOINTS"
     pixhawk_inspections: list[dict[str, object]] = []
     window.pixhawk.inspection_requested.connect(pixhawk_inspections.append)
     window.pixhawk.candidate_table.selectRow(0)
     window.pixhawk.candidate_table.clicked.emit(window.pixhawk.candidate_model.index(0, 0))
-    assert pixhawk_inspections[-1]["selection"] == "Pixhawk endpoint · PC_IP"
+    assert pixhawk_inspections[-1]["selection"] == "Pixhawk endpoint · NETWORK"
     assert "no attitude" in str(pixhawk_inspections[-1]["contract"])
-    assert window.pixhawk.candidate_buttons["host"].isEnabled()
-    window.pixhawk.candidate_buttons["host"].click()
-    assert backend.calls[-1] == ("pixhawk_apply_candidate", "pc", 0, "host")
-    assert window.pixhawk.candidate_feedback.text() == "Applied PC_IP to HOST"
+    assert window.pixhawk.candidate_buttons["left"].isEnabled()
+    window.pixhawk.candidate_buttons["left"].click()
+    assert backend.calls[-1] == (
+        "pixhawk_assign_network_candidate",
+        "5:enp5s0:192.168.1.10/24",
+        "left",
+    )
+    assert "press Connect" in window.pixhawk.candidate_feedback.text()
+    backend.panel.pixhawk_network_assignments["left"] = {
+        "interface": "enp5s0",
+        "local_address": "192.168.1.10",
+    }
+    backend.panel.pixhawk_network_assignment_status["left"] = {
+        "state": "ASSIGNED",
+        "detail": "ROUTE OK",
+    }
+    window.pixhawk.refresh(window.status_adapter.model.snapshot())
+    assert window.pixhawk._selected_candidate_row() == 0
+    assert window.pixhawk.candidate_model.item(0, 4).text() == "P1"
+    assert window.pixhawk.network_assignment_values["left"]["state"].value.text() == "ASSIGNED"
+    assert window.pixhawk.network_assignment_values["left"]["nic"].value.text() == "enp5s0"
+    assert window.pixhawk.network_assignment_values["left"]["local"].value.text() == "192.168.1.10"
+    assert (
+        window.pixhawk.network_assignment_values["left"]["endpoint"].value.text()
+        == "udpin:0.0.0.0:14550"
+    )
+    assert window.pixhawk.network_assignment_values["left"]["route"].value.text() == "ROUTE OK"
+    assert window.pixhawk.network_assignment_values["right"]["state"].value.text() == "LEGACY AUTO ROUTE"
+    backend.panel.pixhawk_network_assignments["right"] = {
+        "interface": "enp5s0",
+        "local_address": "192.168.1.10",
+    }
+    backend.panel.pixhawk_network_assignment_status["right"] = {
+        "state": "ASSIGNED",
+        "detail": "ROUTE OK",
+    }
+    window.pixhawk.refresh(window.status_adapter.model.snapshot())
+    assert window.pixhawk.candidate_model.item(0, 4).text() == "P1,P2"
+    assert (
+        window.pixhawk.network_assignment_values["right"]["endpoint"].value.text()
+        == "udpin:0.0.0.0:14551"
+    )
+    assert window.pixhawk.network_assignment_values["right"]["route"].value.text() == "ROUTE OK"
+    assert "warning" not in window.pixhawk.candidate_feedback.text().lower()
     window.pixhawk.candidate_table.selectRow(1)
+    assert not window.pixhawk.candidate_buttons["right"].isEnabled()
+    window.pixhawk.candidate_table.selectRow(2)
     assert window.pixhawk.candidate_buttons["right"].isEnabled()
     window.pixhawk.candidate_buttons["right"].click()
     assert backend.calls[-1] == ("pixhawk_apply_candidate", "mavlink", 0, "right")
@@ -3938,22 +4020,21 @@ def test_pixhawk_verified_usb_recovery_is_visible_and_stall_gated() -> None:
         if pixhawk_layout.itemAt(index).widget() is not None
     ] == [
         "Connection",
+        "Network candidates and assignments",
         "Attitude (R/P/Y)",
         "P1/P2 GNSS receivers",
         "IMU magnetometer (MAVLink)",
         "CAN magnetometer (dedicated MAVLink)",
         "Pixhawk Parameters · calibration-owned groups",
         "P1→P2 baseline",
-        "Discovered endpoints",
         "ETH MAV",
     ]
     top_actions = pixhawk_layout.itemAt(1).layout()
-    assert [top_actions.itemAt(index).widget().text() for index in range(5)] == [
+    assert [top_actions.itemAt(index).widget().text() for index in range(4)] == [
         "Connect",
         "Disconnect",
         "Find USB",
         "Find network",
-        "Find host IP",
     ]
     assert window.pixhawk.operation_buttons["pixhawk.recover_eth_mavlink.p1"].text() == "P1 verified-USB reboot"
     assert window.pixhawk.operation_buttons["pixhawk.recover_eth_mavlink.p2"].text() == "P2 verified-USB reboot"

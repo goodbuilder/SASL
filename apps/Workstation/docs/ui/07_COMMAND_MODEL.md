@@ -28,6 +28,13 @@ Session Save/Finalize command.
 
 Operate on selected object/workspace: camera connect/preview/capture, calibration capture/calculate/save, etc.
 
+Pixhawk `Find network` is a read-only contextual command. It inventories wired NIC/address/carrier
+and P1/P2 route evidence without changing host networking. The discovery row remains candidate-only;
+P1/P2 assignment cards separately expose each side's endpoint and route. `Assign P1/P2` persists operator intent;
+it disconnects only the selected side when that side is already open. `Connect` revalidates the
+stored interface/address against the current kernel route and attempts valid disconnected sides
+independently. Assign or socket-open acknowledgement is never link success.
+
 ## 5. Stateful Commands
 
 Transitions matter. Examples:
@@ -73,6 +80,13 @@ Candidate: File, View, Device, Camera, Measurement, Calibration, Recording, Tool
 ## 11. Enablement / Preconditions
 
 Commands shall be enabled/disabled based on actual runtime conditions. Disabled reasons should be discoverable where non-obvious.
+
+`Use suggestion` ignores detector quality state/confidence for both Horizon and Mountain while
+retaining those values as status/evidence. Horizon requires current frozen identities/dimensions,
+exactly two finite in-frame endpoints per side and 25%-width separation. Mountain requires at least
+four equal-order finite in-frame unique/distributed pairs after one shared exclusion-index set. The
+controller repeats validation; widget state is never the geometry oracle. The command does not run
+Solve or Apply.
 
 ## 12. Postconditions / Failure
 

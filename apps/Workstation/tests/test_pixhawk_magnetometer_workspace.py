@@ -208,7 +208,9 @@ def test_pixhawk_workspace_renders_p1_p2_imu_magnetometer_table() -> None:
             )
         }
     )
-    assert not workspace.operation_buttons["pixhawk.connect_mavlink"].isEnabled()
+    # P1 is already live, but Connect remains available for the independently
+    # disconnected P2 side.
+    assert workspace.operation_buttons["pixhawk.connect_mavlink"].isEnabled()
     assert workspace.operation_buttons["pixhawk.disconnect_mavlink"].isEnabled()
     assert workspace.operation_buttons["pixhawk.open_shell.left"].text() == "P1 Shell"
     assert workspace.operation_buttons["pixhawk.open_shell.right"].text() == "P2 Shell"

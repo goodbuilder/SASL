@@ -21,6 +21,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 Point2 = tuple[float, float]
+HORIZON_MIN_ENDPOINT_SEPARATION_FRACTION = 0.25
 
 
 def _finite(value: Any, *, name: str) -> float:
@@ -44,6 +45,171 @@ def _optional_float(value: Any) -> float | None:
     if value is None:
         return None
     return _finite(value, name="metric")
+
+
+def _suggestion_points(
+    values: Any,
+    *,
+    side: str,
+    image_size: tuple[int, int] | None,
+    label: str = "Mountain",
+) -> tuple[Point2, ...]:
+    if not isinstance(values, (tuple, list)):
+        raise ValueError(f"{label} {side} suggestion points must be a list")
+    width = height = None
+    if image_size is not None:
+        width, height = int(image_size[0]), int(image_size[1])
+        if width <= 0 or height <= 0:
+            raise ValueError(f"{label} {side} native image dimensions are invalid")
+    parsed: list[Point2] = []
+    for index, point in enumerate(values):
+        if isinstance(point, Mapping):
+            value = (point.get("u_px"), point.get("v_px"))
+        else:
+            value = point
+        if not isinstance(value, (tuple, list)) or len(value) != 2:
+            raise ValueError(
+                f"{label} {side} suggestion point {index} must contain exactly (u, v)"
+            )
+        u = _finite(value[0], name=f"{label} {side} u_px[{index}]")
+        v = _finite(value[1], name=f"{label} {side} v_px[{index}]")
+        if width is not None and height is not None and not (
+            0.0 <= u <= width - 1 and 0.0 <= v <= height - 1
+        ):
+            raise ValueError(
+                f"{label} {side} suggestion point {index} is outside the native image"
+            )
+        parsed.append((u, v))
+    return tuple(parsed)
+
+
+def validate_horizon_suggestion_points(
+    left_points: Any,
+    right_points: Any,
+    *,
+    left_image_size: tuple[int, int],
+    right_image_size: tuple[int, int],
+    minimum_separation_fraction: float = HORIZON_MIN_ENDPOINT_SEPARATION_FRACTION,
+) -> tuple[tuple[Point2, ...], tuple[Point2, ...]]:
+    """Validate Horizon copy structure without consulting detector quality."""
+
+    fraction = _finite(
+        minimum_separation_fraction,
+        name="Horizon minimum endpoint separation fraction",
+    )
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError("Horizon minimum endpoint separation fraction must be in (0,1]")
+    left = _suggestion_points(
+        left_points,
+        side="left",
+        image_size=left_image_size,
+        label="Horizon",
+    )
+    right = _suggestion_points(
+        right_points,
+        side="right",
+        image_size=right_image_size,
+        label="Horizon",
+    )
+    for side, points, image_size in (
+        ("left", left, left_image_size),
+        ("right", right, right_image_size),
+    ):
+        if len(points) != 2:
+            raise ValueError(
+                f"Horizon {side} suggestion requires exactly two native endpoints"
+            )
+        separation = math.hypot(
+            points[1][0] - points[0][0],
+            points[1][1] - points[0][1],
+        )
+        minimum = fraction * int(image_size[0])
+        if separation < minimum:
+            raise ValueError(
+                f"Horizon {side} endpoints are only {separation:.1f}px apart; "
+                f"at least {minimum:.1f}px ({fraction:.0%} of image width) is required"
+            )
+    return left, right
+
+
+def validate_mountain_point_distribution(
+    points: Sequence[Point2],
+    *,
+    side: str,
+) -> None:
+    """Reject insufficient, duplicate, or nearly one-dimensional Mountain points."""
+
+    if len(points) < 4:
+        raise ValueError(
+            f"GNSS + Mountain requires at least four left/right u,v correspondence pairs ({side})"
+        )
+    unique: list[Point2] = []
+    for point in points:
+        if all(
+            math.hypot(point[0] - other[0], point[1] - other[1]) >= 1.0
+            for other in unique
+        ):
+            unique.append(point)
+    if len(unique) < 4:
+        raise ValueError(
+            f"GNSS + Mountain {side} points contain duplicate/near-duplicate observations"
+        )
+    mean_u = sum(point[0] for point in unique) / len(unique)
+    mean_v = sum(point[1] for point in unique) / len(unique)
+    xx = sum((point[0] - mean_u) ** 2 for point in unique)
+    yy = sum((point[1] - mean_v) ** 2 for point in unique)
+    xy = sum((point[0] - mean_u) * (point[1] - mean_v) for point in unique)
+    trace = xx + yy
+    determinant = max(0.0, xx * yy - xy * xy)
+    if trace <= 1.0e-12:
+        raise ValueError(f"GNSS + Mountain {side} points are coincident")
+    discriminant = max(0.0, trace * trace - 4.0 * determinant)
+    minimum = 0.5 * (trace - math.sqrt(discriminant))
+    maximum = 0.5 * (trace + math.sqrt(discriminant))
+    if maximum <= 1.0e-12 or minimum / maximum < 1.0e-3:
+        raise ValueError(
+            f"GNSS + Mountain {side} points are near-collinear; "
+            "distribute at least four features over the image"
+        )
+
+
+def validate_mountain_suggestion_points(
+    left_points: Any,
+    right_points: Any,
+    *,
+    excluded_indices: Sequence[int] = (),
+    left_image_size: tuple[int, int] | None = None,
+    right_image_size: tuple[int, int] | None = None,
+) -> tuple[tuple[Point2, ...], tuple[Point2, ...], tuple[int, ...]]:
+    """Validate and symmetrically filter one Mountain suggestion.
+
+    Detector quality is intentionally absent from this contract. The returned
+    points remain in their original same-order native OpenCV ``(u, v)`` pixel
+    coordinate system.
+    """
+
+    left = _suggestion_points(left_points, side="left", image_size=left_image_size)
+    right = _suggestion_points(right_points, side="right", image_size=right_image_size)
+    if len(left) != len(right):
+        raise ValueError(
+            "Mountain suggestion requires the same number of left/right point pairs"
+        )
+    normalized_exclusions: list[int] = []
+    for value in excluded_indices:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("Mountain excluded point indices must be integers")
+        if value < 0 or value >= len(left):
+            raise ValueError(f"Mountain excluded point index {value} is out of range")
+        if value in normalized_exclusions:
+            raise ValueError(f"Mountain excluded point index {value} is duplicated")
+        normalized_exclusions.append(value)
+    excluded = tuple(sorted(normalized_exclusions))
+    excluded_set = set(excluded)
+    filtered_left = tuple(point for index, point in enumerate(left) if index not in excluded_set)
+    filtered_right = tuple(point for index, point in enumerate(right) if index not in excluded_set)
+    validate_mountain_point_distribution(filtered_left, side="left")
+    validate_mountain_point_distribution(filtered_right, side="right")
+    return filtered_left, filtered_right, excluded
 
 
 @dataclass(frozen=True)
@@ -1149,9 +1315,13 @@ auto_select_mountain = detect_mountain
 
 __all__ = [
     "AutoSelectionResult",
+    "HORIZON_MIN_ENDPOINT_SEPARATION_FRACTION",
     "MountainAutoSelection",
     "auto_select_horizon",
     "auto_select_mountain",
     "detect_horizon",
     "detect_mountain",
+    "validate_horizon_suggestion_points",
+    "validate_mountain_point_distribution",
+    "validate_mountain_suggestion_points",
 ]

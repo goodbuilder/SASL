@@ -22,6 +22,10 @@ from Workstation.workstation_core.measurement_methods import (
     MEASUREMENT_METHOD_IDS,
     MEASUREMENT_METHOD_LABELS,
 )
+from Workstation.workstation_core.optical_pose_auto_select import (
+    validate_horizon_suggestion_points,
+    validate_mountain_suggestion_points,
+)
 from Workstation.workstation_core.pixhawk_attitude import MAVLINK_MAG_STREAMS
 from Workstation.workstation_core.runtime_camera_status import decoder_presentation
 from Workstation.workstation_core.px4_attitude_cal_manager import (
@@ -3597,7 +3601,6 @@ class PixhawkWorkspace(QtWidgets.QWidget):
             ("pixhawk.disconnect_mavlink", "Disconnect"),
             ("pixhawk.discover_usb", "Find USB"),
             ("pixhawk.discover_mavlink_candidates", "Find network"),
-            ("pixhawk.discover_host_ip", "Find host IP"),
             ("alignment.swap_pixhawks", "Swap P1/P2"),
             ("pixhawk.reset_level_calibration", "Reset level cal."),
         ):
@@ -3682,13 +3685,47 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         self.recovery_feedback.setWordWrap(True)
         recovery_layout.addWidget(self.recovery_feedback)
 
-        candidate_group = QtWidgets.QGroupBox("Discovered endpoints")
+        candidate_group = QtWidgets.QGroupBox("Network candidates and assignments")
         candidate_layout = QtWidgets.QVBoxLayout(candidate_group)
+        assignment_layout = QtWidgets.QHBoxLayout()
+        self.network_assignment_values: dict[str, dict[str, EngineeringValue]] = {}
+        for side, label in (("left", "P1 assignment"), ("right", "P2 assignment")):
+            card = QtWidgets.QGroupBox(label)
+            card_layout = QtWidgets.QGridLayout(card)
+            card_layout.setContentsMargins(6, 6, 6, 6)
+            card_layout.setHorizontalSpacing(6)
+            card_layout.setVerticalSpacing(4)
+            values: dict[str, EngineeringValue] = {}
+            for key, value_label, row, column, column_span in (
+                ("state", "State", 0, 0, 1),
+                ("nic", "NIC", 0, 1, 1),
+                ("local", "Local IPv4", 0, 2, 1),
+                ("endpoint", "Endpoint", 1, 0, 1),
+                ("route", "Route", 1, 1, 2),
+            ):
+                value = EngineeringValue(value_label)
+                value.set_value(
+                    "LEGACY AUTO ROUTE" if key == "state" else "--",
+                    source="no explicit NIC assignment",
+                )
+                values[key] = value
+                card_layout.addWidget(value, row, column, 1, column_span)
+            for column in range(3):
+                card_layout.setColumnStretch(column, 1)
+            self.network_assignment_values[side] = values
+            assignment_layout.addWidget(card, 1)
+        candidate_layout.addLayout(assignment_layout)
         self.discovery_status = EngineeringValue("Discovery")
         candidate_layout.addWidget(self.discovery_status)
         self.candidate_model = _table_model(
             self,
-            ("Source", "Kind", "Value", "Baud", "Status", "Interface"),
+            (
+                "Source",
+                "NIC / Device",
+                "Link",
+                "Local IPv4",
+                "Assigned",
+            ),
         )
         self.candidate_table = QtWidgets.QTableView()
         self.candidate_table.setModel(self.candidate_model)
@@ -3696,14 +3733,19 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         self.candidate_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.candidate_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.candidate_table.verticalHeader().setVisible(False)
-        self.candidate_table.setMaximumHeight(120)
-        self.candidate_table.horizontalHeader().setStretchLastSection(True)
+        self.candidate_table.setMaximumHeight(170)
+        self.candidate_table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        candidate_header = self.candidate_table.horizontalHeader()
+        candidate_header.setStretchLastSection(False)
+        candidate_header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
+        for column, width in enumerate((90, 220, 90, 150, 90)):
+            candidate_header.resizeSection(column, width)
         self.candidate_table.selectionModel().selectionChanged.connect(self._refresh_candidate_actions)
         self.candidate_table.clicked.connect(self._inspect_candidate_row)
         candidate_layout.addWidget(self.candidate_table)
         candidate_actions = QtWidgets.QHBoxLayout()
         self.candidate_buttons: dict[str, QtWidgets.QPushButton] = {}
-        for target, label in (("host", "Use host IP"), ("left", "Assign P1"), ("right", "Assign P2")):
+        for target, label in (("left", "Assign P1"), ("right", "Assign P2")):
             button = QtWidgets.QPushButton(label)
             button.setEnabled(False)
             button.clicked.connect(lambda _checked=False, target=target: self._apply_candidate(target))
@@ -3720,6 +3762,7 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         self._recording_locked = False
         self._invoke_command_available = invoke_command is not None
         self._invoke_command = invoke_command
+        layout.addWidget(candidate_group)
 
         attitude_group = QtWidgets.QGroupBox("Attitude (R/P/Y)")
         attitude_layout = QtWidgets.QVBoxLayout(attitude_group)
@@ -3848,7 +3891,6 @@ class PixhawkWorkspace(QtWidgets.QWidget):
             value.activated.connect(lambda key=key: self._inspect_baseline_value(key))
             baseline_layout.addWidget(value, index // 4, index % 4)
         layout.addWidget(baseline_group)
-        layout.addWidget(candidate_group)
         layout.addWidget(recovery_group)
 
         gnss_source_group = QtWidgets.QGroupBox("GNSS used for Pixhawk calculation")
@@ -4068,6 +4110,7 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         for key, indicator in self.indicators.items():
             indicator.set_status(snapshot.get(key))
         evidence = _evidence(self.backend)
+        panel = getattr(self.backend, "panel", self.backend)
         connection = evidence.pixhawk_connection_candidates()
         pixhawk_discovery_status = str(connection.get("status", "NOT RUN") or "NOT RUN")
         self.discovery_status.set_value(
@@ -4076,43 +4119,133 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         )
         candidates = connection.get("candidates")
         candidates = tuple(row for row in candidates if isinstance(row, dict)) if isinstance(candidates, (tuple, list)) else ()
+        assignments = connection.get("assignments")
+        assignments = assignments if isinstance(assignments, Mapping) else {}
+        for side, label in (("left", "P1"), ("right", "P2")):
+            assignment = assignments.get(side)
+            assignment = assignment if isinstance(assignment, Mapping) else {}
+            state = str(assignment.get("state") or "LEGACY AUTO ROUTE")
+            interface_name = str(assignment.get("interface") or "")
+            local_address = str(assignment.get("local_address") or "")
+            endpoint = (
+                getattr(panel, "left_mavlink_url_edit", None)
+                if side == "left"
+                else getattr(panel, "right_mavlink_url_edit", None)
+            )
+            endpoint_text = endpoint.text().strip() if endpoint is not None and hasattr(endpoint, "text") else ""
+            detail = str(assignment.get("detail") or "")
+            valid = (
+                True
+                if state in {"ASSIGNED", "ROUTE OK"}
+                else False
+                if state not in {"LEGACY AUTO ROUTE"}
+                else None
+            )
+            values = self.network_assignment_values[side]
+            source = detail or f"{label} operator assignment"
+            values["state"].set_value(state, source=source, valid=valid)
+            values["nic"].set_value(interface_name or "--", source=source)
+            values["local"].set_value(local_address or "--", source=source)
+            values["endpoint"].set_value(endpoint_text or "--", source=source)
+            values["route"].set_value(detail or "--", source=source, valid=valid)
+
+        def assigned_label(row: Mapping[str, object]) -> str:
+            if str(row.get("source") or "") != "network":
+                return ""
+            return ",".join(
+                label
+                for side, label in (("left", "P1"), ("right", "P2"))
+                if isinstance(assignments.get(side), Mapping)
+                and str(assignments[side].get("interface") or "") == str(row.get("interface") or "")
+                and str(assignments[side].get("local_address") or "") == str(row.get("local_ip") or "")
+            )
+
         candidate_signature = tuple(
-            tuple(row.get(key, "") for key in ("source", "source_row", "kind", "value", "baud", "status", "interface"))
+            (*tuple(
+                row.get(key, "")
+                for key in (
+                    "source",
+                    "source_row",
+                    "candidate_id",
+                    "kind",
+                    "value",
+                    "baud",
+                    "status",
+                    "interface",
+                    "carrier",
+                    "local_cidr",
+                    "p1_route",
+                    "p2_route",
+                    "p1_endpoint",
+                    "p2_endpoint",
+                )
+            ), assigned_label(row))
             for row in candidates
         )
         if candidate_signature != self._candidate_signature:
             selected = self._selected_candidate_identity()
             self.candidate_model.removeRows(0, self.candidate_model.rowCount())
             for row in candidates:
+                source = str(row.get("source") or "")
+                if source == "network":
+                    assigned_to = assigned_label(row)
+                    values = (
+                        "NETWORK",
+                        row.get("interface", "--"),
+                        row.get("carrier", "UNKNOWN"),
+                        row.get("local_cidr", "--") or "--",
+                        assigned_to or "--",
+                    )
+                else:
+                    values = (
+                        source.upper() or "--",
+                        row.get("value", "--"),
+                        row.get("kind", "--"),
+                        row.get("status", "--"),
+                        "--",
+                    )
                 _append_table_row(
                     self.candidate_model,
-                    tuple(row.get(key, "") for key in ("source", "kind", "value", "baud", "status", "interface")),
+                    values,
                 )
+                model_row = self.candidate_model.rowCount() - 1
+                for column, value in enumerate(values):
+                    item = self.candidate_model.item(model_row, column)
+                    if item is not None:
+                        item.setToolTip(str(value))
             self._candidate_signature = candidate_signature
             self._candidate_rows = candidates
             if selected:
                 for row_index, row in enumerate(candidates):
-                    if (str(row.get("source", "")), str(row.get("kind", "")), str(row.get("value", ""))) == selected:
+                    if self._candidate_identity(row) == selected:
                         self.candidate_table.selectRow(row_index)
                         break
         discovery_active = bool(connection.get("discovery_active", False))
         recording = snapshot.get("recording")
         self._recording_locked = recording is not None and recording.state in {"ACTIVE", "FINALIZING"}
-        panel = getattr(self.backend, "panel", self.backend)
         source_connection_allowed = not self._recording_locked or bool(
             getattr(panel, "_automatic_session_recording", False)
         )
         open_sides = getattr(panel, "_mavlink_open_sides", None)
         connected_sides = set(open_sides()) if callable(open_sides) else set()
         connection_in_progress = getattr(panel, "pixhawk_connection_thread", None) is not None
-        status_connected = any(
-            getattr(snapshot.get(f"pixhawk.{side}"), "state", "").upper()
-            in {"LIVE", "CONNECTED", "STARTING"}
+        status_connected_sides = {
+            side
             for side in ("left", "right")
-        )
+            if getattr(snapshot.get(f"pixhawk.{side}"), "state", "").upper()
+            in {"LIVE", "CONNECTED", "STARTING"}
+        }
+        connected_sides.update(status_connected_sides)
+        status_connected = bool(status_connected_sides)
         connection_active = bool(connected_sides) or connection_in_progress or status_connected
+        configured_reader = getattr(panel, "_configured_mavlink_sides", None)
+        configured_sides = set(configured_reader()) if callable(configured_reader) else {"left", "right"}
+        has_disconnected_target = bool(configured_sides - connected_sides)
         self.operation_buttons["pixhawk.connect_mavlink"].setEnabled(
-            self._invoke_command_available and source_connection_allowed and not connection_active
+            self._invoke_command_available
+            and source_connection_allowed
+            and not connection_in_progress
+            and has_disconnected_target
         )
         self.operation_buttons["pixhawk.disconnect_mavlink"].setEnabled(
             self._invoke_command_available and source_connection_allowed and connection_active
@@ -4167,7 +4300,7 @@ class PixhawkWorkspace(QtWidgets.QWidget):
                 == "ETH MAVLINK RX STALLED"
             )
         self.recovery_feedback.setText(" | ".join(recovery_feedback))
-        for command_id in ("pixhawk.discover_usb", "pixhawk.discover_host_ip"):
+        for command_id in ("pixhawk.discover_usb", "pixhawk.discover_mavlink_candidates"):
             self.operation_buttons[command_id].setEnabled(not discovery_active)
         self._refresh_candidate_actions()
         self._refresh_gnss_source_controls(panel)
@@ -4363,22 +4496,27 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         selected = self.candidate_table.selectionModel().selectedRows()
         return selected[0].row() if selected else -1
 
+    @staticmethod
+    def _candidate_identity(candidate: Mapping[str, object]) -> tuple[str, str, str]:
+        source = str(candidate.get("source", ""))
+        if source == "network":
+            return source, "NETWORK", str(candidate.get("candidate_id", ""))
+        return source, str(candidate.get("kind", "")), str(candidate.get("value", ""))
+
     def _selected_candidate_identity(self) -> tuple[str, str, str] | None:
         row = self._selected_candidate_row()
         if not 0 <= row < len(self._candidate_rows):
             return None
-        candidate = self._candidate_rows[row]
-        return str(candidate.get("source", "")), str(candidate.get("kind", "")), str(candidate.get("value", ""))
+        return self._candidate_identity(self._candidate_rows[row])
 
     def _refresh_candidate_actions(self, *_args: object) -> None:
         row = self._selected_candidate_row()
         candidate = self._candidate_rows[row] if 0 <= row < len(self._candidate_rows) else {}
         kind = str(candidate.get("kind", ""))
         source = str(candidate.get("source", ""))
-        self.candidate_buttons["host"].setEnabled(
-            not self._recording_locked and source == "pc" and kind == "PC_IP"
+        endpoint_enabled = source == "network" or (
+            source == "mavlink" and kind in {"USB", "MAVLink"}
         )
-        endpoint_enabled = source == "mavlink" and kind in {"USB", "MAVLink"}
         self.candidate_buttons["left"].setEnabled(not self._recording_locked and endpoint_enabled)
         self.candidate_buttons["right"].setEnabled(not self._recording_locked and endpoint_enabled)
 
@@ -4388,19 +4526,27 @@ class PixhawkWorkspace(QtWidgets.QWidget):
             self.candidate_feedback.setText("ERROR: select a compatible endpoint")
             return
         candidate = self._candidate_rows[row]
-        method = getattr(self.backend, "pixhawk_apply_candidate", None)
+        source = str(candidate.get("source", ""))
+        if source == "network":
+            method = getattr(self.backend, "pixhawk_assign_network_candidate", None)
+            args = (str(candidate.get("candidate_id", "")), target)
+        else:
+            method = getattr(self.backend, "pixhawk_apply_candidate", None)
+            args = (source, int(candidate.get("source_row", -1)), target)
         if not callable(method):
             self.candidate_feedback.setText("ERROR: Pixhawk endpoint adapter unavailable")
             return
         try:
-            applied = method(str(candidate.get("source", "")), int(candidate.get("source_row", -1)), target)
+            applied = method(*args)
         except Exception as exc:
             self.candidate_feedback.setText(f"ERROR: {exc}")
             return
         if applied is False:
             self.candidate_feedback.setText("ERROR: endpoint was not applied")
             return
-        self.candidate_feedback.setText(f"Applied {candidate.get('kind', 'endpoint')} to {target.upper()}")
+        self.candidate_feedback.setText(
+            f"Assigned {candidate.get('kind', 'endpoint')} to {target.upper()} · press Connect"
+        )
         self.refresh(self.status_model.snapshot())
 
     def _inspect_candidate_row(self, index: QtCore.QModelIndex) -> None:
@@ -4419,13 +4565,20 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         return {
             "selection": f"Pixhawk endpoint · {candidate.get('kind', '--')}",
             "value": (
-                f"value={candidate.get('value', '--')} · baud={candidate.get('baud', '--')} · "
-                f"discovery path={candidate.get('source', '--')}"
+                f"NIC/device={candidate.get('interface') or candidate.get('value', '--')} · "
+                f"local={candidate.get('local_cidr') or '--'} · "
+                "Assign P1/P2 to inspect that side's endpoint and route"
             ),
             "freshness": "Latest completed Pixhawk endpoint discovery",
-            "contract": "Host/serial/MAVLink endpoint metadata; no attitude, GPS position, or baseline values",
+            "contract": (
+                "Read-only NIC/address/kernel-route plus endpoint metadata; "
+                "no host-network mutation and no attitude/GPS/baseline coordinate values"
+            ),
             "verdict": candidate.get("status") or "UNVERIFIED",
-            "source": "Pixhawk discovery workers",
+            "source": (
+                f"Pixhawk discovery workers · mac={candidate.get('mac') or '--'} · "
+                f"driver={candidate.get('driver') or '--'} · path={candidate.get('device_path') or '--'}"
+            ),
         }
 
     def _inspect_attitude_row(self, index: QtCore.QModelIndex) -> None:
@@ -6105,8 +6258,10 @@ class OpticalPosePane(QtWidgets.QWidget):
         )
         self.use_suggestion_button.setEnabled(False)
         self.use_suggestion_button.setToolTip(
-            "Approve the currently displayed high-confidence suggestion and copy its points into "
-            "the existing manual annotation buffer. Low-confidence suggestions remain overlay-only."
+            "Copy the currently displayed suggestion into the manual annotation buffer. "
+            "Horizon/Mountain detector quality is advisory, but current-frame native points must "
+            "remain structurally usable. Horizon requires two separated endpoints per side; "
+            "Mountain requires paired distributed points after exclusions."
         )
         auto_layout.addWidget(self.use_suggestion_button, 0, 2)
         self.auto_suggestion_status_label = QtWidgets.QLabel("No automatic suggestion")
@@ -7042,6 +7197,94 @@ class OpticalPosePane(QtWidgets.QWidget):
         )
         return filtered_points, filtered_confidences
 
+    def _mountain_suggestion_copy_status(
+        self,
+        suggestion_id: str,
+        sides: Mapping[str, object],
+    ) -> tuple[bool, str]:
+        """Project the shared owner validation as a button affordance."""
+
+        raw_points: dict[str, object] = {}
+        image_sizes: dict[str, tuple[int, int]] = {}
+        for side in ("left", "right"):
+            row = sides.get(side)
+            if not isinstance(row, Mapping):
+                return False, f"{side} suggestion points are missing"
+            view = self.annotation_views[side]
+            if (
+                str(row.get("frame_id") or "") != str(view.frame_id or "")
+                or str(row.get("image_sha256") or "") != str(view.image_sha256 or "")
+            ):
+                return False, f"{side} frame identity changed"
+            size = view.source_size
+            if not size.isValid() or size.isEmpty():
+                return False, f"{side} frozen native frame is unavailable"
+            image_sizes[side] = (size.width(), size.height())
+            try:
+                declared_size = (
+                    int(row.get("source_width_px", -1)),
+                    int(row.get("source_height_px", -1)),
+                )
+            except (TypeError, ValueError, OverflowError):
+                return False, f"{side} native image dimensions are invalid"
+            if declared_size != image_sizes[side]:
+                return False, f"{side} native image dimensions changed"
+            raw_points[side] = row.get("points", row.get("ridge_polyline", ()))
+        try:
+            validate_mountain_suggestion_points(
+                raw_points["left"],
+                raw_points["right"],
+                excluded_indices=sorted(
+                    self._auto_suggestion_excluded_indices.get(suggestion_id, set())
+                ),
+                left_image_size=image_sizes["left"],
+                right_image_size=image_sizes["right"],
+            )
+        except (TypeError, ValueError) as exc:
+            return False, str(exc)
+        return True, ""
+
+    def _horizon_suggestion_copy_status(
+        self,
+        sides: Mapping[str, object],
+    ) -> tuple[bool, str]:
+        raw_points: dict[str, object] = {}
+        image_sizes: dict[str, tuple[int, int]] = {}
+        for side in ("left", "right"):
+            row = sides.get(side)
+            if not isinstance(row, Mapping):
+                return False, f"{side} Horizon endpoints are missing"
+            view = self.annotation_views[side]
+            if (
+                str(row.get("frame_id") or "") != str(view.frame_id or "")
+                or str(row.get("image_sha256") or "") != str(view.image_sha256 or "")
+            ):
+                return False, f"{side} frame identity changed"
+            size = view.source_size
+            if not size.isValid() or size.isEmpty():
+                return False, f"{side} frozen native frame is unavailable"
+            image_sizes[side] = (size.width(), size.height())
+            try:
+                declared_size = (
+                    int(row.get("source_width_px", -1)),
+                    int(row.get("source_height_px", -1)),
+                )
+            except (TypeError, ValueError, OverflowError):
+                return False, f"{side} native image dimensions are invalid"
+            if declared_size != image_sizes[side]:
+                return False, f"{side} native image dimensions changed"
+            raw_points[side] = row.get("points", row.get("horizon_line", ()))
+        try:
+            validate_horizon_suggestion_points(
+                raw_points["left"],
+                raw_points["right"],
+                left_image_size=image_sizes["left"],
+                right_image_size=image_sizes["right"],
+            )
+        except (TypeError, ValueError) as exc:
+            return False, str(exc)
+        return True, ""
+
     def set_auto_suggestion_busy(self, busy: bool, mode: str = "") -> None:
         """Show an in-flight selector and prevent duplicate CPU-heavy runs."""
 
@@ -7170,13 +7413,29 @@ class OpticalPosePane(QtWidgets.QWidget):
         )
         reason = str(suggestion.get("failure_reason") or suggestion.get("reason") or "")
         suffix = f" · {reason}" if reason else ""
+        copy_eligible = False
+        copy_status = ""
+        if mode == "mountain":
+            copy_eligible, copy_reason = self._mountain_suggestion_copy_status(
+                suggestion_id, sides
+            )
+        elif mode == "horizon":
+            copy_eligible, copy_reason = self._horizon_suggestion_copy_status(sides)
+        else:
+            copy_reason = "unsupported automatic suggestion mode"
+        if mode in {"horizon", "mountain"}:
+            copy_status = (
+                " · COPY READY"
+                if copy_eligible
+                else f" · COPY BLOCKED: {copy_reason}"
+            )
         self.auto_suggestion_status_label.setText(
-            f"{mode.title() or 'Automatic'} · {state} · {provenance} · {suggestion_id[:18]}{suffix}"
+            f"{mode.title() or 'Automatic'} · {state} · {provenance}{copy_status} "
+            f"· {suggestion_id[:18]}{suffix}"
         )
         self.use_suggestion_button.setEnabled(
             bool(suggestion_id)
-            and state == "GOOD"
-            and bool(suggestion.get("eligible", False))
+            and copy_eligible
             and provenance != "AUTO_ACCEPTED"
             and self._auto_suggestion_provenance != "MANUAL_EDITED"
         )
@@ -7221,8 +7480,9 @@ class OpticalPosePane(QtWidgets.QWidget):
         self._accepted_suggestion_id = suggestion_id
         self._accepted_annotation_snapshots = committed
         self._auto_suggestion_provenance = "AUTO_ACCEPTED"
+        quality_state = str(suggestion.get("state") or "UNKNOWN").upper()
         self.auto_suggestion_status_label.setText(
-            f"{mode.title()} · GOOD · AUTO_ACCEPTED · points copied to manual annotation"
+            f"{mode.title()} · {quality_state} · AUTO_ACCEPTED · points copied to manual annotation"
         )
         self.use_suggestion_button.setEnabled(False)
 
