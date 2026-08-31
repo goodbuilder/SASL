@@ -437,6 +437,31 @@ class MeasurementRunController:
                 flush()
             except Exception:
                 pass
+        request_xlsx = getattr(
+            self.panel,
+            "request_latest_measurement_xlsx",
+            None,
+        )
+        if callable(request_xlsx):
+            try:
+                request_xlsx(
+                    generation,
+                    started_utc_ns=getattr(
+                        self.panel,
+                        "_measurement_run_started_utc_ns",
+                        None,
+                    ),
+                    stopped_utc_ns=stopped_utc_ns,
+                    source_states=dict(
+                        getattr(self.panel, "_measurement_run_last_sources", {})
+                        or {}
+                    ),
+                    automatic=True,
+                )
+            except Exception:
+                # XLSX is a derived convenience view. Its request boundary is
+                # deliberately later than IDLE and can never retain the run.
+                pass
         return True
 
     def fail_measurement_start(self, reason: str) -> bool:

@@ -431,9 +431,16 @@ Prefer factual messages such as `RTSP port unreachable` over vague `camera unhea
 ## 15. Data Review and Assembly
 
 Open `Data > Status` to inspect fixed stream paths, writer state, last write, and drops. Use the
-file manager or an external analysis tool to join structured rows by UTC/source time and transient
-generation. Binary names carry creation time and explicit UTC offset. Workstation does not generate
-Parquet or `review.xlsx` automatically.
+file manager or an external analysis tool for authoritative multi-run assembly. Binary names carry
+creation time and explicit UTC offset. Stopping Measurement also queues one derived
+`latest_measurement.xlsx` for that most recent generation. Its Summary and source sheets preserve
+the raw clocks and add readable KST timestamps; missing fields are `#N/A`.
+
+Watch the fixed `Latest XLSX` status line. `READY` proves a validated workbook was published;
+`WAITING/GENERATING/STALE/FAILED/CANCELLED` does not affect Measurement. Use `Update Latest XLSX`
+when an automatic update was delayed or failed and `Open Latest XLSX` after publication. A new
+Measurement or Manual record takes priority over export. The workbook is derived and replaceable;
+fixed JSONL remains the source of truth. No Parquet or legacy `review.xlsx` is generated.
 
 Legacy `recordings/` trees are file-manager-only and are not scanned or recovered.
 

@@ -173,6 +173,15 @@ class _FakeBackend:
         )
         self.panel._session_recording_active = lambda: bool(self.panel.recording_active)
         self.panel.data_storage_snapshot = self.data_storage_snapshot
+        self._latest_xlsx_snapshot: dict[str, object] = {
+            "state": "NOT_CREATED",
+            "output_path": "/tmp/measurement_data/latest_measurement.xlsx",
+            "target_generation": "",
+            "published_generation": "",
+            "row_counts": {},
+            "recording_active": False,
+            "error": "",
+        }
 
     def toggle_camera(self) -> None:
         self.calls.append("camera")
@@ -206,6 +215,15 @@ class _FakeBackend:
     def retry_data_storage(self) -> dict[str, object]:
         self.calls.append("retry_data_storage")
         return self.data_storage_snapshot()
+
+    def latest_measurement_xlsx_snapshot(self) -> dict[str, object]:
+        return dict(self._latest_xlsx_snapshot)
+
+    def request_latest_measurement_xlsx(self) -> bool:
+        self.calls.append("request_latest_measurement_xlsx")
+        self._latest_xlsx_snapshot["state"] = "WAITING"
+        self._latest_xlsx_snapshot["target_generation"] = "run-latest"
+        return True
 
     def optical_pose_reset(self) -> None:
         self.calls.append("optical_pose_reset")

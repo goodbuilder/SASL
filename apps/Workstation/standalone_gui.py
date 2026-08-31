@@ -306,6 +306,7 @@ from sasl_common.lifecycle import LifecycleCoordinator, LifecycleStep
 from Workstation.evidence import mavlink_link_provenance
 from Workstation.runtime_paths import (
     WORKSTATION_DATA_ROOT,
+    WORKSTATION_MEASUREMENT_DATA_ROOT,
     WORKSTATION_SETTINGS_PATH,
     import_workstation_asset_file,
     portable_workstation_data_path_text,
@@ -1141,6 +1142,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             QtCore.Qt.QueuedConnection,
         )
         self.app_root = Path(APP_ROOT if app_root is None else app_root).expanduser().resolve()
+        self.default_measurement_data_root = (
+            WORKSTATION_MEASUREMENT_DATA_ROOT
+            if app_root is None
+            else self.app_root / "recordings"
+        )
         self.settings_path = Path(
             self.app_root / WORKSTATION_SETTINGS_PATH.name
             if settings_path is None
@@ -10477,6 +10483,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def allocate_workstation_data_artifact(self, *args: Any, **kwargs: Any) -> Any: ...
         def flush_workstation_data(self, *args: Any, **kwargs: Any) -> Any: ...
         def close_workstation_data(self, *args: Any, **kwargs: Any) -> Any: ...
+        def request_latest_measurement_xlsx(self, *args: Any, **kwargs: Any) -> Any: ...
+        def latest_measurement_xlsx_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
+        def cancel_latest_measurement_xlsx_export(self, *args: Any, **kwargs: Any) -> Any: ...
         def reset_workstation_optical_pose_session(self, *args: Any, **kwargs: Any) -> Any: ...
         def workstation_optical_pose_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
         def register_workstation_optical_pose_candidate(self, *args: Any, **kwargs: Any) -> Any: ...

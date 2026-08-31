@@ -16,13 +16,21 @@ historical data and cannot disable `측정 시작`.
 After an abnormal process exit, restart likewise leaves the incomplete run as inert append-only
 history and creates a new runtime generation only when the operator presses `측정 시작` again.
 
-Structured records append to fixed, type-owned files beneath one relative
-`measurement_data_root`. Videos, still images, native PNGs, and ULogs use their own creation-time
-filename with local UTC offset and never replace an existing file. Each row retains its UTC,
-monotonic, and available source-clock evidence, so an operator can collect or join records later.
+Structured records append to fixed, type-owned files beneath the repository-root `recordings/`
+folder by default. A blank `measurement_data_root` selects that default; an explicit custom value
+remains relative to `SASL_WORKSTATION_DATA_ROOT`. Videos, still images, native PNGs, and ULogs use
+their own creation-time filename with local UTC offset and never replace an existing file. Each row
+retains its UTC, monotonic, and available source-clock evidence, so an operator can collect or join
+records later.
 Storage failures and bounded-queue drops are visible in `Data > Status`, but do not stop camera,
 Detection, GNSS/RTCM routing, target telemetry, or the next Measurement. Result/event queues are
 reserved ahead of bulk camera/PX4/GNSS traffic.
+
+The same data root may contain one derived `latest_measurement.xlsx` for the most recently stopped
+Measurement. It is generated only after the run has returned to `IDLE`, may be updated/opened from
+`Data > Status`, and never replaces fixed JSONL as the source of truth. A missing source or field is
+shown as zero rows/Excel `#N/A`; unlike-rate sources are kept on separate sheets rather than joined
+by an invented timestamp rule.
 
 If an essential stream (`events`, `measurements`, or `method_evaluations`) cannot write, the
 background owner retains FIFO records in a 256-record/8 MiB reserve and retries with bounded
@@ -30,8 +38,8 @@ backoff. Video and high-rate telemetry are never accumulated without bound; thei
 visible and the observation continues.
 
 The top-level `Data` workspace exposes writer health, fixed paths, capture tools, the current data
-folder, and a file-manager link to untouched legacy `recordings/`. It does not scan, recover, or
-mutate legacy Session catalogs. Alignment is app-lifetime state: Apply persists an append-only
+folder, and a separate file-manager link to historical data-root `recordings/`. It does not scan,
+recover, migrate, or mutate legacy Session catalogs. Alignment is app-lifetime state: Apply persists an append-only
 Alignment event, and the active Alignment remains available across Measurements until Revert,
 `Reset Alignment`, or application restart.
 
@@ -179,10 +187,15 @@ Auto-Connect, RTSP Enable and Reactivate never send `SEBR/SEQZ/SEGS/SEIR`. They 
 the physical bitrate/QP/GOP/IDR from the saved JSON; use explicit readback, and change an encoder
 field only through a separately approved manual command path.
 
-Choose `Settings > Storage > Data folder` before field work. The value must be relative to
-`SASL_WORKSTATION_DATA_ROOT`; the default is `measurement_data`. `Data > Status` shows every fixed
+Leave `Settings > Storage > Data folder` blank to use `<SASL_ROOT>/recordings`. A non-empty custom
+value must be relative to `SASL_WORKSTATION_DATA_ROOT`. When that environment variable is explicitly
+set and the field remains blank, the default becomes
+`<SASL_WORKSTATION_DATA_ROOT>/recordings`. `Data > Status` shows the resolved folder, every fixed
 file, writer state, dropped-row count, last write, and error. `Retry Storage` retries failed streams,
-but it is never a prerequisite for Measurement.
+but it is never a prerequisite for Measurement. `Update Latest XLSX` regenerates the most recent
+Measurement view and `Open Latest XLSX` opens only a successfully published app-owned workbook.
+`WAITING`, `GENERATING`, `STALE`, `FAILED`, or `CANCELLED` remains local Data status and never owns
+Measurement admission.
 
 Calibration can be completed at any time against the reusable calibration root. Alignment can
 also be captured and applied before or between Measurements. The active Alignment is reused until
@@ -198,16 +211,18 @@ For an ordinary run:
    If a still capture, camera command, time sync, discovery, or RTSP activation owns the cameras,
    the transient run shows `QUEUED` and starts automatically when that owner releases them.
 4. Press `측정 종료` when finished. Camera/Detection/video owners stop and the run returns to
-   `IDLE`; no save, hash, manifest, RTCM drain, review workbook, or previous data state can delay the
-   next start.
-5. Repeat whenever needed, including after long gaps. Join the type-owned records later using their
-   per-row timestamps and transient `runtime_generation` where present.
+   `IDLE`; no save, hash, manifest, RTCM drain, workbook, or previous data state can delay the next
+   start. After that boundary, Workstation queues a background `latest_measurement.xlsx` rebuild.
+5. Repeat whenever needed, including after long gaps. For a quick one-run review, wait for
+   `Latest XLSX · READY` and use `Open Latest XLSX`; for authoritative or multi-run analysis, join
+   the type-owned records using their per-row timestamps and transient generation identity.
 
 Every matched pair is still evaluated independently by Pixhawk, Checkerboard, Horizon, Mountain,
 Drone Rotation, Drone Multi-view, Terrain, and Combined against the frozen inputs for that run.
 The representative result remains `Pixhawk attitude + GPS/RTK`; another method is not promoted
 when the primary method is blocked or fails. Result and method events append immediately to their
-fixed JSONL streams. No automatic Parquet or `review.xlsx` is produced.
+fixed JSONL streams. No automatic Parquet or legacy Session `review.xlsx` is produced; the
+distinct latest-only XLSX is a non-authoritative post-stop projection.
 
 Manual recording remains under `Advanced > Files`. It uses the same fixed structured streams and
 timestamped binary paths. Starting Measurement stops Manual record and does not resume it after the
@@ -666,6 +681,13 @@ python3 tools/check_portable_paths.py
   | Alignment changes | `alignment.jsonl` |
   | binary inventory/logs | `artifacts.jsonl`, `native_frames.jsonl`, `application_log.jsonl` |
 
+- `<resolved data root>/latest_measurement.xlsx` is one app-owned, atomically replaced derived
+  workbook. It contains `Summary`, Measurement events, materialized/latest and append/replace
+  result history, method bundles/outcomes/inputs, Camera/Pixhawk/Target/GNSS/geometry/native/file
+  sheets, and `Issues`. Manual-record-only and unrelated application/capture/alignment streams are
+  excluded. Original clock fields remain exact, UTC epoch fields gain KST ISO columns, and integers
+  beyond Excel's 15-digit precision are stored as text.
+
 - The writer removes Session membership fields, adds host UTC and monotonic record timestamps, and
   preserves producer coordinate/source-clock fields. A torn final JSONL fragment is left as one bad
   historical line; the next valid append begins on a new line. Files are not rotated automatically.
@@ -692,8 +714,8 @@ python3 tools/check_portable_paths.py
   until Revert, Reset, or restart.
 - Existing `recordings/<id>/` and `recordings/sessions/<id>/` trees are never scanned or recovered
   by the new workflow. `Data > Status > Open Legacy Recordings Folder` exposes them read-only through
-  the file manager. Old manifests, Parquet, and `review.xlsx` remain untouched but no new instance is
-  generated automatically.
+  the file manager. Old manifests, Parquet, and `review.xlsx` remain untouched and no new legacy
+  instance is generated. The root-level latest-only workbook does not inspect or convert them.
 - `measurement-method-snapshot-v1` still supplies the live Measurement view. Runtime
   `method_capabilities` remains instance-driven while `method_catalog` lists all eight method IDs;
   missing inputs become explicit BLOCKED outcomes rather than invented pose data.
@@ -969,6 +991,10 @@ python3 tools/check_portable_paths.py
 - Storage is best-effort. A setup/open/write/serialization/fsync failure drops the affected record
   or pauses only that stream and is reported in `Data`; it never stops the recorder or raises through
   a Qt callback into Measurement admission. `Retry Storage` clears failed-stream state.
+- Treat `latest_measurement.xlsx` as a disposable review projection. Only `READY` with an existing
+  published generation proves success; request acceptance or `GENERATING` does not. Do not use it
+  as a completeness verdict or edit it as the only copy of data. A new Measurement/Manual record or
+  shutdown cancels or defers export, while `Update Latest XLSX` retries after the system is idle.
 - Native PNG completion is joined to its append-only recording row by the unique async request ID,
   independently of the 1024-pair lookup cache. A stale completion for an older request cannot
   overwrite a newer pending request for the same pair. The disk-I/O barrier is acknowledged when
@@ -979,7 +1005,8 @@ python3 tools/check_portable_paths.py
 - The Measurement view displays all eight frozen/live source values independently. Missing method
   instances remain visible as blocked catalog rows, while each pair persists one atomic bundle with
   method ID, instance ID, component sources, geometry hash, status, warnings, and worker timing for
-  every method. No automatic workbook or Parquet materialization follows run stop.
+  every method. No authoritative workbook or Parquet materialization gates run stop; the
+  latest-only derived XLSX is built afterward and may be cancelled or retried independently.
 - Calibration quality and evidence preservation are separate. `WARNING` and `FAIL` calculation
   attempts are saved under `attempts/` without changing active aliases or settings. `WARNING`
   requires confirmation before Apply and `FAIL` cannot be applied. Any applied PASS/confirmed
@@ -1441,10 +1468,16 @@ An explicit `stereo_pair_saved=false` or `pair_persistence_allowed=false` always
 matching images K,D-only. Malformed capture metadata is not silently promoted and the existing
 zoom/evidence gate blocks calculation until it is repaired.
 
-Workstation no longer generates `review.xlsx` or typed Parquet automatically. Later analysis must
-read the fixed JSONL streams, interpret append/replace operations by `_record_index`, retain signed
-nanosecond timestamps, and join records by time and transient generation where appropriate. Any
-spreadsheet or Parquet conversion is an explicit downstream task and is not an evidence authority.
+Workstation still does not generate legacy Session `review.xlsx` or typed Parquet automatically.
+It now generates one root-level `latest_measurement.xlsx` convenience view for the latest
+Measurement only; earlier Measurements and Manual-record-only intervals are not archived there.
+Large exports are deliberately background/idle work: the representative current-data copy produced
+42,425 workbook rows in about 62 seconds (23.4 MB XLSX, about 28 MiB peak RSS), and a new recording
+may cancel or defer that work. Use `Update Latest XLSX` after the system is idle if the status is
+stale/failed/cancelled. A foreign unmarked file with the same name is preserved; rename or move it
+before retrying. Multi-run or authoritative analysis must still read fixed JSONL, interpret
+append/replace operations by `_record_index`, retain signed nanosecond timestamps, and join only
+where the recorded identity/time contract supports it.
 
 The Workstation does not prove that a stereo rig's physical transform remains valid as the
 lenses change zoom. Validate every intended A→B combination externally and retain that
@@ -1616,6 +1649,14 @@ live on the panel at solve time -- a later live-GPS change cannot silently retar
 frozen Mountain image.
 
 ## Change Log
+
+- 2026-08-31: Added one derived `<data-root>/latest_measurement.xlsx` for the most recently stopped
+  Measurement. A generation-exact checkpoint feeds Summary, result/history, eight-method, source,
+  native/file and Issues sheets with Excel `#N/A`, exact large integers and KST display columns.
+  Generation is automatic after stop and manually retryable/openable from `Data > Status`; one
+  coalesced cancellable worker keeps Measurement/Manual recording and shutdown authoritative.
+  Temp validation/atomic replacement protects prior app-owned output, while foreign same-name
+  files and all JSONL/legacy Session data remain untouched.
 
 - 2026-08-29: Removed Horizon detector quality from `Use suggestion` permission while retaining
   `GOOD`/`LOW_CONFIDENCE`, confidence, residual and reason text/evidence. Owner/UI validation now

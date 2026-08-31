@@ -816,6 +816,69 @@ def test_sessionless_data_workspace_never_scans_legacy_session_catalog(monkeypat
     advanced.deleteLater()
     app.processEvents()
 
+
+def test_sessionless_data_workspace_exposes_stable_latest_xlsx_actions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from PyQt5 import QtGui
+
+    from Workstation.status_model import StatusModel
+    from Workstation.workspaces import RecordingWorkspace
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    output = tmp_path / "latest_measurement.xlsx"
+    output.write_bytes(b"fixture")
+    backend._latest_xlsx_snapshot.update(
+        state="READY",
+        output_path=str(output),
+        target_generation="run-latest",
+        published_generation="run-latest",
+        row_counts={"Results": 2, "CameraLeft": 3},
+    )
+    opened: list[str] = []
+    monkeypatch.setattr(
+        QtGui.QDesktopServices,
+        "openUrl",
+        lambda url: opened.append(url.toLocalFile()) or True,
+    )
+    workspace = RecordingWorkspace(backend, StatusModel(), lambda: None)
+    initial_height = workspace.latest_xlsx_status_label.height()
+
+    workspace._refresh_latest_measurement_xlsx()
+    assert workspace.update_latest_xlsx_button.objectName() == (
+        "dataWorkspaceUpdateLatestXlsx"
+    )
+    assert workspace.open_latest_xlsx_button.objectName() == (
+        "dataWorkspaceOpenLatestXlsx"
+    )
+    assert workspace.update_latest_xlsx_button.isEnabled()
+    assert workspace.open_latest_xlsx_button.isEnabled()
+    assert "READY" in workspace.latest_xlsx_status_label.text()
+    assert "rows=5" in workspace.latest_xlsx_status_label.text()
+
+    workspace.open_latest_xlsx_button.click()
+    workspace.update_latest_xlsx_button.click()
+    assert opened == [str(output)]
+    assert backend.calls[-1] == "request_latest_measurement_xlsx"
+
+    long_error = "permission denied · " + "x" * 300
+    backend._latest_xlsx_snapshot.update(
+        state="FAILED",
+        recording_active=True,
+        error=long_error,
+    )
+    workspace._refresh_latest_measurement_xlsx()
+    app.processEvents()
+    assert not workspace.update_latest_xlsx_button.isEnabled()
+    assert workspace.latest_xlsx_status_label.height() == initial_height
+    assert len(workspace.latest_xlsx_status_label.text()) < len(long_error)
+    assert long_error in workspace.latest_xlsx_status_label.toolTip()
+
+    workspace.deleteLater()
+    app.processEvents()
+
 def test_status_refresh_updates_only_visible_workspace_and_diagnostics() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     window = WorkstationMainWindow(backend=_FakeBackend())

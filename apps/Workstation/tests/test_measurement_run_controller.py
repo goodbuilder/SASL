@@ -9,6 +9,7 @@ from Workstation.measurement_run_controller import MeasurementRunController
 
 def _panel(*, storage_accepts: bool = True) -> SimpleNamespace:
     events: list[tuple[str, dict[str, object]]] = []
+    exports: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
     def append(stream: str, payload: dict[str, object], **_kwargs: object) -> bool:
         events.append((stream, dict(payload)))
@@ -29,12 +30,17 @@ def _panel(*, storage_accepts: bool = True) -> SimpleNamespace:
         retry_data_storage=lambda: {"state": "UNAVAILABLE"},
         append_workstation_data=append,
         flush_workstation_data=lambda: True,
+        request_latest_measurement_xlsx=lambda *args, **kwargs: exports.append(
+            (args, dict(kwargs))
+        )
+        or True,
         data_storage_snapshot=lambda: {
             "state": "UNAVAILABLE" if not storage_accepts else "OK",
             "streams": {},
         },
         _refresh_operation_header=lambda: None,
         _events=events,
+        _exports=exports,
     )
 
 
@@ -159,6 +165,35 @@ def test_stop_boundary_immediately_admits_a_new_run_before_old_teardown() -> Non
     assert panel._measurement_run_generation == current
 
 
+def test_stop_requests_latest_xlsx_after_releasing_measurement_state() -> None:
+    panel = _panel()
+    observed_states: list[str] = []
+    requests: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def request(*args: object, **kwargs: object) -> bool:
+        observed_states.append(str(panel._measurement_run_state))
+        requests.append((args, dict(kwargs)))
+        return True
+
+    panel.request_latest_measurement_xlsx = request
+    controller = MeasurementRunController(panel)
+    assert controller.begin_measurement_run()
+    generation = panel._measurement_run_generation
+    started_utc_ns = panel._measurement_run_started_utc_ns
+    assert controller.measurement_source_transition(
+        "camera.left", "LIVE", "fixture source"
+    )
+
+    assert controller.request_measurement_stop()
+
+    assert observed_states == ["IDLE"]
+    assert requests[0][0] == (generation,)
+    assert requests[0][1]["started_utc_ns"] == started_utc_ns
+    assert requests[0][1]["stopped_utc_ns"] >= started_utc_ns
+    assert requests[0][1]["source_states"]["camera.left"]["state"] == "LIVE"
+    assert requests[0][1]["automatic"] is True
+
+
 def test_persistence_exceptions_never_gate_start_stop_or_next_run() -> None:
     panel = _panel()
 
@@ -170,6 +205,9 @@ def test_persistence_exceptions_never_gate_start_stop_or_next_run() -> None:
 
     panel.append_workstation_data = fail_append
     panel.flush_workstation_data = fail_flush
+    panel.request_latest_measurement_xlsx = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        OSError("xlsx offline")
+    )
     panel._measurement_view_controller_owner = SimpleNamespace(
         close_method_evaluation_workers=lambda: (_ for _ in ()).throw(
             RuntimeError("old worker teardown failed")
@@ -223,9 +261,12 @@ def test_real_panel_ignores_old_session_and_prepares_type_owned_paths(
     assert panel.start_yolo() is None
     assert panel.measurement_run_snapshot()["state"] == "RUNNING"
     assert starts == [{"enable_detection": True, "switch_to_depth": True}]
-    assert panel.data_storage_snapshot()["root"] == str(tmp_path / "measurement_data")
-    assert all(path.parent == tmp_path / "measurement_data" / "videos" for path in panel.video_recording_paths.values())
-    assert not (tmp_path / "measurement_data" / "session.json").exists()
+    assert panel.data_storage_snapshot()["root"] == str(tmp_path / "recordings")
+    assert all(
+        path.parent == tmp_path / "recordings" / "videos"
+        for path in panel.video_recording_paths.values()
+    )
+    assert not (tmp_path / "recordings" / "session.json").exists()
 
     assert panel.close_workstation_data(timeout_s=2.0)
     panel._shutdown_coordinator = SimpleNamespace(run=lambda: True)

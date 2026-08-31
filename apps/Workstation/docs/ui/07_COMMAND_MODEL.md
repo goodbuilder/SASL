@@ -28,6 +28,19 @@ Session Save/Finalize command.
 
 Operate on selected object/workspace: camera connect/preview/capture, calibration capture/calculate/save, etc.
 
+`Data > Status` adds two local derived-artifact commands:
+
+- `Update Latest XLSX` submits/coalesces a request for the newest saved Measurement only. It is
+  disabled while Measurement/Manual recording or XLSX generation is active. Acceptance means
+  `WAITING/GENERATING`, not success; status readback owns the result.
+- `Open Latest XLSX` is enabled only when the published path exists and an app-owned generation is
+  reported. It delegates to the system spreadsheet application and does not edit source data.
+
+Automatic Measurement-stop submission uses the same backend request after the run is already
+`IDLE`. Duplicate requests coalesce; a newer completed generation supersedes an older pending one.
+Cancellation, checkpoint timeout, malformed input, publication failure, and manual retry remain
+local to Data and cannot reject Measurement.
+
 Pixhawk `Find network` is a read-only contextual command. It inventories wired NIC/address/carrier
 and P1/P2 route evidence without changing host networking. The discovery row remains candidate-only;
 P1/P2 assignment cards separately expose each side's endpoint and route. `Assign P1/P2` persists operator intent;

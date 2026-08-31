@@ -16,10 +16,13 @@ from pathlib import Path, PureWindowsPath
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+_WORKSTATION_DATA_ROOT_OVERRIDE = os.environ.get(
+    "SASL_WORKSTATION_DATA_ROOT", ""
+).strip()
 
 
 def _workstation_data_root() -> Path:
-    configured = os.environ.get("SASL_WORKSTATION_DATA_ROOT", "").strip()
+    configured = _WORKSTATION_DATA_ROOT_OVERRIDE
     if not configured:
         return REPO_ROOT / ".local" / "workstation_data"
     root = Path(configured).expanduser()
@@ -33,7 +36,11 @@ WORKSTATION_SETTINGS_PATH = WORKSTATION_DATA_ROOT / "stereo_distance_settings.js
 WORKSTATION_RECORDINGS_ROOT = WORKSTATION_DATA_ROOT / "recordings"
 WORKSTATION_CALIBRATION_ROOT = WORKSTATION_DATA_ROOT / "calibration"
 WORKSTATION_MODELS_ROOT = WORKSTATION_DATA_ROOT / "models"
-WORKSTATION_MEASUREMENT_DATA_ROOT = WORKSTATION_DATA_ROOT / "measurement_data"
+WORKSTATION_MEASUREMENT_DATA_ROOT = (
+    WORKSTATION_DATA_ROOT / "recordings"
+    if _WORKSTATION_DATA_ROOT_OVERRIDE
+    else REPO_ROOT / "recordings"
+)
 
 PORTABLE_SETTINGS_PATH_FIELDS = (
     "intrinsics_path",
@@ -110,7 +117,8 @@ def workstation_settings_portability_errors(
                 value,
                 data_root=data_root,
                 field_name=field_name,
-                allow_empty=field_name == "calibration_validation_json",
+                allow_empty=field_name
+                in {"calibration_validation_json", "measurement_data_root"},
             )
         except ValueError as exc:
             errors.append(str(exc))

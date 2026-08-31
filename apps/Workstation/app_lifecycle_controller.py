@@ -103,6 +103,14 @@ class AppLifecycleController:
             if not callable(native_store_closer)
             else bool(native_store_closer())
         )
+        data_owner = getattr(self.panel, "_data_storage_controller_owner", None)
+        latest_xlsx_stopped = (
+            True
+            if data_owner is None
+            else bool(
+                data_owner.cancel_latest_measurement_xlsx_export(timeout_s=0.0)
+            )
+        )
         native_rings_stopped = True
         for side in ("left", "right"):
             pane = getattr(self.panel, f"{side}_pane", None)
@@ -156,6 +164,7 @@ class AppLifecycleController:
             and lrf_stopped
             and measurement_workers_stopped
             and native_stores_stopped
+            and latest_xlsx_stopped
             and native_rings_stopped
             and all(results)
         )

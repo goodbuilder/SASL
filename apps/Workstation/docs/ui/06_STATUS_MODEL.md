@@ -136,6 +136,19 @@ active calibration, and the selected Pixhawk/GNSS or checkerboard geometry evide
 It returns `READY` only when all required checks pass; it never treats a command
 acceptance as proof that a source is live. Storage state is observable but never a Measurement gate.
 
+### 15.1 Latest Measurement XLSX
+
+The Data workspace owns a local derived-artifact read model, not a new global runtime status key:
+`NOT_CREATED`, `WAITING`, `GENERATING`, `READY`, `STALE`, `FAILED`, or `CANCELLED`. It includes the
+target and published generation, output path, generation time, per-sheet row counts, issue count,
+checkpoint settled/pending evidence, completion basis, and error. Request acceptance is not
+publication success; only `READY` with an existing app-owned workbook is success.
+
+`STALE` means a newer target or late matching row exists while the prior workbook remains usable.
+Missing device/source rows are shown inside the workbook as zero rows/`#N/A`, not as a false export
+failure. A long path/error is compacted in the fixed-height label and retained in its tooltip, so
+status changes never move buttons, focus, selection, scroll, docks, or the window.
+
 ## 16. Aggregate Status
 
 Aggregate status may simplify details for Navigation/Status Bar but must be computed by explicit rules.

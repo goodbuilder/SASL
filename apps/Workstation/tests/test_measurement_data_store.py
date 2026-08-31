@@ -402,9 +402,49 @@ def test_bad_record_drops_only_itself_and_later_results_continue(tmp_path: Path)
     assert snapshot["streams"]["measurements"]["dropped_records"] == 1
 
 
-def test_data_root_is_relative_and_invalid_absolute_setting_falls_back(tmp_path: Path) -> None:
+def test_default_and_legacy_default_use_repository_recordings_root(tmp_path: Path) -> None:
+    expected = tmp_path / "repository-recordings"
+
+    for configured in ("", "measurement_data"):
+        class Panel:
+            app_root = tmp_path / "data-root"
+            default_measurement_data_root = expected
+            settings = type("Settings", (), {"measurement_data_root": configured})()
+
+            @staticmethod
+            def _workstation_setting(_name, default):
+                return configured if _name == "measurement_data_root" else default
+
+        controller = DataStorageController(Panel())
+        assert controller.data_storage_snapshot()["root"] == str(expected.resolve())
+        assert controller.close_workstation_data(timeout_s=2.0)
+
+
+def test_custom_data_root_remains_relative_to_workstation_data_root(tmp_path: Path) -> None:
+    class Panel:
+        app_root = tmp_path / "data-root"
+        default_measurement_data_root = tmp_path / "repository-recordings"
+        settings = type("Settings", (), {"measurement_data_root": "field/run-a"})()
+
+        @staticmethod
+        def _workstation_setting(_name, default):
+            return "field/run-a" if _name == "measurement_data_root" else default
+
+    controller = DataStorageController(Panel())
+    assert controller.data_storage_snapshot()["root"] == str(
+        (Panel.app_root / "field" / "run-a").resolve()
+    )
+    assert controller.close_workstation_data(timeout_s=2.0)
+
+
+def test_invalid_absolute_setting_falls_back_to_default_recordings_root(
+    tmp_path: Path,
+) -> None:
+    expected = tmp_path / "repository-recordings"
+
     class Panel:
         app_root = tmp_path
+        default_measurement_data_root = expected
         settings = type("Settings", (), {"measurement_data_root": "/outside/data"})()
 
         @staticmethod
@@ -413,7 +453,7 @@ def test_data_root_is_relative_and_invalid_absolute_setting_falls_back(tmp_path:
 
     controller = DataStorageController(Panel())
     snapshot = controller.data_storage_snapshot()
-    assert snapshot["root"] == str((tmp_path / "measurement_data").resolve())
+    assert snapshot["root"] == str(expected.resolve())
     assert snapshot["state"] == "DEGRADED"
     assert "portable relative path" in snapshot["configuration_error"]
     assert controller.append_workstation_data("events", {"event_type": "still_available"})

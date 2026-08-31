@@ -23,11 +23,13 @@ restart-recovery identity for new data.
 
 ## Physical layout
 
-`measurement_data_root` is a POSIX-style path relative to `SASL_WORKSTATION_DATA_ROOT`; it defaults
-to `measurement_data`.
+An empty `measurement_data_root` selects `<SASL_ROOT>/recordings` for a normal launch. When
+`SASL_WORKSTATION_DATA_ROOT` is explicitly configured, the empty default selects its `recordings/`
+child. A non-empty value is a POSIX-style path relative to `SASL_WORKSTATION_DATA_ROOT`.
 
 ```text
-<measurement_data_root>/
+<resolved Measurement data root>/
+├── latest_measurement.xlsx
 ├── events.jsonl
 ├── measurements.jsonl
 ├── method_evaluations.jsonl
@@ -57,7 +59,34 @@ to `measurement_data`.
 ```
 
 Structured files append across runs and are not rotated automatically. No new Measurement folder,
-Parquet generation, `review.xlsx`, package manifest, or publication pointer is produced.
+Parquet generation, legacy `review.xlsx`, package manifest, or publication pointer is produced.
+`latest_measurement.xlsx` is one replaceable derived view of the most recently completed
+Measurement; it is not a Session, archive, completeness verdict, or authoritative store.
+
+## Latest Measurement XLSX
+
+After a Measurement stops, Workstation requests a background rebuild of
+`latest_measurement.xlsx`. `Data > Status` exposes `Update Latest XLSX`, `Open Latest XLSX`, and
+the factual `NOT_CREATED/WAITING/GENERATING/READY/STALE/FAILED/CANCELLED` state. The request occurs
+after the run has returned to `IDLE`; delay, cancellation, failure, or a locked/foreign destination
+never blocks the next Measurement.
+
+The workbook selects exactly one `runtime_generation`, using `runtime_generation` or the
+sessionless compatibility `measurement_id` stored on each source row. It contains Summary,
+Measurement events, materialized and append/replace result history, eight-method bundles/outcomes/
+inputs, camera, P1/P2/Target, Base GNSS, geometry, native-frame, file-inventory, and issue sheets.
+Manual-record-only and unrelated application/capture/alignment streams are excluded. Differently
+sampled sources are not time-joined.
+
+Original clock values remain exact; integers beyond Excel's 15-digit precision are text and UTC
+epoch fields gain adjacent nanosecond-precision KST ISO display columns. Missing cells are Excel
+`#N/A`; absent samples are never invented. Row, column, and cell limits produce deterministic
+shards/continuation columns inside the same workbook.
+
+The writer takes a background-only durable byte-cutoff checkpoint, builds and validates a hidden
+temporary XLSX, and atomically publishes it. A prior Workstation-schema workbook may be replaced;
+an unmarked same-name file is treated as user-owned and preserved. Malformed/torn source records
+are excluded with `Issues` evidence. JSONL remains authoritative in every success and failure path.
 
 ## Fixed stream contract
 
@@ -98,7 +127,7 @@ One daemon writer owns the fixed JSONL files.
   Other streams keep their existing drop behavior.
 - Serialization failure drops only the malformed record; a later valid record continues normally.
 - `Data > Status` exposes root, writer liveness, pending counts, per-stream state, last error, last
-  write time, written count, and dropped count.
+  write time, written count, dropped count, and latest-XLSX request/publication state.
 - `OK`, `DEGRADED`, or `UNAVAILABLE` never disables Measurement.
 
 ## Recording intervals

@@ -24,6 +24,36 @@ from collections.abc import Iterator, Sequence
 
 DATA_STORE_SCHEMA = "workstation-measurement-data-store-v1"
 DATA_RECORD_SCHEMA = "workstation-measurement-data-record-v1"
+STORE_LIFECYCLE_OPEN = "OPEN"
+STORE_LIFECYCLE_CLOSING = "CLOSING"
+STORE_LIFECYCLE_CLOSED = "CLOSED"
+ROW_WRITE_ADMITTED = "ADMITTED"
+ROW_WRITE_RETRYABLE = "RETRYABLE"
+ROW_WRITE_UNAVAILABLE = "UNAVAILABLE"
+
+
+@dataclass(frozen=True)
+class RowWriteAdmission:
+    state: str
+    reason: str = ""
+    row_index: int | None = None
+    lease: tuple[int, int] | None = None
+
+    def __post_init__(self) -> None:
+        if self.state not in {
+            ROW_WRITE_ADMITTED,
+            ROW_WRITE_RETRYABLE,
+            ROW_WRITE_UNAVAILABLE,
+        }:
+            raise ValueError(f"unsupported row write admission state: {self.state}")
+        if self.lease is not None and (
+            self.row_index is None or self.lease[1] != self.row_index
+        ):
+            raise ValueError("row write lease must identify row_index")
+
+    @property
+    def admitted(self) -> bool:
+        return self.state == ROW_WRITE_ADMITTED
 
 STREAM_PATHS: dict[str, Path] = {
     "events": Path("events.jsonl"),
@@ -145,6 +175,19 @@ class _QueuedRecord:
     stream: str
     payload: bytes
     enqueued_monotonic_ns: int
+    sequence: int
+
+
+@dataclass(frozen=True)
+class MeasurementDataCheckpoint:
+    """Durable read boundary captured without blocking data producers."""
+
+    root: Path
+    captured_utc_ns: int
+    settled: bool
+    pending_before_cutoff: int
+    stream_byte_limits: Mapping[str, int]
+    storage_snapshot: Mapping[str, Any]
 
 
 class MeasurementDataStore:
@@ -175,6 +218,14 @@ class MeasurementDataStore:
         self._states = {name: _StreamState() for name in STREAM_PATHS}
         self._handles: dict[str, Any] = {}
         self._state_lock = threading.RLock()
+        self._lifecycle_condition = threading.Condition(self._state_lock)
+        self._io_lock = threading.RLock()
+        self._lifecycle_state = STORE_LIFECYCLE_OPEN
+        self._lifecycle_rejected_records = 0
+        self._active_enqueues = 0
+        self._active_operations = 0
+        self._next_sequence = 0
+        self._pending_sequences: set[int] = set()
         self._retry_reserve: deque[_QueuedRecord] = deque()
         self._retry_reserve_bytes = 0
         self._retry_backoff_s = {name: 1.0 for name in STREAM_PATHS}
@@ -201,6 +252,15 @@ class MeasurementDataStore:
             raise ValueError(f"unknown measurement data stream: {stream}") from exc
         return self.root / relative
 
+    def _reject_enqueue_for_lifecycle_unlocked(self, stream: str) -> bool:
+        state = self._states[stream]
+        state.dropped_records += 1
+        state.last_error = (
+            f"enqueue rejected: store lifecycle is {self._lifecycle_state}"
+        )
+        self._lifecycle_rejected_records += 1
+        return False
+
     def enqueue(
         self,
         stream: str,
@@ -211,6 +271,9 @@ class MeasurementDataStore:
         name = str(stream)
         if name not in STREAM_PATHS:
             raise ValueError(f"unknown measurement data stream: {name}")
+        with self._state_lock:
+            if self._lifecycle_state != STORE_LIFECYCLE_OPEN:
+                return self._reject_enqueue_for_lifecycle_unlocked(name)
         now_utc_ns = time.time_ns()
         now_monotonic_ns = time.monotonic_ns()
         try:
@@ -237,63 +300,155 @@ class MeasurementDataStore:
             # whole type stream would let one optional field suppress every
             # later valid Measurement result until an operator retry.
             with self._state_lock:
+                if self._lifecycle_state != STORE_LIFECYCLE_OPEN:
+                    return self._reject_enqueue_for_lifecycle_unlocked(name)
                 state = self._states[name]
                 state.dropped_records += 1
                 state.last_error = f"record rejected: {exc}"
             return False
-        queued = _QueuedRecord(name, encoded, now_monotonic_ns)
-        with self._state_lock:
-            retry_stream_pending = any(
-                item.stream == name for item in self._retry_reserve
-            )
-            if self._states[name].state == "FAILED" or retry_stream_pending:
-                return self._reserve_retry_unlocked(queued)
-        use_priority = name in PRIORITY_STREAMS if priority is None else bool(priority)
-        target = self._priority if use_priority else self._bulk
+        with self._lifecycle_condition:
+            if self._lifecycle_state != STORE_LIFECYCLE_OPEN:
+                return self._reject_enqueue_for_lifecycle_unlocked(name)
+            self._active_enqueues += 1
+            self._active_operations += 1
+            self._next_sequence += 1
+            sequence = self._next_sequence
+            self._pending_sequences.add(sequence)
+        queued = _QueuedRecord(name, encoded, now_monotonic_ns, sequence)
         try:
-            target.put_nowait(queued)
-        except queue.Full:
-            if use_priority:
-                with self._state_lock:
-                    self._states[name].dropped_records += 1
-                return False
-            try:
-                evicted = target.get_nowait()
-            except queue.Empty:
-                with self._state_lock:
-                    self._states[name].dropped_records += 1
-                return False
             with self._state_lock:
-                self._states[evicted.stream].dropped_records += 1
+                retry_stream_pending = any(
+                    item.stream == name for item in self._retry_reserve
+                )
+                if self._states[name].state == "FAILED" or retry_stream_pending:
+                    accepted = self._reserve_retry_unlocked(queued)
+                    if not accepted:
+                        self._settle_sequence_unlocked(queued.sequence)
+                    return accepted
+            use_priority = (
+                name in PRIORITY_STREAMS if priority is None else bool(priority)
+            )
+            target = self._priority if use_priority else self._bulk
             try:
                 target.put_nowait(queued)
             except queue.Full:
-                # Another producer can claim the slot between the eviction and
-                # this non-blocking admission.  Treat that race as a factual
-                # drop of this record instead of leaking queue.Full through a
-                # camera/telemetry callback.
+                if use_priority:
+                    with self._state_lock:
+                        self._states[name].dropped_records += 1
+                        self._settle_sequence_unlocked(queued.sequence)
+                    return False
+                try:
+                    evicted = target.get_nowait()
+                except queue.Empty:
+                    with self._state_lock:
+                        self._states[name].dropped_records += 1
+                        self._settle_sequence_unlocked(queued.sequence)
+                    return False
                 with self._state_lock:
-                    self._states[name].dropped_records += 1
-                return False
-        with self._state_lock:
-            if self._states[name].state == "IDLE":
-                self._states[name].state = "PENDING"
-        return True
+                    self._states[evicted.stream].dropped_records += 1
+                    self._settle_sequence_unlocked(evicted.sequence)
+                try:
+                    target.put_nowait(queued)
+                except queue.Full:
+                    # Another producer can claim the slot between the eviction
+                    # and this non-blocking admission. Treat that race as a
+                    # factual drop instead of leaking queue.Full through a
+                    # camera/telemetry callback.
+                    with self._state_lock:
+                        self._states[name].dropped_records += 1
+                        self._settle_sequence_unlocked(queued.sequence)
+                    return False
+            with self._state_lock:
+                if self._states[name].state == "IDLE":
+                    self._states[name].state = "PENDING"
+            return True
+        finally:
+            with self._lifecycle_condition:
+                self._active_enqueues -= 1
+                self._active_operations -= 1
+                self._lifecycle_condition.notify_all()
 
     def retry_failed(self) -> None:
-        with self._state_lock:
-            failed = [name for name, state in self._states.items() if state.state == "FAILED"]
-            for name in failed:
-                self._states[name].state = "IDLE"
-                self._states[name].last_error = ""
-                self._close_handle(name)
-            for name in failed:
-                self._next_retry_monotonic_s[name] = None
-                self._retry_backoff_s[name] = 1.0
-        self._drain_retry_reserve()
+        with self._lifecycle_condition:
+            if self._lifecycle_state != STORE_LIFECYCLE_OPEN:
+                return
+            self._active_operations += 1
+        try:
+            with self._state_lock:
+                failed = [
+                    name
+                    for name, state in self._states.items()
+                    if state.state == "FAILED"
+                ]
+                for name in failed:
+                    self._states[name].state = "IDLE"
+                    self._states[name].last_error = ""
+                    self._close_handle(name)
+                for name in failed:
+                    self._next_retry_monotonic_s[name] = None
+                    self._retry_backoff_s[name] = 1.0
+            self._drain_retry_reserve()
+        finally:
+            with self._lifecycle_condition:
+                self._active_operations -= 1
+                self._lifecycle_condition.notify_all()
 
     def request_flush(self) -> None:
         self._flush_requested.set()
+
+    def export_checkpoint(self, *, timeout_s: float = 5.0) -> MeasurementDataCheckpoint:
+        """Flush and return complete-file byte limits for a background export.
+
+        The cutoff covers records admitted before this call. Producers remain
+        non-blocking; when retryable storage cannot settle within ``timeout_s``,
+        the returned boundary is explicitly partial instead of delaying a
+        Measurement command.
+        """
+
+        timeout = max(0.0, float(timeout_s))
+        deadline = time.monotonic() + timeout
+        with self._lifecycle_condition:
+            if self._lifecycle_state != STORE_LIFECYCLE_OPEN:
+                raise RuntimeError(
+                    f"cannot checkpoint store lifecycle {self._lifecycle_state}"
+                )
+            self._active_operations += 1
+            cutoff = self._next_sequence
+        try:
+            with self._lifecycle_condition:
+                while True:
+                    pending = sum(
+                        1 for sequence in self._pending_sequences if sequence <= cutoff
+                    )
+                    if pending == 0:
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        break
+                    self._lifecycle_condition.wait(timeout=min(0.05, remaining))
+                settled = pending == 0
+            with self._io_lock:
+                self._flush_all()
+                stream_byte_limits: dict[str, int] = {}
+                for stream in STREAM_PATHS:
+                    path = self.path_for(stream)
+                    stream_byte_limits[stream] = (
+                        path.stat().st_size
+                        if path.is_file() and not path.is_symlink()
+                        else 0
+                    )
+            return MeasurementDataCheckpoint(
+                root=self.root,
+                captured_utc_ns=time.time_ns(),
+                settled=settled,
+                pending_before_cutoff=pending,
+                stream_byte_limits=stream_byte_limits,
+                storage_snapshot=self.snapshot(),
+            )
+        finally:
+            with self._lifecycle_condition:
+                self._active_operations -= 1
+                self._lifecycle_condition.notify_all()
 
     def snapshot(self) -> dict[str, Any]:
         with self._state_lock:
@@ -317,6 +472,11 @@ class MeasurementDataStore:
                 if value is not None
             }
             next_retry = min(retry_deadlines.values(), default=None)
+            lifecycle_state = self._lifecycle_state
+            lifecycle_rejected_records = self._lifecycle_rejected_records
+            active_enqueues = self._active_enqueues
+            active_operations = self._active_operations
+            checkpoint_pending_records = len(self._pending_sequences)
         failed = sum(1 for value in streams.values() if value["state"] == "FAILED")
         dropped = sum(int(value["dropped_records"]) for value in streams.values())
         writer_alive = self.alive
@@ -330,6 +490,11 @@ class MeasurementDataStore:
         return {
             "schema": DATA_STORE_SCHEMA,
             "state": overall,
+            "lifecycle_state": lifecycle_state,
+            "lifecycle_rejected_records": lifecycle_rejected_records,
+            "active_enqueues": active_enqueues,
+            "active_operations": active_operations,
+            "checkpoint_pending_records": checkpoint_pending_records,
             "root": str(self.root),
             "priority_pending": self._priority.qsize(),
             "priority_capacity": self.priority_capacity,
@@ -345,9 +510,21 @@ class MeasurementDataStore:
         }
 
     def close(self, *, timeout_s: float = 2.0) -> bool:
-        self._stop_requested.set()
-        self._flush_requested.set()
-        self._thread.join(timeout=max(0.0, float(timeout_s)))
+        timeout = max(0.0, float(timeout_s))
+        deadline = time.monotonic() + timeout
+        with self._lifecycle_condition:
+            if self._lifecycle_state == STORE_LIFECYCLE_CLOSED:
+                return True
+            if self._lifecycle_state == STORE_LIFECYCLE_OPEN:
+                self._lifecycle_state = STORE_LIFECYCLE_CLOSING
+            while self._active_operations:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                self._lifecycle_condition.wait(timeout=remaining)
+            self._stop_requested.set()
+            self._flush_requested.set()
+        self._thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if self._thread.is_alive():
             return False
         return True
@@ -389,17 +566,22 @@ class MeasurementDataStore:
                     item = self._retry_reserve.popleft()
                     self._retry_reserve_bytes -= len(item.payload)
                     self._states[item.stream].dropped_records += 1
+                    self._settle_sequence_unlocked(item.sequence)
                 for name in tuple(self._handles):
                     self._close_handle(name)
+                self._lifecycle_state = STORE_LIFECYCLE_CLOSED
 
     def _write(self, item: _QueuedRecord) -> None:
         with self._state_lock:
             if self._states[item.stream].state == "FAILED":
-                self._reserve_retry_unlocked(item)
+                accepted = self._reserve_retry_unlocked(item)
+                if not accepted:
+                    self._settle_sequence_unlocked(item.sequence)
                 return
         try:
-            handle = self._handle(item.stream)
-            written = handle.write(item.payload)
+            with self._io_lock:
+                handle = self._handle(item.stream)
+                written = handle.write(item.payload)
             if written != len(item.payload):
                 raise OSError(
                     f"short append: expected={len(item.payload)}, actual={written}"
@@ -407,7 +589,9 @@ class MeasurementDataStore:
         except OSError as exc:
             self._mark_failed(item.stream, str(exc))
             with self._state_lock:
-                self._reserve_retry_unlocked(item)
+                accepted = self._reserve_retry_unlocked(item)
+                if not accepted:
+                    self._settle_sequence_unlocked(item.sequence)
             return
         with self._state_lock:
             state = self._states[item.stream]
@@ -417,6 +601,7 @@ class MeasurementDataStore:
             state.written_records += 1
             self._retry_backoff_s[item.stream] = 1.0
             self._next_retry_monotonic_s[item.stream] = None
+            self._settle_sequence_unlocked(item.sequence)
 
     def _handle(self, stream: str):
         with self._state_lock:
@@ -480,9 +665,14 @@ class MeasurementDataStore:
             evicted = self._retry_reserve.pop()
             self._retry_reserve_bytes -= len(evicted.payload)
             self._states[evicted.stream].dropped_records += 1
+            self._settle_sequence_unlocked(evicted.sequence)
             if evicted is item:
                 accepted = False
         return accepted
+
+    def _settle_sequence_unlocked(self, sequence: int) -> None:
+        self._pending_sequences.discard(int(sequence))
+        self._lifecycle_condition.notify_all()
 
     def _maybe_retry_failed(self) -> None:
         now = time.monotonic()
@@ -533,14 +723,15 @@ class MeasurementDataStore:
                     self._retry_reserve_bytes -= len(item.payload)
 
     def _flush_all(self) -> None:
-        with self._state_lock:
-            handles = tuple(self._handles.items())
-        for stream, handle in handles:
-            try:
-                handle.flush()
-                _FSYNC(handle.fileno())
-            except OSError as exc:
-                self._mark_failed(stream, f"flush failed: {exc}")
+        with self._io_lock:
+            with self._state_lock:
+                handles = tuple(self._handles.items())
+            for stream, handle in handles:
+                try:
+                    handle.flush()
+                    _FSYNC(handle.fileno())
+                except OSError as exc:
+                    self._mark_failed(stream, f"flush failed: {exc}")
 
     def _close_handle(self, stream: str) -> None:
         handle = self._handles.pop(stream, None)
@@ -654,6 +845,7 @@ __all__ = [
     "DATA_RECORD_SCHEMA",
     "DATA_STORE_SCHEMA",
     "ESSENTIAL_RETRY_STREAMS",
+    "MeasurementDataCheckpoint",
     "MeasurementDataStore",
     "LiveDataRows",
     "PRIORITY_STREAMS",

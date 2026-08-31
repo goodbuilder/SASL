@@ -101,8 +101,12 @@ capture, FTP, and EXIF comparison remain Legacy-only.
 
 `Data` is the top-level storage/capture surface with `Status` and `Capture` tabs. Status owns the
 fixed stream table, writer/queue/drop state, data-folder access, Retry Storage, and a file-manager
-link to legacy recordings. Capture owns Target reference, HR/OZ events/import, and ULog tools. It
-does not expose Session lifecycle, package completeness, saved review, or legacy catalog rows.
+link to legacy recordings. A fixed second Files action row owns `Update Latest XLSX` and
+`Open Latest XLSX`; a fixed two-line status strip shows target/published generation, state, row
+count, and compact error while the tooltip retains full path/detail. Capture owns Target reference,
+HR/OZ events/import, and ULog tools. Data does not expose Session lifecycle, package completeness,
+legacy `review.xlsx`, or legacy catalog rows. The latest XLSX is a replaceable one-Measurement view,
+not a restored Review workspace.
 
 Measurement owns one `측정 시작`/`측정 종료` control and transient
 `IDLE/QUEUED/STARTING/RUNNING/STOPPING/ERROR` status. The control stays enabled when storage is
