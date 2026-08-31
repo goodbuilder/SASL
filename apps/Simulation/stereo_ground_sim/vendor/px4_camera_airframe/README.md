@@ -15,12 +15,12 @@ that never maneuver, unlike the target drone which actually flies. EKF2's
 default `MAG_TYPE=Automatic` switches to 3-axis magnetometer fusion once
 considered in-flight, which also tries to estimate a body-fixed hard-iron
 bias state -- but that state is only observable if the vehicle's attitude
-actually changes. A camera that never maneuvers leaves it stuck wherever it
-happened to be after the brief startup transient (confirmed via
-`estimator_sensor_bias`: `mag_bias_stable=0`, non-zero `mag_bias[0..2]`),
-which was the source of a steady, per-camera heading bias feeding the
-Attitude/Full Ray triangulation. `EKF2_MAG_TYPE=1` (Magnetic heading) fuses
-only 2D heading and never attempts hard-iron bias learning, avoiding this.
+actually changes. A camera that never maneuvers can leave it unstable
+(`estimator_sensor_bias.mag_bias_stable=0`). `EKF2_MAG_TYPE=1` keeps these
+fixed cameras on 2D magnetic-heading fusion rather than 3-axis fusion. It
+does not repair a malformed simulated sensor vector: the Gazebo ENU -> sensor
+FLU -> PX4 body-FRD contract is prepared and build-stamped separately by
+`run_operator_view.sh`.
 
 Rather than branching on `$px4_instance` inside the target drone's own
 `4001_gz_x500` airframe, the two camera Pixhawks boot on this separate

@@ -12,6 +12,8 @@ PX4_MSGS_OVERLAY_SETUP="$SASL_ROS_WORKSPACE/install/setup.bash"
 PX4_MSGS_OVERLAY_MANIFEST="$SASL_ROS_WORKSPACE/install/share/sasl_ros_workspace/px4_msgs-overlay.env"
 PX4_MSGS_PACKAGE_SETUP="$SASL_ROS_WORKSPACE/install/px4_msgs/share/px4_msgs/local_setup.bash"
 PX4_MSGS_REF="${PX4_MSGS_REF:-86d8239e962f6939e05c3737784f60c02fa884db}"
+PX4_MAG_FRAME_HELPER="$ROOT_DIR/scripts/prepare_px4_gz_magnetometer_frame.py"
+PX4_CAMERA_AIRFRAME_SOURCE="$ROOT_DIR/stereo_ground_sim/vendor/px4_camera_airframe/4090_camera_px4"
 cd "$ROOT_DIR"
 export OPERATOR_BAG_DIR="${OPERATOR_BAG_DIR:-$ROOT_DIR/Recordings}"
 
@@ -806,6 +808,51 @@ if ! ensure_no_px4_build_in_progress; then
   exit 2
 fi
 
+if [[ ! -f "$PX4_MAG_FRAME_HELPER" ]]; then
+  printf '%s\n' "error: PX4 Gazebo magnetometer frame helper is missing: $PX4_MAG_FRAME_HELPER" >&2
+  exit 2
+fi
+if [[ ! -f "$PX4_CAMERA_AIRFRAME_SOURCE" ]]; then
+  printf '%s\n' "error: camera PX4 airframe source is missing: $PX4_CAMERA_AIRFRAME_SOURCE" >&2
+  exit 2
+fi
+
+# Prepare the one pinned PX4/Gazebo boundary before stopping or launching any
+# runtime process. The helper edits only a known v1.17.0 stock/legacy three-line
+# block and fails closed for an unexpected source variant.
+"$PX4_PYTHON_EXECUTABLE" "$PX4_MAG_FRAME_HELPER" prepare \
+  --px4-root "$PX4_DIR" \
+  --required-version "${PX4_REQUIRED_VERSION:-v1.17.0}"
+
+PX4_BINARY_PATH="$PX4_DIR/build/px4_sitl_default/bin/px4"
+if [[ "$skip_px4_build" == true ]]; then
+  "$PX4_PYTHON_EXECUTABLE" "$PX4_MAG_FRAME_HELPER" check-build \
+    --px4-root "$PX4_DIR" \
+    --airframe "$PX4_CAMERA_AIRFRAME_SOURCE" \
+    --binary "$PX4_BINARY_PATH" \
+    --required-version "${PX4_REQUIRED_VERSION:-v1.17.0}"
+fi
+
+require_fresh_installed_simulation_assets() {
+  local source_path installed_path relative_path
+  for relative_path in \
+    "worlds/stereo_ground_drone.sdf" \
+    "launch/stereo_ground_sim.launch.py"; do
+    source_path="$ROOT_DIR/stereo_ground_sim/$relative_path"
+    installed_path="$ROOT_DIR/install/stereo_ground_sim/share/stereo_ground_sim/$relative_path"
+    if [[ ! -f "$source_path" || ! -f "$installed_path" ]] || ! cmp -s "$source_path" "$installed_path"; then
+      printf '%s\n' \
+        "error: --skip-colcon-build cannot reuse stale Simulation asset: $relative_path" \
+        "Run once without --skip-colcon-build so the ENU magnetometer contract is installed." >&2
+      return 2
+    fi
+  done
+}
+
+if [[ "$skip_colcon_build" == true ]] && ! require_fresh_installed_simulation_assets; then
+  exit 2
+fi
+
 DEFAULT_YOLO_PYTHON="${DEFAULT_YOLO_PYTHON:-${YOLO_PYTHON:-}}"
 YOLO_BOOTSTRAP_PREFERRED_PYTHON="${DEFAULT_YOLO_PYTHON:-python3}"
 if [[ "$yolo_enabled" != true ]]; then
@@ -1396,6 +1443,8 @@ setsid bash -c '
     left_uxrce_dds_port="${18}"
     right_uxrce_dds_port="${19}"
     ready_file="${20}"
+    mag_frame_helper="${21}"
+    required_px4_version="${22}"
     cd "$px4_dir"
     export DISPLAY="$display_value"
     if [[ -x "$px4_python" ]]; then
@@ -1434,6 +1483,13 @@ setsid bash -c '
     mkdir -p "$px4_dir/build/px4_sitl_default/etc/init.d-posix/airframes"
     cp "$camera_airframe_src" \
       "$px4_dir/build/px4_sitl_default/etc/init.d-posix/airframes/4090_camera_px4"
+    if [[ "$skip_px4_build" != true ]]; then
+      "$px4_python" "$mag_frame_helper" record-build \
+        --px4-root "$px4_dir" \
+        --airframe "$camera_airframe_src" \
+        --binary "$px4_binary" \
+        --required-version "$required_px4_version"
+    fi
     if [[ "$left_instance" == "0" || "$right_instance" == "0" || "$left_instance" == "$right_instance" ]]; then
       printf "%s\n" "error: Camera PX4 instances must be distinct non-zero integers." >&2
       exit 2
@@ -1506,13 +1562,15 @@ setsid bash -c '
     "$PX4_PYTHON_EXECUTABLE" \
     "$PX4_UXRCE_DDS_PORT" \
     "$PX4_CONSOLE_LOG" \
-    "$ROOT_DIR/stereo_ground_sim/vendor/px4_camera_airframe/4090_camera_px4" \
+    "$PX4_CAMERA_AIRFRAME_SOURCE" \
     "$skip_px4_build" \
     "${CAM_L_SIM_GPS_USED:-10}" \
     "${CAM_R_SIM_GPS_USED:-10}" \
     "$CAM_L_PX4_UXRCE_DDS_PORT" \
     "$CAM_R_PX4_UXRCE_DDS_PORT" \
-    "$px4_ready_file" &
+    "$px4_ready_file" \
+    "$PX4_MAG_FRAME_HELPER" \
+    "${PX4_REQUIRED_VERSION:-v1.17.0}" &
 px4_supervisor_pid="$!"
 children+=("$px4_supervisor_pid")
 

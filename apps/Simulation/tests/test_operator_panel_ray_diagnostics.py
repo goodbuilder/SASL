@@ -101,7 +101,7 @@ def test_panel_renders_all_ten_ray_rows_with_correct_labels_and_order(qt_app):
 
     assert labels == [
         "Nominal Pose", "Optical Pose", "Ideal", "GPS Baseline", "Global Baseline",
-        "Attitude", "Operational", "Attitude (True North)", "Attitude (Declination)",
+        "Attitude", "Operational", "Attitude (True North)", "Attitude (Shared GNSS North)",
         "Operational (True North)",
     ]
 

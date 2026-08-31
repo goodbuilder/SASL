@@ -148,9 +148,11 @@ def test_gps_baseline_plot_arrays_preserve_public_frd_order_without_header_time(
     assert len(node.gps_baseline_position_pub.messages) == 1
     assert len(node.global_baseline_position_pub.messages) == 1
     assert len(node.uam_raw_gps_reference_position_pub.messages) == 1
-    assert node.gps_baseline_plot_pub.messages[0].data == [1002.0, 6.0, 5.0]
-    assert node.uam_raw_gps_reference_plot_pub.messages[0].data == [1001.0, 5.0, 4.0]
-    assert node.global_baseline_plot_pub.messages[0].data == [1000.0, 5.5, 4.5]
+    # ROS-generated Float32MultiArray uses array('f'); fallback test messages
+    # may use list. Normalize only the container while preserving FRD values.
+    assert list(node.gps_baseline_plot_pub.messages[0].data) == [1002.0, 6.0, 5.0]
+    assert list(node.uam_raw_gps_reference_plot_pub.messages[0].data) == [1001.0, 5.0, 4.0]
+    assert list(node.global_baseline_plot_pub.messages[0].data) == [1000.0, 5.5, 4.5]
 
 
 def test_uam_raw_gps_reference_uses_left_local_enu_then_public_frd() -> None:

@@ -9,7 +9,9 @@ It compiles and runs PX4's own, unmodified
 minimal local shim for the one generic ``math::constrain`` utility it needs,
 so it can be built standalone without the full PX4 NuttX/posix build system)
 and reads back the declination/inclination/strength it actually returns for
-the world's coordinates.
+the world's coordinates. It also requires the world plugin to declare ENU
+earth-frame output explicitly. Body-frame FLU -> FRD delivery is verified
+separately from real ULogs by ``validate_px4_magnetometer_frame.py``.
 
 Usage:
     python3 apps/Simulation/stereo_ground_sim/tools/verify_magnetic_field.py \\
@@ -109,6 +111,21 @@ def parse_world(world_path: Path) -> tuple[float, float, tuple[float, float, flo
         raise _fail("magnetic_field contains NaN or Inf")
     if math.sqrt(sum(value * value for value in values)) <= 0.0:
         raise _fail("magnetic_field is a zero vector")
+
+    plugins = [
+        plugin
+        for plugin in root.findall(".//world/plugin")
+        if plugin.attrib.get("name") == "gz::sim::systems::Magnetometer"
+    ]
+    if len(plugins) != 1:
+        raise _fail(
+            "world must contain exactly one gz::sim::systems::Magnetometer plugin"
+        )
+    plugin = plugins[0]
+    if (plugin.findtext("use_units_gauss") or "").strip().lower() != "true":
+        raise _fail("magnetometer plugin must explicitly use gauss units")
+    if (plugin.findtext("use_earth_frame_ned") or "").strip().lower() != "false":
+        raise _fail("magnetometer plugin must explicitly emit the earth field in ENU")
 
     return latitude_deg, longitude_deg, values  # type: ignore[return-value]
 

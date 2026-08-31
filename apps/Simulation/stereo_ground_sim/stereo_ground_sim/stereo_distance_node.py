@@ -330,7 +330,7 @@ RAY_DISPLAY_NAMES = {
     "attitude": "Attitude",
     "operational": "Operational",
     "attitude_true_north": "Attitude (True North)",
-    "attitude_declination": "Attitude (Declination)",
+    "attitude_declination": "Attitude (Shared GNSS North)",
     "operational_true_north": "Operational (True North)",
 }
 

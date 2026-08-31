@@ -16,8 +16,11 @@ world SDF's `<magnetic_field>` after the first tick. That table disagreed
 with PX4's own WMM table (which PX4 uses for `EKF2_MAG_DECL`) by ~0.85° of
 declination at this world's `spherical_coordinates` lat/lon, which showed up
 as a small but real bias in Attitude/Full ray heading. Replacing gz-sim's
-table with PX4's makes both sides reference the same WMM data. This does not
-touch EKF2 parameters, coordinate transforms, or PX4/GZBridge source.
+table with PX4's makes both sides reference the same WMM data. The world
+plugin is configured with `use_earth_frame_ned=false`, so the field stays in
+Gazebo ENU until the sensor produces a local FLU vector. The repo-owned PX4
+preparation helper then makes GZBridge perform the single sensor-local FLU ->
+body-FRD conversion.
 
 ## What this does *not* do
 
@@ -31,6 +34,11 @@ plugin at that `.so` by absolute path (via
 `run_operator_view.sh`) instead of gz-sim's stock one. Deleting `build/` or
 unsetting that env var reverts to gz-sim's stock plugin with no other
 changes needed.
+
+This plugin does not apply a camera yaw correction and does not modify
+`EKF2_MAG_DECL`. `scripts/prepare_px4_gz_magnetometer_frame.py` owns the
+pinned PX4 GZBridge source delta and its build stamp; the ULog validator owns
+the final body-vector/attitude qualification.
 
 ## Updating
 

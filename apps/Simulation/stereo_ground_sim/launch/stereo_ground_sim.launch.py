@@ -572,11 +572,14 @@ def _generate_world(context):
     magnetometer_plugin_path = os.environ.get(
         "STEREO_GROUND_SIM_MAGNETOMETER_PLUGIN_PATH")
     if magnetometer_plugin_path and os.path.isfile(magnetometer_plugin_path):
+        stock_filename = 'filename="gz-sim-magnetometer-system"'
+        if world.count(stock_filename) != 1:
+            raise ValueError(
+                "generated world must contain exactly one stock magnetometer plugin filename"
+            )
         world = world.replace(
-            '<plugin filename="gz-sim-magnetometer-system" '
-            'name="gz::sim::systems::Magnetometer" />',
-            f'<plugin filename="{magnetometer_plugin_path}" '
-            'name="gz::sim::systems::Magnetometer" />',
+            stock_filename,
+            f'filename="{magnetometer_plugin_path}"',
             1,
         )
 

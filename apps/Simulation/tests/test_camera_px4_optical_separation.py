@@ -120,6 +120,12 @@ def test_every_runner_uses_the_unified_config() -> None:
 
 def test_camera_models_expose_px4_sensors_and_separate_optical_links() -> None:
     root = ET.parse(PACKAGE_ROOT / "worlds" / "stereo_ground_drone.sdf").getroot()
+    magnetometer_plugin = root.find(
+        "./world/plugin[@name='gz::sim::systems::Magnetometer']"
+    )
+    assert magnetometer_plugin is not None
+    assert magnetometer_plugin.findtext("use_units_gauss") == "true"
+    assert magnetometer_plugin.findtext("use_earth_frame_ned") == "false"
     required_sensors = {
         "imu_sensor",
         "magnetometer_sensor",
@@ -228,6 +234,28 @@ def test_generated_world_uses_independent_body_frd_mag_and_gyro_noise_bias(tmp_p
                 f"{group}/{axis}/noise/{field}"
             )
             assert float(model.findtext(path)) == pytest.approx(expected)
+
+
+def test_generated_world_keeps_enu_magnetometer_contract_with_local_plugin(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = _launch_module()
+    monkeypatch.setattr(module, "get_package_share_directory", lambda _: str(PACKAGE_ROOT))
+    monkeypatch.setattr(module.tempfile, "gettempdir", lambda: str(tmp_path))
+    plugin = tmp_path / "libgz-sim-magnetometer-system.so"
+    plugin.write_bytes(b"test plugin fixture")
+    monkeypatch.setenv("STEREO_GROUND_SIM_MAGNETOMETER_PLUGIN_PATH", str(plugin))
+
+    generated = module._generate_world(_context(module))
+    root = ET.parse(generated).getroot()
+    magnetometer_plugin = root.find(
+        "./world/plugin[@name='gz::sim::systems::Magnetometer']"
+    )
+
+    assert magnetometer_plugin is not None
+    assert magnetometer_plugin.attrib["filename"] == str(plugin)
+    assert magnetometer_plugin.findtext("use_units_gauss") == "true"
+    assert magnetometer_plugin.findtext("use_earth_frame_ned") == "false"
 
 
 @pytest.mark.parametrize(

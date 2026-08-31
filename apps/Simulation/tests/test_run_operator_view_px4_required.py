@@ -47,6 +47,10 @@ class RunOperatorViewPx4RequiredTests(unittest.TestCase):
         scripts_dir = root / "scripts"
         scripts_dir.mkdir()
         shutil.copy2(ROOT_DIR / "scripts" / "load_sim_config.sh", scripts_dir / "load_sim_config.sh")
+        shutil.copy2(
+            ROOT_DIR / "scripts" / "prepare_px4_gz_magnetometer_frame.py",
+            scripts_dir / "prepare_px4_gz_magnetometer_frame.py",
+        )
         ensure_yolo = scripts_dir / "ensure_yolo_runtime.sh"
         ensure_yolo.write_text(
             f"#!/usr/bin/env bash\nprintf '%s\\n' yolo-bootstrap >> {str(marker)!r}\nprintf '%s\\n' /usr/bin/python3\n",
@@ -180,6 +184,21 @@ class RunOperatorViewPx4RequiredTests(unittest.TestCase):
             parents=True
         )
         (px4_dir / "Makefile").write_text("# isolated PX4 checkout marker\n", encoding="utf-8")
+        gz_bridge_source = px4_dir / "src" / "modules" / "simulation" / "gz_bridge" / "GZBridge.cpp"
+        gz_bridge_source.parent.mkdir(parents=True)
+        gz_bridge_source.write_text(
+            "void GZBridge::magnetometerCallback(const gz::msgs::Magnetometer &msg)\n"
+            "{\n"
+            "\t// FIMEX: once we're on jetty or later\n"
+            "\t// The magnetometer plugin publishes in units of gauss and in a weird left handed coordinate system\n"
+            "\t// https://github.com/gazebosim/gz-sim/pull/2460\n"
+            "\treport.x = -msg.field_tesla().y();\n"
+            "\treport.y = -msg.field_tesla().x();\n"
+            "\treport.z = msg.field_tesla().z();\n"
+            "\t_sensor_mag_pub.publish(report);\n"
+            "}\n",
+            encoding="utf-8",
+        )
         gz_bridge_dir = px4_dir / "build" / "px4_sitl_default" / "src" / "modules" / "simulation" / "gz_bridge"
         gz_bridge_dir.mkdir(parents=True)
         px4_binary = px4_dir / "build" / "px4_sitl_default" / "bin" / "px4"
@@ -376,6 +395,12 @@ class RunOperatorViewPx4RequiredTests(unittest.TestCase):
             )
 
             events = marker.read_text(encoding="utf-8").splitlines()
+            bridge_source = (
+                px4_dir / "src/modules/simulation/gz_bridge/GZBridge.cpp"
+            ).read_text(encoding="utf-8")
+            build_stamp_exists = (
+                px4_dir / "build/px4_sitl_default/.sasl-gz-magnetometer-frame-v1.json"
+            ).is_file()
 
         self.assertEqual(result.returncode, 0, result.stderr)
         make_events = [event for event in events if event.startswith("make:px4_sitl_default:")]
@@ -393,6 +418,117 @@ class RunOperatorViewPx4RequiredTests(unittest.TestCase):
         self.assertTrue(any("px4:-d -i 1:" in event and "model=left_stereo_camera" in event and "namespace=camera_left" in event and "port=8889" in event for event in px4_events), px4_events)
         self.assertTrue(any("px4:-d -i 2:" in event and "model=right_stereo_camera" in event and "namespace=camera_right" in event and "port=8890" in event for event in px4_events), px4_events)
         self.assertNotIn("mission-start", events)
+        self.assertIn("report.x = msg.field_tesla().x();", bridge_source)
+        self.assertIn("report.y = -msg.field_tesla().y();", bridge_source)
+        self.assertIn("report.z = -msg.field_tesla().z();", bridge_source)
+        self.assertTrue(build_stamp_exists)
+
+    def test_matching_px4_build_stamp_allows_skip_without_make(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            launcher, marker, env = self.make_isolated_launcher(root)
+            px4_dir = self.make_valid_px4_checkout(root)
+            env["PX4_TEST_MARKER"] = str(marker)
+            first = subprocess.run(
+                [str(launcher), "--px4-dir", str(px4_dir), "--headless", "--no-yolo"],
+                cwd=root,
+                env=env,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+            marker.unlink()
+
+            second = subprocess.run(
+                [
+                    str(launcher),
+                    "--px4-dir",
+                    str(px4_dir),
+                    "--headless",
+                    "--no-yolo",
+                    "--skip-px4-build",
+                ],
+                cwd=root,
+                env=env,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            events = marker.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertFalse(any(event.startswith("make:") for event in events), events)
+        self.assertEqual(sum(event.startswith("px4:-d -i ") for event in events), 3, events)
+
+    def test_stale_px4_build_stamp_fails_before_runtime_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            launcher, marker, env = self.make_isolated_launcher(root)
+            px4_dir = self.make_valid_px4_checkout(root)
+            env["PX4_TEST_MARKER"] = str(marker)
+            first = subprocess.run(
+                [str(launcher), "--px4-dir", str(px4_dir), "--headless", "--no-yolo"],
+                cwd=root,
+                env=env,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+            marker.unlink()
+            airframe = root / "stereo_ground_sim/vendor/px4_camera_airframe/4090_camera_px4"
+            airframe.write_text(airframe.read_text(encoding="utf-8") + "# stale fixture\n", encoding="utf-8")
+
+            second = subprocess.run(
+                [
+                    str(launcher),
+                    "--px4-dir",
+                    str(px4_dir),
+                    "--headless",
+                    "--no-yolo",
+                    "--skip-px4-build",
+                ],
+                cwd=root,
+                env=env,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+        self.assertEqual(second.returncode, 2)
+        self.assertIn("build stamp is stale", second.stderr)
+        self.assert_no_launch_side_effects(marker)
+
+    def test_skip_colcon_build_rejects_missing_or_stale_installed_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            launcher, marker, env = self.make_isolated_launcher(root)
+            px4_dir = self.make_valid_px4_checkout(root)
+            result = subprocess.run(
+                [
+                    str(launcher),
+                    "--px4-dir",
+                    str(px4_dir),
+                    "--headless",
+                    "--no-yolo",
+                    "--skip-colcon-build",
+                ],
+                cwd=root,
+                env=env,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("cannot reuse stale Simulation asset", result.stderr)
+        self.assert_no_launch_side_effects(marker)
 
     def test_custom_uxrce_ports_reach_their_respective_px4_instance(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

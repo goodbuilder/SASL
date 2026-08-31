@@ -143,10 +143,12 @@ environment variable overrides that file, and a CLI option overrides both.
 - `SWEEP_RANDOMIZE`: `true` randomizes conditions; `false` preserves the
   configured axis/value order. `--ordered` is the CLI equivalent of `false`.
 - `SWEEP_SKIP_COLCON_BUILD`: `true` reuses the existing ROS install and skips
-  the build for each case.
+  the build for each case. Source/install world and launch assets must be
+  byte-identical or the operator runner fails before launch.
 - `SWEEP_SKIP_PX4_BUILD`: `true` reuses the existing PX4 SITL binary/build
-  output for each case; use only after the PX4 build and camera airframe are
-  known to be current. The CLI equivalent is `--skip-px4-build`.
+  output for each case; the magnetometer-frame build stamp must match the
+  current PX4 HEAD, bridge source, camera airframe, and binary. The CLI
+  equivalent is `--skip-px4-build`.
 - `SWEEP_KEEP_GOING`: `true` continues after a failed case and records the
   failure in the manifest.
 - `SWEEP_FORCE_EXISTING_SIM`: `true` allows the runner to clean an existing
@@ -216,6 +218,14 @@ workaround until the final all-visible waypoint set is chosen. The observed
 unique camera-source rate is also about 11--13 Hz under 20 Hz requests, so the
 diagnostic 10 Hz overlay gate must not be presented as final 15 Hz evidence.
 Neither limitation changes the confirmed velocity-only guidance result.
+
+Attitude/Operational Ray records created before the 2026-08-31 Gazebo
+magnetometer-frame fix are immutable pre-fix evidence. In those runs a
+configured body pitch of 20 degrees produced a common PX4 yaw bias near 21.5
+degrees even though the WMM scalar field and `EKF2_MAG_DECL` agreed. Do not
+promote those raw-attitude metrics as post-fix acceptance evidence. The
+current change is qualified with level, pitch-20, and combined-RPY cases; the
+full 20-case campaign remains a separate future requalification.
 
 ### Target SDF stability and protected size
 
@@ -425,12 +435,12 @@ ROS 2 Humble apt `ros_gz` 패키지는 Fortress 6에 링크되어 있으므로, 
 
 ## PX4-Autopilot SITL
 
-PX4 SITL 소스는 이 디렉터리 안의 `PX4-Autopilot/`에 `release/1.16` 브랜치로
+PX4 SITL 소스는 이 디렉터리 안의 `PX4-Autopilot/`에 정확한 `v1.17.0` tag로
 설치한다. 전체 PX4 checkout과 빌드 산출물은 `.gitignore`에 포함되므로 git에는
 커밋하지 않으며, 다른 컴퓨터에서는 다음 명령으로 재생성한다.
 
 ```bash
-git clone --branch release/1.16 --depth 1 --recurse-submodules \
+git clone --branch v1.17.0 --depth 1 --recurse-submodules \
   https://github.com/PX4/PX4-Autopilot.git apps/Simulation/PX4-Autopilot
 PYTHON_EXECUTABLE="$PWD/apps/Simulation/.venv/bin/python" \
   make px4_sitl_default -j"$(nproc)" \
@@ -446,8 +456,32 @@ PX4 빌드에는 `apps/Simulation/.venv/bin/python`을 사용한다. PX4 SITL은
 ```
 
 PX4 local position은 `north/east/down` 순서의 NED이고, Gazebo world/model pose와
-스테레오 중심 카메라의 `right/down/forward` RDF는 서로 다른 frame이다. SITL
-설치 자체는 이 좌표 변환을 변경하지 않는다.
+스테레오 중심 카메라의 `right/down/forward` RDF는 서로 다른 frame이다.
+
+### PX4 magnetometer frame과 현재 실행 흐름
+
+자력계의 단일 계약은 `Gazebo world ENU -> sensor-local FLU -> PX4 body FRD`이다.
+월드 magnetometer plugin은 `use_earth_frame_ned=false`와 Gauss 단위를 명시하며,
+PX4 GZBridge는 IMU와 동일하게 `(x, -y, -z)` FLU-to-FRD 변환만 수행한다. PX4
+EKF의 `EKF2_MAG_DECL`은 WMM 기반 진북 보정으로 그대로 사용하며 Workstation이나
+Simulation Ray에서 같은 편각을 다시 더하지 않는다.
+
+`run_operator_view.sh`는 runtime process를 중단하거나 시작하기 전에
+`scripts/prepare_px4_gz_magnetometer_frame.py`를 실행한다. helper는 정확한
+`v1.17.0` checkout에서 알려진 stock/legacy 3줄 또는 이미 수정된 블록만
+허용하고, 그 외 소스는 변경하지 않은 채 실패한다. 정상 `make
+px4_sitl_default` 후에는 PX4 HEAD, bridge source, camera airframe, binary SHA-256을
+`build/px4_sitl_default/.sasl-gz-magnetometer-frame-v1.json`에 기록한다.
+`--skip-px4-build`는 이 stamp가 현재 입력과 일치할 때만 허용된다.
+`--skip-colcon-build`도 source와 install의 world/launch asset이 byte-identical일
+때만 허용되며, 불일치하면 먼저 일반 실행으로 다시 build해야 한다.
+
+공개 CSV/JSON identifier `attitude_declination`은 호환성을 위해 유지한다. 화면
+표시명 `Attitude (Shared GNSS North)`는 PX4 편각 재적용이 아니라 left GNSS
+baseline에서 얻은 하나의 공통 진북 yaw correction을 양쪽에 적용하는 진단
+Ray다. `Attitude (True North)`는 같은 GNSS 기준 correction을 각 카메라에
+독립적으로 계산한다. Raw `Attitude`는 보정되지 않은 PX4
+`VehicleAttitude`를 계속 표시한다.
 
 ## Operator recording outputs
 
@@ -5864,7 +5898,10 @@ Replay 출력:
 ./run_operator_view.sh
 ```
 
-이 단일 명령이 build, Gazebo Sim 서버, ROS-Gazebo bridge, 거리 계산 노드, PX4 SITL 3개, 단일 `rqt_gui` 운용 창을 모두 실행합니다. 커스텀 앱을 만들지 않고 표준 ROS 도구만 실행합니다.
+이 단일 명령이 PX4 magnetometer frame patch 검증/적용, ROS/PX4 build freshness
+검사, Gazebo Sim 서버, ROS-Gazebo bridge, 거리 계산 노드, PX4 SITL 3개, 단일
+`rqt_gui` 운용 창을 모두 실행합니다. 커스텀 앱을 만들지 않고 표준 ROS 도구만
+실행합니다.
 기본 실행은 target PX4(instance 0)를 `x500_15m`에, Camera_Left PX4(instance 1)를 `left_stereo_camera`에, Camera_Right PX4(instance 2)를 `right_stereo_camera`에 각각 attach합니다. target PX4는 기존 `/fmu`와 QGroundControl MAVLink UDP 14550 계약을 유지하고, 카메라 PX4는 `/camera_left/fmu`, `/camera_right/fmu` namespace로 격리됩니다. 세 PX4의 operator용 MAVLink `ATTITUDE`는 UDP 14551 하나로 모이며, RQT 패널은 MAVLink system ID 2/3을 각각 Left/Right로 분류합니다(system ID 1 target은 수신하지만 카메라 비교 표에는 표시하지 않습니다). target의 이륙-접근-착륙을 자동 시작하려면 `--auto-mission`을 붙입니다.
 `x500_15m`는 카메라 전방 +Y 약 2000 m 지점에서 yaw -90도로 스폰되어, QGC/PX4에서 전진 명령을 주면 카메라 방향으로 접근합니다. 스테레오 베이스라인은 X축 방향입니다.
 Gazebo 3D GUI에서는 카메라 뒤에서 전방 +Y를 바라보는 운용자 기준으로 왼쪽 카메라는 world X 음수 위치의 파란색 본체, 오른쪽 카메라는 world X 양수 위치의 빨간색 본체로 표시됩니다. 카메라 모델 원점은 실제 sensor optical center이며, 렌즈 visual의 앞면이 이 원점에 맞춰집니다.
@@ -6317,7 +6354,8 @@ magnetometer와 gyroscope를 body FRD 축별로 독립 설정할 수 있습니�
 `0.00001 rad/s`입니다. PX4 v1.17의 `1e-6 rad/s` 연속 동일값 판정
 경계보다 충분히 크면서 PX4 Gazebo 모델값 `0.0008726646 rad/s`보다
 작은 안전 최소값입니다. 기본 mag noise는 stale sample 방지를 위해
-`0.000001 G`이며 모든 bias 기본값은 0입니다.
+`0.000001 G`이며 모든 bias 기본값은 0입니다. WMM field는 Gazebo ENU로
+회전된 뒤 sensor FLU에서 PX4 body FRD로 한 번만 변환됩니다.
 
 ```bash
 CAM_L_MAG_NOISE_Z_GAUSS=0.000001
@@ -6334,8 +6372,22 @@ bias mean은 부호가 있는 유한값이어야 합니다. 이 값들은 Gazebo
 주입되는 오차이며 PX4 EKF의 `estimator_sensor_bias.mag_bias` 상태를 직접
 지정하지 않습니다. 완전히 고정된 카메라에서는 yaw와 magnetometer bias가
 충분히 관측되지 않을 수 있으므로, bias 0만으로 yaw 오차 0을 보장하지
-않습니다. runtime 평가에는 Gazebo ground truth를 입력하지 않고 ULog의
-센서·추정 상태와 동일 frame으로 변환한 자세 오차만 사용합니다.
+않습니다. `EKF2_MAG_TYPE=1`은 고정 카메라를 2D magnetic-heading fusion으로
+유지하지만 잘못된 센서 축을 고치는 기능은 아닙니다. runtime 평가는 Gazebo
+ground truth를 입력하지 않고 ULog의 센서·추정 상태와 동일 frame으로 변환한
+자세 오차만 사용합니다.
+
+수정 후 ULog pair를 판정하려면 다음 명령을 사용합니다. 기본 gate는 마지막
+15초 동안 body-axis 오차 0.002 G, inclination 0.5도, yaw 1도, 좌우 yaw 0.25도
+이내입니다.
+
+```bash
+python3 scripts/validate_px4_magnetometer_frame.py \
+  --left-ulog <left.ulg> --right-ulog <right.ulg> \
+  --expected-roll-deg 0 --expected-pitch-deg 20 --expected-yaw-deg 0 \
+  --expected-declination-deg 3.405765295 \
+  --output-json <evidence-dir>/pitch20.json
+```
 
 ```bash
 CAMERA_BASELINE_M=25.0
@@ -6447,6 +6499,19 @@ Debug = telemetry.csv + left_overlay.mp4 + right_overlay.mp4 + rosbag/
 
 ## 변경 이력
 
+- 2026-08-31: Gazebo world ENU 자기장을 sensor FLU에서 PX4 body FRD로
+  전달하는 경계를 수정했습니다. repo-owned helper가 PX4 v1.17.0
+  GZBridge를 `(x,-y,-z)`로 안전하게 준비하고 build stamp로 stale binary를
+  차단합니다. world plugin은 ENU/Gauss를 명시하며 ULog validator가 WMM
+  body vector, inclination, yaw, reset/fusion flags와 좌우 차이를 판정합니다.
+  schema ID `attitude_declination`은 유지하고 화면명은 실제 동작에 맞춰
+  `Attitude (Shared GNSS North)`로 변경했습니다. 기존 attitude sweep 기록은
+  pre-fix evidence로 유지합니다. 집중 ULog 검증은 level, pitch 20도,
+  roll/pitch/yaw `10/20/15`도에서 모두 PASS했습니다. pitch-20의 기존
+  `-21.5°` yaw는 수정 후 `0.041°/0.131°` 오차, inclination 오차
+  `0.005°/0.009°`, 좌우 yaw 차이 `0.090°`가 되었고, full 20-case sweep은
+  재실행하지 않았습니다. 로컬 증거는
+  `recordings/magnetometer-frame-qualification-20260831_9W3has/`에 있습니다.
 - 2026-08-10: 고정 카메라 gyro noise 기본값을 Left/Right 모든 body-FRD
   축에서 `0.00001 rad/s`로 설정했습니다. `1e-10 rad/s`에서 PX4 센서
   validator가 gyro를 stale로 판정해 약 5초 후 `sensor_combined`, attitude,
