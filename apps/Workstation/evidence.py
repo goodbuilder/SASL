@@ -5,7 +5,8 @@ from __future__ import annotations
 The workstation is a presentation shell.  This module deliberately keeps the
 projection boundary boring: it reads existing model objects and widgets,
 retains their timestamp/frame contracts, and never performs a measurement,
-coordinate conversion, save, or calibration operation.
+save, or calibration operation. Explicit presentation-only coordinate
+derivations remain separate from their authoritative raw values.
 """
 
 import time
@@ -19,7 +20,16 @@ from typing import Any, Mapping
 from Workstation.workstation_core.attitude_geometry import relative_attitude
 from Workstation.workstation_core.calibration import independent_zoom_selection_mode
 from Workstation.workstation_core.gnss_monitor import evaluate_ntrip_health
-from Workstation.workstation_core.pixhawk_attitude import MAVLINK_MAG_STREAMS, magnetometer_value_units
+from Workstation.workstation_core.pixhawk_attitude import (
+    MAVLINK_ATTITUDE_STALE_S,
+    MAVLINK_MAG_STREAMS,
+    magnetometer_value_units,
+)
+from Workstation.workstation_core.physical_alignment import (
+    angle_error_deg,
+    calculate_baseline_yaw_alignment,
+    normalize_compass_angle_deg,
+)
 
 from Workstation.workstation_core.coordinate_contract import (
     BASELINE_TRANSLATION_FRAME,
@@ -1190,6 +1200,203 @@ class EvidenceAdapter:
             "left_fix_type": _integer(getattr(selected_left, "fix_type", None)),
             "right_fix_type": _integer(getattr(selected_right, "fix_type", None)),
             **projection_values,
+        }
+
+    def baseline_yaw_alignment(self, *, now_s: float | None = None) -> dict[str, object]:
+        """Project horizontal Baseline-P1/P2 angles with source freshness.
+
+        This latest-state read model is an operator aid for stationary/slow
+        physical alignment.  It does not claim that GNSS and ATTITUDE samples
+        are simultaneous, and it never replaces the raw NED baseline or raw
+        PX4 attitude evidence.
+        """
+
+        now = time.monotonic() if now_s is None else float(now_s)
+        baseline = self.baseline()
+        attitudes = {
+            side: self.attitude(side, now_s=now)
+            for side in ("left", "right")
+        }
+        sources = {
+            "left": str(baseline.get("left_source") or "GPS1"),
+            "right": str(baseline.get("right_source") or "GPS1"),
+        }
+        gps = {
+            side: self.gps(side, source=sources[side], now_s=now)
+            for side in ("left", "right")
+        }
+
+        manager = getattr(self.panel, "gnss_operation_manager", None)
+        readiness = getattr(getattr(manager, "config", None), "readiness", None)
+        try:
+            maximum_gps_age_s = float(
+                getattr(readiness, "maximum_gps_sample_age_s", 1.0)
+            )
+        except (TypeError, ValueError):
+            maximum_gps_age_s = 1.0
+        if not math.isfinite(maximum_gps_age_s) or maximum_gps_age_s < 0.0:
+            maximum_gps_age_s = 1.0
+
+        def finite_number(value: object) -> float | None:
+            number = _number(value)
+            return number if number is not None and math.isfinite(number) else None
+
+        def freshness_state(value: float | None, age_s: float | None, maximum_age_s: float) -> str:
+            if value is None:
+                return "WAITING"
+            if age_s is None or not math.isfinite(age_s) or age_s > maximum_age_s:
+                return "STALE"
+            return "CURRENT"
+
+        ned_values = tuple(
+            finite_number(baseline.get(key))
+            for key in ("north_m", "east_m", "down_m")
+        )
+        raw_yaws = {
+            side: finite_number(attitudes[side].get("yaw_deg"))
+            for side in ("left", "right")
+        }
+        compass_yaws = {
+            side: (
+                None
+                if raw_yaws[side] is None
+                else normalize_compass_angle_deg(raw_yaws[side], f"{side}_yaw_deg")
+            )
+            for side in ("left", "right")
+        }
+        geometry = None
+        baseline_reason = ""
+        if all(value is not None for value in ned_values):
+            geometry = calculate_baseline_yaw_alignment(
+                ned_values,  # type: ignore[arg-type]
+                p1_yaw_deg=raw_yaws["left"],
+                p2_yaw_deg=raw_yaws["right"],
+            )
+            if geometry is None:
+                baseline_reason = "P1→P2 horizontal baseline direction is undefined"
+        else:
+            baseline_reason = "P1→P2 NED baseline waiting"
+
+        gps_ages = {
+            side: finite_number(gps[side].get("age_s"))
+            for side in ("left", "right")
+        }
+        gps_positions_present = {
+            side: all(
+                finite_number(gps[side].get(key)) is not None
+                for key in ("latitude_deg", "longitude_deg", "altitude_m")
+            )
+            for side in ("left", "right")
+        }
+        gps_states = {
+            side: freshness_state(
+                1.0 if gps_positions_present[side] else None,
+                gps_ages[side],
+                maximum_gps_age_s,
+            )
+            for side in ("left", "right")
+        }
+        baseline_state = "WAITING"
+        if geometry is not None:
+            baseline_state = (
+                "CURRENT"
+                if all(state == "CURRENT" for state in gps_states.values())
+                else "STALE"
+            )
+
+        attitude_ages = {
+            side: finite_number(attitudes[side].get("age_s"))
+            for side in ("left", "right")
+        }
+        side_states = {
+            side: freshness_state(
+                compass_yaws[side],
+                attitude_ages[side],
+                MAVLINK_ATTITUDE_STALE_S,
+            )
+            for side in ("left", "right")
+        }
+        if geometry is None:
+            state = "WAITING"
+        elif baseline_state == "STALE":
+            state = "STALE"
+        else:
+            current_count = sum(value == "CURRENT" for value in side_states.values())
+            if current_count == 2:
+                state = "CURRENT"
+            elif current_count == 1:
+                state = "PARTIAL"
+            elif any(value == "STALE" for value in side_states.values()):
+                state = "STALE"
+            else:
+                state = "WAITING"
+
+        reasons: list[str] = []
+        if baseline_reason:
+            reasons.append(baseline_reason)
+        elif baseline_state == "STALE":
+            reasons.append("selected P1/P2 GNSS baseline is stale")
+        for side, label in (("left", "P1"), ("right", "P2")):
+            if side_states[side] != "CURRENT":
+                reasons.append(f"{label} ATTITUDE {side_states[side].lower()}")
+
+        gps_timestamps = {
+            side: finite_number(gps[side].get("timestamp_s"))
+            for side in ("left", "right")
+        }
+        gps_pair_delta_ms = None
+        if all(value is not None for value in gps_timestamps.values()):
+            gps_pair_delta_ms = abs(
+                gps_timestamps["right"] - gps_timestamps["left"]  # type: ignore[operator]
+            ) * 1000.0
+        baseline_age_values = [value for value in gps_ages.values() if value is not None]
+        baseline_age_s = max(baseline_age_values) if baseline_age_values else None
+
+        return {
+            "state": state,
+            "reason": "; ".join(reasons),
+            "baseline_state": baseline_state,
+            "p1_state": side_states["left"],
+            "p2_state": side_states["right"],
+            "baseline_azimuth_deg": (
+                None if geometry is None else geometry.baseline_azimuth_deg
+            ),
+            "p1_yaw_deg": compass_yaws["left"],
+            "p2_yaw_deg": compass_yaws["right"],
+            "baseline_p1_deg": None if geometry is None else geometry.baseline_p1_deg,
+            "baseline_p2_deg": None if geometry is None else geometry.baseline_p2_deg,
+            "p2_minus_p1_deg": (
+                geometry.p2_minus_p1_deg
+                if geometry is not None
+                else (
+                    None
+                    if raw_yaws["left"] is None or raw_yaws["right"] is None
+                    else angle_error_deg(raw_yaws["left"], raw_yaws["right"])
+                )
+            ),
+            "baseline_age_s": baseline_age_s,
+            "p1_attitude_age_s": attitude_ages["left"],
+            "p2_attitude_age_s": attitude_ages["right"],
+            "gps_pair_delta_ms": gps_pair_delta_ms,
+            "maximum_gps_age_s": maximum_gps_age_s,
+            "attitude_stale_age_s": MAVLINK_ATTITUDE_STALE_S,
+            "p1_gps_source": sources["left"],
+            "p2_gps_source": sources["right"],
+            "p1_fix_type": gps["left"].get("fix_type"),
+            "p2_fix_type": gps["right"].get("fix_type"),
+            "p1_rtk_label": gps["left"].get("rtk_label", gps["left"].get("state", "NO DATA")),
+            "p2_rtk_label": gps["right"].get("rtk_label", gps["right"].get("state", "NO DATA")),
+            "p1_gps_age_s": gps_ages["left"],
+            "p2_gps_age_s": gps_ages["right"],
+            "baseline_quality": baseline.get("state", "NO DATA"),
+            "baseline_length_m": finite_number(baseline.get("length_m")),
+            "source": "selected P1/P2 GpsPositionState + MAVLink ATTITUDE",
+            "clock": "latest app receive monotonic snapshots; not simultaneous measurement",
+            "frame_contract": "P1→P2 horizontal local NED; Pixhawk body FRD yaw in world NED",
+            "angle_contract": (
+                "Baseline-Pn = wrap180(azimuth(P1→P2) - Pn yaw); "
+                "+ is clockwise/right, - is counter-clockwise/left"
+            ),
         }
 
     def gnss_operation(self, *, now_s: float | None = None) -> dict[str, object]:

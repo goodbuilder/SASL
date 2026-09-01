@@ -146,6 +146,11 @@ app-lifetime state and is not a second calibration owner.
 The Alignment evidence keeps raw RTK NED `[N,E,D]` and the separate P1 body-FRD
 `[F,R,D]` projection in adjacent groups so the operator can use the intuitive P1
 orientation without confusing it with camera optical RDF or public measurement output.
+The Pixhawk page places one compact `P1→P2 baseline / Pixhawk yaw` group immediately below its
+raw baseline group. A fixed numeric summary at left keeps Baseline−P1 and Baseline−P2 separate;
+a fixed-height north-referenced top view at right draws baseline, P1 Forward and P2 Forward with
+labels and distinct line/color treatment. Live 4 Hz updates replace values in place and never
+resize the group, move controls, change focus/selection, or jump the outer scroll position.
 Data Capture keeps Target reference connectivity, HR purpose/import events, and a PX4 ULog table.
 UAM target telemetry is shown as deferred rather
 than erroneous; target Drone data is a separate receive-only source and never replaces P1/P2

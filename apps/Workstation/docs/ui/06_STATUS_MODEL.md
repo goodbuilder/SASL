@@ -109,6 +109,15 @@ The separate `P1 body FRD projection` state is `WAITING` until P1 attitude is av
 when ready it is `[Forward, Right, Down]` in P1 PX4 body FRD and retains its attitude age.
 It must not overwrite raw NED, camera optical RDF, or public `baseline_center_frd` values.
 
+The horizontal baseline/yaw read model is independent from the raw baseline and from physical
+alignment acceptance. `CURRENT` requires a current selected P1/P2 GNSS baseline plus current P1
+and P2 ATTITUDE. `PARTIAL` requires a current baseline and exactly one current board attitude;
+that board's Baseline−Pn value remains visible. `STALE` retains finite last values and actual ages
+without presenting them as current. `WAITING` means no finite non-zero horizontal direction or no
+comparable attitude. The formulas are `Baseline−Pn=wrap180(azimuth(P1→P2)-Pn yaw)` and
+`P2−P1=wrap180(P2 yaw-P1 yaw)`. These states are source availability/freshness only; there is no
+GOOD/WARN/BAD angle verdict.
+
 ## 13. Detection
 
 Separate configured/model-loaded/runtime-running/target-present/output-fresh states where applicable.

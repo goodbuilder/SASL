@@ -17,7 +17,7 @@ written into an optical RDF or public measurement field here.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import atan2, cos, degrees, isfinite, radians, sin
+from math import atan2, cos, degrees, hypot, isfinite, radians, sin
 from statistics import mean, pstdev
 from typing import Any, Iterable
 
@@ -46,6 +46,77 @@ def angle_error_deg(reference: float, current: float) -> float:
     """Return the shortest signed current-reference angular error."""
 
     return wrap_angle_deg(float(current) - float(reference))
+
+
+def normalize_compass_angle_deg(value: float, name: str = "angle_deg") -> float:
+    """Return a finite clockwise compass angle in ``[0, 360)``."""
+
+    angle = float(value)
+    if not isfinite(angle):
+        raise ValueError(f"{name} must be finite")
+    return angle % 360.0
+
+
+@dataclass(frozen=True)
+class BaselineYawAlignment:
+    """Horizontal P1->P2 bearing compared independently with P1/P2 yaw.
+
+    Compass values are clockwise from local-NED North in ``[0, 360)``.
+    Signed values are wrapped into ``[-180, 180)``.  A positive
+    baseline-relative value means the P1->P2 bearing is clockwise/right of
+    that Pixhawk's Forward direction.
+    """
+
+    baseline_azimuth_deg: float
+    p1_yaw_deg: float | None
+    p2_yaw_deg: float | None
+    baseline_p1_deg: float | None
+    baseline_p2_deg: float | None
+    p2_minus_p1_deg: float | None
+
+
+def calculate_baseline_yaw_alignment(
+    baseline_ned_m: Iterable[float],
+    *,
+    p1_yaw_deg: float | None = None,
+    p2_yaw_deg: float | None = None,
+) -> BaselineYawAlignment | None:
+    """Compare the horizontal P1->P2 NED bearing with each Pixhawk yaw.
+
+    The Down component is validated and retained by the input contract but
+    intentionally does not affect this horizontal operator aid.  A baseline
+    with no horizontal direction returns ``None`` instead of inventing an
+    azimuth.  Optional yaw inputs remain independent so one live Pixhawk can
+    still produce its own comparison while the other is unavailable.
+    """
+
+    north_m, east_m, _down_m = _vector3(baseline_ned_m, "baseline_ned_m")
+    if hypot(north_m, east_m) <= 1.0e-9:
+        return None
+    baseline_azimuth_deg = normalize_compass_angle_deg(
+        degrees(atan2(east_m, north_m)),
+        "baseline azimuth",
+    )
+    p1_yaw = (
+        None if p1_yaw_deg is None else normalize_compass_angle_deg(p1_yaw_deg, "p1_yaw_deg")
+    )
+    p2_yaw = (
+        None if p2_yaw_deg is None else normalize_compass_angle_deg(p2_yaw_deg, "p2_yaw_deg")
+    )
+    return BaselineYawAlignment(
+        baseline_azimuth_deg=baseline_azimuth_deg,
+        p1_yaw_deg=p1_yaw,
+        p2_yaw_deg=p2_yaw,
+        baseline_p1_deg=(
+            None if p1_yaw is None else wrap_angle_deg(baseline_azimuth_deg - p1_yaw)
+        ),
+        baseline_p2_deg=(
+            None if p2_yaw is None else wrap_angle_deg(baseline_azimuth_deg - p2_yaw)
+        ),
+        p2_minus_p1_deg=(
+            None if p1_yaw is None or p2_yaw is None else wrap_angle_deg(p2_yaw - p1_yaw)
+        ),
+    )
 
 
 @dataclass(frozen=True)

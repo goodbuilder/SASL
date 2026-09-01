@@ -6,6 +6,11 @@ This package provides the operator Workstation for synchronized stereo-camera ca
 calibration, Measurement, Pixhawk/GNSS evidence, and recording. It owns its runtime and UI
 independently from the Legacy application.
 
+`Devices > Pixhawk` combines the selected live P1→P2 horizontal GNSS baseline with each
+Pixhawk's MAVLink ATTITUDE yaw in a read-only `Baseline−P1`/`Baseline−P2` view. The signed
+degrees and north-referenced top view make the two board directions directly observable while
+retaining raw NED, body-FRD, source, fix, age, and pair-time evidence separately.
+
 As of 2026-08-29, Measurement is an observation interval rather than a package-completion
 transaction. There is no Create, Open, Close, Finalize, Seal, recovery, completeness, source-
 readiness, media-integrity, or storage gate before a Measurement can start. Pressing `측정 시작`
@@ -91,6 +96,13 @@ commands before returning the shared `0/1/2` exit contract. Both launchers force
 the user site therefore fails the doctor instead of making this machine appear reproducible.
 Use `--no-start` to open without camera discovery or preview and `--start-pixhawk` to connect the
 configured Pixhawk endpoints after launch.
+
+Before physical baseline/Roll/Pitch/Yaw alignment, open `Devices > Pixhawk` and inspect the raw
+`Attitude (R/P/Y)` and `P1→P2 baseline` groups. Directly below them, confirm the separate
+`Baseline−P1` and `Baseline−P2` signed values and top-view arrows. `+` means the P1→P2
+bearing is clockwise/right of that Pixhawk's Forward direction; `-` means
+counter-clockwise/left. `CURRENT/PARTIAL/STALE/WAITING` describes input freshness only and is not
+an alignment pass/fail verdict.
 
 Each manual `Connect cameras` request performs one WIRIS discovery, activation, and RTSP-frame
 verification attempt. A failed request does not retry the same camera IP in the background; press
@@ -651,6 +663,12 @@ python3 tools/check_portable_paths.py
   by the P1→P2 GNSS baseline, NTRIP GGA, rover readiness/status, Drone reference calculation,
   Measurement calculation, and frozen GNSS contract; the default and persisted mapping is
   `P1 GPS1 → P2 GPS1`. No automatic averaging or best-fix substitution occurs.
+- `baseline_yaw_alignment()` is a read-only latest-state interface over those selected receivers
+  and P1/P2 MAVLink ATTITUDE. It reports horizontal
+  `azimuth(P1→P2)=atan2(East,North)`, compass-normalized P1/P2 yaw,
+  `Baseline−Pn=wrap180(azimuth−Pn yaw)`, and `P2−P1 yaw`. Compass angles use North=0° and
+  clockwise-positive; signed values use `[-180°,180°)`. The view keeps per-source age/fix/pair
+  delta and never rewrites raw NED, P1 body FRD, camera RDF, or measurement coordinates.
 - The approved patched v6X custom firmware is
   `firmware/px4_fmu-v6x_sasl_can_mag/px4_fmu-v6x_default.px4`, with SHA-256
   `3ef5736aabdaec9047cf97b0cd5eefa2cfc074672c3ae43776c3f0e12d2349ce`. It retains the custom
@@ -832,6 +850,12 @@ python3 tools/check_portable_paths.py
   the configured QP remains effective.
 
 ## Operational Rules
+
+- Treat `Baseline−P1` and `Baseline−P2` as separate horizontal observations. A positive value
+  means P1→P2 lies right/clockwise of that board's Forward direction. Do not interpret
+  `CURRENT` as physical-alignment acceptance: the UI intentionally has no target angle or
+  GOOD/WARN/BAD tolerance. A stale row retains its last number with age/dashed-arrow evidence;
+  use only current inputs for live adjustment.
 
 - Treat the three simple Calibration tabs as an ordered workflow, not as a quality bypass.
   `FAIL` continues to block Apply, `WARNING` still requires explicit review/confirmation in
@@ -1250,6 +1274,18 @@ python3 tools/check_portable_paths.py
 
 ## Known Limitations and Workarounds
 
+### Baseline−P1/P2 is a latest-state physical-alignment aid
+
+The Pixhawk view combines the latest selected P1/P2 GNSS positions and latest independent
+ATTITUDE samples at the 4 Hz UI poll. It exposes GNSS ages, GNSS pair delta and each attitude age,
+but it does not interpolate the streams or claim one simultaneous measurement timestamp. It also
+uses only horizontal North/East direction; Down does not affect the displayed degrees.
+
+Workaround: use the view while the assembly is stationary or moving slowly and require CURRENT
+source evidence. For offline reconstruction, join the existing `pixhawk_attitude` rows
+(yaw/quaternion and app/PX4 timestamps) with `gps_rtk` rows (receiver role, WGS84 position, fix and
+timestamps) and apply the documented formula. No additional derived-angle field is persisted.
+
 ### NVIDIA NVDEC unavailable after `s2idle` resume — observed 2026-08-29
 
 On the qualified RTX 4050 laptop, an active dual-`nvh264dec` Preview did not survive one lid-close
@@ -1649,6 +1685,12 @@ live on the panel at solve time -- a later live-GPS change cannot silently retar
 frozen Mountain image.
 
 ## Change Log
+
+- 2026-09-01: Added a read-only `P1→P2 baseline / Pixhawk yaw` group below the Pixhawk raw
+  baseline. It separately reports compass-normalized P1/P2 yaw, signed `Baseline−P1` and
+  `Baseline−P2`, `P2−P1 yaw`, selected GNSS/fix/age/pair-delta evidence, and a fixed-height
+  north-referenced top view. Missing/stale sides remain independent; no target/tolerance verdict,
+  history, worker, setting, measurement change, or derived recording field was added.
 
 - 2026-08-31: Added one derived `<data-root>/latest_measurement.xlsx` for the most recently stopped
   Measurement. A generation-exact checkpoint feeds Summary, result/history, eight-method, source,

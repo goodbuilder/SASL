@@ -4016,7 +4016,7 @@ def test_pixhawk_verified_usb_recovery_is_visible_and_stall_gated() -> None:
     pixhawk_layout = window.pixhawk.layout()
     assert [
         pixhawk_layout.itemAt(index).widget().title()
-        for index in range(2, 11)
+        for index in range(2, 12)
         if pixhawk_layout.itemAt(index).widget() is not None
     ] == [
         "Connection",
@@ -4027,6 +4027,7 @@ def test_pixhawk_verified_usb_recovery_is_visible_and_stall_gated() -> None:
         "CAN magnetometer (dedicated MAVLink)",
         "Pixhawk Parameters · calibration-owned groups",
         "P1→P2 baseline",
+        "P1→P2 baseline / Pixhawk yaw",
         "ETH MAV",
     ]
     top_actions = pixhawk_layout.itemAt(1).layout()

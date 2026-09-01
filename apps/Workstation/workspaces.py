@@ -67,6 +67,7 @@ from .components import EngineeringValue, StatusIndicator, WorkspaceHeader
 from .evidence import EvidenceAdapter
 from .protocol import evaluate_recording_protocol
 from .status_model import RuntimeStatus, StatusModel, StatusSeverity
+from .telemetry_plots import BaselineYawAlignmentPlot
 
 
 SESSION_CATALOG_REFRESH_INTERVAL_S = 5.0
@@ -89,6 +90,38 @@ def _display_number(value: object, *, digits: int = 3, suffix: str = "") -> str:
         return f"{float(value):.{digits}f}{suffix}"
     except (TypeError, ValueError):
         return f"{value}{suffix}"
+
+
+def _display_compass_deg(value: object) -> str:
+    if value in (None, ""):
+        return "--"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "--"
+    if not math.isfinite(number):
+        return "--"
+    normalized = number % 360.0
+    if round(normalized, 2) >= 360.0:
+        normalized = 0.0
+    return f"{normalized:06.2f}"
+
+
+def _display_signed_deg(value: object) -> str:
+    if value in (None, ""):
+        return "--"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "--"
+    if not math.isfinite(number):
+        return "--"
+    wrapped = (number + 180.0) % 360.0 - 180.0
+    if abs(wrapped) < 0.005:
+        wrapped = 0.0
+    if round(wrapped, 2) >= 180.0:
+        wrapped = -180.0
+    return f"{wrapped:+07.2f}"
 
 
 def _compact_text(value: object, *, limit: int = 128) -> str:
@@ -3891,6 +3924,66 @@ class PixhawkWorkspace(QtWidgets.QWidget):
             value.activated.connect(lambda key=key: self._inspect_baseline_value(key))
             baseline_layout.addWidget(value, index // 4, index % 4)
         layout.addWidget(baseline_group)
+
+        baseline_yaw_group = QtWidgets.QGroupBox("P1→P2 baseline / Pixhawk yaw")
+        baseline_yaw_group_layout = QtWidgets.QHBoxLayout(baseline_yaw_group)
+        baseline_yaw_group_layout.setContentsMargins(8, 8, 8, 8)
+        baseline_yaw_group_layout.setSpacing(8)
+        summary = QtWidgets.QWidget()
+        summary.setMinimumWidth(330)
+        summary.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        summary_layout = QtWidgets.QVBoxLayout(summary)
+        summary_layout.setContentsMargins(0, 0, 0, 0)
+        summary_layout.setSpacing(4)
+        self.baseline_yaw_status_label = QtWidgets.QLabel(
+            "WAITING · Baseline WAITING · P1 WAITING · P2 WAITING"
+        )
+        self.baseline_yaw_status_label.setObjectName("statusStrip")
+        self.baseline_yaw_status_label.setFixedHeight(24)
+        summary_layout.addWidget(self.baseline_yaw_status_label)
+        values_grid = QtWidgets.QGridLayout()
+        values_grid.setContentsMargins(0, 0, 0, 0)
+        values_grid.setHorizontalSpacing(8)
+        values_grid.setVerticalSpacing(3)
+        self.baseline_yaw_values: dict[str, EngineeringValue] = {}
+        baseline_yaw_fields = (
+            ("baseline_azimuth", "Baseline azimuth", 0, 0),
+            ("p2_minus_p1", "P2−P1 yaw", 0, 1),
+            ("p1_yaw", "P1 yaw", 1, 0),
+            ("baseline_p1", "Baseline−P1", 1, 1),
+            ("p2_yaw", "P2 yaw", 2, 0),
+            ("baseline_p2", "Baseline−P2", 2, 1),
+        )
+        for key, label_text, row, column in baseline_yaw_fields:
+            value = EngineeringValue(label_text)
+            reserve_width = value.value.fontMetrics().horizontalAdvance("-180.00")
+            value.value.setMinimumWidth(reserve_width)
+            value.activated.connect(
+                lambda key=key: self._inspect_baseline_yaw_value(key)
+            )
+            self.baseline_yaw_values[key] = value
+            values_grid.addWidget(value, row, column)
+            values_grid.setColumnStretch(column, 1)
+        summary_layout.addLayout(values_grid)
+        self.baseline_yaw_evidence_label = QtWidgets.QLabel(
+            "P1/P2 selected GNSS and ATTITUDE evidence waiting"
+        )
+        self.baseline_yaw_evidence_label.setObjectName("statusStrip")
+        self.baseline_yaw_evidence_label.setWordWrap(True)
+        self.baseline_yaw_evidence_label.setFixedHeight(42)
+        summary_layout.addWidget(self.baseline_yaw_evidence_label)
+        self.baseline_yaw_contract_label = QtWidgets.QLabel(
+            "Baseline−Pn = wrap180(azimuth(P1→P2) − Pn yaw) · + right/CW · horizontal NED"
+        )
+        self.baseline_yaw_contract_label.setObjectName("compactContract")
+        self.baseline_yaw_contract_label.setWordWrap(True)
+        self.baseline_yaw_contract_label.setFixedHeight(36)
+        summary_layout.addWidget(self.baseline_yaw_contract_label)
+        self.baseline_yaw_plot = BaselineYawAlignmentPlot()
+        baseline_yaw_group_layout.addWidget(summary, 1)
+        baseline_yaw_group_layout.addWidget(self.baseline_yaw_plot, 1)
+        self.baseline_yaw_group = baseline_yaw_group
+        layout.addWidget(baseline_yaw_group)
         layout.addWidget(recovery_group)
 
         gnss_source_group = QtWidgets.QGroupBox("GNSS used for Pixhawk calculation")
@@ -4399,6 +4492,97 @@ class PixhawkWorkspace(QtWidgets.QWidget):
                 frame=frame,
                 valid=valid,
             )
+        self._refresh_baseline_yaw_alignment(evidence.baseline_yaw_alignment())
+
+    def _refresh_baseline_yaw_alignment(self, data: Mapping[str, object]) -> None:
+        state = str(data.get("state") or "WAITING")
+        baseline_state = str(data.get("baseline_state") or "WAITING")
+        p1_state = str(data.get("p1_state") or "WAITING")
+        p2_state = str(data.get("p2_state") or "WAITING")
+        status_text = (
+            f"{state} · Baseline {baseline_state} · P1 {p1_state} · P2 {p2_state}"
+        )
+        self.baseline_yaw_status_label.setText(status_text)
+
+        field_specs = {
+            "baseline_azimuth": (
+                "baseline_azimuth_deg",
+                _display_compass_deg,
+                "selected P1/P2 GNSS baseline",
+                "local NED horizontal; North=0 deg, clockwise",
+            ),
+            "p1_yaw": (
+                "p1_yaw_deg",
+                _display_compass_deg,
+                "P1 MAVLink ATTITUDE",
+                "P1 body FRD Forward in world NED; compass-normalized",
+            ),
+            "baseline_p1": (
+                "baseline_p1_deg",
+                _display_signed_deg,
+                "selected GNSS baseline + P1 MAVLink ATTITUDE",
+                "wrap180(P1→P2 azimuth - P1 yaw); + right/CW",
+            ),
+            "p2_yaw": (
+                "p2_yaw_deg",
+                _display_compass_deg,
+                "P2 MAVLink ATTITUDE",
+                "P2 body FRD Forward in world NED; compass-normalized",
+            ),
+            "baseline_p2": (
+                "baseline_p2_deg",
+                _display_signed_deg,
+                "selected GNSS baseline + P2 MAVLink ATTITUDE",
+                "wrap180(P1→P2 azimuth - P2 yaw); + right/CW",
+            ),
+            "p2_minus_p1": (
+                "p2_minus_p1_deg",
+                _display_signed_deg,
+                "P1/P2 MAVLink ATTITUDE",
+                "wrap180(P2 yaw - P1 yaw); + clockwise",
+            ),
+        }
+        for key, (data_key, formatter, source, frame) in field_specs.items():
+            self.baseline_yaw_values[key].set_value(
+                formatter(data.get(data_key)),
+                unit="deg",
+                source=source,
+                frame=frame,
+            )
+
+        def age_text(value: object) -> str:
+            if value in (None, ""):
+                return "--"
+            try:
+                age_s = float(value)
+            except (TypeError, ValueError):
+                return "--"
+            return "--" if not math.isfinite(age_s) else f"{max(0.0, age_s):.2f}s"
+
+        pair_delta = data.get("gps_pair_delta_ms")
+        pair_delta_text = _display_number(pair_delta, digits=1, suffix="ms")
+        evidence_text = (
+            f"P1 {data.get('p1_gps_source', 'GPS1')} "
+            f"fix={data.get('p1_fix_type', '--')}/{data.get('p1_rtk_label', 'NO DATA')} "
+            f"GPS={age_text(data.get('p1_gps_age_s'))} ATT={age_text(data.get('p1_attitude_age_s'))} · "
+            f"P2 {data.get('p2_gps_source', 'GPS1')} "
+            f"fix={data.get('p2_fix_type', '--')}/{data.get('p2_rtk_label', 'NO DATA')} "
+            f"GPS={age_text(data.get('p2_gps_age_s'))} ATT={age_text(data.get('p2_attitude_age_s'))} · "
+            f"pair Δt={pair_delta_text} · baseline={data.get('baseline_quality', 'NO DATA')}"
+        )
+        self.baseline_yaw_evidence_label.setText(evidence_text)
+        reason = str(data.get("reason") or "all required baseline/yaw evidence current")
+        tooltip = (
+            f"{status_text}\n{evidence_text}\nReason: {reason}\n"
+            f"Clock: {data.get('clock', '')}\nContract: {data.get('angle_contract', '')}"
+        )
+        self.baseline_yaw_status_label.setToolTip(tooltip)
+        self.baseline_yaw_evidence_label.setToolTip(tooltip)
+        self.baseline_yaw_contract_label.setToolTip(
+            f"{data.get('frame_contract', '')}\n{data.get('angle_contract', '')}\n"
+            "Latest-state physical-alignment aid; not simultaneous measurement evidence."
+        )
+        self.baseline_yaw_plot.set_snapshot(data)
 
     def _inspect_magnetometer_row(self, index: QtCore.QModelIndex) -> None:
         if index.row() < 0 or index.row() >= self.magnetometer_model.rowCount():
@@ -4675,6 +4859,39 @@ class PixhawkWorkspace(QtWidgets.QWidget):
                 lambda key=key: self._baseline_inspection(key),
             )
         )
+
+    def _inspect_baseline_yaw_value(self, key: str) -> None:
+        self.inspection_requested.emit(
+            _live_inspection(
+                self._baseline_yaw_inspection(key),
+                lambda key=key: self._baseline_yaw_inspection(key),
+            )
+        )
+
+    def _baseline_yaw_inspection(self, key: str) -> dict[str, object]:
+        data = _evidence(self.backend).baseline_yaw_alignment()
+        fields = {
+            "baseline_azimuth": ("baseline_azimuth_deg", _display_compass_deg, "baseline_state"),
+            "p1_yaw": ("p1_yaw_deg", _display_compass_deg, "p1_state"),
+            "baseline_p1": ("baseline_p1_deg", _display_signed_deg, "p1_state"),
+            "p2_yaw": ("p2_yaw_deg", _display_compass_deg, "p2_state"),
+            "baseline_p2": ("baseline_p2_deg", _display_signed_deg, "p2_state"),
+            "p2_minus_p1": ("p2_minus_p1_deg", _display_signed_deg, "state"),
+        }
+        data_key, formatter, state_key = fields[key]
+        return {
+            "selection": self.baseline_yaw_values[key].label.text(),
+            "value": f"{formatter(data.get(data_key))} deg",
+            "freshness": (
+                f"baseline={data.get('baseline_state', 'WAITING')} "
+                f"P1={data.get('p1_state', 'WAITING')} "
+                f"P2={data.get('p2_state', 'WAITING')} · "
+                f"GNSS pair Δt={_display_number(data.get('gps_pair_delta_ms'), digits=1, suffix='ms')}"
+            ),
+            "contract": str(data.get("angle_contract", "horizontal local NED angle")),
+            "verdict": str(data.get(state_key, "WAITING")),
+            "source": str(data.get("source", "selected GNSS + MAVLink ATTITUDE")),
+        }
 
     def _baseline_inspection(self, key: str) -> dict[str, object]:
         data = _evidence(self.backend).baseline()

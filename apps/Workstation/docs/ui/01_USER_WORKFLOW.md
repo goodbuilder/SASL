@@ -411,6 +411,12 @@ The selected antenna baseline remains `P1→P2` in local NED `[North, East, Down
 When P1 attitude is available, show the same vector separately in P1 body FRD
 `[Forward, Right, Down]`; this is an attitude-derived operator aid and is not camera
 optical RDF or `baseline_center_frd` measurement output.
+Directly below the raw baseline, the Pixhawk workspace also shows a horizontal latest-state
+comparison for both boards: `Baseline−P1` and `Baseline−P2` are independently
+`wrap180(atan2(East,North) - yaw)`, where North is 0 degrees, clockwise is positive, `+` is right
+of that board's Forward direction, and `-` is left. P1/P2 retain independent ATTITUDE state/age,
+so one missing side never hides the other. The top view and CURRENT/PARTIAL/STALE/WAITING labels
+are read-only observation evidence; they add no target angle or alignment acceptance verdict.
 
 ## 13. Detection
 

@@ -9,6 +9,7 @@ This module performs no NED/FRD/camera-frame conversion.
 
 import math
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 from math import isfinite
 
@@ -376,6 +377,219 @@ class TelemetryHistoryPlot(QtWidgets.QWidget):
         painter.drawText(rect.left(), rect.bottom() + 18, f"t={start_s:.3f}s")
         painter.drawText(rect.right() - 86, rect.bottom() + 18, f"t={end_s:.3f}s")
         self._draw_legend(painter, rect, series_colors)
+        painter.end()
+
+
+class BaselineYawAlignmentPlot(QtWidgets.QWidget):
+    """North-referenced top view for horizontal Baseline-P1/P2 angles."""
+
+    HEIGHT_PX = 250
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.snapshot: dict[str, object] = {}
+        self.setFixedHeight(self.HEIGHT_PX)
+        self.setMinimumWidth(360)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.setStyleSheet(f"background: {CHART_BG}; border: 1px solid {PANEL_BORDER};")
+        self.setToolTip(
+            "Horizontal local NED: North=0 deg, clockwise positive.\n"
+            "Baseline-Pn = wrap180(azimuth(P1->P2) - Pn yaw).\n"
+            "Positive is right/clockwise of that Pixhawk Forward direction."
+        )
+
+    def set_snapshot(self, snapshot: Mapping[str, object] | None) -> None:
+        values = dict(snapshot or {})
+        if values != self.snapshot:
+            self.snapshot = values
+            self.update()
+
+    @staticmethod
+    def heading_endpoint(
+        center: QtCore.QPointF,
+        radius: float,
+        heading_deg: float,
+    ) -> QtCore.QPointF:
+        angle_rad = math.radians(float(heading_deg))
+        return QtCore.QPointF(
+            center.x() + math.sin(angle_rad) * radius,
+            center.y() - math.cos(angle_rad) * radius,
+        )
+
+    @staticmethod
+    def _finite_angle(value: object) -> float | None:
+        try:
+            angle = float(value)
+        except (TypeError, ValueError):
+            return None
+        return angle if math.isfinite(angle) else None
+
+    @staticmethod
+    def _series_pen(color: str, state: str, width: int) -> QtGui.QPen:
+        series_color = QtGui.QColor(color)
+        style = QtCore.Qt.SolidLine
+        if state == "STALE":
+            series_color.setAlpha(130)
+            style = QtCore.Qt.DashLine
+        return QtGui.QPen(series_color, width, style)
+
+    def _draw_heading_arrow(
+        self,
+        painter: QtGui.QPainter,
+        center: QtCore.QPointF,
+        radius: float,
+        heading_deg: float,
+        *,
+        color: str,
+        state: str,
+        label: str,
+        width: int = 2,
+        label_tangent_offset: float = 0.0,
+    ) -> None:
+        end = self.heading_endpoint(center, radius, heading_deg)
+        pen = self._series_pen(color, state, width)
+        painter.setPen(pen)
+        painter.drawLine(center, end)
+        line_angle = math.atan2(end.y() - center.y(), end.x() - center.x())
+        head_length = 8.0
+        for offset in (math.radians(150.0), -math.radians(150.0)):
+            head = QtCore.QPointF(
+                end.x() + math.cos(line_angle + offset) * head_length,
+                end.y() + math.sin(line_angle + offset) * head_length,
+            )
+            painter.drawLine(end, head)
+        painter.setPen(QtGui.QColor(pen.color()))
+        unit_x = math.sin(math.radians(float(heading_deg)))
+        unit_y = -math.cos(math.radians(float(heading_deg)))
+        tangent_x, tangent_y = -unit_y, unit_x
+        label_point = QtCore.QPointF(
+            end.x() - unit_x * 12.0 + tangent_x * label_tangent_offset,
+            end.y() - unit_y * 12.0 + tangent_y * label_tangent_offset,
+        )
+        painter.drawText(label_point, label)
+
+    @staticmethod
+    def _draw_legend_item(
+        painter: QtGui.QPainter,
+        x: int,
+        y: int,
+        *,
+        color: str,
+        label: str,
+    ) -> int:
+        painter.setPen(QtGui.QPen(QtGui.QColor(color), 2))
+        painter.drawLine(x, y, x + 20, y)
+        painter.setPen(QtGui.QColor(CHART_TEXT))
+        painter.drawText(x + 25, y + 4, label)
+        return x + 25 + painter.fontMetrics().horizontalAdvance(label) + 18
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt override.
+        super().paintEvent(event)
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QtGui.QColor(CHART_BG))
+        painter.setPen(QtGui.QColor(CHART_TEXT))
+        painter.drawText(12, 20, "Horizontal top view · North=0° clockwise")
+        state = str(self.snapshot.get("state") or "WAITING")
+        state_width = painter.fontMetrics().horizontalAdvance(state)
+        painter.drawText(self.width() - state_width - 12, 20, state)
+
+        plot = self.rect().adjusted(38, 30, -38, -46)
+        radius = max(20.0, min(plot.width(), plot.height()) * 0.43)
+        center = QtCore.QPointF(plot.center())
+        compass_rect = QtCore.QRectF(
+            center.x() - radius,
+            center.y() - radius,
+            radius * 2.0,
+            radius * 2.0,
+        )
+        painter.setBrush(QtCore.Qt.NoBrush)
+        painter.setPen(QtGui.QPen(QtGui.QColor(CHART_AXIS), 1))
+        painter.drawEllipse(compass_rect)
+        painter.setPen(QtGui.QPen(QtGui.QColor(CHART_GRID), 1, QtCore.Qt.DashLine))
+        painter.drawLine(
+            QtCore.QPointF(center.x(), center.y() - radius),
+            QtCore.QPointF(center.x(), center.y() + radius),
+        )
+        painter.drawLine(
+            QtCore.QPointF(center.x() - radius, center.y()),
+            QtCore.QPointF(center.x() + radius, center.y()),
+        )
+        painter.setPen(QtGui.QColor(CHART_MUTED))
+        painter.drawText(int(center.x() - 4), int(center.y() - radius - 5), "N")
+        painter.drawText(int(center.x() + radius + 7), int(center.y() + 4), "E")
+        painter.drawText(int(center.x() - 4), int(center.y() + radius + 15), "S")
+        painter.drawText(int(center.x() - radius - 17), int(center.y() + 4), "W")
+
+        baseline_azimuth = self._finite_angle(self.snapshot.get("baseline_azimuth_deg"))
+        if baseline_azimuth is None:
+            reason = str(self.snapshot.get("reason") or "P1→P2 horizontal baseline waiting")
+            painter.setPen(QtGui.QColor(CHART_MUTED))
+            painter.drawText(
+                plot,
+                QtCore.Qt.AlignCenter | QtCore.Qt.TextWordWrap,
+                reason,
+            )
+        else:
+            self._draw_heading_arrow(
+                painter,
+                center,
+                radius,
+                baseline_azimuth,
+                color=SERIES_DISTANCE,
+                state=str(self.snapshot.get("baseline_state") or "CURRENT"),
+                label="B",
+                width=3,
+                label_tangent_offset=-9.0,
+            )
+            p1_yaw = self._finite_angle(self.snapshot.get("p1_yaw_deg"))
+            if p1_yaw is not None:
+                self._draw_heading_arrow(
+                    painter,
+                    center,
+                    radius * 0.82,
+                    p1_yaw,
+                    color=SERIES_LEFT,
+                    state=str(self.snapshot.get("p1_state") or "CURRENT"),
+                    label="P1",
+                    label_tangent_offset=7.0,
+                )
+            p2_yaw = self._finite_angle(self.snapshot.get("p2_yaw_deg"))
+            if p2_yaw is not None:
+                self._draw_heading_arrow(
+                    painter,
+                    center,
+                    radius * 0.66,
+                    p2_yaw,
+                    color=SERIES_RIGHT,
+                    state=str(self.snapshot.get("p2_state") or "CURRENT"),
+                    label="P2",
+                    label_tangent_offset=10.0,
+                )
+
+        legend_y = self.height() - 18
+        legend_x = 12
+        legend_x = self._draw_legend_item(
+            painter,
+            legend_x,
+            legend_y,
+            color=SERIES_DISTANCE,
+            label="B P1→P2",
+        )
+        legend_x = self._draw_legend_item(
+            painter,
+            legend_x,
+            legend_y,
+            color=SERIES_LEFT,
+            label="P1 Forward",
+        )
+        self._draw_legend_item(
+            painter,
+            legend_x,
+            legend_y,
+            color=SERIES_RIGHT,
+            label="P2 Forward",
+        )
         painter.end()
 
 
