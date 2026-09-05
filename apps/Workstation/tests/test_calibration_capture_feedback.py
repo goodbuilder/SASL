@@ -502,3 +502,45 @@ def test_primary_capture_controls_and_feedback_precede_preview_at_1366x768() -> 
 
     window.deleteLater()
     app.processEvents()
+
+
+def test_overlay_frames_and_quality_gate_do_not_reread_capture_snapshot() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    class _CountingBackend(_WorkspaceBackend):
+        def __init__(self, snapshot: dict[str, object]) -> None:
+            super().__init__(snapshot)
+            self.snapshot_reads = 0
+
+        def workstation_calibration_capture_snapshot(self) -> dict[str, object]:
+            self.snapshot_reads += 1
+            return super().workstation_calibration_capture_snapshot()
+
+    backend = _CountingBackend(_capture_snapshot_for_ui())
+    workspace = CalibrationWorkspace(backend, lambda: None, lambda _command: True)
+    workspace.resize(1000, 700)
+    workspace.show()
+    app.processEvents()
+    backend.snapshot_reads = 0
+
+    overlay = QtGui.QImage(640, 360, QtGui.QImage.Format_RGB888)
+    overlay.fill(QtGui.QColor("red"))
+    for _ in range(5):
+        backend.panel.calibration_preview_changed.emit(
+            {"camera": "left", "image": overlay, "kind": "overlay"}
+        )
+    app.processEvents()
+    workspace.refresh_calibration_quality()
+    app.processEvents()
+
+    # Overlay frames arrive many times per second on the GUI thread; the
+    # capture root is only stat'ed by the periodic refresh, never per frame.
+    assert backend.snapshot_reads == 0
+    assert workspace.simple_calibration_previews["left"]._image is not None
+
+    workspace._sync_simple_calibration_status()
+    assert backend.snapshot_reads == 1
+
+    workspace.deleteLater()
+    backend.panel.deleteLater()
+    app.processEvents()

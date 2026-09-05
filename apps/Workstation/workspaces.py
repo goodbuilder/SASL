@@ -11233,11 +11233,8 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         target.setToolTip(message)
         return snapshot
 
-    def _sync_simple_calibration_status(
-        self,
-        capture_status: object = None,
-    ) -> None:
-        """Mirror authoritative advanced status text into the simple surface."""
+    def _sync_simple_calibration_labels(self) -> None:
+        """Mirror advanced zoom/quality/profile label text into the simple surface."""
 
         for target_name, source_name in (
             ("simple_calibration_zoom_status", "zoom_readback_label"),
@@ -11251,6 +11248,19 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         state = getattr(getattr(self, "profile_values", {}).get("state"), "value", None)
         if isinstance(profile, QtWidgets.QLabel) and isinstance(state, QtWidgets.QLabel):
             profile.setText(f"Active bundle: {state.text()}")
+
+    def _sync_simple_calibration_status(
+        self,
+        capture_status: object = None,
+    ) -> None:
+        """Mirror authoritative advanced status into the simple surface.
+
+        Without a snapshot this reads the capture status from the backend, which
+        stats the capture root; callers that only changed a label should use
+        _sync_simple_calibration_labels() instead.
+        """
+
+        self._sync_simple_calibration_labels()
         if hasattr(self, "simple_calibration_run_status"):
             self.apply_calibration_capture_snapshot(
                 capture_status
@@ -11283,7 +11293,7 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         else:
             status = "GZVV readback pending"
         self.zoom_readback_label.setText(status)
-        self._sync_simple_calibration_status()
+        self._sync_simple_calibration_labels()
 
     def _build_operation_tabs(self) -> QtWidgets.QTabWidget:
         kind_tabs = _ContentSizedOperationTabs()
@@ -12684,7 +12694,6 @@ class CalibrationWorkspace(QtWidgets.QWidget):
 
         self.calibration_quality_warning_checkbox.setVisible(state == "WARNING")
         self._apply_calibration_quality_gate()
-        self._sync_simple_calibration_status()
         return dict(normalized)
 
     def refresh_calibration_quality(self) -> dict[str, object]:
@@ -12762,7 +12771,7 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                 "existing Save / Apply behavior is preserved."
             )
         self.calibration_quality_gate_label.setText(text)
-        self._sync_simple_calibration_status()
+        self._sync_simple_calibration_labels()
 
     def _calibration_diagnostic_rows(self) -> tuple[dict[str, object], ...]:
         panel = getattr(self.backend, "panel", self.backend)
@@ -14054,14 +14063,21 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         if callable(connect):
             connect(self._on_calibration_preview_changed)
 
+    def _show_preview_frame(self, side: str, image: QtGui.QImage, metadata: object) -> None:
+        """Route one frame to the advanced preview and, once built, the simple one."""
+
+        self.previews[side].set_frame(image, metadata)
+        # Frame signals are connected before the simple surface exists, so the
+        # attribute lookup has to stay tolerant during construction.
+        simple = getattr(self, "simple_calibration_previews", {}).get(side)
+        if simple is not None:
+            simple.set_frame(image, metadata)
+            self._set_simple_calibration_preview_meta(side)
+
     def _on_camera_frame(self, side: str, image: QtGui.QImage, metadata: object) -> None:
         self._camera_preview_metadata[side] = metadata
         if not self._checkerboard_overlay_active[side]:
-            self.previews[side].set_frame(image, metadata)
-            simple = getattr(self, "simple_calibration_previews", {}).get(side)
-            if simple is not None:
-                simple.set_frame(image, metadata)
-                self._set_simple_calibration_preview_meta(side)
+            self._show_preview_frame(side, image, metadata)
 
     def _on_calibration_preview_changed(self, payload: object) -> None:
         if not isinstance(payload, dict):
@@ -14073,19 +14089,12 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         kind = str(payload.get("kind") or "raw")
         metadata = payload.get("metadata", self._camera_preview_metadata[camera])
         if kind == "overlay":
+            # Board indicators and counters come from the 4 Hz refresh; an
+            # overlay frame must not trigger another capture-root snapshot.
             self._checkerboard_overlay_active[camera] = True
-            self.previews[camera].set_frame(image, metadata)
-            simple = getattr(self, "simple_calibration_previews", {}).get(camera)
-            if simple is not None:
-                simple.set_frame(image, metadata)
-                self._set_simple_calibration_preview_meta(camera)
-            self._sync_simple_calibration_status()
+            self._show_preview_frame(camera, image, metadata)
         elif not self._checkerboard_overlay_active[camera]:
-            self.previews[camera].set_frame(image, metadata)
-            simple = getattr(self, "simple_calibration_previews", {}).get(camera)
-            if simple is not None:
-                simple.set_frame(image, metadata)
-                self._set_simple_calibration_preview_meta(camera)
+            self._show_preview_frame(camera, image, metadata)
 
     def _request_checkerboard_preview(self) -> None:
         if not self._checkerboard_preview_supported:
