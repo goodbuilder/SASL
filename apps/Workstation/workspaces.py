@@ -6734,16 +6734,6 @@ class TelemetryWorkspace(QtWidgets.QWidget):
         _sync_table_rows(self.position_model, tuple(rows))
 
     @staticmethod
-    def _gnss_center_axis_text(value: object) -> str:
-        if value in (None, ""):
-            return "--"
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            return "--"
-        return f"{number:+.3f}" if math.isfinite(number) else "--"
-
-    @staticmethod
     def _gnss_center_unsigned_text(value: object, *, digits: int) -> str:
         if value in (None, ""):
             return "--"
@@ -6771,9 +6761,9 @@ class TelemetryWorkspace(QtWidgets.QWidget):
         )
         row = (
             state,
-            self._gnss_center_axis_text(geometry.get("forward_m")),
-            self._gnss_center_axis_text(geometry.get("right_m")),
-            self._gnss_center_axis_text(geometry.get("down_m")),
+            _display_signed_number(geometry.get("forward_m"), digits=3),
+            _display_signed_number(geometry.get("right_m"), digits=3),
+            _display_signed_number(geometry.get("down_m"), digits=3),
             self._gnss_center_unsigned_text(geometry.get("range_m"), digits=3),
             self._gnss_center_unsigned_text(
                 geometry.get("baseline_drone_angle_deg"),
