@@ -540,6 +540,8 @@ class DecodedNv12Recorder:
         self._failed_detail = ""
         self._closed = False
         self._accepting = True
+        self._stderr_lock = threading.Lock()
+        self._stderr_tail = b""
         self.frames: queue.Queue[tuple[bytes, int] | None] = queue.Queue(
             maxsize=2
         )
@@ -598,6 +600,12 @@ class DecodedNv12Recorder:
             daemon=True,
         )
         self.thread.start()
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr,
+            name="stereo-nvenc-stderr-reader",
+            daemon=True,
+        )
+        self._stderr_thread.start()
         _emit_status(
             self.output_queue,
             f"Decoded NV12 lossless FFmpeg/NVENC recording started: {self.path}",
@@ -691,13 +699,26 @@ class DecodedNv12Recorder:
         except queue.Full:
             self._failed_detail = "recorder queue did not drain for shutdown"
 
-    def _stderr_text(self) -> str:
+    def _drain_stderr(self) -> None:
+        # ffmpeg's stderr must be serviced continuously while it runs: the
+        # OS pipe buffer is small (~64KB), and once it fills, ffmpeg blocks
+        # writing to stderr and stops reading stdin too, stalling the whole
+        # recording pipeline. Keep only a bounded tail for diagnostics.
         if self.process.stderr is None:
-            return ""
+            return
         try:
-            data = self.process.stderr.read(16_384)
-        except OSError:
-            return ""
+            while True:
+                chunk = self.process.stderr.read(4096)
+                if not chunk:
+                    return
+                with self._stderr_lock:
+                    self._stderr_tail = (self._stderr_tail + chunk)[-16_384:]
+        except (OSError, ValueError):
+            return
+
+    def _stderr_text(self) -> str:
+        with self._stderr_lock:
+            data = self._stderr_tail
         return data.decode("utf-8", errors="replace").strip()
 
     def close(self) -> bool:
@@ -717,6 +738,7 @@ class DecodedNv12Recorder:
             self.process.kill()
             returncode = self.process.wait(timeout=1.0)
             self._failed_detail = self._failed_detail or "FFmpeg exit timeout"
+        self._stderr_thread.join(timeout=1.0)
         stderr_text = self._stderr_text()
         if returncode != 0 and not self._failed_detail:
             self._failed_detail = (

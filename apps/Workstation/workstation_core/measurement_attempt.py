@@ -422,8 +422,8 @@ def live_pair_timing_evidence(
 
     if left.camera != "left" or right.camera != "right":
         raise ValueError("live pair timing requires exact Left/Right identity")
-    left_app_ns = left.app_receive_monotonic_ns
-    right_app_ns = right.app_receive_monotonic_ns
+    left_app_ns = _safe_app_receive_monotonic_ns(left)
+    right_app_ns = _safe_app_receive_monotonic_ns(right)
     signed_app_delta_ns = right_app_ns - left_app_ns
     abs_app_delta_ns = abs(signed_app_delta_ns)
 
@@ -1497,7 +1497,14 @@ class MeasurementAttempt:
                 )
                 if expected_basis is None or basis != expected_basis:
                     raise ValueError("baseline translation and right-ray target must use the same selected left quaternion")
-                if self.baseline.left_basis_attitude_monotonic_s != self.left_attitude.timestamp_s:
+                # geometry_left_quaternion_wxyz-only attempts (e.g.
+                # live_pixhawk_baseline_yaw) have no live left_attitude
+                # object to compare a timestamp against; the quaternion
+                # equality check above is the invariant that applies there.
+                if (
+                    self.left_attitude is not None
+                    and self.baseline.left_basis_attitude_monotonic_s != self.left_attitude.timestamp_s
+                ):
                     raise ValueError("baseline translation and right-ray target must use the same selected left attitude timestamp")
 
     @property
@@ -1802,6 +1809,28 @@ class BlockedMeasurementPair:
         return f"blocked:{self.canonical_sha256()}"
 
 
+def _safe_app_receive_monotonic_ns(observation: Any) -> int:
+    """Read app_receive_monotonic_ns tolerantly for identity/evidence keys.
+
+    A malformed value (e.g. a legacy float where an exact int is required)
+    must degrade to a derived timestamp instead of raising out of a
+    Qt-timer-driven pairing/recording loop; an explicit ``0`` is a real
+    value here (near process/monotonic-clock start) and must not be treated
+    as absent.
+    """
+
+    try:
+        value = getattr(observation, "app_receive_monotonic_ns", None)
+    except (AttributeError, ValueError):
+        value = None
+    if value is None:
+        metadata = getattr(observation, "timestamp_metadata", {}) or {}
+        value = metadata.get("app_receive_monotonic_ns")
+    if value is None:
+        value = round(float(observation.timestamp_s) * 1_000_000_000.0)
+    return int(value)
+
+
 def detection_pair_key(
     *,
     triangulation_source: str,
@@ -1816,16 +1845,8 @@ def detection_pair_key(
     return (
         str(triangulation_source),
         str(timestamp_basis),
-        int(
-            getattr(left, "app_receive_monotonic_ns", None)
-            or getattr(left, "timestamp_metadata", {}).get("app_receive_monotonic_ns")
-            or round(float(left.timestamp_s) * 1_000_000_000.0)
-        ),
-        int(
-            getattr(right, "app_receive_monotonic_ns", None)
-            or getattr(right, "timestamp_metadata", {}).get("app_receive_monotonic_ns")
-            or round(float(right.timestamp_s) * 1_000_000_000.0)
-        ),
+        _safe_app_receive_monotonic_ns(left),
+        _safe_app_receive_monotonic_ns(right),
         _finite_float(left.timestamp_s, name="left timestamp"),
         _finite_float(right.timestamp_s, name="right timestamp"),
         _finite_float(left_pairing_timestamp_s, name="left pairing timestamp"),

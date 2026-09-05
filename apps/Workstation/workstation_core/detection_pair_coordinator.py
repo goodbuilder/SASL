@@ -137,6 +137,16 @@ def _clock_epoch_state(observation: DetectionObservation) -> tuple[str, str]:
     )
 
 
+def _has_clock_epoch_evidence(observation: DetectionObservation) -> bool:
+    # "unverified" is the default stamp on every frame once STUS epoch
+    # tracking is decorating metadata at all, so treating it as evidence
+    # would force epoch gating unconditionally and silently override an
+    # explicit require_current_clock_epoch=False. Only a real signal that
+    # an epoch is actually in flux or established should auto-enable it.
+    state, epoch_id = _clock_epoch_state(observation)
+    return bool(epoch_id) or state not in ("", "unverified")
+
+
 class DetectionPairCoordinator:
     """Pair lightweight detections without running matcher logic on Qt's thread."""
 
@@ -413,7 +423,7 @@ class DetectionPairCoordinator:
             return None, "RTCP_TIMESTAMP_UNAVAILABLE"
 
         require_epoch = bool(policy.require_current_clock_epoch) or any(
-            any(_clock_epoch_state(item)) for item in (*left_valid, *right_valid)
+            _has_clock_epoch_evidence(item) for item in (*left_valid, *right_valid)
         )
         epoch_groups: list[tuple[list[DetectionObservation], list[DetectionObservation]]] = []
         if require_epoch:

@@ -4360,12 +4360,13 @@ class CalibrationWorkflowController:
                 )
                 return
             frame_id, native_image, native_metadata = native
+            preview_pts_ns = preview_metadata[side].get("h264_access_unit_pts_ns")
             if (
                 str(frame_id) != frame_key.text
                 or str(native_metadata.get("frame_key") or "") != frame_key.text
                 or not is_nal1_non_idr_auto_capture_metadata(native_metadata)
-                or int(native_metadata["h264_access_unit_pts_ns"])
-                != int(preview_metadata[side]["h264_access_unit_pts_ns"])
+                or preview_pts_ns is None
+                or int(native_metadata["h264_access_unit_pts_ns"]) != int(preview_pts_ns)
             ):
                 self.panel.calibration_status_label.setText(
                     f"자동 촬영 대기: {side} NAL1/FrameKey provenance가 일치하지 않습니다"

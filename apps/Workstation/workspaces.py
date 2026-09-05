@@ -4240,7 +4240,11 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         candidate_layout.addWidget(self.candidate_table)
         candidate_actions = QtWidgets.QHBoxLayout()
         self.candidate_buttons: dict[str, QtWidgets.QPushButton] = {}
-        for target, label in (("left", "Assign P1"), ("right", "Assign P2")):
+        for target, label in (
+            ("left", "Assign P1"),
+            ("right", "Assign P2"),
+            ("host", "Assign Host"),
+        ):
             button = QtWidgets.QPushButton(label)
             button.setEnabled(False)
             button.clicked.connect(lambda _checked=False, target=target: self._apply_candidate(target))
@@ -6005,16 +6009,11 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         endpoint_enabled = source == "network" or (
             source == "mavlink" and kind in {"USB", "MAVLink"}
         )
-        self.candidate_buttons["left"].setEnabled(
-            not self._recording_locked
-            and not self._network_role_locked
-            and endpoint_enabled
-        )
-        self.candidate_buttons["right"].setEnabled(
-            not self._recording_locked
-            and not self._network_role_locked
-            and endpoint_enabled
-        )
+        host_enabled = source == "pc"
+        not_locked = not self._recording_locked and not self._network_role_locked
+        self.candidate_buttons["left"].setEnabled(not_locked and endpoint_enabled)
+        self.candidate_buttons["right"].setEnabled(not_locked and endpoint_enabled)
+        self.candidate_buttons["host"].setEnabled(not_locked and host_enabled)
 
     def _apply_candidate(self, target: str) -> None:
         row = self._selected_candidate_row()

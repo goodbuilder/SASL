@@ -2065,6 +2065,16 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 wait_for_send_lock=False,
             )
             self._emit_liveness_transition(camera, now_s=time.monotonic())
+            with self._command_state_lock:
+                command_active = camera in self._active_command_cameras
+            if command_active:
+                # A blocking command worker (Shell/PARAM/MAVFTP) owns
+                # recv_match while it runs, so spin_once sees no fresh
+                # traffic here even though the link is fine. Declaring the
+                # link dead and closing the shared connection out from under
+                # that in-flight worker would abort its command with a
+                # spurious I/O error instead of a real disconnect.
+                continue
             health = self.mavlink_health_snapshot(camera, now_s=time.monotonic())
             if health.state in {
                 MavlinkLivenessState.INITIAL_RX_TIMEOUT,
