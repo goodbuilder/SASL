@@ -14,7 +14,16 @@ from collections.abc import Mapping
 
 from PyQt5 import QtCore
 
-from Workstation.device_runtime_workers import PixhawkConnectionWorker, PixhawkUsbDiscoveryWorker
+from Workstation.device_runtime_workers import (
+    DroneNetworkDiscoveryWorker,
+    PixhawkConnectionWorker,
+    PixhawkUsbDiscoveryWorker,
+)
+from Workstation.workstation_core.gnss_baseline_center import (
+    DEFAULT_MAXIMUM_GNSS_AGE_S,
+    DEFAULT_MAXIMUM_GNSS_TIMESTAMP_SPREAD_S,
+    estimate_gnss_baseline_center_frd,
+)
 from Workstation.workstation_core.ideal_disparity import estimate_ideal_disparity
 from Workstation.workstation_core.wiris_zoom import nominal_focal_length_px
 
@@ -47,6 +56,8 @@ DRONE_TELEMETRY_CONTROLLER_METHODS = (
     "save_drone_telemetry_settings",
     "drone_telemetry_snapshot",
     "discover_drone_telemetry_usb",
+    "discover_drone_telemetry_network",
+    "use_drone_telemetry_network_candidate",
 )
 
 
@@ -57,6 +68,43 @@ def _positive_baud(value: object) -> int:
     if parsed <= 0:
         raise ValueError("drone telemetry baud must be a positive integer")
     return parsed
+
+
+def _drone_usb_endpoint(panel: object) -> str:
+    """Read the Drone USB serial path from the bootstrap widget it lives in.
+
+    USB transport reuses the bootstrap endpoint that recovery and firmware work
+    already own, so there is one device path per board to keep current.
+    """
+
+    widget = getattr(panel, "drone_pixhawk_bootstrap_url_edit", None)
+    reader = getattr(widget, "text", None)
+    if callable(reader):
+        return str(reader()).strip()
+    return str(getattr(panel, "drone_pixhawk_bootstrap_url", "") or "").strip()
+
+
+def _drone_usb_baud(panel: object) -> int:
+    widget = getattr(panel, "drone_pixhawk_bootstrap_baud_spin", None)
+    reader = getattr(widget, "value", None)
+    if callable(reader):
+        return int(reader())
+    return int(getattr(panel, "drone_pixhawk_bootstrap_baud", 57_600))
+
+
+def _set_drone_usb_endpoint(panel: object, device: str, baud: int) -> None:
+    url_widget = getattr(panel, "drone_pixhawk_bootstrap_url_edit", None)
+    url_setter = getattr(url_widget, "setText", None)
+    if callable(url_setter):
+        url_setter(device)
+    else:
+        setattr(panel, "drone_pixhawk_bootstrap_url", device)
+    baud_widget = getattr(panel, "drone_pixhawk_bootstrap_baud_spin", None)
+    baud_setter = getattr(baud_widget, "setValue", None)
+    if callable(baud_setter):
+        baud_setter(baud)
+    else:
+        setattr(panel, "drone_pixhawk_bootstrap_baud", baud)
 
 
 def _gps_mapping(gps: object, *, now_s: float) -> dict[str, object]:
@@ -115,11 +163,20 @@ class DroneTelemetryController:
 
     def configure_drone_telemetry(self, payload: Mapping[str, object] | None = None) -> dict[str, object]:
         values = dict(payload or {})
+        transport = str(
+            values.get(
+                "drone_pixhawk_transport",
+                getattr(self.panel, "drone_pixhawk_transport", "radio"),
+            )
+            or "radio"
+        ).strip().lower()
+        if transport not in {"ethernet", "radio", "usb"}:
+            transport = "radio"
         endpoint = str(
             values.get("drone_telemetry_url", values.get("endpoint", getattr(self.panel, "drone_telemetry_url", "")))
             or ""
         ).strip()
-        if not endpoint:
+        if transport == "ethernet" and not endpoint:
             raise ValueError("Drone Telemetry MAVLink URL이 비어 있습니다.")
         baud = _positive_baud(
             values.get("drone_telemetry_baud", values.get("baud", getattr(self.panel, "drone_telemetry_baud", 57_600)))
@@ -136,23 +193,56 @@ class DroneTelemetryController:
                 values.get("rtcm_source", getattr(self.panel, "drone_telemetry_rtcm_source", "base")),
             )
         )
+        # Radio and USB each keep their own saved serial endpoint; apply the
+        # submitted one to whichever the selected transport will open.
+        serial_device = values.get("drone_pixhawk_serial_device")
+        if serial_device is not None and transport in {"radio", "usb"}:
+            serial_baud = _positive_baud(
+                values.get("drone_pixhawk_serial_baud", baud)
+            )
+            if transport == "radio":
+                self.panel.drone_pixhawk_radio_device = str(serial_device).strip()
+                self.panel.drone_pixhawk_radio_baud = serial_baud
+            else:
+                _set_drone_usb_endpoint(self.panel, str(serial_device).strip(), serial_baud)
         subscriber = getattr(self.panel, "mavlink_pixhawk", None)
         existing_endpoint = ""
         if subscriber is not None:
             existing_endpoint = str(getattr(subscriber, "urls", {}).get("drone", "") or "")
-            if "drone" in getattr(subscriber, "connections", {}) and existing_endpoint != endpoint:
+            if (
+                transport == "ethernet"
+                and "drone" in getattr(subscriber, "connections", {})
+                and existing_endpoint != endpoint
+            ):
                 subscriber.stop("drone")
                 self.panel.drone_telemetry_connection_state = "DISCONNECTED"
         self.panel.drone_telemetry_url = endpoint
         self.panel.drone_telemetry_baud = baud
         self.panel.drone_telemetry_rtcm_forward = forward_rtcm
         self.panel.drone_telemetry_rtcm_source = rtcm_source
+        self.panel.drone_pixhawk_transport = transport
         self._sync_rtcm_pipeline_route()
         if subscriber is not None:
-            subscriber.urls["drone"] = endpoint
-            subscriber.baudrates["drone"] = baud
+            if transport == "radio":
+                subscriber.urls["drone"] = str(
+                    getattr(self.panel, "drone_pixhawk_radio_device", "") or ""
+                ).strip()
+                subscriber.baudrates["drone"] = int(
+                    getattr(self.panel, "drone_pixhawk_radio_baud", 57_600)
+                )
+            elif transport == "usb":
+                subscriber.urls["drone"] = _drone_usb_endpoint(self.panel)
+                subscriber.baudrates["drone"] = _drone_usb_baud(self.panel)
+            else:
+                subscriber.urls["drone"] = endpoint
+                subscriber.baudrates["drone"] = baud
+            setter = getattr(subscriber, "set_transport", None)
+            if callable(setter):
+                setter("drone", transport)
         self.panel._log(
-            f"[픽스호크] Drone Telemetry 설정: {endpoint} @ {baud} baud | "
+            f"[픽스호크] Drone Telemetry 설정: transport={transport} "
+            f"endpoint={subscriber.urls['drone'] if subscriber is not None else endpoint} @ "
+            f"{subscriber.baudrates['drone'] if subscriber is not None else baud} baud | "
             f"RTCM source={drone_rtcm_source_label(rtcm_source)} | "
             f"forward={'ON' if forward_rtcm else 'OFF'}"
         )
@@ -168,34 +258,12 @@ class DroneTelemetryController:
     def connect_drone_telemetry(self, payload: Mapping[str, object] | None = None) -> dict[str, object]:
         if payload:
             self.configure_drone_telemetry(payload)
-        endpoint = str(getattr(self.panel, "drone_telemetry_url", "") or "").strip()
-        if not endpoint:
-            raise ValueError("Drone Telemetry MAVLink URL이 비어 있습니다.")
-        subscriber = self.panel._ensure_mavlink_subscriber()
-        subscriber.urls["drone"] = endpoint
-        subscriber.baudrates["drone"] = int(getattr(self.panel, "drone_telemetry_baud", 57_600))
-        if "drone" in getattr(subscriber, "connections", {}):
-            return self.drone_telemetry_snapshot()
-        existing_thread = getattr(self.panel, "drone_telemetry_connection_thread", None)
-        if existing_thread is not None:
-            return self.drone_telemetry_snapshot()
-
+        connector = getattr(self.panel, "connect_mavlink_pixhawk", None)
+        if not callable(connector):
+            raise RuntimeError("공용 Pixhawk Connect owner가 없습니다.")
         self.panel.drone_telemetry_connection_state = "CONNECTING"
         self.panel.drone_telemetry_last_error = ""
-        thread = QtCore.QThread(self.panel)
-        worker = PixhawkConnectionWorker(subscriber, "drone")
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.completed.connect(self._apply_connection_result)
-        worker.failed.connect(self._connection_failed)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._clear_connection_worker)
-        self.panel.drone_telemetry_connection_thread = thread
-        self.panel.drone_telemetry_connection_worker = worker
-        self.panel._log(f"[픽스호크] Drone Telemetry MAVLink 연결을 시작했습니다: {endpoint}")
-        thread.start()
+        connector("drone")
         return self.drone_telemetry_snapshot()
 
     def _apply_connection_result(self, _result: object) -> None:
@@ -231,16 +299,74 @@ class DroneTelemetryController:
         self.panel.drone_telemetry_connection_thread = None
         self.panel.drone_telemetry_connection_worker = None
 
+    def discover_drone_telemetry_network(self) -> None:
+        if getattr(self.panel, "drone_telemetry_network_discovery_thread", None) is not None:
+            raise RuntimeError("Drone network discovery is already running")
+        self.panel.drone_telemetry_network_discovery_generation = int(
+            getattr(self.panel, "drone_telemetry_network_discovery_generation", 0)
+        ) + 1
+        self.panel.drone_telemetry_network_candidates = ()
+        self.panel.drone_telemetry_network_discovery_state = "SEARCHING"
+        thread = QtCore.QThread(self.panel)
+        worker = DroneNetworkDiscoveryWorker(timeout_s=3.0)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.discovered.connect(self._apply_drone_telemetry_network_discovery)
+        worker.failed.connect(self._drone_telemetry_network_discovery_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_drone_telemetry_network_discovery)
+        self.panel.drone_telemetry_network_discovery_thread = thread
+        self.panel.drone_telemetry_network_discovery_worker = worker
+        self.panel._log("[픽스호크] Drone read-only network discovery를 시작했습니다.")
+        thread.start()
+
+    def _apply_drone_telemetry_network_discovery(self, result: object) -> None:
+        rows = tuple(dict(row) for row in (result or ()) if isinstance(row, Mapping))
+        self.panel.drone_telemetry_network_candidates = rows
+        verified = [row for row in rows if bool(row.get("selectable"))]
+        if len(verified) == 1:
+            state = "FOUND 1 DRONE"
+        elif len(verified) > 1:
+            state = f"AMBIGUOUS {len(verified)} DRONES"
+        elif rows:
+            state = "FOUND OTHER SYSTEMS ONLY"
+        else:
+            state = "EMPTY"
+        self.panel.drone_telemetry_network_discovery_state = state
+        self.panel._log(f"[픽스호크] Drone network discovery: {state}")
+
+    def _drone_telemetry_network_discovery_failed(self, error: str) -> None:
+        self.panel.drone_telemetry_network_candidates = ()
+        self.panel.drone_telemetry_network_discovery_state = f"FAILED · {error}"
+        self.panel._log(f"[픽스호크] Drone network discovery 실패: {error}")
+
+    def _clear_drone_telemetry_network_discovery(self) -> None:
+        self.panel.drone_telemetry_network_discovery_thread = None
+        self.panel.drone_telemetry_network_discovery_worker = None
+
+    def use_drone_telemetry_network_candidate(self, candidate_id: object) -> dict[str, object]:
+        selected_id = str(candidate_id or "")
+        matches = [
+            dict(row)
+            for row in getattr(self.panel, "drone_telemetry_network_candidates", ())
+            if str(row.get("candidate_id") or "") == selected_id
+        ]
+        if len(matches) != 1:
+            raise ValueError("Select one current Drone network candidate")
+        row = matches[0]
+        if not bool(row.get("selectable")) or int(row.get("system_id") or -1) != 3:
+            raise ValueError("Selected network source is not verified as Drone sysid 3")
+        endpoint = str(row.get("endpoint") or "").strip()
+        if not endpoint.startswith("udpin:0.0.0.0:"):
+            raise ValueError("Selected Drone endpoint is invalid")
+        return {"candidate_id": selected_id, "endpoint": endpoint, "candidate": row}
+
     def disconnect_drone_telemetry(self) -> dict[str, object]:
-        subscriber = getattr(self.panel, "mavlink_pixhawk", None)
-        if subscriber is not None:
-            try:
-                subscriber.stop("drone")
-            except Exception as exc:
-                self.panel.drone_telemetry_last_error = str(exc)
-        thread = getattr(self.panel, "drone_telemetry_connection_thread", None)
-        if thread is not None and thread.isRunning():
-            thread.quit()
+        disconnect = getattr(self.panel, "disconnect_mavlink_pixhawk", None)
+        if callable(disconnect):
+            disconnect("drone")
         self.panel.drone_telemetry_connection_state = "DISCONNECTED"
         self._sync_rtcm_pipeline_route()
         self.panel._log("[픽스호크] Drone Telemetry MAVLink 연결을 해제했습니다.")
@@ -280,17 +406,19 @@ class DroneTelemetryController:
         data = dict(result or {}) if isinstance(result, dict) else {}
         candidates = list(data.get("candidates") or [])
         found = list(data.get("found") or [])
+        self.panel.drone_telemetry_usb_candidates = tuple(candidates)
         if found:
             device, baud = found[0]
-            self.configure_drone_telemetry({"drone_telemetry_url": device, "drone_telemetry_baud": baud})
-            self.panel.drone_telemetry_usb_discovery_state = f"FOUND heartbeat {device} @ {baud}"
+            self.panel.drone_telemetry_usb_discovery_state = (
+                f"CANDIDATE heartbeat {device} @ {baud} · select for Drone then Connect"
+            )
             self.panel._log(
-                f"[픽스호크] Drone Telemetry USB 라디오 발견 (MAVLink heartbeat 확인): {device} @ {baud} baud"
+                f"[픽스호크] Drone Radio 후보 발견: {device} @ {baud} baud. "
+                "자동 배정하지 않습니다; Drone에 선택한 뒤 Connect를 누르세요."
             )
         elif candidates:
             device = candidates[0]
-            self.configure_drone_telemetry({"drone_telemetry_url": device})
-            self.panel.drone_telemetry_usb_discovery_state = f"FOUND no-heartbeat {device}"
+            self.panel.drone_telemetry_usb_discovery_state = f"CANDIDATE no-heartbeat {device}"
             self.panel._log(
                 f"[픽스호크] USB 시리얼 장치는 찾았지만 MAVLink heartbeat 응답이 없습니다: {device} "
                 "(드론/자동조종장치 전원 및 라디오 페어링을 확인하세요)"
@@ -321,7 +449,7 @@ class DroneTelemetryController:
             connection_state = "LIVE"
         elif drone_connection:
             connection_state = "CONNECTED"
-        elif getattr(self.panel, "drone_telemetry_connection_thread", None) is not None:
+        elif getattr(self.panel, "pixhawk_connection_thread", None) is not None:
             connection_state = str(getattr(self.panel, "drone_telemetry_connection_state", "CONNECTING"))
         else:
             connection_state = str(getattr(self.panel, "drone_telemetry_connection_state", "DISCONNECTED"))
@@ -343,13 +471,27 @@ class DroneTelemetryController:
             else None
         )
         focal_length_px, focal_source = self._focal_length_px()
+        gnss_baseline_center = estimate_gnss_baseline_center_frd(
+            left_gps,
+            right_gps,
+            drone_gps,
+            now_s=now_s,
+            maximum_age_s=DEFAULT_MAXIMUM_GNSS_AGE_S,
+            maximum_timestamp_spread_s=(
+                DEFAULT_MAXIMUM_GNSS_TIMESTAMP_SPREAD_S
+            ),
+        )
         estimate = estimate_ideal_disparity(
             left_gps,
             right_gps,
             drone_gps,
             focal_length_px=focal_length_px,
             now_s=now_s,
-            maximum_gps_age_s=2.0,
+            maximum_gps_age_s=DEFAULT_MAXIMUM_GNSS_AGE_S,
+            maximum_gps_timestamp_spread_s=(
+                DEFAULT_MAXIMUM_GNSS_TIMESTAMP_SPREAD_S
+            ),
+            gnss_estimate=gnss_baseline_center,
         )
         baseline = estimate.baseline
         injection = self._drone_injection_stats()
@@ -363,12 +505,34 @@ class DroneTelemetryController:
             if target_distance is not None
             else "waiting for three GNSS positions"
         )
+        drone_transport = str(getattr(self.panel, "drone_pixhawk_transport", "radio") or "radio")
+        if drone_transport == "radio":
+            drone_endpoint = str(getattr(self.panel, "drone_pixhawk_radio_device", "") or "")
+            drone_baud = int(getattr(self.panel, "drone_pixhawk_radio_baud", 57_600))
+        elif drone_transport == "usb":
+            drone_endpoint = _drone_usb_endpoint(self.panel)
+            drone_baud = _drone_usb_baud(self.panel)
+        else:
+            drone_endpoint = str(getattr(self.panel, "drone_telemetry_url", "") or "")
+            drone_baud = int(getattr(self.panel, "drone_telemetry_baud", 57_600))
         return {
             "source_id": "drone_telemetry",
             "usb_discovery_state": str(getattr(self.panel, "drone_telemetry_usb_discovery_state", "") or ""),
             "usb_discovery_active": getattr(self.panel, "drone_telemetry_usb_discovery_thread", None) is not None,
-            "endpoint": str(getattr(self.panel, "drone_telemetry_url", "") or ""),
-            "baud": int(getattr(self.panel, "drone_telemetry_baud", 57_600)),
+            "network_discovery_state": str(
+                getattr(self.panel, "drone_telemetry_network_discovery_state", "IDLE") or "IDLE"
+            ),
+            "network_discovery_active": getattr(
+                self.panel, "drone_telemetry_network_discovery_thread", None
+            ) is not None,
+            "network_candidates": tuple(
+                dict(row)
+                for row in getattr(self.panel, "drone_telemetry_network_candidates", ())
+                if isinstance(row, Mapping)
+            ),
+            "transport": drone_transport,
+            "endpoint": drone_endpoint,
+            "baud": drone_baud,
             "connection_state": connection_state,
             "heartbeat_received": heartbeat_received,
             "forward_rtcm": bool(getattr(self.panel, "drone_telemetry_rtcm_forward", True)),
@@ -386,6 +550,7 @@ class DroneTelemetryController:
             "automatic_target_distance_m": target_distance,
             "target_distance_used_m": target_distance,
             "target_distance_source": target_source,
+            "gnss_baseline_center_frd": gnss_baseline_center.to_mapping(),
             "ideal_disparity": {
                 "state": estimate.state,
                 "reason": estimate.reason,

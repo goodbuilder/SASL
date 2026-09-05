@@ -183,12 +183,18 @@ class AsyncNativeEvidenceWriter(QtCore.QObject):
         *,
         max_pending: int = DEFAULT_MAX_PENDING,
         timestamp_filenames: bool = False,
+        events_path: Path | str | None = None,
         parent: QtCore.QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self.root = Path(session_root).expanduser().resolve()
         self.max_pending = max(1, int(max_pending))
         self.timestamp_filenames = bool(timestamp_filenames)
+        self.events_path = (
+            None
+            if events_path is None
+            else Path(events_path).expanduser().resolve()
+        )
         self._lock = threading.RLock()
         self._pending: set[str] = set()
         self._results: dict[str, dict[str, object]] = {}
@@ -422,7 +428,10 @@ class AsyncNativeEvidenceWriter(QtCore.QObject):
 
     def _persist(self, job: RingPairJob) -> dict[str, object]:
         if self._store is None:
-            self._store = NativeFrameStore(self.root)
+            self._store = NativeFrameStore(
+                self.root,
+                events_path=self.events_path,
+            )
         fields: dict[str, object] = {
             "native_pair_status": "complete",
             "evidence_state": "SAVED",

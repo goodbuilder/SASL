@@ -222,6 +222,7 @@ _DRONE_RTK_OBSERVATION_SCHEMA = "optical-pose-drone-rtk-capture-observation-v1"
 _DRONE_RTK_MULTIVIEW_SAMPLE_SCHEMA = "optical-pose-drone-rtk-multiview-sample-v1"
 _DRONE_RTK_MULTIVIEW_COLLECTION_SCHEMA = "optical-pose-drone-rtk-multiview-collection-v1"
 _DRONE_RTK_MULTIVIEW_MIN_OBSERVATIONS = 4
+_MOUNTAIN_MINIMUM_GNSS_FIX_TYPE = 3
 
 
 def _gps_state_observation_mapping(value: Any, *, role: str) -> dict[str, Any] | None:
@@ -290,6 +291,40 @@ def _gps_state_from_capture_mapping(row: Any) -> GpsPositionState | None:
         return None
     kwargs = {key: value for key, value in row.items() if key in _GPS_STATE_FIELD_NAMES}
     return GpsPositionState(**kwargs)
+
+
+def _mountain_fix_type(value: Any, *, rtk_label: Any) -> int | None:
+    """Resolve auditable GNSS fix quality for the Mountain translation gate.
+
+    Capture observations carry the numeric MAVLink/PX4 ``fix_type``. Explicit
+    baseline overrides may instead retain an older RTK label, so the known
+    labels are mapped to their minimum equivalent without treating an unknown
+    label as usable evidence.
+    """
+
+    if value not in (None, ""):
+        try:
+            fix_type = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return fix_type if fix_type >= 0 else None
+    return {
+        "3D_FIX": 3,
+        "RTK_FLOAT": 5,
+        "RTK_FIXED": 6,
+    }.get(str(rtk_label or "").strip().upper())
+
+
+def _finite_gps_position(state: GpsPositionState) -> bool:
+    if not state.has_position:
+        return False
+    try:
+        return all(
+            math.isfinite(float(value))
+            for value in (state.latitude_deg, state.longitude_deg, state.altitude_m)
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _frame_clock_domain_verified(artifact: NativeFrameArtifact) -> bool:
@@ -434,7 +469,7 @@ def _candidate_mapping(candidate: OpticalPoseCandidate) -> dict[str, Any]:
         name: all(side_observability[side].get(name, False) for side in ("left", "right"))
         for name in POSE_DOF_NAMES
     }
-    return {
+    mapping = {
         "schema": "optical-pose-candidate-v1",
         "candidate_id": candidate.candidate_id,
         "method": candidate.method,
@@ -467,6 +502,23 @@ def _candidate_mapping(candidate: OpticalPoseCandidate) -> dict[str, Any]:
         "uncertainty_metrics": dict(candidate.uncertainty_metrics),
         "created_utc_ns": candidate.created_utc_ns,
     }
+    if candidate.method == "gnss-constrained-mountain-uv":
+        relative_pose = candidate.stereo_pose_rdf
+        mapping["relative_pose_rdf"] = {
+            "rotation_right_from_left_rdf": [
+                list(row) for row in relative_pose.rotation_right_from_left_rdf
+            ],
+            "translation_right_from_left_rdf_m": list(
+                relative_pose.translation_right_from_left_rdf_m
+            ),
+            "right_origin_in_left_rdf_m": list(relative_pose.right_origin_in_left_rdf_m),
+            "frame_contract": (
+                "X_right = R_right_from_left_rdf * X_left "
+                "+ t_right_from_left_rdf_m"
+            ),
+            "unit": "m",
+        }
+    return mapping
 
 
 class OpticalPoseController:
@@ -3134,8 +3186,11 @@ class OpticalPoseController:
             details.setdefault("fix_quality", payload.get("gnss_fix_quality", "UNKNOWN"))
             details.setdefault("left_rtk_label", payload.get("gnss_left_rtk_label", "UNKNOWN"))
             details.setdefault("right_rtk_label", payload.get("gnss_right_rtk_label", "UNKNOWN"))
+            details.setdefault("left_fix_type", payload.get("gnss_left_fix_type"))
+            details.setdefault("right_fix_type", payload.get("gnss_right_fix_type"))
             details.setdefault("left_age_s", payload.get("gnss_left_age_s"))
             details.setdefault("right_age_s", payload.get("gnss_right_age_s"))
+            details["position_evidence"] = "explicit finite NED baseline override"
         else:
             observation = self._capture_observation_for_frozen_burst()
             if observation is None:
@@ -3156,13 +3211,23 @@ class OpticalPoseController:
                     f"(capture observation {observation.get('observation_id')} is missing "
                     "left/right GNSS position)"
                 )
+            if not _finite_gps_position(left_state) or not _finite_gps_position(right_state):
+                raise RuntimeError(
+                    "frozen Mountain image has no usable capture-associated GNSS baseline "
+                    f"evidence (capture observation {observation.get('observation_id')} has "
+                    "non-finite left/right GNSS position)"
+                )
             delta = ned_delta_m(left_state, right_state)
             if delta is None:
                 raise RuntimeError(
                     "frozen Mountain image has no capture-associated GNSS baseline evidence "
                     "(left/right GNSS position incomplete)"
                 )
-            baseline_ned = delta
+            baseline_ned = _finite_vector(
+                delta,
+                length=3,
+                name="capture-associated gnss_baseline_ned_m",
+            )
             source = f"capture_observation:{observation.get('observation_id')}"
             left_label = str((left_row or {}).get("rtk_label") or "UNKNOWN")
             right_label = str((right_row or {}).get("rtk_label") or "UNKNOWN")
@@ -3170,6 +3235,8 @@ class OpticalPoseController:
                 "capture_observation_id": observation.get("observation_id"),
                 "left_rtk_label": left_label,
                 "right_rtk_label": right_label,
+                "left_fix_type": left_state.fix_type,
+                "right_fix_type": right_state.fix_type,
                 "fix_quality": (
                     "RTK_FIXED"
                     if left_label == "RTK_FIXED" and right_label == "RTK_FIXED"
@@ -3177,15 +3244,35 @@ class OpticalPoseController:
                 ),
                 "left_timestamp_s": (left_row or {}).get("timestamp_s"),
                 "right_timestamp_s": (right_row or {}).get("timestamp_s"),
+                "left_eph_m": (left_row or {}).get("eph_m"),
+                "right_eph_m": (right_row or {}).get("eph_m"),
+                "left_epv_m": (left_row or {}).get("epv_m"),
+                "right_epv_m": (right_row or {}).get("epv_m"),
+                "position_evidence": "same frozen-burst capture observation",
             }
 
         baseline_m = math.sqrt(sum(value * value for value in baseline_ned))
         if baseline_m <= 1.0e-9:
-            raise ValueError("GNSS + Mountain requires a non-zero RTK baseline")
+            raise ValueError("GNSS + Mountain requires a non-zero finite GNSS baseline")
+        left_fix_type = _mountain_fix_type(
+            details.get("left_fix_type"),
+            rtk_label=details.get("left_rtk_label"),
+        )
+        right_fix_type = _mountain_fix_type(
+            details.get("right_fix_type"),
+            rtk_label=details.get("right_rtk_label"),
+        )
         fix_quality = str(details.get("fix_quality") or "UNKNOWN").upper()
         apply_eligible = (
-            str(details.get("left_rtk_label") or "").upper() == "RTK_FIXED"
-            and str(details.get("right_rtk_label") or "").upper() == "RTK_FIXED"
+            left_fix_type is not None
+            and left_fix_type >= _MOUNTAIN_MINIMUM_GNSS_FIX_TYPE
+            and right_fix_type is not None
+            and right_fix_type >= _MOUNTAIN_MINIMUM_GNSS_FIX_TYPE
+        )
+        gate_reasons = tuple(
+            f"{side} fix_type {fix_type!r} < {_MOUNTAIN_MINIMUM_GNSS_FIX_TYPE}"
+            for side, fix_type in (("left", left_fix_type), ("right", right_fix_type))
+            if fix_type is None or fix_type < _MOUNTAIN_MINIMUM_GNSS_FIX_TYPE
         )
         details.update(
             {
@@ -3193,7 +3280,11 @@ class OpticalPoseController:
                 "ned_m": list(baseline_ned),
                 "baseline_m": baseline_m,
                 "fix_quality": fix_quality,
+                "left_fix_type": left_fix_type,
+                "right_fix_type": right_fix_type,
+                "minimum_fix_type": _MOUNTAIN_MINIMUM_GNSS_FIX_TYPE,
                 "apply_eligible": apply_eligible,
+                "translation_gate_reasons": list(gate_reasons),
                 "coordinate_contract": "right GNSS antenna minus left GNSS antenna; world NED metres",
             }
         )
@@ -3382,8 +3473,20 @@ class OpticalPoseController:
         ]
         if not gnss_apply_eligible:
             warnings.append(
-                "GNSS + Mountain apply eligibility requires RTK_FIXED on both Left and Right; "
-                f"left={gnss_details.get('left_rtk_label')} right={gnss_details.get('right_rtk_label')}"
+                "GNSS + Mountain translation requires fix_type >= 3 (3D fix or better) on "
+                "both Left and Right; "
+                f"left_fix_type={gnss_details.get('left_fix_type')} "
+                f"right_fix_type={gnss_details.get('right_fix_type')}"
+            )
+        elif not (
+            str(gnss_details.get("left_rtk_label") or "").upper() == "RTK_FIXED"
+            and str(gnss_details.get("right_rtk_label") or "").upper() == "RTK_FIXED"
+        ):
+            warnings.append(
+                "GNSS + Mountain translation accepted with 3D fix or better without "
+                "RTK_FIXED on both sides; the Mountain measurement remains ESTIMATED; "
+                f"left={gnss_details.get('left_rtk_label')} "
+                f"right={gnss_details.get('right_rtk_label')}"
             )
         if not rotation_apply_eligible:
             warnings.append(
@@ -3401,7 +3504,12 @@ class OpticalPoseController:
                 float(len(solve.inlier_indices)) / float(solve.total_count) if solve.total_count else 0.0,
             ),
             ("gnss_baseline_m", float(gnss_details["baseline_m"])),
+            ("gnss_minimum_fix_type", float(_MOUNTAIN_MINIMUM_GNSS_FIX_TYPE)),
         ]
+        for side in ("left", "right"):
+            fix_type = gnss_details.get(f"{side}_fix_type")
+            if fix_type is not None:
+                quality.append((f"gnss_{side}_fix_type", float(fix_type)))
         if math.isfinite(solve.sampson_rms_normalized) and math.isfinite(solve.sampson_p95_normalized):
             quality.extend(
                 (
@@ -4611,28 +4719,6 @@ class OpticalPoseController:
             now_monotonic_s=now,
             extrinsics_source_zoom_index=getattr(extrinsics, "source_zoom_level", None),
         )
-        if (
-            not use_frozen
-            and profile is not None
-            and getattr(self.panel, "active_intrinsics", None) is not None
-            and not result.geometry_allowed
-            and any(
-                "operating_zoom_mismatch" in reason or "intrinsics_zoom_unknown" in reason
-                for reason in result.reasons
-            )
-        ):
-            nominal = self._nominal_operating_intrinsics_profile(use_frozen=False)
-            if nominal is not None:
-                nominal_result = evaluate_intrinsics_applicability(
-                    nominal,
-                    left,
-                    right,
-                    now_monotonic_s=now,
-                    extrinsics_source_zoom_index=getattr(extrinsics, "source_zoom_level", None),
-                )
-                if nominal_result.geometry_allowed:
-                    profile = nominal
-                    result = nominal_result
         return {
             "schema": "optical-pose-intrinsics-snapshot-v1",
             "evidence_scope": "frozen_capture" if use_frozen else "current_live",

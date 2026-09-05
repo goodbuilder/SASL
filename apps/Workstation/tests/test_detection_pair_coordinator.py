@@ -3,6 +3,9 @@ from __future__ import annotations
 import multiprocessing
 import time
 from collections.abc import Mapping
+from types import SimpleNamespace
+
+import pytest
 
 from Workstation.workstation_core.detection_pair_coordinator import (
     DetectionPairCoordinator,
@@ -117,9 +120,670 @@ def test_missing_camera_rtc_uses_explicit_app_fallback() -> None:
         result = _await_result(coordinator)
         assert result.pair is not None
         assert result.uses_app_fallback is True
-        assert "app receive time used" in result.advisories[0]
+        assert result.timing is not None
+        assert result.timing.requested_basis == "camera_rtc_required"
+        assert result.timing.effective_basis == "app_receive_monotonic"
+        assert result.timing.fallback_reason == "RTCP_TIMESTAMP_UNAVAILABLE"
+        assert result.advisories == ()
     finally:
         assert coordinator.close()
+
+
+def test_healthy_rtcp_preference_actually_selects_rtcp_pair() -> None:
+    coordinator = DetectionPairCoordinator()
+    try:
+        policy = PairingPolicy(
+            timestamp_basis="camera_rtcp",
+            max_delta_s=0.100,
+            allow_app_fallback=True,
+            rtcp_clock_verified=True,
+            require_current_clock_epoch=True,
+        )
+        metadata = {
+            "clock_epoch_id": "epoch-7",
+            "clock_epoch_state": "current",
+        }
+        coordinator.submit(
+            "left",
+            _detection(
+                "left",
+                10.000,
+                rtc_s=1_000.000,
+                timestamp_metadata={
+                    **metadata,
+                    "app_receive_monotonic_ns": 10_000_000_000,
+                },
+            ),
+            policy,
+        )
+        coordinator.submit(
+            "right",
+            _detection(
+                "right",
+                10.090,
+                rtc_s=1_000.010,
+                timestamp_metadata={
+                    **metadata,
+                    "app_receive_monotonic_ns": 10_090_000_000,
+                },
+            ),
+            policy,
+        )
+
+        result = _await_result(coordinator)
+
+        assert result.pair is not None
+        assert result.timing is not None
+        assert result.timing.requested_basis == "camera_rtcp"
+        assert result.timing.effective_basis == "camera_rtcp"
+        assert result.timing.signed_delta_ns == 10_000_000
+        assert result.timing.fallback_reason == ""
+        assert result.uses_app_fallback is False
+    finally:
+        assert coordinator.close()
+
+
+@pytest.mark.parametrize(
+    ("clock_verified", "left_metadata", "right_metadata", "rtc_pair", "reason"),
+    (
+        (
+            False,
+            {"clock_epoch_id": "epoch", "clock_epoch_state": "current"},
+            {"clock_epoch_id": "epoch", "clock_epoch_state": "current"},
+            (100.0, 100.01),
+            "CLOCK_NOT_VERIFIED",
+        ),
+        (
+            True,
+            {"clock_epoch_id": "epoch", "clock_epoch_state": "transition"},
+            {"clock_epoch_id": "epoch", "clock_epoch_state": "current"},
+            (100.0, 100.01),
+            "CLOCK_EPOCH_TRANSITION",
+        ),
+        (
+            True,
+            {"clock_epoch_id": "left", "clock_epoch_state": "current"},
+            {"clock_epoch_id": "right", "clock_epoch_state": "current"},
+            (100.0, 100.01),
+            "CLOCK_EPOCH_MISMATCH",
+        ),
+        (
+            True,
+            {"clock_epoch_id": "epoch", "clock_epoch_state": "current"},
+            {"clock_epoch_id": "epoch", "clock_epoch_state": "current"},
+            (100.0, None),
+            "RTCP_TIMESTAMP_UNAVAILABLE",
+        ),
+        (
+            True,
+            {"clock_epoch_id": "epoch", "clock_epoch_state": "current"},
+            {"clock_epoch_id": "epoch", "clock_epoch_state": "current"},
+            (100.0, 100.101),
+            "RTCP_DELTA_EXCEEDED",
+        ),
+    ),
+)
+def test_rtcp_timing_faults_fall_back_to_exact_app_receive(
+    clock_verified,
+    left_metadata,
+    right_metadata,
+    rtc_pair,
+    reason,
+) -> None:
+    coordinator = DetectionPairCoordinator()
+    try:
+        policy = PairingPolicy(
+            timestamp_basis="camera_rtcp",
+            max_delta_s=0.100,
+            allow_app_fallback=True,
+            rtcp_clock_verified=clock_verified,
+            require_current_clock_epoch=True,
+        )
+        for side, timestamp_s, app_ns, rtc_s, metadata in (
+            ("left", 5.000, 5_000_000_000, rtc_pair[0], left_metadata),
+            ("right", 5.020, 5_020_000_000, rtc_pair[1], right_metadata),
+        ):
+            coordinator.submit(
+                side,
+                _detection(
+                    side,
+                    timestamp_s,
+                    rtc_s=rtc_s,
+                    timestamp_metadata={
+                        **metadata,
+                        "app_receive_monotonic_ns": app_ns,
+                    },
+                ),
+                policy,
+            )
+
+        result = _await_result(coordinator)
+
+        assert result.pair is not None
+        assert result.timing is not None
+        assert result.timing.effective_basis == "app_receive_monotonic"
+        assert result.timing.signed_delta_ns == 20_000_000
+        assert result.timing.fallback_reason == reason
+        assert result.primary_rejection_reason == reason
+        assert result.uses_app_fallback is True
+        assert result.advisories == ()
+    finally:
+        assert coordinator.close()
+
+
+def test_rtcp_and_app_timing_failure_returns_precise_final_rejection() -> None:
+    coordinator = DetectionPairCoordinator()
+    try:
+        policy = PairingPolicy(
+            timestamp_basis="camera_rtcp",
+            max_delta_s=0.100,
+            allow_app_fallback=True,
+            rtcp_clock_verified=False,
+            rtcp_unavailable_reason="CLOCK_NOT_VERIFIED",
+            require_current_clock_epoch=True,
+        )
+        coordinator.submit("left", _detection("left", 1.0), policy)
+        coordinator.submit("right", _detection("right", 1.100_000_001), policy)
+
+        result = _await_result(coordinator)
+
+        assert result.pair is None
+        assert result.primary_rejection_reason == "CLOCK_NOT_VERIFIED"
+        assert result.fallback_rejection_reason == "APP_RECEIVE_DELTA_EXCEEDED"
+        assert result.rejection_reason == "APP_RECEIVE_DELTA_EXCEEDED"
+    finally:
+        assert coordinator.close()
+
+
+def test_latest_missing_rtcp_does_not_reuse_an_older_healthy_rtcp_pair() -> None:
+    coordinator = DetectionPairCoordinator()
+    try:
+        policy = PairingPolicy(
+            timestamp_basis="camera_rtcp",
+            allow_app_fallback=True,
+            rtcp_clock_verified=True,
+            require_current_clock_epoch=True,
+        )
+        epoch = {"clock_epoch_id": "epoch", "clock_epoch_state": "current"}
+        coordinator.submit(
+            "left",
+            _detection("left", 1.0, frame_id=1, rtc_s=100.0, timestamp_metadata=epoch),
+            policy,
+        )
+        coordinator.submit(
+            "right",
+            _detection("right", 1.01, frame_id=1, rtc_s=100.01, timestamp_metadata=epoch),
+            policy,
+        )
+        healthy = _await_result_where(
+            coordinator,
+            lambda result: result.pair is not None and not result.uses_app_fallback,
+        )
+        assert healthy.pair.left.timestamp_s == pytest.approx(1.0)
+
+        coordinator.submit(
+            "left",
+            _detection("left", 2.0, frame_id=2, timestamp_metadata=epoch),
+            policy,
+        )
+        coordinator.submit(
+            "right",
+            _detection("right", 2.01, frame_id=2, timestamp_metadata=epoch),
+            policy,
+        )
+        fallback = _await_result_where(
+            coordinator,
+            lambda result: result.pair is not None and result.uses_app_fallback,
+        )
+
+        assert fallback.pair.left.timestamp_s == pytest.approx(2.0)
+        assert fallback.pair.right.timestamp_s == pytest.approx(2.01)
+        assert fallback.timing.fallback_reason == "RTCP_TIMESTAMP_UNAVAILABLE"
+    finally:
+        assert coordinator.close()
+
+
+def test_time_dependent_pairing_rejects_stus_clock_epoch_transition() -> None:
+    coordinator = DetectionPairCoordinator()
+    try:
+        policy = PairingPolicy(timestamp_basis="camera_rtc_required")
+        coordinator.submit(
+            "left",
+            _detection(
+                "left",
+                1.0,
+                rtc_s=100.0,
+                timestamp_metadata={
+                    "clock_epoch_id": "epoch-2",
+                    "clock_epoch_state": "transition",
+                },
+            ),
+            policy,
+        )
+        coordinator.submit(
+            "right",
+            _detection(
+                "right",
+                1.0,
+                rtc_s=100.0,
+                timestamp_metadata={
+                    "clock_epoch_id": "epoch-1",
+                    "clock_epoch_state": "current",
+                },
+            ),
+            policy,
+        )
+        result = _await_result(coordinator)
+        assert result.pair is None
+        assert result.rejection_reason == "CLOCK_EPOCH_TRANSITION"
+        assert result.uses_app_fallback is False
+    finally:
+        assert coordinator.close()
+
+
+def test_time_dependent_pairing_requires_same_current_clock_epoch() -> None:
+    coordinator = DetectionPairCoordinator()
+    try:
+        policy = PairingPolicy(timestamp_basis="camera_rtc_required")
+        for side, epoch in (("left", "epoch-left"), ("right", "epoch-right")):
+            coordinator.submit(
+                side,
+                _detection(
+                    side,
+                    1.0,
+                    rtc_s=100.0,
+                    timestamp_metadata={
+                        "clock_epoch_id": epoch,
+                        "clock_epoch_state": "current",
+                    },
+                ),
+                policy,
+            )
+        result = _await_result(coordinator)
+        assert result.pair is None
+        assert result.rejection_reason == "CLOCK_EPOCH_MISMATCH"
+    finally:
+        assert coordinator.close()
+
+
+def test_app_receive_pairing_ignores_ntp_value_and_clock_epoch() -> None:
+    coordinator = DetectionPairCoordinator()
+    try:
+        policy = PairingPolicy(
+            timestamp_basis="app_receive_monotonic",
+            max_delta_s=0.100,
+            allow_app_fallback=False,
+        )
+        coordinator.submit(
+            "left",
+            _detection(
+                "left",
+                10.000,
+                rtc_s=100.0,
+                timestamp_metadata={
+                    "clock_epoch_id": "epoch-left",
+                    "clock_epoch_state": "transition",
+                    "rtcp_frame_ntp_unix_s": 100.0,
+                },
+            ),
+            policy,
+        )
+        coordinator.submit(
+            "right",
+            _detection(
+                "right",
+                10.020,
+                rtc_s=32_500.0,
+                timestamp_metadata={
+                    "clock_epoch_id": "epoch-right",
+                    "clock_epoch_state": "current",
+                    "rtcp_frame_ntp_unix_s": 32_500.0,
+                },
+            ),
+            policy,
+        )
+
+        result = _await_result(coordinator)
+
+        assert result.pair is not None
+        assert result.pair.delta_s == pytest.approx(0.020)
+        assert result.uses_app_fallback is False
+    finally:
+        assert coordinator.close()
+
+
+def test_app_receive_pairing_hard_rejects_over_100ms_even_when_ntp_is_close() -> None:
+    coordinator = DetectionPairCoordinator()
+    try:
+        policy = PairingPolicy(
+            timestamp_basis="app_receive_monotonic",
+            max_delta_s=0.100,
+            allow_app_fallback=False,
+        )
+        coordinator.submit(
+            "left",
+            _detection("left", 20.0, rtc_s=1_000.000),
+            policy,
+        )
+        coordinator.submit(
+            "right",
+            _detection("right", 20.1001, rtc_s=1_000.001),
+            policy,
+        )
+
+        result = _await_result(coordinator)
+
+        assert result.pair is None
+        assert result.rejection_reason == "APP_RECEIVE_DELTA_EXCEEDED"
+    finally:
+        assert coordinator.close()
+
+
+@pytest.mark.parametrize("configured_limit_s", [0.100, 0.500, float("inf")])
+def test_app_receive_pairing_rejects_exact_100ms_plus_one_ns(
+    configured_limit_s: float,
+) -> None:
+    coordinator = DetectionPairCoordinator()
+    try:
+        policy = PairingPolicy(
+            timestamp_basis="app_receive_monotonic",
+            max_delta_s=configured_limit_s,
+        )
+        coordinator.submit(
+            "left",
+            _detection(
+                "left",
+                10.0,
+                timestamp_metadata={"app_receive_monotonic_ns": 10_000_000_000},
+            ),
+            policy,
+        )
+        coordinator.submit(
+            "right",
+            _detection(
+                "right",
+                10.100000001,
+                timestamp_metadata={"app_receive_monotonic_ns": 10_100_000_001},
+            ),
+            policy,
+        )
+
+        result = _await_result(coordinator)
+
+        assert result.pair is None
+        assert result.rejection_reason == "APP_RECEIVE_DELTA_EXCEEDED"
+    finally:
+        assert coordinator.close()
+
+
+def test_app_receive_pairing_accepts_exact_100ms_without_ntp() -> None:
+    coordinator = DetectionPairCoordinator()
+    try:
+        policy = PairingPolicy(
+            timestamp_basis="app_receive_monotonic",
+            max_delta_s=0.100,
+            allow_app_fallback=False,
+        )
+        coordinator.submit("left", _detection("left", 30.0), policy)
+        coordinator.submit("right", _detection("right", 30.1), policy)
+
+        result = _await_result(coordinator)
+
+        assert result.pair is not None
+        assert result.pair.delta_s == pytest.approx(0.100)
+    finally:
+        assert coordinator.close()
+
+
+def test_app_receive_pairing_rejects_invalid_exact_monotonic_timestamp() -> None:
+    coordinator = DetectionPairCoordinator()
+    try:
+        policy = PairingPolicy(
+            timestamp_basis="app_receive_monotonic",
+            max_delta_s=0.100,
+        )
+        coordinator.submit(
+            "left",
+            _detection(
+                "left",
+                40.0,
+                timestamp_metadata={"app_receive_monotonic_ns": -1},
+            ),
+            policy,
+        )
+        coordinator.submit("right", _detection("right", 40.01), policy)
+
+        result = _await_result(coordinator)
+
+        assert result.pair is None
+        assert result.rejection_reason == "APP_RECEIVE_TIMESTAMP_INVALID"
+    finally:
+        assert coordinator.close()
+
+
+@pytest.mark.parametrize("invalid_exact_ns", [True, 1.5, "1000000000"])
+def test_app_receive_pairing_rejects_noninteger_exact_timestamp(
+    invalid_exact_ns: object,
+) -> None:
+    coordinator = DetectionPairCoordinator()
+    try:
+        policy = PairingPolicy(
+            timestamp_basis="app_receive_monotonic",
+            max_delta_s=0.100,
+        )
+        coordinator.submit(
+            "left",
+            _detection(
+                "left",
+                1.0,
+                timestamp_metadata={"app_receive_monotonic_ns": invalid_exact_ns},
+            ),
+            policy,
+        )
+        coordinator.submit(
+            "right",
+            _detection(
+                "right",
+                1.02,
+                timestamp_metadata={"app_receive_monotonic_ns": 1_020_000_000},
+            ),
+            policy,
+        )
+
+        result = _await_result(coordinator)
+
+        assert result.pair is None
+        assert result.rejection_reason == "APP_RECEIVE_TIMESTAMP_INVALID"
+    finally:
+        assert coordinator.close()
+
+
+def test_workstation_live_pairing_policy_defaults_to_app_receive_and_caps_100ms() -> None:
+    from Workstation.measurement_view_controller import MeasurementViewController
+
+    panel = SimpleNamespace(
+        _yolo_pair_max_delta_s=lambda: float("inf"),
+        _yolo_vertical_max_delta_px=lambda: 25.0,
+    )
+    controller = MeasurementViewController(panel)
+
+    policy = controller._pairing_policy_snapshot()
+
+    assert policy.timestamp_basis == "app_receive_monotonic"
+    assert policy.max_delta_s == pytest.approx(0.100)
+    assert policy.max_vertical_delta_px == pytest.approx(25.0)
+    assert policy.allow_app_fallback is False
+
+
+def test_workstation_live_pairing_policy_uses_verified_rtcp_preference() -> None:
+    from Workstation.measurement_view_controller import MeasurementViewController
+
+    panel = SimpleNamespace(
+        yolo_gate_time_basis_combo=SimpleNamespace(currentData=lambda: "camera_rtcp"),
+        _yolo_pair_max_delta_s=lambda: 0.080,
+        _yolo_vertical_max_delta_px=lambda: 25.0,
+        _measurement_id="",
+        camera_sync_status="verified",
+        frame_timing_status="current",
+    )
+    controller = MeasurementViewController(panel)
+
+    policy = controller._pairing_policy_snapshot()
+
+    assert policy.timestamp_basis == "camera_rtcp"
+    assert policy.max_delta_s == pytest.approx(0.080)
+    assert policy.allow_app_fallback is True
+    assert policy.rtcp_clock_verified is True
+    assert policy.require_current_clock_epoch is True
+
+
+def test_running_measurement_keeps_frozen_request_until_next_measurement() -> None:
+    from Workstation.measurement_view_controller import MeasurementViewController
+
+    run_metadata: dict[str, object] = {}
+    panel = SimpleNamespace(
+        yolo_gate_time_basis_combo=SimpleNamespace(currentData=lambda: "camera_rtcp"),
+        _measurement_id="run-1",
+        _measurement_package=None,
+        _measurement_run_metadata=run_metadata,
+        _measurement_method_config_token=("run-1", id(run_metadata)),
+        _measurement_active_time_basis_requested="app_receive_monotonic",
+    )
+    controller = MeasurementViewController(panel)
+
+    assert controller.requested_time_basis() == "app_receive_monotonic"
+    panel._measurement_id = ""
+    assert controller.requested_time_basis() == "camera_rtcp"
+
+
+def test_freeze_consumes_coordinator_rtcp_decision_but_attitude_uses_app_time() -> None:
+    from Workstation.measurement_view_controller import MeasurementViewController
+    from Workstation.workstation_core.detection_pair_coordinator import PairTimingDecision
+
+    left = _detection(
+        "left",
+        10.000,
+        rtc_s=1_000.000,
+        timestamp_metadata={
+            "app_receive_monotonic_ns": 10_000_000_000,
+            "rtcp_frame_ntp_unix_s": 1_000.000,
+            "clock_epoch_id": "epoch-1",
+            "clock_epoch_state": "current",
+        },
+    )
+    right = _detection(
+        "right",
+        10.090,
+        rtc_s=1_000.010,
+        timestamp_metadata={
+            "app_receive_monotonic_ns": 10_090_000_000,
+            "rtcp_frame_ntp_unix_s": 1_000.010,
+            "clock_epoch_id": "epoch-1",
+            "clock_epoch_state": "current",
+        },
+    )
+    pair = SimpleNamespace(left=left, right=right)
+    timing = PairTimingDecision(
+        requested_basis="camera_rtcp",
+        effective_basis="camera_rtcp",
+        left_timestamp_s=1_000.000,
+        right_timestamp_s=1_000.010,
+        signed_delta_ns=10_000_000,
+        abs_delta_ns=10_000_000,
+    )
+    attitude_queries: dict[str, list[float]] = {"left": [], "right": []}
+
+    def attitude_buffer(side: str):
+        return SimpleNamespace(
+            nearest=lambda timestamp_s: (
+                attitude_queries[side].append(timestamp_s) or None
+            )
+        )
+
+    panel = SimpleNamespace(
+        _coordinated_pairing_result=SimpleNamespace(pair=pair, timing=timing),
+        _detection_pair_coordinator_active=True,
+        _last_frozen_measurement_pair=None,
+        _coordinated_detection_pair_reservation=None,
+        attitude_buffers={
+            "left": attitude_buffer("left"),
+            "right": attitude_buffer("right"),
+        },
+        _measurement_started_monotonic_s=None,
+        _measurement_attempt_counter=0,
+        _measurement_attempt_generation_id="generation-1",
+        _measurement_id="measurement-1",
+        _yolo_pair_max_delta_s=lambda: 0.100,
+    )
+    controller = MeasurementViewController(panel)
+    controller._cached_measurement_gps_states = lambda: (None, None, ())
+    controller._ftp_command_round_sync = lambda _pair: {}
+
+    frozen = controller._freeze_measurement_pair_inputs(pair)
+
+    assert frozen["requested_timestamp_basis"] == "camera_rtcp"
+    assert frozen["timestamp_basis"] == "camera_rtcp"
+    assert frozen["left_pairing_timestamp_s"] == pytest.approx(1_000.000)
+    assert frozen["right_pairing_timestamp_s"] == pytest.approx(1_000.010)
+    assert frozen["snapshot"].capture_sync["selected_pair_delta_ns"] == 10_000_000
+    assert frozen["snapshot"].capture_sync["app_receive_pair_delta_ns"] == 90_000_000
+    assert attitude_queries == {"left": [10.0], "right": [10.09]}
+
+
+def test_policy_revision_flushes_old_candidates_and_rejects_rollback() -> None:
+    coordinator = DetectionPairCoordinator()
+    try:
+        old = PairingPolicy(timestamp_basis="app_receive_monotonic", revision=1)
+        new = PairingPolicy(timestamp_basis="app_receive_monotonic", revision=2)
+        coordinator.submit("left", _detection("left", 1.0), old)
+        _await_result_where(
+            coordinator,
+            lambda result: result.rejection_reason == "missing_right_detection",
+        )
+
+        coordinator.submit("right", _detection("right", 1.01), new)
+        flushed = _await_result_where(
+            coordinator,
+            lambda result: result.rejection_reason == "missing_left_detection",
+        )
+        assert flushed.policy_revision == 2
+
+        coordinator.submit("left", _detection("left", 1.0, frame_id=99), old)
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and coordinator.metrics()["stale_policy_inputs"] < 1:
+            time.sleep(0.005)
+        assert coordinator.metrics()["stale_policy_inputs"] == 1
+
+        coordinator.submit("left", _detection("left", 1.0, frame_id=2), new)
+        paired = _await_result_where(coordinator, lambda result: result.pair is not None)
+        assert paired.policy_revision == 2
+        assert coordinator.metrics()["policy_revisions"] >= 2
+    finally:
+        assert coordinator.close()
+
+
+def test_wait_status_distinguishes_timing_fallback_failure_from_correspondence() -> None:
+    from Workstation.measurement_view_controller import MeasurementViewController
+
+    panel = SimpleNamespace(
+        _last_correspondence_rejection_reason="APP_RECEIVE_DELTA_EXCEEDED",
+        _coordinated_pairing_result=SimpleNamespace(
+            primary_rejection_reason="CLOCK_NOT_VERIFIED"
+        ),
+        detection_buffers={"left": [object()], "right": [object()]},
+        camera_stream_stats={"left": {}, "right": {}},
+        _yolo_time_delta_gate_enabled=lambda: True,
+        _yolo_time_basis=lambda: "camera_rtcp",
+    )
+    controller = MeasurementViewController(panel)
+
+    assert controller._detection_wait_status() == (
+        "거리: timing pair 대기 (APP_RECEIVE_DELTA_EXCEEDED)"
+    )
+    detail = controller._detection_wait_detail()
+    assert "timing" in detail
+    assert "preferred=CLOCK_NOT_VERIFIED" in detail
+    assert "correspondence" not in detail
 
 
 def test_new_stream_generation_evicts_old_camera_detections() -> None:

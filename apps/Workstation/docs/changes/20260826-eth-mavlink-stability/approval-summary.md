@@ -83,3 +83,16 @@ Workstation 수정은 공식 PX4/NuttX deadlock을 완화하고 빨리 발견할
 작업도 포함됩니다. 승인 당시 P1/P2는 ping에는 응답했지만 ETH MAVLink heartbeat가 없고
 USB 장치도 없어 실제 firmware를 재확인할 수 없었습니다. 구현은 version-agnostic하게
 진행하고, 실제 version/sysid/parameter 재확인은 hardware 시험 전 필수 gate로 남깁니다.
+
+## 2026-08-31 approved P1 IMU delivery amendment
+
+사용자는 P1 `SCALED_IMU/2/3`가 실시간으로 들어와 기존 Pixhawk IMU 표에 표시되는 결과를
+직접 요청했다. Workstation은 initial Stock profile command 전송 자체가 아니라 각 stream의
+실제 expected-sysid sample 수신을 성공 증거로 사용한다. 누락되거나 오래된 표준 IMU
+stream만 기존 side send-lock에서 제한적으로 재요청하고, sample이 도착하면 즉시 재시도를
+끝낸다. 전체 ETH RX stall에는 어떤 stream request도 보내지 않는다.
+
+기존 IMU 표는 fresh sample만 `LIVE`로 표시한다. sample이 한 번도 없으면 `WAITING`, 마지막
+sample이 오래되면 값을 보존한 채 `STALE`과 실제 age를 표시한다. 새 화면이나 자동 USB
+명령은 추가하지 않는다. verified USB runtime recovery/reboot는 계속 별도 operator 확인을
+요구하며 PX4 parameter/config/file/firmware는 변경하지 않는다.

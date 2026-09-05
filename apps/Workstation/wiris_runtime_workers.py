@@ -64,10 +64,10 @@ ENCODER_PROFILE_COMMAND_SETTLE_MS = 250
 ENCODER_PROFILE_READBACK_RETRY_INTERVAL_MS = 1000
 ENCODER_PROFILE_READBACK_MAX_ATTEMPTS = 30
 WIRIS_STUS_RTT_PROBE_COMMAND = "HIWS"
-WIRIS_STUS_RTT_PROBE_COUNT = 3
+WIRIS_STUS_RTT_PROBE_COUNT = 5
 WIRIS_STUS_MIN_VALID_RTT_PROBES = 2
 WIRIS_STUS_HIGH_RTT_WARNING_S = 0.250
-WIRIS_STUS_MAX_VALID_RTT_S = 2.000
+WIRIS_STUS_MAX_VALID_RTT_S = 3.900
 WIRIS_STUS_PARSE_MARGIN_S = 0.002
 WIRIS_STUS_MAX_ABSOLUTE_COMPENSATION_S = 2.000
 WIRIS_STUS_MAX_ATTEMPTS = 2
@@ -135,8 +135,9 @@ class WirisClockCommandWorker(QtCore.QObject):
     WIRIS's STUS command does not account for command transfer/parsing time.
     Every STUS round first requires bounded, exact-OK HIWS probes from all
     selected cameras.  The initial round uses the robust RTT median only as a
-    target seed.  A correction round uses fresh signed RTCP Sender Report
-    feedback while retaining HIWS as a no-mutation reachability preflight.
+    target seed.  A correction round uses fresh Left/Right differential RTCP
+    Sender Report feedback while retaining HIWS as a no-mutation reachability
+    preflight.  Absolute SR-PC remains diagnostic-only.
     """
 
     completed = QtCore.pyqtSignal(object)
@@ -317,6 +318,8 @@ class WirisClockCommandWorker(QtCore.QObject):
                     f"HIWS RTT {elapsed_s * 1000.0:.1f}ms is high but within "
                     f"{WIRIS_STUS_MAX_VALID_RTT_S * 1000.0:.0f}ms bound"
                 )
+            if len(samples) >= WIRIS_STUS_MIN_VALID_RTT_PROBES:
+                break
         probe["samples_s"] = samples
         if len(samples) >= WIRIS_STUS_MIN_VALID_RTT_PROBES:
             probe["median_s"] = median(samples)
@@ -370,8 +373,10 @@ class WirisClockCommandWorker(QtCore.QObject):
                         feedback_offset_s = self._normalized_explicit_stus_compensation_s(
                             self.stus_feedback_offset_by_camera.get(label)
                         )
-                        compensation_source = "rtcp-sr-closed-loop"
-                        probe["compensation_note"] = "closed-loop uses fresh RTCP SR feedback"
+                        compensation_source = "rtcp-relative-closed-loop"
+                        probe["compensation_note"] = (
+                            "closed-loop uses fresh Left/Right relative RTCP feedback"
+                        )
                     else:
                         rtt_median_s = probe.get("median_s")
                         valid_rtt_s = self._normalized_stus_rtt_s(rtt_median_s)
@@ -480,17 +485,52 @@ class WirisClockCommandWorker(QtCore.QObject):
                     self.target_infos,
                     key=lambda row: 0 if row[0] == "left" else 1 if row[0] == "right" else 2,
                 )
-                failed_preflight_labels: list[str] = []
-                for label, host, port, timeout_s in ordered_targets:
-                    self._raise_if_cancelled()
-                    probe = self._measure_control_rtt(
-                        host=host,
-                        port=port,
-                        timeout_s=timeout_s,
+                # HIWS is observation, not mutation. Measure both independent
+                # control channels concurrently, then retain deterministic
+                # Left-ACK-before-Right ordering for STUS itself.
+                probe_lock = threading.Lock()
+
+                def measure_target(
+                    label: str,
+                    host: str,
+                    port: int,
+                    timeout_s: float,
+                ) -> None:
+                    try:
+                        probe = self._measure_control_rtt(
+                            host=host,
+                            port=port,
+                            timeout_s=timeout_s,
+                        )
+                    except InterruptedError:
+                        return
+                    except Exception as exc:  # noqa: BLE001 - external probe boundary.
+                        probe = self._empty_rtt_probe_result()
+                        probe["errors"] = [f"HIWS probe failed: {exc}"]
+                    with probe_lock:
+                        rtt_probe_by_camera[label] = probe
+
+                probe_threads = [
+                    threading.Thread(
+                        target=measure_target,
+                        args=(label, host, port, timeout_s),
+                        name=f"wiris-stus-hiws-{label}",
                     )
-                    rtt_probe_by_camera[label] = probe
-                    if self._normalized_stus_rtt_s(probe.get("median_s")) is None:
-                        failed_preflight_labels.append(label)
+                    for label, host, port, timeout_s in ordered_targets
+                ]
+                for thread in probe_threads:
+                    thread.start()
+                for thread in probe_threads:
+                    thread.join()
+                self._raise_if_cancelled()
+                failed_preflight_labels = [
+                    label
+                    for label, _host, _port, _timeout_s in ordered_targets
+                    if self._normalized_stus_rtt_s(
+                        dict(rtt_probe_by_camera.get(label) or {}).get("median_s")
+                    )
+                    is None
+                ]
                 if failed_preflight_labels:
                     failure_text = ",".join(failed_preflight_labels)
                     for label, host, port, _timeout_s in ordered_targets:
@@ -615,7 +655,7 @@ class WirisClockCommandWorker(QtCore.QObject):
                     "requested_utc_by_camera": dict(command_times),
                     "stus_rtt_by_camera": rtt_probe_by_camera,
                     "compensation_method": (
-                        "rtcp-sr-closed-loop"
+                        "rtcp-relative-closed-loop"
                         if self.command_text == "STUS" and self.stus_compensation_by_camera
                         else "control-rtt-half-plus-parse-margin"
                         if self.command_text == "STUS"
@@ -626,6 +666,7 @@ class WirisClockCommandWorker(QtCore.QObject):
                     "operation_deadline_monotonic_s": self.operation_deadline_monotonic_s,
                     "stus_max_response_timeout_s": WIRIS_STUS_RESPONSE_TIMEOUT_S,
                     "stus_feedback_offset_by_camera": dict(self.stus_feedback_offset_by_camera),
+                    "stus_feedback_role": "left-right-relative-error",
                     "stus_parse_margin_s": WIRIS_STUS_PARSE_MARGIN_S
                     if self.command_text == "STUS"
                     else None,

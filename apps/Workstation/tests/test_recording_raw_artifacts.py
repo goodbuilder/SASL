@@ -835,3 +835,50 @@ def test_retryable_loader_accepts_legacy_spool_without_manifest(tmp_path: Path) 
             recovered.gnss_base_rows,
         ):
             spool.close()
+
+
+def test_v4_save_keeps_authoritative_app_delta_and_record_only_ntp_distinct(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "recordings" / "v4-app-time"
+    saved = save_session_files(
+        output,
+        metadata={"session_id": output.name},
+        pair_rows=[
+            {
+                "schema_version": "stereowiris-paired-frame-v4",
+                "pair_id": "pair-v4",
+                "pairing_time_basis": "app_receive_monotonic",
+                "pairing_time_basis_role": "authoritative_distance",
+                "left_app_receive_monotonic_ns": 1_000_000_000,
+                "right_app_receive_monotonic_ns": 1_020_000_000,
+                "app_receive_pair_delta_ns": 20_000_000,
+                "selected_pair_delta_ns": 20_000_000,
+                "selected_pair_abs_delta_ns": 20_000_000,
+                "sync_delta_ns": 20_000_000,
+                "left_rtcp_frame_ntp_unix_ns": 100_000_000_000,
+                "right_rtcp_frame_ntp_unix_ns": 32_500_000_000_000,
+                "rtcp_pair_delta_ns": 32_400_000_000_000,
+                "ntp_evidence_role": "record_only",
+                "measurement_valid": True,
+            }
+        ],
+    )
+
+    manifest = json.loads(saved.manifest.read_text(encoding="utf-8"))
+    raw_path = output / "data" / "raw" / "stereo_measurements.jsonl"
+    [raw] = [
+        json.loads(line)
+        for line in raw_path.read_text(encoding="utf-8").splitlines()
+    ]
+    table = pq.read_table(saved.measurement_pairs_parquet)
+
+    assert manifest["schema"] == "workstation-measurement-storage-v4"
+    assert manifest["schema_version"] == 4
+    assert raw["selected_pair_delta_ns"] == 20_000_000
+    assert raw["rtcp_pair_delta_ns"] == 32_400_000_000_000
+    assert raw["ntp_evidence_role"] == "record_only"
+    assert table.column("sync_delta_ns").to_pylist() == [20_000_000]
+    assert table.column("rtcp_pair_delta_ns").to_pylist() == [
+        32_400_000_000_000
+    ]

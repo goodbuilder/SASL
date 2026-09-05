@@ -248,3 +248,239 @@ Append accepted decisions chronologically. Supersede entries rather than deletin
 - Consequence: A clean deployment must explicitly provision Workstation and Legacy model artifacts.
   Custom Legacy model selections preserve their existing presence-only contract; the approved
   default is the hash-locked reproducible path.
+
+## 2026-08-27 — STUS clock truth is independent and may be scheduled during active work
+
+- Decision: Workstation exposes persistent Manual/Auto STUS scheduling. Auto requires one manual
+  VERIFIED seed per application run, then runs at the configured interval; default mode/interval are
+  Manual/30 minutes. Manual detects and records drift without sending a recovery command.
+- Decision: Neither manual nor scheduled STUS restarts the active CameraPane/YOLO/MP4 path, even
+  during Measurement or recording. A separate RTCP-only owner restarts only its own observation
+  session and supplies closed-loop/continuous clock evidence.
+- Decision: Clock, Frame timing and Media states remain separate. Logical clock epochs block only
+  time-dependent cross-boundary results; imagery, MP4 and timing-independent results continue.
+- Excluded: Legacy, firmware, encoder mutation/reboot and coordinate/calibration algorithms.
+
+## 2026-08-27 — SR-PC is diagnostic; Left/Right relative timing owns quality
+
+- Decision: Continue observing, displaying and persisting signed/raw per-camera SR-PC, but never use
+  its absolute magnitude as a success condition, failure/revocation gate, Auto trigger or result
+  blocker.
+- Decision: Clock convergence and continuous health use fresh/stable Left/Right relative RTCP
+  mapping with a 100 ms bound. Observation/preflight remains parallel; STUS mutation remains
+  ordered Left exact-OK then Right for deterministic failure isolation.
+- Decision: The Frame layer admits only same-clock-epoch pairs at or below 100 ms. Occasional
+  unmatched/outlier frames may be dropped and reported; acceptance does not require a pair for every
+  source frame. Sustained field evidence, not a single outlier or an average that hides long failures,
+  owns the long-run result.
+- Consequence: Closed-loop correction removes differential error around the current common mode;
+  common absolute offset is evidence only. Existing target-lead and operation-time safety bounds
+  remain.
+
+## 2026-08-27 — Proposed health-aware app-receive distance fallback (not approved)
+
+- Request: If oscillator drift later makes STUS/NTP relative timing untrustworthy, continue distance
+  measurement by pairing on same-host decoded-frame app-receive monotonic time while retaining NTP
+  in stored data.
+- Recommendation: preserve NTP as primary only while Clock is VERIFIED. After one manual seed is
+  later revoked or current evidence is unavailable, flush pair buffers and use app-receive timing
+  with a hard 100 ms bound. Continue rejecting active clock-epoch transitions and mixed epochs.
+- Recommendation: store the selected basis/delta, app monotonic values/delta, NTP values/delta,
+  Clock state/reason, basis generation and fallback reason as distinct fields. Never overwrite or
+  reinterpret historical rows.
+- Recommendation: keep the numerical distance but classify it `ESTIMATED/DEGRADED_TIMING`, because
+  app arrival contains RTSP/network/decode latency and is not exposure time.
+- Preserved: STUS/Auto behavior, camera/PX4 settings, imagery/recording ownership, geometry,
+  calibration, coordinates, Legacy and old data.
+- Open decision: whether fallback distance is visibly/persistently `ESTIMATED/DEGRADED_TIMING`
+  (recommended) or promoted to normal `VALID` despite the timing limitation.
+
+## 2026-08-27 — App-arrival fallback deferred; evaluate STUS cadence first
+
+- The user rejected the proposed degraded classification and stated that, if the fallback is later
+  implemented, app-receive time is the authoritative distance-pairing truth and its distance is
+  `VALID`. Provenance must still name it `app_receive_monotonic`; it is not relabelled as camera
+  exposure time.
+- Before approving or implementing that amendment, the user deferred it and asked to evaluate
+  whether a shorter Auto STUS interval can make STUS reliable.
+- Current evidence separates cadence from actuation: the confirmed 16.605 ppm relative rate adds
+  about 5/10/15/30 ms in 5/10/15/30 minutes, while the latest exact-OK STUS expanded phase from
+  about 140 ms to about 3.11 seconds. A shorter cadence cannot repair an unbounded single-cycle
+  result.
+- Safety decision: do not enable repeated Auto mutation until one complete manual STUS cycle is
+  independently repeatable. First close post-ACK SR collection, per-side observer recovery and
+  common-mode-recentered relative correction; then run bounded repeated manual and Auto gates.
+- Recommended evaluation order: five successful manual cycles; then a 5-minute six-cycle stress
+  test; then choose the operational interval from measured post-STUS residual plus the 16.6 ppm
+  drift. Do not interpret stress cadence as the recommended field default.
+
+## 2026-08-27 — App-receive monotonic is the sole live-distance time truth
+
+- User decision: supersede both NTP-required live distance and the proposed health-aware fallback.
+  Workstation live distance always selects Left/Right frames using app-receive monotonic time.
+- User decision: a selected app-receive pair at or below 100 ms is normal timing truth. Its distance
+  is `VALID` when all other method/geometry requirements pass; do not label it estimated or degraded
+  solely because NTP/STUS is unverified, failed, revoked or drifting.
+- NTP is record-only. Preserve every available frame NTP, raw SR identity/value, RTP mapping/rate,
+  signed NTP pair delta, Clock status/reason and logical clock epoch. None may influence pair
+  selection, pair validity, distance validity or method readiness.
+- STUS/NTP clock-epoch transitions do not interrupt app-timed distance pairing because host monotonic
+  does not change. Stream-generation, exact-frame identity, correspondence and app-delta gates remain.
+- Provenance constraint: `app_receive_monotonic` is the product's authoritative distance clock but
+  is not renamed or represented as physical camera exposure time.
+- Persistence consequence: new-row selected/compatibility sync delta means app receive; NTP remains
+  separately named. No historical row is migrated or reinterpreted.
+- Approval: the user explicitly approved this exact Workstation-only amendment at
+  `2026-08-27T14:31:06+09:00`.
+
+## 2026-08-27 — Indoor NAL1 60-minute experiment proposed, not yet approved
+
+- The user started a new goal to conduct one indoor 60-minute integrated experiment and supplied a
+  process-session SASL/NGII credential.
+- The default strict NAL5 contract remains approved product truth. A temporary, explicit process
+  flag is proposed only because the default correctly fails both zero-IDR cameras before the soak.
+- Candidate recovery is device-specific complete SPS/PPS-backed non-delta NAL1 plus exact decoded
+  PTS. It is never represented as IDR/keyframe and every later discontinuity relatches the side.
+- No re-encode, device setting, SDK loop, firmware, PX4 parameter or persistence migration is
+  proposed. Direct-copy MP4 remains integrity FAIL and STUS mutation remains outside this soak.
+- Source, real run and `./README.md` changes await explicit approval of the appended approval summary.
+
+## 2026-08-27 — NAL1 experiment approved and moved outdoors
+
+- The user's instruction to proceed outdoors approves the immediately preceding opt-in NAL1
+  source/UI/test/README and 5+60-minute execution scope.
+- Outdoor replaces only location. It adds real P1/P2 RTK Fixed/accuracy evidence; it does not relax
+  any camera, MP4, STUS, MAVLink, NTRIP, resource, cleanup or provenance criterion.
+- Process-local SASL/NGII credentials remain secret and non-persistent. No SDK/encoder or STUS
+  mutation is sent during the timed soak.
+- Approval recorded at `2026-08-27T19:40:48+09:00`.
+
+## 2026-08-27 — PX4 calibration PARAM readback is manual-only
+
+- Remove the automatic per-side `calibration_refresh` that ran when MAVLink first reached `LIVE`.
+- Preserve the explicit P1/P2 parameter refresh commands, advanced MAG/attitude refresh, and
+  readback after reset/apply/save.
+- Keep `PARAM SYNC`, exclusive receive ownership, heartbeat servicing, deferred replay, error
+  mapping, and post-command qualification behavior for an explicit operation.
+- Do not add a new setting or control. Before manual refresh the existing UI remains in
+  `PARAM readback 대기 중`; missing cache data is not a Measurement, RTCM, or telemetry gate.
+- Reason: the automatic snapshot serves diagnostics/evidence only, while it creates unsolicited
+  PARAM traffic and deliberately restarts ten-minute qualification after the first LIVE boundary.
+- User approval recorded at `2026-08-27T21:57:08+09:00`.
+
+## 2026-08-27 — Operational MAVLink qualification is 60 seconds
+
+- Supersede the former ten-minute product readiness timer with 60 continuous seconds of fresh
+  expected-system HEARTBEAT and ATTITUDE for initial, reconnect, reboot and recovery paths.
+- Keep ATTITUDE stale and all-RX stall thresholds unchanged and fail dependent measurement/RTCM/
+  commands closed immediately when they fire.
+- Keep explicit/manual PARAM command requalification. Reaching LIVE itself sends no PARAM request
+  because automatic readback was removed in the preceding approved amendment.
+- Preserve ten-minute comparison/cold-boot experiments and the final 60-minute soak as independent
+  stability evidence; `LIVE` after one minute is not a long-run certification claim.
+- Preserve UI geometry and render the health-owned required duration dynamically as `01:00`.
+- User approval: “그렇게 하자” after confirming automatic PARAM read removal.
+
+## 2026-08-28 — Mountain translation accepts 3D fix or better
+
+- User direction: remove the requirement that both Mountain baseline sides are `RTK_FIXED`.
+- Recommended hard replacement: same-frozen-burst P1/P2 samples with `fix_type >= 3`, finite
+  latitude/longitude/altitude and a finite non-zero NED baseline.
+- Recommended quality result: non-fixed usable GNSS keeps its exact labels/accuracy/age as warnings
+  and makes the Mountain method `ESTIMATED`; image-rotation rank/inlier/condition gates remain hard.
+- Confirmed current workflow: a solved Mountain Draft completed before Measurement start is frozen
+  automatically and evaluated into `method_evaluations.jsonl`; global Apply is not required for the
+  comparison outcome. `pixhawk_rtk_live` remains the fixed representative result.
+- User approval: “3D fix 이상이면 가능하게 해”. The replacement gate and
+  `ESTIMATED` classification were approved at `2026-08-28T00:17:37+09:00`.
+
+## 2026-08-28 — Proposed Mountain suggestion direct use (not yet approved)
+
+- User request: relax the `GOOD`-only `Use suggestion` gate and make that extra click unnecessary.
+- Baseline: Auto-select records an overlay; `Use suggestion` requires `eligible=true` and `GOOD`;
+  Solve reads only committed/manual annotations. Right-click exclusion is present in the UI payload
+  but the current backend acceptance path does not consume it, despite the tooltip promising that it
+  affects accepted solver input.
+- Recommendation: keep Solve explicit, but let it directly consume the latest current-frame,
+  structurally usable Mountain proposal when no manual points exist. Confidence becomes warning
+  evidence rather than permission; robust solve and all GNSS/K,D/prior gates remain hard.
+- Recommendation: keep `Use suggestion` as an optional copy/edit path and enable it for structurally
+  usable LOW_CONFIDENCE Mountain proposals. Manual points take precedence; partial manual input is
+  never silently overwritten or mixed. Apply exclusions symmetrically to Left/Right and persist them.
+- Excluded: immediate auto-copy, auto-Solve, auto-Apply, Horizon behavior, settings/schema migration,
+  worker/resource changes, device commands and representative-method changes.
+- Open decision: approve the recommended workflow and Workstation `./README.md` as the product-doc
+  target, or choose immediate auto-copy instead.
+
+## 2026-08-29 — Mountain LOW_CONFIDENCE optional copy approved; direct Solve remains excluded
+
+- User approval: remove the confidence/quality-state permission gate from Mountain `Use suggestion`
+  so a structurally usable `LOW_CONFIDENCE` proposal can be copied into the editable annotation
+  buffer.
+- Scope is the existing optional copy/edit action only. Direct consumption by
+  `Solve GNSS + Mountain R,t`, automatic copy, automatic Solve and automatic Apply remain outside
+  this approval.
+- Preserve Mountain structural gates: current frozen frame identity, equal paired points, at least
+  four finite in-frame unique/distributed pairs after shared exclusions, and owner-side validation.
+  Preserve the existing Horizon `GOOD`-only rule.
+- Confidence, state and failure reason remain visible and persisted quality evidence. They no longer
+  block the approved Mountain copy action when structural validation passes.
+- Workstation README target confirmation remains open before source implementation.
+
+## 2026-08-29 — Horizon automatic-suggestion quality gate removed
+
+- User approval: remove Horizon detector quality state and confidence from `Use suggestion`
+  permission while retaining the quality label, confidence, residual and reason as visible and
+  persisted evidence.
+- Preserve structural copy gates: current frozen Left/Right identity and dimensions, exactly two
+  finite in-frame endpoints per side, and endpoint separation of at least 25% of native image width.
+- Preserve explicit `Use suggestion -> Solve Horizon Roll/Pitch -> Apply candidate`; no automatic
+  copy, Solve or Apply is introduced. Horizon solver/apply geometry, K,D, observability and
+  persistence contracts remain unchanged.
+- Reuse the confirmed `apps/Workstation/README.md` target. No setting, worker, device operation,
+  schema migration or historical-row rewrite is included.
+
+## 2026-08-31 — Settings-preferred distance timing requested; fallback remains app receive
+
+- User request: restore an operator-selectable live-distance timing preference in Settings.
+- Default: new/migrated settings select exact decoded-frame `app_receive_monotonic`.
+- Failure behavior: a problem with the selected non-app source must not block distance timing; the
+  effective basis returns to app receive and retains the existing app-delta gate and provenance.
+- Preserve: RTCP/NTP/STUS observation, exact app timestamps, geometry, attitude/GNSS association,
+  coordinate contracts, existing rows and bounded pairing ownership.
+- Open decision: when RTCP/NTP is selected and healthy, does it actually own pair selection
+  (recommended, because the setting then has operational meaning), or does app receive remain the
+  only pairing truth and the setting control display/evidence only?
+- Compatibility handling for the former `camera_rtc_required` strict value remains to be included
+  in the approval summary after the visible outcome is decided. No source edit is authorized yet.
+
+## 2026-08-31 — Settings-preferred distance timing approved
+
+- `App receive` remains the missing/new/invalid default and always selects exact decoded-frame
+  app-receive monotonic time.
+- `RTCP/NTP preferred` has operational meaning: healthy VERIFIED/current, finite, same-epoch RTCP
+  evidence inside the configured pair limit actually selects the pair.
+- Every RTCP timing failure falls back to exact app-receive monotonic within the same configured
+  limit and 100 ms hard cap. Fallback provenance does not lower otherwise-valid geometry to
+  `ESTIMATED`.
+- A running Measurement freezes the requested preference. Apply/Save persists a new value for the
+  next Measurement; an idle preview may switch only after a policy-generation buffer flush.
+- Migrate historical `camera_rtc_required` to `camera_rtcp` preferred-with-fallback. Preserve old
+  rows and add requested/effective/fallback evidence for new rows.
+- Preserve PX4 attitude/GNSS association on host monotonic time, geometry/coordinate math, Clock
+  truth, bounded ownership and all device settings. The user approved the plan and source work.
+
+## 2026-09-01 — Mountain lever-arm `UNMODELED` removal requested; outcome open
+
+- User request: remove the Mountain result's lever-arm-driven `UNMODELED` state.
+- Verified baseline: missing correction already computes with a zero Left-camera-RDF metre vector;
+  it records `UNMODELED` and an explicit warning. A finite explicit correction records
+  `CALIBRATED`. No current GUI/persistent value supplies measured rig offsets.
+- Open outcome A: formalize the existing zero-offset hardware assumption, use a truthful explicit
+  assumed-zero provenance state, and remove the `UNMODELED` warning without changing geometry.
+- Open outcome B: add measured per-rig camera-optical-center/GNSS-antenna offsets and apply their
+  frame-aware baseline correction; this requires operator values and a larger settings workflow.
+- Recommendation: do not simply hide the condition. Choose A when zero/equal offset is the accepted
+  hardware contract; choose B when the request is to remove the physical ranging error.
+- No source, test, current product-document, device, setting, schema, or historical-row change is
+  authorized until the operator selects the observable outcome and approves the amendment.

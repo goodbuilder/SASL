@@ -26,10 +26,10 @@ from Workstation.workstation_core.yolo_stream import (
 DEFAULT_NATIVE_CALIBRATION_FRAME_MAX_AGE_S = 2.0
 MAX_GUI_PREVIEW_RATE_HZ = DEFAULT_PREVIEW_DISPLAY_RATE_HZ
 GUI_HEARTBEAT_INTERVAL_MS = 250
-CAMERA_STOP_COOPERATIVE_WAIT_MS = 12_000
+CAMERA_STOP_COOPERATIVE_WAIT_MS = 30_000
 CAMERA_STOP_POST_ESCALATION_WAIT_MS = 1_000
-CAMERA_STOP_TERMINATE_AFTER_S = 12.0
-CAMERA_STOP_KILL_AFTER_S = 20.0
+CAMERA_STOP_TERMINATE_AFTER_S = 30.0
+CAMERA_STOP_KILL_AFTER_S = 40.0
 
 
 def infer_camera_timestamp_reference(metadata: dict) -> str:
@@ -273,7 +273,10 @@ class CameraPane(QtWidgets.QGroupBox):
         # Finalization can arrive after stop() has invalidated the preview
         # generation and deleted its adapter.  Bind it directly to the pane and
         # key by the unique recording path instead of treating it as live UI.
-        self.worker.recording_finalized.connect(self._handle_recording_finalized)
+        self.worker.recording_finalized.connect(
+            self._handle_recording_finalized,
+            QtCore.Qt.DirectConnection,
+        )
         self.worker.status_changed.connect(
             adapter.status,
         )
@@ -462,6 +465,12 @@ class CameraPane(QtWidgets.QGroupBox):
             self._preview_submitted += 1
             if self._pending_preview is not None:
                 self._preview_replaced += 1
+                pending_metadata = self._pending_preview[2]
+                if (
+                    pending_metadata.get("h264_nal1_non_idr_intra") is True
+                    and frame_metadata.get("h264_nal1_non_idr_intra") is not True
+                ):
+                    return
             self._pending_preview = (generation, image, frame_metadata)
 
     @QtCore.pyqtSlot()
@@ -800,6 +809,37 @@ class CameraPane(QtWidgets.QGroupBox):
             return None
         return self._native_calibration_frame_for_key(
             key,
+            maximum_age_s=maximum_age_s,
+            now_monotonic_s=now_monotonic_s,
+        )
+
+    def calibration_native_frame_for_key(
+        self,
+        key: FrameKey,
+        *,
+        maximum_age_s: float = DEFAULT_NATIVE_CALIBRATION_FRAME_MAX_AGE_S,
+        now_monotonic_s: float | None = None,
+    ) -> tuple[str, QtGui.QImage, dict[str, object]] | None:
+        """Resolve one current-generation calibration frame by exact identity.
+
+        Auto capture must never replace an expired observation with a nearby
+        timestamp. The detection therefore supplies its immutable ``FrameKey``;
+        an evicted, wrong-side, or old-generation key fails closed.
+        """
+
+        if not isinstance(key, FrameKey):
+            return None
+        if key.camera_id != self.camera_label:
+            return None
+        if key.stream_generation != self.stream_generation:
+            return None
+        metadata = self.native_frame_descriptors.get(key.text)
+        if not isinstance(metadata, dict):
+            return None
+        if self._frame_key_from_metadata(metadata) != key:
+            return None
+        return self._native_calibration_frame_for_descriptor(
+            metadata,
             maximum_age_s=maximum_age_s,
             now_monotonic_s=now_monotonic_s,
         )

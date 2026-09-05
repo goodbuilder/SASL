@@ -28,7 +28,10 @@ from Workstation.calibration_workers import (
     CheckerboardExtrinsicsWorker,
     CheckerboardRandomValidationWorker,
 )
-from Workstation.calibration_sessions import write_calibration_session_manifest
+from Workstation.calibration_sessions import (
+    scan_calibration_capture_inventory,
+    write_calibration_session_manifest,
+)
 from Workstation.workstation_core.calibration import (
     CheckerboardConfig,
     StereoExtrinsics,
@@ -56,6 +59,7 @@ from Workstation.workstation_core.calibration_timing import (
     CAMERA_TIMESTAMP_VERIFIED,
     EXPOSURE_TIMESTAMP_VERIFIED,
     HOST_DISPATCH_PROXY,
+    HOST_RECEIVE_PROXY,
     UNKNOWN_TIMING_EVIDENCE,
     CalibrationTimingEvidence,
     load_calibration_pair_usage,
@@ -70,6 +74,7 @@ from Workstation.workstation_core.settings import (
     DEFAULT_CALIBRATION_ROOT,
     resolve_settings_path,
 )
+from Workstation.workstation_core.native_frame_ring import FrameKey
 from Workstation.wiris_runtime_workers import (
     WirisFtpBatchDeleteWorker,
     WirisImageFormatWorker,
@@ -81,6 +86,32 @@ from Workstation.wiris_runtime_workers import (
 CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S = 0.100
 CALIBRATION_AUTO_DETECTION_MAX_AGE_S = 2.0
 _USE_SELECTED_EXTRINSICS = object()
+
+
+def is_nal1_non_idr_auto_capture_metadata(metadata: object) -> bool:
+    if not isinstance(metadata, Mapping):
+        return False
+    nal_types = metadata.get("h264_access_unit_nal_types")
+    if not isinstance(nal_types, (list, tuple)):
+        return False
+    try:
+        normalized_nal_types = {int(value) for value in nal_types}
+        pts_ns = int(metadata["h264_access_unit_pts_ns"])
+        decoded_pts_ns = int(metadata["decoded_buffer_pts_ns"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    return bool(
+        metadata.get("h264_access_unit_kind") == "nal1_non_idr_intra"
+        and metadata.get("h264_nal1_non_idr_intra") is True
+        and metadata.get("h264_access_unit_is_delta") is False
+        and metadata.get("h264_random_access_guaranteed") is False
+        and pts_ns >= 0
+        and decoded_pts_ns == pts_ns
+        and 1 in normalized_nal_types
+        and 5 not in normalized_nal_types
+    )
+
+
 CALIBRATION_WORKFLOW_METHODS = [
     "_app_relative_path_text",
     "_checkerboard_validation_mode",
@@ -126,6 +157,7 @@ CALIBRATION_WORKFLOW_METHODS = [
     "_next_calibration_capture_stem",
     "_checkerboard_capture_pair_timing",
     "_checkerboard_capture_pair_timing_evidence",
+    "workstation_calibration_capture_snapshot",
     "capture_calibration_images",
     "toggle_auto_calibration_capture",
     "start_auto_calibration_capture",
@@ -197,6 +229,301 @@ class CalibrationWorkflowController:
         self._auto_capture_inflight_pair_key: tuple[int, int] | None = None
         self._auto_capture_last_attempt_s = 0.0
         self._capture_origin = "manual"
+        self._capture_feedback_root_text = ""
+        self._capture_feedback_run = self._empty_capture_feedback_run()
+        self._capture_feedback_last: dict[str, object] = {
+            "state": "IDLE",
+            "capture_id": "",
+            "origin": "",
+        }
+        self._capture_feedback_inventory_stamp: tuple[object, ...] | None = None
+        self._capture_feedback_inventory: dict[str, object] | None = None
+
+    @staticmethod
+    def _empty_capture_feedback_run() -> dict[str, int]:
+        return {
+            "inspection_request_count": 0,
+            "stereo_saved_count": 0,
+            "intrinsics_only_saved_count": 0,
+            "failed_count": 0,
+            "inflight_count": 0,
+        }
+
+    def _ensure_capture_feedback_state(self) -> None:
+        """Keep legacy/lightweight controller construction compatible."""
+
+        if not isinstance(getattr(self, "_capture_feedback_run", None), dict):
+            self._capture_feedback_run = self._empty_capture_feedback_run()
+        if not isinstance(getattr(self, "_capture_feedback_last", None), dict):
+            self._capture_feedback_last = {
+                "state": "IDLE",
+                "capture_id": "",
+                "origin": "",
+            }
+        if not hasattr(self, "_capture_feedback_root_text"):
+            self._capture_feedback_root_text = ""
+        if not hasattr(self, "_capture_feedback_inventory_stamp"):
+            self._capture_feedback_inventory_stamp = None
+        if not hasattr(self, "_capture_feedback_inventory"):
+            self._capture_feedback_inventory = None
+
+    @staticmethod
+    def _capture_feedback_root_id(root: Path) -> str:
+        if root.name == "AutoCapture" and root.parent.name == "calib_capture":
+            return f"{root.parent.parent.name}/AutoCapture"
+        return root.name or str(root)
+
+    def _capture_feedback_prepare_root(self, root: str | Path) -> Path:
+        self._ensure_capture_feedback_state()
+        resolved = Path(root).expanduser().resolve(strict=False)
+        root_text = str(resolved)
+        if root_text != self._capture_feedback_root_text:
+            self._capture_feedback_root_text = root_text
+            self._capture_feedback_run = self._empty_capture_feedback_run()
+            self._capture_feedback_inventory_stamp = None
+            self._capture_feedback_inventory = None
+            self._capture_feedback_last = {
+                "state": "IDLE",
+                "capture_id": "",
+                "origin": "",
+            }
+        return resolved
+
+    def _capture_feedback_reset_run(self, *, origin: str) -> None:
+        """Start a new visible run without changing persisted capture inventory."""
+
+        self._ensure_capture_feedback_state()
+        self._capture_feedback_run = self._empty_capture_feedback_run()
+        self._capture_feedback_last = {
+            "state": "WAITING",
+            "capture_id": "",
+            "origin": str(origin),
+        }
+
+    def _capture_feedback_begin(
+        self,
+        *,
+        root: str | Path,
+        capture_id: str,
+        origin: str,
+    ) -> None:
+        self._capture_feedback_prepare_root(root)
+        self._capture_feedback_run["inspection_request_count"] += 1
+        self._capture_feedback_run["inflight_count"] += 1
+        self._capture_feedback_last = {
+            "state": "INFLIGHT",
+            "capture_id": str(capture_id),
+            "origin": str(origin),
+        }
+
+    def _capture_feedback_complete(
+        self,
+        *,
+        capture_id: str,
+        origin: str,
+        saved_sides: tuple[str, ...],
+        stereo_pair_saved: bool,
+    ) -> None:
+        self._ensure_capture_feedback_state()
+        counted = self._capture_feedback_run["inflight_count"] > 0
+        if counted:
+            self._capture_feedback_run["inflight_count"] -= 1
+            if stereo_pair_saved:
+                self._capture_feedback_run["stereo_saved_count"] += 1
+                state = "STEREO_SAVED"
+            elif saved_sides:
+                self._capture_feedback_run["intrinsics_only_saved_count"] += 1
+                state = "INTRINSICS_ONLY_SAVED"
+            else:
+                self._capture_feedback_run["failed_count"] += 1
+                state = "FAILED"
+        else:
+            state = "LATE_RESULT"
+        self._capture_feedback_last = {
+            "state": state,
+            "capture_id": str(capture_id),
+            "origin": str(origin),
+        }
+        self._capture_feedback_inventory_stamp = None
+
+    def _capture_feedback_failed(self, *, origin: str) -> None:
+        self._ensure_capture_feedback_state()
+        counted = self._capture_feedback_run["inflight_count"] > 0
+        if counted:
+            self._capture_feedback_run["inflight_count"] -= 1
+            self._capture_feedback_run["failed_count"] += 1
+        self._capture_feedback_last = {
+            "state": "FAILED" if counted else "LATE_FAILURE",
+            "capture_id": str(self._capture_feedback_last.get("capture_id") or ""),
+            "origin": str(origin),
+        }
+        self._capture_feedback_inventory_stamp = None
+
+    @staticmethod
+    def _capture_inventory_stamp(root: Path) -> tuple[object, ...]:
+        stamp: list[object] = [str(root)]
+        for path in (root, root / "left", root / "right", root / "capture_metadata"):
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                stamp.append((str(path), "missing"))
+            except OSError as exc:
+                stamp.append((str(path), "error", type(exc).__name__, str(exc)))
+            else:
+                stamp.append(
+                    (
+                        str(path),
+                        "dir" if path.is_dir() else "file",
+                        int(stat.st_mtime_ns),
+                        int(stat.st_size),
+                    )
+                )
+        return tuple(stamp)
+
+    def _capture_feedback_inventory_for(self, root: Path) -> dict[str, object]:
+        stamp = self._capture_inventory_stamp(root)
+        if (
+            self._capture_feedback_inventory is None
+            or self._capture_feedback_inventory_stamp != stamp
+        ):
+            self._capture_feedback_inventory = scan_calibration_capture_inventory(
+                root
+            ).to_mapping()
+            self._capture_feedback_inventory_stamp = stamp
+        return dict(self._capture_feedback_inventory)
+
+    def _capture_feedback_detection(self, side: str, now_s: float) -> dict[str, object]:
+        detections = getattr(self.panel, "calibration_preview_detection_results", {})
+        row = detections.get(side) if isinstance(detections, dict) else None
+        if not isinstance(row, dict):
+            preview_images = getattr(self.panel, "latest_calibration_preview_images", {})
+            has_frame = isinstance(preview_images, dict) and preview_images.get(side) is not None
+            return {
+                "state": "DETECTING" if has_frame else "NO_FRAME",
+                "found": None,
+                "corner_count": None,
+                "age_s": None,
+                "request_id": None,
+                "detail": (
+                    "checkerboard detection pending"
+                    if has_frame
+                    else "calibration preview frame unavailable"
+                ),
+            }
+
+        metadata = row.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        age_s: float | None = None
+        try:
+            candidate_age_s = now_s - float(metadata.get("timestamp_s"))
+        except (TypeError, ValueError, OverflowError):
+            pass
+        else:
+            if math.isfinite(candidate_age_s):
+                age_s = candidate_age_s
+        status = str(row.get("status") or "checkerboard: not found")
+        status_lower = status.lower()
+        if "opencv unavailable" in status_lower or "invalid pattern" in status_lower:
+            state = "UNAVAILABLE"
+        elif "missing frame" in status_lower:
+            state = "NO_FRAME"
+        elif age_s is not None and (
+            age_s < 0.0 or age_s > CALIBRATION_AUTO_DETECTION_MAX_AGE_S
+        ):
+            state = "STALE"
+        elif bool(row.get("found")):
+            state = "FOUND"
+        else:
+            state = "NOT_FOUND"
+        corners = row.get("corners")
+        corner_count = len(corners) if isinstance(corners, (list, tuple)) else None
+        return {
+            "state": state,
+            "found": bool(row.get("found")),
+            "corner_count": corner_count,
+            "age_s": age_s,
+            "request_id": row.get("request_id"),
+            "detail": status,
+        }
+
+    def workstation_calibration_capture_snapshot(self) -> dict[str, object]:
+        """Return source-backed live and persisted capture feedback."""
+
+        self._ensure_capture_feedback_state()
+        root_error = ""
+        root: Path | None = None
+        root_reader = getattr(self.panel, "_calibration_dirs", None)
+        if callable(root_reader):
+            try:
+                directories = root_reader()
+                root = Path(directories[0])
+            except (OSError, TypeError, ValueError, IndexError) as exc:
+                root_error = str(exc)
+        if root is None:
+            session_root = getattr(self.panel, "_calibration_session_root", None)
+            if session_root is not None:
+                root = Path(session_root)
+        if root is not None:
+            root = self._capture_feedback_prepare_root(root)
+            capture_set = self._capture_feedback_inventory_for(root)
+            capture_set_id = self._capture_feedback_root_id(root)
+        else:
+            capture_set = {
+                "root": "",
+                "state": "UNAVAILABLE",
+                "left_image_count": None,
+                "right_image_count": None,
+                "stereo_candidate_count": None,
+                "left_intrinsics_only_count": None,
+                "right_intrinsics_only_count": None,
+                "legacy_unverified_pair_count": None,
+                "invalid_metadata_pair_count": None,
+                "evidence_warning_pair_count": None,
+                "error": root_error or "calibration capture root unavailable",
+            }
+            capture_set_id = ""
+
+        minimum_widget = getattr(self.panel, "calib_min_images_spin", None)
+        minimum_reader = getattr(minimum_widget, "value", None)
+        try:
+            minimum_images = int(minimum_reader()) if callable(minimum_reader) else int(
+                getattr(getattr(self.panel, "settings", None), "calibration_min_images", 20)
+            )
+        except (TypeError, ValueError, OverflowError):
+            minimum_images = 20
+        status_widget = getattr(self.panel, "calibration_status_label", None)
+        status_reader = getattr(status_widget, "text", None)
+        last = dict(self._capture_feedback_last)
+        last["message"] = (
+            str(status_reader()).strip()
+            if callable(status_reader)
+            else ""
+        )
+        now_s = time.monotonic()
+        return {
+            "schema": "workstation-calibration-capture-status-v1",
+            "capture_root": "" if root is None else str(root),
+            "capture_set_id": capture_set_id,
+            "auto_capture_active": bool(
+                getattr(self, "_auto_capture_active", False)
+            ),
+            "detection": {
+                side: self._capture_feedback_detection(side, now_s)
+                for side in ("left", "right")
+            },
+            "run": dict(self._capture_feedback_run),
+            "capture_set": capture_set,
+            "minimum_images_per_side": max(3, minimum_images),
+            "last": last,
+            "source": (
+                "checkerboard preview result + calibration controller lifecycle + "
+                "persisted capture files/metadata"
+            ),
+            "frame_contract": (
+                "checkerboard corners are OpenCV image pixels (u right, v down); "
+                "no NED/FRD or calibration-matrix conversion"
+            ),
+        }
 
     def _publish_calibration_capture_event(
         self,
@@ -1852,15 +2179,28 @@ class CalibrationWorkflowController:
             square_size_m=self.panel.calib_square_spin.value() / 1000.0,
         )
 
-    def _calibration_dirs(self) -> tuple[Path, Path, Path]:
+    def _default_calibration_root(self) -> Path:
+        configured = getattr(self.panel, "default_calibration_root", None)
+        if configured is None:
+            configured = resolve_settings_path(
+                DEFAULT_CALIBRATION_ROOT,
+                base_dir=self.panel.app_root,
+            )
+        return Path(configured).expanduser().resolve(strict=False)
+
+    def _configured_calibration_root(self) -> Path:
         text = self.panel.calib_dir_edit.text().strip()
-        configured_root = (
-            resolve_settings_path(text, base_dir=self.panel.app_root)
-            if text
-            else resolve_settings_path(DEFAULT_CALIBRATION_ROOT, base_dir=self.panel.app_root)
-        )
+        if not text or text == DEFAULT_CALIBRATION_ROOT:
+            return self._default_calibration_root()
+        return resolve_settings_path(
+            text,
+            base_dir=self.panel.app_root,
+        ).expanduser().resolve(strict=False)
+
+    def _calibration_dirs(self) -> tuple[Path, Path, Path]:
+        configured_root = self._configured_calibration_root()
         session_root = getattr(self.panel, "_calibration_session_root", None)
-        default_root = resolve_settings_path(DEFAULT_CALIBRATION_ROOT, base_dir=self.panel.app_root)
+        default_root = self._default_calibration_root()
         if session_root is not None and (
             configured_root == default_root
             or bool(getattr(self.panel, "_measurement_session_hierarchy_enabled", False))
@@ -1887,12 +2227,7 @@ class CalibrationWorkflowController:
 
         if not hasattr(self.panel, "calib_dir_edit") or not hasattr(self.panel, "app_root"):
             return None
-        text = self.panel.calib_dir_edit.text().strip()
-        configured_root = (
-            resolve_settings_path(text, base_dir=self.panel.app_root)
-            if text
-            else resolve_settings_path(DEFAULT_CALIBRATION_ROOT, base_dir=self.panel.app_root)
-        )
+        configured_root = self._configured_calibration_root()
         hierarchy_enabled = bool(
             getattr(self.panel, "_measurement_session_hierarchy_enabled", False)
         )
@@ -1927,7 +2262,7 @@ class CalibrationWorkflowController:
                 )
                 return configured_root
         else:
-            default_root = resolve_settings_path(DEFAULT_CALIBRATION_ROOT, base_dir=self.panel.app_root)
+            default_root = self._default_calibration_root()
             if configured_root != default_root:
                 return None
             session_base = default_root
@@ -2100,6 +2435,45 @@ class CalibrationWorkflowController:
             compatibility_detail,
         )
 
+    @staticmethod
+    def _app_receive_monotonic_ns_from_metadata(
+        metadata: Mapping[str, object],
+    ) -> tuple[int | None, str]:
+        """Return one decoded-frame host receipt stamp and its field source.
+
+        Normal camera metadata carries the exact integer field.  Native-ring
+        descriptors also guarantee that ``timestamp_s`` is the producer's
+        app-receive monotonic clock, so it remains a bounded compatibility
+        source when preview throttling omitted the redundant integer field.
+        """
+
+        exact = metadata.get("app_receive_monotonic_ns")
+        if exact is not None:
+            if isinstance(exact, bool):
+                return None, ""
+            try:
+                if isinstance(exact, float) and (
+                    not math.isfinite(exact) or not exact.is_integer()
+                ):
+                    raise ValueError
+                exact_ns = int(exact)
+            except (TypeError, ValueError, OverflowError):
+                return None, ""
+            if exact_ns <= 0:
+                return None, ""
+            return exact_ns, "app_receive_monotonic_ns"
+
+        compatibility = metadata.get("timestamp_s")
+        if compatibility is None or isinstance(compatibility, bool):
+            return None, ""
+        try:
+            compatibility_s = float(compatibility)
+        except (TypeError, ValueError, OverflowError):
+            return None, ""
+        if not math.isfinite(compatibility_s) or compatibility_s <= 0.0:
+            return None, ""
+        return int(round(compatibility_s * 1_000_000_000.0)), "timestamp_s"
+
     def _checkerboard_capture_pair_timing_evidence(
         self,
         metadata_by_camera: dict[str, dict[str, object]] | None = None,
@@ -2235,54 +2609,56 @@ class CalibrationWorkflowController:
                 "FTP still lacks per-camera CPTR dispatch timestamps",
             )
 
-        left_timestamp = self.panel._camera_rtc_timestamp_s_from_metadata(left_metadata)
-        right_timestamp = self.panel._camera_rtc_timestamp_s_from_metadata(right_metadata)
-        if left_timestamp is None or right_timestamp is None:
+        left_receive_ns, left_receive_source = (
+            self._app_receive_monotonic_ns_from_metadata(left_metadata)
+        )
+        right_receive_ns, right_receive_source = (
+            self._app_receive_monotonic_ns_from_metadata(right_metadata)
+        )
+        if left_receive_ns is None or right_receive_ns is None:
             return CalibrationTimingEvidence(
                 UNKNOWN_TIMING_EVIDENCE,
                 False,
                 False,
                 False,
-                "rtcp-ntp",
+                "app-receive-monotonic",
                 None,
                 limit_s,
-                "missing RTCP/NTP camera timestamp for left or right frame",
+                "missing decoded-frame app-receive monotonic timestamp for left or right frame",
             )
-        try:
-            left_value = float(left_timestamp)
-            right_value = float(right_timestamp)
-        except (TypeError, ValueError, OverflowError):
-            return CalibrationTimingEvidence(
-                UNKNOWN_TIMING_EVIDENCE, False, False, False,
-                "rtcp-ntp", None, limit_s, "invalid RTCP/NTP camera timestamp",
+        delta_ns = right_receive_ns - left_receive_ns
+        delta_s = delta_ns * 1.0e-9
+        source_detail = (
+            "exact integer metadata"
+            if left_receive_source == right_receive_source == "app_receive_monotonic_ns"
+            else (
+                "native-frame timestamp_s compatibility"
+                if left_receive_source == right_receive_source == "timestamp_s"
+                else "mixed exact/compatibility app-receive metadata"
             )
-        if not math.isfinite(left_value) or not math.isfinite(right_value):
-            return CalibrationTimingEvidence(
-                UNKNOWN_TIMING_EVIDENCE, False, False, False,
-                "rtcp-ntp", None, limit_s, "non-finite RTCP/NTP camera timestamp",
-            )
-        delta_s = right_value - left_value
+        )
         if abs(delta_s) > limit_s:
             return CalibrationTimingEvidence(
-                CAMERA_TIMESTAMP_VERIFIED,
+                HOST_RECEIVE_PROXY,
                 False,
                 False,
                 False,
-                "rtcp-ntp",
+                "app-receive-monotonic",
                 delta_s,
                 limit_s,
-                f"RTCP/NTP pair delta {delta_s * 1000.0:.1f} ms exceeds "
-                f"{limit_s * 1000.0:.1f} ms",
+                f"decoded-frame app-receive pair delta {delta_s * 1000.0:.1f} ms exceeds "
+                f"{limit_s * 1000.0:.1f} ms ({source_detail}); camera exposure remains unverified",
             )
         return CalibrationTimingEvidence(
-            CAMERA_TIMESTAMP_VERIFIED,
-            True,
+            HOST_RECEIVE_PROXY,
             True,
             False,
-            "rtcp-ntp",
+            False,
+            "app-receive-monotonic",
             delta_s,
             limit_s,
-            "ok",
+            f"decoded-frame app-receive delta within gate ({source_detail}); "
+            "camera exposure remains unverified",
         )
 
     def capture_calibration_images(
@@ -2368,6 +2744,23 @@ class CalibrationWorkflowController:
         pair_time_basis = timing_evidence.timestamp_reference
         pair_delta_s = timing_evidence.pair_delta_s
         pair_timing_detail = timing_evidence.detail
+        app_receive_samples = {
+            side: (
+                self._app_receive_monotonic_ns_from_metadata(
+                    metadata_by_camera.get(side) or {}
+                )
+                if frames.get(side) is not None
+                else (None, "")
+            )
+            for side in ("left", "right")
+        }
+        left_app_receive_ns = app_receive_samples["left"][0]
+        right_app_receive_ns = app_receive_samples["right"][0]
+        app_receive_pair_delta_ns = (
+            right_app_receive_ns - left_app_receive_ns
+            if left_app_receive_ns is not None and right_app_receive_ns is not None
+            else None
+        )
         zoom_snapshot = self._capture_zoom_snapshot()
         self.panel.last_capture_zoom_level = zoom_snapshot.get("capture_zoom_level")
         metadata_payload = {
@@ -2375,6 +2768,11 @@ class CalibrationWorkflowController:
             "capture_recorded_unix_ns": time.time_ns(),
             "pair_time_basis": pair_time_basis,
             "pair_delta_s": pair_delta_s,
+            "pair_delta_ns": (
+                app_receive_pair_delta_ns
+                if pair_time_basis == "app-receive-monotonic"
+                else None
+            ),
             "pair_max_delta_s": pair_max_delta_s,
             "pair_timing_status": pair_timing_detail,
             "calibration_timing_evidence": timing_evidence.to_mapping(),
@@ -2382,17 +2780,49 @@ class CalibrationWorkflowController:
             "pair_persistence_allowed": timing_evidence.pair_persistence_allowed,
             "precision_timing_qualified": timing_evidence.precision_qualified,
             "actual_exposure_verified": timing_evidence.actual_exposure_verified,
+            "left_app_receive_monotonic_ns": left_app_receive_ns,
+            "right_app_receive_monotonic_ns": right_app_receive_ns,
+            "app_receive_pair_delta_ns": app_receive_pair_delta_ns,
             "left_rtcp_frame_ntp_unix_s": (metadata_by_camera.get("left") or {}).get("rtcp_frame_ntp_unix_s"),
             "right_rtcp_frame_ntp_unix_s": (metadata_by_camera.get("right") or {}).get("rtcp_frame_ntp_unix_s"),
             "frame_contract": (
                 "OpenCV source image pixels (x right, y down); no application resize/crop/overlay; "
                 "native/preview/saved grids are explicit per side; "
-                f"stereo pairing gate uses {pair_time_basis}; FTP CPTR dispatch is a host-side "
-                "pairing proxy and never an exposure timestamp"
+                f"stereo pairing gate uses {pair_time_basis}; decoded-frame app receipt and "
+                "FTP CPTR dispatch are host-side pairing proxies and never exposure timestamps"
             ),
             "frame_grid_by_side": {
                 side: {
                     "frame_id": str((metadata_by_camera.get(side) or {}).get("frame_id") or ""),
+                    "frame_key": str(
+                        (metadata_by_camera.get(side) or {}).get("frame_key") or ""
+                    ),
+                    "h264_access_unit_kind": (
+                        metadata_by_camera.get(side) or {}
+                    ).get("h264_access_unit_kind"),
+                    "h264_access_unit_nal_types": list(
+                        (metadata_by_camera.get(side) or {}).get(
+                            "h264_access_unit_nal_types", ()
+                        )
+                        or ()
+                    ),
+                    "h264_access_unit_is_delta": (
+                        metadata_by_camera.get(side) or {}
+                    ).get("h264_access_unit_is_delta"),
+                    "h264_access_unit_pts_ns": (
+                        metadata_by_camera.get(side) or {}
+                    ).get("h264_access_unit_pts_ns"),
+                    "decoded_buffer_pts_ns": (
+                        metadata_by_camera.get(side) or {}
+                    ).get("decoded_buffer_pts_ns"),
+                    "h264_nal1_non_idr_intra": (
+                        metadata_by_camera.get(side) or {}
+                    ).get("h264_nal1_non_idr_intra"),
+                    "h264_random_access_guaranteed": (
+                        metadata_by_camera.get(side) or {}
+                    ).get("h264_random_access_guaranteed"),
+                    "app_receive_monotonic_ns": app_receive_samples[side][0],
+                    "app_receive_timestamp_source": app_receive_samples[side][1],
                     "source_native_width": int(
                         (metadata_by_camera.get(side) or {}).get("native_width")
                         or (frames.get(side).width() if frames.get(side) is not None else 0)
@@ -2481,6 +2911,11 @@ class CalibrationWorkflowController:
         self.panel.run_calibration_button.setEnabled(False)
         self.panel.checkerboard_validation_random_button.setEnabled(False)
         self.panel.calibration_status_label.setText(f"Capture Live Pair {stem}: encoding and checkerboard validation running")
+        self._capture_feedback_begin(
+            root=root,
+            capture_id=stem,
+            origin=str(capture_origin),
+        )
         thread.start()
         return True
 
@@ -3749,6 +4184,7 @@ class CalibrationWorkflowController:
             self.panel.calibration_status_label.setText("A calibration operation is already running.")
             return False
         interval_s = float(self.panel.calibration_auto_interval_spin.value())
+        self._capture_feedback_reset_run(origin="auto")
         self._auto_capture_active = True
         self._auto_capture_saved_pairs = 0
         self._auto_capture_last_pair_key = None
@@ -3819,18 +4255,33 @@ class CalibrationWorkflowController:
             "left": dict(left.get("metadata") or {}) if isinstance(left.get("metadata"), dict) else {},
             "right": dict(right.get("metadata") or {}) if isinstance(right.get("metadata"), dict) else {},
         }
+        allow_preview_fallback = bool(
+            getattr(self.panel, "_allow_legacy_calibration_preview_fallback", False)
+        )
+        if not allow_preview_fallback:
+            missing_nal1_sides = [
+                side
+                for side in ("left", "right")
+                if not is_nal1_non_idr_auto_capture_metadata(
+                    preview_metadata[side]
+                )
+            ]
+            if missing_nal1_sides:
+                self.panel.calibration_status_label.setText(
+                    "자동 촬영 대기: "
+                    + ", ".join(missing_nal1_sides)
+                    + " NAL1 non-delta frame을 기다리는 중"
+                )
+                return
         native_boundary_available = all(
             callable(
                 getattr(
                     getattr(self.panel, f"{side}_pane", None),
-                    "calibration_native_frame_near",
+                    "calibration_native_frame_for_key",
                     None,
                 )
             )
             for side in ("left", "right")
-        )
-        allow_preview_fallback = bool(
-            getattr(self.panel, "_allow_legacy_calibration_preview_fallback", False)
         )
         corners_available = all(bool(row.get("corners")) for row in (left, right))
         try:
@@ -3880,41 +4331,46 @@ class CalibrationWorkflowController:
         native_frames: dict[str, QtGui.QImage] = {}
         metadata_by_camera: dict[str, dict[str, object]] = {}
         for side in ("left", "right"):
-            timestamp_value = preview_metadata[side].get("timestamp_s")
-            try:
-                timestamp_s = float(timestamp_value)
-            except (TypeError, ValueError):
-                self.panel.calibration_status_label.setText(
-                    f"자동 촬영 대기: {side} preview timestamp가 없습니다"
-                )
-                return
             pane = getattr(self.panel, f"{side}_pane", None)
-            native_getter = getattr(pane, "calibration_native_frame_near", None)
+            native_getter = getattr(pane, "calibration_native_frame_for_key", None)
             if not callable(native_getter):
                 if not allow_preview_fallback:
                     self.panel.calibration_status_label.setText(
-                        f"자동 촬영 대기: {side} native lossless frame API가 없습니다"
+                        f"자동 촬영 대기: {side} exact FrameKey API가 없습니다"
                     )
                     return
                 preview_image = left_image if side == "left" else right_image
                 native_frames[side] = preview_image
                 metadata_by_camera[side] = dict(preview_metadata[side])
                 continue
-            native = (
-                native_getter(
-                    timestamp_s,
-                    maximum_delta_s=0.001,
-                    maximum_age_s=CALIBRATION_AUTO_DETECTION_MAX_AGE_S,
+            try:
+                frame_key = FrameKey.from_mapping(preview_metadata[side])
+            except (TypeError, ValueError):
+                self.panel.calibration_status_label.setText(
+                    f"자동 촬영 대기: {side} exact FrameKey가 없습니다"
                 )
-                if callable(native_getter)
-                else None
+                return
+            native = native_getter(
+                frame_key,
+                maximum_age_s=CALIBRATION_AUTO_DETECTION_MAX_AGE_S,
             )
             if native is None:
                 self.panel.calibration_status_label.setText(
-                    f"자동 촬영 대기: {side} preview와 동일한 native frame을 기다리는 중"
+                    f"자동 촬영 대기: {side} exact native FrameKey가 만료되어 새 NAL1 frame을 기다리는 중"
                 )
                 return
             frame_id, native_image, native_metadata = native
+            if (
+                str(frame_id) != frame_key.text
+                or str(native_metadata.get("frame_key") or "") != frame_key.text
+                or not is_nal1_non_idr_auto_capture_metadata(native_metadata)
+                or int(native_metadata["h264_access_unit_pts_ns"])
+                != int(preview_metadata[side]["h264_access_unit_pts_ns"])
+            ):
+                self.panel.calibration_status_label.setText(
+                    f"자동 촬영 대기: {side} NAL1/FrameKey provenance가 일치하지 않습니다"
+                )
+                return
             native_frames[side] = native_image
             metadata_by_camera[side] = {
                 **dict(native_metadata),
@@ -4003,6 +4459,12 @@ class CalibrationWorkflowController:
                         capture_id=stem,
                     )
         if not saved_sides:
+            self._capture_feedback_complete(
+                capture_id=stem,
+                origin=capture_origin,
+                saved_sides=(),
+                stereo_pair_saved=False,
+            )
             status = f"Capture {stem}: no calibration images saved; " + ", ".join(status_parts)
             if capture_origin == "auto" and self._auto_capture_active:
                 status = f"자동 촬영 대기: Capture {stem} 실패; 다음 새 검출 pair를 기다리는 중"
@@ -4034,12 +4496,18 @@ class CalibrationWorkflowController:
             )
             or ()
         )
+        self._capture_feedback_complete(
+            capture_id=stem,
+            origin=capture_origin,
+            saved_sides=saved_sides,
+            stereo_pair_saved=pair_saved,
+        )
         if (
             pair_saved
             and isinstance(pair_delta_s, (int, float))
         ):
             status += (
-                f"; pair_time_basis={result.get('pair_time_basis', 'rtcp-ntp')}, "
+                f"; pair_time_basis={result.get('pair_time_basis', 'unknown')}, "
                 f"pair_delta_s={float(pair_delta_s):.6f}"
             )
         elif intrinsics_only_sides:
@@ -4101,6 +4569,7 @@ class CalibrationWorkflowController:
 
     def _handle_checkerboard_capture_failed(self, error: str) -> None:
         capture_origin = self._capture_origin
+        self._capture_feedback_failed(origin=capture_origin)
         source_label = {
             "ftp": "FTP HR",
             "ftp_oz": "FTP OZ",

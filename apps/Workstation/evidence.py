@@ -17,11 +17,29 @@ import math
 from pathlib import Path
 from typing import Any, Mapping
 
-from Workstation.workstation_core.attitude_geometry import relative_attitude
+from Workstation.workstation_core.attitude_geometry import (
+    relative_attitude,
+    world_ned_vector_to_body_frd,
+)
 from Workstation.workstation_core.calibration import independent_zoom_selection_mode
+from Workstation.workstation_core.drone_pixhawk_geometry import (
+    calculate_horizontal_triangle_angles,
+    subtract_vectors,
+    vector_range_m,
+)
+from Workstation.workstation_core.gnss_baseline_center import (
+    DEFAULT_MAXIMUM_GNSS_AGE_S,
+    DEFAULT_MAXIMUM_GNSS_TIMESTAMP_SPREAD_S,
+    estimate_gnss_baseline_center_frd,
+)
 from Workstation.workstation_core.gnss_monitor import evaluate_ntrip_health
+from Workstation.workstation_core.magnetometer_yaw import (
+    calibrated_magnetometer_yaw_deg,
+    project_magnetometer_yaw,
+)
 from Workstation.workstation_core.pixhawk_attitude import (
     MAVLINK_ATTITUDE_STALE_S,
+    MAVLINK_IMU_STREAM_STALE_S,
     MAVLINK_MAG_STREAMS,
     magnetometer_value_units,
 )
@@ -30,6 +48,19 @@ from Workstation.workstation_core.physical_alignment import (
     calculate_baseline_yaw_alignment,
     normalize_compass_angle_deg,
 )
+from Workstation.workstation_core.px4_mag_manager import (
+    BOARD_INTERNAL_MAG_ID,
+    GPS1_MAG_ID,
+    GPS2_MAG_ID,
+    INTERNAL_MAG_IDS,
+    MAG_SLOTS,
+    RM3100_BACKUP_IDS,
+    RM3100_PRIMARY_IDS,
+    identify_mag_device,
+    mag_role_for_device_id,
+    mag_priority_slot_key,
+)
+from Workstation.workstation_core.rtk_geometry import GpsPositionState
 
 from Workstation.workstation_core.coordinate_contract import (
     BASELINE_TRANSLATION_FRAME,
@@ -974,6 +1005,112 @@ class EvidenceAdapter:
             **provenance,
         }
 
+    def _magnetometer_yaw_fields(
+        self,
+        side: str,
+        *,
+        xmag: object,
+        ymag: object,
+        sensor_device_id: int | None,
+        sample_available: bool,
+        now_s: float,
+    ) -> dict[str, object]:
+        """Return raw yaw plus an exact active-device PX4 reference."""
+
+        active_ids = getattr(self.panel, "latest_vehicle_mag_device_ids", {}) or {}
+        active_device_id = (
+            _integer(active_ids.get(side)) if isinstance(active_ids, Mapping) else None
+        )
+        if not sample_available:
+            return {
+                "raw_yaw_deg": None,
+                "px4_yaw_deg": None,
+                "delta_yaw_deg": None,
+                "px4_yaw_state": "WAITING",
+                "px4_yaw_reason": "MAG sample waiting",
+                "raw_yaw_contract": (
+                    "RAW sensor-axis azimuth = atan2(-y, x); no CAL_MAG, sensor rotation, "
+                    "board rotation, or tilt correction"
+                ),
+                "active_device_id": active_device_id,
+                "px4_yaw_age_s": None,
+            }
+        attitude = self.attitude(side, now_s=now_s)
+        projection = project_magnetometer_yaw(
+            x=xmag,
+            y=ymag,
+            sensor_device_id=sensor_device_id,
+            active_device_id=active_device_id,
+            px4_yaw_deg=attitude.get("yaw_deg"),
+            px4_age_s=attitude.get("age_s"),
+            px4_stale_s=MAVLINK_ATTITUDE_STALE_S,
+        )
+        return {
+            **projection.to_mapping(),
+            "active_device_id": active_device_id,
+            "px4_yaw_age_s": attitude.get("age_s"),
+            "px4_yaw_source": attitude.get("source", "MAVLink attitude telemetry"),
+            "px4_yaw_frame_contract": attitude.get(
+                "frame_contract",
+                "PX4 vehicle attitude quaternion rotates body FRD to world NED",
+            ),
+        }
+
+    def _magnetometer_corrected_yaw_fields(
+        self,
+        side: str,
+        *,
+        xmag: object,
+        ymag: object,
+        zmag: object,
+        sensor_device_id: int | None,
+        sample_available: bool,
+    ) -> dict[str, object]:
+        if not sample_available:
+            return {
+                "corrected_yaw_deg": None,
+                "corrected_yaw_state": "WAITING",
+                "corrected_yaw_reason": "MAG sample waiting",
+                "corrected_yaw_contract": "CAL_MAG-corrected sensor vector; PARAM readback required",
+            }
+        if sensor_device_id is None:
+            return {
+                "corrected_yaw_deg": None,
+                "corrected_yaw_state": "IDENTITY UNKNOWN",
+                "corrected_yaw_reason": "sensor device ID unavailable; corrected yaw not calculated",
+                "corrected_yaw_contract": "CAL_MAG-corrected sensor vector; device identity required",
+            }
+        status_cache = getattr(self.panel, "_px4_mag_status_cache", {}) or {}
+        status = status_cache.get(side) if isinstance(status_cache, Mapping) else None
+        params = getattr(status, "params", None)
+        params = params if isinstance(params, Mapping) else None
+        slot = None
+        if params is not None:
+            for candidate in range(4):
+                if _integer(params.get(f"CAL_MAG{candidate}_ID")) == int(sensor_device_id):
+                    slot = candidate
+                    break
+        attitude_cache = getattr(self.panel, "_px4_attitude_cal_status_cache", {}) or {}
+        attitude_status = attitude_cache.get(side) if isinstance(attitude_cache, Mapping) else None
+        board_params = getattr(attitude_status, "params", None)
+        board_params = board_params if isinstance(board_params, Mapping) else None
+        calibration = calibrated_magnetometer_yaw_deg(
+            x=xmag,
+            y=ymag,
+            z=zmag,
+            calibration_params=params,
+            calibration_slot=slot,
+            board_params=board_params,
+            internal_sensor=int(sensor_device_id) in INTERNAL_MAG_IDS,
+        )
+        return {
+            **calibration,
+            "corrected_yaw_contract": (
+                "PX4 Magnetometer::Correct-equivalent: CAL_MAG offset/scale/off-diagonal/rotation; "
+                "power compensation is withheld when no contemporaneous power sample exists"
+            ),
+        }
+
     def magnetometers(self, side: str, *, now_s: float | None = None) -> tuple[dict[str, object], ...]:
         """Project the ROS2-free MAVLink IMU magnetometer streams.
 
@@ -994,6 +1131,14 @@ class EvidenceAdapter:
             expected_topic = f"mavlink/{message_name}"
             state = states_by_slot.get(sensor_slot) if isinstance(states_by_slot, Mapping) else None
             if state is None:
+                yaw_fields = self._magnetometer_yaw_fields(
+                    side,
+                    xmag=None,
+                    ymag=None,
+                    sensor_device_id=None,
+                    sample_available=False,
+                    now_s=now,
+                )
                 rows.append(
                     {
                         "side": side,
@@ -1013,6 +1158,15 @@ class EvidenceAdapter:
                         "device_id": None,
                         "axis_contract": axis_contract,
                         "source": "MAVLink SCALED_IMU telemetry",
+                        **yaw_fields,
+                        **self._magnetometer_corrected_yaw_fields(
+                            side,
+                            xmag=None,
+                            ymag=None,
+                            zmag=None,
+                            sensor_device_id=None,
+                            sample_available=False,
+                        ),
                     }
                 )
                 continue
@@ -1025,22 +1179,51 @@ class EvidenceAdapter:
                 "norm": _number(getattr(state, "magnitude", None)),
             }
             complete = all(values[key] is not None for key in ("xmag", "ymag", "zmag"))
+            age_s = _age(getattr(state, "timestamp_s", None), now)
+            device_id = _integer(getattr(state, "device_id", None))
+            yaw_fields = self._magnetometer_yaw_fields(
+                side,
+                xmag=values["xmag"],
+                ymag=values["ymag"],
+                sensor_device_id=device_id,
+                sample_available=True,
+                now_s=now,
+            )
             rows.append(
                 {
                     "side": side,
                     "pixhawk": "P1" if side == "left" else "P2",
                     "sensor_slot": sensor_slot,
                     "imu": imu_label,
-                    "state": "LIVE" if complete else "PARTIAL",
+                    "state": (
+                        "PARTIAL"
+                        if not complete
+                        else "STALE"
+                        if age_s is None or age_s > MAVLINK_IMU_STREAM_STALE_S
+                        else "LIVE"
+                    ),
                     **values,
                     "unit": magnetometer_value_units(topic) or "mG",
-                    "age_s": _age(getattr(state, "timestamp_s", None), now),
+                    "age_s": age_s,
                     "timestamp_s": _number(getattr(state, "timestamp_s", None)),
                     "px4_timestamp_s": _number(getattr(state, "px4_timestamp_s", None)),
                     "topic": topic,
-                    "device_id": _integer(getattr(state, "device_id", None)),
+                    "device_id": device_id,
                     "axis_contract": axis_contract,
-                    "source": "MAVLink SCALED_IMU telemetry",
+                    "source": (
+                        "PX4 Shell sensor_mag readback"
+                        if topic.lower().startswith("px4-shell/sensor_mag/")
+                        else "MAVLink SCALED_IMU telemetry"
+                    ),
+                    **yaw_fields,
+                    **self._magnetometer_corrected_yaw_fields(
+                        side,
+                        xmag=values["xmag"],
+                        ymag=values["ymag"],
+                        zmag=values["zmag"],
+                        sensor_device_id=device_id,
+                        sample_available=complete,
+                    ),
                 }
             )
         return tuple(rows)
@@ -1061,26 +1244,70 @@ class EvidenceAdapter:
             "firmware CAN magnetometer xmag/ymag/zmag producer sensor axes; "
             "Workstation applies no coordinate conversion"
         )
+
+        def source_for(topic: str) -> str:
+            if topic.lower().startswith("px4-shell/sensor_mag/"):
+                return "PX4 Shell sensor_mag readback"
+            return "PX4 DEBUG_VECT CAN_MAG compatibility telemetry"
+
+        configured_status = getattr(self.panel, "_px4_mag_status_cache", {}) or {}
+        configured_status = configured_status.get(side) if isinstance(configured_status, Mapping) else None
+        configured_rm: dict[str, tuple[int, int | None]] = {}
+        for slot in getattr(configured_status, "slots", ()) or ():
+            device_id = _integer(getattr(slot, "device_id", None))
+            if device_id in RM3100_PRIMARY_IDS:
+                configured_rm["CAN1"] = (
+                    device_id,
+                    0x7D if device_id == RM3100_PRIMARY_IDS[0] else 0x7C,
+                )
+            elif device_id in RM3100_BACKUP_IDS:
+                configured_rm["CAN2"] = (
+                    device_id,
+                    0x7B if device_id == RM3100_BACKUP_IDS[0] else None,
+                )
+
         for sensor_slot in ("CAN1", "CAN2"):
             state = states_by_slot.get(sensor_slot) if isinstance(states_by_slot, Mapping) else None
             if state is None:
+                configured = configured_rm.get(sensor_slot)
+                yaw_fields = self._magnetometer_yaw_fields(
+                    side,
+                    xmag=None,
+                    ymag=None,
+                    sensor_device_id=None,
+                    sample_available=False,
+                    now_s=now,
+                )
                 rows.append(
                     {
                         "side": side,
                         "pixhawk": "P1" if side == "left" else "P2",
                         "can_port": sensor_slot,
-                        "node_id": None,
-                        "device_id": None,
-                        "state": "WAITING",
+                        "node_id": None if configured is None else configured[1],
+                        "device_id": None if configured is None else configured[0],
+                        "state": "CONFIG" if configured is not None else "WAITING",
                         "xmag": None,
                         "ymag": None,
                         "zmag": None,
                         "norm": None,
                         "unit": "G",
                         "age_s": None,
-                        "topic": "mavlink/DEBUG_VECT (CAN1_MAG/CAN2_MAG)",
+                        "topic": "px4-shell/sensor_mag or mavlink/DEBUG_VECT",
                         "axis_contract": axis_contract,
-                        "source": "PX4 DEBUG_VECT CAN_MAG compatibility telemetry",
+                        "source": (
+                            "PX4 CAL_MAG configuration; waiting for Shell sensor_mag sample"
+                            if configured is not None
+                            else "PX4 Shell sensor_mag / DEBUG_VECT compatibility telemetry"
+                        ),
+                        **yaw_fields,
+                        **self._magnetometer_corrected_yaw_fields(
+                            side,
+                            xmag=None,
+                            ymag=None,
+                            zmag=None,
+                            sensor_device_id=None if configured is None else configured[0],
+                            sample_available=False,
+                        ),
                     }
                 )
                 continue
@@ -1094,30 +1321,184 @@ class EvidenceAdapter:
                 "norm": _number(getattr(state, "magnitude", None)),
             }
             complete = all(values[key] is not None for key in ("xmag", "ymag", "zmag"))
+            shell_source = topic.lower().startswith("px4-shell/sensor_mag/")
             if not complete:
                 state_label = "PARTIAL"
-            elif age_s is None or age_s > 5.0:
+            elif age_s is None or age_s > (15.0 if shell_source else 5.0):
                 state_label = "DISCONNECTED"
-            elif age_s > 1.0:
+            elif age_s > (6.0 if shell_source else 1.0):
                 state_label = "STALE"
             else:
                 state_label = "LIVE"
+            device_id = _integer(getattr(state, "device_id", None))
+            yaw_fields = self._magnetometer_yaw_fields(
+                side,
+                xmag=values["xmag"],
+                ymag=values["ymag"],
+                sensor_device_id=device_id,
+                sample_available=True,
+                now_s=now,
+            )
             rows.append(
                 {
                     "side": side,
                     "pixhawk": "P1" if side == "left" else "P2",
                     "can_port": sensor_slot,
                     "node_id": _integer(getattr(state, "node_id", None)),
-                    "device_id": _integer(getattr(state, "device_id", None)),
+                    "device_id": device_id,
                     "state": state_label,
                     **values,
                     "unit": magnetometer_value_units(topic) or "G",
                     "age_s": age_s,
                     "topic": topic,
                     "axis_contract": axis_contract,
-                    "source": "PX4 DEBUG_VECT CAN_MAG compatibility telemetry",
+                    "source": source_for(topic),
+                    **yaw_fields,
+                    **self._magnetometer_corrected_yaw_fields(
+                        side,
+                        xmag=values["xmag"],
+                        ymag=values["ymag"],
+                        zmag=values["zmag"],
+                        sensor_device_id=device_id,
+                        sample_available=complete,
+                    ),
                 }
             )
+        return tuple(rows)
+
+    def magnetometers_for_imu_view(
+        self, side: str, *, now_s: float | None = None
+    ) -> tuple[dict[str, object], ...]:
+        """Project the IMU-table view without relabeling CAN data as SCALED_IMU.
+
+        The first three rows are the standard ``SCALED_IMU*`` streams.  The
+        final two rows are the existing dedicated ``DEBUG_VECT``
+        ``CAN1_MAG``/``CAN2_MAG`` compatibility samples from the stable PX4
+        path.  Keeping the two sources separate in the evidence dictionaries
+        preserves their topic, units, identity, and yaw-correlation rules.
+        """
+
+        rows = list(self.magnetometers(side, now_s=now_s))
+        for can_row in self.can_magnetometers(side, now_s=now_s):
+            can_port = str(can_row.get("can_port") or "CAN?")
+            rows.append(
+                {
+                    **can_row,
+                    "imu": f"RM3100 {can_port}",
+                    "sensor_slot": can_port,
+                }
+            )
+        return tuple(rows)
+
+    def magnetometers_for_cal_mag_view(
+        self, side: str, *, now_s: float | None = None
+    ) -> tuple[dict[str, object], ...]:
+        """Project one row per PX4 ``CAL_MAGn`` slot in parameter order.
+
+        ``sensor_mag`` instance numbers and MAVLink ``SCALED_IMU*`` stream
+        numbers are transport/topology identities, not calibration-slot
+        identities.  The operator-facing MAG table therefore uses the
+        configured ``CAL_MAGn_ID`` as its row key and only attaches a live
+        sample whose device ID matches that slot.
+        """
+
+        now = time.monotonic() if now_s is None else float(now_s)
+        status_cache = getattr(self.panel, "_px4_mag_status_cache", {}) or {}
+        status = status_cache.get(side) if isinstance(status_cache, Mapping) else None
+        params = getattr(status, "params", {}) if status is not None else {}
+        params = params if isinstance(params, Mapping) else {}
+        slots_by_number = {
+            int(getattr(slot, "slot")): slot
+            for slot in (getattr(status, "slots", ()) or ())
+            if getattr(slot, "slot", None) is not None
+        }
+
+        # Standard SCALED_IMU and dedicated CAN evidence are kept in separate
+        # stores.  Prefer a live dedicated CAN sample when both paths expose
+        # the same identity; do not let a CONFIG placeholder hide live data.
+        source_rows: dict[int, dict[str, object]] = {}
+        for row in self.magnetometers(side, now_s=now):
+            device_id = _integer(row.get("device_id"))
+            if device_id is not None:
+                source_rows[device_id] = dict(row)
+        for row in self.can_magnetometers(side, now_s=now):
+            device_id = _integer(row.get("device_id"))
+            if device_id is None:
+                continue
+            existing = source_rows.get(device_id)
+            if existing is None or str(row.get("state")) not in {"CONFIG", "WAITING"}:
+                source_rows[device_id] = dict(row)
+
+        rows: list[dict[str, object]] = []
+        for slot_number in MAG_SLOTS:
+            slot = slots_by_number.get(slot_number)
+            configured_device_id = _integer(
+                getattr(slot, "device_id", None)
+                if slot is not None
+                else params.get(f"CAL_MAG{slot_number}_ID")
+            )
+            priority = _integer(
+                getattr(slot, "priority", None)
+                if slot is not None
+                else params.get(f"CAL_MAG{slot_number}_PRIO")
+            )
+            info = identify_mag_device(configured_device_id)
+            role = mag_role_for_device_id(configured_device_id)
+            source_row = source_rows.get(configured_device_id) if configured_device_id is not None else None
+            if source_row is None:
+                yaw_fields = self._magnetometer_yaw_fields(
+                    side,
+                    xmag=None,
+                    ymag=None,
+                    sensor_device_id=configured_device_id,
+                    sample_available=False,
+                    now_s=now,
+                )
+                row = {
+                    "side": side,
+                    "pixhawk": "P1" if side == "left" else "P2",
+                    "cal_slot": slot_number,
+                    "cal_mag": mag_priority_slot_key(slot_number),
+                    "sensor": info.device_type if configured_device_id is not None else "N/A",
+                    "sensor_role": role or "UNKNOWN",
+                    "state": "CONFIG" if configured_device_id is not None else "WAITING",
+                    "xmag": None,
+                    "ymag": None,
+                    "zmag": None,
+                    "norm": None,
+                    "unit": "G",
+                    "age_s": None,
+                    "topic": "CAL_MAG configuration",
+                    "device_id": configured_device_id,
+                    "priority": priority,
+                    "source": (
+                        "PX4 CAL_MAG configuration; waiting for matching sensor sample"
+                        if configured_device_id is not None
+                        else "PX4 CAL_MAG parameter readback waiting"
+                    ),
+                    **yaw_fields,
+                    **self._magnetometer_corrected_yaw_fields(
+                        side,
+                        xmag=None,
+                        ymag=None,
+                        zmag=None,
+                        sensor_device_id=configured_device_id,
+                        sample_available=False,
+                    ),
+                }
+            else:
+                row = dict(source_row)
+                row.update(
+                    {
+                        "cal_slot": slot_number,
+                        "cal_mag": mag_priority_slot_key(slot_number),
+                        "sensor": info.device_type,
+                        "sensor_role": role or "UNKNOWN",
+                        "device_id": configured_device_id,
+                        "priority": priority,
+                    }
+                )
+            rows.append(row)
         return tuple(rows)
 
     def baseline(self) -> dict[str, object]:
@@ -1396,6 +1777,373 @@ class EvidenceAdapter:
             "angle_contract": (
                 "Baseline-Pn = wrap180(azimuth(P1→P2) - Pn yaw); "
                 "+ is clockwise/right, - is counter-clockwise/left"
+            ),
+        }
+
+    def drone_pixhawk_geometry(self, *, now_s: float | None = None) -> dict[str, object]:
+        """Project Dr/P1/P2 relative vectors and horizontal triangle angles.
+
+        The midpoint vector uses the existing GNSS local-level FRD geometry.
+        The P1/P2 vectors are the same GNSS world-NED vectors expressed in the
+        corresponding PX4 body-FRD frame.  The two point angles use only the
+        horizontal North/East components and are independent of Pixhawk yaw.
+        """
+
+        now = time.monotonic() if now_s is None else float(now_s)
+        if not math.isfinite(now):
+            raise ValueError("now_s must be finite")
+
+        latest_gps = getattr(self.panel, "latest_gps", {}) or {}
+        latest_gps = latest_gps if isinstance(latest_gps, Mapping) else {}
+
+        def selected_gps(side: str) -> tuple[GpsPositionState | None, str]:
+            selector = getattr(self.panel, "_selected_rover_gps_state", None)
+            if callable(selector):
+                try:
+                    selected = selector(side)
+                except Exception:
+                    selected = None
+                if not isinstance(selected, GpsPositionState):
+                    selected = None
+                if side == "drone":
+                    if selected is None:
+                        selected = latest_gps.get("drone")
+                    return (
+                        selected if isinstance(selected, GpsPositionState) else None,
+                        "DRONE",
+                    )
+                source_reader = getattr(self.panel, "_pixhawk_gnss_source", None)
+                source = (
+                    str(source_reader(side)).upper()
+                    if callable(source_reader)
+                    else "GPS1"
+                )
+                return selected, source if source in {"GPS1", "GPS2"} else "GPS1"
+            if side == "drone":
+                selected = latest_gps.get("drone")
+                return (
+                    selected if isinstance(selected, GpsPositionState) else None,
+                    "DRONE",
+                )
+            source_reader = getattr(self.panel, "_pixhawk_gnss_source", None)
+            source = (
+                str(source_reader(side)).upper()
+                if callable(source_reader)
+                else "GPS1"
+            )
+            source = source if source in {"GPS1", "GPS2"} else "GPS1"
+            key = side if source == "GPS1" else f"{side}_GPS2"
+            selected = latest_gps.get(key)
+            return selected if isinstance(selected, GpsPositionState) else None, source
+
+        p1, p1_source = selected_gps("left")
+        p2, p2_source = selected_gps("right")
+        drone, _drone_source = selected_gps("drone")
+        if not callable(getattr(self.panel, "_selected_rover_gps_state", None)):
+            drone = latest_gps.get("drone")
+
+        estimate = estimate_gnss_baseline_center_frd(
+            p1,
+            p2,
+            drone,
+            now_s=now,
+            maximum_age_s=DEFAULT_MAXIMUM_GNSS_AGE_S,
+            maximum_timestamp_spread_s=DEFAULT_MAXIMUM_GNSS_TIMESTAMP_SPREAD_S,
+        )
+        geometry = estimate.geometry
+        geometry_state = (
+            "WAITING"
+            if geometry is None
+            else "STALE"
+            if estimate.state == "STALE"
+            else "CURRENT"
+        )
+
+        def finite_age(state: object | None) -> float | None:
+            if state is None:
+                return None
+            age = _age(getattr(state, "timestamp_s", None), now)
+            return age if age is not None and math.isfinite(age) else None
+
+        p1_age = finite_age(p1)
+        p2_age = finite_age(p2)
+        drone_age = finite_age(drone)
+        gps_ages = tuple(
+            age for age in (p1_age, p2_age, drone_age) if age is not None
+        )
+        gps_age = max(gps_ages) if gps_ages else None
+
+        def attitude_snapshot(side: str) -> dict[str, object]:
+            return self.attitude(side, now_s=now)
+
+        attitudes = {
+            "p1": attitude_snapshot("left"),
+            "p2": attitude_snapshot("right"),
+        }
+
+        def body_attitude_state(data: Mapping[str, object]) -> str:
+            q = data.get("q_wxyz")
+            age = data.get("age_s")
+            if not isinstance(q, (tuple, list)) or len(q) != 4:
+                return "WAITING"
+            try:
+                finite_q = all(math.isfinite(float(value)) for value in q)
+                finite_age_value = age is not None and math.isfinite(float(age))
+            except (TypeError, ValueError):
+                return "WAITING"
+            if not finite_q or not finite_age_value:
+                return "WAITING"
+            return (
+                "STALE"
+                if float(age) > MAVLINK_ATTITUDE_STALE_S
+                else "CURRENT"
+            )
+
+        p1_attitude_state = body_attitude_state(attitudes["p1"])
+        p2_attitude_state = body_attitude_state(attitudes["p2"])
+
+        def vector_row(
+            key: str,
+            label: str,
+            vector: tuple[float, float, float] | None,
+            *,
+            state: str,
+            frame: str,
+            age_s: float | None,
+            source: str,
+            reason: str,
+        ) -> dict[str, object]:
+            if vector is None:
+                return {
+                    "key": key,
+                    "label": label,
+                    "state": state,
+                    "forward_m": None,
+                    "right_m": None,
+                    "down_m": None,
+                    "range_m": None,
+                    "frame": frame,
+                    "age_s": age_s,
+                    "source": source,
+                    "reason": reason,
+                }
+            return {
+                "key": key,
+                "label": label,
+                "state": state,
+                "forward_m": vector[0],
+                "right_m": vector[1],
+                "down_m": vector[2],
+                "range_m": vector_range_m(vector),
+                "frame": frame,
+                "age_s": age_s,
+                "source": source,
+                "reason": reason,
+            }
+
+        def combined_body_state(base_state: str, attitude_state: str) -> str:
+            if base_state == "WAITING":
+                return "WAITING"
+            if base_state == "STALE" or attitude_state == "STALE":
+                return "STALE"
+            if attitude_state == "CURRENT":
+                return "CURRENT"
+            return "WAITING"
+
+        vectors: list[dict[str, object]] = []
+        if geometry is None:
+            midpoint_vector = None
+            p1_vector_ned = None
+            p2_vector_ned = None
+        else:
+            midpoint_vector = geometry.vector_m
+            p1_vector_ned = geometry.drone_from_p1_ned_m
+            p2_vector_ned = subtract_vectors(
+                geometry.drone_from_p1_ned_m,
+                geometry.baseline_ned_m,
+            )
+
+        midpoint_reason = (
+            estimate.reason
+            if geometry is None or geometry_state != "CURRENT"
+            else "Three GNSS positions are current"
+        )
+        vectors.append(
+            vector_row(
+                "baseline_center",
+                "Dr from Baseline Center",
+                midpoint_vector,
+                state=geometry_state,
+                frame=(
+                    str(getattr(geometry, "frame", "gnss_baseline_center_local_level_frd"))
+                    if geometry is not None
+                    else "gnss_baseline_center_local_level_frd"
+                ),
+                age_s=gps_age,
+                source="selected P1/P2 GNSS + Drone GNSS; midpoint geometry",
+                reason=midpoint_reason,
+            )
+        )
+
+        def transformed_body_vector(
+            vector_ned: tuple[float, float, float] | None,
+            attitude: Mapping[str, object],
+        ) -> tuple[float, float, float] | None:
+            if vector_ned is None:
+                return None
+            q = attitude.get("q_wxyz")
+            if not isinstance(q, (tuple, list)) or len(q) != 4:
+                return None
+            try:
+                return world_ned_vector_to_body_frd(vector_ned, q)
+            except (TypeError, ValueError):
+                return None
+
+        p1_body_vector = transformed_body_vector(p1_vector_ned, attitudes["p1"])
+        p2_body_vector = transformed_body_vector(p2_vector_ned, attitudes["p2"])
+        p1_body_state = combined_body_state(geometry_state, p1_attitude_state)
+        p2_body_state = combined_body_state(geometry_state, p2_attitude_state)
+        p1_body_reason = (
+            estimate.reason
+            if p1_attitude_state in {"CURRENT", "STALE"}
+            else "P1 ATTITUDE waiting or invalid"
+        )
+        p2_body_reason = (
+            estimate.reason
+            if p2_attitude_state in {"CURRENT", "STALE"}
+            else "P2 ATTITUDE waiting or invalid"
+        )
+        vectors.append(
+            vector_row(
+                "p1",
+                "Dr from P1",
+                p1_body_vector,
+                state=p1_body_state,
+                frame=f"{BODY_FRAME} (P1 body)",
+                age_s=max(
+                    (age for age in (gps_age, attitudes["p1"].get("age_s")) if age is not None),
+                    default=None,
+                ),
+                source="P1→Dr GNSS vector + P1 MAVLink ATTITUDE",
+                reason=p1_body_reason,
+            )
+        )
+        vectors.append(
+            vector_row(
+                "p2",
+                "Dr from P2",
+                p2_body_vector,
+                state=p2_body_state,
+                frame=f"{BODY_FRAME} (P2 body)",
+                age_s=max(
+                    (age for age in (gps_age, attitudes["p2"].get("age_s")) if age is not None),
+                    default=None,
+                ),
+                source="P2→Dr GNSS vector + P2 MAVLink ATTITUDE",
+                reason=p2_body_reason,
+            )
+        )
+
+        angles = None
+        if geometry is not None:
+            angles = calculate_horizontal_triangle_angles(
+                (0.0, 0.0, 0.0),
+                geometry.baseline_ned_m,
+                geometry.drone_from_p1_ned_m,
+            )
+
+        def angle_row(
+            key: str,
+            label: str,
+            value: float | None,
+            *,
+            vertex: str,
+        ) -> dict[str, object]:
+            state = geometry_state if value is not None else "WAITING"
+            reason = (
+                estimate.reason
+                if value is not None
+                else "horizontal ray is undefined"
+                if geometry is not None
+                else estimate.reason
+            )
+            return {
+                "key": key,
+                "label": label,
+                "angle_deg": value,
+                "state": state,
+                "vertex": vertex,
+                "age_s": gps_age,
+                "source": "P1/P2/Drone GNSS horizontal positions",
+                "frame": "horizontal local NED (North/East only)",
+                "reason": reason,
+            }
+
+        angles_rows = (
+            angle_row(
+                "dr_p1_p2",
+                "∠Dr-P1-P2",
+                None if angles is None else angles.at_p1_deg,
+                vertex="P1",
+            ),
+            angle_row(
+                "dr_p2_p1",
+                "∠Dr-P2-P1",
+                None if angles is None else angles.at_p2_deg,
+                vertex="P2",
+            ),
+        )
+
+        angle_values = tuple(row.get("angle_deg") for row in angles_rows)
+        if geometry_state == "STALE":
+            overall_state = "STALE"
+        elif geometry_state != "CURRENT":
+            overall_state = geometry_state
+        else:
+            current_attitudes = sum(
+                state == "CURRENT"
+                for state in (p1_attitude_state, p2_attitude_state)
+            )
+            if current_attitudes == 2:
+                overall_state = "CURRENT" if all(value is not None for value in angle_values) else "PARTIAL"
+            elif current_attitudes == 1:
+                overall_state = "PARTIAL"
+            elif any(
+                state == "STALE"
+                for state in (p1_attitude_state, p2_attitude_state)
+            ):
+                overall_state = "STALE"
+            else:
+                overall_state = "WAITING"
+
+        reasons: list[str] = []
+        if estimate.reason and geometry_state != "CURRENT":
+            reasons.append(estimate.reason)
+        if p1_attitude_state not in {"CURRENT"}:
+            reasons.append(f"P1 ATTITUDE {p1_attitude_state.lower()}")
+        if p2_attitude_state not in {"CURRENT"}:
+            reasons.append(f"P2 ATTITUDE {p2_attitude_state.lower()}")
+        if geometry_state == "CURRENT" and any(value is None for value in angle_values):
+            reasons.append("one or both horizontal triangle angles are undefined")
+        return {
+            "state": overall_state,
+            "reason": "; ".join(dict.fromkeys(reasons)) or "all geometry inputs current",
+            "vectors": tuple(vectors),
+            "angles": angles_rows,
+            "p1_gps_source": p1_source,
+            "p2_gps_source": p2_source,
+            "p1_gps_age_s": p1_age,
+            "p2_gps_age_s": p2_age,
+            "drone_gps_age_s": drone_age,
+            "source": "selected P1/P2 GNSS + Drone GNSS + P1/P2 MAVLink ATTITUDE",
+            "clock": "latest app receive monotonic snapshots; not simultaneous measurement",
+            "frame_contract": (
+                "midpoint→Dr is GNSS baseline-center local-level FRD; "
+                "P1/P2→Dr are respective PX4 body FRD vectors"
+            ),
+            "angle_contract": (
+                "∠Dr-P1-P2 and ∠Dr-P2-P1 use horizontal North/East only; "
+                "unsigned internal angles in [0,180] degrees"
             ),
         }
 
@@ -2063,7 +2811,9 @@ class EvidenceAdapter:
 
         def setting(name: str, default: object = None) -> object:
             value = getattr(settings, name, default)
-            return default if value is None else value
+            value = default if value is None else value
+            resolver = getattr(self.panel, "_workstation_setting", None)
+            return resolver(name, value) if callable(resolver) else value
 
         intrinsics_source = _combo_data(
             getattr(self.panel, "intrinsics_source_combo", None),
@@ -2089,6 +2839,9 @@ class EvidenceAdapter:
             ),
             "measurement_method_fallback_order": list(
                 setting("measurement_method_fallback_order", ()) or ()
+            ),
+            "measurement_baseline_yaw_reverse": bool(
+                setting("measurement_baseline_yaw_reverse", False)
             ),
             "pixhawk_left_gnss_source": str(
                 setting("pixhawk_left_gnss_source", "GPS1")
@@ -2120,10 +2873,12 @@ class EvidenceAdapter:
             "time_basis": str(
                 _combo_data(
                     getattr(self.panel, "yolo_gate_time_basis_combo", None),
-                    setting("yolo_gate_time_basis", "camera_rtcp"),
+                    setting("yolo_gate_time_basis", "app_receive_monotonic"),
                 )
-                or "camera_rtcp"
+                or "app_receive_monotonic"
             ),
+            "time_basis_role": "preferred_with_app_receive_fallback",
+            "ntp_evidence_role": "preferred_when_selected_and_verified",
             "time_delta_gate_enabled": _widget_checked(
                 getattr(self.panel, "yolo_gate_time_delta_checkbox", None),
                 bool(setting("yolo_gate_time_delta_enabled", False)),
@@ -3094,6 +3849,34 @@ class EvidenceAdapter:
                 "reason_codes": ["quality_snapshot_unavailable"],
             }
         )
+        capture_status: dict[str, object] = {}
+        capture_status_error = ""
+        for owner in (self.panel, capture_controller):
+            reader = getattr(owner, "workstation_calibration_capture_snapshot", None)
+            if not callable(reader):
+                continue
+            try:
+                value = reader()
+            except Exception as exc:
+                capture_status_error = str(exc)
+                break
+            if isinstance(value, Mapping):
+                capture_status = dict(value)
+                break
+        if not capture_status:
+            capture_status = {
+                "schema": "workstation-calibration-capture-status-v1",
+                "capture_root": "",
+                "capture_set_id": "",
+                "detection": {},
+                "run": {},
+                "capture_set": {
+                    "state": "UNAVAILABLE",
+                    "error": capture_status_error
+                    or "calibration capture snapshot unavailable",
+                },
+                "last": {"state": "UNKNOWN", "message": calibration_status},
+            }
         return {
             "state": (
                 "CALCULATING"
@@ -3138,6 +3921,7 @@ class EvidenceAdapter:
             "validation_gate": "disabled",
             "quality_gate": "calibration_quality_v1",
             "calibration_quality": calibration_quality,
+            "capture_status": capture_status,
             "zoom_readback": zoom_readback,
             "status_label": status_label,
             "progress": progress_text,

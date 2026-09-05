@@ -1,4 +1,4 @@
-"""Calibration-pair timing evidence without conflating host dispatch and exposure."""
+"""Calibration-pair timing evidence without conflating host proxies and exposure."""
 
 from __future__ import annotations
 
@@ -13,12 +13,14 @@ CALIBRATION_TIMING_EVIDENCE_SCHEMA = "workstation-calibration-timing-evidence-v1
 EXPOSURE_TIMESTAMP_VERIFIED = "EXPOSURE_TIMESTAMP_VERIFIED"
 CAMERA_TIMESTAMP_VERIFIED = "CAMERA_TIMESTAMP_VERIFIED"
 HOST_DISPATCH_PROXY = "HOST_DISPATCH_PROXY"
+HOST_RECEIVE_PROXY = "HOST_RECEIVE_PROXY"
 UNKNOWN_TIMING_EVIDENCE = "UNKNOWN"
 CALIBRATION_TIMING_EVIDENCE_CLASSES = frozenset(
     {
         EXPOSURE_TIMESTAMP_VERIFIED,
         CAMERA_TIMESTAMP_VERIFIED,
         HOST_DISPATCH_PROXY,
+        HOST_RECEIVE_PROXY,
         UNKNOWN_TIMING_EVIDENCE,
     }
 )
@@ -193,10 +195,10 @@ class CalibrationTimingEvidence:
             raise ValueError("pair_delta_s must be finite when present")
         if self.actual_exposure_verified and self.evidence_class != EXPOSURE_TIMESTAMP_VERIFIED:
             raise ValueError("actual exposure verification requires exposure timestamp evidence")
-        if self.evidence_class == HOST_DISPATCH_PROXY and (
+        if self.evidence_class in {HOST_DISPATCH_PROXY, HOST_RECEIVE_PROXY} and (
             self.precision_qualified or self.actual_exposure_verified
         ):
-            raise ValueError("host dispatch proxy cannot qualify or verify camera exposure")
+            raise ValueError("host timing proxy cannot qualify or verify camera exposure")
         if self.precision_qualified and not self.pair_persistence_allowed:
             raise ValueError("precision timing cannot qualify a rejected pair")
 
@@ -244,6 +246,7 @@ __all__ = [
     "CalibrationTimingEvidence",
     "EXPOSURE_TIMESTAMP_VERIFIED",
     "HOST_DISPATCH_PROXY",
+    "HOST_RECEIVE_PROXY",
     "INTRINSICS_ONLY",
     "INVALID_METADATA",
     "LEGACY_UNVERIFIED",

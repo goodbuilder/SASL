@@ -28,3 +28,13 @@ Do not add a new global badge.
 - Existing Camera/CAM tooltip/Performance surfaces now project actual and fallback evidence.
 - Synthetic NVDEC and full software regression pass. Real Left/Right WIRIS Preview was not started
   because a separately owned StereoWIRIS process is running; do not operate both apps concurrently.
+
+## 2026-09-04 — CUDA Driver API is required evidence for NVDEC availability
+
+- `nvidia-smi` success is not sufficient: GStreamer `nvcodec` can be installed while its CUDA
+  initialization fails and `nvh264dec` is consequently absent from the factory registry.
+- The common runtime probe will require both `nvidia-smi` and `cuInit(0)` before selecting NVDEC;
+  Auto remains allowed and selects `avdec_h264` with a degraded reason when CUDA initialization
+  fails. Explicit NVIDIA remains fail-closed.
+- The application-side decoder fallback contract is unchanged; this narrows only the preflight
+  capability claim and avoids repeated NVCodec registry retries when CUDA is already unavailable.

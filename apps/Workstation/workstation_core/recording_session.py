@@ -25,6 +25,12 @@ from Workstation.workstation_core.measurement_methods import (
     MEASUREMENT_METHOD_IDS,
     PIXHAWK_RTK_LIVE,
 )
+from Workstation.workstation_core.measurement_data_store import (
+    ROW_WRITE_ADMITTED,
+    ROW_WRITE_UNAVAILABLE,
+    RowWriteAdmission,
+)
+from Workstation.workstation_core.runtime_camera_status import is_sr_pc_diagnostic_reason
 
 
 # Finalized structured records are canonical JSONL.  Typed Parquet tables and
@@ -35,6 +41,8 @@ PAIR_AXIS_COLUMNS = ("sample_index", "session_elapsed_s")
 DISTANCE_MEASUREMENT_COLUMNS = (
     "sample_index",
     "recording_time_ns",
+    "app_receive_monotonic_ns",
+    "app_receive_timestamp_role",
     "estimated_utc_time_ns",
     "device_utc_time_ns",
     "pair_id",
@@ -52,6 +60,24 @@ DISTANCE_MEASUREMENT_COLUMNS = (
     "baseline_center_right_m",
     "baseline_center_down_m",
     "baseline_m",
+    "pairing_time_basis_requested",
+    "pairing_time_basis",
+    "pairing_time_basis_role",
+    "pairing_fallback_active",
+    "pairing_fallback_reason",
+    "selected_pair_delta_ns",
+    "selected_pair_abs_delta_ns",
+    "selected_pair_midpoint_ns",
+    "app_receive_pair_delta_ns",
+    "app_receive_evidence_role",
+    "rtcp_pair_delta_ns",
+    "ntp_evidence_role",
+    "left_media_recovery_basis",
+    "right_media_recovery_basis",
+    "left_media_integrity_mode",
+    "right_media_integrity_mode",
+    "left_media_random_access_guaranteed",
+    "right_media_random_access_guaranteed",
     "sync_delta_ns",
     "quality",
     "warning_code",
@@ -77,6 +103,10 @@ CAMERA_TIMELINE_COMPACT_COLUMNS = (
     "rtcp_camera_ntp_rate",
     "rtcp_camera_media_rate",
     "rtsp_transport",
+    "ntp_evidence_role",
+    "media_recovery_basis",
+    "media_integrity_mode",
+    "media_random_access_guaranteed",
     "timing_status",
 )
 PX4_TIMELINE_COMPACT_COLUMNS = (
@@ -345,8 +375,8 @@ CALIBRATION_KEYWORDS = (
 )
 
 AUTHORITATIVE_JSONL_SCHEMA_VERSION = "stereowiris-authoritative-jsonl-v1"
-MEASUREMENT_STORAGE_SCHEMA = "workstation-measurement-storage-v3"
-MEASUREMENT_STORAGE_SCHEMA_VERSION = 3
+MEASUREMENT_STORAGE_SCHEMA = "workstation-measurement-storage-v4"
+MEASUREMENT_STORAGE_SCHEMA_VERSION = 4
 AUTHORITATIVE_JSONL_STREAMS = {
     "raw_stereo_measurements": (
         "raw/stereo_measurements",
@@ -558,6 +588,7 @@ class SpoolRows(Sequence[dict[str, object]]):
         self._write_error: str | None = None
         self._volatile_appends: list[dict[str, object]] = []
         self._volatile_updates: dict[int, dict[str, object]] = {}
+        self._owner_epoch = 0
 
     @property
     def spool_path(self) -> Path | None:
@@ -598,6 +629,7 @@ class SpoolRows(Sequence[dict[str, object]]):
     def bind(self, path: Path) -> None:
         with self._lock:
             self.close()
+            self._owner_epoch += 1
             path.parent.mkdir(parents=True, exist_ok=True)
             path.unlink(missing_ok=True)
             self._path = path
@@ -613,6 +645,7 @@ class SpoolRows(Sequence[dict[str, object]]):
     def open_existing(self, path: Path) -> None:
         with self._lock:
             self.close()
+            self._owner_epoch += 1
             self._path = path
             self._preview.clear()
             self._count = 0
@@ -679,6 +712,50 @@ class SpoolRows(Sequence[dict[str, object]]):
         self._atomic_replace_bytes(path, payload + b"\n")
         self._recovery_warnings.append("normalized valid unterminated final JSONL record")
 
+    def append_with_admission(
+        self,
+        row: Mapping[str, object],
+    ) -> RowWriteAdmission:
+        """Append one logical row and return a lease-bound write classification."""
+
+        stored = {key: _serializable_value(value) for key, value in row.items()}
+        with self._lock:
+            index = self._count
+            lease = (self._owner_epoch, index)
+            if self._write_error is not None:
+                return RowWriteAdmission(
+                    ROW_WRITE_UNAVAILABLE,
+                    f"spool write failed: {self._write_error}",
+                    row_index=index,
+                    lease=lease,
+                )
+            if self._path is None or self._handle is None:
+                return RowWriteAdmission(
+                    ROW_WRITE_UNAVAILABLE,
+                    "spool is unbound or closed",
+                    row_index=index,
+                    lease=lease,
+                )
+            try:
+                self._handle.write(
+                    json.dumps(stored, ensure_ascii=False, sort_keys=True) + "\n"
+                )
+            except OSError as exc:
+                self._record_write_error(exc)
+                return RowWriteAdmission(
+                    ROW_WRITE_UNAVAILABLE,
+                    f"spool write failed: {exc}",
+                    row_index=index,
+                    lease=lease,
+                )
+            self._preview.append(stored)
+            self._count += 1
+            return RowWriteAdmission(
+                ROW_WRITE_ADMITTED,
+                row_index=index,
+                lease=lease,
+            )
+
     def append(self, row: dict[str, object]) -> bool:
         stored = {key: _serializable_value(value) for key, value in row.items()}
         persisted = True
@@ -692,7 +769,7 @@ class SpoolRows(Sequence[dict[str, object]]):
                     persisted = False
                     self._record_write_error(exc)
                     self._volatile_appends.append(stored)
-            elif self._path is not None and self._write_error is not None:
+            elif self._path is not None:
                 persisted = False
                 self._volatile_appends.append(stored)
             self._preview.append(stored)
@@ -718,7 +795,7 @@ class SpoolRows(Sequence[dict[str, object]]):
                     persisted = False
                     self._record_write_error(exc)
                     self._volatile_updates[resolved] = stored
-            elif self._path is not None and self._write_error is not None:
+            elif self._path is not None:
                 persisted = False
                 self._volatile_updates[resolved] = stored
             preview_start = self._count - len(self._preview)
@@ -726,11 +803,91 @@ class SpoolRows(Sequence[dict[str, object]]):
                 self._preview[resolved - preview_start] = stored
         return persisted
 
+    def replace_with_admission(
+        self,
+        index: int,
+        row: Mapping[str, object],
+        *,
+        lease: tuple[int, int] | None = None,
+    ) -> RowWriteAdmission:
+        """Atomically replace a row only while its spool is writable."""
+
+        with self._lock:
+            if not self.supports_updates:
+                return RowWriteAdmission(
+                    ROW_WRITE_UNAVAILABLE,
+                    "spool does not support row replacement",
+                    row_index=index,
+                    lease=(self._owner_epoch, index),
+                )
+            resolved = index if index >= 0 else self._count + index
+            current_lease = (self._owner_epoch, resolved)
+            if resolved < 0 or resolved >= self._count:
+                return RowWriteAdmission(
+                    ROW_WRITE_UNAVAILABLE,
+                    "spool row index is no longer available",
+                    row_index=resolved,
+                    lease=current_lease,
+                )
+            if lease is not None and lease != current_lease:
+                return RowWriteAdmission(
+                    ROW_WRITE_UNAVAILABLE,
+                    "spool row lease no longer owns this index",
+                    row_index=resolved,
+                    lease=current_lease,
+                )
+            if self._write_error is not None:
+                return RowWriteAdmission(
+                    ROW_WRITE_UNAVAILABLE,
+                    f"spool write failed: {self._write_error}",
+                    row_index=resolved,
+                    lease=current_lease,
+                )
+            if self._path is None or self._handle is None:
+                return RowWriteAdmission(
+                    ROW_WRITE_UNAVAILABLE,
+                    "spool is unbound or closed",
+                    row_index=resolved,
+                    lease=current_lease,
+                )
+
+            stored = {
+                key: _serializable_value(value) for key, value in row.items()
+            }
+            if self._handle is not None:
+                record = {"__spool_update_index": resolved, "__spool_row": stored}
+                try:
+                    self._handle.write(
+                        json.dumps(record, ensure_ascii=False, sort_keys=True)
+                        + "\n"
+                    )
+                except OSError as exc:
+                    self._record_write_error(exc)
+                    self._volatile_updates[resolved] = stored
+                    preview_start = self._count - len(self._preview)
+                    if resolved >= preview_start:
+                        self._preview[resolved - preview_start] = stored
+                    return RowWriteAdmission(
+                        ROW_WRITE_UNAVAILABLE,
+                        f"spool write failed: {exc}",
+                        row_index=resolved,
+                        lease=current_lease,
+                    )
+            preview_start = self._count - len(self._preview)
+            if resolved >= preview_start:
+                self._preview[resolved - preview_start] = stored
+            return RowWriteAdmission(
+                ROW_WRITE_ADMITTED,
+                row_index=resolved,
+                lease=current_lease,
+            )
+
     def pop(self, index: int = -1) -> dict[str, object]:
-        rows = list(self)
-        removed = rows.pop(index)
-        self._rewrite(rows)
-        return removed
+        with self._lock:
+            rows = list(self)
+            removed = rows.pop(index)
+            self._rewrite(rows)
+            return removed
 
     def close(self) -> bool:
         success = True
@@ -766,6 +923,7 @@ class SpoolRows(Sequence[dict[str, object]]):
     def clear(self) -> None:
         with self._lock:
             self.close()
+            self._owner_epoch += 1
             if self._path is not None:
                 self._path.unlink(missing_ok=True)
             self._path = None
@@ -797,6 +955,7 @@ class SpoolRows(Sequence[dict[str, object]]):
                 except OSError:
                     pass
             self._path = None
+            self._owner_epoch += 1
             return True
 
     def __len__(self) -> int:
@@ -870,6 +1029,7 @@ class SpoolRows(Sequence[dict[str, object]]):
     def _rewrite(self, rows: list[dict[str, object]]) -> None:
         path = self._path
         self.close()
+        self._owner_epoch += 1
         self._preview.clear()
         self._count = 0
         self._volatile_appends.clear()
@@ -1047,7 +1207,13 @@ def _project_pair_typed_fields(rows: list[dict[str, object]]) -> list[dict[str, 
         _copy_first_present(row, "recording_time_ns", "session_elapsed_ns")
         _copy_first_present(row, "estimated_utc_time_ns", "recorded_unix_ns")
         _copy_first_present(row, "device_utc_time_ns", "pair_mid_utc_ns")
-        _copy_first_present(row, "sync_delta_ns", "rtcp_pair_delta_ns")
+        _copy_first_present(
+            row,
+            "sync_delta_ns",
+            "selected_pair_delta_ns",
+            "app_receive_pair_delta_ns",
+            "rtcp_pair_delta_ns",
+        )
     return rows
 
 
@@ -1466,12 +1632,23 @@ def _compact_distance_measurement_row(
     metadata: dict[str, object],
 ) -> dict[str, object]:
     recording_time_ns = _recording_time_ns(row, metadata)
-    sync_delta_ns = _optional_int(_first_present(row, "rtcp_pair_delta_ns", "sync_delta_ns"))
+    selected_pair_delta_ns = _optional_int(
+        _first_present(
+            row,
+            "selected_pair_delta_ns",
+            "app_receive_pair_delta_ns",
+            "sync_delta_ns",
+            "rtcp_pair_delta_ns",
+        )
+    )
+    sync_delta_ns = selected_pair_delta_ns
     if sync_delta_ns is None:
         sync_delta_ns = _ns_from_seconds(_first_present(row, "camera_delta_s", "rtcp_pair_delta_s"))
     compact = {
         "sample_index": _optional_int(row.get("sample_index")),
         "recording_time_ns": recording_time_ns,
+        "app_receive_monotonic_ns": _optional_int(row.get("app_receive_monotonic_ns")),
+        "app_receive_timestamp_role": str(row.get("app_receive_timestamp_role") or ""),
         "estimated_utc_time_ns": _estimated_utc_time_ns(row, metadata, recording_time_ns),
         "device_utc_time_ns": _distance_device_utc_time_ns(row),
         "pair_id": str(
@@ -1499,6 +1676,48 @@ def _compact_distance_measurement_row(
         "baseline_center_right_m": _optional_float(row.get("baseline_center_right_m")),
         "baseline_center_down_m": _optional_float(row.get("baseline_center_down_m")),
         "baseline_m": _optional_float(_first_present(row, "baseline_m", "baseline_length_m")),
+        "pairing_time_basis_requested": str(
+            row.get("pairing_time_basis_requested")
+            or row.get("pairing_time_basis")
+            or ""
+        ),
+        "pairing_time_basis": str(row.get("pairing_time_basis") or ""),
+        "pairing_time_basis_role": str(row.get("pairing_time_basis_role") or ""),
+        "pairing_fallback_active": _optional_bool(
+            row.get("pairing_fallback_active")
+        ),
+        "pairing_fallback_reason": str(
+            row.get("pairing_fallback_reason") or ""
+        ),
+        "selected_pair_delta_ns": selected_pair_delta_ns,
+        "selected_pair_abs_delta_ns": _optional_int(row.get("selected_pair_abs_delta_ns")),
+        "selected_pair_midpoint_ns": _optional_int(
+            row.get("selected_pair_midpoint_ns")
+        ),
+        "app_receive_pair_delta_ns": _optional_int(row.get("app_receive_pair_delta_ns")),
+        "app_receive_evidence_role": str(
+            row.get("app_receive_evidence_role") or ""
+        ),
+        "rtcp_pair_delta_ns": _optional_int(row.get("rtcp_pair_delta_ns")),
+        "ntp_evidence_role": str(row.get("ntp_evidence_role") or ""),
+        "left_media_recovery_basis": str(
+            row.get("left_media_recovery_basis") or ""
+        ),
+        "right_media_recovery_basis": str(
+            row.get("right_media_recovery_basis") or ""
+        ),
+        "left_media_integrity_mode": str(
+            row.get("left_media_integrity_mode") or ""
+        ),
+        "right_media_integrity_mode": str(
+            row.get("right_media_integrity_mode") or ""
+        ),
+        "left_media_random_access_guaranteed": _optional_bool(
+            row.get("left_media_random_access_guaranteed")
+        ),
+        "right_media_random_access_guaranteed": _optional_bool(
+            row.get("right_media_random_access_guaranteed")
+        ),
         "sync_delta_ns": sync_delta_ns,
         "quality": str(_first_present(row, "quality", "pair_quality_status") or ""),
         "warning_code": _warning_code(row),
@@ -1521,6 +1740,11 @@ def _compact_camera_timeline_row(
     recording_time_ns = _recording_time_ns(row, metadata)
     receive_delay_ns = _ns_from_seconds(row.get("rtcp_frame_receive_delay_s"))
     invalid_reason = str(row.get("rtcp_timing_invalid_reason") or "")
+    timing_status = (
+        "valid_sr_pc_diagnostic"
+        if is_sr_pc_diagnostic_reason(invalid_reason)
+        else invalid_reason or "valid"
+    )
     compact = {
         "sequence": _optional_int(row.get("sequence")),
         "recording_time_ns": recording_time_ns,
@@ -1542,7 +1766,13 @@ def _compact_camera_timeline_row(
         "rtcp_camera_ntp_rate": _optional_float(row.get("rtcp_camera_ntp_rate")),
         "rtcp_camera_media_rate": _optional_float(row.get("rtcp_camera_media_rate")),
         "rtsp_transport": str(row.get("rtsp_transport") or ""),
-        "timing_status": invalid_reason or "valid",
+        "ntp_evidence_role": str(row.get("ntp_evidence_role") or ""),
+        "media_recovery_basis": str(row.get("media_recovery_basis") or ""),
+        "media_integrity_mode": str(row.get("media_integrity_mode") or ""),
+        "media_random_access_guaranteed": _optional_bool(
+            row.get("media_random_access_guaranteed")
+        ),
+        "timing_status": timing_status,
     }
     return {column: compact.get(column) for column in CAMERA_TIMELINE_COMPACT_COLUMNS}
 
@@ -3830,7 +4060,7 @@ def save_session_files(
         jsonl_stream(
             "time_sync_epochs",
             time_sync_epoch_rows,
-            "time_sync_epoch_record_v1",
+            "time_sync_epoch_record_v2",
         ),
         jsonl_stream(
             "method_evaluation_bundles",

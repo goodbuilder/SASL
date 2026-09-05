@@ -13,10 +13,12 @@ import json
 import math
 import os
 import re
+import threading
 import time
 import uuid
 from collections import deque
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from math import isfinite
@@ -30,8 +32,10 @@ from Workstation.workstation_core.measurement_attempt import (
     AttitudeSnapshot,
     BlockedMeasurementPair,
     GpsSnapshot,
+    LIVE_DISTANCE_MAX_APP_DELTA_NS,
     MeasurementAttempt,
     StereoIntrinsicsSnapshot,
+    live_pair_timing_evidence,
 )
 from Workstation.workstation_core.measurement_methods import (
     CHECKERBOARD_STEREO,
@@ -49,6 +53,12 @@ from Workstation.workstation_core.coordinate_contract import (
     WORLD_FRAME,
 )
 from Workstation.workstation_core.measurement_widgets import DistanceHistoryPoint
+from Workstation.workstation_core.gnss_baseline_center import (
+    DEFAULT_MAXIMUM_GNSS_AGE_S,
+    DEFAULT_MAXIMUM_GNSS_TIMESTAMP_SPREAD_S,
+    build_gnss_baseline_center_record,
+    estimate_gnss_baseline_center_frd,
+)
 from Workstation.workstation_core.hr_evidence import (
     CapturePurpose,
     create_hr_capture_event,
@@ -63,6 +73,10 @@ from Workstation.workstation_core.native_evidence_writer import (
 from Workstation.workstation_core.native_frame_ring import FrameKey
 from Workstation.workstation_core.measurement_data_store import (
     LiveDataRows,
+    ROW_WRITE_ADMITTED,
+    ROW_WRITE_RETRYABLE,
+    ROW_WRITE_UNAVAILABLE,
+    RowWriteAdmission,
     creation_timestamp_text,
 )
 from Workstation.run_evidence_controller import (
@@ -85,9 +99,20 @@ from Workstation.workstation_core.recording_session import (
     session_sheet_previews,
     write_recovery_metadata,
 )
-from Workstation.workstation_core.rtk_geometry import ned_delta_m, project_ned_baseline_to_p1_body_frd
-from Workstation.workstation_core.runtime_camera_status import infer_runtime_camera_timestamp_reference
-from Workstation.workstation_core.yolo_stream import recording_integrity_contract
+from Workstation.workstation_core.rtk_geometry import (
+    GpsPositionState,
+    ned_delta_m,
+    project_ned_baseline_to_p1_body_frd,
+)
+from Workstation.workstation_core.runtime_camera_status import (
+    infer_runtime_camera_timestamp_reference,
+    is_sr_pc_diagnostic_reason,
+)
+from Workstation.workstation_core.yolo_stream import (
+    RECORDING_ENCODING_DECODED_NVENC_LOSSLESS,
+    RECORDING_ENCODING_H264_COPY_GATED,
+    recording_integrity_contract,
+)
 from Workstation.workstation_core.sync import (
     ATTITUDE_STALE_AGE_S,
     ATTITUDE_STALE_PAIR_DELTA_S,
@@ -110,7 +135,75 @@ from Workstation.wiris_runtime_workers import (
 
 RECORDING_PREVIEW_LIMIT = 256
 RECORDING_KEY_CACHE_LIMIT = 1024
+NATIVE_COMPLETION_RETRY_INTERVAL_MS = 100
+NATIVE_COMPLETION_SLOW_RETRY_INTERVAL_MS = 1000
+NATIVE_COMPLETION_FAST_RETRY_LIMIT = 32
+NATIVE_COMPLETION_TOTAL_RETRY_LIMIT = 64
+NATIVE_COMPLETION_MAX_RETRY_AGE_S = 30.0
+NATIVE_COMPLETION_RETRY_BATCH_LIMIT = 16
+NATIVE_COMPLETION_PENDING_SOFT_LIMIT = 128
+NATIVE_COMPLETION_TERMINAL_DROP_CACHE_LIMIT = 128
+NATIVE_TERMINAL_FINGERPRINT_LIMIT = 4096
 _RECORDING_START_MISSING = object()
+
+
+@dataclass(frozen=True)
+class PairRecordingCommitResult:
+    inserted: bool
+    enqueue_admitted: bool
+    row_index: int
+    admission_state: str = ROW_WRITE_ADMITTED
+    admission_reason: str = ""
+    row_lease: tuple[int, int] | None = None
+    direct_persistence: bool = False
+
+
+@dataclass(frozen=True)
+class DistanceHistoryCommitResult:
+    history_added: bool
+    row_commit: PairRecordingCommitResult | None = None
+
+
+@dataclass(frozen=True)
+class _NativeRowOwner:
+    runtime_generation: str
+    rows: object
+    row_index: int
+    row_lease: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True)
+class _NativeTerminalFingerprint:
+    canonical_sha256: str
+    canonical_json: str
+    context: dict[str, object]
+
+
+@dataclass
+class _PendingNativeCompletion:
+    request_id: str
+    canonical_sha256: str
+    payload: dict[str, object]
+    owner: _NativeRowOwner | None
+    event_recorded: bool = False
+    first_seen_monotonic_s: float = 0.0
+    attempts: int = 0
+    next_retry_monotonic_s: float = 0.0
+    slow_retry_logged: bool = False
+
+
+@dataclass
+class _PendingNativeConflict:
+    request_id: str
+    context: dict[str, object]
+    authoritative_sha256: str
+    conflicting_sha256: str
+    conflicting_canonical_json: str
+    first_seen_monotonic_s: float = 0.0
+    attempts: int = 0
+    next_retry_monotonic_s: float = 0.0
+    slow_retry_logged: bool = False
+
 
 # Every panel attribute replaced while opening a recording session.  The
 # transaction keeps the original objects (including any unsaved legacy rows)
@@ -148,6 +241,7 @@ _RECORDING_START_STATE_ATTRIBUTES = (
     "recording_nominal_intrinsics_snapshot",
     "recording_nominal_optical_pose_profile_hash",
     "recording_reference_baseline_ned_m",
+    "_gnss_baseline_center_recording_sequence",
     "distance_recording_enabled",
     "video_recording_enabled",
     "_last_distance_history_key",
@@ -306,6 +400,7 @@ RECORDING_CONTROLLER_METHODS = [
     "_record_unresolved_pair",
     "_record_blocked_measurement_pair",
     "_append_distance_history",
+    "_commit_primary_distance_outcome",
     "_append_extrinsics_comparison_snapshot",
     "_distance_history_class_name",
     "_fmt_record_float",
@@ -316,6 +411,7 @@ RECORDING_CONTROLLER_METHODS = [
     "_raw_timeline_row",
     "_record_gui_camera_frame",
     "_record_external_timeline_row",
+    "_record_gnss_baseline_center",
     "_record_bbox_parameters",
     "_detection_utc_unix_s",
     "_unix_seconds_to_ns",
@@ -355,6 +451,34 @@ class RecordingController:
         self._pending_hr_requests: dict[str, dict[str, object]] = {}
         self._pending_oz_requests: dict[str, dict[str, object]] = {}
         self._deferred_native_frame_results: dict[str, dict[str, object]] = {}
+        self._native_row_owners: dict[str, _NativeRowOwner] = {}
+        self._native_terminal_fingerprints: dict[
+            str, _NativeTerminalFingerprint
+        ] = {}
+        self._native_terminal_fingerprint_order: deque[str] = deque()
+        self._pending_native_completions: dict[
+            str, _PendingNativeCompletion
+        ] = {}
+        self._pending_native_conflicts: dict[str, _PendingNativeConflict] = {}
+        self._native_conflicts_recorded: set[str] = set()
+        self._native_completion_terminal_drops: deque[dict[str, object]] = deque(
+            maxlen=NATIVE_COMPLETION_TERMINAL_DROP_CACHE_LIMIT
+        )
+        self._native_completion_terminal_drop_count = 0
+        self._native_completion_terminal_drop_evictions = 0
+        self._native_completion_retry_scheduled = False
+        self._pair_recording_row_leases: dict[
+            tuple[object, ...], tuple[int, int]
+        ] = {}
+        self._pending_primary_record_rows: dict[
+            tuple[object, ...], dict[str, object]
+        ] = {}
+        self._primary_persistence_lock = threading.RLock()
+        self._compact_primary_persisted_keys: set[tuple[object, ...]] = set()
+        self._compact_primary_persisted_order: deque[tuple[object, ...]] = deque()
+        self._native_primary_persisted_keys: set[tuple[object, ...]] = set()
+        self._native_primary_persisted_order: deque[tuple[object, ...]] = deque()
+        self._primary_retry_required_keys: set[tuple[object, ...]] = set()
         if not hasattr(panel, "_measurement_video_segments"):
             panel._measurement_video_segments = {"left": [], "right": []}
         if not isinstance(
@@ -1361,23 +1485,8 @@ class RecordingController:
         start_camera_streams: bool,
         transaction: dict[str, object],
     ) -> bool | None:
-        stus_operation = getattr(self.panel, "_camera_sync_stus_operation", None)
-        if isinstance(stus_operation, dict) and bool(stus_operation.get("active")):
-            status_text = (
-                "데이터 기록: WIRIS 시간 폐루프 보정/검증 완료 대기 중 "
-                f"(attempt {stus_operation.get('attempts_started', 1)}/"
-                f"{stus_operation.get('max_attempts', 2)})"
-            )
-            self.panel.recording_status_label.setText(status_text)
-            self.panel._log(f"[저장] {status_text}")
-            return False
         if self._camera_photo_capture_active():
             self.panel.recording_status_label.setText("데이터 기록: HR/OZ still 캡처 완료 대기 중")
-            return False
-        if start_camera_streams and self.panel.wiris_time_sync_thread is not None:
-            status_text = "데이터 기록: WIRIS 시간 동기화 및 스트림 재연결 완료 대기 중"
-            self.panel.recording_status_label.setText(status_text)
-            self.panel._log(f"[저장] {status_text}")
             return False
         if start_camera_streams and (
             self.panel.pixhawk_connection_thread is not None
@@ -1451,6 +1560,7 @@ class RecordingController:
         self.panel.method_evaluation_bundle_rows = allocate_rows(
             "method_evaluations", priority=True
         )
+        self.panel._gnss_baseline_center_recording_sequence = 0
         self.panel._recording_pair_row_index = {}
         self.panel._recording_pending_native_request_rows = {}
         self._deferred_native_frame_results = {}
@@ -1570,6 +1680,10 @@ class RecordingController:
                     )
                 except Exception:
                     pass
+        # The view controller owns any pre-generation primary outcome and can
+        # persist it through its compact late/direct path.  New rows must not
+        # inherit a stale full-row retry candidate from the retired recording.
+        self._pending_primary_record_rows.clear()
         return None
 
     @staticmethod
@@ -1781,8 +1895,10 @@ class RecordingController:
             if callable(sync_rtcm_context):
                 try:
                     sync_rtcm_context()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Must never delay/block the stop path; only surface that
+                    # RTCM evidence sync for this session may be incomplete.
+                    self.panel._log(f"[저장] RTCM evidence sync 실패(계속 진행): {exc}")
             was_manual = bool(getattr(self.panel, "_manual_recording_active", False))
             self.panel._manual_recording_active = False
             for rows in (
@@ -1797,8 +1913,10 @@ class RecordingController:
                 if callable(closer):
                     try:
                         closer()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # Never let one writer's close failure block the rest
+                        # of the stop path; just record that data may be lost.
+                        self.panel._log(f"[저장] 기록 writer close 실패(계속 진행): {exc}")
             append = getattr(self.panel, "append_workstation_data", None)
             if callable(append):
                 try:
@@ -1816,8 +1934,11 @@ class RecordingController:
                         },
                         priority=True,
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Evidence append failures must never block the stop path.
+                    self.panel._log(
+                        f"[저장] recording_stopped 이벤트 기록 실패(계속 진행): {exc}"
+                    )
                 for side, raw_path in (
                     getattr(self.panel, "video_recording_paths", {}) or {}
                 ).items():
@@ -1835,6 +1956,35 @@ class RecordingController:
                         finalization.get("recording_encoding_mode")
                         or default_contract["recording_encoding_mode"]
                     )
+                    try:
+                        inferred_present = path.is_file() and path.stat().st_size > 0
+                    except OSError:
+                        inferred_present = False
+                    if (
+                        not finalization
+                        and inferred_present
+                        and encoding_mode == RECORDING_ENCODING_DECODED_NVENC_LOSSLESS
+                    ):
+                        finalization = {
+                            **default_contract,
+                            "path": str(path),
+                            "stream_backend": backend,
+                            "success": True,
+                            "container_finalization_success": True,
+                            "container_finalization_inferred": True,
+                            "detail": (
+                                "camera child closed with non-empty decoded NVENC MP4; "
+                                "output validation pending"
+                            ),
+                            "integrity_validation_status": "PENDING",
+                            "recording_integrity_verified": False,
+                            "recording_file_integrity_verified": False,
+                            "source_media_integrity_verified": False,
+                            "recording_usable": True,
+                            "integrity_failure_reasons": [
+                                "finalized_mp4_output_validation_pending"
+                            ],
+                        }
                     integrity_pass = bool(
                         finalization.get("integrity_schema")
                         == H264_MP4_INTEGRITY_SCHEMA
@@ -1842,10 +1992,7 @@ class RecordingController:
                         and finalization.get("recording_usable") is True
                         and finalization.get("recording_integrity_verified") is True
                     )
-                    h264_copy = str(backend or "").strip().lower() in {
-                        "gst",
-                        "gstreamer",
-                    }
+                    h264_copy = encoding_mode == RECORDING_ENCODING_H264_COPY_GATED
                     integrity_status = str(
                         finalization.get("integrity_validation_status")
                         or ("PENDING" if not finalization else "FAIL")
@@ -1914,9 +2061,19 @@ class RecordingController:
                                         finalization.get("success", False),
                                     )
                                 ),
+                                "container_finalization_inferred": bool(
+                                    finalization.get(
+                                        "container_finalization_inferred",
+                                        False,
+                                    )
+                                ),
                                 "integrity_validation_status": integrity_status,
                                 "recording_integrity_verified": bool(integrity_pass),
-                                "recording_usable": bool(integrity_pass),
+                                "recording_usable": bool(
+                                    finalization.get("recording_usable", False)
+                                    if not h264_copy
+                                    else integrity_pass
+                                ),
                                 "source_media_integrity_verified": bool(
                                     finalization.get(
                                         "source_media_integrity_verified",
@@ -1940,16 +2097,23 @@ class RecordingController:
                             },
                             priority=True,
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # Evidence append failures must never block the stop
+                        # path; the video file on disk is unaffected either way.
+                        self.panel._log(
+                            f"[저장] video_closed 이벤트 기록 실패(계속 진행): {exc}"
+                        )
             self.panel.recording_session_id = ""
             self.panel._recording_mode = "idle"
             flush = getattr(self.panel, "flush_workstation_data", None)
             if callable(flush):
                 try:
                     flush()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Flush failure must never block the stop path; surface it
+                    # so an operator can tell that this session's data may be
+                    # incomplete on disk.
+                    self.panel._log(f"[저장] workstation data flush 실패(계속 진행): {exc}")
             record_button = getattr(self.panel, "record_button", None)
             setter = getattr(record_button, "setText", None)
             if callable(setter):
@@ -3602,6 +3766,11 @@ class RecordingController:
             invalid_rtcp_count = sum(
                 1 for row in rows
                 if row.get("rtcp_timing_invalid_reason") not in (None, "")
+                and not is_sr_pc_diagnostic_reason(row.get("rtcp_timing_invalid_reason"))
+            )
+            sr_pc_diagnostic_count = sum(
+                1 for row in rows
+                if is_sr_pc_diagnostic_reason(row.get("rtcp_timing_invalid_reason"))
             )
             clock_rate_values = numeric_values(rows, "rtcp_clock_rate_hz")
             media_rate_values = numeric_values(rows, "rtcp_camera_media_rate")
@@ -3620,6 +3789,7 @@ class RecordingController:
                 "rtcp_valid_frame_count": valid_rtcp_count,
                 "rtcp_missing_frame_count": max(0, len(rows) - valid_rtcp_count),
                 "rtcp_invalid_frame_count": invalid_rtcp_count,
+                "rtcp_sr_pc_diagnostic_frame_count": sr_pc_diagnostic_count,
                 "rtcp_valid_ratio": (
                     None if not rows else valid_rtcp_count / float(len(rows))
                 ),
@@ -3786,7 +3956,7 @@ class RecordingController:
             "measurement_started_unix_ns": self.panel.recording_session_started_unix_ns,
             "measurement_started_monotonic_ns": self.panel.recording_session_started_monotonic_ns,
             "measurement_time_anchor_uncertainty_ns": self.panel.recording_session_anchor_uncertainty_ns,
-            "schema_version": "stereowiris-paired-frame-v3",
+            "schema_version": "stereowiris-paired-frame-v5",
             "row_contract": "one row per terminal left/right matched detection outcome",
             "terminal_record_id_contract": (
                 "attempt:<measurement_attempt_sha256> or "
@@ -3795,6 +3965,22 @@ class RecordingController:
             "left_video_path": str(self.panel.video_recording_paths.get("left", "")),
             "right_video_path": str(self.panel.video_recording_paths.get("right", "")),
             "matched_frame_pair_count": len(self.panel.distance_recording_rows),
+            "native_completion_persistence_pending_count": len(
+                self._pending_native_completions
+            ),
+            "native_completion_conflict_pending_count": len(
+                self._pending_native_conflicts
+            ),
+            "native_completion_terminal_drop_count": (
+                self._native_completion_terminal_drop_count
+            ),
+            "native_completion_terminal_drop_evictions": (
+                self._native_completion_terminal_drop_evictions
+            ),
+            "native_completion_terminal_drops": [
+                copy.deepcopy(record)
+                for record in self._native_completion_terminal_drops
+            ],
             "camera_left_gui_frame_count": len(self.panel.camera_recording_rows["left"]),
             "camera_right_gui_frame_count": len(self.panel.camera_recording_rows["right"]),
             "px4_left_sample_count": len(self.panel.px4_recording_rows["left"]),
@@ -3924,10 +4110,21 @@ class RecordingController:
             "checkerboard_stereo_extrinsics": self.panel._record_current_checkerboard_extrinsics_parameters(),
             "timestamp_contract": {
                 "manufacturer_confirmed": False,
+                "distance_pairing_time_basis_requested": str(
+                    self.panel._yolo_time_basis()
+                ),
+                "distance_pairing_policy": "settings_preferred_with_app_receive_fallback",
+                "distance_pairing_time_role": "per_pair_effective_authoritative_distance",
+                "distance_pairing_max_abs_delta_ns": LIVE_DISTANCE_MAX_APP_DELTA_NS,
                 "camera_captured_timestamp_clock": "WIRIS RTC checked by STUS/GDTI",
                 "rtp_rtcp_timestamp_clock": "RTP relative media counter; RTCP Sender Report NTP-derived stream time",
                 "rtp_timestamp_note": "RTP timestamp is a 90 kHz media clock counter; mapping RTCP NTP to WIRIS GDTI/UTC is unverified.",
-                "preferred_frame_time_field": "rtcp_frame_ntp_unix_s",
+                "app_receive_fallback_field": "app_receive_monotonic_ns",
+                "ntp_evidence_role": "selected_only_when_requested_verified_current_same_epoch",
+                "media_integrity_mode": "tolerant_decoded",
+                "media_random_access_contract": (
+                    "diagnostic_provenance_only; decoded Measurement admitted"
+                ),
                 "legacy_equivalent_field": "camera_rtc_frame_unix_s",
                 "clock_offset_check": "Use the 시간 tab RTCP/NTP check plus direct WIRIS GDTI validation before absolute UTC claims.",
             },
@@ -4040,7 +4237,7 @@ class RecordingController:
             "measurement_detection_pair_key": json.dumps(
                 measurement_attempt.detection_pair_key, separators=(",", ":")
             ),
-            "schema_version": "stereowiris-paired-frame-v3",
+            "schema_version": "stereowiris-paired-frame-v5",
             "measurement_attempt_content_sha256": measurement_attempt.content_sha256(),
             "measurement_attempt_instance_sha256": measurement_attempt.instance_sha256(),
             "measurement_attempt_timestamp_basis": measurement_attempt.timestamp_basis,
@@ -4277,6 +4474,16 @@ class RecordingController:
                 "evidence_state": "REJECTED",
             }
 
+        if len(self._pending_native_completions) >= NATIVE_COMPLETION_PENDING_SOFT_LIMIT:
+            if reservation is not None:
+                reservation.release()
+            return {
+                "native_pair_status": "completion_retry_backpressure",
+                "native_pair_error": (
+                    "native completion persistence retry ownership is at capacity"
+                ),
+                "evidence_state": "FAILED",
+            }
         request_id = f"native-{uuid.uuid4().hex}"
         context = {
             "session_id": session_id,
@@ -4359,6 +4566,7 @@ class RecordingController:
             timestamp_filenames=not bool(
                 getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
             ),
+            events_path=self._native_events_path(root),
             parent=parent,
         )
         callback = getattr(self.panel, "_handle_async_native_frame_result", None)
@@ -4397,6 +4605,7 @@ class RecordingController:
             timestamp_filenames=not bool(
                 getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
             ),
+            events_path=self._native_events_path(root),
             parent=parent,
         )
         callback = getattr(self.panel, "_handle_async_native_frame_result", None)
@@ -4410,8 +4619,526 @@ class RecordingController:
         writers[writer_key] = writer
         return writer
 
+    def _native_events_path(self, root: Path) -> Path:
+        """Use the timestamped native ledger selected by the data store when co-located."""
+
+        candidate: Path | None = None
+        owner_factory = getattr(self.panel, "_data_storage_controller", None)
+        if callable(owner_factory):
+            try:
+                store = owner_factory().store
+                path_for = getattr(store, "path_for", None)
+                if callable(path_for):
+                    candidate = Path(path_for("native.frames"))
+            except (OSError, RuntimeError, TypeError, ValueError):
+                candidate = None
+        if candidate is None:
+            return root / "native_frames.jsonl"
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            return root / candidate.name
+        return candidate
+
+    @staticmethod
+    def _native_completion_fingerprint(
+        *,
+        request_id: str,
+        context: Mapping[str, object],
+        fields: Mapping[str, object],
+    ) -> tuple[str, str, dict[str, object]]:
+        canonical_fields = dict(fields)
+        canonical_fields.pop("native_completion_sha256", None)
+        payload = {
+            "request_id": str(request_id),
+            "context": dict(context),
+            "fields": canonical_fields,
+        }
+        canonical_json = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return (
+            hashlib.sha256(canonical_json.encode("utf-8")).hexdigest(),
+            canonical_json,
+            payload,
+        )
+
+    def _remember_native_terminal_fingerprint(
+        self,
+        request_id: str,
+        fingerprint: _NativeTerminalFingerprint,
+    ) -> None:
+        self._native_terminal_fingerprints[request_id] = fingerprint
+        self._native_terminal_fingerprint_order.append(request_id)
+        protected = set(self._pending_native_completions)
+        protected.update(self._deferred_native_frame_results)
+        protected.update(self._native_row_owners)
+        protected.add(request_id)
+        while (
+            len(self._native_terminal_fingerprints)
+            > NATIVE_TERMINAL_FINGERPRINT_LIMIT
+        ):
+            removed = False
+            for _ in range(len(self._native_terminal_fingerprint_order)):
+                candidate = self._native_terminal_fingerprint_order.popleft()
+                if candidate in protected:
+                    self._native_terminal_fingerprint_order.append(candidate)
+                    continue
+                self._native_terminal_fingerprints.pop(candidate, None)
+                self._native_conflicts_recorded.discard(candidate)
+                removed = True
+                break
+            if not removed:
+                # Persistence-required identities are never evicted merely to
+                # satisfy the diagnostic fingerprint cache bound.
+                break
+
+    def _native_result_store(
+        self,
+        context: Mapping[str, object],
+    ) -> AsyncNativeFrameStore | AsyncNativeEvidenceWriter | None:
+        writer_kind = str(context.get("writer_kind") or "legacy")
+        stores = getattr(
+            self.panel,
+            "_native_evidence_writers"
+            if writer_kind == "ring"
+            else "_native_frame_async_stores",
+            None,
+        )
+        session_id = str(context.get("session_id") or "")
+        store_key = (
+            "measurement-data"
+            if not bool(
+                getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
+            )
+            else session_id
+        )
+        store = stores.get(store_key) if isinstance(stores, dict) else None
+        return (
+            store
+            if isinstance(store, (AsyncNativeFrameStore, AsyncNativeEvidenceWriter))
+            else None
+        )
+
+    @staticmethod
+    def _acknowledge_native_result(
+        store: AsyncNativeFrameStore | AsyncNativeEvidenceWriter | None,
+        request_id: str,
+    ) -> None:
+        if store is not None:
+            store.acknowledge(request_id)
+
+    @staticmethod
+    def _native_completion_retry_delay_s(attempts: int) -> float:
+        interval_ms = (
+            NATIVE_COMPLETION_RETRY_INTERVAL_MS
+            if attempts < NATIVE_COMPLETION_FAST_RETRY_LIMIT
+            else NATIVE_COMPLETION_SLOW_RETRY_INTERVAL_MS
+        )
+        return interval_ms / 1000.0
+
+    def _log_native_completion_slow_retry(
+        self,
+        *,
+        request_id: str,
+        attempts: int,
+    ) -> None:
+        logger = getattr(self.panel, "_log", None)
+        if callable(logger):
+            logger(
+                "[저장] native completion fast retry budget 소진; "
+                "payload ownership을 유지하고 저속 background 재시도를 계속합니다: "
+                f"request={request_id}, attempts={attempts}"
+            )
+
+    @staticmethod
+    def _native_retry_is_terminal(
+        *,
+        attempts: int,
+        first_seen_monotonic_s: float,
+    ) -> bool:
+        age_s = max(0.0, time.monotonic() - first_seen_monotonic_s)
+        return bool(
+            attempts >= NATIVE_COMPLETION_TOTAL_RETRY_LIMIT
+            or age_s >= NATIVE_COMPLETION_MAX_RETRY_AGE_S
+        )
+
+    def _remember_native_completion_terminal_drop(
+        self,
+        record: Mapping[str, object],
+    ) -> None:
+        if (
+            self._native_completion_terminal_drops.maxlen is not None
+            and len(self._native_completion_terminal_drops)
+            >= self._native_completion_terminal_drops.maxlen
+        ):
+            self._native_completion_terminal_drop_evictions += 1
+            logger = getattr(self.panel, "_log", None)
+            if callable(logger):
+                logger(
+                    "[저장] native completion terminal-drop 진단 cache가 가득 차 "
+                    "가장 오래된 항목을 명시적으로 교체합니다: "
+                    f"evictions={self._native_completion_terminal_drop_evictions}"
+                )
+        frozen = copy.deepcopy(dict(record))
+        self._native_completion_terminal_drops.append(frozen)
+        self._native_completion_terminal_drop_count += 1
+        setattr(
+            self.panel,
+            "_native_completion_terminal_drop_count",
+            self._native_completion_terminal_drop_count,
+        )
+        setattr(
+            self.panel,
+            "_native_completion_last_terminal_drop",
+            frozen,
+        )
+        logger = getattr(self.panel, "_log", None)
+        if callable(logger):
+            logger(
+                "[저장] native completion 영구 admission 실패를 terminal drop으로 "
+                "전환했습니다; 원 payload/hash는 bounded 진단 cache에 유지됩니다: "
+                f"request={frozen.get('request_id')}, "
+                f"sha256={frozen.get('native_completion_sha256')}, "
+                f"attempts={frozen.get('attempts')}"
+            )
+
+    def _terminal_drop_native_completion(
+        self,
+        record: _PendingNativeCompletion,
+    ) -> None:
+        context = record.payload.get("context")
+        context = dict(context) if isinstance(context, Mapping) else {}
+        fields = record.payload.get("fields")
+        fields = dict(fields) if isinstance(fields, Mapping) else {}
+        age_s = max(0.0, time.monotonic() - record.first_seen_monotonic_s)
+        drop_fields = {
+            **fields,
+            "native_completion_sha256": record.canonical_sha256,
+            "native_completion_persistence_state": "TERMINAL_DROPPED",
+            "native_completion_persistence_reason": (
+                "row projection and native.frames event admission remained unavailable"
+            ),
+            "native_completion_retry_attempts": record.attempts,
+            "native_completion_retry_age_s": age_s,
+            "native_completion_canonical_json": json.dumps(
+                record.payload,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        }
+        status_event_admitted = self._append_native_frame_completion_event(
+            request_id=record.request_id,
+            context=context,
+            fields=drop_fields,
+            force=True,
+            event_type="native_frame_completion_persistence_dropped",
+        )
+        self._remember_native_completion_terminal_drop(
+            {
+                "event_type": "native_frame_completion_persistence_dropped",
+                "request_id": record.request_id,
+                "runtime_generation": str(context.get("session_id") or ""),
+                "native_completion_sha256": record.canonical_sha256,
+                "attempts": record.attempts,
+                "age_s": age_s,
+                "status_event_admitted": status_event_admitted,
+                "payload": record.payload,
+                "owner_runtime_generation": (
+                    "" if record.owner is None else record.owner.runtime_generation
+                ),
+                "owner_row_index": (
+                    None if record.owner is None else record.owner.row_index
+                ),
+                "owner_row_lease": (
+                    None
+                    if record.owner is None or record.owner.row_lease is None
+                    else list(record.owner.row_lease)
+                ),
+            }
+        )
+        self._finish_native_completion(record.request_id)
+
+    def _terminal_drop_native_conflict(
+        self,
+        record: _PendingNativeConflict,
+    ) -> None:
+        age_s = max(0.0, time.monotonic() - record.first_seen_monotonic_s)
+        fields = {
+            "native_completion_conflict": True,
+            "native_completion_authority": "first_terminal_wins",
+            "native_completion_authoritative_sha256": record.authoritative_sha256,
+            "native_completion_rejected_sha256": record.conflicting_sha256,
+            "native_completion_rejected_canonical_json": (
+                record.conflicting_canonical_json
+            ),
+            "native_completion_persistence_state": "TERMINAL_DROPPED",
+            "native_completion_retry_attempts": record.attempts,
+            "native_completion_retry_age_s": age_s,
+        }
+        status_event_admitted = self._append_native_frame_completion_event(
+            request_id=record.request_id,
+            context=record.context,
+            fields=fields,
+            force=True,
+            event_type="native_frame_completion_conflict_persistence_dropped",
+        )
+        self._remember_native_completion_terminal_drop(
+            {
+                "event_type": "native_frame_completion_conflict_persistence_dropped",
+                "request_id": record.request_id,
+                "runtime_generation": str(
+                    record.context.get("session_id") or ""
+                ),
+                "native_completion_sha256": record.authoritative_sha256,
+                "conflicting_sha256": record.conflicting_sha256,
+                "attempts": record.attempts,
+                "age_s": age_s,
+                "status_event_admitted": status_event_admitted,
+            }
+        )
+        self._pending_native_conflicts.pop(record.request_id, None)
+        self._native_conflicts_recorded.add(record.request_id)
+
+    def _defer_native_completion_retry(
+        self,
+        record: _PendingNativeCompletion,
+    ) -> None:
+        record.attempts += 1
+        record.next_retry_monotonic_s = (
+            time.monotonic()
+            + self._native_completion_retry_delay_s(record.attempts)
+        )
+        if (
+            record.attempts >= NATIVE_COMPLETION_FAST_RETRY_LIMIT
+            and not record.slow_retry_logged
+        ):
+            record.slow_retry_logged = True
+            self._log_native_completion_slow_retry(
+                request_id=record.request_id,
+                attempts=record.attempts,
+            )
+        if self._native_retry_is_terminal(
+            attempts=record.attempts,
+            first_seen_monotonic_s=record.first_seen_monotonic_s,
+        ):
+            self._terminal_drop_native_completion(record)
+            return
+        self._pending_native_completions[record.request_id] = record
+        self._schedule_native_completion_retry()
+
+    def _finish_native_completion(self, request_id: str) -> None:
+        self._pending_native_completions.pop(request_id, None)
+        self._native_row_owners.pop(request_id, None)
+        pending = getattr(
+            self.panel,
+            "_recording_pending_native_request_rows",
+            None,
+        )
+        if isinstance(pending, dict):
+            pending.pop(request_id, None)
+
+    def _finish_native_completion_from_admitted_row(
+        self,
+        values: Mapping[str, object],
+    ) -> None:
+        request_id = str(values.get("native_pair_request_id") or "")
+        if not request_id:
+            return
+        record = self._pending_native_completions.get(request_id)
+        if record is None:
+            return
+        status = str(values.get("native_pair_status") or "")
+        row_sha256 = str(values.get("native_completion_sha256") or "")
+        if status == "pending" or not row_sha256:
+            return
+        if row_sha256 != record.canonical_sha256:
+            logger = getattr(self.panel, "_log", None)
+            if callable(logger):
+                logger(
+                    "[저장] admitted native completion row fingerprint 불일치; "
+                    "first terminal retry ownership을 유지합니다: "
+                    f"request={request_id}, expected={record.canonical_sha256}, "
+                    f"actual={row_sha256}"
+                )
+            return
+        self._deferred_native_frame_results.pop(request_id, None)
+        self._finish_native_completion(request_id)
+
+    def _attempt_native_conflict_diagnostic(
+        self,
+        record: _PendingNativeConflict,
+    ) -> bool:
+        admitted = self._append_native_frame_completion_event(
+            request_id=record.request_id,
+            context=record.context,
+            fields={
+                "native_completion_conflict": True,
+                "native_completion_authority": "first_terminal_wins",
+                "native_completion_authoritative_sha256": (
+                    record.authoritative_sha256
+                ),
+                "native_completion_rejected_sha256": record.conflicting_sha256,
+                "native_completion_rejected_canonical_json": (
+                    record.conflicting_canonical_json
+                ),
+            },
+            force=True,
+            event_type="native_frame_completion_conflict",
+        )
+        if admitted:
+            self._pending_native_conflicts.pop(record.request_id, None)
+            self._native_conflicts_recorded.add(record.request_id)
+            return True
+        record.attempts += 1
+        record.next_retry_monotonic_s = (
+            time.monotonic()
+            + self._native_completion_retry_delay_s(record.attempts)
+        )
+        if (
+            record.attempts >= NATIVE_COMPLETION_FAST_RETRY_LIMIT
+            and not record.slow_retry_logged
+        ):
+            record.slow_retry_logged = True
+            self._log_native_completion_slow_retry(
+                request_id=record.request_id,
+                attempts=record.attempts,
+            )
+        if self._native_retry_is_terminal(
+            attempts=record.attempts,
+            first_seen_monotonic_s=record.first_seen_monotonic_s,
+        ):
+            self._terminal_drop_native_conflict(record)
+            return False
+        self._pending_native_conflicts[record.request_id] = record
+        self._schedule_native_completion_retry()
+        return False
+
+    def _record_native_completion_conflict(
+        self,
+        *,
+        request_id: str,
+        authoritative: _NativeTerminalFingerprint,
+        conflicting_sha256: str,
+        conflicting_canonical_json: str,
+    ) -> None:
+        if (
+            request_id in self._native_conflicts_recorded
+            or request_id in self._pending_native_conflicts
+        ):
+            return
+        record = _PendingNativeConflict(
+            request_id=request_id,
+            context=dict(authoritative.context),
+            authoritative_sha256=authoritative.canonical_sha256,
+            conflicting_sha256=conflicting_sha256,
+            conflicting_canonical_json=conflicting_canonical_json,
+            first_seen_monotonic_s=time.monotonic(),
+        )
+        self._pending_native_conflicts[request_id] = record
+        self._attempt_native_conflict_diagnostic(record)
+
+    def _schedule_native_completion_retry(self) -> None:
+        if self._native_completion_retry_scheduled or not (
+            self._pending_native_completions or self._pending_native_conflicts
+        ):
+            return
+        self._native_completion_retry_scheduled = True
+        QtCore.QTimer.singleShot(
+            NATIVE_COMPLETION_RETRY_INTERVAL_MS,
+            self._retry_pending_native_completions,
+        )
+
+    def _retry_pending_native_completions(self, *, force: bool = False) -> None:
+        self._native_completion_retry_scheduled = False
+        now_s = time.monotonic()
+        attempted = 0
+        for request_id, record in tuple(self._pending_native_completions.items()):
+            if attempted >= NATIVE_COMPLETION_RETRY_BATCH_LIMIT:
+                break
+            if not force and record.next_retry_monotonic_s > now_s:
+                continue
+            payload = copy.deepcopy(record.payload)
+            payload["_native_completion_retry"] = True
+            payload["_native_completion_owner"] = record.owner
+            payload["_completion_event_recorded"] = record.event_recorded
+            attempted += 1
+            try:
+                self._handle_async_native_frame_result(payload)
+            except Exception as exc:  # noqa: BLE001 - retry ownership must survive.
+                logger = getattr(self.panel, "_log", None)
+                if callable(logger):
+                    logger(
+                        "[저장] native completion background retry 실패: "
+                        f"request={request_id}, error={exc}"
+                    )
+                self._defer_native_completion_retry(record)
+        now_s = time.monotonic()
+        for request_id, record in tuple(self._pending_native_conflicts.items()):
+            if attempted >= NATIVE_COMPLETION_RETRY_BATCH_LIMIT:
+                break
+            if not force and record.next_retry_monotonic_s > now_s:
+                continue
+            attempted += 1
+            self._attempt_native_conflict_diagnostic(record)
+        if self._pending_native_completions or self._pending_native_conflicts:
+            self._schedule_native_completion_retry()
+
+    def _append_native_frame_completion_event(
+        self,
+        *,
+        request_id: str,
+        context: Mapping[str, object],
+        fields: Mapping[str, object],
+        force: bool = False,
+        event_type: str = "native_frame_pair_persisted",
+    ) -> bool:
+        if not force and bool(
+            getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
+        ):
+            return False
+        writer = getattr(self.panel, "append_workstation_data", None)
+        if not callable(writer):
+            return False
+        runtime_generation = str(context.get("session_id") or "")
+        try:
+            accepted = writer(
+                "native.frames",
+                {
+                    **dict(fields),
+                    "event_type": str(event_type),
+                    "runtime_generation": runtime_generation,
+                    "request_id": request_id,
+                    "native_request_context": {
+                        "owner_runtime_generation": runtime_generation,
+                        "request_id": request_id,
+                        "record_key": context.get("record_key"),
+                        "writer_kind": str(context.get("writer_kind") or "legacy"),
+                    },
+                },
+                priority=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - evidence failure must not block row completion.
+            logger = getattr(self.panel, "_log", None)
+            if callable(logger):
+                logger(f"[저장] native frame completion event 기록 실패: {exc}")
+            return False
+        return accepted is not False
+
     def _handle_async_native_frame_result(self, payload: object) -> None:
         data = dict(payload or {})
+        retrying = bool(data.pop("_native_completion_retry", False))
+        internal_replay = bool(data.pop("_native_completion_internal_replay", False))
+        supplied_owner = data.pop("_native_completion_owner", None)
+        supplied_owner = (
+            supplied_owner if isinstance(supplied_owner, _NativeRowOwner) else None
+        )
         request_id = str(data.get("request_id") or "")
         context = data.get("context")
         context = dict(context) if isinstance(context, Mapping) else {}
@@ -4421,32 +5148,125 @@ class RecordingController:
             "native_pair_status": "failed",
             "native_pair_error": "async native frame result is malformed",
         }
-        writer_kind = str(context.get("writer_kind") or "legacy")
-        stores = getattr(
-            self.panel,
-            "_native_evidence_writers"
-            if writer_kind == "ring"
-            else "_native_frame_async_stores",
-            None,
-        )
-        store_key = (
-            "measurement-data"
-            if not bool(
-                getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
+        event_recorded = bool(data.get("_completion_event_recorded", False))
+        try:
+            completion_sha256, canonical_json, canonical_payload = (
+                self._native_completion_fingerprint(
+                    request_id=request_id,
+                    context=context,
+                    fields=fields,
+                )
             )
-            else session_id
-        )
-        store = stores.get(store_key) if isinstance(stores, dict) else None
+        except (TypeError, ValueError) as exc:
+            fields = {
+                "native_pair_status": "failed",
+                "native_pair_error": (
+                    "async native frame result is not canonical JSON: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                "evidence_state": "FAILED",
+            }
+            completion_sha256, canonical_json, canonical_payload = (
+                self._native_completion_fingerprint(
+                    request_id=request_id,
+                    context=context,
+                    fields=fields,
+                )
+            )
+        fields = {
+            **fields,
+            "native_completion_sha256": completion_sha256,
+        }
+        store = self._native_result_store(context)
+        if not request_id:
+            self._acknowledge_native_result(store, request_id)
+            return
+        existing_fingerprint = self._native_terminal_fingerprints.get(request_id)
+        if not retrying and not internal_replay and existing_fingerprint is not None:
+            if existing_fingerprint.canonical_sha256 == completion_sha256:
+                # The writer may deliver the same terminal signal more than
+                # once. The first callback already owns projection/persistence.
+                self._acknowledge_native_result(store, request_id)
+                return
+            self._record_native_completion_conflict(
+                request_id=request_id,
+                authoritative=existing_fingerprint,
+                conflicting_sha256=completion_sha256,
+                conflicting_canonical_json=canonical_json,
+            )
+            self._acknowledge_native_result(store, request_id)
+            return
+        if existing_fingerprint is None:
+            existing_fingerprint = _NativeTerminalFingerprint(
+                canonical_sha256=completion_sha256,
+                canonical_json=canonical_json,
+                context=dict(context),
+            )
+            self._remember_native_terminal_fingerprint(
+                request_id,
+                existing_fingerprint,
+            )
         raw_key = context.get("record_key")
         record_key = tuple(raw_key) if isinstance(raw_key, (tuple, list)) else None
-        rows = getattr(self.panel, "distance_recording_rows", None)
+        current_rows = getattr(self.panel, "distance_recording_rows", None)
+        rows = current_rows
         pending = getattr(self.panel, "_recording_pending_native_request_rows", {})
-        target = pending.pop(request_id, None) if isinstance(pending, dict) else None
+        owner = supplied_owner or self._native_row_owners.pop(request_id, None)
+        if owner is not None:
+            rows = owner.rows
+            target = (owner.runtime_generation, owner.row_index)
+            if isinstance(pending, dict):
+                pending.pop(request_id, None)
+        else:
+            target = pending.pop(request_id, None) if isinstance(pending, dict) else None
         if target is None and rows is not None and request_id:
             for candidate_index, candidate in enumerate(rows):
                 if str(candidate.get("native_pair_request_id") or "") == request_id:
                     target = (session_id, candidate_index)
                     break
+        if owner is None and target is not None and rows is not None:
+            owner = _NativeRowOwner(
+                runtime_generation=str(target[0]),
+                rows=rows,
+                row_index=int(target[1]),
+            )
+        retry_record = self._pending_native_completions.get(request_id)
+        if retry_record is None:
+            retry_record = _PendingNativeCompletion(
+                request_id=request_id,
+                canonical_sha256=existing_fingerprint.canonical_sha256,
+                payload=copy.deepcopy(canonical_payload),
+                owner=owner,
+                event_recorded=event_recorded,
+                first_seen_monotonic_s=time.monotonic(),
+            )
+        else:
+            if owner is not None:
+                retry_record.owner = owner
+            retry_record.event_recorded = bool(
+                retry_record.event_recorded or event_recorded
+            )
+        self._pending_native_completions[request_id] = retry_record
+        row_admitted = False
+        event_attempted = False
+        if not event_recorded:
+            event_attempted = bool(
+                target is None
+                or not bool(
+                    getattr(
+                        self.panel,
+                        "_measurement_session_hierarchy_enabled",
+                        True,
+                    )
+                )
+            )
+            event_recorded = self._append_native_frame_completion_event(
+                request_id=request_id,
+                context=context,
+                fields=fields,
+                force=target is None,
+            )
+            data["_completion_event_recorded"] = event_recorded
         if target is None and record_key is not None:
             # A non-QObject test adapter can deliver directly from the writer
             # thread before the GUI-side append/upsert binds the request ID.
@@ -4454,44 +5274,222 @@ class RecordingController:
             # barrier now. The binding path drains this exact payload if the
             # row is committed; a later row-building exception must never leave
             # session shutdown waiting on work that has already finished.
+            data = copy.deepcopy(canonical_payload)
+            data["fields"] = dict(fields)
+            data["_completion_event_recorded"] = event_recorded
             self._deferred_native_frame_results[request_id] = data
-            if isinstance(store, (AsyncNativeFrameStore, AsyncNativeEvidenceWriter)):
-                store.acknowledge(request_id)
+            retry_record.event_recorded = event_recorded
+            if event_recorded:
+                self._finish_native_completion(request_id)
+            else:
+                self._defer_native_completion_retry(retry_record)
+            self._acknowledge_native_result(store, request_id)
             return
-        if not bool(
-            getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
-        ):
-            writer = getattr(self.panel, "append_workstation_data", None)
-            if callable(writer):
-                writer(
-                    "native.frames",
-                    {
-                        "event_type": "native_frame_pair_persisted",
-                        "runtime_generation": session_id,
-                        "request_id": request_id,
-                        **fields,
-                    },
-                    priority=True,
-                )
+        if target is None and record_key is None:
+            # Diagnostic/native lookup callers have no Measurement row join.
+            # Their NativeFrameStore ledger is already the durable authority;
+            # an optional workstation event failure must not create an orphan
+            # retry that can never acquire a row owner.
+            self._finish_native_completion(request_id)
+            self._acknowledge_native_result(store, request_id)
+            return
+        self._primary_persistence_lock.acquire()
         try:
+            if (
+                record_key is not None
+                and record_key in self._compact_primary_persisted_keys
+            ):
+                event_attempted = True
+                suppression_event_admitted = self._append_native_frame_completion_event(
+                    request_id=request_id,
+                    context=context,
+                    fields={
+                        **fields,
+                        "native_row_projection_state": "SUPPRESSED",
+                        "native_row_projection_reason": (
+                            "compact primary measurement already persisted"
+                        ),
+                    },
+                    force=True,
+                    event_type="native_frame_row_projection_suppressed",
+                )
+                event_recorded = bool(
+                    event_recorded or suppression_event_admitted
+                )
+                retry_record.event_recorded = event_recorded
+                if event_recorded:
+                    self._deferred_native_frame_results.pop(request_id, None)
+                    self._finish_native_completion(request_id)
+                else:
+                    self._defer_native_completion_retry(retry_record)
+                return
             if target is not None and rows is not None:
                 bound_session_id, row_index = target
-                current = dict(rows[row_index])
+                try:
+                    current = dict(rows[row_index])
+                except (IndexError, KeyError, TypeError):
+                    current = {}
                 current_request_id = str(
                     current.get("native_pair_request_id") or ""
                 )
                 if (
-                    bound_session_id == session_id
+                    current
+                    and bound_session_id == session_id
                     and current_request_id in {"", request_id}
                 ):
+                    row_needed_primary_retry = bool(
+                        isinstance(rows, LiveDataRows)
+                        and row_index
+                        not in getattr(rows, "_admitted_indices", set())
+                    )
                     current.update(fields)
-                    if isinstance(rows, (SpoolRows, LiveDataRows)):
-                        rows.replace(row_index, current)
+                    atomic_replacer = getattr(rows, "replace_with_admission", None)
+                    if callable(atomic_replacer):
+                        if owner is None or owner.row_lease is None:
+                            # An atomic row owner without its append lease cannot
+                            # prove that this numeric index still belongs to the
+                            # completed request.  Preserve the completion as a
+                            # canonical native.frames event and abandon the row
+                            # projection instead of permitting an ABA overwrite.
+                            replacement = RowWriteAdmission(
+                                ROW_WRITE_UNAVAILABLE,
+                                "native row append lease is unavailable",
+                                row_index=row_index,
+                            )
+                        else:
+                            replacement = atomic_replacer(
+                                row_index,
+                                current,
+                                lease=owner.row_lease,
+                            )
+                        replacement_state = str(
+                            getattr(replacement, "state", "") or ""
+                        ).upper()
+                        row_admitted = replacement_state == ROW_WRITE_ADMITTED
+                        if (
+                            row_admitted
+                            and record_key is not None
+                            and row_needed_primary_retry
+                            and record_key in self._primary_retry_required_keys
+                        ):
+                            self._remember_native_primary_persisted(record_key)
+                        if replacement_state == ROW_WRITE_UNAVAILABLE:
+                            projection_fields = {
+                                **fields,
+                                "native_row_projection_state": ROW_WRITE_UNAVAILABLE,
+                                "native_row_projection_reason": str(
+                                    getattr(replacement, "reason", "")
+                                    or "native row owner is unavailable"
+                                ),
+                                "native_row_expected_lease": (
+                                    None
+                                    if owner is None or owner.row_lease is None
+                                    else list(owner.row_lease)
+                                ),
+                                "native_row_current_lease": (
+                                    None
+                                    if getattr(replacement, "lease", None) is None
+                                    else list(replacement.lease)
+                                ),
+                            }
+                            if event_recorded:
+                                event_attempted = True
+                                self._append_native_frame_completion_event(
+                                    request_id=request_id,
+                                    context=context,
+                                    fields=projection_fields,
+                                    force=True,
+                                    event_type=(
+                                        "native_frame_row_projection_unavailable"
+                                    ),
+                                )
+                            else:
+                                event_attempted = True
+                                event_recorded = (
+                                    self._append_native_frame_completion_event(
+                                        request_id=request_id,
+                                        context=context,
+                                        fields=projection_fields,
+                                        force=True,
+                                    )
+                                )
+                            logger = getattr(self.panel, "_log", None)
+                            if callable(logger):
+                                logger(
+                                    "[저장] native frame row projection 포기: "
+                                    f"{projection_fields['native_row_projection_reason']}"
+                                )
+                        elif replacement_state == ROW_WRITE_RETRYABLE:
+                            if not event_recorded:
+                                event_attempted = True
+                                event_recorded = (
+                                    self._append_native_frame_completion_event(
+                                        request_id=request_id,
+                                        context=context,
+                                        fields={
+                                            **fields,
+                                            "native_row_projection_state": (
+                                                ROW_WRITE_RETRYABLE
+                                            ),
+                                            "native_row_projection_reason": str(
+                                                getattr(replacement, "reason", "")
+                                                or "native row projection enqueue was not admitted"
+                                            ),
+                                            "native_row_expected_lease": (
+                                                None
+                                                if owner is None
+                                                or owner.row_lease is None
+                                                else list(owner.row_lease)
+                                            ),
+                                            "native_row_current_lease": (
+                                                None
+                                                if getattr(replacement, "lease", None)
+                                                is None
+                                                else list(replacement.lease)
+                                            ),
+                                        },
+                                        force=True,
+                                    )
+                                )
+                            logger = getattr(self.panel, "_log", None)
+                            if callable(logger):
+                                logger(
+                                    "[저장] native frame row projection enqueue 지연; "
+                                    "native.frames completion event를 권위 증거로 유지합니다."
+                                )
+                        elif rows is current_rows:
+                            refresher = getattr(
+                                self.panel,
+                                "_refresh_recording_table",
+                                None,
+                            )
+                            if callable(refresher):
+                                refresher()
+                    elif isinstance(rows, (SpoolRows, LiveDataRows)):
+                        row_admitted = bool(rows.replace(row_index, current))
+                        refresher = getattr(self.panel, "_refresh_recording_table", None)
+                        if row_admitted and rows is current_rows and callable(refresher):
+                            refresher()
                     else:
                         rows[row_index] = current
-                    refresher = getattr(self.panel, "_refresh_recording_table", None)
-                    if callable(refresher):
-                        refresher()
+                        row_admitted = True
+                        refresher = getattr(self.panel, "_refresh_recording_table", None)
+                        if rows is current_rows and callable(refresher):
+                            refresher()
+            if not row_admitted and not event_recorded and not event_attempted:
+                event_attempted = True
+                event_recorded = self._append_native_frame_completion_event(
+                    request_id=request_id,
+                    context=context,
+                    fields={
+                        **fields,
+                        "native_row_projection_state": ROW_WRITE_UNAVAILABLE,
+                        "native_row_projection_reason": (
+                            "native row target is missing or no longer owns request"
+                        ),
+                    },
+                    force=True,
+                )
             if str(fields.get("native_pair_status") or "").startswith(("failed", "missing", "queue")):
                 logger = getattr(self.panel, "_log", None)
                 if callable(logger):
@@ -4501,10 +5499,20 @@ class RecordingController:
                         f"{fields.get('native_pair_error', '')}"
                     )
         finally:
-            if isinstance(store, (AsyncNativeFrameStore, AsyncNativeEvidenceWriter)):
-                store.acknowledge(request_id)
+            self._primary_persistence_lock.release()
+            retained = self._pending_native_completions.get(request_id)
+            if retained is not None:
+                retained.event_recorded = bool(
+                    retained.event_recorded or event_recorded
+                )
+                if row_admitted or retained.event_recorded:
+                    self._finish_native_completion(request_id)
+                elif retained.next_retry_monotonic_s <= time.monotonic():
+                    self._defer_native_completion_retry(retained)
+            self._acknowledge_native_result(store, request_id)
 
     def native_frame_persistence_pending_count(self) -> int:
+        self._retry_pending_native_completions()
         pending = 0
         for attribute, writer_type in (
             ("_native_frame_async_stores", AsyncNativeFrameStore),
@@ -4518,9 +5526,17 @@ class RecordingController:
                 for store in stores.values()
                 if isinstance(store, writer_type)
             )
-        return pending
+        return (
+            pending
+            + len(self._pending_native_completions)
+            + len(self._pending_native_conflicts)
+        )
 
     def _shutdown_native_frame_stores(self) -> bool:
+        # Application shutdown may outlive the Qt retry timer. Force one bounded
+        # retry slice per lifecycle pass so permanent rejection reaches the
+        # explicit terminal-drop state instead of blocking close forever.
+        self._retry_pending_native_completions(force=True)
         all_closed = True
         for attribute, writer_type in (
             ("_native_frame_async_stores", AsyncNativeFrameStore),
@@ -4530,6 +5546,25 @@ class RecordingController:
             if not isinstance(stores, dict):
                 continue
             for session_id, store in list(stores.items()):
+                persistence_required = any(
+                    str(session_id) == "measurement-data"
+                    or str(
+                        record.payload.get("context", {}).get("session_id", "")
+                        if isinstance(record.payload.get("context"), Mapping)
+                        else ""
+                    )
+                    == str(session_id)
+                    for record in self._pending_native_completions.values()
+                )
+                persistence_required = persistence_required or any(
+                    str(session_id) == "measurement-data"
+                    or str(record.context.get("session_id") or "")
+                    == str(session_id)
+                    for record in self._pending_native_conflicts.values()
+                )
+                if persistence_required:
+                    all_closed = False
+                    continue
                 if not isinstance(store, writer_type) or store.close():
                     stores.pop(session_id, None)
                     orphaned = []
@@ -4538,6 +5573,8 @@ class RecordingController:
                         context = (
                             dict(context) if isinstance(context, Mapping) else {}
                         )
+                        if request_id in self._pending_native_completions:
+                            continue
                         if (
                             str(session_id) == "measurement-data"
                             or str(context.get("session_id") or "")
@@ -4585,6 +5622,7 @@ class RecordingController:
         validity: str | None = None,
         hard_block_reasons: tuple[str, ...] = (),
         advisory_reasons: tuple[str, ...] = (),
+        measurement_yaw: Mapping[str, object] | None = None,
     ) -> dict[str, str]:
         warning_values = (
             [str(value) for value in warnings]
@@ -4610,6 +5648,7 @@ class RecordingController:
             "measurement_axis_contract": MEASUREMENT_AXIS_CONTRACT,
             "unit": "m",
             "vector_frd_range_m": list(vector_frd_range_m),
+            "measurement_yaw": None if measurement_yaw is None else dict(measurement_yaw),
         }
         encoded = json.dumps(
             payload,
@@ -4627,6 +5666,8 @@ class RecordingController:
         self,
         row_index: int,
         values: Mapping[str, object],
+        *,
+        row_lease: tuple[int, int] | None = None,
     ) -> None:
         """Bind one in-flight native request to its permanent append-only row.
 
@@ -4653,60 +5694,428 @@ class RecordingController:
                 or ""
             )
             pending[request_id] = (session_id, row_index)
+            rows = getattr(self.panel, "distance_recording_rows", None)
+            row_owner = None
+            if rows is not None:
+                row_owner = _NativeRowOwner(
+                    runtime_generation=session_id,
+                    rows=rows,
+                    row_index=int(row_index),
+                    row_lease=row_lease,
+                )
+                self._native_row_owners[request_id] = row_owner
             deferred = self._deferred_native_frame_results.pop(request_id, None)
             if deferred is not None:
+                deferred = dict(deferred)
+                deferred["_native_completion_internal_replay"] = True
+                deferred["_native_completion_owner"] = row_owner
                 self._handle_async_native_frame_result(deferred)
+            else:
+                retry_record = self._pending_native_completions.get(request_id)
+                if retry_record is not None and row_owner is not None:
+                    retry_record.owner = row_owner
+                    retry_record.next_retry_monotonic_s = 0.0
+                    retry_payload = copy.deepcopy(retry_record.payload)
+                    retry_payload["_native_completion_retry"] = True
+                    retry_payload["_native_completion_owner"] = row_owner
+                    retry_payload["_completion_event_recorded"] = (
+                        retry_record.event_recorded
+                    )
+                    self._handle_async_native_frame_result(retry_payload)
         else:
             pending.pop(request_id, None)
+            self._native_row_owners.pop(request_id, None)
+
+    def _append_measurement_row_direct(
+        self,
+        values: Mapping[str, object],
+        *,
+        reason: str,
+        persistence_mode: str = "direct_owner_unavailable",
+    ) -> RowWriteAdmission:
+        writer = getattr(self.panel, "append_workstation_data", None)
+        if not callable(writer):
+            return RowWriteAdmission(
+                ROW_WRITE_UNAVAILABLE,
+                reason or "measurement row owner and direct writer are unavailable",
+            )
+        record = {
+            **dict(values),
+            "row_persistence_mode": str(persistence_mode),
+            "row_owner_unavailable_reason": str(reason or "row owner unavailable"),
+        }
+        try:
+            admitted = writer("measurements", record, priority=True)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return RowWriteAdmission(
+                ROW_WRITE_RETRYABLE,
+                f"direct measurement enqueue failed: {exc}",
+            )
+        if admitted is False:
+            return RowWriteAdmission(
+                ROW_WRITE_RETRYABLE,
+                "direct measurement enqueue was not admitted",
+            )
+        return RowWriteAdmission(ROW_WRITE_ADMITTED)
+
+    def _persist_compact_primary_measurement(
+        self,
+        record_key: tuple[object, ...],
+        record: Mapping[str, object],
+    ) -> bool:
+        """Serialize late compact evidence against native full-row projection."""
+
+        key = tuple(record_key)
+        with self._primary_persistence_lock:
+            if self._consume_native_primary_persisted(key):
+                return True
+            admission = self._append_measurement_row_direct(
+                record,
+                reason="primary row retired before background retry admission",
+                persistence_mode=str(
+                    record.get("primary_persistence_mode")
+                    or "late_direct_retry"
+                ),
+            )
+            if admission.admitted:
+                self._remember_compact_primary_persisted(key)
+                self._primary_retry_required_keys.discard(key)
+            return admission.admitted
+
+    def _release_primary_retry_ownership(
+        self,
+        record_key: tuple[object, ...],
+    ) -> None:
+        """Release controller-side handshake after explicit View overflow/drop."""
+
+        key = tuple(record_key)
+        with self._primary_persistence_lock:
+            self._primary_retry_required_keys.discard(key)
+            self._pending_primary_record_rows.pop(key, None)
+            self._consume_native_primary_persisted(key)
+
+    def _remember_pending_primary_row(
+        self,
+        key: tuple[object, ...],
+        row: Mapping[str, object],
+    ) -> None:
+        """Retain one already-built row for side-effect-free admission retry."""
+
+        self._pending_primary_record_rows.pop(key, None)
+        self._pending_primary_record_rows[key] = dict(row)
+        while len(self._pending_primary_record_rows) > RECORDING_KEY_CACHE_LIMIT:
+            oldest = next(iter(self._pending_primary_record_rows))
+            self._pending_primary_record_rows.pop(oldest, None)
+
+    def _remember_compact_primary_persisted(
+        self,
+        key: tuple[object, ...],
+    ) -> None:
+        """Keep projection suppression terminal and bounded across generations."""
+
+        if key in self._compact_primary_persisted_keys:
+            return
+        self._compact_primary_persisted_keys.add(key)
+        self._compact_primary_persisted_order.append(key)
+        protected: set[tuple[object, ...]] = set()
+        for pending in self._pending_native_completions.values():
+            context = pending.payload.get("context")
+            raw_key = (
+                context.get("record_key")
+                if isinstance(context, Mapping)
+                else None
+            )
+            if isinstance(raw_key, (tuple, list)):
+                protected.add(tuple(raw_key))
+        for owner in self._native_row_owners.values():
+            try:
+                row = owner.rows[owner.row_index]  # type: ignore[index]
+                raw_key = json.loads(
+                    str(row.get("measurement_detection_pair_key") or "null")
+                )
+            except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+                continue
+            if isinstance(raw_key, list):
+                protected.add(tuple(raw_key))
+        while (
+            len(self._compact_primary_persisted_order)
+            > RECORDING_KEY_CACHE_LIMIT
+        ):
+            evicted: tuple[object, ...] | None = None
+            for _ in range(len(self._compact_primary_persisted_order)):
+                candidate = self._compact_primary_persisted_order.popleft()
+                if candidate in protected:
+                    self._compact_primary_persisted_order.append(candidate)
+                    continue
+                self._compact_primary_persisted_keys.discard(candidate)
+                evicted = candidate
+                break
+            if evicted is None:
+                # Active native owners are persistence state, not diagnostics;
+                # temporarily exceed the cache bound rather than reopen an ABA
+                # projection after compact primary evidence was already admitted.
+                break
+            logger = getattr(self.panel, "_log", None)
+            if callable(logger):
+                logger(
+                    "[측정] compact primary suppression terminal cache eviction: "
+                    f"key={evicted}"
+                )
+
+    def _remember_native_primary_persisted(
+        self,
+        key: tuple[object, ...],
+    ) -> None:
+        if key in self._native_primary_persisted_keys:
+            return
+        self._native_primary_persisted_keys.add(key)
+        self._native_primary_persisted_order.append(key)
+        while len(self._native_primary_persisted_order) > RECORDING_KEY_CACHE_LIMIT:
+            evicted: tuple[object, ...] | None = None
+            for _ in range(len(self._native_primary_persisted_order)):
+                candidate = self._native_primary_persisted_order.popleft()
+                if candidate in self._primary_retry_required_keys:
+                    self._native_primary_persisted_order.append(candidate)
+                    continue
+                self._native_primary_persisted_keys.discard(candidate)
+                evicted = candidate
+                break
+            if evicted is None:
+                # A full row admission remains a live handshake until the View
+                # consumes that primary retry. Never turn a size bound into a
+                # false "not persisted" result and duplicate compact evidence.
+                break
+
+    def _consume_native_primary_persisted(
+        self,
+        key: tuple[object, ...],
+    ) -> bool:
+        if key not in self._native_primary_persisted_keys:
+            return False
+        self._native_primary_persisted_keys.discard(key)
+        try:
+            self._native_primary_persisted_order.remove(key)
+        except ValueError:
+            pass
+        self._primary_retry_required_keys.discard(key)
+        return True
+
+    def _pending_primary_retry_row(
+        self,
+        key: tuple[object, ...],
+    ) -> dict[str, object] | None:
+        cached = self._pending_primary_record_rows.get(key)
+        if cached is None:
+            return None
+        retry_row = dict(cached)
+        deferred_projection: dict[str, object] = {}
+        cached_request_id = str(cached.get("native_pair_request_id") or "")
+        if cached_request_id:
+            deferred = self._deferred_native_frame_results.pop(
+                cached_request_id,
+                None,
+            )
+            deferred_fields = (
+                deferred.get("fields") if isinstance(deferred, Mapping) else None
+            )
+            if isinstance(deferred_fields, Mapping):
+                deferred_projection = dict(deferred_fields)
+                retry_row.update(deferred_projection)
+        row_index = self.panel._recording_pair_row_index.get(key)
+        if row_index is None:
+            return retry_row
+        try:
+            current = dict(self.panel.distance_recording_rows[row_index])
+        except (IndexError, KeyError, TypeError):
+            return retry_row
+        current_request_id = str(current.get("native_pair_request_id") or "")
+        if cached_request_id and current_request_id == cached_request_id:
+            # Preserve a terminal async native-frame projection that completed
+            # after the first row enqueue was rejected.
+            current.update(deferred_projection)
+            return current
+        return retry_row
 
     def _upsert_pair_recording_row(
         self,
         measurement_attempt: MeasurementAttempt,
         values: dict[str, object],
-    ) -> bool:
+    ) -> PairRecordingCommitResult:
         if not self.panel.distance_recording_enabled:
-            return False
+            return PairRecordingCommitResult(
+                inserted=False,
+                enqueue_admitted=False,
+                row_index=-1,
+                admission_state=ROW_WRITE_UNAVAILABLE,
+                admission_reason="distance recording is not active",
+            )
         key = tuple(measurement_attempt.detection_pair_key)
         row_index = self.panel._recording_pair_row_index.get(key)
+        owner = self.panel.distance_recording_rows
+        persisted_values: Mapping[str, object] = values
         if row_index is None:
-            row_index = len(self.panel.distance_recording_rows)
+            row_index = len(owner)
             values["sample_index"] = row_index
             values["pair_sequence"] = row_index
             content_sha256 = values.pop("measurement_attempt_content_sha256", None)
             instance_sha256 = values.pop("measurement_attempt_instance_sha256", None)
             values["measurement_attempt_content_sha256"] = content_sha256
             values["measurement_attempt_instance_sha256"] = instance_sha256
-            self.panel._recording_pair_row_index[key] = row_index
-            self.panel.distance_recording_rows.append(values)
-            self.panel.distance_recording_keys.append(key)
-            if len(self.panel.distance_recording_keys) > RECORDING_KEY_CACHE_LIMIT:
-                self.panel.distance_recording_keys.pop(0)
-            minimum_cached_index = max(
-                0, len(self.panel.distance_recording_rows) - RECORDING_KEY_CACHE_LIMIT
-            )
-            self.panel._recording_pair_row_index = {
-                cached_key: cached_index
-                for cached_key, cached_index in self.panel._recording_pair_row_index.items()
-                if cached_index >= minimum_cached_index
+            atomic_appender = getattr(owner, "append_with_admission", None)
+            if callable(atomic_appender):
+                admission = atomic_appender(values)
+            else:
+                appender = getattr(owner, "append", None)
+                if not callable(appender):
+                    admission = RowWriteAdmission(
+                        ROW_WRITE_UNAVAILABLE,
+                        "measurement row owner has no append contract",
+                    )
+                else:
+                    try:
+                        appended = appender(values)
+                    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                        admission = RowWriteAdmission(
+                            ROW_WRITE_UNAVAILABLE,
+                            f"legacy measurement append failed: {exc}",
+                        )
+                    else:
+                        admission = RowWriteAdmission(
+                            ROW_WRITE_ADMITTED if appended is not False else ROW_WRITE_RETRYABLE,
+                            "" if appended is not False else "legacy measurement append was not admitted",
+                            row_index=row_index,
+                        )
+            owner_row_index = admission.row_index
+            if owner_row_index is None:
+                owner_row_index = row_index
+            owner_has_row = admission.state in {
+                ROW_WRITE_ADMITTED,
+                ROW_WRITE_RETRYABLE,
             }
-            self._track_pending_native_row(row_index, values)
-            self.panel._append_recording_table_row(values)
-            inserted = True
+            if owner_has_row:
+                row_index = int(owner_row_index)
+                self.panel._recording_pair_row_index[key] = row_index
+                if admission.lease is not None:
+                    self._pair_recording_row_leases[key] = admission.lease
+                self.panel.distance_recording_keys.append(key)
+                if len(self.panel.distance_recording_keys) > RECORDING_KEY_CACHE_LIMIT:
+                    self.panel.distance_recording_keys.pop(0)
+                minimum_cached_index = max(
+                    0, len(owner) - RECORDING_KEY_CACHE_LIMIT
+                )
+                self.panel._recording_pair_row_index = {
+                    cached_key: cached_index
+                    for cached_key, cached_index in self.panel._recording_pair_row_index.items()
+                    if cached_index >= minimum_cached_index
+                }
+                self._pair_recording_row_leases = {
+                    cached_key: lease
+                    for cached_key, lease in self._pair_recording_row_leases.items()
+                    if cached_key in self.panel._recording_pair_row_index
+                }
+                self._track_pending_native_row(
+                    row_index,
+                    values,
+                    row_lease=admission.lease,
+                )
+                self.panel._append_recording_table_row(values)
+                inserted = True
+                direct_persistence = False
+            else:
+                self.panel._recording_pair_row_index.pop(key, None)
+                self._pair_recording_row_leases.pop(key, None)
+                direct = self._append_measurement_row_direct(
+                    values,
+                    reason=admission.reason,
+                )
+                admission = direct
+                row_index = -1
+                inserted = False
+                direct_persistence = direct.admitted
         else:
-            current = self.panel.distance_recording_rows[row_index]
+            try:
+                current = dict(owner[row_index])
+            except (IndexError, KeyError, TypeError):
+                # The owner may have been cleared between the retryable append
+                # and this bundle fallback.  Let replace_with_admission classify
+                # the stale index/lease atomically so the canonical row can be
+                # rerouted to direct persistence instead of escaping as an
+                # indexing exception.
+                current = {}
             sample_index = current.get("sample_index", row_index)
             pair_sequence = current.get("pair_sequence", row_index)
-            current.update(values)
-            current["sample_index"] = sample_index
-            current["pair_sequence"] = pair_sequence
-            if isinstance(self.panel.distance_recording_rows, (SpoolRows, LiveDataRows)):
-                self.panel.distance_recording_rows.replace(row_index, current)
-            self._track_pending_native_row(row_index, values)
-            self.panel._refresh_recording_table()
+            replacement = current
+            replacement.update(values)
+            replacement["sample_index"] = sample_index
+            replacement["pair_sequence"] = pair_sequence
+            persisted_values = replacement
+            atomic_replacer = getattr(owner, "replace_with_admission", None)
+            if callable(atomic_replacer):
+                admission = atomic_replacer(
+                    row_index,
+                    replacement,
+                    lease=self._pair_recording_row_leases.get(key),
+                )
+            else:
+                replacer = getattr(owner, "replace", None)
+                try:
+                    replaced = (
+                        replacer(row_index, replacement)
+                        if callable(replacer)
+                        else owner.__setitem__(row_index, replacement)
+                    )
+                except (IndexError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                    admission = RowWriteAdmission(
+                        ROW_WRITE_UNAVAILABLE,
+                        f"legacy measurement replacement failed: {exc}",
+                        row_index=row_index,
+                    )
+                else:
+                    admission = RowWriteAdmission(
+                        ROW_WRITE_ADMITTED if replaced is not False else ROW_WRITE_RETRYABLE,
+                        "" if replaced is not False else "legacy measurement replacement was not admitted",
+                        row_index=row_index,
+                    )
+            if admission.state == ROW_WRITE_UNAVAILABLE:
+                self.panel._recording_pair_row_index.pop(key, None)
+                self._pair_recording_row_leases.pop(key, None)
+                direct_values = dict(values)
+                direct_values["sample_index"] = sample_index
+                direct_values["pair_sequence"] = pair_sequence
+                persisted_values = direct_values
+                direct = self._append_measurement_row_direct(
+                    direct_values,
+                    reason=admission.reason,
+                )
+                admission = direct
+                row_index = -1
+                direct_persistence = direct.admitted
+            else:
+                if admission.lease is not None:
+                    self._pair_recording_row_leases[key] = admission.lease
+                self._track_pending_native_row(
+                    row_index,
+                    values,
+                    row_lease=admission.lease
+                    or self._pair_recording_row_leases.get(key),
+                )
+                self.panel._refresh_recording_table()
+                direct_persistence = False
             inserted = False
+        enqueue_admitted = admission.admitted
+        if enqueue_admitted:
+            self._finish_native_completion_from_admitted_row(persisted_values)
         self.panel._refresh_recording_status_label()
         self.panel._refresh_operation_header()
-        return inserted
+        return PairRecordingCommitResult(
+            inserted=inserted,
+            enqueue_admitted=enqueue_admitted,
+            row_index=row_index,
+            admission_state=admission.state,
+            admission_reason=admission.reason,
+            row_lease=admission.lease,
+            direct_persistence=direct_persistence,
+        )
 
     def _record_unresolved_pair(
         self,
@@ -4766,7 +6175,7 @@ class RecordingController:
                 getattr(self.panel, "_measurement_id", "") or ""
             ),
             "terminal_record_id": blocked.terminal_record_id,
-            "schema_version": "stereowiris-paired-frame-v3",
+            "schema_version": "stereowiris-paired-frame-v5",
             "measurement_valid": "false",
             "measurement_policy_id": "field_measurement_v1",
             "measurement_validity": "INVALID",
@@ -4813,6 +6222,55 @@ class RecordingController:
                 record_key=key,
             )
         )
+        timing_writer = getattr(
+            self.panel,
+            "_record_measurement_sync_timestamp_parameters",
+            None,
+        )
+        if callable(timing_writer):
+            row.update(timing_writer(blocked))
+        else:
+            timing = live_pair_timing_evidence(
+                blocked.left_detection,
+                blocked.right_detection,
+                requested_basis=blocked.requested_timestamp_basis,
+                effective_basis=blocked.timestamp_basis,
+                fallback_reason=blocked.timing_fallback_reason,
+            )
+            rtcp_delta_s = timing.get("rtcp_pair_delta_s")
+            row.update(
+                {
+                    "pairing_time_basis_requested": timing[
+                        "requested_time_basis"
+                    ],
+                    "pairing_time_basis": timing["time_basis"],
+                    "pairing_time_basis_role": timing["time_basis_role"],
+                    "pairing_fallback_active": timing["fallback_active"],
+                    "pairing_fallback_reason": timing["fallback_reason"],
+                    "left_app_receive_monotonic_ns": timing[
+                        "left_app_receive_monotonic_ns"
+                    ],
+                    "right_app_receive_monotonic_ns": timing[
+                        "right_app_receive_monotonic_ns"
+                    ],
+                    "app_receive_pair_delta_ns": timing[
+                        "app_receive_pair_delta_ns"
+                    ],
+                    "selected_pair_delta_ns": timing["selected_pair_delta_ns"],
+                    "selected_pair_abs_delta_ns": timing[
+                        "selected_pair_abs_delta_ns"
+                    ],
+                    "sync_delta_ns": timing["selected_pair_delta_ns"],
+                    "rtcp_pair_delta_ns": (
+                        ""
+                        if rtcp_delta_s is None
+                        else int(round(float(rtcp_delta_s) * 1_000_000_000.0))
+                    ),
+                    "ntp_evidence_role": timing["ntp_evidence_role"],
+                    "pair_timing_limit_ns": LIVE_DISTANCE_MAX_APP_DELTA_NS,
+                    "pair_timing_valid": True,
+                }
+            )
         row.update(
             self._measurement_result_evidence(
                 attempt_sha256=blocked_sha256,
@@ -4873,12 +6331,229 @@ class RecordingController:
         point_left_m: tuple[float, float, float] | None = None,
         measurement_attempt: MeasurementAttempt,
     ) -> bool:
+        result = self._commit_distance_history(
+            estimate=estimate,
+            distance_m=distance_m,
+            method=method,
+            baseline_source=baseline_source,
+            baseline_m=baseline_m,
+            point_m=point_m,
+            raw_point_m=raw_point_m,
+            raw_point_left_m=raw_point_left_m,
+            point_left_m=point_left_m,
+            measurement_attempt=measurement_attempt,
+            publish_history=True,
+        )
+        return result.history_added
+
+    def _compact_primary_retry_row(
+        self,
+        *,
+        estimate,
+        distance_m: float,
+        method: str,
+        baseline_source: str,
+        baseline_m: float,
+        point_m: tuple[float, float, float] | None,
+        raw_point_m: tuple[float, float, float] | None,
+        raw_point_left_m: tuple[float, float, float] | None,
+        measurement_attempt: MeasurementAttempt,
+        outcome_metadata: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Build side-effect-free primary evidence after bounded row-cache eviction."""
+
+        warnings = tuple(str(value) for value in getattr(estimate, "warnings", ()))
+        vector = (
+            (None, None, None, float(distance_m))
+            if point_m is None
+            else (
+                float(point_m[0]),
+                float(point_m[1]),
+                float(point_m[2]),
+                float(distance_m),
+            )
+        )
+        row: dict[str, object] = {
+            "record_kind": "primary_measurement_evidence",
+            "event_type": "primary_measurement_retry_cache_miss",
+            "session_id": str(getattr(self.panel, "recording_session_id", "") or ""),
+            "measurement_id": str(
+                getattr(self.panel, "_measurement_id", "")
+                or outcome_metadata.get("runtime_generation")
+                or ""
+            ),
+            "runtime_generation": str(
+                outcome_metadata.get("runtime_generation") or ""
+            ),
+            "measurement_attempt_sha256": measurement_attempt.canonical_sha256(),
+            "measurement_attempt_canonical_json": measurement_attempt.canonical_json(),
+            "measurement_detection_pair_key": json.dumps(
+                measurement_attempt.detection_pair_key,
+                separators=(",", ":"),
+            ),
+            "measurement_valid": "true",
+            "measurement_validity": "ESTIMATED" if warnings else "VALID",
+            "pair_status": "measured",
+            "distance_m": float(distance_m),
+            "method": str(method),
+            "quality": str(getattr(estimate, "sync_quality", "")),
+            "baseline_source": str(baseline_source),
+            "baseline_m": float(baseline_m),
+            "baseline_center_forward_m": vector[0],
+            "baseline_center_right_m": vector[1],
+            "baseline_center_down_m": vector[2],
+            "baseline_center_range_m": vector[3],
+            "raw_baseline_center_vector_m": (
+                None if raw_point_m is None else list(raw_point_m)
+            ),
+            "source_left_camera_rdf_m": (
+                None if raw_point_left_m is None else list(raw_point_left_m)
+            ),
+            "native_pair_projection": "authoritative_native.frames_event",
+            **{str(name): value for name, value in outcome_metadata.items()},
+        }
+        row.update(
+            self._measurement_result_evidence(
+                attempt_sha256=measurement_attempt.canonical_sha256(),
+                status="measured",
+                valid=True,
+                method=method,
+                quality=str(getattr(estimate, "sync_quality", "")),
+                warnings=warnings,
+                vector_frd_range_m=vector,
+                policy_id=measurement_attempt.measurement_policy_id,
+                validity="ESTIMATED" if warnings else "VALID",
+                advisory_reasons=warnings,
+            )
+        )
+        return row
+
+    def _commit_primary_distance_outcome(
+        self,
+        *,
+        estimate,
+        distance_m: float,
+        method: str,
+        baseline_source: str,
+        baseline_m: float,
+        point_m: tuple[float, float, float] | None,
+        raw_point_m: tuple[float, float, float] | None,
+        raw_point_left_m: tuple[float, float, float] | None,
+        measurement_attempt: MeasurementAttempt,
+        outcome_metadata: Mapping[str, object],
+        publish_history: bool,
+    ) -> DistanceHistoryCommitResult:
+        key = tuple(measurement_attempt.detection_pair_key)
+        if not publish_history:
+            retry_row = self._pending_primary_retry_row(key)
+            if retry_row is not None:
+                retry_row.update(
+                    {str(name): value for name, value in outcome_metadata.items()}
+                )
+                with self._primary_persistence_lock:
+                    if self._consume_native_primary_persisted(key):
+                        row_commit = PairRecordingCommitResult(
+                            inserted=False,
+                            enqueue_admitted=True,
+                            row_index=-1,
+                            admission_state=ROW_WRITE_ADMITTED,
+                            admission_reason=(
+                                "native completion already admitted the full primary row"
+                            ),
+                        )
+                    else:
+                        row_commit = self._upsert_pair_recording_row(
+                            measurement_attempt,
+                            retry_row,
+                        )
+                    if row_commit.enqueue_admitted:
+                        self._pending_primary_record_rows.pop(key, None)
+                        self._primary_retry_required_keys.discard(key)
+                    else:
+                        self._remember_pending_primary_row(key, retry_row)
+                return DistanceHistoryCommitResult(
+                    history_added=False,
+                    row_commit=row_commit,
+                )
+            compact_row = self._compact_primary_retry_row(
+                estimate=estimate,
+                distance_m=distance_m,
+                method=method,
+                baseline_source=measurement_attempt.baseline_source,
+                baseline_m=measurement_attempt.baseline_m,
+                point_m=point_m,
+                raw_point_m=raw_point_m,
+                raw_point_left_m=raw_point_left_m,
+                measurement_attempt=measurement_attempt,
+                outcome_metadata=outcome_metadata,
+            )
+            with self._primary_persistence_lock:
+                if self._consume_native_primary_persisted(key):
+                    admission = RowWriteAdmission(
+                        ROW_WRITE_ADMITTED,
+                        "native completion already admitted the full primary row",
+                    )
+                    direct_persistence = False
+                else:
+                    admission = self._append_measurement_row_direct(
+                        compact_row,
+                        reason="primary full-row retry cache is unavailable",
+                        persistence_mode="direct_retry_cache_miss",
+                    )
+                    direct_persistence = admission.admitted
+                    if admission.admitted:
+                        self._remember_compact_primary_persisted(key)
+                        self._primary_retry_required_keys.discard(key)
+            return DistanceHistoryCommitResult(
+                history_added=False,
+                row_commit=PairRecordingCommitResult(
+                    inserted=False,
+                    enqueue_admitted=admission.admitted,
+                    row_index=-1,
+                    admission_state=admission.state,
+                    admission_reason=admission.reason,
+                    direct_persistence=direct_persistence,
+                ),
+            )
+        return self._commit_distance_history(
+            estimate=estimate,
+            distance_m=distance_m,
+            method=method,
+            baseline_source=baseline_source,
+            baseline_m=baseline_m,
+            point_m=point_m,
+            raw_point_m=raw_point_m,
+            raw_point_left_m=raw_point_left_m,
+            measurement_attempt=measurement_attempt,
+            publish_history=bool(publish_history),
+            row_metadata=outcome_metadata,
+        )
+
+    def _commit_distance_history(
+        self,
+        *,
+        estimate,
+        distance_m: float,
+        method: str,
+        baseline_source: str,
+        baseline_m: float,
+        point_m: tuple[float, float, float] | None = None,
+        raw_point_m: tuple[float, float, float] | None = None,
+        raw_point_left_m: tuple[float, float, float] | None = None,
+        point_left_m: tuple[float, float, float] | None = None,
+        measurement_attempt: MeasurementAttempt,
+        publish_history: bool,
+        row_metadata: Mapping[str, object] | None = None,
+    ) -> DistanceHistoryCommitResult:
         baseline_source = measurement_attempt.baseline_source
         baseline_m = measurement_attempt.baseline_m
         key = tuple(measurement_attempt.detection_pair_key)
-        if key == self.panel._last_distance_history_key:
-            return False
-        self.panel._last_distance_history_key = key
+        if (
+            publish_history
+            and row_metadata is None
+            and key == self.panel._last_distance_history_key
+        ):
+            return DistanceHistoryCommitResult(history_added=False)
         if point_m is None:
             point_m = point_left_m
         if raw_point_m is None:
@@ -4902,10 +6577,12 @@ class RecordingController:
             sample_key=tuple(measurement_attempt.detection_pair_key),
             recording_elapsed_s=recording_elapsed_s,
         )
-        self.panel.distance_history.append(point)
-        self.panel.distance_plot.add_point(point)
         if not self.panel.distance_recording_enabled:
-            return True
+            if publish_history:
+                self.panel._last_distance_history_key = key
+                self.panel.distance_history.append(point)
+                self.panel.distance_plot.add_point(point)
+            return DistanceHistoryCommitResult(history_added=publish_history)
         raw_distance_m = None
         if raw_point_m is not None:
             raw_distance_m = math.sqrt(
@@ -4948,6 +6625,40 @@ class RecordingController:
             "timestamp_s": f"{timestamp_s:.6f}",
             "distance_m": f"{distance_m:.6f}",
             "method": method,
+            "measurement_method_id": measurement_attempt.measurement_method_id,
+            "measurement_geometry_kind": measurement_attempt.measurement_geometry_kind,
+            "measurement_yaw_source": measurement_attempt.measurement_yaw_source,
+            "measurement_yaw_selection_mode": measurement_attempt.measurement_yaw_selection_mode,
+            "measurement_yaw_branch_offset_deg": self.panel._fmt_record_float(
+                measurement_attempt.measurement_yaw_branch_offset_deg, 6
+            ),
+            "measurement_yaw_baseline_azimuth_deg": self.panel._fmt_record_float(
+                measurement_attempt.measurement_yaw_baseline_azimuth_deg, 6
+            ),
+            "measurement_yaw_selected_deg": self.panel._fmt_record_float(
+                measurement_attempt.measurement_yaw_selected_deg, 6
+            ),
+            "measurement_yaw_p1_reference_deg": self.panel._fmt_record_float(
+                measurement_attempt.measurement_yaw_p1_reference_deg, 6
+            ),
+            "measurement_yaw_p2_reference_deg": self.panel._fmt_record_float(
+                measurement_attempt.measurement_yaw_p2_reference_deg, 6
+            ),
+            "measurement_yaw_p1_age_s": self.panel._fmt_record_float(
+                measurement_attempt.measurement_yaw_p1_age_s, 6
+            ),
+            "measurement_yaw_p2_age_s": self.panel._fmt_record_float(
+                measurement_attempt.measurement_yaw_p2_age_s, 6
+            ),
+            "measurement_yaw_score_minus90_deg": self.panel._fmt_record_float(
+                measurement_attempt.measurement_yaw_score_minus90_deg, 6
+            ),
+            "measurement_yaw_score_plus90_deg": self.panel._fmt_record_float(
+                measurement_attempt.measurement_yaw_score_plus90_deg, 6
+            ),
+            "measurement_yaw_reverse": bool(measurement_attempt.measurement_yaw_reverse),
+            "measurement_yaw_consensus": measurement_attempt.measurement_yaw_consensus,
+            "measurement_yaw_low_margin": bool(measurement_attempt.measurement_yaw_low_margin),
             "quality": estimate.sync_quality,
             "disparity_px": f"{estimate.disparity_px:.6f}",
             "raw_disparity_px": f"{estimate.disparity_px:.6f}",
@@ -5001,6 +6712,8 @@ class RecordingController:
             "pair_status": "measured",
             "measurement_valid": "true",
         })
+        if row_metadata:
+            row.update({str(key): value for key, value in row_metadata.items()})
         row.update(self.panel._record_bbox_parameters(estimate))
         row.update(self.panel._record_measurement_sync_timestamp_parameters(estimate))
         row.update(self.panel._record_intrinsic_parameters(measurement_attempt))
@@ -5018,6 +6731,22 @@ class RecordingController:
                 policy_id=measurement_attempt.measurement_policy_id,
                 validity="ESTIMATED" if estimate.warnings else "VALID",
                 advisory_reasons=tuple(estimate.warnings),
+                measurement_yaw={
+                    "source": measurement_attempt.measurement_yaw_source,
+                    "selection_mode": measurement_attempt.measurement_yaw_selection_mode,
+                    "branch_offset_deg": measurement_attempt.measurement_yaw_branch_offset_deg,
+                    "baseline_azimuth_deg": measurement_attempt.measurement_yaw_baseline_azimuth_deg,
+                    "selected_yaw_deg": measurement_attempt.measurement_yaw_selected_deg,
+                    "p1_reference_yaw_deg": measurement_attempt.measurement_yaw_p1_reference_deg,
+                    "p2_reference_yaw_deg": measurement_attempt.measurement_yaw_p2_reference_deg,
+                    "p1_age_s": measurement_attempt.measurement_yaw_p1_age_s,
+                    "p2_age_s": measurement_attempt.measurement_yaw_p2_age_s,
+                    "score_minus90_deg": measurement_attempt.measurement_yaw_score_minus90_deg,
+                    "score_plus90_deg": measurement_attempt.measurement_yaw_score_plus90_deg,
+                    "reverse": measurement_attempt.measurement_yaw_reverse,
+                    "consensus": measurement_attempt.measurement_yaw_consensus,
+                    "low_margin": measurement_attempt.measurement_yaw_low_margin,
+                },
                 vector_frd_range_m=(
                     point.forward_m,
                     point.right_m,
@@ -5030,13 +6759,27 @@ class RecordingController:
         row.pop("measurement_attempt_instance_sha256", None)
         row["measurement_attempt_content_sha256"] = measurement_attempt_content_sha256
         row["measurement_attempt_instance_sha256"] = measurement_attempt_instance_sha256
-        self.panel._upsert_pair_recording_row(measurement_attempt, row)
-        pair_sequence = self.panel._recording_pair_row_index.get(
-            tuple(measurement_attempt.detection_pair_key)
+        row_commit = self.panel._upsert_pair_recording_row(measurement_attempt, row)
+        if row_metadata is not None:
+            if row_commit.enqueue_admitted:
+                self._pending_primary_record_rows.pop(key, None)
+                self._primary_retry_required_keys.discard(key)
+            else:
+                self._primary_retry_required_keys.add(key)
+                self._remember_pending_primary_row(key, row)
+        if publish_history:
+            self.panel._last_distance_history_key = key
+            self.panel.distance_history.append(point)
+            self.panel.distance_plot.add_point(point)
+        if row_commit.row_index >= 0 and publish_history:
+            self.panel._append_extrinsics_comparison_snapshot(
+                row_commit.row_index,
+                timestamp_s,
+            )
+        return DistanceHistoryCommitResult(
+            history_added=publish_history,
+            row_commit=row_commit,
         )
-        if pair_sequence is not None:
-            self.panel._append_extrinsics_comparison_snapshot(pair_sequence, timestamp_s)
-        return True
 
     def _append_extrinsics_comparison_snapshot(self, pair_sequence: int, timestamp_s: float) -> None:
         """Snapshot analysis-only per-method previews for one accepted pair.
@@ -5229,6 +6972,31 @@ class RecordingController:
             {
                 "frame_stage": "gui_delivered_preview",
                 "mp4_frame_index_contract": "not_available",
+                "app_receive_monotonic_ns": (
+                    ""
+                    if metadata.get("app_receive_monotonic_ns") is None
+                    else int(metadata["app_receive_monotonic_ns"])
+                ),
+                "app_receive_timestamp_role": str(
+                    metadata.get("app_receive_timestamp_role")
+                    or "legacy_float_derived"
+                ),
+                "ntp_evidence_role": "record_only",
+                "media_recovery_basis": str(
+                    metadata.get("media_recovery_basis") or ""
+                ),
+                "media_integrity_mode": str(
+                    metadata.get("media_integrity_mode") or ""
+                ),
+                "media_integrity_unverified": self.panel._fmt_record_bool(
+                    bool(metadata.get("media_integrity_unverified", False))
+                ),
+                "source_media_integrity_verified": self.panel._fmt_record_bool(
+                    bool(metadata.get("source_media_integrity_verified", False))
+                ),
+                "media_random_access_guaranteed": self.panel._fmt_record_bool(
+                    bool(metadata.get("media_random_access_guaranteed", False))
+                ),
                 "image_width_px": image.width(),
                 "image_height_px": image.height(),
                 "image_axis_contract": "opencv_pixels_origin_top_left_u_right_v_down",
@@ -5420,6 +7188,99 @@ class RecordingController:
         self.panel.external_parameter_recording_rows.append(row)
         self.panel._refresh_recording_status_label()
 
+    def _record_gnss_baseline_center(
+        self,
+        camera: str,
+        drone: GpsPositionState,
+    ) -> bool:
+        """Attempt one derived row for each primary Drone GNSS callback."""
+
+        if str(camera) != "drone" or not bool(self.panel.distance_recording_enabled):
+            return False
+        selected_reader = getattr(self.panel, "_selected_rover_gps_state", None)
+        latest = getattr(self.panel, "latest_gps", {}) or {}
+        p1 = (
+            selected_reader("left")
+            if callable(selected_reader)
+            else latest.get("left")
+            if isinstance(latest, Mapping)
+            else None
+        )
+        p2 = (
+            selected_reader("right")
+            if callable(selected_reader)
+            else latest.get("right")
+            if isinstance(latest, Mapping)
+            else None
+        )
+        if not isinstance(p1, GpsPositionState):
+            p1 = None
+        if not isinstance(p2, GpsPositionState):
+            p2 = None
+        now_s = time.monotonic()
+        estimate = estimate_gnss_baseline_center_frd(
+            p1,
+            p2,
+            drone,
+            now_s=now_s,
+            maximum_age_s=DEFAULT_MAXIMUM_GNSS_AGE_S,
+            maximum_timestamp_spread_s=(
+                DEFAULT_MAXIMUM_GNSS_TIMESTAMP_SPREAD_S
+            ),
+        )
+        selection_reader = getattr(self.panel, "_pixhawk_gnss_source", None)
+        p1_selection = (
+            str(selection_reader("left") or "GPS1")
+            if callable(selection_reader)
+            else "GPS1"
+        )
+        p2_selection = (
+            str(selection_reader("right") or "GPS1")
+            if callable(selection_reader)
+            else "GPS1"
+        )
+        sequence = max(
+            0,
+            int(getattr(self.panel, "_gnss_baseline_center_recording_sequence", 0)),
+        )
+        host_receive_monotonic_ns = time.monotonic_ns()
+        host_receive_utc_ns = time.time_ns()
+        source_utc_ns = (
+            None if drone.gps_utc_us is None else int(drone.gps_utc_us) * 1000
+        )
+        row = self.panel._raw_timeline_row(
+            side="drone",
+            sample_type="gnss_baseline_center_frd",
+            row_contract="one row per primary Drone GNSS callback while recording",
+            sample_monotonic_s=float(drone.timestamp_s),
+            host_receive_monotonic_ns=host_receive_monotonic_ns,
+            host_receive_utc_ns=host_receive_utc_ns,
+            source_utc_ns=source_utc_ns,
+            source_utc_method=str(drone.time_source or "drone_gps_utc"),
+            sequence=sequence,
+        )
+        if row is None:
+            return False
+        row.update(
+            build_gnss_baseline_center_record(
+                estimate,
+                p1=p1,
+                p2=p2,
+                drone=drone,
+                p1_selection=p1_selection,
+                p2_selection=p2_selection,
+                sequence=sequence,
+            )
+        )
+        self.panel._gnss_baseline_center_recording_sequence = sequence + 1
+        writer = getattr(self.panel, "append_workstation_data", None)
+        if not callable(writer):
+            return False
+        try:
+            return bool(writer("gnss.baseline.center", row, priority=False))
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
+
     def _record_bbox_parameters(self, estimate) -> dict[str, str]:
         row: dict[str, str] = {}
         for camera in ("left", "right"):
@@ -5485,11 +7346,35 @@ class RecordingController:
             return None
 
     def _record_measurement_sync_timestamp_parameters(self, estimate) -> dict[str, object]:
-        left_timestamp_s = float(getattr(estimate.left, "timestamp_s", 0.0))
-        right_timestamp_s = float(getattr(estimate.right, "timestamp_s", 0.0))
+        left_detection = getattr(
+            estimate, "left", getattr(estimate, "left_detection", None)
+        )
+        right_detection = getattr(
+            estimate, "right", getattr(estimate, "right_detection", None)
+        )
+        if left_detection is None or right_detection is None:
+            raise ValueError("measurement timing requires Left/Right detections")
+        left_timestamp_s = float(getattr(left_detection, "timestamp_s", 0.0))
+        right_timestamp_s = float(getattr(right_detection, "timestamp_s", 0.0))
+        def app_receive_ns(detection: object, timestamp_s: float) -> int:
+            value = getattr(detection, "app_receive_monotonic_ns", None)
+            if value is None:
+                metadata = dict(
+                    getattr(detection, "timestamp_metadata", None) or {}
+                )
+                value = metadata.get("app_receive_monotonic_ns")
+            return (
+                int(value)
+                if value is not None
+                else int(round(timestamp_s * 1_000_000_000.0))
+            )
+
+        left_app_ns = app_receive_ns(left_detection, left_timestamp_s)
+        right_app_ns = app_receive_ns(right_detection, right_timestamp_s)
+        signed_app_delta_ns = right_app_ns - left_app_ns
         bbox_mid_timestamp_s = (left_timestamp_s + right_timestamp_s) / 2.0
-        left_utc_unix_s = self.panel._detection_utc_unix_s(estimate.left)
-        right_utc_unix_s = self.panel._detection_utc_unix_s(estimate.right)
+        left_utc_unix_s = self.panel._detection_utc_unix_s(left_detection)
+        right_utc_unix_s = self.panel._detection_utc_unix_s(right_detection)
         bbox_mid_utc_unix_s = (
             (left_utc_unix_s + right_utc_unix_s) / 2.0
             if left_utc_unix_s is not None and right_utc_unix_s is not None
@@ -5503,15 +7388,67 @@ class RecordingController:
         rtcp_pair_delta_ns = (
             None if left_utc_ns is None or right_utc_ns is None else right_utc_ns - left_utc_ns
         )
-        pair_limit_s = self.panel._yolo_pair_max_delta_s()
-        pair_limit_ns = (
+        effective_basis = str(
+            getattr(
+                estimate,
+                "timestamp_basis",
+                getattr(left_detection, "pairing_timestamp_basis", ""),
+            )
+            or "app_receive_monotonic"
+        )
+        if effective_basis == "camera_rtc_required":
+            effective_basis = "camera_rtcp"
+        requested_basis = str(
+            getattr(estimate, "requested_timestamp_basis", "")
+            or effective_basis
+        )
+        if requested_basis == "camera_rtc_required":
+            requested_basis = "camera_rtcp"
+        fallback_reason = str(
+            getattr(estimate, "timing_fallback_reason", "") or ""
+        )
+        if effective_basis == "camera_rtcp":
+            left_selected_s = (
+                getattr(left_detection, "pairing_timestamp_s", None)
+                if str(getattr(left_detection, "pairing_timestamp_basis", ""))
+                in {"camera_rtcp", "camera_rtc_required"}
+                else left_utc_unix_s
+            )
+            right_selected_s = (
+                getattr(right_detection, "pairing_timestamp_s", None)
+                if str(getattr(right_detection, "pairing_timestamp_basis", ""))
+                in {"camera_rtcp", "camera_rtc_required"}
+                else right_utc_unix_s
+            )
+            selected_left_ns = self.panel._unix_seconds_to_ns(left_selected_s)
+            selected_right_ns = self.panel._unix_seconds_to_ns(right_selected_s)
+            if selected_left_ns is None or selected_right_ns is None:
+                raise ValueError("RTCP_TIMESTAMP_UNAVAILABLE")
+            selected_delta_ns = selected_right_ns - selected_left_ns
+            ntp_evidence_role = "selected_distance_pairing"
+            app_evidence_role = "attitude_association_and_fallback"
+        else:
+            effective_basis = "app_receive_monotonic"
+            selected_delta_ns = signed_app_delta_ns
+            selected_left_ns = left_app_ns
+            selected_right_ns = right_app_ns
+            ntp_evidence_role = "record_only"
+            app_evidence_role = "selected_distance_pairing"
+        selected_abs_delta_ns = abs(selected_delta_ns)
+        configured_pair_limit_s = self.panel._yolo_pair_max_delta_s()
+        configured_pair_limit_ns = (
             None
-            if not isfinite(pair_limit_s)
-            else int(round(pair_limit_s * 1_000_000_000.0))
+            if not isfinite(configured_pair_limit_s)
+            else int(round(configured_pair_limit_s * 1_000_000_000.0))
+        )
+        pair_limit_ns = (
+            LIVE_DISTANCE_MAX_APP_DELTA_NS
+            if configured_pair_limit_ns is None
+            else min(LIVE_DISTANCE_MAX_APP_DELTA_NS, configured_pair_limit_ns)
         )
         camera_time_metrics = self.panel._camera_time_sync_metrics(
-            dict(getattr(estimate.left, "timestamp_metadata", None) or {}),
-            dict(getattr(estimate.right, "timestamp_metadata", None) or {}),
+            dict(getattr(left_detection, "timestamp_metadata", None) or {}),
+            dict(getattr(right_detection, "timestamp_metadata", None) or {}),
             left_receive_mono_s=left_timestamp_s,
             right_receive_mono_s=right_timestamp_s,
         )
@@ -5525,18 +7462,30 @@ class RecordingController:
             "left_frame_utc_ns": "" if left_utc_ns is None else left_utc_ns,
             "right_frame_utc_ns": "" if right_utc_ns is None else right_utc_ns,
             "pair_mid_utc_ns": "" if pair_mid_utc_ns is None else pair_mid_utc_ns,
+            "pairing_time_basis_requested": requested_basis,
+            "pairing_time_basis": effective_basis,
+            "pairing_time_basis_role": "authoritative_distance",
+            "pairing_fallback_active": self.panel._fmt_record_bool(
+                bool(fallback_reason and requested_basis != effective_basis)
+            ),
+            "pairing_fallback_reason": fallback_reason,
+            "left_app_receive_monotonic_ns": left_app_ns,
+            "right_app_receive_monotonic_ns": right_app_ns,
+            "app_receive_pair_delta_ns": signed_app_delta_ns,
+            "app_receive_evidence_role": app_evidence_role,
+            "selected_pair_delta_ns": selected_delta_ns,
+            "selected_pair_abs_delta_ns": selected_abs_delta_ns,
+            "selected_pair_midpoint_ns": (selected_left_ns + selected_right_ns) // 2,
+            "selected_pair_mid_monotonic_ns": (left_app_ns + right_app_ns) // 2,
+            "sync_delta_ns": selected_delta_ns,
             "rtcp_pair_delta_ns": "" if rtcp_pair_delta_ns is None else rtcp_pair_delta_ns,
+            "ntp_evidence_role": ntp_evidence_role,
             "pair_timing_limit_ns": "" if pair_limit_ns is None else pair_limit_ns,
             "pair_timing_valid": self.panel._fmt_record_bool(
-                rtcp_pair_delta_ns is not None
-                and (pair_limit_ns is None or abs(rtcp_pair_delta_ns) <= pair_limit_ns)
+                selected_abs_delta_ns <= pair_limit_ns
             ),
-            "left_bbox_timestamp_reference": str(
-                (getattr(estimate.left, "timestamp_metadata", None) or {}).get("timestamp_reference") or "app-receive"
-            ),
-            "right_bbox_timestamp_reference": str(
-                (getattr(estimate.right, "timestamp_metadata", None) or {}).get("timestamp_reference") or "app-receive"
-            ),
+            "left_bbox_timestamp_reference": "app-receive-monotonic",
+            "right_bbox_timestamp_reference": "app-receive-monotonic",
             "camera_time_sync_status": str(camera_time_metrics["status"]),
             "camera_time_sync_basis": str(camera_time_metrics["basis"]),
             "camera_time_sync_warning": str(camera_time_metrics["warning"]),
@@ -5549,6 +7498,30 @@ class RecordingController:
             "right_rtcp_frame_transit_ms": self.panel._fmt_record_float(camera_time_metrics["right_frame_transit_delay_ms"], 3),
             "left_rtcp_pc_offset_ms": self.panel._fmt_record_float(camera_time_metrics["left_pc_offset_ms"], 3),
             "right_rtcp_pc_offset_ms": self.panel._fmt_record_float(camera_time_metrics["right_pc_offset_ms"], 3),
+            "left_clock_epoch_id": str(
+                (getattr(left_detection, "timestamp_metadata", None) or {}).get(
+                    "clock_epoch_id"
+                )
+                or ""
+            ),
+            "right_clock_epoch_id": str(
+                (getattr(right_detection, "timestamp_metadata", None) or {}).get(
+                    "clock_epoch_id"
+                )
+                or ""
+            ),
+            "left_clock_epoch_state": str(
+                (getattr(left_detection, "timestamp_metadata", None) or {}).get(
+                    "clock_epoch_state"
+                )
+                or ""
+            ),
+            "right_clock_epoch_state": str(
+                (getattr(right_detection, "timestamp_metadata", None) or {}).get(
+                    "clock_epoch_state"
+                )
+                or ""
+            ),
         }
         return row
 
@@ -5556,6 +7529,12 @@ class RecordingController:
         self, measurement_attempt: MeasurementAttempt
     ) -> dict[str, object]:
         row: dict[str, object] = {}
+        rtcp_selected = str(
+            getattr(measurement_attempt, "timestamp_basis", "app_receive_monotonic")
+        ) in {
+            "camera_rtcp",
+            "camera_rtc_required",
+        }
         detections = {
             "left": measurement_attempt.left_detection,
             "right": measurement_attempt.right_detection,
@@ -5564,14 +7543,44 @@ class RecordingController:
             metadata = detection.timestamp_metadata
             timestamp_s = detection.app_receive_monotonic_s
             source_timestamp = metadata.get("source_timestamp_s")
-            timestamp_reference = infer_runtime_camera_timestamp_reference(metadata)
+            ntp_timestamp_reference = infer_runtime_camera_timestamp_reference(metadata)
             row[f"{camera}_display_frame_timestamp_s"] = self.panel._fmt_record_float(timestamp_s, 6)
             row[f"{camera}_source_frame_timestamp_s"] = self.panel._fmt_record_float(
                 None if source_timestamp is None else float(source_timestamp),
                 6,
             )
             row[f"{camera}_frame_timestamp_source"] = str(metadata.get("timestamp_source") or "")
-            row[f"{camera}_frame_timestamp_reference"] = timestamp_reference
+            row[f"{camera}_frame_timestamp_reference"] = "app-receive-monotonic"
+            row[f"{camera}_ntp_timestamp_reference"] = ntp_timestamp_reference
+            row[f"{camera}_ntp_evidence_role"] = (
+                "selected_distance_pairing" if rtcp_selected else "record_only"
+            )
+            row[f"{camera}_app_receive_evidence_role"] = (
+                "attitude_association_and_fallback"
+                if rtcp_selected
+                else "selected_distance_pairing"
+            )
+            row[f"{camera}_media_recovery_basis"] = str(
+                metadata.get("media_recovery_basis") or ""
+            )
+            row[f"{camera}_media_integrity_mode"] = str(
+                metadata.get("media_integrity_mode") or ""
+            )
+            row[f"{camera}_media_integrity_unverified"] = (
+                self.panel._fmt_record_bool(
+                    bool(metadata.get("media_integrity_unverified", False))
+                )
+            )
+            row[f"{camera}_source_media_integrity_verified"] = (
+                self.panel._fmt_record_bool(
+                    bool(metadata.get("source_media_integrity_verified", False))
+                )
+            )
+            row[f"{camera}_media_random_access_guaranteed"] = (
+                self.panel._fmt_record_bool(
+                    bool(metadata.get("media_random_access_guaranteed", False))
+                )
+            )
             row[f"{camera}_rtp_timestamp"] = "" if metadata.get("rtp_timestamp") is None else str(int(metadata["rtp_timestamp"]))
             row[f"{camera}_rtp_ssrc"] = "" if metadata.get("rtp_ssrc") is None else str(int(metadata["rtp_ssrc"]))
             row[f"{camera}_stream_generation"] = (
@@ -5589,8 +7598,8 @@ class RecordingController:
                 if rtcp_frame_ntp_unix_s is None
                 else self.panel._unix_seconds_to_ns(float(rtcp_frame_ntp_unix_s))
             )
-            row[f"{camera}_app_receive_monotonic_ns"] = int(
-                round(timestamp_s * 1_000_000_000.0)
+            row[f"{camera}_app_receive_monotonic_ns"] = (
+                detection.app_receive_monotonic_ns
             )
             row[f"{camera}_camera_rtc_frame_unix_s"] = row[f"{camera}_rtcp_frame_ntp_unix_s"]
             row[f"{camera}_rtcp_sr_ntp_unix_s"] = self.panel._fmt_record_float(
@@ -5605,7 +7614,7 @@ class RecordingController:
             row[f"{camera}_camera_rtc_basis"] = (
                 "rtcp-sender-report"
                 if metadata.get("rtcp_frame_ntp_unix_s") is not None
-                else timestamp_reference
+                else ntp_timestamp_reference
             )
         display_delta_s = (
             measurement_attempt.right_detection.app_receive_monotonic_s
@@ -6052,6 +8061,7 @@ class RecordingController:
     ) -> dict[str, str]:
         triangulation_source = measurement_attempt.triangulation_source
         checkerboard_mode = measurement_attempt.measurement_method_id == CHECKERBOARD_STEREO
+        baseline_yaw_mode = bool(measurement_attempt.measurement_yaw_source)
         relative_pose_mode = measurement_attempt.measurement_geometry_kind == "relative_pose"
         component_sources = dict(measurement_attempt.measurement_component_sources)
         uses_live_gnss = "live_gnss" in component_sources.values()
@@ -6101,6 +8111,8 @@ class RecordingController:
             "mount_assumption_model": (
                 "checkerboard-stereo-extrinsics-v1"
                 if checkerboard_mode
+                else "gps-rtk-baseline-perpendicular-yaw-v1"
+                if baseline_yaw_mode
                 else "hybrid-candidate-live-components-v1"
                 if relative_pose_mode and (uses_live_pixhawk or uses_live_gnss)
                 else "optical-pose-relative-r-t-v1"
@@ -6110,6 +8122,8 @@ class RecordingController:
             "mount_assumption_status": (
                 "checkerboard stereo extrinsics"
                 if checkerboard_mode
+                else "GPS/RTK baseline perpendicular-yaw assumption"
+                if baseline_yaw_mode
                 else "resolved candidate/live component geometry"
                 if relative_pose_mode
                 else "GPS/RTK baseline only"
@@ -6117,6 +8131,8 @@ class RecordingController:
             "mount_assumption_detail": (
                 "applied_checkerboard_stereo_extrinsics_used_as_fixed_optical_transform"
                 if checkerboard_mode
+                else "GPS/RTK baseline azimuth +/-90deg with Pixhawk R/P and selected branch"
+                if baseline_yaw_mode
                 else "resolved_relative_pose_with_per_dof_sources"
                 if relative_pose_mode
                 else "live_gps_rtk_baseline_used_as_stereo_translation"

@@ -53,6 +53,33 @@ def test_preview_inbox_replaces_only_stale_ui_frames_and_renders_latest() -> Non
     pane.deleteLater()
 
 
+def test_preview_inbox_preserves_nal1_candidate_until_gui_drain() -> None:
+    _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    pane = CameraPane("left")
+    pane.stream_generation = 7
+    delivered: list[int] = []
+    pane.frame_changed.connect(
+        lambda _side, _image, metadata: delivered.append(int(metadata["sequence"]))
+    )
+
+    pane._submit_preview_frame_for_generation(
+        7,
+        _image(10),
+        {"sequence": 1, "h264_nal1_non_idr_intra": True},
+    )
+    pane._submit_preview_frame_for_generation(
+        7,
+        _image(20),
+        {"sequence": 2},
+    )
+    pane._drain_preview_frame()
+
+    assert delivered == [1]
+    assert pane.current_image().pixelColor(0, 0).red() == 10
+    assert pane.preview_delivery_snapshot()["replaced"] == 1
+    pane.deleteLater()
+
+
 def test_hidden_camera_pane_retains_and_publishes_frame_without_pixmap_render() -> None:
     _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     pane = CameraPane("left")

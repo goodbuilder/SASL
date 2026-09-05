@@ -142,6 +142,36 @@ def camera_display_name(camera: str) -> str:
     return {"left": "왼쪽", "right": "오른쪽"}.get(camera, camera)
 
 
+def _finite_metric(value: object, *, upper: float | None = None) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not isfinite(number):
+        return None
+    number = max(0.0, number)
+    return min(number, upper) if upper is not None else number
+
+
+def _metric_text(value: object, *, suffix: str = "", upper: float | None = None) -> str:
+    number = _finite_metric(value, upper=upper)
+    return "--" if number is None else f"{number:.1f}{suffix}"
+
+
+def format_camera_input_metrics(camera: str, stats: dict) -> str:
+    """Format measured RTP/H.264 input rates for a fixed two-line UI slot."""
+
+    stats = stats if isinstance(stats, dict) else {}
+    camera_label = {"left": "CAM L", "right": "CAM R"}.get(camera, str(camera))
+    return (
+        f"{camera_label} | RTP {_metric_text(stats.get('rtp_packets_hz'), suffix=' pkt/s')}"
+        f" | missing {_metric_text(stats.get('rtp_missing_hz'), suffix=' pkt/s')}"
+        f" | loss {_metric_text(stats.get('rtp_loss_pct'), suffix='%', upper=100.0)}\n"
+        f"      | H.264 AU {_metric_text(stats.get('h264_au_hz'), suffix=' /s')}"
+        f" | decoded {_metric_text(stats.get('decoded_hz'), suffix=' Hz')}"
+    )
+
+
 def format_camera_stream_stats(camera: str, state: str, stats: dict) -> str:
     camera_name = camera_display_name(camera)
     state_text = {"connected": "연결", "stale": "지연", "waiting": "대기"}.get(state, state)
@@ -211,6 +241,20 @@ def format_runtime_yolo_device_text(stats: dict) -> str:
     return f" ({actual_device})"
 
 
+def is_sr_pc_diagnostic_reason(reason: object) -> bool:
+    """Return whether a legacy invalid marker is now observation-only."""
+
+    normalized = (
+        str(reason or "")
+        .strip()
+        .lower()
+        .replace("_", "-")
+        .replace("/", "-")
+        .replace(" ", "-")
+    )
+    return normalized.startswith("sr-pc")
+
+
 def infer_runtime_camera_timestamp_reference(metadata: dict) -> str:
     reference = (
         str(metadata.get("timestamp_reference") or "")
@@ -220,9 +264,12 @@ def infer_runtime_camera_timestamp_reference(metadata: dict) -> str:
         .replace("/", "-")
         .replace(" ", "-")
     )
-    if reference:
+    invalid_reason = metadata.get("rtcp_timing_invalid_reason")
+    if reference and not (
+        reference == "rtcp-invalid" and is_sr_pc_diagnostic_reason(invalid_reason)
+    ):
         return reference
-    if metadata.get("rtcp_timing_invalid_reason"):
+    if invalid_reason and not is_sr_pc_diagnostic_reason(invalid_reason):
         return "rtcp-invalid"
     if metadata.get("rtcp_frame_ntp_unix_s") is not None:
         return "rtcp-ntp"
@@ -235,7 +282,8 @@ def format_runtime_camera_timestamp(metadata: dict) -> str:
     frame_ntp_unix_s = metadata.get("rtcp_frame_ntp_unix_s")
     timestamp_reference = infer_runtime_camera_timestamp_reference(metadata)
     if timestamp_reference == "rtcp-invalid":
-        return "RTCP invalid (SR-PC offset)"
+        reason = str(metadata.get("rtcp_timing_invalid_reason") or "mapping")
+        return f"RTCP invalid ({reason})"
     if frame_ntp_unix_s is not None:
         try:
             utc_text = datetime.fromtimestamp(float(frame_ntp_unix_s), tz=timezone.utc).isoformat(timespec="microseconds")

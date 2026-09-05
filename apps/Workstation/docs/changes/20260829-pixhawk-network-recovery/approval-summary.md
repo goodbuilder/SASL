@@ -1,49 +1,74 @@
 # Approval Summary
 
-This document explains the proposed modification in plain language. Technical detail remains in the other packet documents.
+This is the revised approval request for explicit host-network role application. The completed
+read-only Find/Assign/Connect implementation remains the baseline until this amendment is approved.
 
-## What changes and what stays the same
+## What changes
 
-`Find network` becomes real NIC/address/route discovery. Assign saves P1/P2 choices; Connect uses them.
-Existing device truth, liveness, USB recovery, Camera ownership and Measurement rules stay the same.
+The operator can select any discovered physical wired NIC and explicitly assign Camera, P1 or P2
+to it. After a native before/after confirmation and OS authentication, Workstation applies only the
+address/routes required by that role and proves the resulting NetworkManager and kernel state.
+Find, row selection and startup never change networking by themselves.
 
-## Operator workflow before and after
+NIC names, models and count are not roles. One NIC may carry Camera+P1+P2 together, or any number of
+NICs may split those roles. Applying a role composes with roles already on that NIC and preserves
+unrelated operator/system configuration.
 
-Before: generate generic URLs and diagnose NICs externally. After: Find -> select -> Assign P1/P2 -> Connect.
+## Operator workflow
 
-## Success, delay, rejection, failure, overload, and recovery
+`Find network -> select NIC -> Assign Camera/P1/P2 -> review exact changes and affected active
+devices -> confirm/authenticate -> apply and verify -> reconnect -> device evidence`.
 
-One failed side does not close the other. Missing/wrong host routes fail before socket creation. Socket open
-is not success; existing expected heartbeat/ATTITUDE and 60-second LIVE remain authoritative.
+If the role is active, a healthy connection does not block the requested move. Workstation stops
+only Camera/Pixhawk owners on source/target NICs, moves the role, and restarts exactly those that
+were active. Devices on unrelated NICs continue. A previously stopped Camera or disconnected
+Pixhawk is not started automatically.
 
-## Data and compatibility effects
+## Success, failure and rollback
 
-Four additive settings fields remember side interface/local address. Old settings continue to work.
+Target NIC settings are applied and verified before the moved role is removed from the source NIC.
+Only that role's Workstation-owned entries are removed; other roles and unrelated settings remain.
+Assignment persistence commits last.
 
-## Performance priorities and allowed degradation
+When reconnecting an active role, Camera success requires a current-generation decoded frame and
+Pixhawk success requires its expected system ID with fresh HEARTBEAT and ATTITUDE. The existing
+60-second Pixhawk qualification remains visible and is not bypassed. Failure rolls back the host
+role and attempts to restore the original active devices. An incomplete rollback shows exact
+partial state and recovery guidance; it is never reported as success.
 
-Discovery is bounded and off the GUI thread. No GPU/media resource change.
+Measurement, recording, save and finalization retain their existing mapping lock and reject a role
+change before any device is stopped or host setting is changed.
 
-## Visual and interaction changes, including dynamic-layout stability
+## Preserved behavior and excluded scope
 
-The existing compact candidate table moves near Connection and gains fixed network evidence columns.
-Selection/focus/scroll remain stable under status refresh.
+Existing expected-sysid/liveness/RTCM/partial-connect, Camera frame truth, USB recovery, settings
+compatibility, Measurement rules and unrelated NIC operation remain. This amendment does not alter
+PX4 firmware, parameters or SD files; Camera decoding; MAVLink parsing; GNSS/coordinates;
+Measurement algorithms; media/CPU/GPU policy; or unrelated host settings. Same-NIC topology remains
+allowed without a warning/readiness gate, while historical long-load evidence remains unqualified.
 
-User clarification supersedes the paired route/endpoint columns: discovery rows show NIC candidates
-only, while independent P1/P2 assignment summaries show each side's State, NIC, Local IPv4,
-Endpoint and Route.
+## UI, performance and operations
 
-## How acceptance will be demonstrated
+The current compact tables/cards and native Qt style remain. One confirmation names current and
+proposed roles, exact address/routes and active devices that will restart. Bounded status text shows
+STOPPING/APPLYING/VERIFYING/RECONNECTING/ROLLING BACK without moving selection, focus outside the
+confirmation, scroll, dock or controls. Network work stays off the GUI thread and introduces no
+GPU/media load change.
 
-Pure/backend/UI/integration tests, launcher and portability checks, target-size screenshots, and real
-P1/P2 route/heartbeat checks where hardware is available.
+The privileged operation is narrowly scoped to Workstation-owned deltas on source/target NICs. It
+never creates a default route, silently applies at startup, or treats an entire existing profile as
+application-owned.
 
-## Cost, risks, assumptions, rollback, and field limits
+## Verification and residual field conditions
 
-Workstation will not fix OS networking. Same Camera/Pixhawk NIC is silently permitted by explicit user
-decision even though historical long-load instability remains unqualified.
+Approval authorizes pure transaction/ownership tests, worker/controller/UI/integration failure
+matrices, the existing full regression and launcher/visual checks, and real NetworkManager/device
+verification for one combined NIC and representative multi-NIC moves. Hardware evidence must show
+actual routes plus Camera frames and expected-system Pixhawk traffic; fakes cannot close that field
+boundary. Shared-NIC long-duration stability remains a separate field qualification.
 
-## Exact scope awaiting approval
+## Exact approval scope
 
-Approved scope: the `20260829-pixhawk-network-recovery` packet described above. No host or PX4 network
-mutation, firmware work, coordinate/measurement change, or unrelated cleanup is authorized.
+Approve the NetworkManager role-application amendment described here and in this packet. The prior
+read-only source and unrelated dirty-worktree changes are preserved. No source implementation begins
+until the user explicitly approves this revised summary.

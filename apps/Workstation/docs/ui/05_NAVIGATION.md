@@ -59,6 +59,15 @@ hardware actions.
 
 Disconnected hardware remains selectable so configuration can still be inspected. Stable logical roles should not disappear based on connectivity.
 
+Every board transport selector offers Radio, Ethernet, and USB. Radio and USB share the serial
+device row and its exclusive-path preflight; they differ only in stream policy, so USB never
+inherits the Radio throttle. USB reuses the board's bootstrap endpoint, leaving the saved Radio
+endpoint intact across a transport switch.
+P1/P2 use their existing transport rows and explicit Connect/Disconnect actions. `Drone / sysid 3`
+transport and Connect live in `Devices > Telemetry`, which owns that MAVLink side. Network
+discovery/assignment remains an explicit host-side operation; it does not automatically connect a
+board.
+
 ## 6. Navigation vs Local Tabs
 
 Navigation handles system-level context. Local tabs switch views within that context.

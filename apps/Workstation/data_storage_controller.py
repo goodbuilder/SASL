@@ -18,6 +18,7 @@ from Workstation.workstation_core.latest_measurement_xlsx import (
     LATEST_MEASUREMENT_WORKBOOK_NAME,
     LatestMeasurementExportCancelled,
     workbook_identity,
+    timestamped_workbook_name,
     write_latest_measurement_xlsx,
 )
 
@@ -48,6 +49,7 @@ DATA_STORAGE_CONTROLLER_METHODS = (
 class _LatestMeasurementXlsxTarget:
     store: MeasurementDataStore
     generation: str | None
+    output_name: str
     started_utc_ns: int | None
     stopped_utc_ns: int | None
     source_states: Mapping[str, object]
@@ -70,6 +72,16 @@ def _payload_generation(payload: Mapping[str, object]) -> str:
     return ""
 
 
+def _allocate_timestamped_workbook_name(root: Path, utc_ns: int) -> str:
+    sequence = 0
+    while True:
+        name = timestamped_workbook_name(utc_ns, sequence=sequence)
+        candidate = root / name
+        if not candidate.exists() and not candidate.is_symlink():
+            return name
+        sequence += 1
+
+
 class _LatestMeasurementXlsxCoordinator:
     """Own one coalesced, cancellable latest-Measurement export worker."""
 
@@ -85,18 +97,35 @@ class _LatestMeasurementXlsxCoordinator:
         self._last_matching_enqueue_s = 0.0
         self._next_attempt_s = 0.0
         self._cancel_event = threading.Event()
-        output = controller._configured_root() / LATEST_MEASUREMENT_WORKBOOK_NAME
+        root = controller._configured_root()
+        candidates = [
+            path
+            for path in root.glob("latest_measurement_*.xlsx")
+            if path.is_file() and not path.is_symlink()
+        ]
+        fixed = root / LATEST_MEASUREMENT_WORKBOOK_NAME
+        if fixed.is_file() and not fixed.is_symlink():
+            candidates.append(fixed)
+        candidates.sort(key=lambda path: (path.stat().st_mtime_ns, path.name), reverse=True)
+        output = candidates[0] if candidates else fixed
         state = "NOT_CREATED"
         published_generation = ""
         error = ""
-        if output.exists() or output.is_symlink():
-            identity = workbook_identity(output) if output.is_file() and not output.is_symlink() else {}
+        owned = next(
+            (
+                (candidate, workbook_identity(candidate))
+                for candidate in candidates
+                if workbook_identity(candidate).get("runtime_generation")
+            ),
+            None,
+        )
+        if owned is not None:
+            output, identity = owned
             published_generation = str(identity.get("runtime_generation") or "")
-            if published_generation:
-                state = "READY"
-            else:
-                state = "FAILED"
-                error = "existing latest_measurement.xlsx is not Workstation-owned"
+            state = "READY"
+        elif candidates:
+            state = "FAILED"
+            error = "existing latest Measurement XLSX is not Workstation-owned"
         self._status: dict[str, object] = {
             "schema": LATEST_MEASUREMENT_XLSX_STATUS_SCHEMA,
             "state": state,
@@ -158,6 +187,7 @@ class _LatestMeasurementXlsxCoordinator:
         selected_or_none = selected or None
         store = self.controller.store
         now_ns = time.time_ns()
+        output_name = _allocate_timestamped_workbook_name(store.root, now_ns)
         now_s = time.monotonic()
         with self._condition:
             if self._stop_requested:
@@ -168,6 +198,7 @@ class _LatestMeasurementXlsxCoordinator:
             self._target = _LatestMeasurementXlsxTarget(
                 store=store,
                 generation=selected_or_none,
+                output_name=output_name,
                 started_utc_ns=(
                     None if started_utc_ns is None else int(started_utc_ns)
                 ),
@@ -187,7 +218,7 @@ class _LatestMeasurementXlsxCoordinator:
             published = str(self._status.get("published_generation") or "")
             self._status.update(
                 state="STALE" if published else "WAITING",
-                output_path=str(store.root / LATEST_MEASUREMENT_WORKBOOK_NAME),
+                output_path=str(store.root / output_name),
                 target_generation=selected_or_none or "",
                 requested_utc_ns=now_ns,
                 error="",
@@ -314,6 +345,7 @@ class _LatestMeasurementXlsxCoordinator:
                     result = write_latest_measurement_xlsx(
                         checkpoint.root,
                         generation=target.generation,
+                        output_name=target.output_name,
                         started_utc_ns=target.started_utc_ns,
                         stopped_utc_ns=target.stopped_utc_ns,
                         completion_evidence=(
@@ -322,6 +354,10 @@ class _LatestMeasurementXlsxCoordinator:
                             else "discovered"
                         ),
                         stream_byte_limits=checkpoint.stream_byte_limits,
+                        stream_paths=checkpoint.stream_paths,
+                        stream_byte_limits_by_path=(
+                            checkpoint.stream_byte_limits_by_path
+                        ),
                         storage_snapshot=checkpoint.storage_snapshot,
                         source_states=target.source_states,
                         checkpoint_settled=checkpoint.settled,
@@ -463,7 +499,7 @@ class DataStorageController:
         root = self._configured_root().resolve(strict=False)
         if self._store is None:
             self._root = root
-            self._store = MeasurementDataStore(root)
+            self._store = MeasurementDataStore(root, timestamped_filenames=True)
         elif self._root != root:
             active = bool(
                 getattr(self.panel, "distance_recording_enabled", False)
@@ -472,7 +508,7 @@ class DataStorageController:
             if not active and not self._latest_xlsx.uses_store(self._store):
                 self._store.close(timeout_s=2.0)
                 self._root = root
-                self._store = MeasurementDataStore(root)
+                self._store = MeasurementDataStore(root, timestamped_filenames=True)
         return self._store
 
     def append_workstation_data(
@@ -510,6 +546,9 @@ class DataStorageController:
                 "priority_pending": 0,
                 "bulk_pending": 0,
                 "dropped_records": 0,
+                "csv_retry_pending": 0,
+                "csv_retry_bytes": 0,
+                "csv_dropped_records": 0,
                 "writer_alive": False,
                 "streams": {},
                 "error": str(exc),

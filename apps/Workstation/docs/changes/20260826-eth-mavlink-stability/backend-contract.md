@@ -38,6 +38,10 @@ Connection generation prevents an old worker callback from reviving a replaced l
 - All-message silence threshold is 10 s after at least one valid remote message.
 - Stream requests are one initial standard profile plus existing bounded ATTITUDE recovery only;
   unsupported private stream retry is disabled for Stock.
+- `SCALED_IMU/2/3` delivery is confirmed only by actual expected-system receive timestamps. After
+  the initial profile, missing/stale standard IMU streams use the existing bounded retry/cooldown
+  policy under the side send lock; a fresh sample clears its retry immediately. All-RX stall blocks
+  both initial and missing-IMU requests.
 - On stall: cancel stream/param retries, block RTCM, emit one transition event, keep 1 Hz heartbeat
   probe, and wait for approved recovery. Do not loop host reconnect.
 - Any fresh valid remote packet moves `STALLED` to `RECOVERING`, never directly to READY.

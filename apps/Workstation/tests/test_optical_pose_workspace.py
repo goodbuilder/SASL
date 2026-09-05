@@ -32,6 +32,49 @@ def test_optical_pose_has_no_editable_candidate_dof_controls() -> None:
     app.processEvents()
 
 
+def test_import_pair_emits_only_paths_without_zoom_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    app = _app()
+    pane = OpticalPosePane()
+    left = tmp_path / "left.png"
+    right = tmp_path / "right.png"
+    left.write_bytes(b"left")
+    right.write_bytes(b"right")
+    selections = iter(((str(left), "Images"), (str(right), "Images")))
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog,
+        "getOpenFileName",
+        lambda *_args, **_kwargs: next(selections),
+    )
+
+    def forbidden_zoom_dialog(*_args, **_kwargs):
+        raise AssertionError("frozen-image Import must not request a zoom index")
+
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getInt", forbidden_zoom_dialog)
+    captured: list[tuple[str, object]] = []
+    pane.command_requested.connect(
+        lambda command_id, payload: captured.append((command_id, payload))
+    )
+
+    pane._import_frozen_burst()
+
+    assert captured == [
+        (
+            "alignment.pose.import_burst",
+            {
+                "sources": {
+                    "left": {"path": str(left)},
+                    "right": {"path": str(right)},
+                }
+            },
+        )
+    ]
+    pane.deleteLater()
+    app.processEvents()
+
+
 def test_alignment_reset_is_an_explicit_owner_command() -> None:
     app = _app()
     pane = OpticalPosePane()
@@ -420,6 +463,15 @@ def test_candidate_detail_panel_shows_provenance_and_warnings_on_selection() -> 
                     "inlier_count": 8.0,
                     "outlier_count": 2.0,
                 },
+                "relative_pose_rdf": {
+                    "rotation_right_from_left_rdf": [
+                        [1.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0],
+                        [0.0, 0.0, 1.0],
+                    ],
+                    "translation_right_from_left_rdf_m": [0.1, -0.2, 0.3],
+                    "right_origin_in_left_rdf_m": [0.1, -0.2, 0.3],
+                },
                 "warnings": ["lever arm UNMODELED: assumption, not a measurement"],
                 "observable_dof": {"roll": True, "pitch": True, "yaw": True},
             }
@@ -427,6 +479,11 @@ def test_candidate_detail_panel_shows_provenance_and_warnings_on_selection() -> 
     )
 
     text = pane.candidate_detail_text.toPlainText()
+    assert "relative_frame: OpenCV optical RDF" in text
+    assert "R_right_from_left_rdf:" in text
+    assert "[+1.000000000, +0.000000000, +0.000000000]" in text
+    assert "t_right_from_left_rdf_m: [+0.100000000, -0.200000000, +0.300000000]" in text
+    assert "right_origin_in_left_rdf_m: [+0.100000000, -0.200000000, +0.300000000]" in text
     assert "lever_arm_status: UNMODELED" in text
     assert "left_anchor_pose_sha256: " + "a" * 64 in text
     assert "sampson_rms_normalized:" in text

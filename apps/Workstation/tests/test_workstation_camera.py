@@ -57,6 +57,25 @@ def test_visible_encoder_profile_settings_round_trip_and_clamp(tmp_path: Path) -
     ) == (0, 51, 32767, 0)
 
 
+def test_encoded_queue_mode_settings_round_trip_and_invalid_value_defaults_to_latest(
+    tmp_path: Path,
+) -> None:
+    from Workstation.workstation_core.settings import (
+        AppSettings,
+        load_settings,
+        save_settings,
+    )
+
+    path = tmp_path / "settings.json"
+    save_settings(AppSettings(rtsp_encoded_queue_mode="reference_safe"), path)
+    assert load_settings(path).rtsp_encoded_queue_mode == "reference_safe"
+
+    payload = json.loads(path.read_text())
+    payload["rtsp_encoded_queue_mode"] = "invalid-mode"
+    path.write_text(json.dumps(payload))
+    assert load_settings(path).rtsp_encoded_queue_mode == "latest"
+
+
 def test_default_visible_encoder_profile_matches_field_validated_wiris_profile() -> None:
     from Workstation.workstation_core.settings import AppSettings
 
@@ -72,19 +91,29 @@ def test_workstation_camera_sync_readiness_uses_imported_finite_check() -> None:
     from Workstation.camera_time_sync_controller import CameraTimeSyncController
 
     now_monotonic_s = time.monotonic()
-    metadata = {
-        "rtcp_sr_received_count": 2,
-        "rtcp_sr_age_s": 0.2,
-        "rtcp_sr_received_wall_s": time.time() - 0.2,
-        "rtcp_sr_arrival_basis": "rtcp-pad-probe",
-        "rtcp_sr_pc_offset_s": 0.020,
-        "rtcp_camera_ntp_rate": 1.0001,
-        "rtcp_camera_media_rate": 0.9999,
-        "timestamp_s": now_monotonic_s,
-    }
+    def observations(side: str) -> list[dict[str, object]]:
+        ssrc = 101 if side == "left" else 202
+        return [
+            {
+                "observer_generation": 4,
+                "ssrc": ssrc,
+                "ntp_raw": index,
+                "received_monotonic_s": now_monotonic_s - (3 - index) * 0.1,
+                "arrival_basis": "rtcp-pad-probe",
+                "sr_pc_offset_s": 0.020 if side == "left" else 0.025,
+                "ntp_rate": 1.0001,
+                "media_rate": 0.9999,
+            }
+            for index in (1, 2, 3)
+        ]
+
     panel = SimpleNamespace(
-        camera_connected=True,
-        camera_frame_metadata_history={},
+        _rtcp_clock_observer_generation=4,
+        _rtcp_clock_observation_history={
+            "left": observations("left"),
+            "right": observations("right"),
+        },
+        _camera_sync_last_sr_counts={},
         _camera_name_ko=lambda camera: camera,
         _camera_sync_required_sr_count=lambda: 2,
         _camera_sync_max_sr_age_s=lambda: 7.0,
@@ -92,12 +121,6 @@ def test_workstation_camera_sync_readiness_uses_imported_finite_check() -> None:
         _camera_sync_rtcp_pair_max_delta_s=lambda: 0.05,
         _camera_sync_receive_pair_max_delta_s=lambda: 0.35,
         _camera_sync_max_pc_offset_s=lambda: 0.1,
-        _clock_sync_pair_metadata=lambda **_kwargs: (dict(metadata), dict(metadata)),
-        _camera_time_sync_metrics=lambda *_args, **_kwargs: {
-            "pair_delta_s": 0.01,
-            "receive_pair_delta_s": 0.01,
-            "max_sr_pc_offset_ms": 20.0,
-        },
     )
 
     ready, reason = CameraTimeSyncController(panel)._camera_sync_readiness()
@@ -105,7 +128,7 @@ def test_workstation_camera_sync_readiness_uses_imported_finite_check() -> None:
     assert ready is True
     assert "검증 완료" in reason
 
-def test_stus_reconnects_only_local_stream_for_fresh_sender_reports() -> None:
+def test_stus_restarts_only_rtcp_observer_and_preserves_video_workers() -> None:
     from Workstation.camera_time_sync_controller import (
         CAMERA_SYNC_STATUS_RECONNECTING,
         CameraTimeSyncController,
@@ -119,22 +142,20 @@ def test_stus_reconnects_only_local_stream_for_fresh_sender_reports() -> None:
             self.started += 1
 
     states: list[tuple[str, str]] = []
-    stream_starts: list[object] = []
+    observer_restarts: list[str] = []
     timer = Timer()
     panel = SimpleNamespace(
-        camera_connected=True,
-        camera_frame_metadata={
-            "left": {"rtcp_sr_received_count": 4},
-            "right": {"rtcp_sr_received_count": 7},
-        },
         _camera_sync_stus_sr_baseline={},
         _camera_sync_deadline_monotonic_s=None,
         _camera_sync_transport_override="tcp",
         _camera_sync_timer=timer,
-        yolo_enabled=True,
-        _session_recording_active=lambda: False,
         _camera_sync_warmup_timeout_s=lambda: 30.0,
-        _start_camera_streams=lambda **kwargs: stream_starts.append(kwargs),
+        _camera_sync_stus_operation={
+            "active": True,
+            "operation_id": "stus-test",
+            "attempts_started": 1,
+        },
+        _restart_rtcp_clock_observer=lambda *, operation_id: observer_restarts.append(operation_id) or True,
         _set_camera_sync_state=lambda status, reason: states.append((status, reason)),
     )
 
@@ -143,12 +164,13 @@ def test_stus_reconnects_only_local_stream_for_fresh_sender_reports() -> None:
         result="success",
     )
 
-    assert stream_starts == [{"enable_detection": True, "switch_to_depth": True}]
+    assert observer_restarts == ["stus-test"]
+    assert panel._camera_sync_stus_operation["phase"] == "observer-restarting-attempt-1"
     assert panel._camera_sync_stus_sr_baseline == {"left": 0, "right": 0}
     assert panel._camera_sync_transport_override is None
     assert timer.started == 1
     assert states[-1][0] == CAMERA_SYNC_STATUS_RECONNECTING
-    assert "Ethernet Mode는 유지" in states[-1][1]
+    assert "영상/YOLO/MP4는 유지" in states[-1][1]
 
 def test_workstation_launcher_bypasses_stereowiris_runtime() -> None:
     from Workstation import standalone_gui
@@ -216,11 +238,13 @@ def test_class_gate_settings_are_forwarded_to_the_yolo_worker(
     panel.apply_workstation_system_settings(
         {
             "rtsp_reconnect_policy": "automatic",
+            "rtsp_encoded_queue_mode": "reference_safe",
         }
     )
     overridden = panel.yolo_kwargs()
     assert "rtsp_pipeline_profile" not in overridden
     assert overridden["rtsp_reconnect_policy"] == "automatic"
+    assert overridden["rtsp_encoded_queue_mode"] == "reference_safe"
     panel._shutdown_coordinator = LifecycleCoordinator([])
     panel.close()
     panel.deleteLater()
@@ -451,6 +475,124 @@ def test_manual_record_stop_does_not_delay_measurement_observation_start(
     app.processEvents()
 
 
+def test_measurement_decoder_preflight_rejection_preserves_live_preview() -> None:
+    from Workstation.camera_stream_controller import CameraStreamLifecycleController
+
+    class Button:
+        def __init__(self) -> None:
+            self.enabled: list[bool] = []
+
+        def setEnabled(self, enabled: bool) -> None:  # noqa: N802 - Qt-compatible fake.
+            self.enabled.append(bool(enabled))
+
+    class Label:
+        def __init__(self) -> None:
+            self.text = "camera LIVE: left/right decoded current frame verified"
+
+        def setText(self, text: str) -> None:  # noqa: N802 - Qt-compatible fake.
+            self.text = str(text)
+
+    events: list[object] = []
+    left_worker = object()
+    right_worker = object()
+    panel = SimpleNamespace(
+        _shutdown_in_progress=False,
+        _manual_recording_active=False,
+        _automatic_session_recording=False,
+        camera_connected=True,
+        yolo_enabled=False,
+        left_pane=SimpleNamespace(worker=left_worker),
+        right_pane=SimpleNamespace(worker=right_worker),
+        start_button=Button(),
+        camera_connect_button=Button(),
+        camera_connection_label=Label(),
+        _session_recording_active=lambda: False,
+        _start_camera_streams=lambda **kwargs: events.append(
+            ("camera.start.rejected", dict(kwargs))
+        )
+        or False,
+        _stop_camera_panes=lambda **kwargs: events.append(
+            ("camera.stop", dict(kwargs))
+        )
+        or True,
+        fail_measurement_start=lambda reason: events.append(
+            ("measurement.camera.unavailable", str(reason))
+        )
+        or True,
+        _log=lambda message: events.append(("log", str(message))),
+        _refresh_session_toggle_buttons=lambda: None,
+        _refresh_operation_header=lambda: None,
+    )
+
+    def start_recording() -> bool:
+        panel._automatic_session_recording = True
+        events.append(("recording.start",))
+        return True
+
+    def stop_recording(*, restart_streams: bool = False) -> bool:
+        panel._automatic_session_recording = False
+        events.append(("recording.stop", bool(restart_streams)))
+        return True
+
+    panel.start_automatic_session_recording = start_recording
+    panel.stop_automatic_session_recording = stop_recording
+    controller = CameraStreamLifecycleController(panel)
+    controller._reserve_package_detection = lambda: True  # type: ignore[method-assign]
+    controller._detection_inputs_valid = lambda: True  # type: ignore[method-assign]
+    controller._camera_busy_reason = lambda: ""  # type: ignore[method-assign]
+
+    assert controller.start_yolo() is None
+
+    assert not any(event[0] == "camera.stop" for event in events)
+    assert panel.camera_connected is True
+    assert panel.yolo_enabled is False
+    assert panel.left_pane.worker is left_worker
+    assert panel.right_pane.worker is right_worker
+    assert ("recording.start",) in events
+    assert ("recording.stop", False) in events
+    assert any(event[0] == "measurement.camera.unavailable" for event in events)
+    assert "Preview 유지" in panel.camera_connection_label.text
+
+
+def test_measurement_start_is_blocked_when_live_pixhawk_mag_is_unverified() -> None:
+    from Workstation.camera_stream_controller import CameraStreamLifecycleController
+
+    events: list[str] = []
+    panel = SimpleNamespace(
+        _shutdown_in_progress=False,
+        measurement_mag_start_gate=lambda: False,
+        _log=lambda message: events.append(str(message)),
+    )
+
+    assert CameraStreamLifecycleController(panel).start_yolo() is False
+    assert any("MAG active-selection verification" in message for message in events)
+
+
+def test_camera_stream_preflight_rejection_does_not_cancel_current_owner() -> None:
+    from Workstation.camera_stream_controller import CameraStreamLifecycleController
+
+    events: list[str] = []
+    controller = CameraStreamLifecycleController(SimpleNamespace())
+    controller._apply_decoder_start_policy = (  # type: ignore[method-assign]
+        lambda: events.append("decoder.preflight") or False
+    )
+    controller._cancel_camera_stop_watchdog = (  # type: ignore[method-assign]
+        lambda: events.append("stop-watchdog.cancel")
+    )
+    controller._cancel_camera_start_readiness = (  # type: ignore[method-assign]
+        lambda: events.append("start-readiness.cancel")
+    )
+    controller._cancel_video_start_readiness = (  # type: ignore[method-assign]
+        lambda **_kwargs: events.append("video-readiness.cancel")
+    )
+
+    assert controller._start_camera_streams(
+        enable_detection=True,
+        switch_to_depth=True,
+    ) is False
+    assert events == ["decoder.preflight"]
+
+
 @pytest.mark.parametrize(
     "busy_attribute",
     (
@@ -485,7 +627,7 @@ def test_measurement_start_queues_while_camera_resource_is_busy(
     assert len(timers) == 1
 
 
-def test_measurement_start_treats_stus_warmup_as_camera_resource_busy() -> None:
+def test_measurement_start_does_not_treat_stus_observer_as_camera_resource_busy() -> None:
     from Workstation.camera_stream_controller import CameraStreamLifecycleController
 
     panel = SimpleNamespace(
@@ -500,8 +642,7 @@ def test_measurement_start_treats_stus_warmup_as_camera_resource_busy() -> None:
 
     reason = CameraStreamLifecycleController(panel)._camera_busy_reason()
 
-    assert "closed-loop" in reason
-    assert "1/2" in reason
+    assert reason == ""
 
 
 def test_queued_stus_measurement_retry_cannot_restart_during_shutdown(
@@ -541,7 +682,7 @@ def test_queued_stus_measurement_retry_cannot_restart_during_shutdown(
     assert starts == []
 
 
-def test_recording_owner_rejects_camera_swap_and_clock_reconnect(
+def test_recording_owner_rejects_camera_swap_but_allows_no_restart_clock_sync(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -552,13 +693,16 @@ def test_recording_owner_rejects_camera_swap_and_clock_reconnect(
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     panel = standalone_gui.WirisStereoDistancePanel(app_root=tmp_path)
     panel.distance_recording_enabled = True
+    panel._restart_rtcp_clock_observer = lambda **_kwargs: True
     left_url = panel.left_url_edit.text()
     right_url = panel.right_url_edit.text()
 
     assert panel.swap_cameras() is False
     assert panel.left_url_edit.text() == left_url
     assert panel.right_url_edit.text() == right_url
-    assert panel.set_selected_wiris_time_from_pc() is False
+    assert panel.set_selected_wiris_time_from_pc() is None
+    assert panel._camera_sync_stus_operation["phase"] == "observer-preflight"
+    panel._finish_wiris_time_sync_operation("cancelled", "test cleanup")
     assert panel.wiris_time_sync_thread is None
     assert panel.swap_pixhawks() is False
     assert panel.toggle_mavlink_connection() is False
@@ -590,7 +734,7 @@ def test_recording_owner_rejects_camera_swap_and_clock_reconnect(
     panel.camera_connected = True
     panel._begin_camera_sync_after_stus(target="both", result="success")
     assert starts == []
-    assert panel.camera_sync_status == standalone_gui.CAMERA_SYNC_STATUS_NOT_VERIFIED
+    assert panel.camera_sync_status == standalone_gui.CAMERA_SYNC_STATUS_RECONNECTING
     panel.camera_connected = False
 
     panel.distance_recording_enabled = False
@@ -600,8 +744,9 @@ def test_recording_owner_rejects_camera_swap_and_clock_reconnect(
         "attempts_started": 1,
         "max_attempts": 2,
     }
-    assert panel._start_session_recording(start_camera_streams=False) is False
-    assert "폐루프" in panel.recording_status_label.text()
+    assert panel._start_session_recording(start_camera_streams=False) is not False
+    assert panel.distance_recording_enabled is True
+    panel._stop_session_recording()
     panel._camera_sync_stus_operation = None
 
     panel.pixhawk_connection_thread = object()
@@ -674,6 +819,28 @@ def test_devices_camera_status_shows_active_decoder_per_side_only() -> None:
         "gpu_uuid": "GPU-sentinel",
         "bus_location": "0000:01:00.0",
     }
+    backend.panel.camera_stream_stats = {
+        "left": {
+            "rtp_packets_hz": 3722.4,
+            "rtp_missing_hz": 3300.1,
+            "rtp_loss_pct": 47.0,
+            "h264_au_hz": 18.5,
+            "decoded_hz": 2.1,
+            "rtp_metrics_window_s": 5.0,
+            "rtp_packets_received_total": 12_345,
+            "rtp_missing_packets_total": 6_789,
+        },
+        "right": {
+            "rtp_packets_hz": 4500.0,
+            "rtp_missing_hz": 500.0,
+            "rtp_loss_pct": 10.0,
+            "h264_au_hz": 19.0,
+            "decoded_hz": 7.4,
+            "rtp_metrics_window_s": 5.0,
+            "rtp_packets_received_total": 23_456,
+            "rtp_missing_packets_total": 1_234,
+        },
+    }
     window = WorkstationMainWindow(backend=backend)
     window.status_adapter.stop()
     window.show()
@@ -683,14 +850,43 @@ def test_devices_camera_status_shows_active_decoder_per_side_only() -> None:
 
     assert window.camera.decoder_values["left"].value.text() == "GPU · nvh264dec"
     assert window.camera.decoder_values["right"].value.text() == "GPU · nvh264dec"
+    assert "RTP 3722.4 pkt/s" in window.camera.stream_metric_labels["left"].text()
+    assert "missing 3300.1 pkt/s" in window.camera.stream_metric_labels["left"].text()
+    assert "loss 47.0%" in window.camera.stream_metric_labels["left"].text()
+    assert "H.264 AU 18.5 /s" in window.camera.stream_metric_labels["left"].text()
+    assert "decoded 2.1 Hz" in window.camera.stream_metric_labels["left"].text()
     preview_button = window.camera.operation_buttons["camera.toggle"]
     preview_button.setFocus()
     app.processEvents()
     gpu_geometry = (
         window.camera.decoder_values["left"].geometry(),
         window.camera.decoder_values["right"].geometry(),
+        window.camera.stream_metric_labels["left"].geometry(),
+        window.camera.stream_metric_labels["right"].geometry(),
         tuple(window.camera.workspace_splitter.sizes()),
     )
+
+    backend.panel.camera_stream_stats["left"].update(
+        {
+            "rtp_packets_hz": 100.0,
+            "rtp_missing_hz": 0.0,
+            "rtp_loss_pct": 0.0,
+            "h264_au_hz": 20.0,
+            "decoded_hz": 19.8,
+        }
+    )
+    window.camera.refresh(window.status_adapter.model.snapshot())
+    assert "RTP 100.0 pkt/s" in window.camera.stream_metric_labels["left"].text()
+    assert "decoded 19.8 Hz" in window.camera.stream_metric_labels["left"].text()
+    app.processEvents()
+    updated_metrics_geometry = (
+        window.camera.decoder_values["left"].geometry(),
+        window.camera.decoder_values["right"].geometry(),
+        window.camera.stream_metric_labels["left"].geometry(),
+        window.camera.stream_metric_labels["right"].geometry(),
+        tuple(window.camera.workspace_splitter.sizes()),
+    )
+    assert updated_metrics_geometry == gpu_geometry
 
     backend.panel.decoder_combo = SimpleNamespace(currentData=lambda: "software")
     backend.panel.active_stream_decoders = {"left": "avdec_h264", "right": "avdec_h264"}
@@ -711,6 +907,8 @@ def test_devices_camera_status_shows_active_decoder_per_side_only() -> None:
     fallback_geometry = (
         window.camera.decoder_values["left"].geometry(),
         window.camera.decoder_values["right"].geometry(),
+        window.camera.stream_metric_labels["left"].geometry(),
+        window.camera.stream_metric_labels["right"].geometry(),
         tuple(window.camera.workspace_splitter.sizes()),
     )
     assert fallback_geometry == gpu_geometry
@@ -756,6 +954,36 @@ def test_camera_status_tooltip_warns_on_auto_decoder_fallback() -> None:
     assert status.severity == StatusSeverity.WARN
     assert "decoder=CPU fallback · avdec_h264" in status.detail
     assert "first-frame timeout" in status.detail
+
+
+def test_camera_status_keeps_non_idr_experiment_visible_and_non_green() -> None:
+    from Workstation.status_model import BackendStatusAdapter, StatusSeverity
+
+    panel = SimpleNamespace(
+        left_pane=SimpleNamespace(current_status="playing"),
+        camera_connected=True,
+        camera_frame_times={"left": [99.9]},
+        camera_frame_metadata={
+            "left": {
+                "media_recovery_basis": "wiris_non_idr_intra_experimental",
+                "media_random_access_guaranteed": False,
+            }
+        },
+        decoder_combo=SimpleNamespace(currentData=lambda: "auto"),
+        active_stream_decoders={"left": "nvh264dec"},
+        decoder_fallback_reasons={},
+        _runtime_decoder_override=None,
+    )
+    adapter = BackendStatusAdapter(SimpleNamespace(panel=panel))
+
+    adapter._refresh_camera(panel, "left", "CAM L", now_s=100.0)
+
+    status = adapter.model.record("camera.left")
+    assert status is not None
+    assert status.state == "LIVE"
+    assert status.severity == StatusSeverity.WARN
+    assert "EXPERIMENTAL NON-IDR INTRA" in status.detail
+    assert "IDR/keyframe guarantee=no" in status.detail
 
 def test_wiris_control_probe_worker_keeps_socket_checks_off_ui_path(monkeypatch) -> None:
     from Workstation import standalone_gui
@@ -1197,6 +1425,102 @@ def test_camera_network_discovery_worker_keeps_nm_queries_off_ui_path(monkeypatc
     assert results[0]["resolved_address"] == "10.0.0.1/24"
     assert results[0]["connection_name"] == "camera-profile"
 
+
+def test_camera_network_discovery_projects_host_interface_into_candidate_rows() -> None:
+    from Workstation import standalone_gui
+    from Workstation.device_runtime_controller import DeviceRuntimeController
+
+    _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    interface = SimpleNamespace(name="enx-new", address="10.0.0.10/24")
+    candidate = SimpleNamespace(
+        interface=interface,
+        neighbor_hosts=("10.0.0.231", "10.0.0.232"),
+    )
+    panel = SimpleNamespace(
+        _camera_candidate_rows=[
+            {"kind": "WIRIS", "address": "stale", "status": "stale"}
+        ],
+        interface_edit=QtWidgets.QLineEdit(),
+        host_address_edit=QtWidgets.QLineEdit(),
+        camera_connection_label=QtWidgets.QLabel(),
+        workstation_camera_discovery_status="SEARCHING",
+        _log=lambda _message: None,
+        _refresh_operation_header=lambda: None,
+    )
+
+    def apply_host_interface_candidates(candidates: list[object]) -> None:
+        selected = candidates[0].interface
+        panel.interface_edit.setText(selected.name)
+        panel.host_address_edit.setText(str(selected.address))
+
+    panel._apply_host_interface_candidates = apply_host_interface_candidates
+    panel._set_camera_candidate_table_rows = lambda rows: setattr(
+        panel, "_camera_candidate_rows", list(rows)
+    )
+    panel._set_camera_candidate_rows = lambda *args: (
+        standalone_gui.WirisStereoDistancePanel._set_camera_candidate_rows(panel, *args)
+    )
+
+    DeviceRuntimeController(panel)._apply_camera_network_discovery(
+        {
+            "candidates": (candidate,),
+            "resolved_address": "10.0.0.10/24",
+            "connection_name": "camera-profile",
+            "addresses": ("10.0.0.10/24",),
+        }
+    )
+
+    assert panel.workstation_camera_discovery_status == "FOUND 1 HOST INTERFACES"
+    assert panel._camera_candidate_rows == [
+        {
+            "kind": "NIC",
+            "address": "enx-new",
+            "port": "",
+            "status": "neighbors=10.0.0.231, 10.0.0.232",
+            "interface": interface,
+            "host_ip": "10.0.0.10/24",
+            "candidate": candidate,
+        }
+    ]
+
+
+def test_camera_network_discovery_zero_result_clears_stale_candidate_rows() -> None:
+    from Workstation import standalone_gui
+    from Workstation.device_runtime_controller import DeviceRuntimeController
+
+    _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = SimpleNamespace(
+        _camera_candidate_rows=[
+            {"kind": "WIRIS", "address": "stale", "status": "stale"}
+        ],
+        interface_edit=QtWidgets.QLineEdit("enx-old"),
+        host_address_edit=QtWidgets.QLineEdit("10.0.0.11/32"),
+        camera_connection_label=QtWidgets.QLabel(),
+        workstation_camera_discovery_status="SEARCHING",
+        _log=lambda _message: None,
+        _refresh_operation_header=lambda: None,
+        _apply_host_interface_candidates=lambda _candidates: None,
+    )
+    panel._set_camera_candidate_table_rows = lambda rows: setattr(
+        panel, "_camera_candidate_rows", list(rows)
+    )
+    panel._set_camera_candidate_rows = lambda *args: (
+        standalone_gui.WirisStereoDistancePanel._set_camera_candidate_rows(panel, *args)
+    )
+
+    DeviceRuntimeController(panel)._apply_camera_network_discovery(
+        {
+            "candidates": (),
+            "resolved_address": None,
+            "connection_name": None,
+            "addresses": (),
+        }
+    )
+
+    assert panel.workstation_camera_discovery_status == "FOUND 0 HOST INTERFACES"
+    assert panel._camera_candidate_rows == []
+
+
 def test_wiris_clock_worker_keeps_stus_and_gdti_io_off_ui_path(monkeypatch) -> None:
     from Workstation import standalone_gui
     from Workstation import wiris_runtime_workers
@@ -1255,7 +1579,137 @@ def test_wiris_stus_compensation_rejects_invalid_rtt() -> None:
     assert standalone_gui.WirisClockCommandWorker._stus_compensation_s(0.515) == pytest.approx(0.2595)
     assert standalone_gui.WirisClockCommandWorker._stus_compensation_s(None) == 0.0
     assert standalone_gui.WirisClockCommandWorker._stus_compensation_s(float("nan")) == 0.0
-    assert standalone_gui.WirisClockCommandWorker._stus_compensation_s(2.001) == 0.0
+    assert standalone_gui.WirisClockCommandWorker._stus_compensation_s(2.001) == pytest.approx(1.0025)
+    assert standalone_gui.WirisClockCommandWorker._stus_compensation_s(3.901) == 0.0
+
+
+def test_runtime_pair_status_shows_requested_effective_and_distinct_deltas() -> None:
+    from Workstation import standalone_gui
+
+    panel = SimpleNamespace(
+        selected_runtime_frame_pair_delta_s=0.020,
+        selected_runtime_frame_pair_basis="APP RECEIVE",
+        selected_runtime_frame_pair_camera_rtc_delta_s=32_400.0,
+        selected_runtime_frame_metadata={
+            "left": {
+                "timestamp_s": 10.0,
+                "rtcp_frame_ntp_unix_s": 100.0,
+            },
+            "right": {
+                "timestamp_s": 10.02,
+                "rtcp_frame_ntp_unix_s": 32_500.0,
+            },
+        },
+    )
+
+    text, tooltip = standalone_gui.WirisStereoDistancePanel._format_runtime_pair_status(
+        panel
+    )
+
+    assert "Pair: requested=APP RECEIVE" in text
+    assert "effective=APP RECEIVE" in text
+    assert "selected Δ 20.0 ms" in text
+    assert "app Δ 20.0 ms" in text
+    assert "NTP Δ 32400000.0 ms (record-only)" in text
+    assert "left pair 전체 시각" in tooltip
+
+
+def test_runtime_pair_status_shows_healthy_rtcp_and_app_fallback_reason() -> None:
+    from Workstation import standalone_gui
+
+    base = {
+        "selected_runtime_frame_pair_delta_s": 0.010,
+        "selected_runtime_frame_pair_basis": "camera_rtcp",
+        "selected_runtime_frame_pair_requested_basis": "camera_rtcp",
+        "selected_runtime_frame_pair_fallback_reason": "",
+        "selected_runtime_frame_pair_camera_rtc_delta_s": 0.010,
+        "selected_runtime_frame_metadata": {
+            "left": {
+                "timestamp_s": 10.0,
+                "app_receive_monotonic_ns": 10_000_000_000,
+                "rtcp_frame_ntp_unix_s": 100.0,
+            },
+            "right": {
+                "timestamp_s": 10.09,
+                "app_receive_monotonic_ns": 10_090_000_000,
+                "rtcp_frame_ntp_unix_s": 100.01,
+            },
+        },
+    }
+    healthy_text, _ = standalone_gui.WirisStereoDistancePanel._format_runtime_pair_status(
+        SimpleNamespace(**base)
+    )
+
+    assert "requested=RTCP/NTP" in healthy_text
+    assert "effective=RTCP/NTP" in healthy_text
+    assert "selected Δ 10.0 ms" in healthy_text
+    assert "app Δ 90.0 ms" in healthy_text
+    assert "NTP Δ 10.0 ms (selected)" in healthy_text
+
+    fallback_text, _ = standalone_gui.WirisStereoDistancePanel._format_runtime_pair_status(
+        SimpleNamespace(
+            **{
+                **base,
+                "selected_runtime_frame_pair_delta_s": 0.090,
+                "selected_runtime_frame_pair_basis": "app_receive_monotonic",
+                "selected_runtime_frame_pair_fallback_reason": "CLOCK_NOT_VERIFIED",
+            }
+        )
+    )
+
+    assert "requested=RTCP/NTP" in fallback_text
+    assert "effective=APP RECEIVE" in fallback_text
+    assert "fallback=CLOCK_NOT_VERIFIED" in fallback_text
+    assert "NTP Δ 10.0 ms (record-only)" in fallback_text
+
+
+def test_noncoordinator_app_pair_path_hard_rejects_100ms_plus_one_ns() -> None:
+    from Workstation.standalone_gui import WirisStereoDistancePanel
+    from Workstation.workstation_core.stereo import (
+        DetectionObservation,
+        detection_timestamp_for_basis,
+    )
+
+    def observation(side: str, timestamp_s: float, exact_ns: int) -> DetectionObservation:
+        return DetectionObservation(
+            camera=side,
+            timestamp_s=timestamp_s,
+            width=1280,
+            height=720,
+            x1=100.0,
+            y1=100.0,
+            x2=200.0,
+            y2=200.0,
+            confidence=0.9,
+            class_id=0,
+            timestamp_metadata={"app_receive_monotonic_ns": exact_ns},
+            candidate_class_ids=(0,),
+        )
+
+    samples = {
+        "left": [observation("left", 10.0, 10_000_000_000)],
+        "right": [observation("right", 10.100000001, 10_100_000_001)],
+    }
+    panel = SimpleNamespace(
+        _detection_pair_coordinator_active=False,
+        _recent_detection_observations=lambda side, **_kwargs: samples[side],
+        _yolo_pair_max_delta_s=lambda: 0.500,
+        _yolo_match_timestamp_s=lambda item: detection_timestamp_for_basis(
+            item,
+            "app_receive_monotonic",
+        ),
+        _validated_correspondence_pair=lambda pair, _left, _right: pair,
+        _yolo_vertical_max_delta_px=lambda: float("inf"),
+        _runtime_pair_uses_app_fallback=True,
+        _last_pair_advisories=(),
+        _last_correspondence_rejection_reason="",
+    )
+
+    pair = WirisStereoDistancePanel._matched_detection_pair(panel)
+
+    assert pair is None
+    assert panel._last_correspondence_rejection_reason == "APP_RECEIVE_DELTA_EXCEEDED"
+    assert panel._runtime_pair_uses_app_fallback is False
 
 
 def test_raw_stus_sdk_command_is_blocked_in_favor_of_interlocked_workflow() -> None:
@@ -1520,7 +1974,8 @@ def test_camera_disconnect_watchdog_retries_wedged_stop_until_it_exits(
     # A worker that does not exit on the first cooperative stop must not be
     # abandoned in "종료 대기 중" forever; a watchdog keeps retrying it.
     assert panel.stop_yolo_streams(wait=False) is False
-    assert panel._last_wiris_pc_utc_sync["result"] == "revoked"
+    assert panel._last_wiris_pc_utc_sync["result"] == "success"
+    assert panel.frame_timing_status == "not-verified"
     assert len(callbacks) == 1
 
     callbacks.pop(0)()
@@ -1890,7 +2345,7 @@ def test_workstation_camera_pane_shutdown_is_cooperative_and_retryable(
 
     assert pane.stop(wait=True) is True
     assert calls == ["request_stop", "stop"]
-    assert thread.wait_calls == [12000, 1000]
+    assert thread.wait_calls == [30000, 1000]
     assert pane.worker is None
     assert pane.thread is None
 
@@ -1904,10 +2359,10 @@ def test_workstation_camera_pane_shutdown_is_cooperative_and_retryable(
     assert pane.thread is thread
 
     pane._stop_requested_monotonic_s = 10.0
-    monkeypatch.setattr(camera_pane.time, "monotonic", lambda: 22.1)
+    monkeypatch.setattr(camera_pane.time, "monotonic", lambda: 40.1)
     assert pane.stop(wait=False) is False
     assert calls[-2:] == ["request_stop", "terminate"]
-    monkeypatch.setattr(camera_pane.time, "monotonic", lambda: 30.1)
+    monkeypatch.setattr(camera_pane.time, "monotonic", lambda: 50.1)
     assert pane.stop(wait=False) is False
     assert calls[-2:] == ["request_stop", "kill"]
 

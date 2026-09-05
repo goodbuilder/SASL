@@ -100,7 +100,7 @@ capture, FTP, and EXIF comparison remain Legacy-only.
 ## 15. Data and Measurement Workspaces
 
 `Data` is the top-level storage/capture surface with `Status` and `Capture` tabs. Status owns the
-fixed stream table, writer/queue/drop state, data-folder access, Retry Storage, and a file-manager
+fixed JSONL/CSV stream table, writer/queue/drop state, data-folder access, Retry Storage, and a file-manager
 link to legacy recordings. A fixed second Files action row owns `Update Latest XLSX` and
 `Open Latest XLSX`; a fixed two-line status strip shows target/published generation, state, row
 count, and compact error while the tooltip retains full path/detail. Capture owns Target reference,
@@ -131,6 +131,21 @@ reset button that sends PX4 `param reset` only for that group's parameters and t
 the readback; Board Orientation is explicitly manual and has no calibration reset. Priority
 values are shown with their PX4 semantic label and raw number. These values retain the PX4
 sensor-axis/board-parameter contract and are not converted to NED, ENU, or camera frames.
+The P1/P2 MAG Priority cards also show a bounded read-only `sensor_mag instance → device_id →
+role/CAL_MAG slot` topology map, a priority candidate preview, and the actual
+`vehicle_magnetometer` device. The priority combos remain editable for all roles; candidate and
+actual are deliberately separate and topology refresh never blocks the controls or moves focus.
+The IMU magnetometer table shows the three `SCALED_IMU/2/3` rows plus the existing dedicated
+RM3100 `DEBUG_VECT` `CAN1_MAG`/`CAN2_MAG` rows, preserving each row's original topic and unit.
+Stable PX4 Shell `sensor_mag` readback may populate those same RM3100 rows with a
+`px4-shell/sensor_mag/<instance>` topic and Gauss unit; the source remains visible.
+The IMU and dedicated CAN magnetometer tables additionally show fixed `RAW yaw°` and
+`Corrected yaw°` columns. RAW is an explicitly labelled producer-axis `atan2(-y,x)` diagnostic;
+Corrected yaw applies the read-back `CAL_MAG` offset/scale/misalignment/rotation when the user
+has manually refreshed parameters. Before readback, the cell remains `PARAM 대기`. PX4 yaw/Δ
+remain backend diagnostic evidence rather than operator-table columns. Missing, stale, and
+uncalibrated values use bounded text and do not resize the table, move selection, or alter
+priority/calibration ownership.
 Base GNSS presents the Base receiver, Survey-in/NTRIP, discovered receiver candidates, and
 RTCM delivery; Alignment presents physical sampling and iteration evidence. Detection remains
 with Cameras, writer/capture status is Data, and Manual record/video files are Advanced.
@@ -151,6 +166,12 @@ raw baseline group. A fixed numeric summary at left keeps Baseline−P1 and Base
 a fixed-height north-referenced top view at right draws baseline, P1 Forward and P2 Forward with
 labels and distinct line/color treatment. Live 4 Hz updates replace values in place and never
 resize the group, move controls, change focus/selection, or jump the outer scroll position.
+Immediately below this baseline/yaw group, Pixhawk adds one compact read-only `Drone Pixhawk
+geometry · F/R/D/Rg` table with `Dr from Baseline Center`, `Dr from P1`, and `Dr from P2` rows.
+The midpoint row is GNSS baseline-center local-level FRD; the P1/P2 rows are their respective
+PX4 body-FRD vectors. Its separate `∠Dr-P1-P2` and `∠Dr-P2-P1` values use horizontal F/R only,
+are unsigned internal angles, and do not add a 3D/yaw verdict. Fixed formats and in-place refresh
+preserve group height, focus, row selection, and outer scroll.
 Data Capture keeps Target reference connectivity, HR purpose/import events, and a PX4 ULog table.
 UAM target telemetry is shown as deferred rather
 than erroneous; target Drone data is a separate receive-only source and never replaces P1/P2

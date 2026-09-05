@@ -212,6 +212,12 @@ class StandalonePanelBackend(QtCore.QObject):
     def drone_telemetry_discover_usb(self) -> Any:
         return self._call("discover_drone_telemetry_usb")
 
+    def drone_telemetry_discover_network(self) -> Any:
+        return self._call("discover_drone_telemetry_network")
+
+    def drone_telemetry_use_network_candidate(self, candidate_id: str) -> Any:
+        return self._call("use_drone_telemetry_network_candidate", candidate_id)
+
     # Operation facades delegate to the standalone panel owner.  The
     # Workstation has one camera/telemetry worker per runtime; sibling
     # applications keep independent resource owners.
@@ -461,6 +467,9 @@ class StandalonePanelBackend(QtCore.QObject):
     def workstation_calibration_quality_snapshot(self) -> Any:
         return self._call("workstation_calibration_quality_snapshot")
 
+    def workstation_calibration_capture_snapshot(self) -> Any:
+        return self._call("workstation_calibration_capture_snapshot")
+
     def configure_workstation_checkerboard_validation(self, payload: dict[str, object]) -> Any:
         return self._call("configure_workstation_checkerboard_validation", dict(payload))
 
@@ -516,6 +525,85 @@ class StandalonePanelBackend(QtCore.QObject):
 
     def workstation_settings_snapshot(self) -> Any:
         return self._call("workstation_settings_snapshot")
+
+    def set_pixhawk_transport(self, role: str, transport: str) -> Any:
+        return self._call("set_pixhawk_transport", str(role), str(transport))
+
+    def connect_pixhawk_role(self, role: str) -> Any:
+        return self._call("connect_mavlink_pixhawk", str(role))
+
+    def disconnect_pixhawk_role(self, role: str) -> Any:
+        return self._call("disconnect_mavlink_pixhawk", str(role))
+
+    def configure_pixhawk_radio(self, role: str, device: str, baud: int) -> Any:
+        return self._call(
+            "configure_pixhawk_radio",
+            str(role),
+            str(device),
+            int(baud),
+        )
+
+    def configure_pixhawk_usb(self, role: str, device: str, baud: int) -> Any:
+        return self._call(
+            "configure_pixhawk_usb",
+            str(role),
+            str(device),
+            int(baud),
+        )
+
+    def pixhawk_mavftp_upload(
+        self,
+        role: str,
+        local_path: str,
+        remote_path: str,
+        *,
+        resume: bool = False,
+        category: str = "file_upload",
+    ) -> Any:
+        return self._call(
+            "start_pixhawk_mavftp_upload",
+            str(role),
+            str(local_path),
+            str(remote_path),
+            resume=bool(resume),
+            category=str(category),
+        )
+
+    def pixhawk_mavftp_cancel(self, role: str) -> Any:
+        return self._call("cancel_pixhawk_mavftp_transfer", str(role))
+
+    def pixhawk_mavftp_download(
+        self,
+        role: str,
+        remote_path: str,
+        local_path: str,
+        *,
+        resume: bool = False,
+    ) -> Any:
+        return self._call(
+            "start_pixhawk_mavftp_download",
+            str(role),
+            str(remote_path),
+            str(local_path),
+            resume=bool(resume),
+        )
+
+    def pixhawk_transfer_snapshot(self) -> Any:
+        return self._call("pixhawk_transfer_snapshot")
+
+    def pixhawk_usb_flash(self, role: str, usb_device: str, firmware_path: str) -> Any:
+        return self._call(
+            "start_pixhawk_usb_flash",
+            str(role),
+            str(usb_device),
+            str(firmware_path),
+        )
+
+    def pixhawk_usb_flash_cancel(self) -> Any:
+        return self._call("cancel_pixhawk_usb_flash")
+
+    def apply_manual_pixhawk_ethernet_setup(self, role: str) -> Any:
+        return self._call("apply_manual_mavlink_stream_setup", (str(role),))
 
     def apply_workstation_system_settings(self, settings: dict[str, object]) -> Any:
         return self._call("apply_workstation_system_settings", dict(settings))
@@ -596,6 +684,12 @@ class StandalonePanelBackend(QtCore.QObject):
 
     def advanced_apply_px4_mag_priorities(self, camera: str, priorities: dict[str, int]) -> Any:
         return self._call("workstation_apply_px4_mag_priorities", camera, dict(priorities))
+
+    def pixhawk_mag_verification_snapshot(self, camera: str | None = None) -> Any:
+        return self._call("workstation_px4_mag_verification_snapshot", camera)
+
+    def pixhawk_mag_measurement_gate(self, required_sides: tuple[str, ...] = ("left", "right")) -> Any:
+        return self._call("workstation_px4_mag_measurement_gate", tuple(required_sides))
 
     def advanced_save_px4_mag_params(self, camera: str) -> Any:
         return self._call("workstation_save_px4_mag_params", camera)

@@ -15,13 +15,10 @@ from sasl_common.operator_runtime import (
     current_decoder_selection,
 )
 
-from Workstation.camera_time_sync_controller import (
-    CAMERA_SYNC_STATUS_NOT_VERIFIED,
-    CAMERA_SYNC_STATUS_RECONNECTING,
-    CAMERA_SYNC_STATUS_WARMING,
+from Workstation.workstation_core.yolo_stream import (
+    RECORDING_ENCODING_DECODED_NVENC_LOSSLESS,
+    recording_integrity_contract,
 )
-from Workstation.workstation_core.yolo_stream import recording_integrity_contract
-from Workstation.workstation_core.mp4_integrity import H264_MP4_INTEGRITY_SCHEMA
 
 CAMERA_START_READINESS_TIMEOUT_S = 35.0
 CAMERA_START_READINESS_POLL_MS = 100
@@ -40,8 +37,10 @@ _CAMERA_START_FAILURE_MARKERS = (
     "GStreamer 오류",
     "스트림 오류",
     "스트림 프로세스 오류",
+    "스트림 프로세스 종료",
     "스트림 프로세스 크래시 복구 한도 초과",
     "스트림 열기 실패",
+    "RTSP/source 오류",
     "PyAV 사용 불가",
     "PyAV 스트림 열기 실패",
     "PyAV 비디오 스트림 없음",
@@ -340,7 +339,6 @@ class CameraStreamLifecycleController:
             ("calibration_wiris_oz_delete_thread", "Calibration camera cleanup is running"),
             ("calibration_wiris_oz_format_thread", "Calibration image-format change is running"),
             ("calibration_wiris_oz_gilc_thread", "Calibration GILC operation is running"),
-            ("wiris_time_sync_thread", "camera time synchronization is running"),
             ("wiris_image_format_thread", "camera image-format change is running"),
             ("wiris_command_thread", "a camera command is running"),
             ("wiris_zoom_thread", "camera zoom is changing"),
@@ -353,13 +351,6 @@ class CameraStreamLifecycleController:
         for attribute, reason in busy_threads:
             if getattr(self.panel, attribute, None) is not None:
                 return reason
-        stus_operation = getattr(self.panel, "_camera_sync_stus_operation", None)
-        if isinstance(stus_operation, Mapping) and bool(stus_operation.get("active")):
-            return (
-                "camera time synchronization closed-loop is running "
-                f"(attempt {stus_operation.get('attempts_started', 1)}/"
-                f"{stus_operation.get('max_attempts', 2)})"
-            )
         if getattr(self.panel, "_rtsp_reactivation_side", None) is not None:
             return "camera RTSP reactivation is running"
         if bool(getattr(self.panel, "auto_wiris_connect_pending", False)):
@@ -430,6 +421,12 @@ class CameraStreamLifecycleController:
         if bool(getattr(self.panel, "_shutdown_in_progress", False)):
             self.panel._log("[YOLO] application shutdown is in progress; Measurement start rejected")
             return False
+        mag_gate = getattr(self.panel, "measurement_mag_start_gate", None)
+        if callable(mag_gate) and not bool(mag_gate()):
+            self.panel._log(
+                "[YOLO] 측정 시작 차단: live Pixhawk MAG active-selection verification is incomplete"
+            )
+            return False
         if not self._reserve_package_detection():
             self.panel._log("[YOLO] 측정 시작 준비가 거부되었습니다: live run state를 확인하세요.")
             return False
@@ -468,6 +465,7 @@ class CameraStreamLifecycleController:
             self._rollback_camera_start(
                 "camera/decoder start request was rejected",
                 enable_detection=True,
+                preserve_existing_streams=True,
             )
             return None
         return None
@@ -715,6 +713,7 @@ class CameraStreamLifecycleController:
             "started_sides": tuple(started_sides),
             "expected_stream_generations": expected_stream_generations,
             "frame_ready_sides": set(),
+            "unverified_frame_sides": set(),
             "failed_sides": {
                 side: "camera worker did not accept start" for side in unavailable
             },
@@ -806,6 +805,17 @@ class CameraStreamLifecycleController:
             setter(camera, active_decoder)
 
         readiness = getattr(self.panel, "_camera_start_readiness", None)
+        if isinstance(readiness, dict) and frame_metadata.get(
+            "media_integrity_unverified"
+        ) is not None:
+            unverified = readiness.get("unverified_frame_sides")
+            if not isinstance(unverified, set):
+                unverified = set(unverified or ())
+                readiness["unverified_frame_sides"] = unverified
+            if bool(frame_metadata.get("media_integrity_unverified")):
+                unverified.add(camera)
+            else:
+                unverified.discard(camera)
         if not isinstance(readiness, dict) or camera not in readiness.get(
             "started_sides", ()
         ):
@@ -1175,9 +1185,16 @@ class CameraStreamLifecycleController:
         self.panel.yolo_enabled = enable_detection
         self.panel.start_button.setEnabled(True)
         self.panel.camera_connect_button.setEnabled(True)
+        unverified_sides = set(readiness.get("unverified_frame_sides") or ())
+        unverified_sides.intersection_update(ready_sides)
         if len(ready_sides) == 2:
             self.panel.camera_connection_label.setText(
-                "camera LIVE: left/right current frame verified"
+                "camera LIVE: left/right decoded"
+                + (
+                    " (INPUT UNVERIFIED)"
+                    if unverified_sides
+                    else " current frame verified"
+                )
             )
         else:
             failed_text = ", ".join(failed) or (
@@ -1185,11 +1202,22 @@ class CameraStreamLifecycleController:
             )
             self.panel.camera_connection_label.setText(
                 f"camera partial: {', '.join(ready_sides)} LIVE; "
-                f"{failed_text} unavailable"
+                + (
+                    "INPUT UNVERIFIED; "
+                    if unverified_sides
+                    else ""
+                )
+                + f"{failed_text} unavailable"
             )
             self.panel._log(
                 f"[카메라] current-generation frame 확인: "
-                f"{', '.join(ready_sides)}; failed={failed_text}"
+                f"{', '.join(ready_sides)}"
+                + (
+                    "; media=INPUT UNVERIFIED"
+                    if unverified_sides
+                    else ""
+                )
+                + f"; failed={failed_text}"
             )
         self.panel._refresh_session_toggle_buttons()
         self.panel._refresh_operation_header()
@@ -1240,9 +1268,15 @@ class CameraStreamLifecycleController:
         reason: str,
         *,
         enable_detection: bool,
+        preserve_existing_streams: bool = False,
     ) -> None:
         failure = str(reason or "camera start failed")
-        self._cancel_camera_start_readiness()
+        previous_camera_connected = bool(
+            getattr(self.panel, "camera_connected", False)
+        )
+        previous_yolo_enabled = bool(getattr(self.panel, "yolo_enabled", False))
+        if not preserve_existing_streams:
+            self._cancel_camera_start_readiness()
         video = getattr(self.panel, "_video_start_readiness", None)
         if isinstance(video, dict):
             rows = video.get("rows")
@@ -1277,17 +1311,18 @@ class CameraStreamLifecycleController:
                     failed_rows[str(side)] = row
                 self._set_video_start_rows(failed_rows, detail=failure)
         self._cancel_video_start_readiness(mark_idle=False)
-        stopper = getattr(self.panel, "_stop_camera_panes", None)
         panes_stopped = True
-        if callable(stopper):
-            try:
-                panes_stopped = bool(stopper(clear_previews=True, wait=False))
-            except TypeError:
-                panes_stopped = bool(stopper(clear_previews=True))
-        if not panes_stopped:
-            watchdog = getattr(self.panel, "_schedule_camera_stop_watchdog", None)
-            if callable(watchdog):
-                watchdog()
+        if not preserve_existing_streams:
+            stopper = getattr(self.panel, "_stop_camera_panes", None)
+            if callable(stopper):
+                try:
+                    panes_stopped = bool(stopper(clear_previews=True, wait=False))
+                except TypeError:
+                    panes_stopped = bool(stopper(clear_previews=True))
+            if not panes_stopped:
+                watchdog = getattr(self.panel, "_schedule_camera_stop_watchdog", None)
+                if callable(watchdog):
+                    watchdog()
         if bool(getattr(self.panel, "_automatic_session_recording", False)):
             stop_recording = getattr(
                 self.panel, "stop_automatic_session_recording", None
@@ -1304,18 +1339,32 @@ class CameraStreamLifecycleController:
                 )
                 if callable(cancel):
                     cancel(failure)
-        self.panel.camera_connected = False
-        self.panel.yolo_enabled = False
-        for attribute in ("start_button", "camera_connect_button"):
-            setter = getattr(getattr(self.panel, attribute, None), "setEnabled", None)
-            if callable(setter):
-                setter(True)
+        if preserve_existing_streams:
+            self.panel.camera_connected = previous_camera_connected
+            self.panel.yolo_enabled = previous_yolo_enabled
+        else:
+            self.panel.camera_connected = False
+            self.panel.yolo_enabled = False
+            for attribute in ("start_button", "camera_connect_button"):
+                setter = getattr(getattr(self.panel, attribute, None), "setEnabled", None)
+                if callable(setter):
+                    setter(True)
         set_text = getattr(
             getattr(self.panel, "camera_connection_label", None), "setText", None
         )
         if callable(set_text):
-            set_text(f"camera ERROR: {failure}")
-        self.panel._log(f"[카메라] 시작 실패: {failure}")
+            if preserve_existing_streams and previous_camera_connected:
+                set_text(
+                    f"camera Measurement unavailable: {failure}; Preview 유지"
+                )
+            else:
+                set_text(f"camera ERROR: {failure}")
+        if preserve_existing_streams and previous_camera_connected:
+            self.panel._log(
+                f"[카메라] Measurement 전환 거부: {failure}; 기존 Preview는 유지합니다."
+            )
+        else:
+            self.panel._log(f"[카메라] 시작 실패: {failure}")
         refresh = getattr(self.panel, "_refresh_session_toggle_buttons", None)
         if callable(refresh):
             refresh()
@@ -1324,12 +1373,6 @@ class CameraStreamLifecycleController:
             refresh()
 
     def _start_camera_streams(self, *, enable_detection: bool, switch_to_depth: bool) -> bool:
-        # A leftover stop watchdog from a prior disconnect must not call
-        # pane.stop() again once this start attempt owns the pane's teardown
-        # (via _stop_camera_panes below and, if needed, its own start retry).
-        self._cancel_camera_stop_watchdog()
-        self._cancel_camera_start_readiness()
-        self._cancel_video_start_readiness(mark_idle=False)
         if not self._apply_decoder_start_policy():
             return False
         kwargs = self.panel.yolo_kwargs()
@@ -1344,8 +1387,25 @@ class CameraStreamLifecycleController:
             self.panel._set_distance_text("거리: 좌/우 RTSP URL이 동일해 측정 차단", quality="ERROR")
             self.panel._log(f"[카메라] {message}")
             return False
+        # Preflight rejection above has not taken ownership of the current
+        # panes. Only an accepted replacement may cancel their lifecycle
+        # watchdog/readiness and begin teardown.
+        self._cancel_camera_stop_watchdog()
+        self._cancel_camera_start_readiness()
+        self._cancel_video_start_readiness(mark_idle=False)
         self.panel._log("[연결] 카메라 프리뷰/YOLO는 설정된 인터페이스와 RTSP URL을 사용합니다.")
         was_camera_connected = bool(self.panel.camera_connected)
+        active_stus = getattr(self.panel, "_camera_sync_stus_operation", None)
+        if not was_camera_connected and not (
+            isinstance(active_stus, Mapping) and bool(active_stus.get("active"))
+        ):
+            reset_schedule = getattr(
+                self.panel,
+                "_reset_stus_schedule_for_connection",
+                None,
+            )
+            if callable(reset_schedule):
+                reset_schedule()
         self.panel.start_button.setEnabled(False)
         self.panel.camera_connect_button.setEnabled(False)
         # QThread/process creation is request acceptance only.  These public
@@ -1358,15 +1418,8 @@ class CameraStreamLifecycleController:
             message = "[YOLO] 좌/우 WIRIS 스트림을 YOLO Depth 측정 모드로 시작합니다."
         else:
             message = "[카메라] 좌/우 WIRIS RTSP 프리뷰 스트림을 시작합니다."
-        if self.panel.camera_sync_status not in {
-            CAMERA_SYNC_STATUS_RECONNECTING,
-            CAMERA_SYNC_STATUS_WARMING,
-        }:
-            self.panel._camera_sync_transport_override = None
-            self.panel._set_camera_sync_state(
-                CAMERA_SYNC_STATUS_NOT_VERIFIED,
-                "새 스트림은 STUS 후 RTCP/NTP 검증이 필요합니다.",
-            )
+        self.panel.frame_timing_status = "not-verified"
+        self.panel.frame_timing_reason = "new video stream awaits decoded RTCP frame mapping"
         if was_camera_connected:
             message += " 기존 스트림은 재시작합니다."
         self.panel._log(message)
@@ -1552,6 +1605,7 @@ class CameraStreamLifecycleController:
             self.panel._pending_video_finalization_artifacts = None
             return True
         backend = str(pending.get("backend") or "gstreamer")
+        runtime_generation = str(pending.get("runtime_generation") or "")
         append = getattr(self.panel, "append_workstation_data", None)
         recorded_sides = {
             str(side) for side in tuple(pending.get("recorded_sides", ()) or ())
@@ -1569,67 +1623,92 @@ class CameraStreamLifecycleController:
                 else {}
             )
             side_backend = str(payload.get("stream_backend") or backend)
+            default_contract = recording_integrity_contract(side_backend)
+            encoding_mode = str(
+                payload.get("recording_encoding_mode")
+                or default_contract["recording_encoding_mode"]
+            )
+            try:
+                inferred_present = path.is_file()
+            except OSError:
+                inferred_present = False
+            if (
+                not payload
+                and inferred_present
+                and encoding_mode == RECORDING_ENCODING_DECODED_NVENC_LOSSLESS
+            ):
+                payload = {
+                    **default_contract,
+                    "path": str(path),
+                    "stream_backend": side_backend,
+                    "success": True,
+                    "container_finalization_success": True,
+                    "container_finalization_inferred": True,
+                    "detail": "camera child closed; file existence observed",
+                    "integrity_validation_status": "NOT_RUN",
+                    "recording_integrity_verified": False,
+                    "recording_file_integrity_verified": False,
+                    "source_media_integrity_verified": False,
+                    "recording_usable": False,
+                    "integrity_failure_reasons": [],
+                }
             container_success = bool(
                 payload.get(
                     "container_finalization_success",
                     payload.get("success", False),
                 )
             )
-            h264_copy = side_backend.strip().lower() in {"gst", "gstreamer"}
-            integrity_pass = bool(
-                payload.get("integrity_schema") == H264_MP4_INTEGRITY_SCHEMA
-                and payload.get("integrity_validation_status") == "PASS"
-                and payload.get("recording_usable") is True
-                and payload.get("recording_integrity_verified") is True
-            )
-            success = bool(
-                payload.get("success", False)
-                and (integrity_pass if h264_copy else True)
-            )
+            success = bool(payload.get("success", False))
             detail = str(
                 payload.get("detail")
                 or "worker exited without recording-finalization evidence"
             )
-            if h264_copy and not integrity_pass:
-                payload.update(
-                    integrity_validation_status="FAIL",
-                    recording_integrity_verified=False,
-                    recording_usable=False,
-                )
-                failures = list(
-                    payload.get("integrity_failure_reasons", ()) or ()
-                )
-                if payload.get("integrity_schema") != H264_MP4_INTEGRITY_SCHEMA:
-                    failures.append("integrity_validation_schema_invalid")
-                if not failures:
-                    failures.append("finalized_mp4_integrity_evidence_missing")
-                payload["integrity_failure_reasons"] = list(dict.fromkeys(failures))
-                if container_success and "MP4 integrity FAIL" not in detail:
-                    detail = (
-                        f"{detail}; MP4 integrity FAIL: "
-                        + ",".join(str(reason) for reason in failures)
-                    )
             try:
                 present = path.is_file()
                 size_bytes = path.stat().st_size if present else 0
             except OSError:
                 present = False
                 size_bytes = 0
+            validation_status = str(
+                payload.get("integrity_validation_status") or "NOT_RUN"
+            ).upper()
+            validated_usable = bool(
+                validation_status == "PASS"
+                and payload.get("recording_usable") is True
+                and payload.get("recording_integrity_verified") is True
+            )
             artifact = {
                 "event_type": "video_finalized",
+                "runtime_generation": runtime_generation,
                 "side": side,
                 "path": str(path),
                 "media_type": "video/mp4",
                 "stream_backend": side_backend,
-                **recording_integrity_contract(side_backend),
+                **default_contract,
+                "recording_encoding_mode": encoding_mode,
                 **payload,
                 "success": success,
                 "container_finalization_success": container_success,
                 "finalization_success": success,
                 "finalization_detail": detail,
                 "present": present,
+                "presence_state": "SAVED" if present else "FAILED",
                 "size_bytes": size_bytes,
+                "integrity_validation_status": (
+                    "PASS" if validated_usable else "NOT_RUN"
+                ),
+                "recording_usable": validated_usable,
             }
+            presence_recorder = getattr(
+                self.panel, "record_measurement_video_segment_presence", None
+            )
+            if callable(presence_recorder):
+                presence_recorder(
+                    side,
+                    path,
+                    detail=detail,
+                    runtime_generation=runtime_generation,
+                )
             accepted = True
             if callable(append):
                 accepted = append(
@@ -1642,10 +1721,8 @@ class CameraStreamLifecycleController:
                 if callable(logger):
                     logger(
                         f"[저장] {side} MP4 finalization evidence queue 실패; "
-                        "DataStorage를 닫지 않고 재시도합니다."
+                        "Measurement와 다음 실행은 계속합니다."
                     )
-                pending["recorded_sides"] = tuple(sorted(recorded_sides))
-                return False
             finalization_evidence = getattr(
                 self.panel,
                 "_measurement_package_video_finalization_evidence",
@@ -1796,19 +1873,7 @@ class CameraStreamLifecycleController:
         if self.panel.auto_wiris_connect_pending:
             self.panel._cancel_auto_wiris_connect_retry()
         self.panel._cancel_pending_camera_start()
-        self.panel._camera_sync_timer.stop()
-        self.panel._camera_sync_deadline_monotonic_s = None
-        self.panel._camera_sync_stus_sr_baseline = {}
-        self.panel._camera_sync_last_sr_counts = {}
         self.panel._camera_sync_transport_override = None
-        stus_operation = getattr(self.panel, "_camera_sync_stus_operation", None)
-        if isinstance(stus_operation, Mapping) and bool(stus_operation.get("active")):
-            finish_stus = getattr(self.panel, "_finish_wiris_time_sync_operation", None)
-            if callable(finish_stus):
-                finish_stus(
-                    "cancelled",
-                    "camera streams were stopped before STUS closed-loop verification completed",
-                )
         finalize_session = self.panel._session_recording_active()
         recording_paths = dict(
             getattr(self.panel, "video_recording_paths", {}) or {}
@@ -1879,27 +1944,17 @@ class CameraStreamLifecycleController:
         self.panel._clear_detection_state()
         self.panel.camera_connected = False
         self.panel.yolo_enabled = False
-        self.panel._set_camera_sync_state(
-            CAMERA_SYNC_STATUS_NOT_VERIFIED,
-            "스트림이 중지되어 동기화 검증이 초기화되었습니다.",
-        )
-        last_sync = getattr(self.panel, "_last_wiris_pc_utc_sync", None)
-        if (
-            isinstance(last_sync, dict)
-            and last_sync.get("command") == "STUS"
-            and last_sync.get("result") in {"success", "pending-verification"}
-        ):
-            last_sync["result"] = "revoked"
-            last_sync["verification_reason"] = (
-                "camera stream generation stopped; fresh STUS/SR verification required"
-            )
-            last_sync["revoked_at_unix_s"] = time.time()
+        self.panel.frame_timing_status = "not-verified"
+        self.panel.frame_timing_reason = "camera stream stopped; clock observer remains independent"
+        status_by_side = getattr(self.panel, "frame_timing_status_by_side", None)
+        if isinstance(status_by_side, dict):
+            status_by_side.update(left="not-verified", right="not-verified")
         self.panel.camera_connection_label.setText("카메라: 연결 해제")
         self.panel.start_button.setEnabled(True)
         self.panel.camera_connect_button.setEnabled(True)
         self.panel._refresh_session_toggle_buttons()
         self.panel._refresh_operation_header()
-        return bool(panes_stopped and finalization_recorded)
+        return bool(panes_stopped)
 
     def _stop_camera_panes(self, *, clear_previews: bool, wait: bool = False) -> bool:
         left_stopped = self.panel.left_pane.stop(wait=wait)
@@ -1961,6 +2016,9 @@ class CameraStreamLifecycleController:
         self.panel._refresh_distance()
 
     def stop_all(self, *, wait: bool = False) -> bool:
+        stop_clock_observer = getattr(self.panel, "_stop_rtcp_clock_observer", None)
+        if callable(stop_clock_observer):
+            stop_clock_observer()
         camera_stopped = self.panel.stop_yolo_streams(wait=wait)
         pixhawk_stopped = self.panel._stop_pixhawk_operation_workers(wait=wait)
         if pixhawk_stopped and self.panel.mavlink_pixhawk is not None:
@@ -1987,9 +2045,11 @@ class CameraStreamLifecycleController:
             "wiris_command_thread",
             "wiris_zoom_thread",
             "wiris_time_sync_thread",
+            "_rtcp_clock_observer_thread",
             "wiris_stip_thread",
             "camera_network_discovery_thread",
             "camera_network_apply_thread",
+            "network_role_apply_thread",
             "interface_status_thread",
             "pixhawk_usb_discovery_thread",
             "pixhawk_host_ip_discovery_thread",

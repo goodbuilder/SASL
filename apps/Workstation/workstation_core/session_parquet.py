@@ -129,12 +129,13 @@ class _DatasetSpec:
     role: str
     schema_id: str
     columns: tuple[_Column, ...]
+    schema_version: int = PARQUET_FORMAT_VERSION
 
     @property
     def schema(self) -> pa.Schema:
         metadata = {
             b"workstation.schema_id": self.schema_id.encode("utf-8"),
-            b"workstation.schema_version": str(PARQUET_FORMAT_VERSION).encode("ascii"),
+            b"workstation.schema_version": str(self.schema_version).encode("ascii"),
             b"workstation.artifact_role": self.role.encode("utf-8"),
             b"workstation.row_json_contract": ROW_JSON_CONTRACT.encode("utf-8"),
         }
@@ -290,7 +291,8 @@ BOOL = pa.bool_()
 MEASUREMENT_PAIRS = _DatasetSpec(
     key="measurement_pairs",
     role="measurement_pairs_parquet",
-    schema_id="workstation-measurement-pairs-parquet-v1",
+    schema_id="workstation-measurement-pairs-parquet-v4",
+    schema_version=4,
     columns=(
         _column("sample_index", I64, _as_int),
         _column("recording_time_ns", I64, _as_int, unit="ns"),
@@ -320,7 +322,31 @@ MEASUREMENT_PAIRS = _DatasetSpec(
         _column("baseline_center_right_m", F64, _as_float, unit="m"),
         _column("baseline_center_down_m", F64, _as_float, unit="m"),
         _column("baseline_m", F64, _as_float, aliases=("baseline_length_m",), unit="m"),
-        _column("sync_delta_ns", I64, _as_int, aliases=("rtcp_pair_delta_ns",), unit="ns"),
+        _column("pairing_time_basis_requested", TEXT, _as_string),
+        _column("pairing_time_basis", TEXT, _as_string),
+        _column("pairing_time_basis_role", TEXT, _as_string),
+        _column("pairing_fallback_active", BOOL, _as_bool),
+        _column("pairing_fallback_reason", TEXT, _as_string),
+        _column("selected_pair_delta_ns", I64, _as_int, unit="ns"),
+        _column("selected_pair_abs_delta_ns", I64, _as_int, unit="ns"),
+        _column("selected_pair_midpoint_ns", I64, _as_int, unit="ns"),
+        _column("app_receive_pair_delta_ns", I64, _as_int, unit="ns"),
+        _column("app_receive_evidence_role", TEXT, _as_string),
+        _column("rtcp_pair_delta_ns", I64, _as_int, unit="ns"),
+        _column("ntp_evidence_role", TEXT, _as_string),
+        _column("left_media_recovery_basis", TEXT, _as_string),
+        _column("right_media_recovery_basis", TEXT, _as_string),
+        _column("left_media_integrity_mode", TEXT, _as_string),
+        _column("right_media_integrity_mode", TEXT, _as_string),
+        _column("left_media_random_access_guaranteed", BOOL, _as_bool),
+        _column("right_media_random_access_guaranteed", BOOL, _as_bool),
+        _column(
+            "sync_delta_ns",
+            I64,
+            _as_int,
+            aliases=("selected_pair_delta_ns", "app_receive_pair_delta_ns", "rtcp_pair_delta_ns"),
+            unit="ns",
+        ),
         _column("quality", TEXT, _as_string, aliases=("pair_quality_status",)),
         _column("warning_code", TEXT, _as_string),
     ),
@@ -330,11 +356,14 @@ MEASUREMENT_PAIRS = _DatasetSpec(
 CAMERA_TIMELINE = _DatasetSpec(
     key="camera_timeline",
     role="camera_timeline_parquet",
-    schema_id="workstation-camera-timeline-parquet-v1",
+    schema_id="workstation-camera-timeline-parquet-v3",
+    schema_version=3,
     columns=(
         _column("side", TEXT, _required_string, nullable=False),
         _column("sequence", I64, _as_int),
         _column("recording_time_ns", I64, _as_int, unit="ns"),
+        _column("app_receive_monotonic_ns", I64, _as_int, unit="ns"),
+        _column("app_receive_timestamp_role", TEXT, _as_string),
         _column("estimated_utc_time_ns", I64, _as_int, unit="ns"),
         _column("device_utc_time_ns", I64, _as_int, unit="ns"),
         _column("image_width_px", I64, _as_int, unit="px"),
@@ -353,6 +382,10 @@ CAMERA_TIMELINE = _DatasetSpec(
         _column("rtcp_camera_ntp_rate", F64, _as_float),
         _column("rtcp_camera_media_rate", F64, _as_float),
         _column("rtsp_transport", TEXT, _as_string),
+        _column("ntp_evidence_role", TEXT, _as_string),
+        _column("media_recovery_basis", TEXT, _as_string),
+        _column("media_integrity_mode", TEXT, _as_string),
+        _column("media_random_access_guaranteed", BOOL, _as_bool),
         _column("timing_status", TEXT, _as_string),
     ),
 )
@@ -665,7 +698,7 @@ def _schema_mapping(spec: _DatasetSpec) -> dict[str, object]:
         fields.append(field_entry)
     return {
         "id": spec.schema_id,
-        "version": PARQUET_FORMAT_VERSION,
+        "version": spec.schema_version,
         "fields": fields,
         "metadata": schema_metadata,
     }

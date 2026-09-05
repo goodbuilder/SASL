@@ -30,3 +30,32 @@ side별 endpoint/peer는 있으나 side별 interface/local address는 없다.
 README의 field-qualified 구성은 camera/Pixhawk NIC 분리를 요구하지만 사용자는 같은 NIC도
 경고 없이 선택 가능하도록 승인했다. 새 UI는 topology를 차단하지 않되 기존 shared-NIC stall
 field evidence를 문서에서 삭제하거나 안정성이 검증됐다고 표현하지 않는다.
+
+## 2026-08-29 Network-role amendment implementation
+
+The current source keeps Find read-only but makes confirmed Assign a role-scoped NetworkManager
+transaction. Runtime-discovered NICs carry composable Camera/P1/P2 sets; target readback precedes
+source cleanup, exact Workstation-owned entries are persisted, and ordinary active affected owners
+stop/reconnect automatically. Mapping-locked Measurement/recording remains unchanged. Automated,
+launcher, read-only real-NM and visual evidence pass; real mutating device moves remain unverified.
+
+## 2026-08-29 Real multi-NIC field finding
+
+The first mutating field run exposed a contract mismatch rather than a NetworkManager write
+failure. After the OWC RTL8156B appeared as `enx0023a40a2e39`, Camera traffic was physically on
+`enx588694fce07e` and P1 traffic was physically on the new NIC. P2 was temporarily silent until a
+USB-triggered PX4 boot, after which it broadcast `10.0.0.3:14551` normally.
+
+Moving one Pixhawk role marked every open Camera/P1/P2 owner on the source and target interfaces as
+affected. The coordinator then required fresh device evidence from that whole set before committing
+the host assignment. A silent P2 therefore caused `device evidence timeout on selected NIC`, locked
+both Assign buttons during the operation, and produced `ROLLBACK PARTIAL` even though the selected
+host address/route delta itself was valid. This prevents an operator from intentionally assigning an
+offline or not-yet-powered device to its desired NIC.
+
+With Workstation stopped, the same role-scoped NetworkManager transaction was applied and read back
+successfully: Camera `.231/.232` routes use `enx588694fce07e` with source `.11`, while P1 `.2` and P2
+`.3` use `enx0023a40a2e39` with source `.10`. A fresh Workstation launch then reached expected-system
+P1/P2 `LIVE`; after USB removal P2 rebooted, completed the visible 60-second qualification, and
+returned to `LIVE` without a USB device present. The remaining issue is assignment/reconnect policy,
+not the final host topology or PX4 Ethernet parameters.

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Mapping, Protocol
 
 
 RM3100_PRIMARY_ID = 8944899
@@ -23,6 +23,7 @@ INTERNAL_MAG_IDS = (BOARD_INTERNAL_MAG_ID, *GPS_MAG_IDS)
 # into eighteen sequential timeouts. Explicit callers may still request an
 # arbitrary parameter through the generic MAVLink parameter API.
 MAG_SLOTS = tuple(range(4))
+MAG_PRIORITY_KEYS = tuple(f"CAL_MAG{slot}" for slot in MAG_SLOTS)
 MAG_PRIORITY_LEVELS = (
     (-1, "Uninitialized"),
     (0, "Disabled"),
@@ -53,6 +54,30 @@ def mag_priority_display(value: int | float | None) -> str:
     raw = int(value)
     label = MAG_PRIORITY_LABELS.get(raw)
     return f"{label} ({raw})" if label is not None else f"Custom ({raw})"
+
+
+def mag_priority_slot_key(slot: int) -> str:
+    """Return the operator-facing key for one ``CAL_MAGn_PRIO`` value."""
+
+    slot = int(slot)
+    if slot not in MAG_SLOTS:
+        raise ValueError(f"Unsupported PX4 CAL_MAG slot: {slot}")
+    return f"CAL_MAG{slot}"
+
+
+def mag_priority_slot_from_key(key: object) -> int | None:
+    """Parse ``CAL_MAGn``/``CAL_MAGn_PRIO`` without accepting another slot."""
+
+    text = str(key or "").strip().upper()
+    if not text.startswith("CAL_MAG"):
+        return None
+    suffix = text[len("CAL_MAG") :]
+    if suffix.endswith("_PRIO"):
+        suffix = suffix[: -len("_PRIO")]
+    if not suffix.isdigit():
+        return None
+    slot = int(suffix)
+    return slot if slot in MAG_SLOTS else None
 
 
 # Hard-iron/soft-iron fit coefficients only -- the calibration *output*,
@@ -91,6 +116,12 @@ MAG_PARAM_NAMES = (
     "EKF2_MAG_TYPE",
     *MAG_CAL_PARAM_NAMES,
 )
+MAG_PRIORITY_PARAM_NAMES = (
+    "UAVCAN_ENABLE",
+    "UAVCAN_SUB_MAG",
+    *(f"CAL_MAG{slot}_ID" for slot in MAG_SLOTS),
+    *(f"CAL_MAG{slot}_PRIO" for slot in MAG_SLOTS),
+)
 
 
 class ParameterStore(Protocol):
@@ -122,6 +153,34 @@ class MagSlotStatus:
     interface: str
     is_rm3100: bool
     status: str
+
+
+@dataclass(frozen=True)
+class MagSelectionCandidate:
+    """One live ``sensor_mag`` instance considered by the stock selector preview."""
+
+    instance: int
+    device_id: int
+    role: str
+    priority: int
+    cal_slot: int | None
+    stock_selector_range: bool
+
+
+@dataclass(frozen=True)
+class MagSelectionPreview:
+    """Read-only prediction; it is not evidence that PX4 actually selected the candidate."""
+
+    instance_map: tuple[tuple[int, int], ...]
+    candidates: tuple[MagSelectionCandidate, ...]
+    predicted_instance: int | None
+    predicted_device_id: int | None
+    predicted_role: str | None
+    predicted_priority: int | None
+    actual_device_id: int | None
+    actual_role: str | None
+    out_of_range_device_ids: tuple[int, ...]
+    priority_tie: bool
 
 
 @dataclass(frozen=True)
@@ -225,6 +284,113 @@ def identify_mag_device(device_id: int | None) -> MagDeviceInfo:
     if device_id is None:
         return MagDeviceInfo(device_id, "N/A", "N/A", False)
     return MagDeviceInfo(device_id, "Unknown MAG", "Unknown", False)
+
+
+def mag_role_for_device_id(device_id: int | None) -> str | None:
+    """Return the stable operator role for a known magnetometer identity."""
+
+    if device_id == BOARD_INTERNAL_MAG_ID:
+        return "BOARD"
+    if device_id in RM3100_PRIMARY_IDS:
+        return "CAN1"
+    if device_id in RM3100_BACKUP_IDS:
+        return "CAN2"
+    if device_id == GPS1_MAG_ID:
+        return "GPS1_MAG"
+    if device_id == GPS2_MAG_ID:
+        return "GPS2_MAG"
+    return None
+
+
+def _default_mag_priority(device_id: int) -> int:
+    """PX4's default priority for an identity with no matching CAL_MAG slot."""
+
+    return 50 if device_id == BOARD_INTERNAL_MAG_ID else 75
+
+
+def build_mag_selection_preview(
+    params: Mapping[str, int | float | None],
+    instance_device_ids: Mapping[int, int | None],
+    *,
+    requested_priorities: Mapping[str, int] | None = None,
+    actual_selected_device_id: int | None = None,
+) -> MagSelectionPreview:
+    """Predict the stock PX4 MAG candidate from live instances and priorities.
+
+    This intentionally does not claim estimator success.  Stock PX4's
+    ``VehicleMagnetometer`` consumes only instances 0..3; instance 4 remains
+    visible in the topology map but is excluded from the candidate preview.
+    Health/confidence tie-breaking is left to the actual active-device readback.
+    """
+
+    role_overrides: dict[str, int] = {}
+    slot_overrides: dict[int, int] = {}
+    for key, value in dict(requested_priorities or {}).items():
+        slot = mag_priority_slot_from_key(key)
+        if slot is not None:
+            slot_overrides[slot] = int(value)
+        else:
+            # Keep the previous role-based contract for callers outside the
+            # visible CAL_MAG UI. New UI payloads use CAL_MAGn keys.
+            role_overrides[str(key)] = int(value)
+    slot_by_device: dict[int, int] = {}
+    priority_by_slot: dict[int, int] = {}
+    for slot in MAG_SLOTS:
+        device_id = _param_int(dict(params), f"CAL_MAG{slot}_ID")
+        if device_id is None:
+            continue
+        slot_by_device[device_id] = slot
+        priority_by_slot[slot] = _param_int(dict(params), f"CAL_MAG{slot}_PRIO") or 0
+
+    normalized_instances = tuple(
+        sorted(
+            (int(instance), int(device_id))
+            for instance, device_id in dict(instance_device_ids).items()
+            if device_id is not None
+        )
+    )
+    candidates: list[MagSelectionCandidate] = []
+    for instance, device_id in normalized_instances:
+        role = mag_role_for_device_id(device_id) or "UNKNOWN"
+        slot = slot_by_device.get(device_id)
+        if slot in slot_overrides:
+            priority = int(slot_overrides[slot])
+        elif role in role_overrides:
+            priority = int(role_overrides[role])
+        elif slot is not None:
+            priority = int(priority_by_slot.get(slot, 0))
+        else:
+            priority = _default_mag_priority(device_id)
+        candidates.append(
+            MagSelectionCandidate(
+                instance=instance,
+                device_id=device_id,
+                role=role,
+                priority=priority,
+                cal_slot=slot,
+                stock_selector_range=instance < 4,
+            )
+        )
+
+    eligible = [candidate for candidate in candidates if candidate.stock_selector_range and candidate.priority > 0]
+    best_priority = max((candidate.priority for candidate in eligible), default=None)
+    best = [candidate for candidate in eligible if candidate.priority == best_priority]
+    selected = min(best, key=lambda candidate: candidate.instance) if best else None
+    active_role = mag_role_for_device_id(actual_selected_device_id)
+    return MagSelectionPreview(
+        instance_map=normalized_instances,
+        candidates=tuple(candidates),
+        predicted_instance=None if selected is None else selected.instance,
+        predicted_device_id=None if selected is None else selected.device_id,
+        predicted_role=None if selected is None else selected.role,
+        predicted_priority=None if selected is None else selected.priority,
+        actual_device_id=actual_selected_device_id,
+        actual_role=active_role,
+        out_of_range_device_ids=tuple(
+            candidate.device_id for candidate in candidates if not candidate.stock_selector_range
+        ),
+        priority_tie=len(best) > 1,
+    )
 
 
 def read_mag_params(store: ParameterStore) -> dict[str, int | float | None]:

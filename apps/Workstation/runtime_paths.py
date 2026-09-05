@@ -16,6 +16,7 @@ from pathlib import Path, PureWindowsPath
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+WORKSTATION_SOURCE_ROOT = Path(__file__).resolve().parent
 _WORKSTATION_DATA_ROOT_OVERRIDE = os.environ.get(
     "SASL_WORKSTATION_DATA_ROOT", ""
 ).strip()
@@ -34,7 +35,7 @@ def _workstation_data_root() -> Path:
 WORKSTATION_DATA_ROOT = _workstation_data_root()
 WORKSTATION_SETTINGS_PATH = WORKSTATION_DATA_ROOT / "stereo_distance_settings.json"
 WORKSTATION_RECORDINGS_ROOT = WORKSTATION_DATA_ROOT / "recordings"
-WORKSTATION_CALIBRATION_ROOT = WORKSTATION_DATA_ROOT / "calibration"
+WORKSTATION_CALIBRATION_ROOT = WORKSTATION_SOURCE_ROOT / "calibration"
 WORKSTATION_MODELS_ROOT = WORKSTATION_DATA_ROOT / "models"
 WORKSTATION_MEASUREMENT_DATA_ROOT = (
     WORKSTATION_DATA_ROOT / "recordings"
@@ -194,6 +195,7 @@ def import_workstation_asset_file(
 
 __all__ = [
     "REPO_ROOT",
+    "WORKSTATION_SOURCE_ROOT",
     "WORKSTATION_DATA_ROOT",
     "WORKSTATION_SETTINGS_PATH",
     "WORKSTATION_RECORDINGS_ROOT",

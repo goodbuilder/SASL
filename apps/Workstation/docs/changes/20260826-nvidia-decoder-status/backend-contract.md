@@ -3,7 +3,8 @@
 ## Commands and validation
 
 `current_decoder_selection(requested)` remains the sole availability policy. Auto requires software
-decoder and prefers NVIDIA only when driver and element probes both pass.
+decoder and prefers NVIDIA only when the `nvh264dec` factory, `nvidia-smi`, and the CUDA Driver API
+`cuInit(0)` all pass.
 
 ## State, ownership, and concurrency
 
@@ -18,8 +19,8 @@ cap, frame queues, recording finalization, and fallback restart ordering remain.
 
 ## External boundaries and workers
 
-Boundaries: `nvidia-smi` driver probe, GStreamer `nvh264dec` factory, actual decoder start/first
-frame/stall, and current active pipeline status.
+Boundaries: `nvidia-smi` management probe, CUDA Driver API `cuInit(0)`, GStreamer `nvh264dec`
+factory, actual decoder start/first-frame/stall, and current active pipeline status.
 
 ## Results, errors, timeout, retry, and cancellation
 

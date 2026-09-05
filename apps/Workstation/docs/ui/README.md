@@ -50,12 +50,15 @@ Measurement 실행은 persisted Session 없이 transient
 `IDLE/QUEUED/STARTING/RUNNING/STOPPING/ERROR` 상태만 사용합니다. `측정 시작`은 기존
 OPEN/RECOVERABLE 데이터와 writer 오류를 검사하지 않습니다. 수동 기록은 먼저 중지하고,
 실제 카메라 작업이 진행 중이면 QUEUED로 기다렸다가 자동 시작합니다. 구조화 자료는
-기본 `<SASL_ROOT>/recordings`의 유형별 고정 JSONL에 append되고 MP4/사진/native PNG/ULog는
-생성 시각과 UTC offset 파일명을 사용하며 기존 파일을 덮어쓰지 않습니다. `측정 종료`는
+기본 `<SASL_ROOT>/recordings`의 유형별 timestamped JSONL에 append되고 MP4/사진/native PNG/ULog는
+생성 시각과 UTC offset 파일명을 사용하며 기존 파일을 덮어쓰지 않습니다. 구조화 JSONL도 새
+writer 파일 세트마다 날짜·시간 파일명을 사용하고 기존 파일을 보존합니다. `측정 종료`는
 실제 카메라 owner를 해제한 뒤 즉시 다음 실행이 가능하며 Parquet, review.xlsx, manifest,
 Finalize/Seal/Retry Save를 기다리지 않습니다. 종료 뒤에는 최근 Measurement 한 건의 파생
-`latest_measurement.xlsx`를 백그라운드에서 만들며 이 작업도 다음 실행을 막지 않습니다.
-`Data > Status`는 writer 상태와 `Update/Open Latest XLSX`, 고정 상태 줄을 제공하고,
+`latest_measurement_<timestamp>.xlsx`를 백그라운드에서 만들며 기존 workbook을 덮어쓰지 않고,
+이 작업도 다음 실행을 막지 않습니다.
+`Data > Status`는 writer 상태와 JSONL/CSV same-stem 경로·미러 상태, `Update/Open Latest XLSX`,
+timestamped 상태 줄을 제공하고,
 `Capture`는 기존 캡처 도구를 유지하며 과거 Session recordings는 file manager에서만 엽니다.
 
 Optical Pose는 현재 Horizon, Mountain + GNSS, Terrain PnP, Drone RTK Rotation,

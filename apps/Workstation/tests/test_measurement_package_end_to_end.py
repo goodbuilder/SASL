@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from PyQt5 import QtGui
 
 from Workstation.measurement_package_controller import MeasurementPackageController
@@ -20,6 +22,7 @@ from Workstation.workstation_core.measurement_package import (
     MeasurementPackage,
     verify_package,
 )
+from Workstation.workstation_core.measurement_data_store import LiveDataRows
 from Workstation.workstation_core.package_provenance import (
     REDACTED,
     write_atomic_json_snapshot,
@@ -413,6 +416,776 @@ def test_accepted_and_blocked_rows_persist_exact_canonical_payloads_and_hashes(
     assert blocked_row["terminal_record_id"] == blocked.terminal_record_id
     assert blocked_row["measurement_package_id"] == blocked_row["measurement_id"]
     assert accepted_row["terminal_record_id"] != blocked_row["terminal_record_id"]
+
+
+def test_primary_distance_commit_persists_method_outcome_provenance(
+    tmp_path: Path,
+) -> None:
+    spool = SpoolRows(supports_updates=True)
+    spool_path = tmp_path / "primary-row-session" / ".spool" / "pair_rows.jsonl"
+    spool.bind(spool_path)
+    panel = _recording_panel(tmp_path, spool)
+    controller = RecordingController(panel)
+    panel._pair_recording_base_row = controller._pair_recording_base_row
+    panel._upsert_pair_recording_row = controller._upsert_pair_recording_row
+    attempt = _measurement_attempt()
+    estimate = SimpleNamespace(
+        left=SimpleNamespace(timestamp_s=1.0),
+        right=SimpleNamespace(timestamp_s=1.01),
+        sync_quality="GOOD",
+        disparity_px=40.0,
+        time_delta_s=0.01,
+        vertical_delta_px=0.0,
+        warnings=(),
+    )
+    metadata = {
+        "runtime_generation": "run-primary",
+        "method_evaluation_pair_id": "run-primary:00000000000000000001",
+        "method_evaluation_pair_sequence": 1,
+        "method_evaluation_request_generation": 1,
+        "method_evaluation_snapshot_sha256": "b" * 64,
+        "primary_outcome_status": "VALID",
+        "primary_outcome_sha256": "c" * 64,
+        "primary_committed_before_bundle": True,
+        "primary_commit_source": "early_outcome",
+    }
+
+    committed = controller._commit_primary_distance_outcome(
+        estimate=estimate,
+        distance_m=9.0,
+        method="two_ray_closest_midpoint-pixhawk_rtk_live",
+        baseline_source="ignored-by-controller",
+        baseline_m=0.0,
+        point_m=(9.0, 0.0, 0.0),
+        raw_point_m=(9.0, 0.0, 0.0),
+        raw_point_left_m=(0.0, 0.0, 9.0),
+        measurement_attempt=attempt,
+        outcome_metadata=metadata,
+        publish_history=True,
+    )
+
+    assert committed.history_added is True
+    assert committed.row_commit is not None
+    assert committed.row_commit.enqueue_admitted is True
+    assert len(spool) == 1
+    row = spool[0]
+    for key, value in metadata.items():
+        assert row[key] == value
+    assert row["measurement_valid"] == "true"
+    assert row["measurement_validity"] == "VALID"
+    assert row["distance_m"] == "9.000000"
+
+
+def test_primary_bundle_retry_updates_the_physically_admitted_provenance(
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, object]] = []
+    admissions = iter((False, True))
+
+    class Store:
+        def enqueue(self, _stream, payload, *, priority=None):
+            calls.append({"payload": dict(payload), "priority": priority})
+            return next(admissions)
+
+    rows = LiveDataRows(Store(), "measurements", priority=True)
+    panel = _recording_panel(tmp_path, rows)
+    controller = RecordingController(panel)
+    native_calls: list[int] = []
+    persist_native = controller._persist_native_measurement_pair
+
+    def counted_native(measurement_attempt):
+        native_calls.append(int(measurement_attempt.attempt_id))
+        return persist_native(measurement_attempt)
+
+    controller._persist_native_measurement_pair = counted_native
+    panel._pair_recording_base_row = controller._pair_recording_base_row
+    panel._upsert_pair_recording_row = controller._upsert_pair_recording_row
+    attempt = _measurement_attempt()
+    estimate = SimpleNamespace(
+        left=SimpleNamespace(timestamp_s=1.0),
+        right=SimpleNamespace(timestamp_s=1.01),
+        sync_quality="GOOD",
+        disparity_px=40.0,
+        time_delta_s=0.01,
+        vertical_delta_px=0.0,
+        warnings=(),
+    )
+    base_metadata = {
+        "runtime_generation": "run-primary",
+        "method_evaluation_pair_id": "run-primary:00000000000000000001",
+        "method_evaluation_pair_sequence": 1,
+        "method_evaluation_request_generation": 1,
+        "method_evaluation_snapshot_sha256": "b" * 64,
+        "primary_outcome_status": "VALID",
+        "primary_outcome_sha256": "c" * 64,
+    }
+
+    first = controller._commit_primary_distance_outcome(
+        estimate=estimate,
+        distance_m=9.0,
+        method="two_ray_closest_midpoint-pixhawk_rtk_live",
+        baseline_source="ignored-by-controller",
+        baseline_m=0.0,
+        point_m=(9.0, 0.0, 0.0),
+        raw_point_m=(9.0, 0.0, 0.0),
+        raw_point_left_m=(0.0, 0.0, 9.0),
+        measurement_attempt=attempt,
+        outcome_metadata={
+            **base_metadata,
+            "primary_committed_before_bundle": True,
+            "primary_commit_source": "early_outcome",
+        },
+        publish_history=True,
+    )
+    second = controller._commit_primary_distance_outcome(
+        estimate=estimate,
+        distance_m=9.0,
+        method="two_ray_closest_midpoint-pixhawk_rtk_live",
+        baseline_source="ignored-by-controller",
+        baseline_m=0.0,
+        point_m=(9.0, 0.0, 0.0),
+        raw_point_m=(9.0, 0.0, 0.0),
+        raw_point_left_m=(0.0, 0.0, 9.0),
+        measurement_attempt=attempt,
+        outcome_metadata={
+            **base_metadata,
+            "primary_committed_before_bundle": False,
+            "primary_commit_source": "bundle_fallback",
+        },
+        publish_history=False,
+    )
+
+    assert first.row_commit is not None
+    assert first.row_commit.enqueue_admitted is False
+    assert second.row_commit is not None
+    assert second.row_commit.enqueue_admitted is True
+    assert [call["payload"]["_record_operation"] for call in calls] == [
+        "append",
+        "append",
+    ]
+    assert rows[0]["primary_commit_source"] == "bundle_fallback"
+    assert rows[0]["primary_committed_before_bundle"] is False
+    assert native_calls == [attempt.attempt_id]
+
+
+def test_primary_unavailable_spool_uses_direct_measurement_persistence(
+    tmp_path: Path,
+) -> None:
+    for mode in ("unbound", "closed"):
+        rows = SpoolRows(supports_updates=True)
+        if mode == "closed":
+            rows.bind(tmp_path / mode / "measurements.jsonl")
+            assert rows.close() is True
+        panel = _recording_panel(tmp_path, rows)
+        writes: list[dict[str, object]] = []
+
+        def append_workstation_data(stream, payload, *, priority=None):
+            writes.append(
+                {
+                    "stream": str(stream),
+                    "payload": dict(payload),
+                    "priority": priority,
+                }
+            )
+            return True
+
+        panel.append_workstation_data = append_workstation_data
+        controller = RecordingController(panel)
+        panel._pair_recording_base_row = controller._pair_recording_base_row
+        panel._upsert_pair_recording_row = controller._upsert_pair_recording_row
+        attempt = _measurement_attempt()
+        estimate = SimpleNamespace(
+            left=SimpleNamespace(timestamp_s=1.0),
+            right=SimpleNamespace(timestamp_s=1.01),
+            sync_quality="GOOD",
+            disparity_px=40.0,
+            time_delta_s=0.01,
+            vertical_delta_px=0.0,
+            warnings=(),
+        )
+
+        committed = controller._commit_primary_distance_outcome(
+            estimate=estimate,
+            distance_m=9.0,
+            method="two_ray_closest_midpoint-pixhawk_rtk_live",
+            baseline_source="ignored-by-controller",
+            baseline_m=0.0,
+            point_m=(9.0, 0.0, 0.0),
+            raw_point_m=(9.0, 0.0, 0.0),
+            raw_point_left_m=(0.0, 0.0, 9.0),
+            measurement_attempt=attempt,
+            outcome_metadata={
+                "runtime_generation": f"run-{mode}",
+                "primary_outcome_status": "VALID",
+                "primary_outcome_sha256": "d" * 64,
+                "primary_committed_before_bundle": True,
+                "primary_commit_source": "early_outcome",
+            },
+            publish_history=True,
+        )
+
+        assert committed.history_added is True
+        assert committed.row_commit is not None
+        assert committed.row_commit.enqueue_admitted is True
+        assert committed.row_commit.direct_persistence is True
+        assert committed.row_commit.row_index == -1
+        assert len(rows) == 0
+        assert len(writes) == 1
+        assert writes[0]["stream"] == "measurements"
+        assert writes[0]["priority"] is True
+        assert writes[0]["payload"]["row_persistence_mode"] == (
+            "direct_owner_unavailable"
+        )
+        assert mode in str(
+            writes[0]["payload"]["row_owner_unavailable_reason"]
+        ) or "spool" in str(
+            writes[0]["payload"]["row_owner_unavailable_reason"]
+        )
+
+
+def test_primary_direct_rejection_retries_cached_full_row_without_new_native_request(
+    tmp_path: Path,
+) -> None:
+    rows = SpoolRows(supports_updates=True)
+    panel = _recording_panel(tmp_path, rows)
+    writes: list[dict[str, object]] = []
+    direct_admissions = iter((False, True))
+
+    def append_workstation_data(stream, payload, *, priority=None):
+        writes.append(
+            {
+                "stream": str(stream),
+                "payload": dict(payload),
+                "priority": priority,
+            }
+        )
+        return next(direct_admissions)
+
+    panel.append_workstation_data = append_workstation_data
+    controller = RecordingController(panel)
+    native_calls: list[int] = []
+
+    def counted_native(measurement_attempt):
+        native_calls.append(int(measurement_attempt.attempt_id))
+        return {
+            "native_pair_request_id": "native-primary-1",
+            "native_pair_status": "pending",
+        }
+
+    controller._persist_native_measurement_pair = counted_native
+    panel._pair_recording_base_row = controller._pair_recording_base_row
+    panel._upsert_pair_recording_row = controller._upsert_pair_recording_row
+    attempt = _measurement_attempt()
+    estimate = SimpleNamespace(
+        left=SimpleNamespace(timestamp_s=1.0),
+        right=SimpleNamespace(timestamp_s=1.01),
+        sync_quality="GOOD",
+        disparity_px=40.0,
+        time_delta_s=0.01,
+        vertical_delta_px=0.0,
+        warnings=(),
+    )
+    base_metadata = {
+        "runtime_generation": "run-primary",
+        "method_evaluation_pair_id": "run-primary:00000000000000000001",
+        "method_evaluation_pair_sequence": 1,
+        "method_evaluation_request_generation": 1,
+        "method_evaluation_snapshot_sha256": "b" * 64,
+        "primary_outcome_status": "VALID",
+        "primary_outcome_sha256": "c" * 64,
+    }
+
+    first = controller._commit_primary_distance_outcome(
+        estimate=estimate,
+        distance_m=9.0,
+        method="two_ray_closest_midpoint-pixhawk_rtk_live",
+        baseline_source="ignored-by-controller",
+        baseline_m=0.0,
+        point_m=(9.0, 0.0, 0.0),
+        raw_point_m=(9.0, 0.0, 0.0),
+        raw_point_left_m=(0.0, 0.0, 9.0),
+        measurement_attempt=attempt,
+        outcome_metadata={
+            **base_metadata,
+            "primary_committed_before_bundle": True,
+            "primary_commit_source": "early_outcome",
+        },
+        publish_history=True,
+    )
+    controller._deferred_native_frame_results["native-primary-1"] = {
+        "fields": {
+            "native_pair_status": "saved",
+            "native_pair_sha256": "f" * 64,
+        }
+    }
+    second = controller._commit_primary_distance_outcome(
+        estimate=estimate,
+        distance_m=9.0,
+        method="two_ray_closest_midpoint-pixhawk_rtk_live",
+        baseline_source="ignored-by-controller",
+        baseline_m=0.0,
+        point_m=(9.0, 0.0, 0.0),
+        raw_point_m=(9.0, 0.0, 0.0),
+        raw_point_left_m=(0.0, 0.0, 9.0),
+        measurement_attempt=attempt,
+        outcome_metadata={
+            **base_metadata,
+            "primary_committed_before_bundle": False,
+            "primary_commit_source": "background_retry",
+        },
+        publish_history=False,
+    )
+
+    assert first.row_commit is not None
+    assert first.row_commit.enqueue_admitted is False
+    assert second.row_commit is not None
+    assert second.row_commit.enqueue_admitted is True
+    assert second.row_commit.direct_persistence is True
+    assert native_calls == [attempt.attempt_id]
+    assert len(writes) == 2
+    persisted = writes[-1]["payload"]
+    assert persisted["measurement_attempt_sha256"] == attempt.canonical_sha256()
+    assert persisted["distance_m"] == "9.000000"
+    assert persisted["primary_commit_source"] == "background_retry"
+    assert persisted["primary_committed_before_bundle"] is False
+    assert persisted["row_persistence_mode"] == "direct_owner_unavailable"
+    assert persisted["native_pair_request_id"] == "native-primary-1"
+    assert persisted["native_pair_status"] == "saved"
+    assert persisted["native_pair_sha256"] == "f" * 64
+    assert controller._deferred_native_frame_results == {}
+    assert controller._pending_primary_record_rows == {}
+    assert len(panel.distance_history) == 1
+
+
+def test_primary_cache_eviction_uses_compact_direct_without_native_reschedule(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from Workstation import recording_controller as recording_module
+
+    monkeypatch.setattr(recording_module, "RECORDING_KEY_CACHE_LIMIT", 2)
+    store_calls: list[dict[str, object]] = []
+    store_admissions = iter((False, False, False, True, True))
+
+    class Store:
+        def enqueue(self, _stream, payload, *, priority=None):
+            store_calls.append({"payload": dict(payload), "priority": priority})
+            return next(store_admissions)
+
+    rows = LiveDataRows(Store(), "measurements", priority=True)
+    panel = _recording_panel(tmp_path, rows)
+    panel._recording_pending_native_request_rows = {}
+    direct_writes: list[dict[str, object]] = []
+    suppression_admissions = iter((False, True))
+
+    def append_workstation_data(stream, payload, **_kwargs):
+        direct_writes.append({"stream": str(stream), "payload": dict(payload)})
+        if (
+            stream == "native.frames"
+            and payload.get("event_type")
+            == "native_frame_row_projection_suppressed"
+        ):
+            return next(suppression_admissions)
+        return True
+
+    panel.append_workstation_data = append_workstation_data
+    controller = RecordingController(panel)
+    native_calls: list[int] = []
+
+    def counted_native(measurement_attempt):
+        native_calls.append(int(measurement_attempt.attempt_id))
+        return {
+            "native_pair_request_id": f"native-{measurement_attempt.attempt_id}",
+            "native_pair_status": "pending",
+        }
+
+    controller._persist_native_measurement_pair = counted_native
+    panel._pair_recording_base_row = controller._pair_recording_base_row
+    panel._upsert_pair_recording_row = controller._upsert_pair_recording_row
+    base_attempt = _measurement_attempt()
+    attempts = tuple(
+        replace(
+            base_attempt,
+            attempt_id=index,
+            attempt_session_id=f"attempt-session-{index:03d}",
+            detection_pair_key=("accepted", index),
+        )
+        for index in range(1, 4)
+    )
+    estimate = SimpleNamespace(
+        left=SimpleNamespace(timestamp_s=1.0),
+        right=SimpleNamespace(timestamp_s=1.01),
+        sync_quality="GOOD",
+        disparity_px=40.0,
+        time_delta_s=0.01,
+        vertical_delta_px=0.0,
+        warnings=(),
+    )
+
+    def metadata(attempt: MeasurementAttempt, source: str) -> dict[str, object]:
+        return {
+            "runtime_generation": "run-primary",
+            "method_evaluation_pair_id": f"run-primary:{attempt.attempt_id}",
+            "method_evaluation_pair_sequence": attempt.attempt_id,
+            "method_evaluation_request_generation": attempt.attempt_id,
+            "method_evaluation_snapshot_sha256": "b" * 64,
+            "primary_outcome_status": "VALID",
+            "primary_outcome_sha256": f"{attempt.attempt_id:x}" * 64,
+            "primary_committed_before_bundle": source == "early_outcome",
+            "primary_commit_source": source,
+        }
+
+    first_results = [
+        controller._commit_primary_distance_outcome(
+            estimate=estimate,
+            distance_m=9.0,
+            method="two_ray_closest_midpoint-pixhawk_rtk_live",
+            baseline_source="ignored-by-controller",
+            baseline_m=0.0,
+            point_m=(9.0, 0.0, 0.0),
+            raw_point_m=(9.0, 0.0, 0.0),
+            raw_point_left_m=(0.0, 0.0, 9.0),
+            measurement_attempt=attempt,
+            outcome_metadata=metadata(attempt, "early_outcome"),
+            publish_history=True,
+        )
+        for attempt in attempts
+    ]
+
+    assert all(
+        result.row_commit is not None
+        and result.row_commit.enqueue_admitted is False
+        for result in first_results
+    )
+    assert len(controller._pending_primary_record_rows) == 2
+    assert tuple(attempts[0].detection_pair_key) not in (
+        controller._pending_primary_record_rows
+    )
+
+    retry_results = [
+        controller._commit_primary_distance_outcome(
+            estimate=estimate,
+            distance_m=9.0,
+            method="two_ray_closest_midpoint-pixhawk_rtk_live",
+            baseline_source="ignored-by-controller",
+            baseline_m=0.0,
+            point_m=(9.0, 0.0, 0.0),
+            raw_point_m=(9.0, 0.0, 0.0),
+            raw_point_left_m=(0.0, 0.0, 9.0),
+            measurement_attempt=attempt,
+            outcome_metadata=metadata(attempt, "background_retry"),
+            publish_history=False,
+        )
+        for attempt in attempts
+    ]
+
+    assert all(
+        result.row_commit is not None
+        and result.row_commit.enqueue_admitted is True
+        for result in retry_results
+    )
+    controller._remember_compact_primary_persisted(("extra", 1))
+    controller._remember_compact_primary_persisted(("extra", 2))
+    assert tuple(attempts[0].detection_pair_key) in (
+        controller._compact_primary_persisted_keys
+    )
+    store_call_count = len(store_calls)
+    controller._handle_async_native_frame_result(
+        {
+            "request_id": "native-1",
+            "context": {
+                "session_id": panel.recording_session_id,
+                "record_key": list(attempts[0].detection_pair_key),
+                "writer_kind": "legacy",
+            },
+            "fields": {
+                "native_pair_status": "saved",
+                "native_pair_sha256": "a" * 64,
+            },
+        }
+    )
+    assert "native-1" in controller._pending_native_completions
+    assert tuple(attempts[0].detection_pair_key) in (
+        controller._compact_primary_persisted_keys
+    )
+    controller._pending_native_completions[
+        "native-1"
+    ].next_retry_monotonic_s = 0.0
+    controller._retry_pending_native_completions()
+
+    assert native_calls == [1, 2, 3]
+    assert len(rows) == 3
+    assert len(panel.distance_history) == 3
+    assert len(store_calls) == store_call_count == 5
+    assert rows[0]["native_pair_status"] == "pending"
+    measurement_writes = [
+        write for write in direct_writes if write["stream"] == "measurements"
+    ]
+    assert len(measurement_writes) == 1
+    assert any(
+        write["stream"] == "native.frames"
+        and write["payload"]["event_type"]
+        == "native_frame_row_projection_suppressed"
+        for write in direct_writes
+    )
+    assert sum(
+        write["stream"] == "native.frames"
+        and write["payload"]["event_type"]
+        == "native_frame_row_projection_suppressed"
+        for write in direct_writes
+    ) == 2
+    compact = measurement_writes[0]["payload"]
+    assert compact["event_type"] == "primary_measurement_retry_cache_miss"
+    assert compact["row_persistence_mode"] == "direct_retry_cache_miss"
+    assert compact["measurement_attempt_sha256"] == attempts[0].canonical_sha256()
+    assert compact["primary_commit_source"] == "background_retry"
+    assert tuple(attempts[0].detection_pair_key) in (
+        controller._compact_primary_persisted_keys
+    )
+    assert controller._pending_native_completions == {}
+    assert controller._pending_primary_record_rows == {}
+
+
+def test_late_compact_skips_direct_when_native_completion_admitted_full_row(
+    tmp_path: Path,
+) -> None:
+    store_calls: list[dict[str, object]] = []
+    store_admissions = iter((False, True))
+
+    class Store:
+        def enqueue(self, _stream, payload, *, priority=None):
+            store_calls.append({"payload": dict(payload), "priority": priority})
+            return next(store_admissions)
+
+    rows = LiveDataRows(Store(), "measurements", priority=True)
+    panel = _recording_panel(tmp_path, rows)
+    panel._recording_pending_native_request_rows = {}
+    writes: list[dict[str, object]] = []
+    panel.append_workstation_data = lambda stream, payload, **_kwargs: (
+        writes.append({"stream": str(stream), "payload": dict(payload)}) or True
+    )
+    controller = RecordingController(panel)
+    controller._persist_native_measurement_pair = lambda _attempt: {
+        "native_pair_request_id": "native-full-first",
+        "native_pair_status": "pending",
+    }
+    panel._pair_recording_base_row = controller._pair_recording_base_row
+    panel._upsert_pair_recording_row = controller._upsert_pair_recording_row
+    attempt = _measurement_attempt()
+    estimate = SimpleNamespace(
+        left=SimpleNamespace(timestamp_s=1.0),
+        right=SimpleNamespace(timestamp_s=1.01),
+        sync_quality="GOOD",
+        disparity_px=40.0,
+        time_delta_s=0.01,
+        vertical_delta_px=0.0,
+        warnings=(),
+    )
+    first = controller._commit_primary_distance_outcome(
+        estimate=estimate,
+        distance_m=9.0,
+        method="two_ray_closest_midpoint-pixhawk_rtk_live",
+        baseline_source="ignored-by-controller",
+        baseline_m=0.0,
+        point_m=(9.0, 0.0, 0.0),
+        raw_point_m=(9.0, 0.0, 0.0),
+        raw_point_left_m=(0.0, 0.0, 9.0),
+        measurement_attempt=attempt,
+        outcome_metadata={
+            "runtime_generation": "run-old",
+            "primary_outcome_status": "VALID",
+            "primary_outcome_sha256": "e" * 64,
+            "primary_committed_before_bundle": True,
+            "primary_commit_source": "early_outcome",
+        },
+        publish_history=True,
+    )
+    assert first.row_commit is not None
+    assert first.row_commit.enqueue_admitted is False
+
+    controller._handle_async_native_frame_result(
+        {
+            "request_id": "native-full-first",
+            "context": {
+                "session_id": panel.recording_session_id,
+                "record_key": list(attempt.detection_pair_key),
+                "writer_kind": "legacy",
+            },
+            "fields": {
+                "native_pair_status": "saved",
+                "native_pair_sha256": "f" * 64,
+            },
+        }
+    )
+    assert tuple(attempt.detection_pair_key) in (
+        controller._native_primary_persisted_keys
+    )
+
+    admitted = controller._persist_compact_primary_measurement(
+        tuple(attempt.detection_pair_key),
+        {
+            "event_type": "late_primary_measurement_outcome",
+            "primary_persistence_mode": "late_direct_retry",
+            "primary_outcome_sha256": "e" * 64,
+        },
+    )
+
+    assert admitted is True
+    assert len(store_calls) == 2
+    assert rows[0]["native_pair_status"] == "saved"
+    assert not any(write["stream"] == "measurements" for write in writes)
+    assert tuple(attempt.detection_pair_key) not in (
+        controller._native_primary_persisted_keys
+    )
+
+
+def test_native_full_tokens_protect_all_active_primary_retries_over_cache_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from Workstation import recording_controller as recording_module
+
+    monkeypatch.setattr(recording_module, "RECORDING_KEY_CACHE_LIMIT", 1)
+    panel = _recording_panel(tmp_path, SpoolRows(supports_updates=True))
+    writes: list[dict[str, object]] = []
+    panel.append_workstation_data = lambda stream, payload, **_kwargs: (
+        writes.append({"stream": str(stream), "payload": dict(payload)}) or True
+    )
+    controller = RecordingController(panel)
+    key1 = ("active-primary", 1)
+    key2 = ("active-primary", 2)
+    controller._primary_retry_required_keys.update((key1, key2))
+
+    controller._remember_native_primary_persisted(key1)
+    controller._remember_native_primary_persisted(key2)
+
+    assert controller._native_primary_persisted_keys == {key1, key2}
+    assert len(controller._native_primary_persisted_order) == 2
+    assert controller._persist_compact_primary_measurement(
+        key1,
+        {
+            "event_type": "late_primary_measurement_outcome",
+            "primary_persistence_mode": "late_direct_retry",
+        },
+    ) is True
+    assert not any(write["stream"] == "measurements" for write in writes)
+    assert controller._native_primary_persisted_keys == {key2}
+    assert controller._primary_retry_required_keys == {key2}
+
+
+@pytest.mark.parametrize("reuse_index", [False, True], ids=["cleared", "reused"])
+def test_primary_retry_lease_rejects_cleared_or_reused_index_and_persists_clean_direct_row(
+    tmp_path: Path,
+    reuse_index: bool,
+) -> None:
+    admissions = iter((False, True))
+
+    class Store:
+        def enqueue(self, _stream, _payload, *, priority=None):
+            return next(admissions)
+
+    rows = LiveDataRows(Store(), "measurements", priority=True)
+    panel = _recording_panel(tmp_path, rows)
+    writes: list[dict[str, object]] = []
+    panel.append_workstation_data = lambda stream, payload, **_kwargs: writes.append(
+        {"stream": str(stream), "payload": dict(payload)}
+    ) or True
+    controller = RecordingController(panel)
+    native_calls: list[int] = []
+    persist_native = controller._persist_native_measurement_pair
+
+    def counted_native(measurement_attempt):
+        native_calls.append(int(measurement_attempt.attempt_id))
+        return persist_native(measurement_attempt)
+
+    controller._persist_native_measurement_pair = counted_native
+    panel._pair_recording_base_row = controller._pair_recording_base_row
+    panel._upsert_pair_recording_row = controller._upsert_pair_recording_row
+    attempt = _measurement_attempt()
+    estimate = SimpleNamespace(
+        left=SimpleNamespace(timestamp_s=1.0),
+        right=SimpleNamespace(timestamp_s=1.01),
+        sync_quality="GOOD",
+        disparity_px=40.0,
+        time_delta_s=0.01,
+        vertical_delta_px=0.0,
+        warnings=(),
+    )
+
+    first = controller._commit_primary_distance_outcome(
+        estimate=estimate,
+        distance_m=9.0,
+        method="two_ray_closest_midpoint-pixhawk_rtk_live",
+        baseline_source="ignored-by-controller",
+        baseline_m=0.0,
+        point_m=(9.0, 0.0, 0.0),
+        raw_point_m=(9.0, 0.0, 0.0),
+        raw_point_left_m=(0.0, 0.0, 9.0),
+        measurement_attempt=attempt,
+        outcome_metadata={
+            "runtime_generation": "run-old",
+            "primary_outcome_status": "VALID",
+            "primary_outcome_sha256": "e" * 64,
+            "primary_committed_before_bundle": True,
+            "primary_commit_source": "early_outcome",
+        },
+        publish_history=True,
+    )
+    assert first.row_commit is not None
+    assert first.row_commit.enqueue_admitted is False
+    old_lease = first.row_commit.row_lease
+    assert old_lease is not None
+
+    rows.clear()
+    if reuse_index:
+        replacement = rows.append_with_admission(
+            {
+                "sentinel": "new-run-row",
+                "native_pair_request_id": "new-request",
+            }
+        )
+        assert replacement.admitted is True
+        assert replacement.lease != old_lease
+
+    second = controller._commit_primary_distance_outcome(
+        estimate=estimate,
+        distance_m=9.0,
+        method="two_ray_closest_midpoint-pixhawk_rtk_live",
+        baseline_source="ignored-by-controller",
+        baseline_m=0.0,
+        point_m=(9.0, 0.0, 0.0),
+        raw_point_m=(9.0, 0.0, 0.0),
+        raw_point_left_m=(0.0, 0.0, 9.0),
+        measurement_attempt=attempt,
+        outcome_metadata={
+            "runtime_generation": "run-old",
+            "primary_outcome_status": "VALID",
+            "primary_outcome_sha256": "e" * 64,
+            "primary_committed_before_bundle": False,
+            "primary_commit_source": "bundle_fallback",
+        },
+        publish_history=False,
+    )
+
+    assert second.row_commit is not None
+    assert second.row_commit.enqueue_admitted is True
+    assert second.row_commit.direct_persistence is True
+    if reuse_index:
+        assert rows[0] == {
+            "sentinel": "new-run-row",
+            "native_pair_request_id": "new-request",
+        }
+    else:
+        assert len(rows) == 0
+    assert len(writes) == 1
+    persisted = writes[0]["payload"]
+    assert writes[0]["stream"] == "measurements"
+    assert "sentinel" not in persisted
+    assert persisted["measurement_attempt_sha256"] == attempt.canonical_sha256()
+    assert persisted["primary_commit_source"] == "bundle_fallback"
+    assert persisted["primary_committed_before_bundle"] is False
+    assert persisted["row_persistence_mode"] == "direct_owner_unavailable"
+    assert native_calls == [attempt.attempt_id]
 
 
 def test_provenance_redaction_survives_registration_and_sealing(tmp_path: Path) -> None:

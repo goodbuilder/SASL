@@ -305,6 +305,29 @@ def test_pixhawk_connect_disconnect_operations_do_not_overlap() -> None:
     assert any("연결 작업이 끝난 뒤" in message for message in logs)
 
 
+def test_active_rtcm_admin_start_is_log_only_and_exactly_once(monkeypatch) -> None:
+    from Workstation import device_runtime_controller
+    from Workstation.device_runtime_controller import DeviceRuntimeController
+
+    monkeypatch.setattr(device_runtime_controller.time, "monotonic", lambda: 100.0)
+    logs: list[str] = []
+    panel = SimpleNamespace(
+        left_pixhawk_transport="radio",
+        gnss_base_rtcm_stats={"injection": {"left": {"last_delivery_s": 99.25}}},
+        _log=logs.append,
+    )
+    controller = DeviceRuntimeController(panel)
+
+    controller._log_pixhawk_admin_start("left", "file_upload")
+
+    assert len(logs) == 1
+    assert "role=left" in logs[0]
+    assert "transport=radio" in logs[0]
+    assert "category=file_upload" in logs[0]
+    assert "rtcm_age_s=0.750" in logs[0]
+    assert "warning" not in logs[0].lower()
+
+
 def test_pixhawk_source_connection_is_allowed_only_for_automatic_measurement_recording() -> None:
     from Workstation.device_runtime_controller import DeviceRuntimeController
 
@@ -330,6 +353,7 @@ def test_pixhawk_source_connection_is_allowed_only_for_automatic_measurement_rec
 def test_all_rx_stall_does_not_cycle_host_socket_as_remote_recovery(monkeypatch) -> None:
     from Workstation import device_runtime_controller
     from Workstation.device_runtime_controller import DeviceRuntimeController
+    from Workstation.workstation_core.mavlink_liveness import MAVLINK_ALL_RX_STALL_S
     from Workstation.workstation_core import pixhawk_attitude
     from Workstation.workstation_core.pixhawk_attitude import DualPixhawkMavlinkSubscriber
 
@@ -350,7 +374,7 @@ def test_all_rx_stall_does_not_cycle_host_socket_as_remote_recovery(monkeypatch)
             received_at_s=0.0,
             generation=model.connection_generation,
         )
-    clock["value"] = 10.0
+    clock["value"] = MAVLINK_ALL_RX_STALL_S
 
     logs: list[str] = []
     labels: list[str] = []
@@ -545,7 +569,7 @@ def test_stalled_ethernet_connection_is_never_used_for_reboot_command(monkeypatc
 
     DeviceRuntimeController(panel).reboot_pixhawk_from_mavlink("left")
 
-    assert any("verified-USB recovery" in message for message in logs)
+    assert any("Connect 상태와 identity" in message for message in logs)
 
 
 def test_alignment_refresh_never_overwrites_the_canonical_rtk_baseline() -> None:
@@ -939,6 +963,175 @@ def test_stock_stream_profile_burst_uses_the_side_send_lock() -> None:
     assert len(calls) == len(MAVLINK_STOCK_STREAM_REQUESTS)
 
 
+def test_missing_imu_stream_retry_uses_actual_samples_as_the_postcondition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from Workstation.workstation_core import pixhawk_attitude
+    from Workstation.workstation_core.pixhawk_attitude import (
+        DualPixhawkMavlinkSubscriber,
+        MAVLINK_MESSAGE_IDS,
+        MAVLINK_STOCK_STREAM_REQUESTS,
+    )
+
+    clock = [100.0]
+    monkeypatch.setattr(pixhawk_attitude.time, "monotonic", lambda: clock[0])
+
+    class Mav:
+        def __init__(self) -> None:
+            self.commands: list[tuple[object, ...]] = []
+
+        def command_long_send(self, *args: object) -> None:
+            self.commands.append(args)
+
+    class Message:
+        def __init__(self, message_type: str) -> None:
+            self.message_type = message_type
+            self.xacc = self.yacc = self.zacc = 1
+            self.xgyro = self.ygyro = self.zgyro = 2
+            self.xmag = 3
+            self.ymag = 4
+            self.zmag = 5
+            self.temperature = 20
+            self.time_boot_ms = int(clock[0] * 1_000)
+
+        def get_type(self) -> str:
+            return self.message_type
+
+        def get_srcSystem(self) -> int:
+            return 1
+
+        def get_srcComponent(self) -> int:
+            return 1
+
+    mav = Mav()
+    subscriber = DualPixhawkMavlinkSubscriber(left_url="udp:test", right_url="")
+    subscriber.connections["left"] = SimpleNamespace(
+        mav=mav,
+        mavlink=SimpleNamespace(MAV_CMD_SET_MESSAGE_INTERVAL=511),
+        target_system=1,
+        target_component=1,
+    )
+
+    subscriber._request_mavlink_sensor_streams("left")
+    profile_size = len(MAVLINK_STOCK_STREAM_REQUESTS)
+    assert len(mav.commands) == profile_size
+
+    # The initial profile gets a two-second response window.  Afterwards only
+    # the three UI-backed IMU streams are retried.
+    clock[0] = 101.99
+    subscriber._request_missing_mavlink_imu_streams("left")
+    assert len(mav.commands) == profile_size
+    clock[0] = 102.01
+    subscriber._request_missing_mavlink_imu_streams("left")
+    assert [int(call[4]) for call in mav.commands[profile_size:]] == [
+        MAVLINK_MESSAGE_IDS["SCALED_IMU"],
+        MAVLINK_MESSAGE_IDS["SCALED_IMU2"],
+        MAVLINK_MESSAGE_IDS["SCALED_IMU3"],
+    ]
+
+    # A real decoded sample is the success evidence.  The next retry contains
+    # only streams that still lack that evidence.
+    clock[0] = 104.01
+    subscriber._handle_mavlink_message(
+        "left",
+        Message("SCALED_IMU"),
+        received_at_s=clock[0],
+    )
+    after_first_retry = len(mav.commands)
+    clock[0] = 104.02
+    subscriber._request_missing_mavlink_imu_streams("left")
+    assert [int(call[4]) for call in mav.commands[after_first_retry:]] == [
+        MAVLINK_MESSAGE_IDS["SCALED_IMU2"],
+        MAVLINK_MESSAGE_IDS["SCALED_IMU3"],
+    ]
+
+    for message_type in ("SCALED_IMU2", "SCALED_IMU3"):
+        subscriber._handle_mavlink_message(
+            "left",
+            Message(message_type),
+            received_at_s=clock[0],
+        )
+    after_all_samples = len(mav.commands)
+    clock[0] = 104.50
+    subscriber._request_missing_mavlink_imu_streams("left")
+    assert len(mav.commands) == after_all_samples
+
+
+def test_missing_imu_stream_retry_is_blocked_during_all_rx_stall(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from Workstation.workstation_core import pixhawk_attitude
+    from Workstation.workstation_core.mavlink_liveness import MAVLINK_ALL_RX_STALL_S
+    from Workstation.workstation_core.pixhawk_attitude import DualPixhawkMavlinkSubscriber
+
+    clock = [10.0]
+    monkeypatch.setattr(pixhawk_attitude.time, "monotonic", lambda: clock[0])
+    calls: list[tuple[object, ...]] = []
+    subscriber = DualPixhawkMavlinkSubscriber(left_url="udp:test", right_url="")
+    connection = SimpleNamespace(
+        mav=SimpleNamespace(command_long_send=lambda *args: calls.append(args)),
+        mavlink=SimpleNamespace(MAV_CMD_SET_MESSAGE_INTERVAL=511),
+        target_system=1,
+        target_component=1,
+    )
+    subscriber.connections["left"] = connection
+    model = subscriber._open_liveness_generation("left", connection)
+    model.observe_packet(
+        system_id=1,
+        component_id=1,
+        message_type="HEARTBEAT",
+        received_at_s=clock[0],
+        generation=model.connection_generation,
+    )
+    subscriber._mavlink_stream_requests_sent.add("left")
+    subscriber._mavlink_stream_last_request_s["left"] = clock[0]
+
+    clock[0] = 10.0 + MAVLINK_ALL_RX_STALL_S + 0.01
+    subscriber._request_missing_mavlink_imu_streams("left")
+
+    assert calls == []
+
+
+def test_missing_imu_stream_retry_is_bounded_and_cooldown_is_not_log_spam(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from Workstation.workstation_core import pixhawk_attitude
+    from Workstation.workstation_core.pixhawk_attitude import (
+        DualPixhawkMavlinkSubscriber,
+        MAVLINK_STOCK_STREAM_REQUESTS,
+    )
+
+    clock = [0.0]
+    monkeypatch.setattr(pixhawk_attitude.time, "monotonic", lambda: clock[0])
+    calls: list[tuple[object, ...]] = []
+    subscriber = DualPixhawkMavlinkSubscriber(left_url="udp:test", right_url="")
+    subscriber.connections["left"] = SimpleNamespace(
+        mav=SimpleNamespace(command_long_send=lambda *args: calls.append(args)),
+        mavlink=SimpleNamespace(MAV_CMD_SET_MESSAGE_INTERVAL=511),
+        target_system=1,
+        target_component=1,
+    )
+    statuses: list[str] = []
+    subscriber.status_changed.connect(statuses.append)
+    subscriber._request_mavlink_sensor_streams("left")
+    profile_size = len(MAVLINK_STOCK_STREAM_REQUESTS)
+
+    for observed_s in (2.0, 4.0):
+        clock[0] = observed_s
+        subscriber._request_missing_mavlink_imu_streams("left")
+    assert len(calls) == profile_size + 6
+
+    for observed_s in (6.0, 7.0):
+        clock[0] = observed_s
+        subscriber._request_missing_mavlink_imu_streams("left")
+    assert len(calls) == profile_size + 6
+    assert len([text for text in statuses if "stream 응답이 없습니다" in text]) == 3
+
+    clock[0] = 14.01
+    subscriber._request_missing_mavlink_imu_streams("left")
+    assert len(calls) == profile_size + 9
+
+
 def test_remote_px4_reboot_rearms_only_affected_stock_profile_on_next_heartbeat(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1020,6 +1213,26 @@ def test_remote_px4_reboot_rearms_only_affected_stock_profile_on_next_heartbeat(
             ),
         )
 
+    def imu(side: str, system_id: int, message_type: str) -> None:
+        deliver(
+            side,
+            Message(
+                message_type,
+                system_id,
+                xacc=1,
+                yacc=2,
+                zacc=3,
+                xgyro=4,
+                ygyro=5,
+                zgyro=6,
+                xmag=7,
+                ymag=8,
+                zmag=9,
+                temperature=20,
+                time_boot_ms=int(clock[0] * 1_000),
+            ),
+        )
+
     heartbeat("left", 1)
     attitude("left", 1, 120_000)
     heartbeat("right", 2)
@@ -1074,6 +1287,8 @@ def test_remote_px4_reboot_rearms_only_affected_stock_profile_on_next_heartbeat(
     # the prior boot and repeated new-boot samples must not create a storm.
     clock[0] = 102.1
     heartbeat("left", 1)
+    for message_type in ("SCALED_IMU", "SCALED_IMU2", "SCALED_IMU3"):
+        imu("left", 1, message_type)
     assert len(left_mav.commands) == profile_size * 2
     assert len(right_mav.commands) == profile_size
     assert subscriber.mavlink_health_snapshot("left").state is MavlinkLivenessState.RECOVERING
@@ -1099,6 +1314,8 @@ def test_remote_px4_reboot_rearms_only_affected_stock_profile_on_next_heartbeat(
     for observed_s, boot_ms in ((107.0, 4_200), (111.0, 8_200), (115.0, 12_200)):
         clock[0] = observed_s
         attitude("left", 1, boot_ms)
+        for message_type in ("SCALED_IMU", "SCALED_IMU2", "SCALED_IMU3"):
+            imu("left", 1, message_type)
         clock[0] += 0.01
         heartbeat("left", 1)
     assert len(left_mav.commands) == profile_size * 2
@@ -1436,48 +1653,45 @@ def test_device_runtime_passes_and_syncs_explicit_pixhawk_peer_hosts() -> None:
 
     subscriber = controller._ensure_mavlink_subscriber()
 
-    assert subscriber.peer_hosts == {"left": "10.0.0.2", "right": "10.0.0.3"}
+    assert subscriber.peer_hosts == {
+        "left": "10.0.0.2",
+        "right": "10.0.0.3",
+        "drone": "",
+    }
     panel.left_pixhawk_eth_ip_edit = SimpleNamespace(text=lambda: "10.0.0.12")
     panel.right_pixhawk_eth_ip_edit = SimpleNamespace(text=lambda: "10.0.0.13")
     controller._sync_mavlink_subscriber_settings()
-    assert subscriber.peer_hosts == {"left": "10.0.0.12", "right": "10.0.0.13"}
+    assert subscriber.peer_hosts == {
+        "left": "10.0.0.12",
+        "right": "10.0.0.13",
+        "drone": "",
+    }
 
 
-def test_automatic_calibration_param_refresh_waits_for_live_qualification() -> None:
+def test_mavlink_status_refresh_never_starts_calibration_param_readback() -> None:
     from Workstation.device_runtime_controller import DeviceRuntimeController
 
-    health = {"left": "QUALIFYING", "right": "MAVLINK INITIAL RX TIMEOUT"}
-
-    class Subscriber:
-        connections = {"left": object(), "right": object()}
-
-        @staticmethod
-        def mavlink_health_snapshot(side: str):
-            return SimpleNamespace(state=SimpleNamespace(value=health[side]))
-
     started: list[tuple[str, str]] = []
+    refreshed: list[str] = []
     panel = SimpleNamespace(
-        mavlink_pixhawk=Subscriber(),
-        _px4_calibration_auto_refreshed_sides=set(),
+        _mavlink_status_ui_refresh_pending=True,
+        _refresh_mavlink_side_actions=lambda: refreshed.append("actions"),
         _start_pixhawk_parameter_worker=lambda side, operation: started.append((side, operation)),
     )
     controller = DeviceRuntimeController(panel)
 
-    controller._auto_refresh_px4_calibration_params_when_live()
+    controller._flush_mavlink_status_ui_refresh()
+    panel._mavlink_status_ui_refresh_pending = True
+    controller._flush_mavlink_status_ui_refresh()
+
+    assert panel._mavlink_status_ui_refresh_pending is False
+    assert refreshed == ["actions", "actions"]
     assert started == []
-    assert panel._px4_calibration_auto_refreshed_sides == set()
-
-    health["left"] = "LIVE"
-    controller._auto_refresh_px4_calibration_params_when_live()
-    assert started == [("left", "calibration_refresh")]
-    assert panel._px4_calibration_auto_refreshed_sides == {"left"}
-
-    controller._auto_refresh_px4_calibration_params_when_live()
-    assert started == [("left", "calibration_refresh")]
 
 
 def test_all_rx_stall_blocks_initial_and_attitude_stream_requests(monkeypatch: pytest.MonkeyPatch) -> None:
     from Workstation.workstation_core import pixhawk_attitude
+    from Workstation.workstation_core.mavlink_liveness import MAVLINK_ALL_RX_STALL_S
     from Workstation.workstation_core.pixhawk_attitude import DualPixhawkMavlinkSubscriber
 
     clock = [100.0]
@@ -1512,7 +1726,7 @@ def test_all_rx_stall_blocks_initial_and_attitude_stream_requests(monkeypatch: p
         generation=generation,
     )
 
-    clock[0] += 10.0
+    clock[0] += MAVLINK_ALL_RX_STALL_S
     subscriber._request_mavlink_sensor_streams("left")
     subscriber._request_stale_attitude_stream("left")
 
@@ -1939,7 +2153,9 @@ def test_base_gnss_workspace_shows_gga_transmission_status() -> None:
 
     gga_text = workspace.ntrip_values["gga_transmission"].value.text()
     assert "전송 중" in gga_text
-    assert "VALID" in workspace.ntrip_values["gga_transmission"].meta.text()
+    assert workspace.ntrip_values["gga_transmission"].meta.text() == ""
+    assert workspace.ntrip_values["gga_transmission"].meta.isHidden()
+    assert "Quality: valid" in workspace.ntrip_values["gga_transmission"].toolTip()
 
     workspace.deleteLater()
     app.processEvents()
@@ -2060,10 +2276,13 @@ def test_camera_and_pixhawk_discovery_candidates_are_visible_and_assignable() ->
         ],
         "mavlink": [
             {
-                "kind": "MAVLink",
-                "value": "udpin:0.0.0.0:14550",
-                "baud": 115200,
-                "status": "Ethernet candidate",
+                "kind": "USB",
+                "value": "/dev/serial/by-id/p2-radio",
+                "resolved_device": "/dev/ttyUSB1",
+                "baud": 57600,
+                "system_id": 2,
+                "component_id": 1,
+                "status": "MAVLink heartbeat sysid=2 compid=1",
             }
         ],
     }
@@ -2098,7 +2317,9 @@ def test_camera_and_pixhawk_discovery_candidates_are_visible_and_assignable() ->
     assert not window.camera.candidate_buttons["left"].isEnabled()
     window.camera.candidate_buttons["nic"].click()
     assert backend.calls[-1] == ("camera_apply_candidate", 0, "nic")
-    assert window.camera.candidate_feedback.text() == "Applied row 1 to NIC"
+    assert window.camera.candidate_feedback.text() == (
+        "Requested row 1 for NIC · follow network role status"
+    )
     window.camera.candidate_table.selectRow(1)
     assert window.camera.candidate_buttons["left"].isEnabled()
     window.camera.candidate_buttons["left"].click()
@@ -2112,7 +2333,7 @@ def test_camera_and_pixhawk_discovery_candidates_are_visible_and_assignable() ->
             column, QtCore.Qt.Horizontal, QtCore.Qt.DisplayRole
         )
         for column in range(window.pixhawk.candidate_model.columnCount())
-    ] == ["Source", "NIC / Device", "Link", "Local IPv4", "Assigned"]
+    ] == ["Source", "NIC / Device", "Link / Kind", "Evidence", "Role"]
     assert window.pixhawk.discovery_status.value.text() == "FOUND 2 ENDPOINTS"
     pixhawk_inspections: list[dict[str, object]] = []
     window.pixhawk.inspection_requested.connect(pixhawk_inspections.append)
@@ -2127,7 +2348,7 @@ def test_camera_and_pixhawk_discovery_candidates_are_visible_and_assignable() ->
         "5:enp5s0:192.168.1.10/24",
         "left",
     )
-    assert "press Connect" in window.pixhawk.candidate_feedback.text()
+    assert "follow role status" in window.pixhawk.candidate_feedback.text()
     backend.panel.pixhawk_network_assignments["left"] = {
         "interface": "enp5s0",
         "local_address": "192.168.1.10",
@@ -2157,7 +2378,7 @@ def test_camera_and_pixhawk_discovery_candidates_are_visible_and_assignable() ->
         "detail": "ROUTE OK",
     }
     window.pixhawk.refresh(window.status_adapter.model.snapshot())
-    assert window.pixhawk.candidate_model.item(0, 4).text() == "P1,P2"
+    assert window.pixhawk.candidate_model.item(0, 4).text() == "P1, P2 (shared NIC)"
     assert (
         window.pixhawk.network_assignment_values["right"]["endpoint"].value.text()
         == "udpin:0.0.0.0:14551"
@@ -2168,8 +2389,26 @@ def test_camera_and_pixhawk_discovery_candidates_are_visible_and_assignable() ->
     assert not window.pixhawk.candidate_buttons["right"].isEnabled()
     window.pixhawk.candidate_table.selectRow(2)
     assert window.pixhawk.candidate_buttons["right"].isEnabled()
+    assert window.pixhawk.candidate_model.item(2, 0).text() == "USB"
+    assert window.pixhawk.candidate_model.item(2, 2).text() == "MAVLink"
+    assert window.pixhawk.candidate_model.item(2, 3).text() == "MAVLink heartbeat sysid=2 compid=1"
+    assert window.pixhawk.candidate_model.item(2, 4).text() == "P2 (sysid 2)"
     window.pixhawk.candidate_buttons["right"].click()
     assert backend.calls[-1] == ("pixhawk_apply_candidate", "mavlink", 0, "right")
+
+    backend.panel._pixhawk_candidate_rows_by_source = {
+        "network": [],
+        "pc": [],
+        "mavlink": [],
+    }
+    backend.panel.pixhawk_discovery_revision = 1
+    backend.panel.workstation_pixhawk_discovery_status = "SEARCHING USB"
+    window.pixhawk.refresh(window.status_adapter.model.snapshot())
+    assert window.pixhawk.candidate_model.rowCount() == 0
+    assert window.pixhawk._selected_candidate_row() == -1
+    assert window.pixhawk.candidate_feedback.text() == ""
+    assert not window.pixhawk.candidate_buttons["left"].isEnabled()
+    assert not window.pixhawk.candidate_buttons["right"].isEnabled()
 
     backend.camera_apply_candidate = lambda _row, _target: False
     window.camera.candidate_table.selectRow(1)
@@ -2813,11 +3052,11 @@ def test_pixhawk_shell_and_parameter_workers_use_exclusive_command_path() -> Non
         subscriber,
         camera="left",
         operation="mag_apply",
-        priorities={"BOARD": 100},
+        priorities={"CAL_MAG0": 100},
     )
     parameter_worker.completed.connect(parameter_results.append)
     parameter_worker.run()
-    assert parameter_results[0]["applied"] == ("BOARD:CAL_MAG0_PRIO=100",)
+    assert parameter_results[0]["applied"] == ("CAL_MAG0(BOARD):CAL_MAG0_PRIO=100",)
     assert subscriber.params["CAL_MAG0_PRIO"] == 100
 
     refresh_results: list[object] = []
@@ -2913,6 +3152,7 @@ def test_pixhawk_connect_status_precedes_gui_completion_without_precompletion_re
         app_root=tmp_path,
         settings_path=tmp_path / "settings.json",
     )
+    panel.left_pixhawk_transport = "ethernet"
     gui_thread = panel.thread()
     worker_entered = threading.Event()
     release_worker = threading.Event()
@@ -4016,7 +4256,7 @@ def test_pixhawk_verified_usb_recovery_is_visible_and_stall_gated() -> None:
     pixhawk_layout = window.pixhawk.layout()
     assert [
         pixhawk_layout.itemAt(index).widget().title()
-        for index in range(2, 12)
+        for index in range(2, 15)
         if pixhawk_layout.itemAt(index).widget() is not None
     ] == [
         "Connection",
@@ -4024,12 +4264,20 @@ def test_pixhawk_verified_usb_recovery_is_visible_and_stall_gated() -> None:
         "Attitude (R/P/Y)",
         "P1/P2 GNSS receivers",
         "IMU magnetometer (MAVLink)",
+        "MAG Priority / active selection",
         "CAN magnetometer (dedicated MAVLink)",
         "Pixhawk Parameters · calibration-owned groups",
         "P1→P2 baseline",
         "P1→P2 baseline / Pixhawk yaw",
+        "Drone Pixhawk geometry · F/R/D/Rg",
         "ETH MAV",
+        "GNSS used for Pixhawk calculation",
     ]
+    assert not hasattr(window.pixhawk, "topology_setup_group")
+    assert not any(
+        command_id.startswith("pixhawk.topology.")
+        for command_id in window.commands._actions
+    )
     top_actions = pixhawk_layout.itemAt(1).layout()
     assert [top_actions.itemAt(index).widget().text() for index in range(4)] == [
         "Connect",
@@ -4114,7 +4362,7 @@ def test_pixhawk_recovery_evidence_separates_usb_control_and_attitude() -> None:
                 listener_open=True,
                 heartbeat_rx_age_s=0.1,
                 attitude_rx_age_s=0.1,
-                qualification_elapsed_s=600.0,
+                qualification_elapsed_s=60.0,
             ),
         ),
         latest_extrinsics={
@@ -4137,7 +4385,7 @@ def test_pixhawk_recovery_evidence_separates_usb_control_and_attitude() -> None:
     assert recovery["attitude_state"] == "OK"
     assert recovery["mavlink_endpoint"] == "udpin:0.0.0.0:14550"
     assert recovery["usb_system_id"] == 1
-    assert "10-minute qualification" in str(recovery["contract"])
+    assert "1-minute qualification" in str(recovery["contract"])
 
     left_baud.deleteLater()
     panel.left_pixhawk_bootstrap_url_edit.deleteLater()
@@ -4224,3 +4472,72 @@ def test_workstation_exposes_phase_one_camera_pixhawk_and_gnss_commands() -> Non
     app.processEvents()
     window.deleteLater()
     app.processEvents()
+
+
+def _rtcm_1005_frame(station_id: int, ecef_m: tuple[float, float, float]) -> bytes:
+    from Workstation.workstation_core.gnss_protocol import parse_rtcm3_message_type
+
+    bitstring = ""
+
+    def put(value: int, length: int, sign: bool = False) -> None:
+        nonlocal bitstring
+        if sign and value < 0:
+            value += 1 << length
+        bitstring += format(value, f"0{length}b")
+
+    put(1005, 12)
+    put(station_id, 12)
+    put(0, 6)
+    put(1, 1)
+    put(1, 1)
+    put(0, 1)
+    put(0, 1)
+    put(int(round(ecef_m[0] * 10000)), 38, sign=True)
+    put(0, 1)
+    put(0, 1)
+    put(int(round(ecef_m[1] * 10000)), 38, sign=True)
+    put(0, 2)
+    put(int(round(ecef_m[2] * 10000)), 38, sign=True)
+    payload = bytes(int(bitstring[i : i + 8], 2) for i in range(0, len(bitstring), 8))
+    frame = b"\xd3" + bytes([(len(payload) >> 8) & 0x03, len(payload) & 0xFF]) + payload
+
+    crc = 0
+    for byte in frame:
+        crc ^= byte << 16
+        for _ in range(8):
+            crc <<= 1
+            if crc & 0x1000000:
+                crc ^= 0x1864CFB
+    frame += (crc & 0xFFFFFF).to_bytes(3, "big")
+    assert parse_rtcm3_message_type(frame) == 1005
+    return frame
+
+
+def test_parse_rtcm3_reference_station_arp_reads_1005_exactly() -> None:
+    from Workstation.workstation_core.gnss_protocol import (
+        parse_rtcm3_reference_station_arp,
+    )
+
+    frame = _rtcm_1005_frame(4095, (-3178038.1194, 4185259.0653, 3602516.1845))
+
+    parsed = parse_rtcm3_reference_station_arp(frame)
+
+    assert parsed is not None
+    station_id, ecef_01mm = parsed
+    assert station_id == 4095
+    assert ecef_01mm == (-31780381194, 41852590653, 36025161845)
+
+
+def test_parse_rtcm3_reference_station_arp_ignores_other_message_types() -> None:
+    from Workstation.workstation_core.gnss_protocol import (
+        parse_rtcm3_reference_station_arp,
+    )
+
+    frame = _rtcm_1005_frame(4095, (-3178038.1194, 4185259.0653, 3602516.1845))
+    # Rewrite the message number to 1074 (MSM4) without touching anything else.
+    payload = bytearray(frame[3:-3])
+    payload[0] = (1074 >> 4) & 0xFF
+    payload[1] = ((1074 & 0x0F) << 4) | (payload[1] & 0x0F)
+    other = frame[:3] + bytes(payload) + frame[-3:]
+
+    assert parse_rtcm3_reference_station_arp(other) is None

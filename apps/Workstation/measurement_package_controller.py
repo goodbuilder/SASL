@@ -719,6 +719,13 @@ class MeasurementPackageController:
         )
         if measurement_owner is not None:
             measurement_owner.close_method_evaluation_workers()
+            begin_pairing_generation = getattr(
+                measurement_owner,
+                "begin_pairing_generation",
+                None,
+            )
+            if callable(begin_pairing_generation):
+                begin_pairing_generation()
         self.panel._measurement_package = package
         self.panel.recording_session_id = session_id
         if measurement_id:

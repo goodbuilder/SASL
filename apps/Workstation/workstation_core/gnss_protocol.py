@@ -376,6 +376,42 @@ def parse_rtcm3_message_type(frame: bytes) -> int | None:
     return ((int(frame[3]) << 4) | (int(frame[4]) >> 4)) & 0x0FFF
 
 
+RTCM_REFERENCE_STATION_MESSAGE_TYPES = (1005, 1006)
+
+
+def parse_rtcm3_reference_station_arp(
+    frame: bytes,
+) -> tuple[int, tuple[int, int, int]] | None:
+    """Return ``(station_id, ECEF)`` from an RTCM 1005/1006 frame.
+
+    The ECEF triple stays in the wire unit of 0.1 mm as exact integers, so two
+    reports can be compared without reintroducing float noise.  Returns
+    ``None`` for any other message type or a truncated frame.
+    """
+
+    if len(frame) < 6 or frame[0] != 0xD3:
+        return None
+    payload_len = ((frame[1] & 0x03) << 8) | frame[2]
+    if payload_len < 19 or len(frame) < 3 + payload_len + 3:
+        return None
+    payload = frame[3 : 3 + payload_len]
+
+    def bits(offset: int, length: int) -> int:
+        value = 0
+        for index in range(offset, offset + length):
+            value = (value << 1) | ((payload[index // 8] >> (7 - index % 8)) & 1)
+        return value
+
+    def signed(offset: int, length: int) -> int:
+        value = bits(offset, length)
+        return value - (1 << length) if value & (1 << (length - 1)) else value
+
+    if bits(0, 12) not in RTCM_REFERENCE_STATION_MESSAGE_TYPES:
+        return None
+    station_id = bits(12, 12)
+    return station_id, (signed(34, 38), signed(74, 38), signed(114, 38))
+
+
 def gnss_base_serial_port_candidates() -> list[str]:
     candidates: list[str] = []
     for pattern in ("/dev/serial/by-id/*", "/dev/ttyACM*", "/dev/ttyUSB*"):

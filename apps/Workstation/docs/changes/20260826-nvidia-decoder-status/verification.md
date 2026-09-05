@@ -103,3 +103,22 @@ Persisted mode is Auto and software/application verification passes. This packet
 both real WIRIS streams report `GPU · nvh264dec` with current frames, acceptable sustained rate,
 no unbounded queue/drop/thermal behavior, and normal shutdown. Repository portability also retains
 12 unrelated pre-existing findings.
+
+## 2026-09-04 follow-up evidence
+
+- Current host: `nvidia-smi` reports RTX 4050/driver 595.84, but `cuInit(0)` returns `999`
+  (`CUDA_ERROR_UNKNOWN`). GStreamer reports the installed `nvcodec` plugin cannot initialize CUDA,
+  so `nvh264dec` is not registered and both live sides use `avdec_h264`.
+- `nvidia-smi -q` reports `GPU Recovery Action: Reboot`; the current boot kernel log contains Xid 31,
+  UVM global fatal `0x60`, and Xid 154. Real GPU recovery therefore remains a host reboot/manual
+  acceptance condition and is not inferred from application fallback tests.
+- CUDA/registry probe tests: **36 passed**. Decoder/recovery focused set: **89 passed, 1 skipped**.
+  `apps/Workstation/run.sh --check` and `apps/StereoWIRIS/run.sh --check` both complete with the
+  truthful warning `CUDA Driver API unavailable: cuInit(0) returned CUDA_ERROR_UNKNOWN (999)` and
+  select `avdec_h264` for Auto.
+- The Workstation-only regression run returned **1869 passed, 2 skipped, 31 failed** in the already
+  dirty tree; failures are in unrelated calibration, telemetry, Pixhawk, optical-pose, and UI
+  compatibility tests. Repository-wide collection remains blocked by duplicate top-level test module
+  names (`test_px4_attitude_cal_manager`) in the two application test trees, including under
+  `--import-mode=importlib`. Portability check reports 15 pre-existing absolute/dated-path findings;
+  repository policy passes. Ruff is not installed in the canonical venv.

@@ -559,7 +559,13 @@ def test_method_readiness_failures_remain_visible_without_disabling_global_start
     assert button.isEnabled(), case
     assert action.text() == "측정 시작"
     assert window.commands.invoke("detection.toggle") is True
-    assert backend.calls == ["detection"]
+    assert backend.calls == [
+        (
+            "settings_apply",
+            {"yolo_weights_path": "models/yolov8m.pt"},
+        ),
+        "detection",
+    ]
 
     window.status_adapter.stop()
     window.close()
@@ -647,9 +653,25 @@ def test_workstation_main_cards_hide_source_but_provenance_survives_in_inspector
 
     valid_value = EngineeringValue("Pair")
     valid_value.set_value("person", valid=True, age_s=0.038)
-    assert "VALID" in valid_value.meta.text()
+    assert "VALID" not in valid_value.meta.text()
     assert "38 ms" in valid_value.meta.text()
     assert "background" not in valid_value.meta.text()
+    assert "Quality: valid" in valid_value.toolTip()
+
+    valid_value.set_value("person", valid=True)
+    assert valid_value.meta.text() == ""
+    assert valid_value.meta.isHidden()
+    assert "Quality: valid" in valid_value.toolTip()
+
+    invalid_value = EngineeringValue("Pair")
+    invalid_value.set_value("person", valid=False)
+    assert "INVALID" in invalid_value.meta.text()
+    assert "Quality: invalid" in invalid_value.toolTip()
+
+    unknown_value = EngineeringValue("Pair")
+    unknown_value.set_value("person")
+    assert unknown_value.meta.text() == ""
+    assert "Quality:" not in unknown_value.toolTip()
 
     _ = app
 
@@ -741,9 +763,9 @@ def test_status_adapter_emits_one_snapshot_per_poll() -> None:
     adapter.refresh()
 
     assert len(snapshots) == 1
-    assert len(snapshots[0]) == 14
+    assert len(snapshots[0]) == 15
     assert len(polls) == 1
-    assert len(polls[0]) == 14
+    assert len(polls[0]) == 15
     adapter.refresh()
     assert len(snapshots) == 1
     assert len(polls) == 2
@@ -875,6 +897,77 @@ def test_sessionless_data_workspace_exposes_stable_latest_xlsx_actions(
     assert workspace.latest_xlsx_status_label.height() == initial_height
     assert len(workspace.latest_xlsx_status_label.text()) < len(long_error)
     assert long_error in workspace.latest_xlsx_status_label.toolTip()
+
+    workspace.deleteLater()
+    app.processEvents()
+
+
+def test_sessionless_data_workspace_shows_csv_mirror_state_and_path(tmp_path: Path) -> None:
+    from Workstation.status_model import StatusModel
+    from Workstation.workspaces import RecordingWorkspace
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    jsonl_path = tmp_path / "measurements.jsonl"
+    csv_path = tmp_path / "measurements.csv"
+    backend.data_storage_snapshot = lambda: {
+        "state": "DEGRADED",
+        "root": str(tmp_path),
+        "priority_pending": 0,
+        "bulk_pending": 0,
+        "dropped_records": 1,
+        "csv_dropped_records": 2,
+        "streams": {
+            "measurements": {
+                "path": str(jsonl_path),
+                "state": "ACTIVE",
+                "dropped_records": 1,
+                "last_write_utc_ns": 123,
+                "last_error": "",
+                "csv": {
+                    "path": str(csv_path),
+                    "state": "FAILED",
+                    "dropped_records": 2,
+                    "last_error": "permission denied",
+                },
+            }
+        },
+    }
+    workspace = RecordingWorkspace(backend, StatusModel(), lambda: None)
+    workspace._refresh_data_storage()
+    app.processEvents()
+
+    headers = tuple(
+        workspace.artifact_model.headerData(index, QtCore.Qt.Horizontal)
+        for index in range(workspace.artifact_model.columnCount())
+    )
+    assert headers == (
+        "Type",
+        "JSONL path",
+        "JSONL state",
+        "CSV path",
+        "CSV state",
+        "JSONL drop",
+        "CSV drop",
+        "Last write",
+        "Error",
+    )
+    row = tuple(
+        workspace.artifact_model.item(0, index).text()
+        for index in range(workspace.artifact_model.columnCount())
+    )
+    assert row == (
+        "measurements",
+        str(jsonl_path),
+        "ACTIVE",
+        str(csv_path),
+        "FAILED",
+        "1",
+        "2",
+        "123",
+        "CSV: permission denied",
+    )
+    assert "csv_dropped=2" in workspace.session_values["status_label"].value.text()
 
     workspace.deleteLater()
     app.processEvents()

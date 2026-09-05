@@ -42,6 +42,30 @@ def _frame_payload(seed: int) -> bytes:
     return bytes([seed]) * (4 * 3 * 3)
 
 
+def test_owner_unlink_is_idempotent_after_external_segment_cleanup() -> None:
+    from multiprocessing import shared_memory
+
+    value = SharedNativeFrameRing.create(
+        camera_id="left",
+        stream_generation=91,
+        capacity=1,
+        max_width=4,
+        max_height=3,
+        channels=3,
+        mp_context=multiprocessing.get_context("spawn"),
+    )
+    name = value.shm_name
+    value.close()
+    external = shared_memory.SharedMemory(name=name, create=False)
+    try:
+        external.unlink()
+    finally:
+        external.close()
+
+    value.unlink()
+    value.unlink()
+
+
 def _publish_in_spawned_child(ring: SharedNativeFrameRing) -> None:
     ring.publish_bytes(
         _frame_payload(7),

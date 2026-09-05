@@ -110,6 +110,7 @@ def test_settings_portability_checks_only_asset_path_fields(tmp_path: Path) -> N
         calibration_root="calibration",
         calibration_validation_root="calibration",
         calibration_validation_json="",
+        measurement_data_root="",
         gnss_base_serial_port="/dev/ttyACM0",
         wiris_ftp_remote_dir="/",
     )
@@ -118,6 +119,15 @@ def test_settings_portability_checks_only_asset_path_fields(tmp_path: Path) -> N
 
     assert len(errors) == 1
     assert errors[0].startswith("yolo_weights_path")
+
+
+def test_blank_measurement_root_is_a_valid_portable_default(tmp_path: Path) -> None:
+    settings = SimpleNamespace(measurement_data_root="")
+
+    assert workstation_settings_portability_errors(
+        settings,
+        data_root=tmp_path / "data",
+    ) == []
 
 
 def test_panel_settings_save_normalizes_owned_paths_and_rejects_external_root(

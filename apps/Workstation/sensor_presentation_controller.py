@@ -10,11 +10,13 @@ from __future__ import annotations
 import json
 import math
 import time
+from dataclasses import replace
 
 from PyQt5 import QtWidgets
 
 from Workstation.telemetry_plots import AttitudeHistoryPoint, TelemetryHistoryPoint
 from Workstation.workstation_core.pixhawk_attitude import CameraExtrinsicState
+from Workstation.workstation_core.px4_mag_manager import RM3100_IDS
 from Workstation.workstation_core.rtk_geometry import GpsPositionState
 from Workstation.workstation_core.theme import (
     ERROR, ERROR_TEXT, PANEL_ALT_BG, PANEL_BORDER,
@@ -221,6 +223,10 @@ class SensorPresentationController:
                 "age_s": self.panel._fmt_record_float(max(0.0, time.monotonic() - gps.timestamp_s), 6),
             },
         )
+        if camera == "drone":
+            recorder = getattr(self.panel, "_record_gnss_baseline_center", None)
+            if callable(recorder):
+                recorder(camera, gps)
         age_ms = max(0.0, time.monotonic() - gps.timestamp_s) * 1000.0
         accuracy_text = []
         if gps.satellites_used is not None:
@@ -294,11 +300,35 @@ class SensorPresentationController:
                 self.panel.latest_vehicle_mag_device_ids[camera] = int(state.device_id)
                 self.panel.refresh_px4_mag_manager(camera)
         sensor_slot = str(getattr(state, "sensor_slot", ""))
+        if topic.startswith("mavlink/SCALED_IMU") and getattr(state, "device_id", None) is None:
+            # Stable PX4 Shell supplies the per-instance device identity, while
+            # SCALED_IMU carries the higher-rate vector without that identity.
+            # Preserve the latest Shell identity when the faster telemetry
+            # sample replaces the same presentation slot; otherwise the active
+            # PX4 yaw gate falls back to ID 확인 대기 on every SCALED_IMU tick.
+            previous_state = self.panel.latest_mag_sensors.get(camera, {}).get(sensor_slot)
+            previous_device_id = getattr(previous_state, "device_id", None)
+            if (
+                previous_state is not None
+                and previous_device_id is not None
+            ):
+                try:
+                    state = replace(state, device_id=int(previous_device_id))
+                except (TypeError, ValueError):
+                    try:
+                        state.device_id = int(previous_device_id)
+                    except (AttributeError, TypeError, ValueError):
+                        pass
         device_id = self.panel._mag_state_display_device_id(camera, state)[0]
         device_type = self.panel._magnetometer_device_type(sensor_slot, device_id)
+        is_px4_shell_can_mag = (
+            topic.lower().startswith("px4-shell/sensor_mag/")
+            and sensor_slot in {"CAN1", "CAN2"}
+            and getattr(state, "device_id", None) in RM3100_IDS
+        )
         is_dedicated_can_mag = any(
             message_name in topic.upper() for message_name in ("CAN_MAG", "CAN_MAGNETOMETER", "SASL_CAN_MAG")
-        ) or (topic.upper().endswith("DEBUG_VECT") and sensor_slot in {"CAN1", "CAN2"})
+        ) or (topic.upper().endswith("DEBUG_VECT") and sensor_slot in {"CAN1", "CAN2"}) or is_px4_shell_can_mag
         if is_dedicated_can_mag:
             can_states = getattr(self.panel, "latest_can_mag_sensors", None)
             if can_states is None:

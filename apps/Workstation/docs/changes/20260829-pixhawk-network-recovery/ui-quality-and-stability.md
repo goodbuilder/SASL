@@ -18,6 +18,9 @@ plot과 telemetry/parameter/baseline 표는 바뀌지 않는다.
 NIC/link/local IPv4/Assigned candidate 열은 discovery 완료 시에만 갱신한다. P1/P2의
 State/NIC/Local IPv4/Endpoint/Route는 side별 assignment summary에서 독립적으로 갱신한다.
 liveness refresh는 candidate model을 rebuild하지 않는다.
+The amendment uses one native confirmation and existing status/EngineeringValue language for
+`STOPPING/APPLYING/VERIFYING/RECONNECTING/ROLLING BACK`. Long affected-owner and error text is
+bounded/elided with full Inspector detail; progress never rebuilds the NIC table.
 
 ## Reserved geometry, overflow, wrapping, elision, and detail access
 
@@ -27,6 +30,8 @@ liveness refresh는 candidate model을 rebuild하지 않는다.
 ## Focus, selection, scroll, table-column, dock/splitter, and window stability
 
 stable candidate ID로 refresh 뒤 selection을 복원하고 scroll/focus를 변경하지 않는다.
+The confirmation is the only intentional focus transition. Cancel returns focus to the selected
+row; asynchronous phases do not move selection, scroll, dock or adjacent controls.
 
 ## Accessibility, font scaling, DPI, locale, theme, and target-size checks
 

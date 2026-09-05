@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -237,16 +238,44 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 lambda: self._pixhawk_refresh_parameters("right"),
             ),
             (
+                "pixhawk.mag.refresh.p1",
+                "Refresh P1 MAG",
+                "Read P1 MAG priorities and active-selection evidence.",
+                "device",
+                lambda: self._pixhawk_mag_refresh("left"),
+            ),
+            (
+                "pixhawk.mag.refresh.p2",
+                "Refresh P2 MAG",
+                "Read P2 MAG priorities and active-selection evidence.",
+                "device",
+                lambda: self._pixhawk_mag_refresh("right"),
+            ),
+            (
+                "pixhawk.mag.apply.p1",
+                "Apply P1 MAG",
+                "Apply P1's visible MAG priorities and begin independent active-device verification.",
+                "device",
+                lambda: self._pixhawk_mag_apply("left"),
+            ),
+            (
+                "pixhawk.mag.apply.p2",
+                "Apply P2 MAG",
+                "Apply P2's visible MAG priorities and begin independent active-device verification.",
+                "device",
+                lambda: self._pixhawk_mag_apply("right"),
+            ),
+            (
                 "pixhawk.recover_eth_mavlink.p1",
                 "Recover P1 via USB",
-                "For a confirmed P1 ETH RX stall, revalidate a unique USB heartbeat sysid=1, ask for confirmation, reboot only P1, then require 10-minute requalification.",
+                "For a confirmed P1 ETH RX stall, revalidate a unique USB heartbeat sysid=1, ask for confirmation, reboot only P1, then require 1-minute requalification.",
                 "device",
                 lambda: self._pixhawk_recover_eth_mavlink("left"),
             ),
             (
                 "pixhawk.recover_eth_mavlink.p2",
                 "Recover P2 via USB",
-                "For a confirmed P2 ETH RX stall, revalidate a unique USB heartbeat sysid=2, ask for confirmation, reboot only P2, then require 10-minute requalification.",
+                "For a confirmed P2 ETH RX stall, revalidate a unique USB heartbeat sysid=2, ask for confirmation, reboot only P2, then require 1-minute requalification.",
                 "device",
                 lambda: self._pixhawk_recover_eth_mavlink("right"),
             ),
@@ -305,6 +334,20 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 "Probe /dev/serial/by-id, ttyACM, and ttyUSB candidates for a MAVLink heartbeat and fill the URL.",
                 "device",
                 self._telemetry_discover_usb,
+            ),
+            (
+                "telemetry.discover_network",
+                "Find Network drone telemetry",
+                "Passively find wired MAVLink sources and identify Drone sysid 3 without changing networking.",
+                "device",
+                self._telemetry_discover_network,
+            ),
+            (
+                "telemetry.use_network_candidate",
+                "Use selected Drone network candidate",
+                "Fill the MAVLink URL from the selected current sysid 3 candidate without connecting.",
+                "device",
+                self._telemetry_use_network_candidate,
             ),
             (
                 "gnss.base_discover",
@@ -713,6 +756,10 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             "pixhawk.reset_level_calibration",
             "pixhawk.refresh_parameters.p1",
             "pixhawk.refresh_parameters.p2",
+            "pixhawk.mag.refresh.p1",
+            "pixhawk.mag.refresh.p2",
+            "pixhawk.mag.apply.p1",
+            "pixhawk.mag.apply.p2",
             "pixhawk.recover_eth_mavlink.p1",
             "pixhawk.recover_eth_mavlink.p2",
             "pixhawk.discover_usb",
@@ -807,6 +854,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             ("camera.right", "CAM R"),
             ("pixhawk.left", "P1"),
             ("pixhawk.right", "P2"),
+            ("pixhawk.drone", "Drone"),
             ("gnss", "RTK"),
             ("gnss.ntrip", "NTRIP"),
             ("detection", "DET"),
@@ -1514,6 +1562,48 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         return self.backend.toggle_camera()
 
     def _toggle_detection(self) -> object:
+        run_state = ""
+        run_reader = getattr(self.backend, "measurement_run_snapshot", None)
+        if callable(run_reader):
+            try:
+                run_snapshot = run_reader()
+            except Exception:
+                run_snapshot = {}
+            if isinstance(run_snapshot, Mapping):
+                run_state = str(run_snapshot.get("state") or "").upper()
+        runtime_panel = getattr(self.backend, "panel", None)
+        detection_active = bool(getattr(runtime_panel, "yolo_enabled", False))
+        detection_active = detection_active or run_state in {
+            "QUEUED",
+            "STARTING",
+            "RUNNING",
+            "STOPPING",
+        }
+        if not detection_active:
+            # SettingsWorkspace is a separate edit surface from the hidden
+            # panel that owns CameraPane/YOLO. Bind the displayed model to
+            # that runtime owner before begin_measurement snapshots config.
+            weights_widget = self.settings_workspace.settings_widgets.get(
+                "yolo_weights_path"
+            )
+            weights_reader = getattr(weights_widget, "text", None)
+            selected_weights = (
+                str(weights_reader() or "").strip()
+                if callable(weights_reader)
+                else ""
+            )
+            if not selected_weights:
+                raise RuntimeError(
+                    "YOLO model is not selected; choose weights in "
+                    "Settings > YOLO / RTSP"
+                )
+            applied = self.backend.apply_workstation_system_settings(
+                {"yolo_weights_path": selected_weights}
+            )
+            if applied is False:
+                raise RuntimeError(
+                    "selected YOLO model was rejected by the runtime owner"
+                )
         return self.backend.toggle_detection()
 
     def _toggle_recording(self) -> object:
@@ -1581,6 +1671,15 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
     def _pixhawk_refresh_parameters(self, camera: str) -> object:
         return self.backend.advanced_refresh_px4_calibration_params(camera, read_params=True)
 
+    def _pixhawk_mag_refresh(self, camera: str) -> object:
+        return self.backend.advanced_refresh_px4_mag(camera, read_params=True)
+
+    def _pixhawk_mag_apply(self, camera: str) -> object:
+        return self.backend.advanced_apply_px4_mag_priorities(
+            camera,
+            self.pixhawk.mag_priority_payload(camera),
+        )
+
     def _pixhawk_reset_calibration(self, camera: str, group: str) -> object:
         return self.backend.pixhawk_reset_calibration(camera, group)
 
@@ -1597,19 +1696,34 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         return self.backend.pixhawk_discover_host_ip()
 
     def _telemetry_apply(self) -> object:
-        return self.backend.drone_telemetry_configure(self.telemetry.payload())
+        result = self.backend.drone_telemetry_configure(self.telemetry.payload())
+        self.telemetry.accept_endpoint(result)
+        return result
 
     def _telemetry_connect(self) -> object:
-        return self.backend.drone_telemetry_connect(self.telemetry.payload())
+        result = self.backend.drone_telemetry_connect(self.telemetry.payload())
+        self.telemetry.accept_endpoint(result)
+        return result
 
     def _telemetry_disconnect(self) -> object:
         return self.backend.drone_telemetry_disconnect()
 
     def _telemetry_save_settings(self) -> object:
-        return self.backend.drone_telemetry_save_settings(self.telemetry.payload())
+        result = self.backend.drone_telemetry_save_settings(self.telemetry.payload())
+        self.telemetry.accept_endpoint(result)
+        return result
 
     def _telemetry_discover_usb(self) -> object:
         return self.backend.drone_telemetry_discover_usb()
+
+    def _telemetry_discover_network(self) -> object:
+        return self.backend.drone_telemetry_discover_network()
+
+    def _telemetry_use_network_candidate(self) -> object:
+        candidate_id = self.telemetry.selected_network_candidate_id()
+        result = self.backend.drone_telemetry_use_network_candidate(candidate_id)
+        self.telemetry.set_candidate_endpoint(result)
+        return result
 
     def _gnss_base_discover(self) -> object:
         return self.backend.gnss_base_discover()
@@ -1888,7 +2002,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 button.setEnabled(camera_recovery_allowed and not rtsp_operation_active)
         time_set_button = self.time_workspace.operation_buttons.get("time.set_pc")
         if time_set_button is not None:
-            time_set_button.setEnabled(not recording_locked and not clock_change_active)
+            time_set_button.setEnabled(not clock_change_active)
         swap_button = self.alignment.operation_buttons.get("alignment.swap_pixhawks")
         if swap_button is not None:
             swap_button.setEnabled(not recording_locked)
@@ -1935,7 +2049,11 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             for side in open_sides
             if not bool(getattr(managers.get(side), "armed", False))
         }
-        level_reset_enabled = bool(open_sides) and disarmed_open_sides == open_sides and not recording_locked
+        level_reset_enabled = (
+            bool(open_sides)
+            and disarmed_open_sides == open_sides
+            and not recording_locked
+        )
         self.commands.set_enabled("pixhawk.reset_level_calibration", level_reset_enabled)
         if reset_level_button is not None:
             reset_level_button.setEnabled(level_reset_enabled)
@@ -1944,7 +2062,8 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 if calibration.resettable:
                     self.commands.set_enabled(
                         f"pixhawk.reset_calibration.{side_code}.{calibration.key}",
-                        side in disarmed_open_sides and not recording_locked,
+                        side in disarmed_open_sides
+                        and not recording_locked,
                     )
         recovery_active = getattr(panel, "pixhawk_usb_recovery_thread", None) is not None
         for side_code, side in (("p1", "left"), ("p2", "right")):
@@ -1954,7 +2073,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 and not recovery_active
                 and pixhawk_state_by_side.get(side) == "ETH MAVLINK RX STALLED",
             )
-        self.commands.set_enabled("time.set_pc", not recording_locked and not clock_change_active)
+        self.commands.set_enabled("time.set_pc", not clock_change_active)
         # Never hide a Measurement start/stop request behind presentation
         # state.  The backend command boundary owns the fail-closed checks and
         # reports why an unsafe lifecycle or writer transition was rejected.
@@ -1962,7 +2081,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         manual_record_enabled = (
             not automatic_recording
             and recording_state not in {"FINALIZING", "RECOVERABLE"}
-            and (recording_locked or not clock_change_active)
         )
         self.commands.set_enabled("recording.toggle", manual_record_enabled)
         manual_record_button = self.advanced.operation_buttons.get("recording.toggle")

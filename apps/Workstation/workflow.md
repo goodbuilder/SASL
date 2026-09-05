@@ -1,6 +1,6 @@
 # Workstation 표준 작업 순서
 
-이 문서는 2026-08-26 기준 현장 운용 순서다. 가장 중요한 원칙은 저장 완결성보다 **지금 가능한 측정을 실행하는 것**이다.
+이 문서는 2026-08-31 기준 현장 운용 순서다. 가장 중요한 원칙은 저장 완결성보다 **지금 가능한 측정을 실행하는 것**이다.
 
 운용용 Measurement Session은 없다. 새 측정을 위해 폴더를 열거나 닫고, 저장을 확정하거나, 완결성을 복구할 필요가 없다. 과거의 `OPEN`/`RECOVERABLE` 디렉터리와 저장 오류는 `측정 시작`을 비활성화하지 않는다.
 
@@ -34,7 +34,7 @@ export SASL_WORKSTATION_DATA_ROOT=/absolute/path/to/workstation_data
 
 ## 2. Data 저장 구조
 
-`Settings > Storage > Data folder`는 `SASL_WORKSTATION_DATA_ROOT`에 상대적인 하위 경로다. 기본값은 `measurement_data`이다. 절대경로나 루트 밖을 가리키는 값은 기본값으로 대체되고 `DEGRADED`로 표시되지만 측정을 막지 않는다.
+`Settings > Storage > Data folder`를 비우면 기본 실행은 `<SASL_ROOT>/recordings`에 저장한다. `SASL_WORKSTATION_DATA_ROOT`를 명시적으로 지정한 실행에서는 그 루트의 `recordings/`가 기본이다. 빈 값이 아닌 사용자 경로는 `SASL_WORKSTATION_DATA_ROOT`에 상대적인 하위 경로여야 한다. 절대경로나 루트 밖을 가리키는 값은 기본값으로 대체되고 `DEGRADED`로 표시되지만 측정을 막지 않는다. 기존 `.local/workstation_data/measurement_data/`는 이동·삭제하지 않고 과거 자료로 남긴다.
 
 | 데이터 유형 | 지정 파일 |
 | --- | --- |
@@ -55,7 +55,8 @@ MP4, 사진, native PNG, ULog의 파일명은 `YYYYMMDD_HHMMSS_nanoseconds+offse
 
 ## 3. Calibration과 Alignment
 
-Calibration은 Measurement와 독립적인 재사용 루트를 사용한다. `촬영 → 계산·적용 → 프로파일` 순서로 K,D와 R,t를 확인한다. Calibration 화면의 photo-set 묶음은 Calibration 도메인의 작업 단위이며 Measurement Session 게이트가 아니다.
+Calibration은 Measurement와 독립적인 재사용 루트를 사용한다. 기본값 `calibration`은 `<SASL_ROOT>/apps/Workstation/calibration`으로 해석하고, 새 실행은 새 timestamp 하위 폴더를 만든다. 기존 `.local/workstation_data/calibration`과 기존 Workstation calibration 폴더는 자동 이동·병합·삭제하지 않는다. `촬영 → 계산·적용 → 프로파일` 순서로 K,D와 R,t를 확인한다. 승인된 K,D의 재시작 의존 파일은 data root로 해시 검증 복사한다. Calibration 화면의 photo-set 묶음은 Calibration 도메인의 작업 단위이며 Measurement Session 게이트가 아니다.
+Live/Auto pair의 `Max Live pair Δt`는 decoded-frame app-receive monotonic 수신시각을 기준으로 하며, NTP/RTCP는 저장·진단용이다. 수신시각은 노출시각 증명이 아니므로 촬영 순간 보드를 멈춘다. FTP는 기존 CPTR dispatch proxy를 유지한다.
 
 Alignment는 앱 실행 수명을 따른다.
 
@@ -88,14 +89,59 @@ RTSP URL이 비어 있거나 좌·우가 같은 stream이면 시작을 거부한
 IDLE → QUEUED(필요 시) → STARTING → RUNNING → STOPPING → IDLE
 ```
 
-- 측정 결과와 method 평가는 priority 큐를 통해 append된다.
+- Run이 `RUNNING`인 동안 `pixhawk_rtk_live` 대표 결과가 `VALID` 또는
+  `ESTIMATED`로 도착하면 UI를 갱신하기 전 `measurements.jsonl` priority 큐에
+  넣는다. enqueue 시도와 그 결과 확인이 먼저고 현재 테이블·이력·그래프·거리 banner
+  갱신은 나중이다. 거부된 enqueue는 degraded evidence로 표시될 수 있다.
+- primary worker를 먼저 시작·dispatch하고 primary terminal 또는 1초 timeout 후 비교
+  worker를 시작한다. primary와 comparison은 각각 20-pair 한도를 쓴다. comparison만
+  포화되면 primary는 계속 받고 그 pair의 comparison만 `BACKPRESSURE_BLOCKED`로 남긴다.
+- primary `BLOCKED`/`FAILED`/`TIMEOUT`/`BACKPRESSURE_BLOCKED`는 대표 측정 행을
+  만들지 않고 `method_evaluations.jsonl`에만 남는다. 8개 method의 전체 결과도
+  나중에 같은 파일에 bundle로 append된다.
+- 여기서 즉시 저장은 비동기 priority enqueue를 뜻한다. 해당 시점에 디스크
+  write/flush/`fsync`까지 완료됐다는 뜻은 아니다.
+- 8-method bundle은 enqueue가 승인된 뒤에만 commit/count한다. 활성 행 enqueue가 거부되면
+  같은 owner-epoch/index lease의 행을 재시도하고, 그 사이 Stop되면 `late=true`로 기록한다.
+  owner가 clear/rebind/close되어 lease가 무효가 되면 새 행을 덮지 않고 direct writer로 넘긴다.
+- RUNNING 중 도착한 primary 대표 행 enqueue가 거부되면 8-method bundle 저장 여부와
+  무관하게 background 재시도를 유지한다. Stop/다음 run 이후에는 원래 generation의
+  `late_primary_measurement_outcome`만 저장하며 새 run의 표·카운터·그래프·거리 UI는 건드리지 않는다.
+- Data store가 `CLOSING` 또는 `CLOSED`면 새 enqueue를 거부하고 drop/error 증거를
+  남긴다. shutdown 시작 뒤의 행을 저장된 것으로 간주하지 않는다.
+- native frame 완료는 다음 run이 시작됐더라도 원래 request의 row owner/lease만
+  갱신한다. lease가 무효이거나 원래 행을 갱신할 수 없는 경우를 포함해 `native.frames`에 원래
+  runtime generation으로 completion event를 남긴다. row와 event enqueue가 함께 거부되면
+  별도 bounded retry가 payload를 유지한다. exact duplicate는 무시하고 conflict는 최초 terminal
+  결과를 보존한다. 영구 장애로 retry budget을 소진하면 terminal-drop counter/status/log를 남겨
+  종료가 무한 대기하지 않게 한다.
 - Camera/PX4/GNSS/Target bulk row는 별도 큐를 사용한다. overload 시 오래된 bulk row가 누락될 수 있으며 `dropped_records`에 누적된다.
 - RTCM routing/injection은 증거 저장과 독립적이다. RTCM 파일 오류가 발생해도 Measurement를 저장 재시도 상태로 바꾸지 않는다.
 - 정밀 기하 입력이 없으면 결과가 `BLOCKED`/`ESTIMATED`가 될 수 있지만 raw 수집은 계속한다.
+- 실시간 거리의 좌·우 frame 선택은 Measurement Settings를 따른다. 기본값은 exact decoded-
+  frame `app_receive_monotonic_ns`이다. `RTCP/NTP preferred`는 Clock VERIFIED와 current
+  same-epoch frame evidence가 모두 정상일 때 실제 RTCP/NTP로 pair를 고른다.
+- RTCP timestamp 누락/오류, Clock 미검증·stale, epoch transition/mismatch 또는 선택 Δt 초과
+  시 같은 run은 exact app receive로 자동 fallback한다. 선택 기준의 절대 Δt는 설정값과
+  100 ms hard cap을 모두 만족해야 한다. fallback 자체는 유효한 기하를 `ESTIMATED`로 낮추지 않는다.
+- 실행 중 Settings 변경은 현재 Measurement에 섞지 않고 다음 Measurement부터 적용한다.
+  PX4 attitude/GNSS association은 두 기준 모두 host monotonic을 유지한다.
 
 ## 6. 측정 종료와 반복
 
-`측정 종료`를 누르면 Detection, 카메라, 영상 owner를 해제하고 writer에 flush를 요청한다. Parquet/엑셀, manifest/hash/completeness, 과거 디렉터리 복구, optional worker 종료를 대기하지 않는다.
+`측정 종료`를 누르면 Detection, 카메라, 영상 owner를 해제하고 writer에 flush를 요청한다. Stop 전에
+RUNNING primary `VALID`/`ESTIMATED`가 이미 priority enqueue됐다면 그 행은 보존된다. Stop이
+먼저 실행되고 primary가 나중에 도착하면 `measurements.jsonl` 행을 만들지 않고 거리 UI도
+갱신하지 않는다. 단, RUNNING 중 이미 도착했지만 enqueue만 거부된 primary는 background
+소유권을 유지하며 Stop 뒤 compact late evidence로 저장을 계속 시도한다. 이 재시도는 다음
+측정 시작을 막거나 새 측정 UI를 갱신하지 않는다. 대표 거리 행이 반드시 필요하면 Measurement UI에 Pixhawk attitude +
+GNSS/RTK 거리가 나타날 때까지 기다린 뒤 Stop한다. 사용하지 않는 비교 method 종료를 기다릴 필요는
+없다. Parquet/엑셀, manifest/hash/completeness, 과거 디렉터리 복구, optional worker 종료를 대기하지
+않는다.
+
+`Data > Status`의 store lifecycle가 `OPEN`인지도 확인한다. `CLOSING`/`CLOSED`는 새
+enqueue를 받지 않으므로, 필요한 대표 행이 없다면 정상 `OPEN` store로 새 Measurement를
+시작하고 거리 표시 후 Stop한다.
 
 실제 카메라 worker가 종료하면 Run은 `IDLE`로 돌아가고 바로 다음 측정을 시작할 수 있다. 나중에 하나의 실험 묶음으로 만들려면 `recorded_utc_ns`, source timestamp, `runtime_generation`과 timestamped binary 파일명을 기준으로 외부에서 모은다.
 

@@ -7,12 +7,73 @@ from types import SimpleNamespace
 import pytest
 
 from Workstation.workstation_core.recording_reader import read_measurement_stream
-from Workstation.workstation_core.recording_session import save_session_files
+from Workstation.workstation_core.recording_session import (
+    compact_distance_measurement_rows,
+    save_session_files,
+)
 from Workstation.workstation_core.session_parquet import (
     finalize_camera_timeline,
     finalize_measurement_pairs,
 )
 from Workstation.evidence import EvidenceAdapter
+
+
+def test_v4_compact_sync_delta_keeps_historical_selected_app_meaning() -> None:
+    [row] = compact_distance_measurement_rows(
+        [
+            {
+                "pair_id": "v4",
+                "pairing_time_basis": "app_receive_monotonic",
+                "pairing_time_basis_role": "authoritative_distance",
+                "selected_pair_delta_ns": 20_000_000,
+                "selected_pair_abs_delta_ns": 20_000_000,
+                "app_receive_pair_delta_ns": 20_000_000,
+                "rtcp_pair_delta_ns": 32_400_000_000_000,
+                "ntp_evidence_role": "record_only",
+            }
+        ]
+    )
+
+    assert row["sync_delta_ns"] == 20_000_000
+    assert row["selected_pair_delta_ns"] == 20_000_000
+    assert row["rtcp_pair_delta_ns"] == 32_400_000_000_000
+    assert row["ntp_evidence_role"] == "record_only"
+
+
+def test_v5_compact_row_preserves_requested_effective_and_selected_rtcp_delta() -> None:
+    [row] = compact_distance_measurement_rows(
+        [
+            {
+                "pair_id": "v5",
+                "pairing_time_basis_requested": "camera_rtcp",
+                "pairing_time_basis": "camera_rtcp",
+                "pairing_time_basis_role": "authoritative_distance",
+                "pairing_fallback_active": False,
+                "pairing_fallback_reason": "",
+                "selected_pair_delta_ns": 10_000_000,
+                "selected_pair_abs_delta_ns": 10_000_000,
+                "app_receive_pair_delta_ns": 90_000_000,
+                "rtcp_pair_delta_ns": 10_000_000,
+                "ntp_evidence_role": "selected_distance_pairing",
+            }
+        ]
+    )
+
+    assert row["pairing_time_basis_requested"] == "camera_rtcp"
+    assert row["pairing_time_basis"] == "camera_rtcp"
+    assert row["pairing_fallback_active"] is False
+    assert row["sync_delta_ns"] == 10_000_000
+    assert row["app_receive_pair_delta_ns"] == 90_000_000
+    assert row["ntp_evidence_role"] == "selected_distance_pairing"
+
+
+def test_v3_compact_sync_delta_retains_legacy_rtcp_meaning() -> None:
+    [row] = compact_distance_measurement_rows(
+        [{"pair_id": "v3", "rtcp_pair_delta_ns": -10_000_000}]
+    )
+
+    assert row["sync_delta_ns"] == -10_000_000
+    assert row["pairing_time_basis"] == ""
 
 
 def test_v3_reader_prefers_verified_jsonl_even_if_derived_parquet_changes(

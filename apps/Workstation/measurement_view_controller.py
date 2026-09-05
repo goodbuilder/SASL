@@ -13,7 +13,7 @@ import json
 import math
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from math import isfinite
 
 from PyQt5 import QtCore
@@ -45,6 +45,7 @@ from Workstation.workstation_core.measurement_methods import (
     MEASUREMENT_POSE_SIDES,
     MOUNTAIN_GNSS,
     PIXHAWK_RTK_LIVE,
+    PIXHAWK_RP_GPS_BASELINE_YAW,
     TERRAIN_PNP,
     MeasurementMethodStatus,
     choose_ready_measurement_method,
@@ -83,8 +84,19 @@ from Workstation.workstation_core.measurement_attempt import (
     build_checkerboard_baseline_snapshot,
     build_pixhawk_baseline_snapshot,
     detection_pair_key,
+    live_pair_timing_evidence,
+)
+from Workstation.workstation_core.baseline_yaw import (
+    BaselineYawSelection,
+    quaternion_from_roll_pitch_yaw_deg,
+    select_baseline_yaw,
 )
 from Workstation.workstation_core.measurement_controller import calculate_measurement_geometry
+from Workstation.workstation_core.measurement_data_store import (
+    RETRY_RESERVE_MAX_BYTES,
+    ROW_WRITE_ADMITTED,
+    ROW_WRITE_UNAVAILABLE,
+)
 from Workstation.workstation_core.method_evaluation import (
     FrozenMeasurementPairSnapshot,
     MethodEvaluationBundle,
@@ -96,6 +108,7 @@ from Workstation.workstation_core.method_evaluation_workers import (
 )
 from Workstation.workstation_core.detection_pair_coordinator import (
     DetectionPairCoordinator,
+    PairTimingDecision,
     PairingPolicy,
 )
 from Workstation.workstation_core.native_evidence_writer import (
@@ -107,6 +120,7 @@ from Workstation.workstation_core.preview_measurement_worker import (
     PreviewMeasurementCoordinator,
     PreviewMeasurementResult,
 )
+from Workstation.workstation_core.settings import normalize_live_distance_time_basis
 from Workstation.workstation_core.measurement_widgets import triangulation_3d_scene_points
 from Workstation.workstation_core.rtk_geometry import (
     GpsPairReadiness,
@@ -116,7 +130,12 @@ from Workstation.workstation_core.rtk_geometry import (
     ned_delta_m,
     validate_gps_pair_for_baseline,
 )
-from Workstation.workstation_core.stereo import DetectionObservation, StereoEstimate
+from Workstation.workstation_core.stereo import (
+    DetectionObservation,
+    StereoEstimate,
+    TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC,
+    detection_timestamp_for_basis,
+)
 from Workstation.workstation_core.sync import classify_attitude_timing
 from Workstation.workstation_core.theme import (
     ERROR, ERROR_BG, ERROR_TEXT, PANEL_ALT_BG, PANEL_BORDER,
@@ -135,6 +154,20 @@ from Workstation.workstation_core.triangulation import (
 GEOMETRY_COMPARISON_ANALYSIS_SCHEMA = "workstation-geometry-comparison-analysis-v1"
 GEOMETRY_COMPARISON_ANALYSIS_NAMESPACE = "analysis/geometry_comparison"
 DETECTION_PAIR_MAX_OBSERVATION_AGE_S = 1.0
+LIVE_DISTANCE_MAX_PAIR_DELTA_S = 0.100
+PRIMARY_MEASUREMENT_RETRY_BUDGET = 1
+METHOD_BUNDLE_RETRY_BUDGET = 1
+PERSISTENCE_PENDING_MAX_COUNT = 1024
+PERSISTENCE_PENDING_MAX_BYTES = RETRY_RESERVE_MAX_BYTES
+METHOD_EVALUATION_SHUTDOWN_CLOSE_RETRY_LIMIT = 8
+
+
+@dataclass
+class _PendingMethodBundleCommit:
+    bundle: MethodEvaluationBundle
+    row_owner: object | None = None
+    row_index: int | None = None
+    row_lease: tuple[int, int] | None = None
 
 MEASUREMENT_VIEW_CONTROLLER_METHODS = [
     "workstation_measurement_methods_snapshot",
@@ -209,27 +242,328 @@ class MeasurementViewController:
         self._preview_measurement_timer: QtCore.QTimer | None = None
         self._preview_measurement_results: dict[str, PreviewMeasurementResult] = {}
         self._preview_measurement_pending: set[str] = set()
+        self._primary_outcome_hash_by_key: dict[tuple[str, str, int], str] = {}
+        self._primary_normalized_outcome_by_key: dict[
+            tuple[str, str, int], MethodEvaluationOutcome
+        ] = {}
+        self._primary_measurement_persisted: set[tuple[str, str, int]] = set()
+        self._pending_primary_measurement_commits: dict[
+            tuple[str, str, int], MethodEvaluationOutcome
+        ] = {}
+        self._pending_primary_measurement_sizes: dict[
+            tuple[str, str, int], int
+        ] = {}
+        self._pending_primary_measurement_bytes = 0
+        self._primary_history_projected: set[tuple[str, str, int]] = set()
+        self._primary_display_high_water = -1
+        self._primary_displayed_key: tuple[str, str, int] | None = None
+        self._pending_method_bundle_commits: dict[
+            tuple[str, str, int], _PendingMethodBundleCommit
+        ] = {}
+        self._pending_method_bundle_sizes: dict[tuple[str, str, int], int] = {}
+        self._pending_method_bundle_bytes = 0
+        self._persisted_method_bundle_keys: set[tuple[str, str, int]] = set()
+        self._persistence_pending_overflow_count = 0
+        self._persistence_pending_overflow_evidence_failures = 0
+        self._last_persistence_pending_overflow: dict[str, object] = {}
+        self._method_evaluation_shutdown_close_retry_calls = 0
+        self._sync_persistence_pending_status()
+
+    def _ensure_method_evaluation_timer(self) -> None:
+        if (
+            self._method_evaluation_timer is not None
+            or QtCore.QCoreApplication.instance() is None
+        ):
+            return
+        parent = self.panel if isinstance(self.panel, QtCore.QObject) else None
+        timer = QtCore.QTimer(parent)
+        timer.setInterval(20)
+        timer.timeout.connect(self._poll_method_evaluations)
+        timer.start()
+        self._method_evaluation_timer = timer
+
+    def _stop_method_evaluation_timer(self) -> None:
+        timer = self._method_evaluation_timer
+        if timer is None:
+            return
+        timer.stop()
+        timer.deleteLater()
+        self._method_evaluation_timer = None
+
+    @staticmethod
+    def _pending_record_size(record: Mapping[str, object]) -> int:
+        try:
+            return len(
+                json.dumps(
+                    dict(record),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+        except (TypeError, ValueError):
+            return len(repr(dict(record)).encode("utf-8", errors="replace"))
+
+    def _sync_persistence_pending_status(self) -> None:
+        self.panel._primary_measurement_retry_status = {
+            "state": (
+                "OVERFLOW"
+                if self._persistence_pending_overflow_count
+                else "PENDING"
+                if (
+                    self._pending_primary_measurement_commits
+                    or self._pending_method_bundle_commits
+                )
+                else "IDLE"
+            ),
+            "primary_pending_count": len(
+                self._pending_primary_measurement_commits
+            ),
+            "primary_pending_bytes": self._pending_primary_measurement_bytes,
+            "bundle_pending_count": len(self._pending_method_bundle_commits),
+            "bundle_pending_bytes": self._pending_method_bundle_bytes,
+            "max_count_per_kind": max(1, int(PERSISTENCE_PENDING_MAX_COUNT)),
+            "max_bytes_per_kind": max(1, int(PERSISTENCE_PENDING_MAX_BYTES)),
+            "overflow_count": self._persistence_pending_overflow_count,
+            "overflow_evidence_failures": (
+                self._persistence_pending_overflow_evidence_failures
+            ),
+            "shutdown_close_retry_calls": (
+                self._method_evaluation_shutdown_close_retry_calls
+            ),
+            "shutdown_close_retry_limit": max(
+                1,
+                int(METHOD_EVALUATION_SHUTDOWN_CLOSE_RETRY_LIMIT),
+            ),
+            "last_overflow": dict(self._last_persistence_pending_overflow),
+        }
+
+    def _record_persistence_pending_overflow(
+        self,
+        *,
+        kind: str,
+        key: tuple[str, str, int],
+        digest: str,
+        reason: str,
+    ) -> None:
+        self._persistence_pending_overflow_count += 1
+        record = {
+            "event_type": "measurement_persistence_retry_overflow",
+            "pending_kind": str(kind),
+            "eviction_policy": "oldest_first_keep_newest",
+            "reason": str(reason),
+            "measurement_id": str(key[0]),
+            "pair_id": str(key[1]),
+            "request_generation": int(key[2]),
+            "evidence_sha256": str(digest),
+            "primary_pending_count": len(
+                self._pending_primary_measurement_commits
+            ),
+            "primary_pending_bytes": self._pending_primary_measurement_bytes,
+            "bundle_pending_count": len(self._pending_method_bundle_commits),
+            "bundle_pending_bytes": self._pending_method_bundle_bytes,
+            "max_count_per_kind": max(1, int(PERSISTENCE_PENDING_MAX_COUNT)),
+            "max_bytes_per_kind": max(1, int(PERSISTENCE_PENDING_MAX_BYTES)),
+        }
+        writer = getattr(self.panel, "append_workstation_data", None)
+        try:
+            evidence_admitted = bool(
+                callable(writer) and writer("events", record, priority=True)
+            )
+        except Exception:  # noqa: BLE001 - overflow accounting must always survive.
+            evidence_admitted = False
+        if not evidence_admitted:
+            self._persistence_pending_overflow_evidence_failures += 1
+        record["overflow_evidence_admitted"] = evidence_admitted
+        self._last_persistence_pending_overflow = record
+        logger = getattr(self.panel, "_log", None)
+        if callable(logger):
+            logger(
+                "[측정] persistence retry overflow: "
+                f"kind={kind}, pair={key[1]}, reason={reason}, "
+                f"evidence={'QUEUED' if evidence_admitted else 'REJECTED'}"
+            )
+        self._sync_persistence_pending_status()
+
+    def _release_recording_primary_retry(
+        self,
+        outcome: MethodEvaluationOutcome,
+    ) -> None:
+        recording_owner = getattr(
+            self.panel,
+            "_recording_controller_owner",
+            None,
+        )
+        releaser = getattr(
+            recording_owner,
+            "_release_primary_retry_ownership",
+            None,
+        )
+        if not callable(releaser):
+            return
+        try:
+            attempt = MeasurementAttempt.from_canonical_payload(
+                outcome.attempt_payload
+            )
+            releaser(tuple(attempt.detection_pair_key))
+        except (KeyError, RuntimeError, TypeError, ValueError):
+            return
+
+    def _remove_pending_primary_measurement(
+        self,
+        key: tuple[str, str, int],
+    ) -> None:
+        self._pending_primary_measurement_commits.pop(key, None)
+        self._pending_primary_measurement_bytes -= self._pending_primary_measurement_sizes.pop(
+            key,
+            0,
+        )
+        self._pending_primary_measurement_bytes = max(
+            0,
+            self._pending_primary_measurement_bytes,
+        )
+        self._sync_persistence_pending_status()
+
+    def _retain_pending_primary_measurement(
+        self,
+        key: tuple[str, str, int],
+        outcome: MethodEvaluationOutcome,
+    ) -> bool:
+        self._remove_pending_primary_measurement(key)
+        size = self._pending_record_size(outcome.to_record())
+        count_limit = max(1, int(PERSISTENCE_PENDING_MAX_COUNT))
+        byte_limit = max(1, int(PERSISTENCE_PENDING_MAX_BYTES))
+        if size > byte_limit:
+            self._release_recording_primary_retry(outcome)
+            self._record_persistence_pending_overflow(
+                kind="primary_measurement",
+                key=key,
+                digest=outcome.canonical_sha256(),
+                reason=f"single_record_bytes={size} exceeds byte_limit={byte_limit}",
+            )
+            return False
+        while (
+            len(self._pending_primary_measurement_commits) >= count_limit
+            or self._pending_primary_measurement_bytes + size > byte_limit
+        ):
+            oldest_key = next(iter(self._pending_primary_measurement_commits))
+            oldest = self._pending_primary_measurement_commits.get(oldest_key)
+            oldest_size = self._pending_primary_measurement_sizes.pop(oldest_key, 0)
+            self._pending_primary_measurement_commits.pop(oldest_key, None)
+            self._pending_primary_measurement_bytes = max(
+                0,
+                self._pending_primary_measurement_bytes - oldest_size,
+            )
+            if oldest is not None:
+                self._release_recording_primary_retry(oldest)
+                self._record_persistence_pending_overflow(
+                    kind="primary_measurement",
+                    key=oldest_key,
+                    digest=oldest.canonical_sha256(),
+                    reason="oldest evicted to admit newer primary retry",
+                )
+        self._pending_primary_measurement_commits[key] = outcome
+        self._pending_primary_measurement_sizes[key] = size
+        self._pending_primary_measurement_bytes += size
+        self._sync_persistence_pending_status()
+        return True
+
+    def _remove_pending_method_bundle(
+        self,
+        key: tuple[str, str, int],
+    ) -> None:
+        self._pending_method_bundle_commits.pop(key, None)
+        self._pending_method_bundle_bytes -= self._pending_method_bundle_sizes.pop(
+            key,
+            0,
+        )
+        self._pending_method_bundle_bytes = max(
+            0,
+            self._pending_method_bundle_bytes,
+        )
+        self._sync_persistence_pending_status()
+
+    def _retain_pending_method_bundle(
+        self,
+        key: tuple[str, str, int],
+        pending: _PendingMethodBundleCommit,
+    ) -> bool:
+        self._remove_pending_method_bundle(key)
+        size = self._pending_record_size(pending.bundle.to_record())
+        count_limit = max(1, int(PERSISTENCE_PENDING_MAX_COUNT))
+        byte_limit = max(1, int(PERSISTENCE_PENDING_MAX_BYTES))
+        if size > byte_limit:
+            self._record_persistence_pending_overflow(
+                kind="method_bundle",
+                key=key,
+                digest=pending.bundle.canonical_sha256(),
+                reason=f"single_record_bytes={size} exceeds byte_limit={byte_limit}",
+            )
+            return False
+        while (
+            len(self._pending_method_bundle_commits) >= count_limit
+            or self._pending_method_bundle_bytes + size > byte_limit
+        ):
+            oldest_key = next(iter(self._pending_method_bundle_commits))
+            oldest = self._pending_method_bundle_commits.get(oldest_key)
+            oldest_size = self._pending_method_bundle_sizes.pop(oldest_key, 0)
+            self._pending_method_bundle_commits.pop(oldest_key, None)
+            self._pending_method_bundle_bytes = max(
+                0,
+                self._pending_method_bundle_bytes - oldest_size,
+            )
+            if oldest is not None:
+                self._record_persistence_pending_overflow(
+                    kind="method_bundle",
+                    key=oldest_key,
+                    digest=oldest.bundle.canonical_sha256(),
+                    reason="oldest evicted to admit newer bundle retry",
+                )
+        self._pending_method_bundle_commits[key] = pending
+        self._pending_method_bundle_sizes[key] = size
+        self._pending_method_bundle_bytes += size
+        self._sync_persistence_pending_status()
+        return True
+
+    def _terminalize_shutdown_pending_retries(self) -> None:
+        attempts = self._method_evaluation_shutdown_close_retry_calls
+        reason = (
+            "application shutdown close retry budget exhausted: "
+            f"attempts={attempts}"
+        )
+        for key, outcome in tuple(
+            self._pending_primary_measurement_commits.items()
+        ):
+            self._release_recording_primary_retry(outcome)
+            self._record_persistence_pending_overflow(
+                kind="primary_measurement_shutdown_drop",
+                key=key,
+                digest=outcome.canonical_sha256(),
+                reason=reason,
+            )
+            self._remove_pending_primary_measurement(key)
+        for key, pending in tuple(self._pending_method_bundle_commits.items()):
+            self._record_persistence_pending_overflow(
+                kind="method_bundle_shutdown_drop",
+                key=key,
+                digest=pending.bundle.canonical_sha256(),
+                reason=reason,
+            )
+            self._remove_pending_method_bundle(key)
+        self._sync_persistence_pending_status()
 
     def _ensure_method_evaluation_coordinator(self) -> MethodEvaluationCoordinator:
         coordinator = self._method_evaluation_coordinator
         if coordinator is None:
             coordinator = MethodEvaluationCoordinator()
             self._method_evaluation_coordinator = coordinator
-        if self._method_evaluation_timer is None and QtCore.QCoreApplication.instance() is not None:
-            parent = self.panel if isinstance(self.panel, QtCore.QObject) else None
-            timer = QtCore.QTimer(parent)
-            timer.setInterval(20)
-            timer.timeout.connect(self._poll_method_evaluations)
-            timer.start()
-            self._method_evaluation_timer = timer
+        self._ensure_method_evaluation_timer()
         return coordinator
 
     def close_method_evaluation_workers(self) -> bool:
-        timer = self._method_evaluation_timer
-        if timer is not None:
-            timer.stop()
-            timer.deleteLater()
-            self._method_evaluation_timer = None
+        self._retry_pending_primary_measurements()
+        self._retry_pending_method_bundles()
         coordinator = self._method_evaluation_coordinator
         self._method_evaluation_coordinator = None
         if coordinator is not None:
@@ -241,6 +575,32 @@ class MeasurementViewController:
             if not retiring.closed:
                 remaining.append(retiring)
         self._retiring_method_evaluation_coordinators = remaining
+        pending_persistence = bool(
+            self._pending_primary_measurement_commits
+            or self._pending_method_bundle_commits
+        )
+        if bool(getattr(self.panel, "_shutdown_in_progress", False)):
+            if pending_persistence:
+                self._method_evaluation_shutdown_close_retry_calls += 1
+                if self._method_evaluation_shutdown_close_retry_calls >= max(
+                    1,
+                    int(METHOD_EVALUATION_SHUTDOWN_CLOSE_RETRY_LIMIT),
+                ):
+                    self._terminalize_shutdown_pending_retries()
+            else:
+                self._method_evaluation_shutdown_close_retry_calls = 0
+        else:
+            # Measurement generation retirement ignores this return value and
+            # leaves retry ownership alive; it must never consume shutdown budget.
+            self._method_evaluation_shutdown_close_retry_calls = 0
+        self._sync_persistence_pending_status()
+        if (
+            self._pending_primary_measurement_commits
+            or self._pending_method_bundle_commits
+        ):
+            self._ensure_method_evaluation_timer()
+        else:
+            self._stop_method_evaluation_timer()
         detection_timer = self._detection_pair_timer
         if detection_timer is not None:
             detection_timer.stop()
@@ -271,7 +631,13 @@ class MeasurementViewController:
         )
         self._preview_measurement_results.clear()
         self._preview_measurement_pending.clear()
-        return not remaining and detection_closed and preview_closed
+        return bool(
+            not remaining
+            and detection_closed
+            and preview_closed
+            and not self._pending_primary_measurement_commits
+            and not self._pending_method_bundle_commits
+        )
 
     def _measurement_method_state(self) -> None:
         panel = self.panel
@@ -314,11 +680,29 @@ class MeasurementViewController:
                     ),
                 )
             )
+            global_reverse = bool(
+                setting_reader(
+                    "measurement_baseline_yaw_reverse",
+                    getattr(settings, "measurement_baseline_yaw_reverse", False),
+                )
+            )
             panel._measurement_preferred_method_id = normalize_measurement_method_id(
                 metadata.get("measurement_preferred_method", global_preferred)
             )
             panel._measurement_active_fallback_order = normalize_measurement_method_fallback_order(
                 metadata.get("measurement_method_fallback_order", global_order)
+            )
+            panel._measurement_baseline_yaw_reverse = bool(
+                metadata.get("measurement_baseline_yaw_reverse", global_reverse)
+            )
+            global_time_basis = self._configured_time_basis()
+            panel._measurement_active_time_basis_requested = (
+                normalize_live_distance_time_basis(
+                    metadata.get(
+                        "measurement_pairing_time_basis_requested",
+                        global_time_basis,
+                    )
+                )
             )
             panel._measurement_method_fill_policy = normalize_measurement_method_fill_policy(
                 metadata.get("measurement_method_fill_policy")
@@ -426,7 +810,18 @@ class MeasurementViewController:
                 "instance_id": "live:pixhawk-rtk",
                 "operating_intrinsics": operating_intrinsics,
                 "live_inputs": ["left/right Pixhawk attitude", "P1/P2 GNSS"],
-            }
+            },
+            PIXHAWK_RP_GPS_BASELINE_YAW: {
+                "kind": "live_at_pair",
+                "instance_id": "live:pixhawk-rp-gps-baseline-yaw",
+                "operating_intrinsics": operating_intrinsics,
+                "live_inputs": [
+                    "left/right Pixhawk Roll/Pitch",
+                    "P1/P2 GNSS baseline",
+                    "P1/P2 Pixhawk yaw branch reference",
+                ],
+                "yaw_contract": "P1→P2 NED azimuth +/- 90deg; persistent Reverse may invert",
+            },
         }
         frozen_objects: dict[str, object] = {}
         checkerboard_draft = getattr(
@@ -489,7 +884,14 @@ class MeasurementViewController:
             "measurement_preferred_method": preferred,
             "measurement_method_fallback_order": list(order),
             "measurement_method_fill_policy": default_measurement_method_fill_policy(),
+            "measurement_baseline_yaw_reverse": bool(
+                panel._workstation_setting(
+                    "measurement_baseline_yaw_reverse",
+                    getattr(panel.settings, "measurement_baseline_yaw_reverse", False),
+                )
+            ),
             "measurement_frozen_comparison_inputs": frozen_inputs,
+            "measurement_pairing_time_basis_requested": self._configured_time_basis(),
         }
 
     def _measurement_fill_policy(self) -> dict[str, dict[str, str]]:
@@ -507,12 +909,13 @@ class MeasurementViewController:
         """Return field-policy hard readiness plus telemetry advisories."""
 
         now_s = time.monotonic()
-        measurement_start = getattr(self.panel, "_measurement_started_monotonic_s", None)
-        extrinsics = getattr(self.panel, "latest_extrinsics", {}) or {}
+        defaults = ReadinessConfig()
         hard_reasons: list[str] = []
         advisories: list[str] = []
-        for side in ("left", "right"):
-            sample = extrinsics.get(side) if isinstance(extrinsics, dict) else None
+        left_attitude, right_attitude, reused_attitude = (
+            self._cached_measurement_attitude_states()
+        )
+        for side, sample in (("left", left_attitude), ("right", right_attitude)):
             if sample is None:
                 hard_reasons.append(f"{side} Pixhawk attitude missing")
                 continue
@@ -523,14 +926,30 @@ class MeasurementViewController:
                 age_s = float("nan")
             if not math.isfinite(age_s) or age_s < 0.0:
                 hard_reasons.append(f"{side} Pixhawk attitude timestamp invalid")
-            elif measurement_start is not None and float(timestamp_s) < float(measurement_start):
-                hard_reasons.append(f"{side} Pixhawk attitude not received in current Measurement")
             elif age_s > 2.0:
                 advisories.append(f"{side} Pixhawk attitude stale ({age_s:.3f}s)")
+        if reused_attitude:
+            advisories.append(
+                "Pixhawk attitude reused from latest valid sample: "
+                + ",".join(reused_attitude)
+            )
         pixhawk_hard = tuple(reason for reason in hard_reasons if "Pixhawk" in reason)
         pixhawk_ready = not pixhawk_hard
         gnss_ready = False
         left_gps, right_gps, reused_gps = self._cached_measurement_gps_states()
+        dropped_frame_sides = tuple(
+            str(side)
+            for side in (
+                getattr(self.panel, "_measurement_gps_correction_frame_dropped", ())
+                or ()
+            )
+        )
+        if dropped_frame_sides:
+            advisories.append(
+                "GNSS correction frame changed; retained fix discarded for "
+                + ",".join(dropped_frame_sides)
+                + "; reconnect that board to refix under the new reference"
+            )
         if left_gps is None or right_gps is None:
             hard_reasons.append("live GNSS baseline missing")
         elif not left_gps.has_position or not right_gps.has_position or not all(
@@ -567,6 +986,31 @@ class MeasurementViewController:
                 if reused_gps:
                     advisories.append(
                         "GNSS reused from latest valid 3D fix: " + ",".join(reused_gps)
+                    )
+                # P1 and P2 may only be connectable one at a time, so the
+                # retained pair can span minutes.  The exact span is reported
+                # instead of blocked: sequential capture is the only available
+                # field procedure on such a rig.
+                try:
+                    pair_delta_s = abs(
+                        float(left_gps.timestamp_s) - float(right_gps.timestamp_s)
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    pair_delta_s = float("nan")
+                maximum_pair_delta_s = (
+                    float(
+                        getattr(
+                            self._gnss_readiness_config(),
+                            "maximum_left_right_timestamp_delta_ms",
+                            defaults.maximum_left_right_timestamp_delta_ms,
+                        )
+                    )
+                    * 0.001
+                )
+                if math.isfinite(pair_delta_s) and pair_delta_s > maximum_pair_delta_s:
+                    advisories.append(
+                        f"P1/P2 GPS pair captured {pair_delta_s:.3f}s apart "
+                        f"(limit {maximum_pair_delta_s:.3f}s)"
                     )
         if gnss_ready and bool(getattr(self.panel, "gnss_operation_gate_active", False)):
             manager = getattr(self.panel, "gnss_operation_manager", None)
@@ -655,6 +1099,76 @@ class MeasurementViewController:
         stable_reasons = tuple(dict.fromkeys(reasons))
         return not stable_reasons, profile_hash, stable_reasons
 
+    def _measurement_baseline_yaw_reverse(self) -> bool:
+        self._measurement_method_state()
+        setting_reader = getattr(self.panel, "_workstation_setting", None)
+        if not callable(setting_reader):
+            setting_reader = lambda _name, default=None: default
+        settings = getattr(self.panel, "settings", None)
+        default = getattr(settings, "measurement_baseline_yaw_reverse", False)
+        if not str(getattr(self.panel, "_measurement_id", "") or ""):
+            return bool(
+                setting_reader(
+                    "measurement_baseline_yaw_reverse",
+                    default,
+                )
+            )
+        if hasattr(self.panel, "_measurement_baseline_yaw_reverse"):
+            return bool(self.panel._measurement_baseline_yaw_reverse)
+        return bool(
+            setting_reader(
+                "measurement_baseline_yaw_reverse",
+                default,
+            )
+        )
+
+    def _baseline_yaw_selection_preview(
+        self,
+        *,
+        left_gps: object | None = None,
+        right_gps: object | None = None,
+        left_attitude: object | None = None,
+        right_attitude: object | None = None,
+    ) -> tuple[BaselineYawSelection | None, float | None, float | None]:
+        if left_gps is None or right_gps is None:
+            selector = getattr(self.panel, "_selected_baseline_gps_states", None)
+            if callable(selector):
+                selected_left, selected_right = selector()
+            else:
+                latest_gps = getattr(self.panel, "latest_gps", {}) or {}
+                selected_left = latest_gps.get("left") if isinstance(latest_gps, Mapping) else None
+                selected_right = latest_gps.get("right") if isinstance(latest_gps, Mapping) else None
+            left_gps = left_gps or selected_left
+            right_gps = right_gps or selected_right
+        if left_gps is None or right_gps is None:
+            return None, None, None
+        baseline_ned = ned_delta_m(left_gps, right_gps)
+        if baseline_ned is None:
+            return None, None, None
+        if left_attitude is None or right_attitude is None:
+            left_attitude, right_attitude, _reused = self._cached_measurement_attitude_states()
+        p1_yaw = getattr(left_attitude, "yaw_deg", None)
+        p2_yaw = getattr(right_attitude, "yaw_deg", None)
+        now_s = time.monotonic()
+        ages = []
+        for sample in (left_attitude, right_attitude):
+            timestamp_s = getattr(sample, "timestamp_s", None)
+            try:
+                ages.append(max(0.0, now_s - float(timestamp_s)))
+            except (TypeError, ValueError):
+                ages.append(None)
+        try:
+            selection = select_baseline_yaw(
+                north_m=float(baseline_ned[0]),
+                east_m=float(baseline_ned[1]),
+                p1_yaw_deg=p1_yaw,
+                p2_yaw_deg=p2_yaw,
+                reverse=self._measurement_baseline_yaw_reverse(),
+            )
+        except (TypeError, ValueError):
+            return None, ages[0], ages[1]
+        return selection, ages[0], ages[1]
+
     def _measurement_method_statuses(self) -> tuple[MeasurementMethodStatus, ...]:
         """Project every geometry source into independent method readiness."""
 
@@ -741,6 +1255,69 @@ class MeasurementViewController:
                 requires_live_pixhawk=True,
                 requires_live_gnss=True,
                 warnings=live_advisories,
+            )
+        )
+
+        baseline_yaw_selection, _p1_yaw_age_s, _p2_yaw_age_s = (
+            self._baseline_yaw_selection_preview()
+        )
+        baseline_yaw_reasons = list(intrinsics_reasons)
+        if not pixhawk_ready:
+            baseline_yaw_reasons.extend(
+                reason for reason in live_hard_reasons if "Pixhawk" in reason
+            )
+        if not gnss_ready:
+            baseline_yaw_reasons.extend(
+                reason for reason in live_hard_reasons if "Pixhawk" not in reason
+            )
+        if baseline_yaw_selection is None or not baseline_yaw_selection.ready:
+            baseline_yaw_reasons.append(
+                "baseline yaw branch unavailable"
+                if baseline_yaw_selection is None
+                else baseline_yaw_selection.reason
+            )
+        baseline_yaw_reverse = self._measurement_baseline_yaw_reverse()
+        baseline_yaw_sources = tuple(
+            (f"{side}.roll_deg", "live_pixhawk")
+            for side in ("left", "right")
+        ) + tuple(
+            (f"{side}.pitch_deg", "live_pixhawk")
+            for side in ("left", "right")
+        ) + tuple(
+            (f"{side}.yaw_deg", "gnss_baseline_yaw_reverse" if baseline_yaw_reverse else "gnss_baseline_yaw_auto")
+            for side in ("left", "right")
+        ) + tuple(
+            (f"{side}.{name}", "live_gnss")
+            for side in ("left", "right")
+            for name in ("north_m", "east_m", "down_m")
+        )
+        baseline_yaw_warnings = list(live_advisories)
+        if baseline_yaw_selection is not None:
+            if baseline_yaw_selection.consensus is False:
+                baseline_yaw_warnings.append("P1/P2 yaw branch preference disagrees")
+            if baseline_yaw_selection.low_margin:
+                baseline_yaw_warnings.append("baseline yaw branch score margin is low")
+        statuses.append(
+            MeasurementMethodStatus(
+                method_id=PIXHAWK_RP_GPS_BASELINE_YAW,
+                instance_id="live:pixhawk-rp-gps-baseline-yaw",
+                ready=not baseline_yaw_reasons,
+                reasons=tuple(dict.fromkeys(baseline_yaw_reasons)),
+                geometry_sha256=self._geometry_evidence_sha256(
+                    operating_intrinsics_profile_sha256=current_profile_hash,
+                    method_id=PIXHAWK_RP_GPS_BASELINE_YAW,
+                    reverse=baseline_yaw_reverse,
+                    baseline_azimuth=(
+                        None
+                        if baseline_yaw_selection is None
+                        else baseline_yaw_selection.baseline_azimuth_deg
+                    ),
+                ),
+                observed_dofs=POSE_DOF_NAMES,
+                component_sources=baseline_yaw_sources,
+                requires_live_pixhawk=True,
+                requires_live_gnss=True,
+                warnings=tuple(dict.fromkeys(baseline_yaw_warnings)),
             )
         )
 
@@ -1020,7 +1597,11 @@ class MeasurementViewController:
         pixhawk_ready, gnss_ready, _hard_reasons, _advisories = self._measurement_live_readiness()
         locked = self._measurement_fill_policy_locked()
         rows: dict[str, dict[str, object]] = {}
-        atomic_method = status.method_id in {PIXHAWK_RTK_LIVE, CHECKERBOARD_STEREO} or bool(
+        atomic_method = status.method_id in {
+            PIXHAWK_RTK_LIVE,
+            PIXHAWK_RP_GPS_BASELINE_YAW,
+            CHECKERBOARD_STEREO,
+        } or bool(
             status.profile_id and not status.candidate_id
         )
         for side in MEASUREMENT_POSE_SIDES:
@@ -1338,6 +1919,16 @@ class MeasurementViewController:
                 "profile_id": str(getattr(profile, "profile_id", "") or ""),
             }
 
+        baseline_yaw_row: object = None
+        if status.method_id == PIXHAWK_RP_GPS_BASELINE_YAW:
+            selection, p1_age_s, p2_age_s = self._baseline_yaw_selection_preview()
+            if selection is not None:
+                baseline_yaw_row = {
+                    **selection.to_mapping(),
+                    "p1_age_s": p1_age_s,
+                    "p2_age_s": p2_age_s,
+                }
+
         return {
             "uses_live_pixhawk": MEASUREMENT_FILL_LIVE_PIXHAWK in sources,
             "uses_live_gnss": MEASUREMENT_FILL_LIVE_GNSS in sources,
@@ -1345,6 +1936,7 @@ class MeasurementViewController:
             "live_baseline_ned_m": baseline_row,
             "candidate_pose_virtual_frd_to_world_ned": candidate_rows,
             "stereo_extrinsics_opencv_rdf": extrinsics_row,
+            "baseline_yaw_selection": baseline_yaw_row,
         }
 
     def workstation_measurement_methods_snapshot(self) -> dict[str, object]:
@@ -1358,7 +1950,10 @@ class MeasurementViewController:
         )
         selected = (
             latest_status_by_method(self._measurement_method_statuses()).get(
-                PIXHAWK_RTK_LIVE
+                normalize_measurement_method_id(
+                    getattr(self.panel, "_measurement_selected_method_id", "")
+                    or PIXHAWK_RTK_LIVE
+                )
             )
             if frozen_measurement
             else self._select_measurement_method_for_attempt()
@@ -1528,7 +2123,7 @@ class MeasurementViewController:
             elif current is None:
                 return None
             intrinsics_only = without_stereo_extrinsics(current)
-        if status.method_id == PIXHAWK_RTK_LIVE:
+        if status.method_id in {PIXHAWK_RTK_LIVE, PIXHAWK_RP_GPS_BASELINE_YAW}:
             return intrinsics_only
         if status.method_id == CHECKERBOARD_STEREO:
             frozen_objects = getattr(
@@ -1663,6 +2258,9 @@ class MeasurementViewController:
         right_attitude: AttitudeSnapshot | None,
         left_gps: GpsSnapshot | None,
         right_gps: GpsSnapshot | None,
+        geometry_left_quaternion: tuple[float, float, float, float] | None = None,
+        geometry_right_quaternion: tuple[float, float, float, float] | None = None,
+        yaw_selection: BaselineYawSelection | None = None,
     ) -> str:
         component_values = set(dict(status.component_sources).values())
 
@@ -1699,6 +2297,15 @@ class MeasurementViewController:
             "component_sources": dict(status.component_sources),
             "left_attitude": attitude_payload(left_attitude),
             "right_attitude": attitude_payload(right_attitude),
+            "geometry_left_quaternion_wxyz": (
+                None if geometry_left_quaternion is None else list(geometry_left_quaternion)
+            ),
+            "geometry_right_quaternion_wxyz": (
+                None if geometry_right_quaternion is None else list(geometry_right_quaternion)
+            ),
+            "baseline_yaw_selection": (
+                None if yaw_selection is None else yaw_selection.to_mapping()
+            ),
             "left_gps": gps_payload(left_gps),
             "right_gps": gps_payload(right_gps),
         }
@@ -1707,11 +2314,10 @@ class MeasurementViewController:
         ).hexdigest()
 
     def _record_no_ready_measurement_pair(self, pair) -> None:
-        timestamp_basis = self.panel._effective_yolo_time_basis()
-        left_pairing_timestamp_s = self.panel._yolo_match_timestamp_s(pair.left)
-        right_pairing_timestamp_s = self.panel._yolo_match_timestamp_s(pair.right)
-        if left_pairing_timestamp_s is None or right_pairing_timestamp_s is None:
-            return
+        timing = self._pair_timing_decision(pair)
+        timestamp_basis = timing.effective_basis
+        left_pairing_timestamp_s = timing.left_timestamp_s
+        right_pairing_timestamp_s = timing.right_timestamp_s
         statuses = self._measurement_method_statuses()
         readiness_payload = {
             "schema": "measurement-readiness-block-v1",
@@ -1759,6 +2365,8 @@ class MeasurementViewController:
                 sort_keys=True,
                 separators=(",", ":"),
             ),
+            requested_timestamp_basis=timing.requested_basis,
+            timing_fallback_reason=timing.fallback_reason,
         )
         self.panel._record_blocked_measurement_pair(blocked)
 
@@ -1826,21 +2434,94 @@ class MeasurementViewController:
             self._detection_pair_timer = timer
         return coordinator
 
+    def _configured_time_basis(self) -> str:
+        panel = self.panel
+        combo = getattr(panel, "yolo_gate_time_basis_combo", None)
+        current_data = getattr(combo, "currentData", None)
+        if callable(current_data):
+            value = current_data()
+            if value is not None:
+                return normalize_live_distance_time_basis(value)
+        settings = getattr(panel, "settings", None)
+        default = getattr(
+            settings,
+            "yolo_gate_time_basis",
+            TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC,
+        )
+        setting_reader = getattr(panel, "_workstation_setting", None)
+        value = (
+            setting_reader("yolo_gate_time_basis", default)
+            if callable(setting_reader)
+            else default
+        )
+        return normalize_live_distance_time_basis(value)
+
+    def requested_time_basis(self) -> str:
+        """Return the current Measurement-frozen request or the idle setting."""
+
+        measurement_id = str(getattr(self.panel, "_measurement_id", "") or "")
+        if not measurement_id:
+            return self._configured_time_basis()
+        self._measurement_method_state()
+        return normalize_live_distance_time_basis(
+            getattr(
+                self.panel,
+                "_measurement_active_time_basis_requested",
+                self._configured_time_basis(),
+            )
+        )
+
+    def _rtcp_pairing_health(self, requested_basis: str) -> tuple[bool | None, str]:
+        if requested_basis != "camera_rtcp":
+            return None, ""
+        if str(getattr(self.panel, "camera_sync_status", "")) != "verified":
+            return False, "CLOCK_NOT_VERIFIED"
+        if str(getattr(self.panel, "frame_timing_status", "")) != "current":
+            return False, "FRAME_TIMING_NOT_CURRENT"
+        return True, ""
+
     def _pairing_policy_snapshot(self) -> PairingPolicy:
+        configured_delta_s = float(self.panel._yolo_pair_max_delta_s())
+        app_delta_limit_s = (
+            min(LIVE_DISTANCE_MAX_PAIR_DELTA_S, configured_delta_s)
+            if math.isfinite(configured_delta_s)
+            else LIVE_DISTANCE_MAX_PAIR_DELTA_S
+        )
+        requested_basis = self.requested_time_basis()
+        rtcp_verified, rtcp_reason = self._rtcp_pairing_health(requested_basis)
+        measurement_generation = str(
+            getattr(self.panel, "_measurement_id", "") or "idle"
+        )
         token = (
-            str(self.panel._yolo_time_basis()),
-            float(self.panel._yolo_pair_max_delta_s()),
+            measurement_generation,
+            requested_basis,
+            rtcp_verified,
+            rtcp_reason,
+            app_delta_limit_s,
             float(self.panel._yolo_vertical_max_delta_px()),
-            bool(self.panel._camera_sync_gate_active()),
         )
         if token != self._pairing_policy_token:
             self._pairing_policy_token = token
             self._pairing_policy_revision += 1
+            previous_reservation = getattr(
+                self.panel,
+                "_coordinated_detection_pair_reservation",
+                None,
+            )
+            self._release_detection_pair_reservation(previous_reservation)
+            self.panel._coordinated_detection_pair_reservation = None
+            self.panel._coordinated_detection_pair = None
+            self.panel._coordinated_pairing_result = None
+            self.panel._last_frozen_measurement_pair = None
         return PairingPolicy(
-            timestamp_basis=token[0],
-            max_delta_s=token[1],
-            max_vertical_delta_px=token[2],
-            allow_app_fallback=True,
+            timestamp_basis=requested_basis,
+            max_delta_s=app_delta_limit_s,
+            max_vertical_delta_px=float(self.panel._yolo_vertical_max_delta_px()),
+            allow_app_fallback=requested_basis == "camera_rtcp",
+            rtcp_clock_verified=rtcp_verified,
+            rtcp_unavailable_reason=rtcp_reason,
+            require_current_clock_epoch=requested_basis == "camera_rtcp",
+            measurement_generation=measurement_generation,
             max_observation_age_s=DETECTION_PAIR_MAX_OBSERVATION_AGE_S,
             revision=self._pairing_policy_revision,
         )
@@ -1852,6 +2533,12 @@ class MeasurementViewController:
         result = coordinator.poll_latest()
         if result is None:
             return
+        current_policy = self._pairing_policy_snapshot()
+        if result.policy_revision != current_policy.revision:
+            self._release_detection_pair_reservation(result.reservation)
+            self.panel._coordinated_detection_pair = None
+            self.panel._coordinated_pairing_result = None
+            return
         previous_reservation = getattr(
             self.panel,
             "_coordinated_detection_pair_reservation",
@@ -1862,6 +2549,7 @@ class MeasurementViewController:
         self.panel._coordinated_detection_pair_reservation = result.reservation
         self.panel._detection_pair_coordinator_active = True
         self.panel._coordinated_detection_pair = result.pair
+        self.panel._coordinated_pairing_result = result
         self.panel._last_correspondence_rejection_reason = result.rejection_reason
         self.panel._last_pair_advisories = result.advisories
         self.panel._runtime_pair_uses_app_fallback = result.uses_app_fallback
@@ -1886,6 +2574,7 @@ class MeasurementViewController:
             coordinator.close()
         self.panel._detection_pair_coordinator_active = False
         self.panel._coordinated_detection_pair = None
+        self.panel._coordinated_pairing_result = None
         self._release_detection_pair_reservation(
             getattr(self.panel, "_coordinated_detection_pair_reservation", None)
         )
@@ -1899,6 +2588,22 @@ class MeasurementViewController:
         self._preview_measurement_pending.clear()
         self.panel._latest_preview_measurement_result = None
         self.panel._latest_preview_pair_identity = None
+
+    def begin_pairing_generation(self) -> None:
+        """Retire every pre-Measurement candidate/result before freezing settings."""
+
+        self._pairing_policy_token = None
+        self._primary_outcome_hash_by_key.clear()
+        self._primary_normalized_outcome_by_key.clear()
+        self._primary_measurement_persisted.clear()
+        self._primary_history_projected.clear()
+        self._primary_display_high_water = -1
+        self._primary_displayed_key = None
+        self.panel._measurement_recording_method_id = ""
+        self.reset_detection_pair_coordinator()
+        self.panel._last_pair_advisories = ()
+        self.panel._last_correspondence_rejection_reason = ""
+        self.panel._runtime_pair_uses_app_fallback = False
 
     def _ensure_preview_measurement_coordinator(
         self,
@@ -1958,6 +2663,7 @@ class MeasurementViewController:
         )
         mean_fy_px, _fy_source = self.panel._optical_alignment_mean_focal_px("y")
         mean_fx_px, _fx_source = self.panel._optical_alignment_mean_focal_px("x")
+        timing = self._pair_timing_decision(pair)
         return {
             "left_center": tuple(pair.left.center),
             "right_center": tuple(pair.right.center),
@@ -1965,8 +2671,8 @@ class MeasurementViewController:
             "mean_fy_px": mean_fy_px,
             "mean_fx_px": mean_fx_px,
             "target_distance_m": self.panel.optical_target_distance_spin.value(),
-            "left_pair_timestamp_s": self.panel._yolo_match_timestamp_s(pair.left),
-            "right_pair_timestamp_s": self.panel._yolo_match_timestamp_s(pair.right),
+            "left_pair_timestamp_s": timing.left_timestamp_s,
+            "right_pair_timestamp_s": timing.right_timestamp_s,
         }
 
     def _preview_measurement_result(
@@ -1988,6 +2694,16 @@ class MeasurementViewController:
         return None
 
     def _update_detection(self, camera: str, detection: DetectionObservation | None) -> None:
+        if detection is not None:
+            decorate = getattr(self.panel, "_decorate_clock_epoch_metadata", None)
+            if callable(decorate):
+                detection = replace(
+                    detection,
+                    timestamp_metadata=decorate(
+                        camera,
+                        dict(detection.timestamp_metadata),
+                    ),
+                )
         if camera == "left":
             self.panel.latest_left = detection
         elif camera == "right":
@@ -2442,7 +3158,6 @@ class MeasurementViewController:
                 expected_level,
             )
             return
-
         left_center_x, left_center_y = pair.left.center
         right_center_x, right_center_y = pair.right.center
         expected_dy_px, expected_dy_source, expected_dy_level = self.panel._optical_alignment_expected_dy_px()
@@ -2588,9 +3303,110 @@ class MeasurementViewController:
             overall_level,
         )
 
+    def _gnss_readiness_config(self) -> object:
+        manager = getattr(self.panel, "gnss_operation_manager", None)
+        config = getattr(manager, "config", None)
+        if config is None:
+            config = getattr(getattr(self.panel, "settings", None), "gnss_operation", None)
+        return getattr(config, "readiness", None)
+
+    def _measurement_correction_frame_token(self) -> str:
+        """Return the identity of the frame the retained rover positions resolve in.
+
+        P1 and P2 can only be connected one at a time, so their retained
+        positions are captured minutes apart.  Two RTK fixes are comparable as
+        one P1->P2 baseline only while the correction source and the Base
+        coordinate they resolve against stay the same; a re-survey, a
+        mountpoint/caster change, or an operation-mode change silently moves
+        the frame.  Binding the retained pair to this token drops it instead.
+        """
+
+        manager = getattr(self.panel, "gnss_operation_manager", None)
+        identity = getattr(manager, "source_identity", None)
+        source_id = "" if identity is None else str(getattr(identity, "stable_id", "") or "")
+        profile = getattr(self.panel, "gnss_fixed_base_profile", None)
+        base_hash = "" if profile is None else str(getattr(profile, "profile_hash", "") or "")
+        # A VRS mountpoint keeps its caster/mountpoint identity while placing a
+        # new virtual station per session, so the configured identity alone
+        # cannot see the frame move.  The observed RTCM 1005/1006 station does.
+        reference = getattr(self.panel, "latest_rtcm_reference_station", None)
+        station = ""
+        if isinstance(reference, Mapping):
+            ecef = reference.get("ecef_01mm")
+            try:
+                coordinates = ",".join(str(int(value)) for value in ecef or ())
+            except (TypeError, ValueError):
+                coordinates = ""
+            if coordinates:
+                station = f"{reference.get('station_id')}:{coordinates}"
+        return f"{source_id}\0{base_hash}\0{station}"
+
     @staticmethod
-    def _gps_state_is_valid_for_measurement_cache(state: object) -> bool:
-        if state is None or int(getattr(state, "fix_type", 0) or 0) < 3:
+    def _attitude_state_is_valid_for_measurement_cache(state: object) -> bool:
+        if state is None:
+            return False
+        try:
+            timestamp_s = float(getattr(state, "timestamp_s", float("nan")))
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(timestamp_s):
+            return False
+        try:
+            quaternion = tuple(float(value) for value in getattr(state, "q", ()) or ())
+        except (TypeError, ValueError):
+            return False
+        if len(quaternion) != 4 or not all(math.isfinite(value) for value in quaternion):
+            return False
+        return any(value != 0.0 for value in quaternion)
+
+    def _cached_measurement_attitude_states(
+        self,
+    ) -> tuple[object | None, object | None, tuple[str, ...]]:
+        """Update each P1/P2 side independently and retain last valid attitudes.
+
+        This is the attitude twin of `_cached_measurement_gps_states`.  Both
+        sensor halves of the live Pixhawk method therefore reuse their own last
+        valid process-local sample instead of one half being retained while the
+        other is re-read live and blocks on freshness.
+        """
+
+        panel = self.panel
+        cache = getattr(panel, "_measurement_latest_valid_attitude", None)
+        if not isinstance(cache, dict):
+            cache = {"left": None, "right": None}
+            panel._measurement_latest_valid_attitude = cache
+        live = getattr(panel, "latest_extrinsics", {}) or {}
+        measurement_start = getattr(panel, "_measurement_started_monotonic_s", None)
+        reused: list[str] = []
+        for side in ("left", "right"):
+            sample = live.get(side) if isinstance(live, Mapping) else None
+            if self._attitude_state_is_valid_for_measurement_cache(sample):
+                previous = cache.get(side)
+                previous_timestamp = float(getattr(previous, "timestamp_s", -1.0) or -1.0)
+                sample_timestamp = float(getattr(sample, "timestamp_s", -1.0) or -1.0)
+                if previous is None or sample_timestamp >= previous_timestamp:
+                    cache[side] = sample
+            selected = cache.get(side)
+            selected_timestamp = getattr(selected, "timestamp_s", None)
+            reused_from_before_measurement = bool(
+                selected is not None
+                and measurement_start is not None
+                and selected_timestamp is not None
+                and float(selected_timestamp) < float(measurement_start)
+            )
+            if selected is not None and (
+                selected is not sample or reused_from_before_measurement
+            ):
+                reused.append(f"{side}_attitude")
+        return cache.get("left"), cache.get("right"), tuple(reused)
+
+    def _gps_state_is_valid_for_measurement_cache(self, state: object) -> bool:
+        defaults = ReadinessConfig()
+        readiness = self._gnss_readiness_config()
+        minimum_fix_type = int(
+            getattr(readiness, "minimum_fix_type", defaults.minimum_fix_type)
+        )
+        if state is None or int(getattr(state, "fix_type", 0) or 0) < minimum_fix_type:
             return False
         values = (
             getattr(state, "latitude_deg", None),
@@ -2616,6 +3432,15 @@ class MeasurementViewController:
         if not isinstance(source_cache, dict):
             source_cache = {}
             panel._measurement_latest_valid_gps_source = source_cache
+        frame_cache = getattr(panel, "_measurement_latest_valid_gps_correction_frame", None)
+        if not isinstance(frame_cache, dict):
+            frame_cache = {}
+            panel._measurement_latest_valid_gps_correction_frame = frame_cache
+        frame_barrier = getattr(panel, "_measurement_gps_correction_frame_barrier_s", None)
+        if not isinstance(frame_barrier, dict):
+            frame_barrier = {}
+            panel._measurement_gps_correction_frame_barrier_s = frame_barrier
+        correction_frame = self._measurement_correction_frame_token()
         current_left, current_right = panel._selected_baseline_gps_states()
         current = {"left": current_left, "right": current_right}
         measurement_start = getattr(panel, "_measurement_started_monotonic_s", None)
@@ -2630,8 +3455,25 @@ class MeasurementViewController:
             if source_cache.get(side) != source:
                 cache[side] = None
                 source_cache[side] = source
+            previous_frame = frame_cache.get(side)
+            if previous_frame != correction_frame:
+                frame_cache[side] = correction_frame
+                if previous_frame is not None:
+                    # The frame moved under a side that is currently unplugged.
+                    # Its last received sample still resolves against the old
+                    # Base coordinate, so it is dropped and only a sample
+                    # observed after the change may be retained again.
+                    cache[side] = None
+                    frame_barrier[side] = time.monotonic()
             sample = current[side]
-            if self._gps_state_is_valid_for_measurement_cache(sample):
+            barrier_s = frame_barrier.get(side)
+            admissible = self._gps_state_is_valid_for_measurement_cache(sample)
+            if admissible and barrier_s is not None:
+                try:
+                    admissible = float(sample.timestamp_s) >= float(barrier_s)
+                except (AttributeError, TypeError, ValueError):
+                    admissible = False
+            if admissible:
                 previous = cache.get(side)
                 previous_timestamp = float(getattr(previous, "timestamp_s", -1.0) or -1.0)
                 sample_timestamp = float(getattr(sample, "timestamp_s", -1.0) or -1.0)
@@ -2649,6 +3491,15 @@ class MeasurementViewController:
                 selected is not sample or reused_from_before_measurement
             ):
                 reused.append(f"{side}_gps")
+        # A side left empty by a frame change is otherwise indistinguishable
+        # from one that never delivered, which is the difference an operator
+        # needs to act on: reconnect that board to refix under the new
+        # reference rather than hunt for a missing device.
+        panel._measurement_gps_correction_frame_dropped = tuple(
+            side
+            for side in ("left", "right")
+            if cache.get(side) is None and frame_barrier.get(side) is not None
+        )
         return cache.get("left"), cache.get("right"), tuple(reused)
 
     @staticmethod
@@ -2706,15 +3557,68 @@ class MeasurementViewController:
             ),
         }
 
+    def _pair_timing_decision(self, pair: object) -> PairTimingDecision:
+        result = getattr(self.panel, "_coordinated_pairing_result", None)
+        if result is not None and getattr(result, "pair", None) is pair:
+            timing = getattr(result, "timing", None)
+            if isinstance(timing, PairTimingDecision):
+                return timing
+        if bool(getattr(self.panel, "_detection_pair_coordinator_active", False)):
+            raise ValueError("matched detection pair has no coordinated timing decision")
+
+        requested_basis = self.requested_time_basis()
+        effective_basis = requested_basis
+        fallback_reason = ""
+        left_timestamp_s = detection_timestamp_for_basis(pair.left, requested_basis)
+        right_timestamp_s = detection_timestamp_for_basis(pair.right, requested_basis)
+        if (
+            requested_basis == "camera_rtcp"
+            and (left_timestamp_s is None or right_timestamp_s is None)
+        ):
+            effective_basis = TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC
+            fallback_reason = "RTCP_TIMESTAMP_UNAVAILABLE"
+            left_timestamp_s = detection_timestamp_for_basis(
+                pair.left,
+                effective_basis,
+            )
+            right_timestamp_s = detection_timestamp_for_basis(
+                pair.right,
+                effective_basis,
+            )
+        if left_timestamp_s is None or right_timestamp_s is None:
+            raise ValueError("matched detection pair has no timestamp on its selected basis")
+        if effective_basis == TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC:
+            left_ns = pair.left.app_receive_monotonic_ns
+            right_ns = pair.right.app_receive_monotonic_ns
+            signed_delta_ns = right_ns - left_ns
+            left_timestamp_s = left_ns * 1.0e-9
+            right_timestamp_s = right_ns * 1.0e-9
+        else:
+            signed_delta_ns = int(
+                round(
+                    (float(right_timestamp_s) - float(left_timestamp_s))
+                    * 1_000_000_000.0
+                )
+            )
+        return PairTimingDecision(
+            requested_basis=requested_basis,
+            effective_basis=effective_basis,
+            left_timestamp_s=float(left_timestamp_s),
+            right_timestamp_s=float(right_timestamp_s),
+            signed_delta_ns=signed_delta_ns,
+            abs_delta_ns=abs(signed_delta_ns),
+            fallback_reason=fallback_reason,
+        )
+
     def _freeze_measurement_pair_inputs(self, pair: object) -> dict[str, object]:
         """Persist native pixels, then freeze one shared, byte-free pair snapshot."""
 
         panel = self.panel
-        timestamp_basis = panel._effective_yolo_time_basis()
-        left_pairing_timestamp_s = panel._yolo_match_timestamp_s(pair.left)
-        right_pairing_timestamp_s = panel._yolo_match_timestamp_s(pair.right)
-        if left_pairing_timestamp_s is None or right_pairing_timestamp_s is None:
-            raise ValueError("matched detection pair has no timestamp on its selected basis")
+        timing = self._pair_timing_decision(pair)
+        requested_timestamp_basis = timing.requested_basis
+        timestamp_basis = timing.effective_basis
+        left_pairing_timestamp_s = timing.left_timestamp_s
+        right_pairing_timestamp_s = timing.right_timestamp_s
         physical_key = detection_pair_key(
             triangulation_source="all_methods",
             timestamp_basis=timestamp_basis,
@@ -2754,16 +3658,43 @@ class MeasurementViewController:
         )
         left_nearest = panel.attitude_buffers["left"].nearest(float(pair.left.timestamp_s))
         right_nearest = panel.attitude_buffers["right"].nearest(float(pair.right.timestamp_s))
-        left_attitude = None if left_nearest is None else AttitudeSnapshot.from_state(left_nearest.sample)
-        right_attitude = None if right_nearest is None else AttitudeSnapshot.from_state(right_nearest.sample)
         measurement_start = getattr(panel, "_measurement_started_monotonic_s", None)
-        if measurement_start is not None:
-            if left_attitude is not None and left_attitude.timestamp_s < float(measurement_start):
-                left_attitude = None
-            if right_attitude is not None and right_attitude.timestamp_s < float(measurement_start):
-                right_attitude = None
-        selected_left_gps, selected_right_gps, reused_inputs = (
+        (
+            retained_left_attitude,
+            retained_right_attitude,
+            reused_attitude_inputs,
+        ) = self._cached_measurement_attitude_states()
+        left_attitude_state = (
+            retained_left_attitude if left_nearest is None else left_nearest.sample
+        )
+        right_attitude_state = (
+            retained_right_attitude if right_nearest is None else right_nearest.sample
+        )
+        left_attitude = (
+            None
+            if left_attitude_state is None
+            else AttitudeSnapshot.from_state(left_attitude_state)
+        )
+        right_attitude = (
+            None
+            if right_attitude_state is None
+            else AttitudeSnapshot.from_state(right_attitude_state)
+        )
+        left_attitude_age_s = (
+            None
+            if left_attitude is None
+            else abs(float(pair.left.timestamp_s) - float(left_attitude.timestamp_s))
+        )
+        right_attitude_age_s = (
+            None
+            if right_attitude is None
+            else abs(float(pair.right.timestamp_s) - float(right_attitude.timestamp_s))
+        )
+        selected_left_gps, selected_right_gps, reused_gps_inputs = (
             self._cached_measurement_gps_states()
+        )
+        reused_inputs = tuple(
+            dict.fromkeys((*reused_gps_inputs, *reused_attitude_inputs))
         )
         left_gps = None if selected_left_gps is None else GpsSnapshot.from_state(selected_left_gps)
         right_gps = None if selected_right_gps is None else GpsSnapshot.from_state(selected_right_gps)
@@ -2809,13 +3740,23 @@ class MeasurementViewController:
             )
         capture_sync = self._ftp_command_round_sync(pair)
         if not capture_sync:
-            capture_sync = {
-                "time_basis": timestamp_basis,
-                "pair_delta_s": abs(
-                    float(left_pairing_timestamp_s) - float(right_pairing_timestamp_s)
-                ),
-                "operator_approved_sync_assumption": False,
-            }
+            configured_delta_s = float(panel._yolo_pair_max_delta_s())
+            timing_limit_ns = (
+                100_000_000
+                if not math.isfinite(configured_delta_s)
+                else min(
+                    100_000_000,
+                    max(0, int(round(configured_delta_s * 1_000_000_000.0))),
+                )
+            )
+            capture_sync = live_pair_timing_evidence(
+                left_detection,
+                right_detection,
+                requested_basis=requested_timestamp_basis,
+                effective_basis=timestamp_basis,
+                fallback_reason=timing.fallback_reason,
+                max_abs_delta_ns=timing_limit_ns,
+            )
         snapshot = FrozenMeasurementPairSnapshot(
             measurement_id=measurement_id,
             pair_id=pair_id,
@@ -2836,7 +3777,10 @@ class MeasurementViewController:
         frozen = {
             "physical_key": tuple(physical_key),
             "snapshot": snapshot,
+            "requested_timestamp_basis": requested_timestamp_basis,
             "timestamp_basis": timestamp_basis,
+            "timing_fallback_reason": timing.fallback_reason,
+            "pair_timing_decision": timing,
             "left_pairing_timestamp_s": float(left_pairing_timestamp_s),
             "right_pairing_timestamp_s": float(right_pairing_timestamp_s),
             "created_monotonic_s": created_monotonic_ns * 1.0e-9,
@@ -2846,8 +3790,8 @@ class MeasurementViewController:
             "right_detection": right_detection,
             "left_attitude": left_attitude,
             "right_attitude": right_attitude,
-            "left_attitude_age_s": None if left_nearest is None else left_nearest.age_s,
-            "right_attitude_age_s": None if right_nearest is None else right_nearest.age_s,
+            "left_attitude_age_s": left_attitude_age_s,
+            "right_attitude_age_s": right_attitude_age_s,
             "left_gps": left_gps,
             "right_gps": right_gps,
             "measurement_start": measurement_start,
@@ -2870,8 +3814,19 @@ class MeasurementViewController:
         if method_status is None:
             raise ValueError("no ready measurement method")
         method_id = method_status.method_id
-        triangulation_source = "pixhawk" if method_id == PIXHAWK_RTK_LIVE else "checkerboard"
-        geometry_kind = "live_pixhawk_mount" if method_id == PIXHAWK_RTK_LIVE else "relative_pose"
+        pixhawk_geometry_method = method_id in {
+            PIXHAWK_RTK_LIVE,
+            PIXHAWK_RP_GPS_BASELINE_YAW,
+        }
+        baseline_yaw_method = method_id == PIXHAWK_RP_GPS_BASELINE_YAW
+        triangulation_source = "pixhawk" if pixhawk_geometry_method else "checkerboard"
+        geometry_kind = (
+            "live_pixhawk_baseline_yaw"
+            if baseline_yaw_method
+            else "live_pixhawk_mount"
+            if pixhawk_geometry_method
+            else "relative_pose"
+        )
         frozen = dict(frozen_inputs or self._freeze_measurement_pair_inputs(pair))
         snapshot = frozen.get("snapshot")
         if not isinstance(snapshot, FrozenMeasurementPairSnapshot):
@@ -2892,15 +3847,43 @@ class MeasurementViewController:
             if left_attitude is None or right_attitude is None
             else abs(left_attitude.timestamp_s - right_attitude.timestamp_s)
         )
-        relative = (
-            None
-            if left_attitude is None or right_attitude is None
-            else relative_attitude(left_attitude.quaternion_wxyz, right_attitude.quaternion_wxyz)
-        )
-
         left_gps = frozen.get("left_gps")
         right_gps = frozen.get("right_gps")
         measurement_start = frozen.get("measurement_start")
+        yaw_selection: BaselineYawSelection | None = None
+        yaw_p1_age_s: float | None = None
+        yaw_p2_age_s: float | None = None
+        geometry_left_quaternion = None
+        geometry_right_quaternion = None
+        if baseline_yaw_method:
+            yaw_selection, yaw_p1_age_s, yaw_p2_age_s = self._baseline_yaw_selection_preview(
+                left_gps=left_gps,
+                right_gps=right_gps,
+                left_attitude=left_attitude,
+                right_attitude=right_attitude,
+            )
+            if yaw_selection is None or not yaw_selection.ready:
+                raise ValueError(
+                    "baseline yaw selection unavailable: "
+                    + ("no GPS baseline or Pixhawk yaw reference" if yaw_selection is None else yaw_selection.reason)
+                )
+            if left_attitude is None or right_attitude is None or yaw_selection.selected_yaw_deg is None:
+                raise ValueError("baseline yaw method requires both Pixhawk attitudes")
+            geometry_left_quaternion = quaternion_from_roll_pitch_yaw_deg(
+                left_attitude.roll_deg,
+                left_attitude.pitch_deg,
+                yaw_selection.selected_yaw_deg,
+            )
+            geometry_right_quaternion = quaternion_from_roll_pitch_yaw_deg(
+                right_attitude.roll_deg,
+                right_attitude.pitch_deg,
+                yaw_selection.selected_yaw_deg,
+            )
+        relative = (
+            None
+            if geometry_left_quaternion is None or geometry_right_quaternion is None
+            else relative_attitude(geometry_left_quaternion, geometry_right_quaternion)
+        )
         attitude_for_geometry_left = left_attitude
         attitude_for_geometry_right = right_attitude
         measurement_result = self._measurement_intrinsics_result_for_method(
@@ -2960,6 +3943,26 @@ class MeasurementViewController:
                 (*method_status.warnings, *tuple(getattr(self.panel, "_last_pair_advisories", ()) or ()))
             )
         )
+        if baseline_yaw_method and yaw_selection is not None:
+            warnings = tuple(
+                dict.fromkeys(
+                    (
+                        *warnings,
+                        "yaw assumed perpendicular to GPS baseline (+/-90deg)",
+                        f"baseline yaw branch={yaw_selection.selected_offset_deg:+.0f}deg",
+                        *(
+                            ("P1/P2 yaw branch preference disagrees",)
+                            if yaw_selection.consensus is False
+                            else ()
+                        ),
+                        *(
+                            ("baseline yaw branch score margin is low",)
+                            if yaw_selection.low_margin
+                            else ()
+                        ),
+                    )
+                )
+            )
         if (
             measurement_result is not None
             and dict(measurement_result.calibration_quality or {}).get("state")
@@ -2990,7 +3993,8 @@ class MeasurementViewController:
                     left_gps=left_gps,
                     right_gps=right_gps,
                     selected_left_quaternion_wxyz=(
-                        None if left_attitude is None else left_attitude.quaternion_wxyz
+                        geometry_left_quaternion
+                        or (None if left_attitude is None else left_attitude.quaternion_wxyz)
                     ),
                     selected_left_attitude_monotonic_s=(
                         None if left_attitude is None else left_attitude.timestamp_s
@@ -3010,6 +4014,9 @@ class MeasurementViewController:
             intrinsics=intrinsics,
             left_attitude=left_attitude,
             right_attitude=right_attitude,
+            geometry_left_quaternion=geometry_left_quaternion,
+            geometry_right_quaternion=geometry_right_quaternion,
+            yaw_selection=yaw_selection,
             left_gps=left_gps,
             right_gps=right_gps,
         )
@@ -3092,6 +4099,52 @@ class MeasurementViewController:
             ),
             measurement_component_sources=method_status.component_sources,
             measurement_started_monotonic_s=measurement_start,
+            requested_timestamp_basis=str(
+                frozen.get("requested_timestamp_basis") or timestamp_basis
+            ),
+            timing_fallback_reason=str(
+                frozen.get("timing_fallback_reason") or ""
+            ),
+            geometry_left_quaternion_wxyz=geometry_left_quaternion,
+            geometry_right_quaternion_wxyz=geometry_right_quaternion,
+            measurement_yaw_source=(
+                "gnss_baseline_perpendicular_90deg" if baseline_yaw_method else ""
+            ),
+            measurement_yaw_selection_mode=(
+                "" if yaw_selection is None else yaw_selection.mode
+            ),
+            measurement_yaw_branch_offset_deg=(
+                None if yaw_selection is None else yaw_selection.selected_offset_deg
+            ),
+            measurement_yaw_baseline_azimuth_deg=(
+                None if yaw_selection is None else yaw_selection.baseline_azimuth_deg
+            ),
+            measurement_yaw_selected_deg=(
+                None if yaw_selection is None else yaw_selection.selected_yaw_deg
+            ),
+            measurement_yaw_p1_reference_deg=(
+                None if yaw_selection is None else yaw_selection.p1_reference_yaw_deg
+            ),
+            measurement_yaw_p2_reference_deg=(
+                None if yaw_selection is None else yaw_selection.p2_reference_yaw_deg
+            ),
+            measurement_yaw_p1_age_s=yaw_p1_age_s,
+            measurement_yaw_p2_age_s=yaw_p2_age_s,
+            measurement_yaw_score_minus90_deg=(
+                None if yaw_selection is None else yaw_selection.score_minus90_deg
+            ),
+            measurement_yaw_score_plus90_deg=(
+                None if yaw_selection is None else yaw_selection.score_plus90_deg
+            ),
+            measurement_yaw_reverse=(
+                False if yaw_selection is None else yaw_selection.reverse
+            ),
+            measurement_yaw_consensus=(
+                None if yaw_selection is None else yaw_selection.consensus
+            ),
+            measurement_yaw_low_margin=(
+                False if yaw_selection is None else yaw_selection.low_margin
+            ),
         )
         if cached_attempt is not None:
             previous_missing = set(cached_attempt.missing_geometry_inputs)
@@ -3501,7 +4554,10 @@ class MeasurementViewController:
     def method_evaluation_pending_count(self) -> int:
         self._poll_method_evaluations()
         coordinator = self._method_evaluation_coordinator
-        return 0 if coordinator is None else coordinator.pending_pair_count
+        worker_pairs = 0 if coordinator is None else coordinator.pending_pair_count
+        # Primary row admission has independent background ownership and must
+        # not hold the sessionless Stop -> next Measurement boundary.
+        return int(worker_pairs) + len(self._pending_method_bundle_commits)
 
     def _method_evaluation_requests_for_pair(
         self,
@@ -3580,13 +4636,351 @@ class MeasurementViewController:
                 detail="원본 pair와 BACKPRESSURE_BLOCKED 결과는 저장했습니다.",
             )
 
+    @staticmethod
+    def _primary_outcome_key(
+        outcome: MethodEvaluationOutcome,
+    ) -> tuple[str, str, int]:
+        return (
+            str(outcome.measurement_id),
+            str(outcome.pair_id),
+            int(outcome.request_generation),
+        )
+
+    @staticmethod
+    def _failed_primary_outcome(
+        outcome: MethodEvaluationOutcome,
+        reason: str,
+    ) -> MethodEvaluationOutcome:
+        message = str(reason)
+        return replace(
+            outcome,
+            status="FAILED",
+            result={},
+            reasons=(message,),
+            warnings=tuple(dict.fromkeys((*outcome.warnings, message))),
+        )
+
+    def _primary_outcome_is_current(
+        self,
+        outcome: MethodEvaluationOutcome,
+    ) -> bool:
+        if not bool(getattr(self.panel, "distance_recording_enabled", False)):
+            return False
+        sessionless = not bool(
+            getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
+        )
+        if not sessionless:
+            raw_measurement_id = getattr(self.panel, "_measurement_id", None)
+            if raw_measurement_id is None:
+                # Lightweight legacy embedders predate generation ownership.
+                # The production panel always exposes _measurement_id.
+                return True
+            current_measurement_id = str(
+                raw_measurement_id or ""
+            )
+            return bool(
+                current_measurement_id
+                and outcome.measurement_id == current_measurement_id
+            )
+        current_generation = str(
+            getattr(self.panel, "_measurement_run_generation", "")
+            or getattr(self.panel, "_measurement_id", "")
+            or ""
+        )
+        run_state = str(
+            getattr(self.panel, "_measurement_run_state", "IDLE") or "IDLE"
+        ).upper()
+        return bool(
+            run_state == "RUNNING"
+            and current_generation
+            and outcome.measurement_id == current_generation
+        )
+
+    def _normalize_primary_outcome(
+        self,
+        outcome: MethodEvaluationOutcome,
+        *,
+        expected_method_id: str = PIXHAWK_RTK_LIVE,
+    ) -> MethodEvaluationOutcome:
+        key = self._primary_outcome_key(outcome)
+        outcome_sha256 = outcome.canonical_sha256()
+        previous_sha256 = self._primary_outcome_hash_by_key.get(key)
+        if previous_sha256 is not None and previous_sha256 != outcome_sha256:
+            logger = getattr(self.panel, "_log", None)
+            if callable(logger):
+                logger(
+                    "[측정] conflicting primary outcome ignored after first "
+                    f"accepted identity: pair={outcome.pair_id}"
+                )
+            cached = self._primary_normalized_outcome_by_key.get(key)
+            return cached if cached is not None else self._failed_primary_outcome(
+                outcome,
+                "conflicting primary method outcome for one request identity",
+            )
+        self._primary_outcome_hash_by_key.setdefault(key, outcome_sha256)
+        cached = self._primary_normalized_outcome_by_key.get(key)
+        if cached is not None:
+            return cached
+        normalized = outcome
+        try:
+            if outcome.method_id != expected_method_id:
+                raise ValueError(
+                    f"primary outcome method is not {expected_method_id}"
+                )
+            if outcome.status in {"VALID", "ESTIMATED"}:
+                if not isinstance(outcome.attempt_payload, Mapping):
+                    raise ValueError("successful primary outcome has no attempt payload")
+                attempt = MeasurementAttempt.from_canonical_payload(
+                    outcome.attempt_payload
+                )
+                if attempt.canonical_sha256() != outcome.attempt_sha256:
+                    raise ValueError("primary outcome attempt hash mismatch")
+                if attempt.measurement_method_id != expected_method_id:
+                    raise ValueError(
+                        f"primary attempt method is not {expected_method_id}"
+                    )
+                if attempt.measurement_geometry_sha256 != outcome.geometry_sha256:
+                    raise ValueError("primary outcome geometry hash mismatch")
+                self._method_history_payload(outcome, attempt)
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            normalized = self._failed_primary_outcome(
+                outcome,
+                f"primary outcome validation failed: {exc}",
+            )
+        self._primary_normalized_outcome_by_key[key] = normalized
+        return normalized
+
+    def _commit_primary_method_outcome(
+        self,
+        outcome: MethodEvaluationOutcome,
+        *,
+        commit_source: str,
+        expected_method_id: str = PIXHAWK_RTK_LIVE,
+    ) -> tuple[MethodEvaluationOutcome, bool, str]:
+        normalized = self._normalize_primary_outcome(
+            outcome,
+            expected_method_id=expected_method_id,
+        )
+        key = self._primary_outcome_key(normalized)
+        current = self._primary_outcome_is_current(normalized)
+        if not current:
+            return normalized, False, "NOT_REQUESTED"
+        if normalized.status not in {"VALID", "ESTIMATED"}:
+            return normalized, True, "NOT_REQUESTED"
+        if key in self._primary_measurement_persisted:
+            self._remove_pending_primary_measurement(key)
+            return normalized, True, "QUEUED"
+
+        try:
+            attempt = MeasurementAttempt.from_canonical_payload(
+                normalized.attempt_payload
+            )
+            history_payload = self._method_history_payload(normalized, attempt)
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            failed = self._failed_primary_outcome(
+                normalized,
+                f"primary persistence payload invalid: {exc}",
+            )
+            self._primary_normalized_outcome_by_key[key] = failed
+            return failed, True, "NOT_REQUESTED"
+
+        publish_history = key not in self._primary_history_projected
+        outcome_sha256 = normalized.canonical_sha256()
+        metadata = {
+            "runtime_generation": normalized.measurement_id,
+            "method_evaluation_pair_id": normalized.pair_id,
+            "method_evaluation_pair_sequence": normalized.pair_sequence,
+            "method_evaluation_request_generation": normalized.request_generation,
+            "method_evaluation_snapshot_sha256": normalized.snapshot_sha256,
+            "primary_outcome_status": normalized.status,
+            "primary_outcome_sha256": outcome_sha256,
+            "primary_committed_before_bundle": commit_source == "early_outcome",
+            "primary_commit_source": str(commit_source),
+        }
+        method = f"{history_payload['method']}-{expected_method_id}"
+        committer = getattr(
+            self.panel,
+            "_commit_primary_distance_outcome",
+            None,
+        )
+        if callable(committer):
+            commit_result = committer(
+                estimate=history_payload["estimate"],
+                distance_m=float(history_payload["distance_m"]),
+                method=method,
+                baseline_source=attempt.baseline_source,
+                baseline_m=attempt.baseline_m,
+                point_m=history_payload["point_m"],
+                raw_point_m=history_payload["point_m"],
+                raw_point_left_m=history_payload["source_point_left_rdf_m"],
+                measurement_attempt=attempt,
+                outcome_metadata=metadata,
+                publish_history=publish_history,
+            )
+            history_added = bool(getattr(commit_result, "history_added", False))
+            row_commit = getattr(commit_result, "row_commit", None)
+            enqueue_admitted = bool(
+                getattr(row_commit, "enqueue_admitted", False)
+            )
+        else:
+            legacy_append = getattr(self.panel, "_append_distance_history", None)
+            enqueue_admitted = bool(
+                callable(legacy_append)
+                and legacy_append(
+                    estimate=history_payload["estimate"],
+                    distance_m=float(history_payload["distance_m"]),
+                    method=method,
+                    baseline_source=attempt.baseline_source,
+                    baseline_m=attempt.baseline_m,
+                    point_m=history_payload["point_m"],
+                    raw_point_m=history_payload["point_m"],
+                    raw_point_left_m=history_payload["source_point_left_rdf_m"],
+                    measurement_attempt=attempt,
+                )
+            )
+            history_added = enqueue_admitted
+        if history_added:
+            self._primary_history_projected.add(key)
+        if enqueue_admitted:
+            self._primary_measurement_persisted.add(key)
+            self._remove_pending_primary_measurement(key)
+            return normalized, True, "QUEUED"
+
+        first_rejection = key not in self._pending_primary_measurement_commits
+        retained = self._retain_pending_primary_measurement(key, normalized)
+        if retained:
+            self._ensure_method_evaluation_timer()
+        logger = getattr(self.panel, "_log", None)
+        if first_rejection and callable(logger):
+            logger(
+                "[측정] PX4+RTK 대표 결과 저장 enqueue 실패; "
+                f"background에서 재시도합니다. pair={normalized.pair_id}"
+            )
+        return normalized, True, "REJECTED"
+
+    def _persist_late_primary_measurement(
+        self,
+        outcome: MethodEvaluationOutcome,
+    ) -> bool:
+        """Persist a retired primary result without touching the next run's rows/UI."""
+
+        writer = getattr(self.panel, "append_workstation_data", None)
+        if not callable(writer):
+            return False
+        current_generation = str(
+            getattr(self.panel, "_measurement_run_generation", "")
+            or getattr(self.panel, "_measurement_id", "")
+            or ""
+        )
+        primary_record = outcome.to_record()
+        primary_canonical_json = json.dumps(
+            primary_record,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        record = {
+            "event_type": "late_primary_measurement_outcome",
+            "record_kind": "primary_measurement_evidence",
+            "runtime_generation": str(outcome.measurement_id),
+            "measurement_id": str(outcome.measurement_id),
+            "method_evaluation_pair_id": str(outcome.pair_id),
+            "method_evaluation_pair_sequence": int(outcome.pair_sequence),
+            "method_evaluation_request_generation": int(
+                outcome.request_generation
+            ),
+            "primary_outcome_status": str(outcome.status),
+            "primary_outcome_sha256": outcome.canonical_sha256(),
+            "primary_outcome": primary_record,
+            "primary_outcome_canonical_json": primary_canonical_json,
+            "primary_persistence_mode": "late_direct_retry",
+            "late": True,
+            "current_runtime_generation": current_generation,
+        }
+        recording_owner = getattr(
+            self.panel,
+            "_recording_controller_owner",
+            None,
+        )
+        compact_persister = getattr(
+            recording_owner,
+            "_persist_compact_primary_measurement",
+            None,
+        )
+        if callable(compact_persister):
+            try:
+                attempt = MeasurementAttempt.from_canonical_payload(
+                    outcome.attempt_payload
+                )
+                return bool(
+                    compact_persister(
+                        tuple(attempt.detection_pair_key),
+                        record,
+                    )
+                )
+            except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+                return False
+        try:
+            return bool(writer("measurements", record, priority=True))
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
+
+    def _retry_pending_primary_measurements(self) -> None:
+        """Retry primary evidence independently from the already-saved bundle."""
+
+        if not self._pending_primary_measurement_commits:
+            return
+        logger = getattr(self.panel, "_log", None)
+        retry_batch = tuple(
+            self._pending_primary_measurement_commits.items()
+        )[: max(1, int(PRIMARY_MEASUREMENT_RETRY_BUDGET))]
+        for key, outcome in retry_batch:
+            self._pending_primary_measurement_commits.pop(key, None)
+            if key in self._primary_measurement_persisted:
+                self._remove_pending_primary_measurement(key)
+                continue
+            # Reinsert before attempting so a rejection retains ownership while
+            # moving this key to the tail for round-robin fairness.
+            self._pending_primary_measurement_commits[key] = outcome
+            try:
+                if self._primary_outcome_is_current(outcome):
+                    self._commit_primary_method_outcome(
+                        outcome,
+                        commit_source="background_retry",
+                    )
+                    continue
+                if self._persist_late_primary_measurement(outcome):
+                    self._primary_measurement_persisted.add(key)
+                    self._remove_pending_primary_measurement(key)
+            except Exception as exc:  # noqa: BLE001 - keep the retry timer alive.
+                if callable(logger):
+                    logger(f"[측정] primary 저장 재시도 실패: {exc}")
+        if (
+            not self._pending_primary_measurement_commits
+            and not self._pending_method_bundle_commits
+            and self._method_evaluation_coordinator is None
+        ):
+            self._stop_method_evaluation_timer()
+
     def _display_primary_method_outcome(
         self,
         outcome: MethodEvaluationOutcome,
         *,
         waiting_for_barrier: bool,
+        persistence_state: str = "NOT_REQUESTED",
     ) -> None:
-        suffix = " · comparison barrier 대기" if waiting_for_barrier else ""
+        suffix = ""
+        persistence_rejected = persistence_state == "REJECTED"
+        if persistence_rejected:
+            suffix = " · EVIDENCE DEGRADED · 대표 기록 background 재시도 중"
+            if waiting_for_barrier:
+                suffix += " · comparison barrier 대기"
+        elif waiting_for_barrier:
+            if persistence_state == "QUEUED":
+                suffix = " · 대표 기록 QUEUED · comparison barrier 대기"
+            else:
+                suffix = " · comparison barrier 대기"
         result = outcome.result if isinstance(outcome.result, Mapping) else {}
         triangulated = result.get("triangulated")
         if outcome.status in {"VALID", "ESTIMATED"} and isinstance(triangulated, Mapping):
@@ -3596,9 +4990,19 @@ class MeasurementViewController:
             except (TypeError, ValueError):
                 distance_text = "--"
             reused = " · REUSED" if outcome.reused_inputs else ""
+            method_label = MEASUREMENT_METHOD_LABELS.get(
+                outcome.method_id,
+                outcome.method_id,
+            )
             self.panel._set_distance_text(
-                f"거리: {distance_text} (Pixhawk attitude + GNSS/RTK worker){reused}{suffix}",
-                quality="ESTIMATED" if outcome.status == "ESTIMATED" else "GOOD",
+                f"거리: {distance_text} ({method_label} worker){reused}{suffix}",
+                quality=(
+                    "WARNING"
+                    if persistence_rejected
+                    else "ESTIMATED"
+                    if outcome.status == "ESTIMATED"
+                    else "GOOD"
+                ),
             )
             return
         reason = outcome.reasons[0] if outcome.reasons else outcome.status
@@ -3631,17 +5035,20 @@ class MeasurementViewController:
                 {"VALID": 0, "BLOCKED": 0, "FAILED": 0},
             )[bucket] += 1
 
-    def _commit_method_evaluation_bundle(
+    @staticmethod
+    def _method_bundle_key(
+        bundle: MethodEvaluationBundle,
+    ) -> tuple[str, str, int]:
+        return (
+            str(bundle.measurement_id),
+            str(bundle.pair_id),
+            int(bundle.request_generation),
+        )
+
+    def _method_bundle_is_current(
         self,
         bundle: MethodEvaluationBundle,
-    ) -> None:
-        committed = getattr(self.panel, "_method_evaluation_committed", None)
-        if not isinstance(committed, set):
-            committed = set()
-            self.panel._method_evaluation_committed = committed
-        identity = (bundle.pair_id, bundle.request_generation)
-        if identity in committed:
-            return
+    ) -> tuple[bool, str]:
         sessionless = not bool(
             getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
         )
@@ -3651,82 +5058,297 @@ class MeasurementViewController:
         run_state = str(
             getattr(self.panel, "_measurement_run_state", "IDLE") or "IDLE"
         ).upper()
-        if sessionless and (
-            bundle.measurement_id != current_generation or run_state != "RUNNING"
-        ):
+        if not sessionless:
+            raw_measurement_id = getattr(self.panel, "_measurement_id", None)
+            if raw_measurement_id is None:
+                return bool(
+                    getattr(self.panel, "distance_recording_enabled", False)
+                ), str(bundle.measurement_id)
+            hierarchy_generation = str(
+                raw_measurement_id
+                or current_generation
+                or ""
+            )
+            return bool(
+                getattr(self.panel, "distance_recording_enabled", False)
+                and hierarchy_generation
+                and bundle.measurement_id == hierarchy_generation
+            ), hierarchy_generation
+        return bool(
+            bundle.measurement_id == current_generation and run_state == "RUNNING"
+        ), current_generation
+
+    def _method_bundle_record(
+        self,
+        bundle: MethodEvaluationBundle,
+        *,
+        current: bool,
+        current_generation: str,
+    ) -> dict[str, object]:
+        record = dict(bundle.to_record())
+        if not current:
+            record.update(
+                {
+                    "late": True,
+                    "current_runtime_generation": str(current_generation),
+                }
+            )
+        return record
+
+    @staticmethod
+    def _write_admitted(result: object) -> bool:
+        return True if result is None else bool(result)
+
+    @staticmethod
+    def _method_bundle_row_owner_usable(
+        owner: object,
+        index: int | None,
+    ) -> bool:
+        if index is None:
+            return False
+        try:
+            if index < 0 or index >= len(owner):  # type: ignore[arg-type]
+                return False
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return False
+
+        store = getattr(owner, "store", None)
+        snapshot_reader = getattr(store, "snapshot", None)
+        if callable(snapshot_reader):
+            try:
+                snapshot = snapshot_reader()
+            except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+                return False
+            if isinstance(snapshot, Mapping):
+                lifecycle = str(snapshot.get("lifecycle_state") or "").upper()
+                if lifecycle and lifecycle != "OPEN":
+                    return False
+                if snapshot.get("writer_alive") is False:
+                    return False
+
+        try:
+            write_error = getattr(owner, "write_error", None)
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+            return False
+        if write_error:
+            return False
+        return True
+
+    def _persist_method_evaluation_bundle(
+        self,
+        bundle: MethodEvaluationBundle,
+    ) -> bool:
+        key = self._method_bundle_key(bundle)
+        current, current_generation = self._method_bundle_is_current(bundle)
+        record = self._method_bundle_record(
+            bundle,
+            current=current,
+            current_generation=current_generation,
+        )
+
+        def append_direct() -> bool:
             writer = getattr(self.panel, "append_workstation_data", None)
-            if callable(writer):
-                writer(
-                    "method_evaluations",
-                    {
-                        **bundle.to_record(),
-                        "late": True,
-                        "current_runtime_generation": current_generation,
-                    },
-                    priority=True,
-                )
-            committed.add(identity)
-            return
-        primary = bundle.primary
-        attempt: MeasurementAttempt | None = None
-        if primary.attempt_payload:
             try:
-                attempt = MeasurementAttempt.from_canonical_payload(primary.attempt_payload)
-            except (TypeError, ValueError):
-                attempt = None
-                if primary.status in {"VALID", "ESTIMATED"}:
-                    bundle = self._method_bundle_with_primary_failure(
-                        bundle,
-                        "GUI commit rejected malformed worker attempt payload",
+                return bool(
+                    callable(writer)
+                    and writer(
+                        "method_evaluations",
+                        record,
+                        priority=True,
                     )
-                    primary = bundle.primary
-
-        history_payload: dict[str, object] | None = None
-        if primary.status in {"VALID", "ESTIMATED"} and attempt is not None:
-            try:
-                history_payload = self._method_history_payload(primary, attempt)
-            except (KeyError, TypeError, ValueError, OverflowError) as exc:
-                bundle = self._method_bundle_with_primary_failure(
-                    bundle,
-                    f"GUI commit rejected malformed worker geometry result: {exc}",
                 )
-                primary = bundle.primary
+            except (OSError, RuntimeError, TypeError, ValueError):
+                return False
 
-        if attempt is not None and primary.status in {"VALID", "ESTIMATED"} and history_payload is not None:
-            estimate = history_payload["estimate"]
-            self.panel._append_distance_history(
-                estimate=estimate,
-                distance_m=float(history_payload["distance_m"]),
-                method=f"{history_payload['method']}-{PIXHAWK_RTK_LIVE}",
-                baseline_source=attempt.baseline_source,
-                baseline_m=attempt.baseline_m,
-                point_m=history_payload["point_m"],
-                raw_point_m=history_payload["point_m"],
-                raw_point_left_m=history_payload["source_point_left_rdf_m"],
-                measurement_attempt=attempt,
-            )
-        elif attempt is not None:
-            self.panel._record_unresolved_pair(
-                attempt,
-                status=f"method_{primary.status.lower()}",
-                warnings=tuple(dict.fromkeys((*primary.reasons, *primary.warnings))),
-            )
+        pending = self._pending_method_bundle_commits.get(key)
+        pending_candidate: _PendingMethodBundleCommit | None = None
+        if pending is not None:
+            admitted = False
+            if pending.row_owner is None:
+                # Once an owner is retired, retries stay on the direct writer.
+                # Re-appending here would create one in-memory row per timer tick.
+                admitted = append_direct()
+            else:
+                owner = pending.row_owner
+                index = pending.row_index
+                owner_usable = self._method_bundle_row_owner_usable(owner, index)
+                owner_unavailable = not owner_usable
+                if owner_usable:
+                    atomic_replacer = getattr(owner, "replace_with_admission", None)
+                    replacer = getattr(owner, "replace", None)
+                    try:
+                        if callable(atomic_replacer):
+                            replacement = atomic_replacer(
+                                index,
+                                record,
+                                lease=pending.row_lease,
+                            )
+                            replacement_state = str(
+                                getattr(replacement, "state", "") or ""
+                            ).upper()
+                            admitted = replacement_state == ROW_WRITE_ADMITTED
+                            owner_unavailable = (
+                                replacement_state == ROW_WRITE_UNAVAILABLE
+                            )
+                        elif callable(replacer):
+                            admitted = self._write_admitted(replacer(index, record))
+                        else:
+                            owner[index] = dict(record)  # type: ignore[index]
+                            admitted = True
+                    except (IndexError, OSError, RuntimeError, TypeError, ValueError):
+                        admitted = False
+                        owner_unavailable = True
+                if not admitted and owner_unavailable:
+                    pending.row_owner = None
+                    pending.row_index = None
+                    pending.row_lease = None
+                    admitted = append_direct()
+        elif current:
+            owner = getattr(self.panel, "method_evaluation_bundle_rows", None)
+            atomic_appender = getattr(owner, "append_with_admission", None)
+            appender = getattr(owner, "append", None)
+            if callable(atomic_appender):
+                index = len(owner)
+                appended = atomic_appender(record)
+                append_state = str(getattr(appended, "state", "") or "").upper()
+                admitted = append_state == ROW_WRITE_ADMITTED
+                owner_unavailable = append_state == ROW_WRITE_UNAVAILABLE
+                row_index = getattr(appended, "row_index", index)
+                row_lease = getattr(appended, "lease", None)
+                if not admitted:
+                    if owner_unavailable:
+                        admitted = append_direct()
+                    else:
+                        pending_candidate = _PendingMethodBundleCommit(
+                            bundle=bundle,
+                            row_owner=owner,
+                            row_index=row_index,
+                            row_lease=row_lease,
+                        )
+            elif callable(appender):
+                index = len(owner)
+                admitted = self._write_admitted(appender(record))
+                if not admitted:
+                    pending_candidate = _PendingMethodBundleCommit(
+                        bundle=bundle,
+                        row_owner=owner,
+                        row_index=index,
+                    )
+            else:
+                admitted = False
+        else:
+            admitted = append_direct()
 
-        rows = getattr(self.panel, "method_evaluation_bundle_rows", None)
-        if rows is not None and bool(getattr(self.panel, "distance_recording_enabled", False)):
-            rows.append(bundle.to_record())
-        committed.add(identity)
+        if admitted:
+            self._remove_pending_method_bundle(key)
+            self._persisted_method_bundle_keys.add(key)
+            committed = getattr(self.panel, "_method_evaluation_committed", None)
+            current_after_write, _generation_after_write = (
+                self._method_bundle_is_current(bundle)
+            )
+            if current_after_write and isinstance(committed, set):
+                committed.add((bundle.pair_id, bundle.request_generation))
+            return True
+
+        existing = pending_candidate or self._pending_method_bundle_commits.get(key)
+        if existing is None:
+            existing = _PendingMethodBundleCommit(bundle=bundle)
+        else:
+            existing.bundle = bundle
+        self._retain_pending_method_bundle(
+            key,
+            existing,
+        )
+        return False
+
+    def _retry_pending_method_bundles(self) -> None:
+        if not self._pending_method_bundle_commits:
+            return
+        logger = getattr(self.panel, "_log", None)
+        retry_batch = tuple(self._pending_method_bundle_commits.items())[
+            : max(1, int(METHOD_BUNDLE_RETRY_BUDGET))
+        ]
+        for key, pending in retry_batch:
+            self._pending_method_bundle_commits.pop(key, None)
+            self._pending_method_bundle_commits[key] = pending
+            try:
+                self._commit_method_evaluation_bundle(pending.bundle)
+            except Exception as exc:  # noqa: BLE001 - keep the timer alive.
+                if callable(logger):
+                    logger(f"[측정] method bundle 저장 재시도 실패: {exc}")
+        if (
+            not self._pending_method_bundle_commits
+            and not self._pending_primary_measurement_commits
+            and self._method_evaluation_coordinator is None
+        ):
+            self._stop_method_evaluation_timer()
+
+    def _commit_method_evaluation_bundle(
+        self,
+        bundle: MethodEvaluationBundle,
+    ) -> None:
+        bundle_key = self._method_bundle_key(bundle)
+        if bundle_key in self._persisted_method_bundle_keys:
+            return
+        committed = getattr(self.panel, "_method_evaluation_committed", None)
+        if not isinstance(committed, set):
+            committed = set()
+            self.panel._method_evaluation_committed = committed
+        identity = (bundle.pair_id, bundle.request_generation)
+        if identity in committed:
+            return
+        selected_method_id = str(
+            getattr(self.panel, "_measurement_recording_method_id", "")
+            or PIXHAWK_RTK_LIVE
+        )
+        if selected_method_id not in MEASUREMENT_METHOD_IDS:
+            selected_method_id = PIXHAWK_RTK_LIVE
+        selected_index = MEASUREMENT_METHOD_IDS.index(selected_method_id)
+        selected_outcome = bundle.outcomes[selected_index]
+        primary, current, persistence_state = self._commit_primary_method_outcome(
+            selected_outcome,
+            commit_source="bundle_fallback",
+            expected_method_id=selected_method_id,
+        )
+        if primary != selected_outcome:
+            outcomes = list(bundle.outcomes)
+            outcomes[selected_index] = primary
+            bundle = replace(bundle, outcomes=tuple(outcomes))
+
+        if not self._persist_method_evaluation_bundle(bundle):
+            return
+        current_after_write, _generation_after_write = (
+            self._method_bundle_is_current(bundle)
+        )
+        if not current_after_write:
+            return
         self.panel._last_method_evaluation_bundle = bundle
         self._update_method_evaluation_counters(bundle)
-        self._display_primary_method_outcome(primary, waiting_for_barrier=False)
+        primary_key = self._primary_outcome_key(primary)
+        if current and (
+            self._primary_displayed_key == primary_key
+            or primary.pair_sequence >= self._primary_display_high_water
+        ):
+            self._primary_display_high_water = max(
+                self._primary_display_high_water,
+                primary.pair_sequence,
+            )
+            self._primary_displayed_key = primary_key
+            self._display_primary_method_outcome(
+                primary,
+                waiting_for_barrier=False,
+                persistence_state=persistence_state,
+            )
 
     @staticmethod
     def _method_bundle_with_primary_failure(
         bundle: MethodEvaluationBundle,
         reason: str,
+        *,
+        primary_method_id: str = PIXHAWK_RTK_LIVE,
     ) -> MethodEvaluationBundle:
         outcomes = list(bundle.outcomes)
-        primary_index = MEASUREMENT_METHOD_IDS.index(PIXHAWK_RTK_LIVE)
+        primary_index = MEASUREMENT_METHOD_IDS.index(primary_method_id)
         primary = outcomes[primary_index]
         outcomes[primary_index] = replace(
             primary,
@@ -3778,8 +5400,6 @@ class MeasurementViewController:
             )
         )
         distance_m = finite_number(triangulated, "range_m")
-        if distance_m <= 0.0:
-            raise ValueError("range_m must be positive")
         estimate = StereoEstimate(
             distance_m=finite_number(estimate_payload, "distance_m"),
             disparity_px=finite_number(match, "disparity_px"),
@@ -3815,6 +5435,8 @@ class MeasurementViewController:
         }
 
     def _poll_method_evaluations(self) -> None:
+        self._retry_pending_primary_measurements()
+        self._retry_pending_method_bundles()
         coordinator = self._method_evaluation_coordinator
         if coordinator is None:
             return
@@ -3826,12 +5448,34 @@ class MeasurementViewController:
                 logger(f"[측정] method worker poll 실패(타이머 유지): {exc}")
             return
         for primary in polled.primary_outcomes:
+            selected_method_id = str(
+                getattr(self.panel, "_measurement_recording_method_id", "")
+                or PIXHAWK_RTK_LIVE
+            )
+            if selected_method_id != PIXHAWK_RTK_LIVE:
+                # The fixed Pixhawk worker remains the early admission path;
+                # a non-Pixhawk selected method is committed only from the
+                # completed bundle after its own comparison worker finishes.
+                continue
             try:
-                self._display_primary_method_outcome(primary, waiting_for_barrier=True)
+                primary, current, persistence_state = (
+                    self._commit_primary_method_outcome(
+                        primary,
+                        commit_source="early_outcome",
+                    )
+                )
+                if current and primary.pair_sequence >= self._primary_display_high_water:
+                    self._primary_display_high_water = primary.pair_sequence
+                    self._primary_displayed_key = self._primary_outcome_key(primary)
+                    self._display_primary_method_outcome(
+                        primary,
+                        waiting_for_barrier=True,
+                        persistence_state=persistence_state,
+                    )
             except Exception as exc:  # noqa: BLE001 - isolate one malformed outcome.
                 logger = getattr(self.panel, "_log", None)
                 if callable(logger):
-                    logger(f"[측정] primary method 표시 실패: {exc}")
+                    logger(f"[측정] primary method 저장/표시 실패: {exc}")
         for bundle in polled.completed_bundles:
             try:
                 self._commit_method_evaluation_bundle(bundle)
@@ -3839,6 +5483,10 @@ class MeasurementViewController:
                 failed_bundle = self._method_bundle_with_primary_failure(
                     bundle,
                     f"GUI method bundle commit failure: {type(exc).__name__}: {exc}",
+                    primary_method_id=str(
+                        getattr(self.panel, "_measurement_recording_method_id", "")
+                        or PIXHAWK_RTK_LIVE
+                    ),
                 )
                 logger = getattr(self.panel, "_log", None)
                 if callable(logger):
@@ -3878,6 +5526,11 @@ class MeasurementViewController:
             # measurement pipeline below it.
             self.panel.geometry_comparison_rows = ()
         if self._multi_method_measurement_active():
+            selected_method_status = self._select_measurement_method_for_attempt()
+            if selected_method_status is not None and not str(
+                getattr(self.panel, "_measurement_recording_method_id", "") or ""
+            ):
+                self.panel._measurement_recording_method_id = selected_method_status.method_id
             if self.panel._measurement_display_mode() == "detection":
                 self.panel._show_measurement_pair(pair.left, pair.right)
             else:
@@ -3893,12 +5546,19 @@ class MeasurementViewController:
             return
         selected_method_status = self._select_measurement_method_for_attempt()
         if selected_method_status is None:
-            self._record_no_ready_measurement_pair(pair)
+            record_detail = "해당 matched pair를 geometry 미준비 상태로 기록했습니다."
+            try:
+                self._record_no_ready_measurement_pair(pair)
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError) as exc:
+                # Recording the blocked-pair evidence entry must never stop the
+                # refresh loop itself; a missing timing decision here just means
+                # this one pair goes unlogged instead of crashing the loop.
+                record_detail = f"blocked-pair 기록 실패(계속 진행): {exc}"
             self.panel._clear_triangulation_quality("준비된 측정 방식 없음")
             self.panel._set_distance_text(
                 "거리: 준비된 측정 방식 없음",
                 quality="WARNING",
-                detail="해당 matched pair를 geometry 미준비 상태로 기록했습니다.",
+                detail=record_detail,
             )
             return
         gnss_measurement_advisories: tuple[str, ...] = ()
@@ -4075,12 +5735,24 @@ class MeasurementViewController:
                 f"{estimate.relative_pitch_deg:.2f}/{estimate.relative_yaw_deg:.2f}°"
             )
         warning_text = f" | {'; '.join(estimate.warnings)}" if estimate.warnings else ""
+        pair_input_unverified = any(
+            bool(
+                detection.timestamp_metadata.get(
+                    "media_integrity_unverified",
+                    False,
+                )
+            )
+            for detection in (attempt.left_detection, attempt.right_detection)
+        )
+        input_integrity_text = (
+            " input=UNVERIFIED" if pair_input_unverified else " input=VERIFIED"
+        )
         self.panel._set_distance_text(
             f"거리: {display_distance_m:.2f} m ({method_text}{gap_text}) | bboxΔx={estimate.disparity_px:.1f}px "
             f"camΔt={estimate.time_delta_s * 1000:.0f}ms Δy={estimate.vertical_delta_px:.1f}px "
             f"baseline={display_baseline_source}:{display_baseline_m:.3f}m "
             f"ATT:{attitude_badge} {relative_text} validity={measurement_validity} "
-            f"quality={display_quality}{warning_text}",
+            f"quality={display_quality}{input_integrity_text}{warning_text}",
             quality=display_quality,
         )
         appended = self.panel._append_distance_history(
@@ -4109,15 +5781,41 @@ class MeasurementViewController:
             return
         self.panel.selected_runtime_frame_metadata["left"] = dict(left.timestamp_metadata)
         self.panel.selected_runtime_frame_metadata["right"] = dict(right.timestamp_metadata)
-        left_timestamp_s = self.panel._yolo_match_timestamp_s(left)
-        right_timestamp_s = self.panel._yolo_match_timestamp_s(right)
-        self.panel.selected_runtime_frame_pair_delta_s = (
-            None if left_timestamp_s is None or right_timestamp_s is None else abs(left_timestamp_s - right_timestamp_s)
+        result = getattr(self.panel, "_coordinated_pairing_result", None)
+        result_pair = getattr(result, "pair", None)
+        timing = getattr(result, "timing", None)
+        if (
+            isinstance(timing, PairTimingDecision)
+            and result_pair is not None
+            and result_pair.left is left
+            and result_pair.right is right
+        ):
+            self.panel.selected_runtime_frame_pair_delta_s = (
+                timing.abs_delta_ns * 1.0e-9
+            )
+            self.panel.selected_runtime_frame_pair_basis = timing.effective_basis
+            self.panel.selected_runtime_frame_pair_requested_basis = timing.requested_basis
+            self.panel.selected_runtime_frame_pair_fallback_reason = (
+                timing.fallback_reason
+            )
+        else:
+            left_timestamp_s = self.panel._yolo_match_timestamp_s(left)
+            right_timestamp_s = self.panel._yolo_match_timestamp_s(right)
+            self.panel.selected_runtime_frame_pair_delta_s = (
+                None
+                if left_timestamp_s is None or right_timestamp_s is None
+                else abs(left_timestamp_s - right_timestamp_s)
+            )
+            self.panel.selected_runtime_frame_pair_basis = (
+                self.panel._effective_yolo_time_basis()
+            )
+            self.panel.selected_runtime_frame_pair_requested_basis = (
+                self.panel._yolo_time_basis()
+            )
+            self.panel.selected_runtime_frame_pair_fallback_reason = ""
+        _, self.panel.selected_runtime_frame_pair_camera_rtc_delta_s = (
+            self.panel._selected_pair_sync_summary(left, right)
         )
-        (
-            self.panel.selected_runtime_frame_pair_basis,
-            self.panel.selected_runtime_frame_pair_camera_rtc_delta_s,
-        ) = self.panel._selected_pair_sync_summary(left, right)
         self.panel._update_runtime_camera_stats_labels()
 
     def _clear_measurement_pair_display(self) -> None:
@@ -4131,6 +5829,8 @@ class MeasurementViewController:
         self.panel.selected_runtime_frame_pair_delta_s = None
         self.panel.selected_runtime_frame_pair_basis = ""
         self.panel.selected_runtime_frame_pair_camera_rtc_delta_s = None
+        self.panel.selected_runtime_frame_pair_requested_basis = ""
+        self.panel.selected_runtime_frame_pair_fallback_reason = ""
         if update_labels:
             self.panel._update_runtime_camera_stats_labels()
 
@@ -4141,12 +5841,25 @@ class MeasurementViewController:
         right_stats = self.panel.camera_stream_stats.get("right") or {}
         left_yolo_hz = float(left_stats.get("inferred_hz", 0.0))
         right_yolo_hz = float(right_stats.get("inferred_hz", 0.0))
-        if self.panel._last_correspondence_rejection_reason and not self.panel._last_correspondence_rejection_reason.startswith(
-            "missing_"
-        ):
+        rejection_reason = str(
+            self.panel._last_correspondence_rejection_reason or ""
+        )
+        if rejection_reason.startswith(("APP_", "RTCP_", "CLOCK_", "FRAME_")):
+            result = getattr(self.panel, "_coordinated_pairing_result", None)
+            primary_reason = str(
+                getattr(result, "primary_rejection_reason", "") or ""
+            )
+            primary_detail = (
+                f", preferred={primary_reason}" if primary_reason else ""
+            )
+            return (
+                "그래프 미표시: 선택 timing과 app-receive fallback에서 유효한 pair를 "
+                f"만들지 못했습니다 (effective={rejection_reason}{primary_detail})."
+            )
+        if rejection_reason and not rejection_reason.startswith("missing_"):
             return (
                 "그래프 미표시: correspondence 검증 실패 "
-                f"({self.panel._last_correspondence_rejection_reason})."
+                f"({rejection_reason})."
             )
         if left_count == 0 or right_count == 0:
             if left_yolo_hz <= 0.0 or right_yolo_hz <= 0.0:
@@ -4155,21 +5868,6 @@ class MeasurementViewController:
                     f"(left={left_yolo_hz:.1f} Hz, right={right_yolo_hz:.1f} Hz)."
                 )
             return f"그래프 미표시: bbox 검출 대기 중 (left={left_count}, right={right_count})."
-        if self.panel._yolo_time_basis() == "camera_rtc_required":
-            left_has_rtc = any(
-                self.panel._camera_rtc_timestamp_s_from_metadata(detection.timestamp_metadata) is not None
-                for detection in self.panel.detection_buffers["left"]
-            )
-            right_has_rtc = any(
-                self.panel._camera_rtc_timestamp_s_from_metadata(detection.timestamp_metadata) is not None
-                for detection in self.panel.detection_buffers["right"]
-            )
-            if not left_has_rtc or not right_has_rtc:
-                return (
-                    "그래프 미표시: RTCP/NTP 필수 모드에서 RTCP/NTP timestamp가 없는 검출이 있습니다 "
-                    f"(left_rtc={'OK' if left_has_rtc else 'missing'}, "
-                    f"right_rtc={'OK' if right_has_rtc else 'missing'})."
-                )
         return (
             "그래프 미표시: 좌/우 bbox timestamp가 `최대 Δt` 안에서 아직 맞지 않습니다 "
             f"(left={left_count}, right={right_count})."
@@ -4178,10 +5876,13 @@ class MeasurementViewController:
         )
 
     def _detection_wait_status(self) -> str:
-        if self.panel._last_correspondence_rejection_reason and not self.panel._last_correspondence_rejection_reason.startswith(
-            "missing_"
-        ):
-            return f"거리: 검출 대응 거부 ({self.panel._last_correspondence_rejection_reason})"
+        rejection_reason = str(
+            self.panel._last_correspondence_rejection_reason or ""
+        )
+        if rejection_reason.startswith(("APP_", "RTCP_", "CLOCK_", "FRAME_")):
+            return f"거리: timing pair 대기 ({rejection_reason})"
+        if rejection_reason and not rejection_reason.startswith("missing_"):
+            return f"거리: 검출 대응 거부 ({rejection_reason})"
         if self.panel._yolo_time_delta_gate_enabled() or self.panel._yolo_time_basis() != "detection":
             return "거리: timestamp가 맞는 좌/우 검출 대기 중"
         return "거리: 좌/우 검출 쌍 대기 중"
@@ -4192,13 +5893,8 @@ class MeasurementViewController:
         left_center = getattr(left, "center", (0.0, 0.0))
         right_center = getattr(right, "center", (0.0, 0.0))
         disparity_px = abs(float(left_center[0]) - float(right_center[0]))
-        left_timestamp_s = self.panel._yolo_match_timestamp_s(left)
-        right_timestamp_s = self.panel._yolo_match_timestamp_s(right)
-        time_delta_ms = (
-            float("inf")
-            if left_timestamp_s is None or right_timestamp_s is None
-            else abs(left_timestamp_s - right_timestamp_s) * 1000.0
-        )
+        timing = self._pair_timing_decision(pair)
+        time_delta_ms = timing.abs_delta_ns * 1.0e-6
         time_limit_ms = self.panel._yolo_pair_max_delta_s() * 1000.0
         if not isfinite(disparity_px) or disparity_px <= 1e-6:
             return (

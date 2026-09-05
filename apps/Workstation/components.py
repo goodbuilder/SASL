@@ -215,10 +215,8 @@ class EngineeringValue(QtWidgets.QWidget):
         self.value.setText(text)
         self.unit.setText(unit)
         flags: list[str] = []
-        if valid is not None:
-            status_text = "VALID" if valid else "INVALID"
-            status_color = SUCCESS if valid else ERROR
-            flags.append(f'<span style="color:{status_color};">{status_text}</span>')
+        if valid is False:
+            flags.append(f'<span style="color:{ERROR};">INVALID</span>')
         if age_s is not None:
             flags.append(f'<span style="color:{TEXT_MUTED};">{_format_age(age_s)}</span>')
         self.meta.setText(" · ".join(flags))

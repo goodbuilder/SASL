@@ -7,6 +7,7 @@ import threading
 import pytest
 
 from Workstation.workstation_core.mavlink_liveness import (
+    MAVLINK_ALL_RX_STALL_S,
     MAVLINK_INITIAL_RX_TIMEOUT_S,
     MAVLINK_QUALIFICATION_S,
     MavlinkLivenessState,
@@ -39,6 +40,72 @@ def _observe_pair(model: MavlinkSideLiveness, generation: int, at_s: float) -> N
         received_at_s=at_s,
         generation=generation,
     )
+
+
+def test_disconnect_thresholds_are_thirty_seconds() -> None:
+    assert MAVLINK_ALL_RX_STALL_S == 30.0
+    assert MAVLINK_INITIAL_RX_TIMEOUT_S == 30.0
+
+
+def test_subscriber_initializes_active_drone_as_third_identity_owner() -> None:
+    from Workstation.workstation_core.pixhawk_attitude import DualPixhawkMavlinkSubscriber
+
+    subscriber = DualPixhawkMavlinkSubscriber(
+        left_url="left",
+        right_url="right",
+        drone_url="drone",
+    )
+
+    assert subscriber.urls == {"left": "left", "right": "right", "drone": "drone"}
+    assert subscriber.expected_system_ids == {"left": 1, "right": 2, "drone": 3}
+    assert subscriber.mavlink_health_snapshot("drone", now_s=0.0).expected_system_id == 3
+    assert set(subscriber.mavlink_health_snapshots(now_s=0.0)) == {
+        "left",
+        "right",
+        "drone",
+    }
+
+
+def test_radio_status_is_diagnostic_unknown_identity_not_vehicle_liveness() -> None:
+    from Workstation.workstation_core.pixhawk_attitude import DualPixhawkMavlinkSubscriber
+
+    class Message:
+        rssi = 190
+        remrssi = 180
+        noise = 40
+        remnoise = 41
+        txbuf = 73
+        rxerrors = 2
+        fixed = 5
+
+        def get_type(self):
+            return "RADIO_STATUS"
+
+        def get_srcSystem(self):
+            return 0
+
+        def get_srcComponent(self):
+            return 0
+
+    subscriber = DualPixhawkMavlinkSubscriber(
+        left_url="radio",
+        right_url="",
+        transports={"left": "radio"},
+    )
+    subscriber.connections["left"] = object()
+    message = Message()
+
+    assert subscriber._observe_mavlink_transport_message(
+        "left", message, received_at_s=1.0
+    )
+    subscriber._handle_mavlink_message("left", message, received_at_s=1.0)
+
+    status = subscriber.radio_status_snapshot("left")
+    assert status is not None
+    assert status.rssi == 190
+    assert status.remote_rssi == 180
+    assert status.txbuf_pct == 73
+    assert not subscriber.mavlink_health_snapshot("left", now_s=1.0).identity_verified
 
 
 def _keep_fresh_through(model: MavlinkSideLiveness, generation: int, end_s: int) -> None:
@@ -143,20 +210,21 @@ def test_bad_data_and_local_echo_are_not_liveness_evidence() -> None:
     assert model.snapshot(now_s=1.1).last_any_rx_monotonic_s is None
 
 
-def test_qualification_boundary_is_exactly_600_continuous_seconds() -> None:
+def test_qualification_boundary_is_exactly_10_continuous_seconds() -> None:
+    assert MAVLINK_QUALIFICATION_S == 10.0
     model, generation = _opened()
     _observe_pair(model, generation, 0.0)
-    _keep_fresh_through(model, generation, 599)
-    _observe_pair(model, generation, 599.999)
+    _keep_fresh_through(model, generation, 9)
+    _observe_pair(model, generation, 9.999)
 
-    before = model.snapshot(now_s=599.999)
+    before = model.snapshot(now_s=9.999)
     assert before.state is MavlinkLivenessState.QUALIFYING
-    assert before.qualification_elapsed_s == pytest.approx(599.999)
+    assert before.qualification_elapsed_s == pytest.approx(9.999)
 
     _observe_pair(model, generation, MAVLINK_QUALIFICATION_S)
     exact = model.snapshot(now_s=MAVLINK_QUALIFICATION_S)
     assert exact.state is MavlinkLivenessState.LIVE
-    assert exact.qualification_elapsed_s == pytest.approx(600.0)
+    assert exact.qualification_elapsed_s == pytest.approx(10.0)
     assert exact.rtcm_eligible
     assert exact.command_eligible
 
@@ -186,15 +254,15 @@ def test_attitude_stale_boundary_does_not_claim_all_rx_stall() -> None:
     assert stale.rtcm_eligible
 
 
-def test_all_expected_rx_stalls_at_ten_seconds_not_before() -> None:
+def test_all_expected_rx_stalls_at_thirty_seconds_not_before() -> None:
     model, generation = _opened()
     _observe_pair(model, generation, 0.0)
 
-    before = model.snapshot(now_s=9.999)
+    before = model.snapshot(now_s=MAVLINK_ALL_RX_STALL_S - 0.001)
     assert before.state is not MavlinkLivenessState.RX_STALLED
     assert before.rtcm_eligible
 
-    exact = model.snapshot(now_s=10.0)
+    exact = model.snapshot(now_s=MAVLINK_ALL_RX_STALL_S)
     assert exact.state is MavlinkLivenessState.RX_STALLED
     assert exact.stall_reason == "ALL_EXPECTED_RX_SILENT"
     assert not exact.rtcm_eligible
@@ -229,28 +297,29 @@ def test_stale_heartbeat_with_other_rx_is_not_all_rx_stall() -> None:
 def test_stalled_packet_resume_is_recovering_until_requalified() -> None:
     model, generation = _opened()
     _observe_pair(model, generation, 0.0)
-    assert model.snapshot(now_s=10.0).state is MavlinkLivenessState.RX_STALLED
+    assert model.snapshot(now_s=MAVLINK_ALL_RX_STALL_S).state is MavlinkLivenessState.RX_STALLED
 
-    _observe_pair(model, generation, 10.1)
-    resumed = model.snapshot(now_s=10.1)
+    resume_s = MAVLINK_ALL_RX_STALL_S + 0.1
+    _observe_pair(model, generation, resume_s)
+    resumed = model.snapshot(now_s=resume_s)
     assert resumed.state is MavlinkLivenessState.RECOVERING
     assert resumed.qualification_elapsed_s == 0.0
 
-    for second in range(1, 601):
-        _observe_pair(model, generation, 10.1 + second)
-    qualified = model.snapshot(now_s=610.1)
+    for second in range(1, 11):
+        _observe_pair(model, generation, resume_s + second)
+    qualified = model.snapshot(now_s=resume_s + 10.000001)
     assert qualified.state is MavlinkLivenessState.LIVE
-    assert qualified.qualification_elapsed_s == pytest.approx(600.0)
+    assert qualified.qualification_elapsed_s == pytest.approx(10.0)
 
 
 def test_remote_reboot_invalidates_identity_without_replacing_host_generation() -> None:
     model, generation = _opened()
     _observe_pair(model, generation, 0.0)
-    _keep_fresh_through(model, generation, 600)
-    assert model.snapshot(now_s=600.0).state is MavlinkLivenessState.LIVE
+    _keep_fresh_through(model, generation, 10)
+    assert model.snapshot(now_s=10.0).state is MavlinkLivenessState.LIVE
 
-    assert model.note_remote_reboot(now_s=600.1)
-    after_reset = model.snapshot(now_s=600.1)
+    assert model.note_remote_reboot(now_s=10.1)
+    after_reset = model.snapshot(now_s=10.1)
     assert after_reset.connection_generation == generation
     assert after_reset.state is MavlinkLivenessState.CONNECTING
     assert not after_reset.identity_verified
@@ -261,18 +330,18 @@ def test_remote_reboot_invalidates_identity_without_replacing_host_generation() 
         system_id=1,
         component_id=1,
         message_type="ATTITUDE",
-        received_at_s=600.1,
+        received_at_s=10.2,
         generation=generation,
     )
-    assert model.snapshot(now_s=600.1).state is MavlinkLivenessState.CONNECTING
+    assert model.snapshot(now_s=10.2).state is MavlinkLivenessState.CONNECTING
     assert model.observe_packet(
         system_id=1,
         component_id=1,
         message_type="HEARTBEAT",
-        received_at_s=600.2,
+        received_at_s=10.3,
         generation=generation,
     )
-    recovering = model.snapshot(now_s=600.2)
+    recovering = model.snapshot(now_s=10.3)
     assert recovering.state is MavlinkLivenessState.RECOVERING
     assert recovering.identity_verified
     assert recovering.qualification_elapsed_s == 0.0
@@ -305,12 +374,30 @@ def test_active_command_suppresses_false_stall_then_requires_fresh_evidence() ->
     assert not during.command_eligible
 
     model.end_command(now_s=100.0)
-    grace = model.snapshot(now_s=109.999)
+    grace = model.snapshot(now_s=129.999)
     assert grace.state is MavlinkLivenessState.QUALIFYING
     assert grace.stall_reason == "AWAITING_POST_COMMAND_HEARTBEAT_ATTITUDE"
 
-    stalled = model.snapshot(now_s=110.0)
+    stalled = model.snapshot(now_s=130.0)
     assert stalled.state is MavlinkLivenessState.RX_STALLED
+
+
+def test_diagnostic_shell_command_preserves_radio_qualification() -> None:
+    model, generation = _opened()
+    _observe_pair(model, generation, 0.0)
+    model.begin_command(
+        "RM3100 SHELL POLL",
+        now_s=1.0,
+        preserve_qualification=True,
+    )
+    during = model.snapshot(now_s=5.0)
+    assert during.active_command == "RM3100 SHELL POLL"
+    model.end_command(now_s=5.0)
+    _observe_pair(model, generation, 5.1)
+
+    for second in range(1, 11):
+        _observe_pair(model, generation, 5.1 + second)
+    assert model.snapshot(now_s=15.100001).state is MavlinkLivenessState.LIVE
 
 
 def test_post_command_heartbeat_and_attitude_restart_qualification() -> None:
@@ -324,6 +411,28 @@ def test_post_command_heartbeat_and_attitude_restart_qualification() -> None:
     assert snapshot.state is MavlinkLivenessState.QUALIFYING
     assert snapshot.qualification_started_monotonic_s == pytest.approx(5.1)
     assert snapshot.qualification_elapsed_s == 0.0
+
+    for second in range(1, 11):
+        _observe_pair(model, generation, 5.1 + second)
+    assert model.snapshot(now_s=15.100001).state is MavlinkLivenessState.LIVE
+
+
+def test_subscriber_transition_formats_health_owned_qualification_duration() -> None:
+    from Workstation.workstation_core.pixhawk_attitude import DualPixhawkMavlinkSubscriber
+
+    subscriber = DualPixhawkMavlinkSubscriber(left_url="", right_url="")
+    subscriber.connections["left"] = object()
+    model = subscriber._ensure_liveness_listener("left")
+    model.qualification_s = 65.0
+    generation = model.connection_generation
+    for second in range(0, 6):
+        _observe_pair(model, generation, float(second))
+
+    statuses: list[str] = []
+    subscriber.status_changed.connect(statuses.append)
+    subscriber._emit_liveness_transition("left", now_s=5.0)
+
+    assert statuses[-1].endswith("qualification=00:05/01:05")
 
 
 class _TransportMessage:
@@ -455,6 +564,7 @@ def test_operational_connection_declares_gcs_source_identity(monkeypatch) -> Non
 
     assert captured["source_system"] == 255
     assert captured["source_component"] == 190
+    assert captured["autoreconnect"] is False
     assert connection.clients == {("10.0.0.2", 14550)}
     assert len(connection.mav.heartbeats) == 1
     assert connection.mav.heartbeats[0] == (6, 8, 0, 0, 4)
@@ -464,16 +574,14 @@ def test_operational_connection_declares_gcs_source_identity(monkeypatch) -> Non
     clock["value"] = 1.0
     subscriber.spin_once()
     assert len(connection.mav.heartbeats) == 2
-    clock["value"] = 20.0
+    clock["value"] = 30.0
     subscriber.spin_once()
     assert len(connection.mav.heartbeats) == 3
-    timed_out = subscriber.mavlink_health_snapshot("left", now_s=20.0)
-    assert timed_out.state is MavlinkLivenessState.INITIAL_RX_TIMEOUT
-    assert timed_out.last_gcs_heartbeat_tx_monotonic_s == 20.0
-    assert subscriber.mavlink_health_snapshot("left", now_s=0.0).listener_open
-    subscriber.stop("left")
+    timed_out = subscriber.mavlink_health_snapshot("left", now_s=30.0)
+    assert timed_out.state is MavlinkLivenessState.DISCONNECTED
+    assert timed_out.last_gcs_heartbeat_tx_monotonic_s == 30.0
+    assert not subscriber.mavlink_health_snapshot("left", now_s=0.0).listener_open
     assert connection.closed
-    assert subscriber.mavlink_health_snapshot("left", now_s=0.0).state is MavlinkLivenessState.DISCONNECTED
 
 
 def test_gcs_heartbeat_without_explicit_udp_peer_starts_after_expected_heartbeat_and_never_catches_up(monkeypatch) -> None:
@@ -590,9 +698,9 @@ def test_liveness_transition_event_is_emitted_once_not_on_every_timer_tick(monke
     subscriber.status_changed.connect(statuses.append)
 
     subscriber.spin_once()
-    clock["value"] = 10.0
+    clock["value"] = 30.0
     subscriber.spin_once()
-    clock["value"] = 11.0
+    clock["value"] = 31.0
     subscriber.spin_once()
 
     stalled_events = [text for text in statuses if "ETH MAVLINK RX STALLED" in text]
@@ -914,11 +1022,59 @@ def test_deferred_heartbeat_attitude_burst_replays_without_recovery_commands(
         131.0,
     )
 
-    assert len(connection.mav.commands) == 1
-    assert connection.mav.commands[0][4] == pixhawk_attitude.MAVLINK_MESSAGE_IDS["ATTITUDE"]
+    assert [int(command[4]) for command in connection.mav.commands] == [
+        pixhawk_attitude.MAVLINK_MESSAGE_IDS["SCALED_IMU"],
+        pixhawk_attitude.MAVLINK_MESSAGE_IDS["SCALED_IMU2"],
+        pixhawk_attitude.MAVLINK_MESSAGE_IDS["SCALED_IMU3"],
+        pixhawk_attitude.MAVLINK_MESSAGE_IDS["ATTITUDE"],
+    ]
 
 
-def test_deferred_first_heartbeat_waits_for_live_profile_and_setup_owner(
+def test_deferred_telemetry_is_replayed_while_shell_command_is_active(
+    monkeypatch,
+) -> None:
+    """Shell polling must not make an arriving ATTITUDE age until poll end."""
+
+    from Workstation.workstation_core import pixhawk_attitude
+
+    clock = {"value": 100.0}
+    monkeypatch.setattr(pixhawk_attitude.time, "monotonic", lambda: clock["value"])
+    connection = _TransportConnection()
+    subscriber = pixhawk_attitude.DualPixhawkMavlinkSubscriber(
+        left_url="udp:test",
+        right_url="",
+    )
+    subscriber.connections["left"] = connection
+    attitudes: list[object] = []
+    subscriber.extrinsic_changed.connect(lambda _side, state: attitudes.append(state))
+
+    heartbeat = _TransportMessage("HEARTBEAT", system_id=1, raw=b"initial-heartbeat")
+    attitude = _TransportMessage("ATTITUDE", system_id=1, raw=b"initial-attitude")
+    subscriber._observe_mavlink_transport_message("left", heartbeat, received_at_s=100.0)
+    subscriber._handle_mavlink_message("left", heartbeat, received_at_s=100.0)
+    subscriber._observe_mavlink_transport_message("left", attitude, received_at_s=100.1)
+    subscriber._handle_mavlink_message("left", attitude, received_at_s=100.1)
+
+    with subscriber.exclusive_command(
+        "left",
+        command_label="RM3100 SHELL POLL",
+        preserve_qualification=True,
+    ):
+        clock["value"] = 104.0
+        deferred_attitude = _TransportMessage(
+            "ATTITUDE", system_id=1, raw=b"deferred-attitude"
+        )
+        subscriber._defer_command_message("left", deferred_attitude)
+        subscriber.spin_once()
+
+        health = subscriber.mavlink_health_snapshot("left", now_s=104.0)
+        assert health.active_command == "RM3100 SHELL POLL"
+        assert health.last_attitude_rx_monotonic_s == pytest.approx(104.0)
+        assert attitudes[-1].timestamp_s == pytest.approx(104.0)
+        assert not subscriber._deferred_command_messages["left"]
+
+
+def test_deferred_first_heartbeat_requests_runtime_profile_without_persistent_setup(
     monkeypatch,
 ) -> None:
     from Workstation.workstation_core import pixhawk_attitude
@@ -957,7 +1113,7 @@ def test_deferred_first_heartbeat_waits_for_live_profile_and_setup_owner(
         "left", live, received_at_s=clock["value"]
     )
 
-    assert setup_sides == ["left"]
+    assert setup_sides == []
     assert len(connection.mav.commands) == len(pixhawk_attitude.MAVLINK_STOCK_STREAM_REQUESTS)
 
     repeated = _TransportMessage("HEARTBEAT", system_id=1, raw=b"live-second-heartbeat")
@@ -969,5 +1125,5 @@ def test_deferred_first_heartbeat_waits_for_live_profile_and_setup_owner(
         "left", repeated, received_at_s=clock["value"]
     )
 
-    assert setup_sides == ["left"]
+    assert setup_sides == []
     assert len(connection.mav.commands) == len(pixhawk_attitude.MAVLINK_STOCK_STREAM_REQUESTS)

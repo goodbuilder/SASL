@@ -16,6 +16,43 @@ Workstation uses its own copied `standalone_gui.py`/`standalone_backend.py` owne
 [`11_DESIGN_AUDIT_RESULT.md`](11_DESIGN_AUDIT_RESULT.md) for the implementation evidence
 and remaining validation conditions.
 
+### 2026-09-02 GNSS baseline-center F/R/D/Rg slice
+
+Telemetry now derives one immutable, runtime-only antenna-midpoint local-level FRD result from
+selected P1/P2 and Drone `GpsPositionState`. A pure transform owns explicit NED input,
+horizontal-P1→P2 Right, NED Down, Right×Down Forward, metres, Rg, 2.0 s age, operator-selected
+1000 ms receive-spread, fix provenance and WAITING/CURRENT/STALE state. The Drone Telemetry
+controller publishes the mapping and existing ideal disparity consumes the same Rg/readiness.
+One fixed non-selectable table below `Live position` renders it in place. No command, setting,
+persistence/schema, device/protocol, worker, queue, Measurement, Recording or canonical camera
+frame changes are included.
+
+### 2026-09-02 GNSS baseline-center recording slice
+
+The follow-up persistence slice adds one fixed best-effort bulk stream and no worker/queue. After
+the existing raw primary Drone GPS row, Sensor presentation calls a public Recording-owner method;
+while recording, it snapshots selected P1/P2 plus exact Drone, reuses the pure estimator, builds a
+<=4 KiB self-contained CURRENT/STALE/WAITING row, and non-blockingly appends
+`gnss.baseline.center`. MeasurementDataStore remains sole writer and Data Status owns failure/drop
+truth. Latest XLSX adds exact-generation `GnssBaselineCenter`; raw PX4 streams, canonical
+Measurement fields, legacy Parquet, settings, commands and device behavior remain unchanged.
+
+### 2026-09-02 guided field-topology slice
+
+The Pixhawk workspace now exposes one fixed, fail-closed preset for P1 D30 Radio, P2 Ethernet, and
+Drone DU Radio. A pure immutable state machine and atomic journal separate operation truth from Qt;
+a single controller owns command enablement, confirmation, commit-last settings, restart recovery,
+cancel, and guided rollback. One bounded worker owns serial/MAVLink/MAVFTP operations, revalidates
+unique sysid/isolation/disarmed evidence immediately before writes, performs exact SiK NETID
+readback, captures/restores the P2 PX4 parameters and SD files byte-for-byte, and verifies P2 UDP
+identity plus ATTITUDE. Lifecycle shutdown cancels and waits for that worker.
+
+Implementation verification is sliced into pure transition/parser/journal tests, worker boundary
+tests, controller persistence/restart/rollback tests, fixed-geometry command/UI tests, affected
+Workstation regressions, full pytest, launcher preflight, and an offscreen render inspection. Real
+radio/Pixhawk mutation and three-board cold-boot qualification remain operator-run hardware gates;
+the automated suite must not claim them.
+
 ### 2026-08-29 Pixhawk network assignment slice
 
 Pixhawk `Find network` uses a bounded read-only worker to inventory physical wired links, global
@@ -23,18 +60,57 @@ IPv4 addresses and side-specific kernel `dev/src` route evidence. The compact wo
 the operator select one NIC/address candidate; independent P1/P2 cards show each assigned
 State/NIC/Local IPv4/Endpoint/Route. Assign persists the last side selection with additive settings
 fields. Connect preflights each disconnected side independently; it never
-mutates host or PX4 networking. Existing custom endpoint/USB paths, expected sysid, 60-second
+mutates host or PX4 networking. Existing custom endpoint/USB paths, expected sysid, 10-second
 qualification, stalled-side RTCM gating and verified-USB recovery remain authoritative.
 Same/different and Camera-shared NIC choices are accepted without a UI topology warning; field
 stability remains a separate hardware evidence boundary.
 
 ### 2026-08-26 Ethernet MAVLink stability slice
 
+The 2026-08-29 network-role amendment adds one bounded host-role coordinator above existing Camera
+and Pixhawk public owner contracts. It owns explicit confirmation, stable physical identity,
+role-set union/delta, exact app-owned NetworkManager provenance, target-first transaction/readback,
+compensating rollback and commit-last persistence. Existing Camera stream and MAVLink subscriber
+owners remain unchanged. Verification covers one/many NICs, shared roles, authorization/readback
+failure, active affected-owner reconnect, unrelated-NIC isolation and mapping-lock rejection.
+
 The Workstation software now owns explicit GCS `255/190` identity and bounded 1 Hz heartbeat,
 consumer-backed Stock stream requests, per-side HB/ATT/ANY liveness with a 600-second qualification,
 truthful ATTITUDE-only versus all-RX stall status, no false host reconnect, RTCM enqueue/send-lock
 fail-close with separate `blocked_stall` evidence, and operator-confirmed verified-USB side reboot.
 PX4 firmware, `MAV_2_RATE`, parameters, and SD-card configuration are unchanged by this slice.
+
+The P1 IMU delivery amendment tracks actual `SCALED_IMU/2/3` receive timestamps, retries only
+missing/stale standard streams with the existing bounded attempt/cooldown policy and side send lock,
+and projects `WAITING/LIVE/STALE/PARTIAL` into the existing table. It adds no worker, automatic USB
+command, persistent PX4 write, coordinate conversion, or new screen.
+
+Calibration PARAM snapshots are manual-only. Completing the 10-second `LIVE` qualification sends
+no PARAM request and causes no unrequested post-command qualification reset. Existing P1/P2 full
+refresh, Advanced MAG/attitude refresh, and reset/apply/save verification remain on the original
+side-specific command worker.
+
+### 2026-08-31 Pixhawk Radio-default transport slice
+
+P1, P2 and active Drone now share one role-configured MAVLink owner with fixed sysids 1/2/3.
+Settings migrate once to Radio selection while preserving Ethernet configuration and leaving Radio
+devices unassigned. Per-board Radio/Ethernet controls, endpoint ownership locks and explicit
+Connect/Disconnect actions replace implicit startup/recovery connection paths.
+
+Radio uses critical-only demand during qualification and deterministic 30/15-second optional
+restoration. `RADIO_STATUS` is diagnostic-only. Connect no longer launches persistent MAV_2 setup;
+that setup and all parameter/shell/reboot work are explicit commands.
+
+Offset-aware MAVFTP supports upload, download, cancellation, restart and verified resume using
+remote prefix readback, remote size/CRC32 and local size/SHA-256/CRC32. Firmware may be staged over
+Radio, while actual flash uses a hash-pinned official PX4 uploader, verified direct USB identity,
+bootloader board matching, global serialization and postflight sysid verification. No telemetry
+transport reconnects after flashing.
+
+The 2026-09-01 Discovery follow-up gives USB/network search one replace-only transient snapshot,
+one row per physical USB serial endpoint, identity-enriched role presentation, and revision-driven
+selection/feedback reset. The existing workers, explicit Assign/Connect boundary, saved settings,
+device ownership, and CPU/GPU topology remain unchanged.
 
 Software completion does not close the field condition. Required hardware evidence remains: actual
 firmware/sysid/parameter inventory, three independent cold boots of at least 10 minutes, one
@@ -53,13 +129,50 @@ the existing Camera status, CAM tooltips, and Diagnostics Performance; no new gl
 worker, queue, rate, affinity, clock, power, or quality policy is introduced. Synthetic NVDEC is
 automated-real evidence; actual dual-WIRIS RTSP remains a hardware/manual acceptance condition.
 
+### 2026-09-03 RTP/H.264 input metrics UI slice
+
+The existing GStreamer RTP sequence and H.264 parser observations now emit five-second rolling
+rates to the existing Workstation stats payload: received RTP packets/s, sequence-gap missing
+packets/s, estimated loss percentage, parser access-units/s, and decoded Hz. Camera workspace
+details and Diagnostics Performance render these per-side measurements in fixed-height text slots;
+missing or non-GStreamer metrics render as `--`. This slice is observational only and does not
+change camera encoder settings, IDR policy, RTSP transport, queue policy, decoder selection, or
+measurement gates.
+
+### 2026-08-29 tolerant Measurement and decoded-NVENC recording slice
+
+Camera admission is permanently tolerant: current decoded frames feed Preview, YOLO, native
+evidence, and official Measurement while `INPUT UNVERIFIED` remains a separate visible/persisted
+dimension. Existing timing, calibration, correspondence, and geometry gates are unchanged and may
+still produce `VALID`. Automatic MP4 uses a bounded oldest-drop decoded-NV12 branch and isolated
+FFmpeg `h264_nvenc` lossless writer. Recorder failure cannot stop YOLO/distance; no CPU encoder
+fallback, bitrate cap, file-size cap, duration cap, or warning burn-in is introduced. Left-camera
+hardware and synthetic pixel-exact NVENC evidence are complete; dual-camera field distance remains
+a hardware condition.
+
 ### 2026-08-29 observation-first admission slice
 
-Measurement opens its transient generation/time boundary immediately with zero or more sources.
-Camera, Pixhawk, Base GNSS/NTRIP, Target and recording publish independent transitions; manual
-camera recovery rejoins with a new MP4 segment. Essential structured records have a bounded retry
-reserve, while media integrity and artifact persistence never gate the current or next run. No
-Session/package, catalog, revalidation UI or new media worker is introduced.
+Measurement now opens its transient generation/time boundary immediately with zero or more sources.
+Camera, Pixhawk, Base GNSS/NTRIP, Target and recording publish independent source transitions;
+manual camera recovery rejoins with a new MP4 segment. Essential structured records have a bounded
+retry reserve, while media integrity and artifact persistence never gate the current or next run.
+No Session/package, catalog, revalidation UI or new media worker is introduced.
+
+### 2026-08-29 Mountain suggestion quality-separation slice
+
+The existing `Use suggestion` control now treats Mountain detector confidence as quality evidence,
+not copy permission. A shared pure validator and the controller enforce current frozen identity,
+paired exclusions, native bounds, equal count, minimum-four, uniqueness and distribution before
+copying filtered points. The UI shows `COPY READY/BLOCKED` in the existing status strip. At that
+slice Horizon was unchanged. No direct/automatic Solve, Apply, layout, worker, device or schema
+migration was introduced.
+
+### 2026-08-29 Horizon suggestion quality-separation slice
+
+Horizon now uses the same quality-versus-copy split as Mountain. Detector state/confidence remains
+visible and persisted, while shared pure/UI/controller validation owns current identity/dimensions,
+exactly two finite in-frame endpoints per side and 25%-width separation. The existing group shows
+`COPY READY/BLOCKED`; explicit Horizon Solve/Apply, layout, worker and device behavior are unchanged.
 
 ## 1. Migration Strategy
 
@@ -118,6 +231,18 @@ Implemented:
 - source-backed System/Camera/Pixhawk/GNSS/Log/Measurement/Performance diagnostics
 - explicit Overview, Camera, and Measurement workspaces
 - explicit Time / Sync workspace for PC UTC, WIRIS RTC, and RTCP/NTP stream evidence
+- decoder-independent parallel RTCP observation, ordered Left-then-Right STUS mutation,
+  Manual/Auto scheduling, logical clock epochs, and separate Clock/Frame/Media truth; SR-PC is
+  diagnostic-only and the relative default bound is 100 ms
+- Settings-preferred Workstation live-distance pairing with app receive as default and mandatory
+  fallback; healthy VERIFIED/current same-epoch RTCP may select pairs, the effective basis has a
+  100 ms cap, and fallback provenance alone cannot degrade distance
+- Calibration Live/Auto pairing on decoded-frame app-receive monotonic with its existing editable
+  gate; persisted `HOST_RECEIVE_PROXY` may admit a pair but never verifies exposure or precision,
+  NTP remains record-only, and FTP retains its separate CPTR-dispatch proxy
+- Calibration Auto-only NAL1/non-delta AU classification with exact AU-to-decoded PTS propagation,
+  current-generation native FrameKey pin/read, bounded provenance cache, and no timestamp-near
+  fallback; other camera consumers and manual/FTP/OZ capture remain unchanged
 - Measurement upstream evidence: left/right frame proxies, detection, synchronization,
   GNSS/RTK baseline, recording, and FPS
 - source-backed Alignment/Pixhawk/GNSS attitude, receiver, and NED baseline tables
@@ -175,6 +300,15 @@ state and receiver/baseline evidence, camera RTCP/NTP synchronization state, inf
 stats, MeasurementAttempt/result fields, session spool/save state, and decoded FPS. Every
 displayed status retains source and clock metadata; command intent is not treated as
 success evidence.
+
+The clock reducer uses a robust three-SR Left/Right relative window. One isolated observation or
+unmatched frame does not create a false long-run failure. Frame pairing separately rejects
+cross-epoch or over-100-ms candidates while preserving explicit drop/rejection evidence.
+
+That Clock/Frame reducer supplies only the public eligibility snapshot used when the frozen
+Measurement preference is `RTCP/NTP preferred`. The distance coordinator selects healthy RTCP or
+exact app fallback once, then freezes requested/effective basis, delta and reason through every
+method and saved row. App-default runs remain independent of Clock/STUS.
 
 ## 12. Diagnostics
 

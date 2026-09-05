@@ -54,3 +54,98 @@ An app mitigation is not a camera/PX4 firmware fix. A required `FAIL`, `NOT_RUN`
 Measurement Start remains available despite MAVLink, GNSS/NTRIP, STUS or best-effort storage
 failure. A method that depends on an unavailable input must fail closed with the exact reason and
 must not publish a valid result.
+
+## Proposed timing-fallback scope — not yet approved
+
+When one manual STUS seed has been VERIFIED and later clock evidence is revoked, keep live distance
+measurement available by selecting Left/Right decoded frames on host app-receive monotonic time.
+Continue preserving NTP/RTP/SR evidence in every selected detection and persisted pair. Keep
+pre-seed operation, active epoch transitions, calibration timing, Legacy, geometry and coordinate
+contracts unchanged. The proposed fallback produces an explicitly degraded/estimated result, not
+fabricated exposure-time truth.
+
+## Superseding app-receive-authoritative scope — awaiting approval
+
+The fallback scope above is superseded. Workstation live distance always pairs decoded frames on
+app-receive monotonic time and treats an accepted ≤100 ms app pair as normal timing truth. NTP,
+STUS status and NTP clock epochs are record-only and cannot block or degrade distance. Preserve
+their full provenance without calling app receive a physical exposure timestamp. Calibration,
+Legacy, geometry, coordinates, device settings and historical bytes remain excluded.
+
+## Proposed indoor 60-minute experimental recovery scope — awaiting approval
+
+The active goal is to execute one real indoor 60-minute Workstation integration run. Because the
+default NAL5 gate truthfully rejects both current cameras, the run requires an explicitly opt-in,
+process-local WIRIS experiment mode. That mode may treat only a parser-complete, SPS/PPS-backed,
+non-delta NAL1 access unit as a device-specific decoded-output recovery candidate. It never calls
+that candidate IDR/keyframe and never makes direct-copy MP4 portable or valid.
+
+The product default remains strict NAL5. The experiment changes no camera/PX4 setting, adds no
+encoder and uses the existing decoder/queues. It runs one five-minute preflight before the timed
+soak, then observes dual camera/YOLO/app pairing, P1/P2 MAVLink, process-local SASL/NGII NTRIP,
+RTCM injection, decoder-independent RTCP Clock evidence, recording growth, GUI responsiveness and
+resources at twelve five-minute checkpoints. Known STUS mutation convergence remains a separate
+failed gate and is not actuated or relabelled PASS by this soak.
+
+The user subsequently approved execution outdoors. The location change adds real rover RTK
+Fixed/accuracy evidence to the gate but does not authorize new device settings, STUS mutation,
+firmware, re-encoding or a relaxed MP4 result.
+## 2026-08-27 manual-only PX4 PARAM amendment
+
+Normal P1/P2 qualification no longer performs a hidden calibration-parameter snapshot. Operators
+retain the existing side-specific Refresh controls and explicit readback after parameter-changing
+actions. This removes unsolicited PARAM traffic and requalification without changing telemetry,
+RTCM, Measurement, recording, device settings, persistence, or GUI layout.
+
+## 2026-08-27 60-second operational MAVLink qualification amendment
+
+P1/P2 operational readiness now requires 60 continuous seconds of fresh expected-system HEARTBEAT
+and ATTITUDE after connection, reconnect, confirmed reboot, stall recovery, or an explicit command
+boundary. Stale/stall blocking is unchanged. This permits attitude-dependent measurement after one
+minute while preserving ten-minute and 60-minute field tests as separate long-run evidence rather
+than product admission delays.
+
+## 2026-08-28 Mountain GNSS 3D-fix amendment
+
+Mountain translation now accepts both P1/P2 at numeric `fix_type >= 3` when their capture-bound
+positions and NED baseline are finite and the baseline is non-zero. Both-side RTK Fixed is no
+longer required. Non-fixed usable results remain explicitly `ESTIMATED`; sub-3D fixes and all
+existing Mountain rotation failures still block their dependent axes. The latest pre-run Draft is
+frozen into the next Measurement, while `pixhawk_rtk_live` remains representative. No setting,
+layout, schema migration, coordinate change or device operation is included.
+
+## 2026-08-29 Mountain automatic-suggestion copy amendment
+
+Mountain `Use suggestion` now accepts a structurally usable proposal regardless of detector quality
+state. LOW_CONFIDENCE remains visible/persisted evidence; the controller still requires current
+frozen identity and at least four equal-order finite in-frame unique/distributed pairs after shared
+exclusions, then copies and hashes only the retained points. Horizon was unchanged in that slice.
+Explicit
+Solve is still required and has no direct proposal fallback; auto-copy, auto-Solve and auto-Apply
+remain excluded. Manual Mountain, solver gates, Measurement freeze, representative result,
+resources and historical data are preserved.
+
+## 2026-08-29 Horizon automatic-suggestion copy amendment
+
+Horizon `Use suggestion` now ignores detector quality state/confidence while retaining all quality
+text and evidence. Current frozen identities/dimensions, exactly two finite in-frame endpoints per
+side and the existing 25%-width separation remain hard owner/UI gates. Accepted low-quality
+suggestions keep their original state and an explicit warning. Solve and Apply remain separate;
+manual Horizon, exact K,D, both-side observability, resources and historical data are unchanged.
+
+## Proposed Mountain lever-arm status amendment — interviewing 2026-09-01
+
+The operator requested removing Mountain's lever-arm-driven `UNMODELED` result. The current solve
+already applies a zero correction when no explicit
+`lever_arm_baseline_correction_left_rdf_m` is supplied, while exposing that assumption as
+`lever_arm_status=UNMODELED` and a candidate warning. The existing Mountain tooltip likewise says
+that the camera optical center is assumed to equal the GNSS antenna.
+
+Two materially different outcomes remain open. The narrow outcome formalizes the existing
+zero-offset calculation as an explicit product assumption, replaces `UNMODELED` with a truthful
+assumed-zero provenance state, and removes only the lever-arm warning. The physical-calibration
+outcome instead requires measured per-rig antenna-to-optical-center offsets, settings/persistence,
+frame-aware conversion, validation, and failure behavior. Merely deleting the text while retaining
+an unnamed assumption is excluded from the recommendation. Existing Mountain correspondence,
+GNSS, K,D, rotation, Draft-freeze, representative-method, and historical-row behavior stays
+unchanged until the operator selects and approves one outcome.

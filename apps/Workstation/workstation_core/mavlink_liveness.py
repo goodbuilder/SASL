@@ -16,9 +16,9 @@ from typing import Callable
 
 MAVLINK_ATTITUDE_FRESH_S = 2.0
 MAVLINK_HEARTBEAT_FRESH_S = 3.0
-MAVLINK_ALL_RX_STALL_S = 10.0
-MAVLINK_INITIAL_RX_TIMEOUT_S = 10.0
-MAVLINK_QUALIFICATION_S = 600.0
+MAVLINK_ALL_RX_STALL_S = 30.0
+MAVLINK_INITIAL_RX_TIMEOUT_S = 30.0
+MAVLINK_QUALIFICATION_S = 10.0
 
 
 class MavlinkLivenessState(str, Enum):
@@ -116,6 +116,7 @@ class MavlinkSideLiveness:
         self._last_gcs_heartbeat_tx_s: float | None = None
         self._qualification_started_s: float | None = None
         self._active_command: str | None = None
+        self._preserve_qualification_command = False
         self._command_ended_s: float | None = None
         self._stalled = False
         self._recovering = False
@@ -158,6 +159,7 @@ class MavlinkSideLiveness:
             self._last_gcs_heartbeat_tx_s = None
             self._qualification_started_s = None
             self._active_command = None
+            self._preserve_qualification_command = False
             self._command_ended_s = None
             self._stalled = False
             self._recovering = bool(recovering)
@@ -171,6 +173,7 @@ class MavlinkSideLiveness:
             self._listener_opened_s = None
             self._identity_wait_started_s = None
             self._active_command = None
+            self._preserve_qualification_command = False
             self._qualification_started_s = None
             self._stalled = False
             self._recovering = False
@@ -211,22 +214,33 @@ class MavlinkSideLiveness:
             self._recovering = True
             return True
 
-    def begin_command(self, command: str, *, now_s: float | None = None) -> None:
+    def begin_command(
+        self,
+        command: str,
+        *,
+        now_s: float | None = None,
+        preserve_qualification: bool = False,
+    ) -> None:
         self._time(now_s)
         with self._lock:
             if self._active_command is not None:
                 raise RuntimeError(f"MAVLink command already active: {self._active_command}")
             self._active_command = str(command)
-            self._qualification_started_s = None
+            self._preserve_qualification_command = bool(preserve_qualification)
+            if not self._preserve_qualification_command:
+                self._qualification_started_s = None
 
     def end_command(self, *, now_s: float | None = None) -> None:
         ended_s = self._time(now_s)
         with self._lock:
             if self._active_command is None:
                 return
+            preserve_qualification = self._preserve_qualification_command
             self._active_command = None
-            self._command_ended_s = ended_s
-            self._qualification_started_s = None
+            self._preserve_qualification_command = False
+            if not preserve_qualification:
+                self._command_ended_s = ended_s
+                self._qualification_started_s = None
 
     def observe_packet(
         self,

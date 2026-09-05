@@ -95,6 +95,7 @@ BACKEND_FACADE_METHODS = (
     "calibration_run_validation",
     "calibration_save_validation",
     "calibration_apply_validation",
+    "workstation_calibration_capture_snapshot",
     "workstation_checkerboard_validation_snapshot",
     "configure_workstation_checkerboard_validation",
     "load_workstation_checkerboard_validation_json",

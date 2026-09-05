@@ -26,7 +26,10 @@ from Workstation.workstation_core.measurement_policy import (
     FIELD_MEASUREMENT_POLICY_ID,
     MEASUREMENT_VALIDITY_VALUES,
 )
-from Workstation.workstation_core.stereo import StereoCalibration
+from Workstation.workstation_core.stereo import (
+    StereoCalibration,
+    TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC,
+)
 from Workstation.workstation_core.triangulation import (
     camera_translation_right_in_left_camera,
     invert_left_to_right_camera_transform,
@@ -44,6 +47,7 @@ CHECKERBOARD_FRAME_CONTRACT = (
     "opencv_optical:RDF(right,down,forward); "
     "X_right = R_left_to_right * X_left + T_left_to_right_m"
 )
+LIVE_DISTANCE_MAX_APP_DELTA_NS = 100_000_000
 
 DETECTION_METADATA_ALLOWLIST = (
     "camera_id",
@@ -59,6 +63,8 @@ DETECTION_METADATA_ALLOWLIST = (
     "native_byte_length",
     "native_pixel_format",
     "timestamp_s",
+    "app_receive_monotonic_ns",
+    "app_receive_timestamp_role",
     "source_timestamp_s",
     "timestamp_source",
     "timestamp_reference",
@@ -83,6 +89,45 @@ DETECTION_METADATA_ALLOWLIST = (
     "rtcp_sr_received_count",
     "rtsp_transport",
     "rtcp_timing_invalid_reason",
+    "media_recovery_basis",
+    "media_integrity_mode",
+    "media_integrity_unverified",
+    "source_media_integrity_verified",
+    "media_random_access_guaranteed",
+    "rtp_integrity_latched",
+    "measurement_input_admitted",
+    "clock_epoch_id",
+    "clock_epoch_state",
+)
+
+RECORD_ONLY_CLOCK_METADATA_KEYS = frozenset(
+    {
+        "source_timestamp_s",
+        "timestamp_source",
+        "timestamp_reference",
+        "rtp_timestamp",
+        "rtp_ssrc",
+        "rtp_marker_seq",
+        "rtp_pts_s",
+        "rtcp_sr_ntp_raw",
+        "rtcp_sr_ntp_unix_s",
+        "rtcp_sr_rtp_timestamp",
+        "rtcp_clock_rate_hz",
+        "rtcp_sr_age_s",
+        "rtcp_sr_received_wall_s",
+        "rtcp_sr_pc_offset_s",
+        "rtcp_frame_ntp_unix_s",
+        "rtcp_frame_received_wall_s",
+        "rtcp_frame_receive_delay_s",
+        "rtcp_frame_transport_delay_s",
+        "rtcp_camera_ntp_rate",
+        "rtcp_camera_media_rate",
+        "rtcp_sr_received_count",
+        "rtsp_transport",
+        "rtcp_timing_invalid_reason",
+        "clock_epoch_id",
+        "clock_epoch_state",
+    }
 )
 
 
@@ -179,7 +224,15 @@ def _canonical_detection_metadata_items(
         if value is None or type(value) in (str, bool, int):
             values_by_key[key] = value
         elif type(value) is float:
-            values_by_key[key] = _finite_float(value, name=f"timestamp_metadata.{key}")
+            if not math.isfinite(value) and key in RECORD_ONLY_CLOCK_METADATA_KEYS:
+                values_by_key[key] = None
+            else:
+                values_by_key[key] = _finite_float(
+                    value,
+                    name=f"timestamp_metadata.{key}",
+                )
+        elif key in RECORD_ONLY_CLOCK_METADATA_KEYS:
+            values_by_key[key] = None
         else:
             raise TypeError(f"timestamp_metadata.{key} must be an immutable scalar")
 
@@ -302,6 +355,18 @@ class DetectionSnapshot:
         return self.app_receive_monotonic_s
 
     @property
+    def app_receive_monotonic_ns(self) -> int:
+        value = self.timestamp_metadata.get("app_receive_monotonic_ns")
+        if value is not None and type(value) is not int:
+            raise ValueError("app_receive_monotonic_ns must be an exact integer")
+        result = value if value is not None else int(
+            round(self.app_receive_monotonic_s * 1_000_000_000.0)
+        )
+        if result < 0:
+            raise ValueError("app_receive_monotonic_ns must be non-negative")
+        return result
+
+    @property
     def width(self) -> int:
         return self.width_px
 
@@ -339,6 +404,141 @@ class DetectionSnapshot:
     def same_class_candidate_count(self) -> int:
         candidates = self.candidate_class_ids or (self.class_id,)
         return sum(class_id == self.class_id for class_id in candidates)
+
+
+def live_pair_timing_evidence(
+    left: DetectionSnapshot,
+    right: DetectionSnapshot,
+    *,
+    requested_basis: str,
+    effective_basis: str,
+    fallback_reason: str = "",
+    max_abs_delta_ns: int = LIVE_DISTANCE_MAX_APP_DELTA_NS,
+) -> dict[str, object]:
+    """Freeze selected timing plus distinct app/RTCP evidence for one live pair."""
+
+    if left.camera != "left" or right.camera != "right":
+        raise ValueError("live pair timing requires exact Left/Right identity")
+    left_app_ns = left.app_receive_monotonic_ns
+    right_app_ns = right.app_receive_monotonic_ns
+    signed_app_delta_ns = right_app_ns - left_app_ns
+    abs_app_delta_ns = abs(signed_app_delta_ns)
+
+    left_metadata = left.timestamp_metadata
+    right_metadata = right.timestamp_metadata
+    def record_only_ntp_s(metadata: Mapping[str, object], side: str) -> float | None:
+        try:
+            return _optional_finite_float(
+                metadata.get("rtcp_frame_ntp_unix_s"),
+                name=f"{side} rtcp_frame_ntp_unix_s",
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    left_ntp_s = record_only_ntp_s(left_metadata, "left")
+    right_ntp_s = record_only_ntp_s(right_metadata, "right")
+    signed_ntp_delta_s = (
+        None
+        if left_ntp_s is None or right_ntp_s is None
+        else right_ntp_s - left_ntp_s
+    )
+    requested = str(requested_basis or TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC)
+    effective = str(effective_basis or TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC)
+    if effective in {"detection", "camera_receive", "app_receive"}:
+        effective = TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC
+    if effective == "camera_rtcp":
+        left_selected_s = (
+            left.pairing_timestamp_s
+            if left.pairing_timestamp_basis in {"camera_rtcp", "camera_rtc_required"}
+            else left_ntp_s
+        )
+        right_selected_s = (
+            right.pairing_timestamp_s
+            if right.pairing_timestamp_basis in {"camera_rtcp", "camera_rtc_required"}
+            else right_ntp_s
+        )
+        if left_selected_s is None or right_selected_s is None:
+            raise ValueError("RTCP_TIMESTAMP_UNAVAILABLE")
+        selected_delta_ns = int(
+            round((right_selected_s - left_selected_s) * 1_000_000_000.0)
+        )
+        ntp_role = "selected_distance_pairing"
+        app_role = "attitude_association_and_fallback"
+    elif effective == TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC:
+        selected_delta_ns = signed_app_delta_ns
+        ntp_role = "record_only"
+        app_role = "selected_distance_pairing"
+    else:
+        raise ValueError(f"unsupported live pair timing basis: {effective}")
+    selected_abs_delta_ns = abs(selected_delta_ns)
+    limit_ns = max(0, int(max_abs_delta_ns))
+    if selected_abs_delta_ns > limit_ns:
+        code = (
+            "APP_RECEIVE_DELTA_EXCEEDED"
+            if effective == TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC
+            else "RTCP_DELTA_EXCEEDED"
+        )
+        raise ValueError(
+            f"{code}: {selected_abs_delta_ns}ns > {limit_ns}ns"
+        )
+    return {
+        "schema": "workstation-live-pair-timing-v2",
+        "requested_time_basis": requested,
+        "time_basis": effective,
+        "time_basis_role": "authoritative_distance",
+        "fallback_active": bool(
+            fallback_reason
+            and effective == TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC
+            and requested != effective
+        ),
+        "fallback_reason": str(fallback_reason or ""),
+        "left_app_receive_monotonic_ns": left_app_ns,
+        "right_app_receive_monotonic_ns": right_app_ns,
+        "app_receive_pair_delta_ns": signed_app_delta_ns,
+        "app_receive_pair_abs_delta_ns": abs_app_delta_ns,
+        "app_receive_evidence_role": app_role,
+        "selected_pair_delta_ns": selected_delta_ns,
+        "selected_pair_abs_delta_ns": selected_abs_delta_ns,
+        "selected_left_pairing_timestamp_s": left.pairing_timestamp_s,
+        "selected_right_pairing_timestamp_s": right.pairing_timestamp_s,
+        "pair_delta_s": selected_abs_delta_ns * 1.0e-9,
+        "pair_timing_limit_ns": limit_ns,
+        "app_receive_timestamp_source_by_side": {
+            side: (
+                "exact_monotonic_ns"
+                if detection.timestamp_metadata.get("app_receive_monotonic_ns")
+                is not None
+                else "legacy_float_derived"
+            )
+            for side, detection in (("left", left), ("right", right))
+        },
+        "left_rtcp_frame_ntp_unix_s": left_ntp_s,
+        "right_rtcp_frame_ntp_unix_s": right_ntp_s,
+        "rtcp_pair_delta_s": signed_ntp_delta_s,
+        "ntp_evidence_role": ntp_role,
+        "left_clock_epoch_id": str(left_metadata.get("clock_epoch_id") or ""),
+        "right_clock_epoch_id": str(right_metadata.get("clock_epoch_id") or ""),
+        "left_clock_epoch_state": str(left_metadata.get("clock_epoch_state") or ""),
+        "right_clock_epoch_state": str(right_metadata.get("clock_epoch_state") or ""),
+        "operator_approved_sync_assumption": False,
+    }
+
+
+def app_receive_pair_timing_evidence(
+    left: DetectionSnapshot,
+    right: DetectionSnapshot,
+    *,
+    max_abs_delta_ns: int = LIVE_DISTANCE_MAX_APP_DELTA_NS,
+) -> dict[str, object]:
+    """Compatibility wrapper for explicitly app-selected live pairs."""
+
+    return live_pair_timing_evidence(
+        left,
+        right,
+        requested_basis=TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC,
+        effective_basis=TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC,
+        max_abs_delta_ns=max_abs_delta_ns,
+    )
 
 
 @dataclass(frozen=True)
@@ -1042,6 +1242,24 @@ class MeasurementAttempt:
     measurement_axis_contract: str = MEASUREMENT_AXIS_CONTRACT
     public_vector_contract: str = PUBLIC_MEASUREMENT_VECTOR_CONTRACT
     measurement_unit: str = "m"
+    requested_timestamp_basis: str = ""
+    timing_fallback_reason: str = ""
+    geometry_left_quaternion_wxyz: tuple[float, float, float, float] | None = None
+    geometry_right_quaternion_wxyz: tuple[float, float, float, float] | None = None
+    measurement_yaw_source: str = ""
+    measurement_yaw_selection_mode: str = ""
+    measurement_yaw_branch_offset_deg: float | None = None
+    measurement_yaw_baseline_azimuth_deg: float | None = None
+    measurement_yaw_selected_deg: float | None = None
+    measurement_yaw_p1_reference_deg: float | None = None
+    measurement_yaw_p2_reference_deg: float | None = None
+    measurement_yaw_p1_age_s: float | None = None
+    measurement_yaw_p2_age_s: float | None = None
+    measurement_yaw_score_minus90_deg: float | None = None
+    measurement_yaw_score_plus90_deg: float | None = None
+    measurement_yaw_reverse: bool = False
+    measurement_yaw_consensus: bool | None = None
+    measurement_yaw_low_margin: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "attempt_id", int(self.attempt_id))
@@ -1073,6 +1291,56 @@ class MeasurementAttempt:
             "measurement_unit",
         ):
             object.__setattr__(self, name, str(getattr(self, name)))
+        object.__setattr__(
+            self,
+            "requested_timestamp_basis",
+            str(self.requested_timestamp_basis or self.timestamp_basis),
+        )
+        object.__setattr__(
+            self,
+            "timing_fallback_reason",
+            str(self.timing_fallback_reason or ""),
+        )
+        for field_name in (
+            "geometry_left_quaternion_wxyz",
+            "geometry_right_quaternion_wxyz",
+        ):
+            value = getattr(self, field_name)
+            if value is not None:
+                object.__setattr__(
+                    self,
+                    field_name,
+                    _finite_tuple(value, name=field_name, length=4),
+                )
+        object.__setattr__(self, "measurement_yaw_source", str(self.measurement_yaw_source or ""))
+        object.__setattr__(
+            self,
+            "measurement_yaw_selection_mode",
+            str(self.measurement_yaw_selection_mode or ""),
+        )
+        object.__setattr__(self, "measurement_yaw_reverse", bool(self.measurement_yaw_reverse))
+        object.__setattr__(self, "measurement_yaw_low_margin", bool(self.measurement_yaw_low_margin))
+        object.__setattr__(
+            self,
+            "measurement_yaw_consensus",
+            None if self.measurement_yaw_consensus is None else bool(self.measurement_yaw_consensus),
+        )
+        for field_name in (
+            "measurement_yaw_branch_offset_deg",
+            "measurement_yaw_baseline_azimuth_deg",
+            "measurement_yaw_selected_deg",
+            "measurement_yaw_p1_reference_deg",
+            "measurement_yaw_p2_reference_deg",
+            "measurement_yaw_p1_age_s",
+            "measurement_yaw_p2_age_s",
+            "measurement_yaw_score_minus90_deg",
+            "measurement_yaw_score_plus90_deg",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _optional_finite_float(getattr(self, field_name), name=field_name),
+            )
         object.__setattr__(self, "warnings", tuple(str(value) for value in self.warnings))
         hard_reasons = tuple(
             dict.fromkeys(str(value) for value in self.hard_block_reasons if str(value))
@@ -1129,6 +1397,7 @@ class MeasurementAttempt:
         if self.measurement_geometry_kind not in {
             "legacy",
             "live_pixhawk_mount",
+            "live_pixhawk_baseline_yaw",
             "relative_pose",
             "unresolved",
         }:
@@ -1216,7 +1485,11 @@ class MeasurementAttempt:
                 raise ValueError("Pixhawk attempts must use GPS/RTK baseline provenance")
             basis = self.baseline.left_basis_quaternion_wxyz
             if self.baseline.translation_right_in_left_rdf_m is not None:
-                if self.left_attitude is None or basis != self.left_attitude.quaternion_wxyz:
+                expected_basis = (
+                    self.geometry_left_quaternion_wxyz
+                    or (None if self.left_attitude is None else self.left_attitude.quaternion_wxyz)
+                )
+                if expected_basis is None or basis != expected_basis:
                     raise ValueError("baseline translation and right-ray target must use the same selected left quaternion")
                 if self.baseline.left_basis_attitude_monotonic_s != self.left_attitude.timestamp_s:
                     raise ValueError("baseline translation and right-ray target must use the same selected left attitude timestamp")
@@ -1242,6 +1515,18 @@ class MeasurementAttempt:
     @property
     def translation_right_in_left_m(self) -> tuple[float, float, float] | None:
         return None if self.baseline is None else self.baseline.translation_right_in_left_rdf_m
+
+    @property
+    def geometry_left_quaternion(self) -> tuple[float, float, float, float] | None:
+        return self.geometry_left_quaternion_wxyz or (
+            None if self.left_attitude is None else self.left_attitude.quaternion_wxyz
+        )
+
+    @property
+    def geometry_right_quaternion(self) -> tuple[float, float, float, float] | None:
+        return self.geometry_right_quaternion_wxyz or (
+            None if self.right_attitude is None else self.right_attitude.quaternion_wxyz
+        )
 
     @property
     def pair_sequence(self) -> int:
@@ -1283,7 +1568,35 @@ class MeasurementAttempt:
         return self.geometry_config.to_stereo_calibration(baseline_m=self.baseline_m)
 
     def canonical_payload(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        if (
+            self.requested_timestamp_basis == self.timestamp_basis
+            and not self.timing_fallback_reason
+        ):
+            payload.pop("requested_timestamp_basis", None)
+            payload.pop("timing_fallback_reason", None)
+        optional_defaults = {
+            "geometry_left_quaternion_wxyz": None,
+            "geometry_right_quaternion_wxyz": None,
+            "measurement_yaw_source": "",
+            "measurement_yaw_selection_mode": "",
+            "measurement_yaw_branch_offset_deg": None,
+            "measurement_yaw_baseline_azimuth_deg": None,
+            "measurement_yaw_selected_deg": None,
+            "measurement_yaw_p1_reference_deg": None,
+            "measurement_yaw_p2_reference_deg": None,
+            "measurement_yaw_p1_age_s": None,
+            "measurement_yaw_p2_age_s": None,
+            "measurement_yaw_score_minus90_deg": None,
+            "measurement_yaw_score_plus90_deg": None,
+            "measurement_yaw_reverse": False,
+            "measurement_yaw_consensus": None,
+            "measurement_yaw_low_margin": False,
+        }
+        for name, default in optional_defaults.items():
+            if payload.get(name) == default:
+                payload.pop(name, None)
+        return payload
 
     @classmethod
     def from_canonical_payload(cls, payload: Mapping[str, Any]) -> "MeasurementAttempt":
@@ -1367,7 +1680,7 @@ class MeasurementAttempt:
         return f"attempt:{self.canonical_sha256()}"
 
     def content_canonical_payload(self) -> dict[str, Any]:
-        payload = asdict(self)
+        payload = self.canonical_payload()
         for field_name in (
             "attempt_id",
             "attempt_session_id",
@@ -1385,7 +1698,7 @@ class MeasurementAttempt:
     def instance_canonical_payload(self) -> dict[str, Any]:
         return {
             "measurement_attempt_content_sha256": self.content_sha256(),
-            "instance": asdict(self),
+            "instance": self.canonical_payload(),
         }
 
     def instance_sha256(self) -> str:
@@ -1406,6 +1719,8 @@ class BlockedMeasurementPair:
     reasons: tuple[str, ...]
     readiness_sha256: str
     readiness_payload_json: str = ""
+    requested_timestamp_basis: str = ""
+    timing_fallback_reason: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "detection_pair_key", tuple(self.detection_pair_key))
@@ -1420,6 +1735,16 @@ class BlockedMeasurementPair:
             _finite_float(self.created_wall_s, name="created_wall_s"),
         )
         object.__setattr__(self, "timestamp_basis", str(self.timestamp_basis))
+        object.__setattr__(
+            self,
+            "requested_timestamp_basis",
+            str(self.requested_timestamp_basis or self.timestamp_basis),
+        )
+        object.__setattr__(
+            self,
+            "timing_fallback_reason",
+            str(self.timing_fallback_reason or ""),
+        )
         object.__setattr__(self, "status", str(self.status))
         object.__setattr__(self, "reasons", tuple(str(value) for value in self.reasons))
         object.__setattr__(self, "readiness_sha256", str(self.readiness_sha256))
@@ -1447,7 +1772,14 @@ class BlockedMeasurementPair:
             raise ValueError("readiness_sha256 must be SHA-256 hex")
 
     def canonical_payload(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        if (
+            self.requested_timestamp_basis == self.timestamp_basis
+            and not self.timing_fallback_reason
+        ):
+            payload.pop("requested_timestamp_basis", None)
+            payload.pop("timing_fallback_reason", None)
+        return payload
 
     def canonical_json(self) -> str:
         """Return the exact canonical JSON retained as blocked-pair evidence."""
@@ -1478,6 +1810,16 @@ def detection_pair_key(
     return (
         str(triangulation_source),
         str(timestamp_basis),
+        int(
+            getattr(left, "app_receive_monotonic_ns", None)
+            or getattr(left, "timestamp_metadata", {}).get("app_receive_monotonic_ns")
+            or round(float(left.timestamp_s) * 1_000_000_000.0)
+        ),
+        int(
+            getattr(right, "app_receive_monotonic_ns", None)
+            or getattr(right, "timestamp_metadata", {}).get("app_receive_monotonic_ns")
+            or round(float(right.timestamp_s) * 1_000_000_000.0)
+        ),
         _finite_float(left.timestamp_s, name="left timestamp"),
         _finite_float(right.timestamp_s, name="right timestamp"),
         _finite_float(left_pairing_timestamp_s, name="left pairing timestamp"),

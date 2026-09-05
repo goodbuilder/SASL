@@ -55,6 +55,7 @@ from Workstation.workstation_core.gnss_protocol import (
     GNSS_BASE_SURVEY_TREND_WINDOW_S,
     Rtcm3StreamParser,
     parse_rtcm3_message_type,
+    parse_rtcm3_reference_station_arp,
     parse_ubx_ack,
     parse_ubx_cfg_tmode3,
     ubx_cfg_tmode3_disabled_frame,
@@ -71,6 +72,10 @@ from Workstation.workstation_core.rtcm_pipeline import (
     append_rtcm_evidence,
     load_rtcm_evidence_high_water,
 )
+
+SYSTEM_CENTER_GGA_MAXIMUM_GPS_SAMPLE_AGE_S = 10.0
+SYSTEM_CENTER_GGA_MAXIMUM_LEFT_RIGHT_TIMESTAMP_DELTA_MS = 3_000.0
+
 
 class NtripCredentialError(RuntimeError):
     """Raised by ``_resolve_ntrip_credentials`` with a precise, user-facing reason.
@@ -1092,18 +1097,26 @@ class GnssRuntimeController:
         left = self._selected_rover_gps_state("left")
         right = self._selected_rover_gps_state("right")
         now_s = time.monotonic()
-        maximum_age_s = float(active_config.readiness.maximum_gps_sample_age_s)
+        maximum_age_s = (
+            SYSTEM_CENTER_GGA_MAXIMUM_GPS_SAMPLE_AGE_S
+            if policy == GgaPolicy.SYSTEM_CENTER
+            else float(active_config.readiness.maximum_gps_sample_age_s)
+        )
 
-        def fresh(position: object, side: str) -> object | None:
+        def fresh(position: object, side: str, *, log: bool = True) -> object | None:
+            def skip(key: str, message: str) -> None:
+                if log:
+                    log_skip(key, message)
+
             if position is None:
-                log_skip(
+                skip(
                     f"{side}-missing",
                     f"[GNSS][NTRIP] GGA skipped: {side} GNSS has no message "
                     f"(policy={policy.value})",
                 )
                 return None
             if not bool(getattr(position, "has_position", False)):
-                log_skip(
+                skip(
                     f"{side}-incomplete",
                     f"[GNSS][NTRIP] GGA skipped: {side} GNSS position is incomplete "
                     f"(policy={policy.value})",
@@ -1115,14 +1128,14 @@ class GnssRuntimeController:
             except (AttributeError, TypeError, ValueError):
                 age_s = float("nan")
             if not isfinite(age_s) or age_s < 0.0:
-                log_skip(
+                skip(
                     f"{side}-timestamp-invalid",
                     f"[GNSS][NTRIP] GGA skipped: {side} GNSS timestamp is invalid "
                     f"(policy={policy.value})",
                 )
                 return None
             if age_s > maximum_age_s:
-                log_skip(
+                skip(
                     f"{side}-stale",
                     f"[GNSS][NTRIP] GGA skipped: {side} GNSS sample is stale "
                     f"(age={age_s:.3f}s > {maximum_age_s:.3f}s, policy={policy.value})",
@@ -1134,8 +1147,30 @@ class GnssRuntimeController:
             selected = fresh(left, "left")
             return None if selected is None else gga_from_position(selected)
         if policy == GgaPolicy.PER_ROVER_SESSION:
-            selected = fresh(left, "left")
-            return None if selected is None else gga_from_position(selected)
+            # P1 and P2 may only be connectable one at a time.  A VRS caster
+            # only needs the rover placed within its service area, and the two
+            # antennas sit metres apart, so the session sends whichever rover
+            # is currently delivering instead of requiring one fixed side.
+            # Left wins when both deliver, keeping the both-connected result
+            # identical to the previous behaviour.
+            for side, position in (("left", left), ("right", right)):
+                selected = fresh(position, side, log=False)
+                if selected is not None:
+                    return gga_from_position(selected)
+
+            def describe(position: object) -> str:
+                if position is None:
+                    return "no message received"
+                if not bool(getattr(position, "has_position", False)):
+                    return "message received but lat/lon/alt incomplete"
+                return "stale or invalid timestamp"
+
+            log_skip(
+                "per-rover-session-unavailable",
+                "[GNSS][NTRIP] GGA skipped: no connected rover has a usable position "
+                f"(policy={policy.value}, left={describe(left)}, right={describe(right)})",
+            )
+            return None
         # SYSTEM_CENTER: average WGS84 geodetic values for the two antenna hints.
         fresh_left = fresh(left, "left")
         fresh_right = fresh(right, "right")
@@ -1157,9 +1192,7 @@ class GnssRuntimeController:
             float(getattr(fresh_right, "timestamp_s"))
             - float(getattr(fresh_left, "timestamp_s"))
         ) * 1000.0
-        maximum_delta_ms = float(
-            active_config.readiness.maximum_left_right_timestamp_delta_ms
-        )
+        maximum_delta_ms = SYSTEM_CENTER_GGA_MAXIMUM_LEFT_RIGHT_TIMESTAMP_DELTA_MS
         if timestamp_delta_ms > maximum_delta_ms:
             log_skip(
                 "system-center-skew",
@@ -2801,6 +2834,20 @@ class GnssRuntimeController:
                 message_types = {}
                 stats["message_types"] = message_types
             message_types[message_type] = int(message_types.get(message_type, 0)) + 1
+        reference = parse_rtcm3_reference_station_arp(payload)
+        if reference is not None:
+            # A VRS caster fixes its virtual station from the GGA sent at
+            # session start and holds it for that session, so this value
+            # identifies the frame every rover fix from this stream resolves
+            # against.  It is only replaced by a newly observed one, never
+            # cleared on a stream gap: the retained fixes still belong to the
+            # station they were measured under.
+            station_id, ecef_01mm = reference
+            self.panel.latest_rtcm_reference_station = {
+                "station_id": int(station_id),
+                "ecef_01mm": tuple(int(value) for value in ecef_01mm),
+                "observed_monotonic_s": time.monotonic(),
+            }
 
     def _append_rtcm_package_evidence(
         self,

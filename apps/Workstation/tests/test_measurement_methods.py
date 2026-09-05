@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import pytest
 from types import SimpleNamespace
 
@@ -43,6 +45,47 @@ from Workstation.workstation_core.measurement_methods import (
     MEASUREMENT_FILL_LIVE_PIXHAWK,
     MEASUREMENT_FILL_NONE,
 )
+
+
+def test_tolerant_unverified_detection_is_admitted_to_measurement_pipeline() -> None:
+    submitted: list[tuple[object, ...]] = []
+    left_buffer: list[DetectionObservation] = []
+    panel = SimpleNamespace(
+        latest_left=None,
+        latest_right=None,
+        detection_buffers={
+            "left": SimpleNamespace(add=left_buffer.append),
+            "right": SimpleNamespace(add=lambda _value: None),
+        },
+    )
+    controller = MeasurementViewController(panel)
+    controller._ensure_detection_pair_coordinator = lambda: SimpleNamespace(
+        submit=lambda *args, **kwargs: submitted.append((*args, kwargs))
+    )
+    controller._pairing_policy_snapshot = lambda: "policy"
+    detection = DetectionObservation(
+        camera="left",
+        timestamp_s=1.0,
+        width=640,
+        height=480,
+        x1=10.0,
+        y1=20.0,
+        x2=30.0,
+        y2=40.0,
+        confidence=0.9,
+        class_id=0,
+        timestamp_metadata={
+            "media_integrity_mode": "tolerant_decoded",
+            "media_integrity_unverified": True,
+            "measurement_input_admitted": True,
+        },
+    )
+
+    controller._update_detection("left", detection)
+
+    assert panel.latest_left is detection
+    assert left_buffer == [detection]
+    assert submitted and submitted[0][0:2] == ("left", detection)
 from Workstation.workstation_core.settings import load_settings, save_settings
 
 
@@ -453,12 +496,12 @@ def test_method_input_snapshot_keeps_live_attitude_and_gnss_baseline_contracts_s
     assert values["stereo_extrinsics_opencv_rdf"] is None
 
 
-def test_zoom_mismatch_blocks_every_measurement_geometry_source() -> None:
+def test_resolution_mismatch_blocks_every_measurement_geometry_source() -> None:
     profile_hash = "a" * 64
     controller = _method_readiness_controller(
         geometry_allowed=False,
         profile_hash=profile_hash,
-        applicability_reasons=("left_operating_zoom_mismatch",),
+        applicability_reasons=("left_frame_resolution_mismatch",),
         candidate_profile_hash=profile_hash,
     )
 
@@ -475,7 +518,7 @@ def test_zoom_mismatch_blocks_every_measurement_geometry_source() -> None:
     assert all(row.ready is False for row in selected)
     assert all("exact operating K,D not applicable" in row.reasons for row in selected)
     assert all(
-        "K,D applicability: left_operating_zoom_mismatch" in row.reasons
+        "K,D applicability: left_frame_resolution_mismatch" in row.reasons
         for row in selected
     )
 
@@ -517,8 +560,8 @@ def test_field_live_readiness_accepts_same_measurement_stale_samples(monkeypatch
     panel = SimpleNamespace(
         _measurement_started_monotonic_s=90.0,
         latest_extrinsics={
-            "left": SimpleNamespace(timestamp_s=91.0),
-            "right": SimpleNamespace(timestamp_s=91.1),
+            "left": SimpleNamespace(timestamp_s=91.0, q=(1.0, 0.0, 0.0, 0.0)),
+            "right": SimpleNamespace(timestamp_s=91.1, q=(1.0, 0.0, 0.0, 0.0)),
         },
         latest_rtk_baseline=baseline,
         _selected_baseline_gps_states=lambda: (left_gps, right_gps),
@@ -537,15 +580,15 @@ def test_field_live_readiness_accepts_same_measurement_stale_samples(monkeypatch
     assert "fix quality low" in advisories
 
 
-def test_field_live_readiness_reuses_valid_gps_from_before_measurement(monkeypatch) -> None:
+def test_field_live_readiness_reuses_valid_inputs_from_before_measurement(monkeypatch) -> None:
     monkeypatch.setattr("Workstation.measurement_view_controller.time.monotonic", lambda: 100.0)
     left_gps = _gps_state("left", timestamp_s=80.0)
     right_gps = _gps_state("right", timestamp_s=80.1, longitude_deg=127.00001)
     panel = SimpleNamespace(
         _measurement_started_monotonic_s=90.0,
         latest_extrinsics={
-            "left": SimpleNamespace(timestamp_s=80.0),
-            "right": SimpleNamespace(timestamp_s=80.1),
+            "left": SimpleNamespace(timestamp_s=80.0, q=(1.0, 0.0, 0.0, 0.0)),
+            "right": SimpleNamespace(timestamp_s=80.1, q=(1.0, 0.0, 0.0, 0.0)),
         },
         latest_rtk_baseline=SimpleNamespace(baseline_m=1.0, warnings=()),
         _selected_baseline_gps_states=lambda: (left_gps, right_gps),
@@ -557,10 +600,14 @@ def test_field_live_readiness_reuses_valid_gps_from_before_measurement(monkeypat
         panel
     )._measurement_live_readiness()
 
-    assert pixhawk_ready is False
+    assert pixhawk_ready is True
     assert gnss_ready is True
-    assert all("GNSS" not in reason for reason in hard)
+    assert hard == ()
     assert any("latest valid 3D fix" in warning for warning in advisories)
+    assert any(
+        "Pixhawk attitude reused from latest valid sample" in warning
+        for warning in advisories
+    )
 
 
 def test_measurement_gps_cache_updates_sides_independently_and_ignores_sub_3d_fix() -> None:
@@ -912,6 +959,10 @@ def test_no_ready_method_pair_is_retained_as_blocked_recording_evidence() -> Non
     assert row["measurement_valid"] == "false"
     assert row["pair_status"] == "matched_no_ready_measurement_method"
     assert row["measurement_geometry_kind"] == "unresolved"
+    assert row["pairing_time_basis"] == "app_receive_monotonic"
+    assert row["selected_pair_delta_ns"] == 10_000_000
+    assert row["sync_delta_ns"] == 10_000_000
+    assert row["ntp_evidence_role"] == "record_only"
 
 
 def test_preflight_explicitly_blocks_when_method_snapshot_has_no_ready_source() -> None:
@@ -1101,3 +1152,433 @@ def test_pixhawk_triangulation_normalizes_each_attitude_once(monkeypatch) -> Non
         translation_right_in_left_m=translation,
     )
     assert len(calls) == 2
+
+
+def _attitude_state(
+    side: str,
+    *,
+    timestamp_s: float,
+    q: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0),
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        camera=side,
+        namespace=f"{side}-pixhawk",
+        timestamp_s=timestamp_s,
+        topic="mavlink/ATTITUDE",
+        q=q,
+    )
+
+
+def _retained_attitude_panel(**overrides) -> SimpleNamespace:
+    panel = SimpleNamespace(
+        _measurement_started_monotonic_s=90.0,
+        latest_extrinsics={},
+        gnss_operation_gate_active=False,
+    )
+    for name, value in overrides.items():
+        setattr(panel, name, value)
+    return panel
+
+
+def test_measurement_attitude_cache_retains_disconnected_side() -> None:
+    panel = _retained_attitude_panel(
+        latest_extrinsics={
+            "left": _attitude_state("left", timestamp_s=91.0),
+            "right": _attitude_state("right", timestamp_s=91.1),
+        }
+    )
+    controller = MeasurementViewController(panel)
+
+    first_left, first_right, first_reused = controller._cached_measurement_attitude_states()
+    assert first_left is not None and first_right is not None
+    assert first_reused == ()
+
+    # The right side disconnects; its owner stops publishing a live sample.
+    panel.latest_extrinsics = {"left": _attitude_state("left", timestamp_s=92.0)}
+    second_left, second_right, second_reused = controller._cached_measurement_attitude_states()
+
+    assert second_left.timestamp_s == 92.0
+    assert second_right is first_right
+    assert second_reused == ("right_attitude",)
+
+
+def test_measurement_attitude_cache_replaces_retained_with_newer_live_sample() -> None:
+    panel = _retained_attitude_panel(
+        latest_extrinsics={"left": _attitude_state("left", timestamp_s=91.0)}
+    )
+    controller = MeasurementViewController(panel)
+    controller._cached_measurement_attitude_states()
+
+    panel.latest_extrinsics = {}
+    _left, _right, reused = controller._cached_measurement_attitude_states()
+    assert reused == ("left_attitude",)
+
+    newer = _attitude_state("left", timestamp_s=95.0)
+    panel.latest_extrinsics = {"left": newer}
+    left, _right, reused = controller._cached_measurement_attitude_states()
+
+    assert left is newer
+    assert reused == ()
+
+
+def test_measurement_attitude_cache_rejects_never_observed_and_invalid_samples() -> None:
+    panel = _retained_attitude_panel(
+        latest_extrinsics={
+            "left": _attitude_state("left", timestamp_s=float("nan")),
+            "right": _attitude_state("right", timestamp_s=91.0, q=(0.0, 0.0, 0.0, 0.0)),
+        }
+    )
+    controller = MeasurementViewController(panel)
+
+    left, right, reused = controller._cached_measurement_attitude_states()
+
+    assert left is None
+    assert right is None
+    assert reused == ()
+
+
+def test_measurement_attitude_cache_is_process_local_per_controller() -> None:
+    panel = _retained_attitude_panel(
+        latest_extrinsics={"left": _attitude_state("left", timestamp_s=91.0)}
+    )
+    MeasurementViewController(panel)._cached_measurement_attitude_states()
+
+    restarted_panel = _retained_attitude_panel()
+    left, right, reused = MeasurementViewController(
+        restarted_panel
+    )._cached_measurement_attitude_states()
+
+    assert left is None
+    assert right is None
+    assert reused == ()
+
+
+def test_field_live_readiness_reuses_attitude_after_disconnect(monkeypatch) -> None:
+    monkeypatch.setattr("Workstation.measurement_view_controller.time.monotonic", lambda: 100.0)
+    left_gps = _gps_state("left", timestamp_s=99.0)
+    right_gps = _gps_state("right", timestamp_s=99.1, longitude_deg=127.00001)
+    panel = _retained_attitude_panel(
+        latest_extrinsics={
+            "left": _attitude_state("left", timestamp_s=91.0),
+            "right": _attitude_state("right", timestamp_s=91.1),
+        },
+        latest_rtk_baseline=SimpleNamespace(baseline_m=1.0, warnings=()),
+        _selected_baseline_gps_states=lambda: (left_gps, right_gps),
+        _gps_baseline_usable_for_translation=lambda _baseline: (True, "usable"),
+    )
+    controller = MeasurementViewController(panel)
+    controller._measurement_live_readiness()
+
+    panel.latest_extrinsics = {}
+    pixhawk_ready, gnss_ready, hard, advisories = controller._measurement_live_readiness()
+
+    assert pixhawk_ready is True
+    assert gnss_ready is True
+    assert hard == ()
+    assert any(
+        "Pixhawk attitude reused from latest valid sample" in warning
+        for warning in advisories
+    )
+
+
+def test_field_live_readiness_blocks_side_that_never_produced_attitude(monkeypatch) -> None:
+    monkeypatch.setattr("Workstation.measurement_view_controller.time.monotonic", lambda: 100.0)
+    left_gps = _gps_state("left", timestamp_s=99.0)
+    right_gps = _gps_state("right", timestamp_s=99.1, longitude_deg=127.00001)
+    panel = _retained_attitude_panel(
+        latest_extrinsics={"left": _attitude_state("left", timestamp_s=91.0)},
+        latest_rtk_baseline=SimpleNamespace(baseline_m=1.0, warnings=()),
+        _selected_baseline_gps_states=lambda: (left_gps, right_gps),
+        _gps_baseline_usable_for_translation=lambda _baseline: (True, "usable"),
+    )
+
+    pixhawk_ready, _gnss_ready, hard, _advisories = MeasurementViewController(
+        panel
+    )._measurement_live_readiness()
+
+    assert pixhawk_ready is False
+    assert "right Pixhawk attitude missing" in hard
+
+
+def test_measurement_gps_cache_honours_configured_minimum_fix_type() -> None:
+    fixed = _gps_state("left", timestamp_s=91.0, fix_type=6)
+    floated = _gps_state("left", timestamp_s=92.0, fix_type=5)
+    panel = SimpleNamespace(
+        _measurement_started_monotonic_s=90.0,
+        gnss_operation_manager=SimpleNamespace(
+            config=GnssOperationConfig(readiness=ReadinessConfig(minimum_fix_type=6))
+        ),
+        _pixhawk_gnss_source=lambda _side: "GPS1",
+        _selected_baseline_gps_states=lambda: (fixed, None),
+    )
+    controller = MeasurementViewController(panel)
+    controller._cached_measurement_gps_states()
+
+    # A later RTK-float sample must not displace the retained RTK-fixed value.
+    panel._selected_baseline_gps_states = lambda: (floated, None)
+    left, _right, reused = controller._cached_measurement_gps_states()
+
+    assert left is fixed
+    assert "left_gps" in reused
+
+
+def _correction_frame_panel(*, identity_id: str, base_hash: str, **overrides):
+    panel = SimpleNamespace(
+        _measurement_started_monotonic_s=90.0,
+        gnss_operation_manager=SimpleNamespace(
+            config=GnssOperationConfig(),
+            source_identity=SimpleNamespace(stable_id=identity_id),
+        ),
+        gnss_fixed_base_profile=SimpleNamespace(profile_hash=base_hash),
+        _pixhawk_gnss_source=lambda _side: "GPS1",
+    )
+    for name, value in overrides.items():
+        setattr(panel, name, value)
+    return panel
+
+
+def test_measurement_gps_cache_survives_unchanged_correction_frame() -> None:
+    left = _gps_state("left", timestamp_s=91.0)
+    right = _gps_state("right", timestamp_s=95.0, longitude_deg=127.00001)
+    panel = _correction_frame_panel(
+        identity_id="source-a",
+        base_hash="base-1",
+        _selected_baseline_gps_states=lambda: (left, right),
+    )
+    controller = MeasurementViewController(panel)
+    controller._cached_measurement_gps_states()
+
+    # P1 is unplugged so P2 can be connected; the frame is unchanged.
+    panel._selected_baseline_gps_states = lambda: (None, right)
+    cached_left, cached_right, reused = controller._cached_measurement_gps_states()
+
+    assert cached_left is left
+    assert cached_right is right
+    assert "left_gps" in reused
+
+
+def test_measurement_gps_cache_drops_retained_pair_when_base_coordinate_changes() -> None:
+    left = _gps_state("left", timestamp_s=91.0)
+    right = _gps_state("right", timestamp_s=95.0, longitude_deg=127.00001)
+    panel = _correction_frame_panel(
+        identity_id="source-a",
+        base_hash="base-1",
+        _selected_baseline_gps_states=lambda: (left, right),
+    )
+    controller = MeasurementViewController(panel)
+    controller._cached_measurement_gps_states()
+
+    # The Base is re-surveyed while only P2 is connected.  Both retained fixes
+    # resolve against a coordinate that no longer applies, so both are dropped.
+    panel.gnss_fixed_base_profile = SimpleNamespace(profile_hash="base-2")
+    panel._selected_baseline_gps_states = lambda: (None, right)
+    cached_left, cached_right, _reused = controller._cached_measurement_gps_states()
+
+    assert cached_left is None
+    assert cached_right is None
+
+    # P2 is still connected, so its next sample restores it under the new frame.
+    refixed = _gps_state("right", timestamp_s=time.monotonic() + 1.0, longitude_deg=127.00001)
+    panel._selected_baseline_gps_states = lambda: (None, refixed)
+    cached_left, cached_right, _reused = controller._cached_measurement_gps_states()
+
+    assert cached_left is None
+    assert cached_right is refixed
+
+
+def test_measurement_gps_cache_drops_retained_pair_when_correction_source_changes() -> None:
+    left = _gps_state("left", timestamp_s=91.0)
+    panel = _correction_frame_panel(
+        identity_id="source-a",
+        base_hash="base-1",
+        _selected_baseline_gps_states=lambda: (left, None),
+    )
+    controller = MeasurementViewController(panel)
+    controller._cached_measurement_gps_states()
+
+    panel.gnss_operation_manager = SimpleNamespace(
+        config=GnssOperationConfig(),
+        source_identity=SimpleNamespace(stable_id="source-b"),
+    )
+    cached_left, _cached_right, _reused = controller._cached_measurement_gps_states()
+
+    assert cached_left is None
+
+
+def test_field_live_readiness_reports_sequential_gps_pair_span(monkeypatch) -> None:
+    monkeypatch.setattr("Workstation.measurement_view_controller.time.monotonic", lambda: 400.0)
+    left_gps = _gps_state("left", timestamp_s=100.0)
+    right_gps = _gps_state("right", timestamp_s=340.0, longitude_deg=127.00001)
+    panel = _correction_frame_panel(
+        identity_id="source-a",
+        base_hash="base-1",
+        latest_extrinsics={
+            "left": _attitude_state("left", timestamp_s=340.0),
+            "right": _attitude_state("right", timestamp_s=340.1),
+        },
+        latest_rtk_baseline=SimpleNamespace(baseline_m=1.0, warnings=()),
+        _selected_baseline_gps_states=lambda: (left_gps, right_gps),
+        _gps_baseline_usable_for_translation=lambda _baseline: (True, "usable"),
+        gnss_operation_gate_active=False,
+    )
+
+    _pixhawk_ready, gnss_ready, hard, advisories = MeasurementViewController(
+        panel
+    )._measurement_live_readiness()
+
+    assert gnss_ready is True
+    assert hard == ()
+    assert any("240.000s apart" in warning for warning in advisories)
+
+
+def test_field_live_readiness_omits_pair_span_advisory_within_limit(monkeypatch) -> None:
+    monkeypatch.setattr("Workstation.measurement_view_controller.time.monotonic", lambda: 400.0)
+    left_gps = _gps_state("left", timestamp_s=399.98)
+    right_gps = _gps_state("right", timestamp_s=400.0, longitude_deg=127.00001)
+    panel = _correction_frame_panel(
+        identity_id="source-a",
+        base_hash="base-1",
+        latest_extrinsics={
+            "left": _attitude_state("left", timestamp_s=399.9),
+            "right": _attitude_state("right", timestamp_s=400.0),
+        },
+        latest_rtk_baseline=SimpleNamespace(baseline_m=1.0, warnings=()),
+        _selected_baseline_gps_states=lambda: (left_gps, right_gps),
+        _gps_baseline_usable_for_translation=lambda _baseline: (True, "usable"),
+        gnss_operation_gate_active=False,
+    )
+
+    _pixhawk_ready, gnss_ready, _hard, advisories = MeasurementViewController(
+        panel
+    )._measurement_live_readiness()
+
+    assert gnss_ready is True
+    assert all("apart" not in warning for warning in advisories)
+
+
+def _vrs_station(x: int = -31780381194, y: int = 41852590653, z: int = 36025161845) -> dict:
+    return {"station_id": 4095, "ecef_01mm": (x, y, z), "observed_monotonic_s": 0.0}
+
+
+def test_measurement_gps_cache_survives_identical_vrs_reference_station() -> None:
+    left = _gps_state("left", timestamp_s=91.0)
+    right = _gps_state("right", timestamp_s=95.0, longitude_deg=127.00001)
+    panel = _correction_frame_panel(
+        identity_id="source-a",
+        base_hash="",
+        latest_rtcm_reference_station=_vrs_station(),
+        _selected_baseline_gps_states=lambda: (left, right),
+    )
+    controller = MeasurementViewController(panel)
+    controller._cached_measurement_gps_states()
+
+    # NTRIP reconnects for the P2 session and the caster reissues the same
+    # virtual station, so the retained P1 fix stays comparable.
+    panel._selected_baseline_gps_states = lambda: (None, right)
+    cached_left, cached_right, reused = controller._cached_measurement_gps_states()
+
+    assert cached_left is left
+    assert cached_right is right
+    assert "left_gps" in reused
+
+
+def test_measurement_gps_cache_drops_pair_when_vrs_reference_station_moves() -> None:
+    left = _gps_state("left", timestamp_s=91.0)
+    right = _gps_state("right", timestamp_s=95.0, longitude_deg=127.00001)
+    panel = _correction_frame_panel(
+        identity_id="source-a",
+        base_hash="",
+        latest_rtcm_reference_station=_vrs_station(),
+        _selected_baseline_gps_states=lambda: (left, right),
+    )
+    controller = MeasurementViewController(panel)
+    controller._cached_measurement_gps_states()
+
+    # The P2 session reconnects with its own GGA, so the caster places the
+    # virtual station elsewhere.  The caster/mountpoint identity is unchanged,
+    # so only the observed station can reveal the move.
+    panel.latest_rtcm_reference_station = _vrs_station(x=-31780381194 + 20000)
+    panel._selected_baseline_gps_states = lambda: (None, right)
+    cached_left, cached_right, _reused = controller._cached_measurement_gps_states()
+
+    assert cached_left is None
+    assert cached_right is None
+
+
+def test_measurement_correction_frame_token_tracks_the_observed_station() -> None:
+    panel = _correction_frame_panel(
+        identity_id="source-a",
+        base_hash="",
+        latest_rtcm_reference_station=_vrs_station(),
+        _selected_baseline_gps_states=lambda: (None, None),
+    )
+    controller = MeasurementViewController(panel)
+    first = controller._measurement_correction_frame_token()
+
+    panel.latest_rtcm_reference_station = _vrs_station(z=36025161845 + 1)
+    assert controller._measurement_correction_frame_token() != first
+
+    panel.latest_rtcm_reference_station = _vrs_station()
+    assert controller._measurement_correction_frame_token() == first
+
+
+def test_field_live_readiness_explains_a_correction_frame_drop(monkeypatch) -> None:
+    monkeypatch.setattr("Workstation.measurement_view_controller.time.monotonic", lambda: 400.0)
+    left = _gps_state("left", timestamp_s=390.0)
+    right = _gps_state("right", timestamp_s=395.0, longitude_deg=127.00001)
+    panel = _correction_frame_panel(
+        identity_id="source-a",
+        base_hash="",
+        latest_rtcm_reference_station=_vrs_station(),
+        latest_extrinsics={
+            "left": _attitude_state("left", timestamp_s=399.0),
+            "right": _attitude_state("right", timestamp_s=399.1),
+        },
+        latest_rtk_baseline=SimpleNamespace(baseline_m=1.0, warnings=()),
+        _selected_baseline_gps_states=lambda: (left, right),
+        _gps_baseline_usable_for_translation=lambda _baseline: (True, "usable"),
+        gnss_operation_gate_active=False,
+    )
+    controller = MeasurementViewController(panel)
+    controller._measurement_live_readiness()
+
+    # The P2 session reconnects and the caster issues a different virtual
+    # station, so both retained fixes are discarded.
+    panel.latest_rtcm_reference_station = _vrs_station(x=-31780381194 + 20000)
+    panel._selected_baseline_gps_states = lambda: (None, None)
+    _pixhawk_ready, gnss_ready, hard, advisories = controller._measurement_live_readiness()
+
+    assert gnss_ready is False
+    assert "live GNSS baseline missing" in hard
+    assert any(
+        "GNSS correction frame changed" in warning
+        and "left,right" in warning
+        and "reconnect that board" in warning
+        for warning in advisories
+    )
+
+
+def test_field_live_readiness_has_no_frame_drop_advisory_in_normal_operation(monkeypatch) -> None:
+    monkeypatch.setattr("Workstation.measurement_view_controller.time.monotonic", lambda: 400.0)
+    left = _gps_state("left", timestamp_s=399.0)
+    right = _gps_state("right", timestamp_s=399.1, longitude_deg=127.00001)
+    panel = _correction_frame_panel(
+        identity_id="source-a",
+        base_hash="",
+        latest_rtcm_reference_station=_vrs_station(),
+        latest_extrinsics={
+            "left": _attitude_state("left", timestamp_s=399.0),
+            "right": _attitude_state("right", timestamp_s=399.1),
+        },
+        latest_rtk_baseline=SimpleNamespace(baseline_m=1.0, warnings=()),
+        _selected_baseline_gps_states=lambda: (left, right),
+        _gps_baseline_usable_for_translation=lambda _baseline: (True, "usable"),
+        gnss_operation_gate_active=False,
+    )
+
+    _pixhawk_ready, gnss_ready, _hard, advisories = MeasurementViewController(
+        panel
+    )._measurement_live_readiness()
+
+    assert gnss_ready is True
+    assert all("correction frame changed" not in warning for warning in advisories)

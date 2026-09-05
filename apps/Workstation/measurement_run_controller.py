@@ -278,6 +278,13 @@ class MeasurementRunController:
         except Exception:
             method_owner = None
         builder = getattr(method_owner, "measurement_method_config_for_new_measurement", None)
+        begin_pairing_generation = getattr(
+            method_owner,
+            "begin_pairing_generation",
+            None,
+        )
+        if callable(begin_pairing_generation):
+            begin_pairing_generation()
         if callable(builder):
             try:
                 value = builder()
@@ -297,6 +304,9 @@ class MeasurementRunController:
             **dict(metadata or {}),
             **method_config,
         }
+        mag_gate = getattr(self.panel, "_last_measurement_mag_gate", None)
+        if isinstance(mag_gate, Mapping) and bool(mag_gate.get("required")):
+            self.panel._measurement_run_metadata["pixhawk_mag_selection"] = dict(mag_gate)
         self.panel._measurement_run_started_utc_ns = started_utc_ns
         self.panel._measurement_run_started_monotonic_ns = started_monotonic_ns
         self.panel._measurement_run_active_sides = ()

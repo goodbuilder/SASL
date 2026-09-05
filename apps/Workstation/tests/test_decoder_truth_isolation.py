@@ -271,6 +271,9 @@ def test_bus_error_routing_only_marks_decoder_health_for_fallback(
             return None
 
     class Pipeline:
+        def get_by_name(self, _name: str) -> None:
+            return None
+
         def set_state(self, _state: object) -> None:
             return None
 

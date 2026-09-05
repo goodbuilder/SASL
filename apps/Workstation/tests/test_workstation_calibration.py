@@ -257,6 +257,15 @@ def test_calibration_workspace_separates_live_and_ftp_previews_with_actions_belo
     assert "X_right = R_left_to_right X_left" in (
         workspace.extrinsics_bundle_contract_label.text()
     )
+    extrinsics_capture_text = " ".join(
+        label.text()
+        for label in workspace.extrinsics_operation_tabs.widget(0).findChildren(
+            QtWidgets.QLabel
+        )
+    )
+    assert "K,D must match the native raster" in extrinsics_capture_text
+    assert "does not gate readiness" in extrinsics_capture_text
+    assert "must match camera, raster, focus, and zoom" not in extrinsics_capture_text
     assert set(workspace.camera_buttons) == {"camera.toggle"}
     assert workspace.zoom_set_button.text() == "Set both"
     assert workspace.zoom_in_button.text() == "Zoom-in"
@@ -281,6 +290,12 @@ def test_calibration_workspace_separates_live_and_ftp_previews_with_actions_belo
     )
     assert workspace.capture_primary_button.isVisible()
     assert workspace.capture_primary_button.text() == "Capture Live Pair"
+    pair_delta_tooltip = workspace.setup_widgets["pair_max_delta_ms"].toolTip()
+    assert "app-receive monotonic" in pair_delta_tooltip
+    assert "Neither host proxy proves exposure simultaneity" in pair_delta_tooltip
+    assert "exact NAL1 non-delta native FrameKeys" in workspace.operation_buttons[
+        "calibration.auto_capture"
+    ].toolTip()
     assert workspace.operation_tabs.height() <= 260
     assert workspace.auto_capture_settings_content.isHidden()
     assert workspace.capture_response_content.isHidden()
@@ -353,6 +368,17 @@ def test_calibration_workspace_separates_live_and_ftp_previews_with_actions_belo
 
     assert workspace.previews["left"].meta.text().startswith("LIVE | Class: --")
     assert workspace.previews["right"].meta.text().startswith("LIVE | Class: --")
+    left_pane.frame_changed.emit(
+        "left",
+        image,
+        {
+            "timestamp_s": 25.0,
+            "media_integrity_mode": "tolerant_decoded",
+            "media_integrity_unverified": True,
+        },
+    )
+    app.processEvents()
+    assert "INPUT UNVERIFIED" in workspace.previews["left"].meta.text()
     assert preview.image.pixmap().size() == preview.image.size()
     without_box = preview.image.pixmap().toImage().copy()
 
@@ -942,36 +968,47 @@ def test_zoom_in_result_schedules_actual_zoom_readback() -> None:
     panel.zoom_status_label.deleteLater()
     app.processEvents()
 
-def test_checkerboard_pair_timing_allows_100ms_but_rejects_larger() -> None:
+def test_checkerboard_pair_timing_uses_app_receive_not_rtcp_ntp() -> None:
     from Workstation.calibration_controller import (
         CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S,
         CalibrationWorkflowController,
     )
+    from Workstation.workstation_core.calibration_timing import HOST_RECEIVE_PROXY
 
     panel = SimpleNamespace(
         camera_frame_metadata={
-            "left": {"rtcp_frame_ntp_unix_s": 0.0},
-            "right": {"rtcp_frame_ntp_unix_s": CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S},
+            "left": {
+                "app_receive_monotonic_ns": 5_000_000_000,
+                "rtcp_frame_ntp_unix_s": 10.0,
+            },
+            "right": {
+                "app_receive_monotonic_ns": 5_100_000_000,
+                "rtcp_frame_ntp_unix_s": 999.0,
+            },
         },
-        _camera_rtc_timestamp_s_from_metadata=lambda metadata: metadata.get("rtcp_frame_ntp_unix_s"),
     )
     controller = CalibrationWorkflowController(panel)
 
     pair_ok, basis, delta_s, detail = controller._checkerboard_capture_pair_timing()
+    evidence = controller._checkerboard_capture_pair_timing_evidence()
 
     assert CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S == pytest.approx(0.100)
     assert pair_ok is True
-    assert basis == "rtcp-ntp"
+    assert basis == "app-receive-monotonic"
     assert delta_s == pytest.approx(0.100)
-    assert detail == "ok"
+    assert "camera exposure remains unverified" in detail
+    assert evidence.evidence_class == HOST_RECEIVE_PROXY
+    assert evidence.precision_qualified is False
+    assert evidence.actual_exposure_verified is False
 
     panel.camera_frame_metadata["right"] = {
-        "rtcp_frame_ntp_unix_s": CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S + 0.000001
+        "app_receive_monotonic_ns": 5_100_000_001,
+        "rtcp_frame_ntp_unix_s": 10.0,
     }
     pair_ok, _basis, delta_s, detail = controller._checkerboard_capture_pair_timing()
 
     assert pair_ok is False
-    assert delta_s == pytest.approx(0.100001)
+    assert delta_s == pytest.approx(0.100000001)
     assert "100.0 ms" in detail
 
 
@@ -980,29 +1017,96 @@ def test_checkerboard_pair_timing_uses_operator_configured_limit() -> None:
 
     panel = SimpleNamespace(
         camera_frame_metadata={
-            "left": {"rtcp_frame_ntp_unix_s": 10.000},
-            "right": {"rtcp_frame_ntp_unix_s": 10.040},
+            "left": {"timestamp_s": 10.000, "rtcp_frame_ntp_unix_s": 500.0},
+            "right": {"timestamp_s": 10.040, "rtcp_frame_ntp_unix_s": 100.0},
         },
         calibration_pair_max_delta_spin=SimpleNamespace(value=lambda: 40.0),
-        _camera_rtc_timestamp_s_from_metadata=lambda metadata: metadata.get(
-            "rtcp_frame_ntp_unix_s"
-        ),
     )
     controller = CalibrationWorkflowController(panel)
 
     pair_ok, basis, delta_s, detail = controller._checkerboard_capture_pair_timing()
 
     assert pair_ok is True
-    assert basis == "rtcp-ntp"
+    assert basis == "app-receive-monotonic"
     assert delta_s == pytest.approx(0.040)
-    assert detail == "ok"
+    assert "timestamp_s compatibility" in detail
 
-    panel.camera_frame_metadata["right"]["rtcp_frame_ntp_unix_s"] = 10.040001
+    panel.camera_frame_metadata["right"]["timestamp_s"] = 10.040001
     pair_ok, _basis, delta_s, detail = controller._checkerboard_capture_pair_timing()
 
     assert pair_ok is False
     assert delta_s == pytest.approx(0.040001)
     assert "40.0 ms" in detail
+
+
+def test_checkerboard_pair_timing_missing_app_receive_never_falls_back_to_ntp() -> None:
+    from Workstation.calibration_controller import CalibrationWorkflowController
+    from Workstation.workstation_core.calibration_timing import UNKNOWN_TIMING_EVIDENCE
+
+    panel = SimpleNamespace(
+        camera_frame_metadata={
+            "left": {
+                "app_receive_monotonic_ns": 1_000_000_000,
+                "rtcp_frame_ntp_unix_s": 20.000,
+            },
+            "right": {"rtcp_frame_ntp_unix_s": 20.001},
+        },
+    )
+    controller = CalibrationWorkflowController(panel)
+
+    evidence = controller._checkerboard_capture_pair_timing_evidence()
+
+    assert evidence.evidence_class == UNKNOWN_TIMING_EVIDENCE
+    assert evidence.timestamp_reference == "app-receive-monotonic"
+    assert evidence.pair_persistence_allowed is False
+    assert evidence.pair_delta_s is None
+    assert "missing decoded-frame app-receive" in evidence.detail
+
+
+@pytest.mark.parametrize("invalid_receive", (True, "bad", 1.5, -1, float("nan")))
+def test_checkerboard_pair_timing_rejects_invalid_exact_receive_without_fallback(
+    invalid_receive: object,
+) -> None:
+    from Workstation.calibration_controller import CalibrationWorkflowController
+    from Workstation.workstation_core.calibration_timing import UNKNOWN_TIMING_EVIDENCE
+
+    panel = SimpleNamespace(
+        camera_frame_metadata={
+            "left": {"app_receive_monotonic_ns": 1_000_000_000},
+            "right": {
+                "app_receive_monotonic_ns": invalid_receive,
+                "timestamp_s": 1.001,
+                "rtcp_frame_ntp_unix_s": 20.001,
+            },
+        },
+    )
+    evidence = CalibrationWorkflowController(
+        panel
+    )._checkerboard_capture_pair_timing_evidence()
+
+    assert evidence.evidence_class == UNKNOWN_TIMING_EVIDENCE
+    assert evidence.pair_persistence_allowed is False
+    assert evidence.pair_delta_s is None
+
+
+def test_checkerboard_pair_timing_preserves_signed_right_minus_left_delta() -> None:
+    from Workstation.calibration_controller import CalibrationWorkflowController
+
+    panel = SimpleNamespace(
+        camera_frame_metadata={
+            "left": {"app_receive_monotonic_ns": 2_050_000_000},
+            "right": {"app_receive_monotonic_ns": 2_000_000_000},
+        },
+    )
+    controller = CalibrationWorkflowController(panel)
+
+    pair_ok, basis, delta_s, _detail = controller._checkerboard_capture_pair_timing(
+        maximum_delta_s=0.050,
+    )
+
+    assert pair_ok is True
+    assert basis == "app-receive-monotonic"
+    assert delta_s == pytest.approx(-0.050)
 
 def test_checkerboard_capture_worker_saves_and_validates_optical_pixel_images(
     monkeypatch: pytest.MonkeyPatch,
@@ -1172,6 +1276,7 @@ def test_checkerboard_auto_capture_uses_new_synchronized_detection_pairs() -> No
     image = standalone_gui.QtGui.QImage(32, 24, standalone_gui.QtGui.QImage.Format_RGB888)
     image.fill(127)
     now_s = time.monotonic()
+    receive_ns = int(round(now_s * 1_000_000_000.0))
     panel = SimpleNamespace(
         checkerboard_calibration_thread=None,
         _allow_legacy_calibration_preview_fallback=True,
@@ -1183,20 +1288,28 @@ def test_checkerboard_auto_capture_uses_new_synchronized_detection_pairs() -> No
                 "request_id": 1,
                 "image": image,
                 "found": True,
-                "metadata": {"timestamp_s": now_s, "rtcp_frame_ntp_unix_s": 100.000},
+                "metadata": {
+                    "timestamp_s": now_s,
+                    "app_receive_monotonic_ns": receive_ns,
+                    "rtcp_frame_ntp_unix_s": 100.000,
+                },
             },
             "right": {
                 "request_id": 2,
                 "image": image,
                 "found": True,
-                "metadata": {"timestamp_s": now_s, "rtcp_frame_ntp_unix_s": 100.010},
+                "metadata": {
+                    "timestamp_s": now_s,
+                    "app_receive_monotonic_ns": receive_ns + 10_000_000,
+                    "rtcp_frame_ntp_unix_s": 900.000,
+                },
             },
         },
-        _checkerboard_capture_pair_timing=lambda _metadata: (True, "rtcp-ntp", 0.010, "ok"),
     )
     panel.calibration_auto_interval_spin.setRange(0.1, 10.0)
     panel.calibration_auto_interval_spin.setValue(0.1)
     controller = CalibrationWorkflowController(panel)
+    panel._checkerboard_capture_pair_timing = controller._checkerboard_capture_pair_timing
     capture_calls: list[dict[str, object]] = []
     controller.capture_calibration_images = lambda **kwargs: capture_calls.append(kwargs) or True
 
@@ -1212,7 +1325,11 @@ def test_checkerboard_auto_capture_uses_new_synchronized_detection_pairs() -> No
         "request_id": 3,
         "image": image,
         "found": True,
-        "metadata": {"timestamp_s": time.monotonic(), "rtcp_frame_ntp_unix_s": 100.020},
+        "metadata": {
+            "timestamp_s": time.monotonic(),
+            "app_receive_monotonic_ns": receive_ns + 20_000_000,
+            "rtcp_frame_ntp_unix_s": 50.000,
+        },
     }
     controller._auto_calibration_capture_tick()
     assert len(capture_calls) == 2
@@ -1229,6 +1346,7 @@ def test_checkerboard_auto_capture_saves_new_timing_rejected_pair_once() -> None
     image = standalone_gui.QtGui.QImage(32, 24, standalone_gui.QtGui.QImage.Format_RGB888)
     image.fill(127)
     now_s = time.monotonic()
+    receive_ns = int(round(now_s * 1_000_000_000.0))
     panel = SimpleNamespace(
         checkerboard_calibration_thread=None,
         _allow_legacy_calibration_preview_fallback=True,
@@ -1242,21 +1360,18 @@ def test_checkerboard_auto_capture_saves_new_timing_rejected_pair_once() -> None
                 "found": True,
                 "metadata": {
                     "timestamp_s": now_s,
+                    "app_receive_monotonic_ns": receive_ns
+                    + (index - 1) * 101_000_000,
                     "rtcp_frame_ntp_unix_s": 100.000 + index * 0.101,
                 },
             }
             for index, side in enumerate(("left", "right"), start=1)
         },
-        _checkerboard_capture_pair_timing=lambda _metadata: (
-            False,
-            "rtcp-ntp",
-            0.101,
-            "RTCP/NTP pair delta 101.0 ms exceeds 100.0 ms",
-        ),
     )
     panel.calibration_auto_interval_spin.setRange(0.1, 10.0)
     panel.calibration_auto_interval_spin.setValue(0.1)
     controller = CalibrationWorkflowController(panel)
+    panel._checkerboard_capture_pair_timing = controller._checkerboard_capture_pair_timing
     capture_calls: list[dict[str, object]] = []
     controller.capture_calibration_images = lambda **kwargs: capture_calls.append(kwargs) or True
 
@@ -1313,7 +1428,7 @@ def test_auto_timing_rejected_completion_tracks_pose_without_counting_stereo() -
             "pair_timing_ok": False,
             "stereo_pair_saved": False,
             "intrinsics_only_sides": ("left", "right"),
-            "pair_time_basis": "rtcp-ntp",
+            "pair_time_basis": "app-receive-monotonic",
             "pair_delta_s": 0.101,
         }
     )
@@ -1343,7 +1458,7 @@ def test_checkerboard_auto_capture_continues_until_operator_stops() -> None:
             "saved_sides": ("left", "right"),
             "status_parts": ("left=OK", "right=OK"),
             "pair_timing_ok": True,
-            "pair_time_basis": "rtcp-ntp",
+            "pair_time_basis": "app-receive-monotonic",
             "pair_delta_s": 0.001,
         }
     )
@@ -1702,6 +1817,13 @@ def test_workstation_calibration_and_validation_run_off_ui_thread(monkeypatch, t
                 "native_lossless_source": True,
                 "overlay_applied": False,
                 "source_native_frame_id": f"native-{side}",
+                "h264_access_unit_kind": "nal1_non_idr_intra",
+                "h264_access_unit_nal_types": [7, 8, 1],
+                "h264_access_unit_is_delta": False,
+                "h264_access_unit_pts_ns": 123_000,
+                "decoded_buffer_pts_ns": 123_000,
+                "h264_nal1_non_idr_intra": True,
+                "h264_random_access_guaranteed": False,
             },
         )
     panel.camera_frame_metadata["left"] = {"rtcp_frame_ntp_unix_s": 100.000}
@@ -1721,6 +1843,16 @@ def test_workstation_calibration_and_validation_run_off_ui_thread(monkeypatch, t
     )
     assert capture_metadata["frame_grid_by_side"]["left"] == {
         "frame_id": "native-left",
+        "frame_key": "",
+        "h264_access_unit_kind": "nal1_non_idr_intra",
+        "h264_access_unit_nal_types": [7, 8, 1],
+        "h264_access_unit_is_delta": False,
+        "h264_access_unit_pts_ns": 123_000,
+        "decoded_buffer_pts_ns": 123_000,
+        "h264_nal1_non_idr_intra": True,
+        "h264_random_access_guaranteed": False,
+        "app_receive_monotonic_ns": int(round(native_now * 1_000_000_000.0)),
+        "app_receive_timestamp_source": "timestamp_s",
         "source_native_width": 32,
         "source_native_height": 24,
         "saved_width": 32,
@@ -1732,6 +1864,22 @@ def test_workstation_calibration_and_validation_run_off_ui_thread(monkeypatch, t
         "overlay_applied": False,
         "native_lossless_source": True,
     }
+    assert capture_metadata["pair_time_basis"] == "app-receive-monotonic"
+    assert capture_metadata["pair_delta_s"] == pytest.approx(0.0)
+    assert capture_metadata["pair_delta_ns"] == 0
+    assert capture_metadata["left_app_receive_monotonic_ns"] == int(
+        round(native_now * 1_000_000_000.0)
+    )
+    assert capture_metadata["right_app_receive_monotonic_ns"] == int(
+        round(native_now * 1_000_000_000.0)
+    )
+    assert capture_metadata["app_receive_pair_delta_ns"] == 0
+    assert capture_metadata["timing_evidence_class"] == "HOST_RECEIVE_PROXY"
+    assert capture_metadata["precision_timing_qualified"] is False
+    assert capture_metadata["actual_exposure_verified"] is False
+    assert "pair_time_basis=app-receive-monotonic" in (
+        panel.calibration_status_label.text()
+    )
     assert panel.capture_calibration_button.isEnabled()
 
     panel.run_intrinsic_calibration()

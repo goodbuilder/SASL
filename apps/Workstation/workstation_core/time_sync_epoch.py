@@ -7,8 +7,10 @@ import hashlib
 import json
 from typing import Any
 
+from Workstation.workstation_core.runtime_camera_status import is_sr_pc_diagnostic_reason
 
-TIME_SYNC_EPOCH_SCHEMA_VERSION = "workstation-time-sync-epoch-v1"
+
+TIME_SYNC_EPOCH_SCHEMA_VERSION = "workstation-time-sync-epoch-v2"
 
 
 def _canonical_bytes(value: Mapping[str, Any]) -> bytes:
@@ -60,12 +62,15 @@ def _row_monotonic_ns(row: Mapping[str, object]) -> int | None:
 
 def _mapping_state(
     row: Mapping[str, object],
-) -> tuple[str, int | None, int | None] | None:
+) -> tuple[str, int | None, int | None, str, str] | None:
     generation = _optional_int(row.get("stream_generation"))
     ssrc = _optional_int(row.get("rtp_ssrc"))
+    clock_epoch_id = str(row.get("clock_epoch_id") or "")
+    clock_epoch_state = str(row.get("clock_epoch_state") or "")
     invalid_reason = str(row.get("rtcp_timing_invalid_reason") or "").strip()
-    if invalid_reason:
-        return "invalid", generation, ssrc
+    blocking_invalid_reason = invalid_reason and not is_sr_pc_diagnostic_reason(invalid_reason)
+    if blocking_invalid_reason or (clock_epoch_state and clock_epoch_state != "current"):
+        return "invalid", generation, ssrc, clock_epoch_id, clock_epoch_state
     source_utc_ns = _optional_int(row.get("source_utc_ns"))
     sender_report_count = _optional_int(row.get("rtcp_sr_received_count"))
     if (
@@ -75,29 +80,49 @@ def _mapping_state(
         or sender_report_count <= 0
     ):
         return None
-    return "valid", generation, ssrc
+    return "valid", generation, ssrc, clock_epoch_id, clock_epoch_state
 
 
 def _transition_trigger(
-    previous: tuple[str, int | None, int | None] | None,
-    current: tuple[str, int | None, int | None],
+    previous: tuple[str, int | None, int | None, str, str] | None,
+    current: tuple[str, int | None, int | None, str, str],
     *,
     has_stus_reference: bool,
 ) -> str:
-    status, generation, ssrc = current
+    status, generation, ssrc, clock_epoch_id, clock_epoch_state = current
     if previous is None:
         if status == "invalid":
-            return "mapping_invalidation"
+            return (
+                "stus_clock_epoch_transition"
+                if clock_epoch_state == "transition"
+                else "mapping_invalidation"
+            )
         return (
             "successful_stus_mapping_observed"
             if has_stus_reference
             else "first_observed_rtcp_mapping"
         )
-    previous_status, previous_generation, previous_ssrc = previous
+    (
+        previous_status,
+        previous_generation,
+        previous_ssrc,
+        previous_clock_epoch_id,
+        previous_clock_epoch_state,
+    ) = previous
     if status == "invalid":
-        return "mapping_invalidation"
+        return (
+            "stus_clock_epoch_transition"
+            if clock_epoch_state == "transition"
+            else "mapping_invalidation"
+        )
     if previous_status == "invalid":
-        return "mapping_revalidated"
+        return (
+            "stus_clock_epoch_verified"
+            if clock_epoch_id and clock_epoch_id == previous_clock_epoch_id
+            else "mapping_revalidated"
+        )
+    if clock_epoch_id and clock_epoch_id != previous_clock_epoch_id:
+        return "stus_clock_epoch_change"
     generation_changed = generation != previous_generation
     ssrc_changed = ssrc != previous_ssrc
     if generation_changed and ssrc_changed:
@@ -131,6 +156,8 @@ def _epoch_record(
         "trigger": str(accumulator["trigger"]),
         "rtp_ssrc": accumulator.get("rtp_ssrc"),
         "stream_generation": accumulator.get("stream_generation"),
+        "clock_epoch_id": str(accumulator.get("clock_epoch_id") or ""),
+        "clock_epoch_state": str(accumulator.get("clock_epoch_state") or ""),
         "stus_evidence_sha256": (
             None if stus_reference is None else stus_reference.get("sha256")
         ),
@@ -160,6 +187,8 @@ def _epoch_record(
         "trigger": str(accumulator["trigger"]),
         "rtp_ssrc": accumulator.get("rtp_ssrc"),
         "stream_generation": accumulator.get("stream_generation"),
+        "clock_epoch_id": str(accumulator.get("clock_epoch_id") or ""),
+        "clock_epoch_state": str(accumulator.get("clock_epoch_state") or ""),
         "stus_evidence_reference": (
             None if stus_reference is None else dict(stus_reference)
         ),
@@ -187,6 +216,8 @@ def _epoch_record(
             "rtcp_timing_invalid_reason": str(
                 first_row.get("rtcp_timing_invalid_reason") or ""
             ),
+            "clock_epoch_id": str(first_row.get("clock_epoch_id") or ""),
+            "clock_epoch_state": str(first_row.get("clock_epoch_state") or ""),
             "host_session_anchor": dict(session_anchor),
         },
         "clock_domain_contract": {
@@ -210,7 +241,7 @@ def _side_epochs(
 ) -> list[dict[str, object]]:
     epochs: list[dict[str, object]] = []
     active: dict[str, object] | None = None
-    active_state: tuple[str, int | None, int | None] | None = None
+    active_state: tuple[str, int | None, int | None, str, str] | None = None
 
     def close_active(*, end_ns: int | None, end_contract: str) -> None:
         nonlocal active
@@ -246,6 +277,8 @@ def _side_epochs(
                 "status": state[0],
                 "stream_generation": state[1],
                 "rtp_ssrc": state[2],
+                "clock_epoch_id": state[3],
+                "clock_epoch_state": state[4],
                 "start_monotonic_ns": observed_ns,
                 "last_monotonic_ns": observed_ns,
                 "trigger": _transition_trigger(

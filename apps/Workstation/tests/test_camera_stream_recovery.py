@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import pytest
+import subprocess
 import sys
 import threading
 import time
@@ -113,7 +114,7 @@ def test_explicit_nvidia_decoder_has_no_software_candidate() -> None:
     assert yolo_stream.decoder_candidates("nvidia") == (yolo_stream.NVIDIA_H264_DECODER,)
 
 
-def test_default_gstreamer_pipeline_preserves_compressed_access_units() -> None:
+def test_default_gstreamer_pipeline_is_permanent_latest_only_decoded_input() -> None:
     from Workstation.workstation_core import yolo_stream
 
     pipeline = yolo_stream.build_gst_pipeline_text(
@@ -124,10 +125,50 @@ def test_default_gstreamer_pipeline_preserves_compressed_access_units() -> None:
 
     assert "h264parse config-interval=-1 disable-passthrough=true name=parse" in pipeline
     assert "video/x-h264,stream-format=byte-stream,alignment=au" in pipeline
-    assert "queue max-size-buffers=0 max-size-bytes=0 max-size-time=250000000" in pipeline
-    assert pipeline.count("queue leaky=downstream max-size-buffers=1") == 0
+    assert f"max-size-time={yolo_stream.GST_ENCODED_QUEUE_MAX_TIME_NS}" not in pipeline
+    assert pipeline.count("queue leaky=downstream max-size-buffers=1") == 2
     assert pipeline.count("queue leaky=downstream max-size-buffers=8") == 1
-    assert "appsink name=sink" in pipeline
+    assert "tee name=decoded" in pipeline
+
+
+def test_gstreamer_encoded_queue_mode_switches_between_latest_and_reference_safe() -> None:
+    from Workstation.workstation_core import yolo_stream
+
+    latest = yolo_stream.build_gst_pipeline_text(
+        "rtsp://camera.invalid/visible",
+        decoder=yolo_stream.SOFTWARE_H264_DECODER,
+        transport="tcp",
+        encoded_queue_mode="latest",
+    )
+    reference_safe = yolo_stream.build_gst_pipeline_text(
+        "rtsp://camera.invalid/visible",
+        decoder=yolo_stream.SOFTWARE_H264_DECODER,
+        transport="tcp",
+        encoded_queue_mode="reference_safe",
+    )
+
+    latest_queue = "queue leaky=downstream max-size-buffers=1"
+    reference_safe_queue = "queue max-size-buffers=8 max-size-bytes=0 max-size-time=0"
+    assert latest.count(latest_queue) == 2
+    assert reference_safe.count(reference_safe_queue) == 2
+    assert reference_safe.count(latest_queue) == 0
+
+
+def test_recording_pipeline_exposes_bounded_decoded_nv12_capture_only() -> None:
+    from Workstation.workstation_core import yolo_stream
+
+    recording_pipeline = yolo_stream.build_gst_pipeline_text(
+        "rtsp://camera.invalid/visible",
+        decoder=yolo_stream.NVIDIA_H264_DECODER,
+        transport="tcp",
+        record_video_path="/tmp/camera recording.mp4",
+    )
+    assert "tee name=decoded" in recording_pipeline
+    assert "queue name=record_capture_queue leaky=downstream max-size-buffers=2" in recording_pipeline
+    assert "video/x-raw,format=NV12" in recording_pipeline
+    assert "appsink name=record_sink" in recording_pipeline
+    assert "mp4mux" not in recording_pipeline
+    assert "filesink" not in recording_pipeline
     assert "pipeline_profile" not in inspect.signature(
         yolo_stream.build_gst_pipeline_text
     ).parameters
@@ -179,57 +220,139 @@ def test_runtime_nvidia_decoder_fallback_uses_first_frame_and_stall_deadlines() 
     ) is None
 
 
-def test_workstation_live_pipeline_adds_only_the_au_integrity_parser_guard(monkeypatch) -> None:
-    from Workstation.workstation_core import yolo_stream as workstation
-
-    stereo_root = Path(__file__).resolve().parents[2] / "StereoWIRIS"
-    monkeypatch.syspath_prepend(str(stereo_root))
-    from wiris_stereo_distance import yolo_stream as stereo
-
-    for decoder in ("nvidia", "software"):
-        for transport in ("tcp", "udp"):
-            kwargs = {
-                "latency_ms": 100,
-                "decoder": decoder,
-                "transport": transport,
-            }
-            workstation_pipeline = workstation.build_gst_pipeline_text(
-                "rtsp://camera.invalid/visible",
-                **kwargs,
-            )
-            stereo_pipeline = stereo.build_gst_pipeline_text(
-                "rtsp://camera.invalid/visible",
-                **kwargs,
-            )
-            assert workstation_pipeline.replace(
-                " disable-passthrough=true", ""
-            ).replace(
-                " ! video/x-h264,stream-format=byte-stream,alignment=au", ""
-            ) == stereo_pipeline
-
-
-def test_gstreamer_recording_branch_is_single_session_mp4_and_non_leaky() -> None:
+def test_gstreamer_recording_contract_is_decoded_nvenc_lossless() -> None:
     from Workstation.workstation_core import yolo_stream
 
-    pipeline = yolo_stream.build_gst_pipeline_text(
-        "rtsp://camera.invalid/visible",
-        decoder=yolo_stream.SOFTWARE_H264_DECODER,
-        transport="tcp",
-        record_video_path="/tmp/camera recording.mp4",
-    )
+    assert yolo_stream.recording_integrity_contract("gstreamer") == {
+        "recording_encoding_mode": "decoded_nvenc_lossless_reencode",
+        "recording_integrity_verified": False,
+        "recording_integrity_scope": (
+            "decoded-nv12:nvenc-lossless+finalized-mp4;"
+            "source-media-integrity=tolerant-unverified"
+        ),
+    }
 
-    assert (
-        "encoded. ! queue max-size-buffers=0 max-size-bytes=0 "
-        "max-size-time=5000000000"
-    ) in pipeline
-    assert pipeline.count("rtspsrc ") == 1
-    assert "video/x-h264,stream-format=avc,alignment=au ! mp4mux name=record_mux" in pipeline
-    assert 'filesink location="/tmp/camera recording.mp4"' in pipeline
-    assert "matroskamux" not in pipeline
-    assert not hasattr(yolo_stream, "_start_ffmpeg_encoded_recording_process")
-    assert not hasattr(yolo_stream, "_start_gst_encoded_recording_process")
-    assert pipeline.count("queue leaky=downstream max-size-buffers=1") == 0
-    assert pipeline.count("queue leaky=downstream max-size-buffers=8") == 1
+
+def test_decoded_nv12_recorder_finalizes_synthetic_lossless_mp4(tmp_path) -> None:
+    from Workstation.workstation_core import yolo_stream
+
+    try:
+        import gi
+
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst
+    except Exception as exc:
+        pytest.skip(f"GStreamer unavailable: {exc}")
+    Gst.init(None)
+    if not Path("/dev/nvidia0").exists():
+        pytest.skip("NVIDIA device unavailable")
+    nvenc_probe = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "nv12",
+            "-video_size",
+            "16x16",
+            "-framerate",
+            "1",
+            "-i",
+            "pipe:0",
+            "-frames:v",
+            "1",
+            "-c:v",
+            "h264_nvenc",
+            "-f",
+            "null",
+            "-",
+        ],
+        input=bytes(16 * 16 * 3 // 2),
+        check=False,
+        capture_output=True,
+        timeout=10.0,
+    )
+    if nvenc_probe.returncode != 0:
+        detail = (nvenc_probe.stderr or nvenc_probe.stdout or b"").decode(
+            "utf-8", errors="replace"
+        ).strip()
+        pytest.skip(f"NVENC unavailable: {detail}")
+
+    messages: list[object] = []
+
+    class OutputQueue:
+        def put(self, message: object) -> None:
+            messages.append(message)
+
+    output = tmp_path / "decoded-lossless.mp4"
+    recorder = yolo_stream.DecodedNv12Recorder(
+        Gst,
+        path=str(output),
+        width=160,
+        height=64,
+        fallback_fps=20.0,
+        output_queue=OutputQueue(),
+    )
+    time.sleep(1.0)
+    frame_bytes = 160 * 64 * 3 // 2
+    expected_frames: list[bytes] = []
+    for index in range(8):
+        expected = bytes([16 + index]) * frame_bytes
+        expected_frames.append(expected)
+        buffer = Gst.Buffer.new_allocate(None, frame_bytes, None)
+        buffer.fill(0, expected)
+        buffer.pts = index * 50_000_000
+        assert recorder.submit(
+            buffer,
+            observed_monotonic_ns=index * 50_000_000,
+        )
+        time.sleep(0.06)
+
+    assert recorder.close(), messages
+    assert output.is_file() and output.stat().st_size > 0
+    finalized = next(
+        message[1]
+        for message in messages
+        if isinstance(message, tuple) and message[0] == "recording_finalized"
+    )
+    assert finalized["success"] is True
+    assert finalized["recording_encoding_mode"] == (
+        "decoded_nvenc_lossless_reencode"
+    )
+    assert finalized["source_media_integrity_verified"] is False
+    assert finalized["container_finalization_success"] is True
+    assert finalized["submitted_frames"] == 8
+    assert finalized["encoded_frames"] == 8
+    assert finalized["dropped_frames"] == 0
+
+    decoded = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(output),
+            "-vsync",
+            "0",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "nv12",
+            "pipe:1",
+        ],
+        check=True,
+        capture_output=True,
+        timeout=10.0,
+    ).stdout
+    actual_frames = [
+        decoded[offset : offset + frame_bytes]
+        for offset in range(0, len(decoded), frame_bytes)
+    ]
+    assert actual_frames == expected_frames
 
 
 def test_h264_annex_b_idr_detection_uses_nal_headers_not_non_delta_flags() -> None:
@@ -251,6 +374,160 @@ def test_h264_annex_b_idr_detection_uses_nal_headers_not_non_delta_flags() -> No
     assert yolo_stream.h264_access_unit_has_idr(b"\x00\x00\x00\x02\x65\x88") is False
     assert yolo_stream.h264_access_unit_has_idr(b"\x00\x00\x01\xe5\x88") is False
     assert yolo_stream.h264_access_unit_has_idr(b"\x00\x00\x01\x05\x88") is False
+
+
+def test_nal1_auto_capture_metadata_requires_non_delta_non_corrupted_exact_pts() -> None:
+    from Workstation.workstation_core import yolo_stream
+
+    nal1 = b"\x00\x00\x00\x01\x61\x65\x99"
+    metadata = yolo_stream.h264_nal1_non_idr_intra_metadata(
+        nal1,
+        pts_ns=123_456,
+        is_delta=False,
+    )
+
+    assert metadata == {
+        "h264_access_unit_kind": "nal1_non_idr_intra",
+        "h264_access_unit_nal_types": [1],
+        "h264_access_unit_is_delta": False,
+        "h264_access_unit_pts_ns": 123_456,
+        "h264_nal1_non_idr_intra": True,
+        "h264_random_access_guaranteed": False,
+    }
+    assert yolo_stream.h264_nal1_non_idr_intra_metadata(
+        nal1, pts_ns=123_456, is_delta=True
+    ) is None
+    assert yolo_stream.h264_nal1_non_idr_intra_metadata(
+        nal1, pts_ns=123_456, is_delta=False, is_corrupted=True
+    ) is None
+    assert yolo_stream.h264_nal1_non_idr_intra_metadata(
+        b"\x00\x00\x01\x65\x88", pts_ns=123_456, is_delta=False
+    ) is None
+    assert yolo_stream.h264_nal1_non_idr_intra_metadata(
+        nal1, pts_ns=None, is_delta=False
+    ) is None
+
+
+def test_nal1_metadata_handoff_is_exact_one_shot_and_bounded() -> None:
+    from Workstation.workstation_core import yolo_stream
+
+    gst = SimpleNamespace(CLOCK_TIME_NONE=-1)
+    tracker = yolo_stream.GstRtpTimingTracker(gst, SimpleNamespace())
+
+    for pts_ns in range(yolo_stream.MAX_RTP_TIMING_CACHE + 1):
+        tracker._remember_nal1_metadata(
+            {
+                "h264_access_unit_pts_ns": pts_ns,
+                "h264_nal1_non_idr_intra": True,
+            }
+        )
+
+    assert tracker.frame_metadata(SimpleNamespace(pts=0), 1.0) is None
+    assert tracker.frame_metadata(SimpleNamespace(pts=999_999), 1.0) is None
+    latest = tracker.frame_metadata(
+        SimpleNamespace(pts=yolo_stream.MAX_RTP_TIMING_CACHE),
+        1.0,
+    )
+    assert latest is not None
+    assert latest["h264_access_unit_pts_ns"] == yolo_stream.MAX_RTP_TIMING_CACHE
+    assert latest["decoded_buffer_pts_ns"] == yolo_stream.MAX_RTP_TIMING_CACHE
+    assert tracker.frame_metadata(
+        SimpleNamespace(pts=yolo_stream.MAX_RTP_TIMING_CACHE),
+        1.0,
+    ) is None
+
+
+def test_experimental_non_idr_intra_requires_exact_sps_pps_nal1_and_non_delta() -> None:
+    from Workstation.workstation_core import yolo_stream
+
+    complete_non_idr_intra = (
+        b"\x00\x00\x00\x01\x67\x64\x00\x1f"
+        b"\x00\x00\x01\x68\xee\x3c\x80"
+        b"\x00\x00\x00\x01\x61\x65\x99"
+    )
+
+    assert yolo_stream.h264_access_unit_recovery_basis(
+        complete_non_idr_intra,
+        is_delta=False,
+    ) is None
+    assert yolo_stream.h264_access_unit_recovery_basis(
+        complete_non_idr_intra,
+        is_delta=True,
+        allow_non_idr_intra_experimental=True,
+    ) is None
+    assert yolo_stream.h264_access_unit_recovery_basis(
+        b"\x00\x00\x01\x61\x65\x99",
+        is_delta=False,
+        allow_non_idr_intra_experimental=True,
+    ) is None
+    assert yolo_stream.h264_access_unit_recovery_basis(
+        complete_non_idr_intra,
+        is_delta=False,
+        allow_non_idr_intra_experimental=True,
+    ) == yolo_stream.H264_RECOVERY_BASIS_NON_IDR_INTRA_EXPERIMENTAL
+
+
+def test_experimental_non_idr_intra_opens_only_exact_decoded_pts_and_relatches() -> None:
+    from Workstation.workstation_core import yolo_stream
+
+    basis = yolo_stream.H264_RECOVERY_BASIS_NON_IDR_INTRA_EXPERIMENTAL
+    strict = yolo_stream.GstRtpTimingTracker(SimpleNamespace(), SimpleNamespace())
+    assert strict.should_drop_encoded_access_unit(
+        pts_ns=100,
+        is_delta=False,
+        is_corrupted=False,
+        is_discontinuous=False,
+        is_random_access=True,
+        recovery_basis=basis,
+    ) is True
+
+    tracker = yolo_stream.GstRtpTimingTracker(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        allow_non_idr_intra_experimental=True,
+    )
+    assert tracker.should_drop_encoded_access_unit(
+        pts_ns=100,
+        is_delta=False,
+        is_corrupted=False,
+        is_discontinuous=True,
+        is_random_access=True,
+        recovery_basis=basis,
+        observed_monotonic_s=1.0,
+    ) is False
+    assert tracker.should_suppress_decoded_buffer(101) is True
+    assert tracker.should_suppress_decoded_buffer(100) is False
+    recovery = tracker.pop_rtp_recovery()
+    assert recovery is not None
+    assert recovery.recovery_basis == basis
+    assert tracker.current_output_recovery_basis() == basis
+
+    tracker.register_rtp_sequence(ssrc=7, sequence=10, rtp_pts_ns=100)
+    gap = tracker.register_rtp_sequence(
+        ssrc=7,
+        sequence=12,
+        rtp_pts_ns=200,
+        observed_monotonic_s=2.0,
+    )
+    assert gap is not None
+    assert tracker.decoded_output_blocked() is True
+    assert tracker.should_drop_encoded_access_unit(
+        pts_ns=200,
+        is_delta=False,
+        is_corrupted=False,
+        is_discontinuous=False,
+        is_random_access=True,
+        recovery_basis=basis,
+    ) is True
+    assert tracker.should_drop_encoded_access_unit(
+        pts_ns=300,
+        is_delta=False,
+        is_corrupted=False,
+        is_discontinuous=False,
+        is_random_access=True,
+        recovery_basis=basis,
+    ) is False
+    assert tracker.should_suppress_decoded_buffer(300) is False
 
 
 def test_rtp_gap_latch_ignores_wrap_duplicate_and_reorder_then_recovers_on_exact_idr() -> None:
@@ -322,6 +599,26 @@ def test_rtp_gap_latch_ignores_wrap_duplicate_and_reorder_then_recovers_on_exact
     assert recovery is not None
     assert recovery.resume_pts_ns == 400
     assert recovery.blocked_duration_s == pytest.approx(2.0)
+
+
+def test_rtp_metrics_snapshot_counts_packets_and_forward_sequence_gaps() -> None:
+    from Workstation.workstation_core import yolo_stream
+
+    tracker = yolo_stream.GstRtpTimingTracker(SimpleNamespace(), SimpleNamespace())
+
+    tracker.register_rtp_sequence(ssrc=7, sequence=10)
+    tracker.register_rtp_sequence(ssrc=7, sequence=11)
+    tracker.register_rtp_sequence(ssrc=7, sequence=14)
+
+    metrics = tracker.rtp_metrics_snapshot()
+
+    assert metrics == {
+        "rtp_packets_received_total": 3,
+        "rtp_gap_events_total": 1,
+        "rtp_missing_packets_total": 2,
+        "h264_access_units_total": 0,
+        "rtp_active_ssrc": 7,
+    }
 
 
 def test_corrupt_access_unit_and_dependent_chain_never_reach_consumers() -> None:
@@ -447,6 +744,39 @@ def test_parser_probe_drops_zero_idr_access_units_before_decoder_and_recording_t
         None, SimpleNamespace(get_buffer=lambda: dependent)
     ) == "OK"
     assert dependent.map_calls == 0
+
+    tolerant_tracker = yolo_stream.GstRtpTimingTracker(
+        Gst,
+        SimpleNamespace(),
+        allow_unverified_encoded_output=True,
+    )
+    tolerant_non_idr = Buffer(
+        b"\x00\x00\x00\x01\x61\x65\x99",
+        pts=100,
+        flags=1,
+    )
+    assert tolerant_tracker._observe_access_unit(
+        None, SimpleNamespace(get_buffer=lambda: tolerant_non_idr)
+    ) == "OK"
+    assert tolerant_non_idr.unmapped is True
+    assert tolerant_tracker.should_suppress_decoded_buffer(100) is True
+
+    tolerant_nal1 = Buffer(
+        b"\x00\x00\x00\x01\x61\x65\x99",
+        pts=200,
+        flags=0,
+    )
+    assert tolerant_tracker._observe_access_unit(
+        None, SimpleNamespace(get_buffer=lambda: tolerant_nal1)
+    ) == "OK"
+    exact_metadata = tolerant_tracker.frame_metadata(
+        SimpleNamespace(pts=200),
+        10.0,
+    )
+    assert exact_metadata is not None
+    assert exact_metadata["h264_nal1_non_idr_intra"] is True
+    assert exact_metadata["h264_access_unit_pts_ns"] == 200
+    assert exact_metadata["decoded_buffer_pts_ns"] == 200
 
 
 def test_zero_idr_sender_stays_blocked_without_extending_the_timeout(monkeypatch) -> None:
@@ -705,11 +1035,26 @@ def test_new_stream_worker_uses_only_stereowiris_pipeline_and_manual_policy() ->
         worker.config["rtsp_reconnect_policy"]
         == yolo_stream.RTSP_RECONNECT_MANUAL
     )
-    assert worker.config["recording_encoding_mode"] == "h264_copy_integrity_gated"
+    assert worker.config["recording_encoding_mode"] == "decoded_nvenc_lossless_reencode"
     assert worker.config["recording_integrity_verified"] is False
     assert worker.config["recording_integrity_scope"] == (
-        "finalized-mp4:h264-idr+frame-num+decode-count+sample-timing"
+        "decoded-nv12:nvenc-lossless+finalized-mp4;"
+        "source-media-integrity=tolerant-unverified"
     )
+    assert worker.config["rtsp_encoded_queue_mode"] == "latest"
+
+    reference_safe_worker = yolo_stream.YoloStreamWorker(
+        url="rtsp://camera.invalid/visible",
+        weights_path="weights.pt",
+        device="cpu",
+        input_size=640,
+        conf_threshold=0.5,
+        iou_threshold=0.45,
+        max_rate_hz=0.0,
+        enable_detection=False,
+        rtsp_encoded_queue_mode="reference_safe",
+    )
+    assert reference_safe_worker.config["rtsp_encoded_queue_mode"] == "reference_safe"
 
 
 @pytest.mark.parametrize("backend", ["opencv", "opencv_auto", "pyav"])
@@ -1081,7 +1426,7 @@ def test_worker_shutdown_preserves_mp4_eos_window_before_escalation(monkeypatch)
 
     worker.stop()
 
-    assert process.join_timeouts == pytest.approx([12.0, 8.0, 1.0])
+    assert process.join_timeouts == pytest.approx([30.0, 10.0, 1.0])
     assert process.terminated is True
     assert process.killed is True
 
@@ -1202,7 +1547,7 @@ def test_gstreamer_eos_fails_closed_when_live_integrity_metrics_are_nonzero() ->
     }
 
 
-def test_video_finalization_artifact_rejects_eos_without_integrity_result(
+def test_video_finalization_records_presence_without_integrity_gate(
     tmp_path: Path,
 ) -> None:
     from Workstation.camera_stream_controller import CameraStreamLifecycleController
@@ -1214,6 +1559,7 @@ def test_video_finalization_artifact_rejects_eos_without_integrity_result(
     finalization = {
         "path": str(path),
         "stream_backend": "gstreamer",
+        "recording_encoding_mode": "h264_copy_integrity_gated",
         "success": True,
         "detail": "EOS received; mp4mux finalized",
         "integrity_gap_events": 1,
@@ -1243,19 +1589,16 @@ def test_video_finalization_artifact_rejects_eos_without_integrity_result(
     assert artifact["recording_encoding_mode"] == "h264_copy_integrity_gated"
     assert artifact["recording_integrity_verified"] is False
     assert artifact["recording_usable"] is False
-    assert artifact["integrity_validation_status"] == "FAIL"
-    assert artifact["success"] is False
+    assert artifact["integrity_validation_status"] == "NOT_RUN"
+    assert artifact["success"] is True
     assert artifact["container_finalization_success"] is True
-    assert artifact["finalization_success"] is False
-    assert artifact["integrity_failure_reasons"] == [
-        "integrity_validation_schema_invalid"
-    ]
-    assert "MP4 integrity FAIL" in str(artifact["finalization_detail"])
+    assert artifact["finalization_success"] is True
+    assert artifact["presence_state"] == "SAVED"
     assert artifact["present"] is True
     assert artifact["size_bytes"] == len(b"valid-mp4-placeholder")
 
 
-def test_video_finalization_evidence_retry_keeps_data_store_open_contract(
+def test_video_finalization_evidence_failure_never_blocks_teardown(
     tmp_path: Path,
 ) -> None:
     from Workstation.camera_stream_controller import CameraStreamLifecycleController
@@ -1286,19 +1629,103 @@ def test_video_finalization_evidence_retry_keeps_data_store_open_contract(
     )
     controller = CameraStreamLifecycleController(panel)
 
-    assert controller._append_pending_video_finalization_artifacts() is False
-    assert panel._pending_video_finalization_artifacts is not None
-    assert str(path) in panel.left_pane.recording_finalizations
-    assert flushes == []
-
     assert controller._append_pending_video_finalization_artifacts() is True
     assert panel._pending_video_finalization_artifacts is None
     assert str(path) not in panel.left_pane.recording_finalizations
     assert flushes == [True]
-    assert [row["finalization_detail"] for row in attempts] == [
-        "EOS timeout",
-        "EOS timeout",
-    ]
+    assert [row["finalization_detail"] for row in attempts] == ["EOS timeout"]
+
+
+def test_decoded_nvenc_presence_does_not_claim_usable_without_review(
+    tmp_path: Path,
+) -> None:
+    from Workstation.camera_stream_controller import CameraStreamLifecycleController
+
+    path = tmp_path / "decoded-left.mp4"
+    path.write_bytes(b"finalized-decoded-mp4")
+    artifacts: list[dict[str, object]] = []
+    finalization = {
+        "path": str(path),
+        "stream_backend": "gstreamer",
+        "recording_encoding_mode": "decoded_nvenc_lossless_reencode",
+        "recording_integrity_scope": (
+            "decoded-nv12:nvenc-lossless+finalized-mp4;"
+            "source-media-integrity=tolerant-unverified"
+        ),
+        "success": True,
+        "container_finalization_success": True,
+        "integrity_validation_status": "PENDING",
+        "recording_integrity_verified": False,
+        "recording_file_integrity_verified": False,
+        "source_media_integrity_verified": False,
+        "recording_usable": True,
+    }
+    panel = SimpleNamespace(
+        _pending_video_finalization_artifacts={
+            "paths": {"left": path},
+            "backend": "gstreamer",
+        },
+        left_pane=SimpleNamespace(
+            recording_finalizations={str(path): finalization}
+        ),
+        append_workstation_data=lambda stream, payload, **_kwargs: artifacts.append(
+            {"stream": stream, **dict(payload)}
+        ),
+        flush_workstation_data=lambda: None,
+        _log=lambda _message: None,
+    )
+
+    assert CameraStreamLifecycleController(
+        panel
+    )._append_pending_video_finalization_artifacts()
+
+    artifact = artifacts[0]
+    assert artifact["success"] is True
+    assert artifact["finalization_success"] is True
+    assert artifact["recording_usable"] is False
+    assert artifact["integrity_validation_status"] == "NOT_RUN"
+    assert artifact["presence_state"] == "SAVED"
+    assert artifact["recording_integrity_verified"] is False
+    assert artifact["source_media_integrity_verified"] is False
+
+
+def test_decoded_nvenc_finalization_is_inferred_from_nonempty_file_when_signal_is_lost(
+    tmp_path: Path,
+) -> None:
+    from Workstation.camera_stream_controller import CameraStreamLifecycleController
+
+    path = tmp_path / "decoded-left-with-lost-signal.mp4"
+    path.write_bytes(b"finalized-decoded-mp4")
+    artifacts: list[dict[str, object]] = []
+    panel = SimpleNamespace(
+        _pending_video_finalization_artifacts={
+            "paths": {"left": path},
+            "backend": "gstreamer",
+        },
+        left_pane=SimpleNamespace(recording_finalizations={}),
+        append_workstation_data=lambda stream, payload, **_kwargs: artifacts.append(
+            {"stream": stream, **dict(payload)}
+        ),
+        flush_workstation_data=lambda: None,
+        _log=lambda _message: None,
+    )
+
+    assert CameraStreamLifecycleController(
+        panel
+    )._append_pending_video_finalization_artifacts()
+
+    artifact = artifacts[0]
+    assert artifact["recording_encoding_mode"] == (
+        "decoded_nvenc_lossless_reencode"
+    )
+    assert artifact["container_finalization_success"] is True
+    assert artifact["container_finalization_inferred"] is True
+    assert artifact["finalization_success"] is True
+    assert artifact["integrity_validation_status"] == "NOT_RUN"
+    assert artifact["recording_usable"] is False
+    assert artifact["recording_file_integrity_verified"] is False
+    assert artifact["source_media_integrity_verified"] is False
+    assert artifact["integrity_failure_reasons"] == []
 
 
 def test_new_workstation_settings_prefer_reliable_tcp_rtsp_transport() -> None:

@@ -7,6 +7,9 @@ from math import isfinite
 from typing import Mapping, Any
 
 
+TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC = "app_receive_monotonic"
+
+
 def _materialize_timestamp_metadata(metadata: Any) -> dict[str, Any]:
     """Detach payload metadata after validating its explicit pair shape."""
 
@@ -60,6 +63,18 @@ class DetectionObservation:
     @property
     def center(self) -> tuple[float, float]:
         return ((self.x1 + self.x2) / 2.0, (self.y1 + self.y2) / 2.0)
+
+    @property
+    def app_receive_monotonic_ns(self) -> int:
+        value = self.timestamp_metadata.get("app_receive_monotonic_ns")
+        if value is not None and type(value) is not int:
+            raise ValueError("app_receive_monotonic_ns must be an exact integer")
+        result = value if value is not None else int(
+            round(float(self.timestamp_s) * 1_000_000_000.0)
+        )
+        if result < 0:
+            raise ValueError("app_receive_monotonic_ns must be non-negative")
+        return result
 
     @property
     def same_class_candidate_count(self) -> int:
@@ -187,6 +202,19 @@ class StereoEstimate(StereoMatch):
 
 
 def detection_timestamp_for_basis(observation: DetectionObservation, timestamp_basis: str = "detection") -> float | None:
+    frozen_basis = str(getattr(observation, "pairing_timestamp_basis", "") or "")
+    frozen_timestamp = getattr(observation, "pairing_timestamp_s", None)
+    equivalent_camera_basis = {
+        frozen_basis,
+        str(timestamp_basis),
+    } <= {"camera_rtcp", "camera_rtc_required"}
+    if frozen_basis == timestamp_basis or equivalent_camera_basis:
+        try:
+            parsed_frozen = float(frozen_timestamp)
+        except (TypeError, ValueError):
+            parsed_frozen = float("nan")
+        if isfinite(parsed_frozen):
+            return parsed_frozen
     if timestamp_basis in {"camera_rtcp", "camera_rtc_required"}:
         value = observation.timestamp_metadata.get("rtcp_frame_ntp_unix_s")
         if value is not None:
@@ -197,6 +225,11 @@ def detection_timestamp_for_basis(observation: DetectionObservation, timestamp_b
             if isfinite(parsed):
                 return parsed
         if timestamp_basis == "camera_rtc_required":
+            return None
+    if timestamp_basis == TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC:
+        try:
+            return observation.app_receive_monotonic_ns * 1.0e-9
+        except (TypeError, ValueError):
             return None
     return float(observation.timestamp_s)
 
@@ -279,13 +312,16 @@ def estimate_disparity_distance(match: StereoMatch, calibration: StereoCalibrati
     if calibration.focal_length_px <= 0.0 or calibration.baseline_m <= 0.0:
         return None
     distance = calibration.focal_length_px * calibration.baseline_m / match.disparity_px
-    if not isfinite(distance) or distance <= 0.0:
+    if not isfinite(distance):
         return None
     return stereo_estimate_from_match(match, distance_m=distance)
 
 
 def stereo_estimate_from_match(match: StereoMatch, *, distance_m: float) -> StereoEstimate | None:
-    if not isfinite(distance_m) or distance_m <= 0.0:
+    # Keep every finite range value as evidence.  A non-positive value must
+    # not discard the paired detections or prevent the rest of the method
+    # bundle from being persisted.
+    if not isfinite(distance_m):
         return None
     return StereoEstimate(
         distance_m=distance_m,

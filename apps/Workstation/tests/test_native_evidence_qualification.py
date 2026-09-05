@@ -194,6 +194,17 @@ def test_real_byte_hash_descriptor_origin_and_ack_chain_passes(tmp_path: Path) -
     assert result["failure_count"] == 0
 
 
+def test_qualification_resolves_timestamped_stream_ledgers(tmp_path: Path) -> None:
+    data_root, runtime, _event = _fixture(tmp_path)
+    stamp = "20260903_120000_000000001+0900"
+    for stem in ("native_frames", "measurements", "method_evaluations"):
+        (data_root / f"{stem}.jsonl").rename(data_root / f"{stem}_{stamp}.jsonl")
+
+    result = audit_native_evidence(data_root, runtime_generation=runtime)
+
+    assert result["passed"] is True, result
+
+
 def test_png_byte_tampering_fails_file_and_png_integrity(tmp_path: Path) -> None:
     data_root, runtime, event = _fixture(tmp_path)
     path = data_root / str(event["native_left_png_path"])

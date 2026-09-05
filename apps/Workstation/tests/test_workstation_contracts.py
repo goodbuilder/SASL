@@ -305,7 +305,7 @@ def test_workstation_recording_gate_protects_preview_mapping_and_save() -> None:
     app.processEvents()
 
     assert not window.commands.action("camera.toggle").isEnabled()
-    assert not window.commands.action("time.set_pc").isEnabled()
+    assert window.commands.action("time.set_pc").isEnabled()
     assert not window.commands.action("camera.swap").isEnabled()
     assert not window.commands.action("camera.auto_connect").isEnabled()
     assert not window.commands.action("camera.reactivate_left").isEnabled()
@@ -318,7 +318,7 @@ def test_workstation_recording_gate_protects_preview_mapping_and_save() -> None:
         window.commands.action("session.save")
     assert not window.measurement.control_buttons["camera.toggle"].isEnabled()
     assert window.measurement.control_buttons["detection.toggle"].isEnabled()
-    assert not window.time_workspace.operation_buttons["time.set_pc"].isEnabled()
+    assert window.time_workspace.operation_buttons["time.set_pc"].isEnabled()
     assert not window.camera.operation_buttons["camera.swap"].isEnabled()
     assert not window.camera.operation_buttons["camera.reactivate_left"].isEnabled()
     assert not window.camera.operation_buttons["camera.reactivate_right"].isEnabled()
@@ -363,7 +363,7 @@ def test_workstation_recording_gate_protects_preview_mapping_and_save() -> None:
     backend.panel.wiris_time_sync_thread = object()
     window._refresh_from_status(window.status_adapter.model.snapshot())
     app.processEvents()
-    assert not window.commands.action("recording.toggle").isEnabled()
+    assert window.commands.action("recording.toggle").isEnabled()
     backend.panel.wiris_time_sync_thread = None
 
     window.close()
@@ -911,6 +911,11 @@ def test_workstation_exposes_advanced_owner_tools_and_preserves_contracts() -> N
     window = WorkstationMainWindow(backend=backend)
     window.show()
     app.processEvents()
+
+    assert window.commands.invoke("pixhawk.refresh_parameters.p1") is True
+    assert backend.calls[-1] == ("advanced_px4_calibration", "left", True)
+    assert window.commands.invoke("pixhawk.refresh_parameters.p2") is True
+    assert backend.calls[-1] == ("advanced_px4_calibration", "right", True)
 
     window.navigation.select_context("tasks.advanced")
     app.processEvents()

@@ -232,3 +232,151 @@ A/B variable, not silently changed in this slice.
 Automated software behavior is green, but the packet cannot be completed: repository portability
 has 12 pre-existing failures, actual firmware/sysid/params could not be re-read in the current
 ping-alive/MAVLink-silent/no-USB condition, and all Slice 8 hardware gates are NOT_RUN.
+
+## P1 IMU live-delivery recovery — 2026-08-31: CURRENT-RUN PASS, reboot persistence NOT_RUN
+
+- Baseline focused regression:
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 QT_QPA_PLATFORM=offscreen PYTHONPATH=..:../../common/python
+  ../../.venv/bin/python -m pytest -q tests/test_mavlink_liveness.py
+  tests/test_workstation_pixhawk_gnss.py tests/test_pixhawk_magnetometer_workspace.py`
+  → `126 passed in 6.08s`.
+- P1 baseline artifact `/tmp/p1-imustream.pcap`: 8 seconds, `ATTITUDE=107`,
+  `SCALED_IMU/2/3=0/0/0`, `RAW_IMU=0`.
+- P2 comparison artifact `/tmp/p2-imu-baseline.pcap`: 6 seconds,
+  `SCALED_IMU/2/3=102/102/102`, proving the common subscriber/parser/UI path works.
+- P1-only GUI Disconnect/Connect artifact `/tmp/p1-imu-reconnect.pcap`: 35 seconds,
+  no host outbound UDP packet and no `COMMAND_LONG`; P1 continued broadcast telemetry.
+- Host evidence: `ip neigh show 10.0.0.2` → `INCOMPLETE`; two pings returned 100% loss.
+  P1 wire source was `10.0.0.2` / MAC `1e:1e:b3:a4:ff:b5` to Ethernet broadcast.
+- Verified USB runtime recovery sent only three non-persistent shell stream commands to Ethernet
+  instance local port `14550`; no reboot, parameter save, config/file write, or firmware action.
+  `mavlink status streams` then reported all three `SCALED_IMU*` streams at 20 Hz.
+- Independent post-command artifact `/tmp/p1-imu-after-shell.pcap`: 6 seconds,
+  `SCALED_IMU/2/3=102/102/102`; packet capture kernel drops `0`.
+- Automated-real AT-SPI table readback showed all P1 rows `LIVE` with ages `0.00/0.00/0.05 s`
+  and changing xmag/ymag/zmag values. Visual artifact: `/tmp/p1-imu-ui-live.png`.
+- Residual: runtime stream enable is lost on PX4 reboot. The next authority boundary is an
+  operator-confirmed verified-USB reboot of P1/sysid 1 followed by a fresh Ethernet-only profile,
+  packet-rate, and UI readback test. Do not call this persistent recovery before that passes.
+
+### P1 IMU delivery amendment implementation — PASS
+
+- RED: the three new focused cases failed on the absent missing-IMU retry method and absent UI
+  freshness threshold. GREEN: all three passed after implementation.
+- Subscriber changes track actual `SCALED_IMU/2/3` receive timestamps, retry only missing/stale
+  streams after the initial profile, share the side send lock, stop immediately on a real sample,
+  enforce three attempts plus ten-second cooldown, suppress duplicate outage logs, clear state on
+  stop/reboot, and send nothing during all-RX stall.
+- Presentation changes preserve cached values but project `STALE` beyond one second; no sample
+  remains `WAITING`, fresh complete values are `LIVE`, and fresh incomplete values are `PARTIAL`.
+- Focused MAVLink/Pixhawk/IMU suite: `129 passed in 7.03s`.
+- Expanded MAVLink/status/RTCM/NTRIP/lifecycle/contracts suite: `306 passed in 20.47s`. One existing
+  NTRIP test emitted a background measurement-writer `StopIteration` warning; no test failed.
+- Full Workstation suite:
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 QT_QPA_PLATFORM=offscreen PYTHONPATH=..:../../common/python
+  ../../.venv/bin/python -m pytest -q`
+  → `1682 passed, 1 skipped in 128.86s`.
+- `compileall`, delegate-stub freshness, `git diff --check`, and `./run.sh --check` pass. The
+  repository portability checker still reports 13 pre-existing/out-of-scope paths; no changed IMU
+  source, test, README, product doc, or packet file is reported.
+- Automated-real failure/recovery: runtime-stopping only P1 `SCALED_IMU3` changed its existing UI
+  row to `STALE` with retained values and age `12.76s`; restoring it changed the row to `LIVE` at
+  `0.04s`. P1 streams 1/2 remained `LIVE` throughout.
+- Final new-code process PID `60907` owns UDP `14550/14551`. Independent artifact
+  `/tmp/p1-imu-final-new-code.pcap` contains, over six seconds, P1 `SCALED_IMU/2/3=102/102/102`,
+  `ATTITUDE=77`, `HEARTBEAT=5`, with zero kernel capture drops.
+- Two AT-SPI reads 1.2 seconds apart showed all three P1 values changed and every row stayed
+  `LIVE` with `0.01–0.04s` age. Visual evidence is `/tmp/p1-imu-ui-new-code.png`; final live table
+  readback after the full suite again showed all three P1 rows `LIVE` at `0.02–0.04s`.
+- README and current UI workflow/status/implementation contracts describe sample-backed delivery,
+  bounded retry, stale-value truth, no automatic USB command, and no persistent PX4 mutation.
+
+## P1 USB-free reboot persistence — 2026-08-31: FAIL at P1 Ethernet RX boundary
+
+- Precondition: Workstation PID `60907` was sole owner of UDP `14550/14551`; cameras and P1/P2 were
+  `LIVE`; Measurement `WAITING`; recording `IDLE`; one USB candidate uniquely revalidated as
+  P1 `sysid/component=1/1` at `/dev/ttyACM0`.
+- The approved one-shot worker revalidated the same identity immediately before sending only
+  `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN`. No parameter/config/file/firmware write occurred.
+- Independent pcap reset evidence:
+  `ATTITUDE.time_boot_ms 3,474,164 -> 3,579`. P1 entered `RECOVERING`; P2 stayed `LIVE`.
+- Post-reboot automatic result: P1 heartbeat/ATTITUDE resumed via Ethernet broadcast, but
+  `SCALED_IMU/2/3=0/0/0`; host `COMMAND_LONG=0` before ARP bypass because neighbor
+  `10.0.0.2` remained `INCOMPLETE`.
+- Temporary static-neighbor A/B used captured MAC `1e:1e:b3:a4:ff:b5`. Pcap then showed host
+  `255/190` heartbeat, one 15-command Stock profile and bounded three-stream retries sent to
+  `10.0.0.2`; P1 returned `COMMAND_ACK=0` and `SCALED_IMU/2/3=0/0/0`.
+- USB `mavlink status` readback showed Ethernet instance #1 received only self-originated
+  `sysid=1/component=1`, with external `255/190` absent. `mavlink status streams` showed the
+  default Ethernet instance lacked all three `SCALED_IMU*` streams.
+- `ifdown eth0` succeeded, `ifup eth0` reported failure and P1 became `ETH MAVLINK RX STALLED`;
+  a second verified USB reboot restored broadcast telemetry. This interface reset did not repair RX.
+- USB runtime stream activation restored P1 Ethernet data. The complete 620-second artifact
+  `/tmp/p1-persistent-10m-eth-data.pcap` contains approximately 19.76 Hz per IMU stream; its single
+  7.55-second P1 gap is the later operator-approved cable exchange and remained below the 10-second
+  all-RX stall threshold. Tcpdump reported zero kernel drops.
+- The independent GUI/process monitor reached `450.15s` with cameras/P1/P2 `LIVE`, NTRIP
+  intentionally disconnected, failures `0`, and was deliberately interrupted for the cable swap;
+  it is not claimed as an uninterrupted 10-minute application soak.
+- Cable/port A/B artifact `/tmp/p1-p2-cable-swap.pcap` (180 seconds, zero kernel drops):
+  P1 ARP requests/replies `147/0`; P2 `5/5`. Both telemetry links recovered from the intentional
+  exchange, but the receive fault followed P1 rather than the physical cable/switch branch.
+- Final classification: **USB-free Ethernet recovery FAIL**. P1 telemetry can be received over ETH
+  after USB runtime stream activation, but P1 cannot receive host GCS heartbeat, stream commands or
+  RTCM over ETH. Repair/replace P1's board-side PHY/driver/NuttX RX path before rerunning the
+  USB-free reboot plus uninterrupted 10-minute gate. `Pixhawk.md` remains unchanged.
+- Final restored-state artifact `/tmp/p1-final-restored-eth.pcap`: four seconds, P1
+  `SCALED_IMU/2/3=61/61/62`, `ATTITUDE=46`, `HEARTBEAT=3`, kernel drops `0`; Workstation PID
+  `60907`, P1/P2 and cameras all `LIVE`.
+
+## P1 official stock reflash and ATTITUDE/GNSS soak — 2026-08-31
+
+### Firmware reinstall: PASS
+
+- Source-of-truth documents: `Pixhawk/P1/README.md`, `Pixhawk/P1/manifest.json`, and
+  `firmware/stock/MANIFEST.md` selected official PX4 v1.17.0 `px4_fmu-v6x_default`, board ID `53`,
+  SHA-256 `8f2c4278...abba0d7f`. The custom SASL CAN-MAG image was not used.
+- Preflight: unique USB heartbeat P1 `1/1`, FMUv6X, GUID match, `Disarmed`, failsafe `no`; fresh
+  2,393-byte BSON and 58-byte extras backups were saved in `Pixhawk/P1/` with hashes recorded in
+  `firmware-reinstall-20260831T1003KST.json`.
+- Official PX4 v1.17 `Tools/px_uploader.py` detected bootloader board `53,0`, protocol revision 5,
+  STM32H7 rev V and 1,966,080-byte flash. No board force or force-erase was used. Erase, program,
+  verify and reboot all reached 100%; uploader exit `0`, elapsed `26.914s`.
+- Postflight: same PX4 `d6f12ad...`, sysid `1`, GUID, all required `MAV_2_*`, `10.0.0.2/24`,
+  netman, extras and 1,178/1,912 parameter storage readbacks passed.
+
+### USB-free inbound Ethernet: FAIL unchanged
+
+- Artifact `/tmp/p1-post-reflash-eth.pcap`, 142.275 seconds, SHA-256
+  `dc5a32e...9050bab`: before USB stream activation P1 sent heartbeat `87`, ATTITUDE `1,299`, and
+  `SCALED_IMU/2/3=0/0/0`; P1 ARP requests/replies were `90/0`, P2 `5/5`.
+- Reflash therefore excluded a corrupt/unverified installed image but did not restore P1 inbound
+  ARP/GCS/RTCM. USB runtime activation restored IMU over ETH (`62/62/62` in the final four-second
+  capture), so the outbound data plane remained usable.
+
+### P1/P2 differential diagnosis: physical damage NOT PROVEN
+
+- P1: no PC ARP entry; static insert `ioctl failed: Out of memory`; originated ping `sendto errno
+  114`; host replied to P1-originated ARP but P1 did not learn it. Free heap was 498,080 bytes,
+  largest block 420,608, DMA 1,024/5,120.
+- Official v6X NuttX defconfig at v1.17.0 has `CONFIG_IOB_NBUFFERS=24`. P1 Ethernet MAVLink RX was
+  4,313 B/s, reported loss 126.9%, source only self `sysid=1`.
+- P2 read through a temporary side-exclusive ETH shell had the same FMUv6X, PX4 git hash,
+  `MAV_2_CONFIG=1000`, broadcast `1`, rate `2,000,000`, and same extras pattern. P2 had the PC ARP
+  entry, Ethernet RX 38.9 B/s, loss 0.1%, and external GCS `255/190` received.
+- This proves a P1-specific board-side boundary but leaves PHY/MAC damage versus NuttX IOB/ARP or
+  duplicate-init state unresolved.
+
+### Ten-minute P1 outbound ATTITUDE/GNSS transport: PASS; GNSS solution: NO FIX
+
+- Artifact `/tmp/p1-post-reflash-attitude-gnss-10m.pcap`, 3,186,079 bytes, SHA-256
+  `980461f4...3a38fbc`, zero kernel drops and parser exceptions.
+- Raw MAVLink2 sequence: 32,034 packets, every delta exactly 1; duplicates/missing/reordered `0/0/0`.
+- HEARTBEAT: 619 at 1.000 Hz, maximum gap 1.0037s.
+- ATTITUDE: 9,292 at 15.000 Hz, maximum gap 0.0715s.
+- GPS_RAW_INT: 3,097 at 5.000 Hz, maximum gap 0.2044s.
+- GPS2_RAW: 620 at 1.000 Hz, maximum gap 1.0029s.
+- Twenty-one UI checkpoints over 602.93 seconds kept P1/P2 `LIVE`, all-RX stall `0`, P1 displayed
+  ATTITUDE age at most 0.06s and GNSS message age at most 0.21s.
+- Both GNSS streams consistently carried `fix_type=0`, satellites `0`, lat/lon `0`; message
+  transport passed but a valid GNSS position solution did not.

@@ -686,7 +686,10 @@ class SharedNativeFrameRing:
         shm = self._shm
         temporary = False
         if shm is None:
-            shm = shared_memory.SharedMemory(name=self.shm_name, create=False)
+            try:
+                shm = shared_memory.SharedMemory(name=self.shm_name, create=False)
+            except FileNotFoundError:
+                return
             temporary = True
         try:
             shm.unlink()

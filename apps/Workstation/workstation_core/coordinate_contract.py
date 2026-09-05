@@ -21,3 +21,13 @@ MEASUREMENT_AXIS_CONTRACT = BASELINE_CENTER_FRD_AXIS_CONTRACT
 PUBLIC_MEASUREMENT_FRAME = BASELINE_CENTER_FRD_FRAME
 PUBLIC_MEASUREMENT_VECTOR_CONTRACT = BASELINE_CENTER_FRD_VECTOR_CONTRACT
 LEGACY_XYZ_ALIAS_CONTRACT = "not_emitted"
+
+# Read-only GNSS antenna-midpoint reference. This must never alias the public
+# optical-center/camera-axis ``baseline_center_frd`` measurement frame above.
+GNSS_BASELINE_CENTER_FRD_FRAME = "gnss_baseline_center_local_level_frd"
+GNSS_BASELINE_CENTER_FRD_AXIS_CONTRACT = (
+    "gnss_baseline_center_local_level_frd:forward_right_down"
+)
+GNSS_BASELINE_CENTER_FRD_VECTOR_CONTRACT = (
+    "gnss_baseline_center_local_level_frd:[forward,right,down,range]"
+)

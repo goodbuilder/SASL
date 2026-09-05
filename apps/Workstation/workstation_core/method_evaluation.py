@@ -2,7 +2,7 @@
 
 One matched detection pair owns one immutable snapshot.  Every canonical
 Measurement method produces exactly one terminal outcome for that snapshot;
-the primary Pixhawk/RTK outcome and the seven comparison outcomes never
+the primary Pixhawk/RTK outcome and the comparison outcomes never
 overwrite one another.  This module is Qt-free so the same evaluator can run
 in the main process, a reference test, or an isolated worker process.
 """
@@ -30,6 +30,7 @@ from Workstation.workstation_core.measurement_methods import (
     MEASUREMENT_METHOD_IDS,
     MOUNTAIN_GNSS,
     PIXHAWK_RTK_LIVE,
+    PIXHAWK_RP_GPS_BASELINE_YAW,
     TERRAIN_PNP,
 )
 
@@ -51,6 +52,8 @@ METHOD_EVALUATION_STATUSES = frozenset(
 )
 
 METHOD_EVALUATION_TIMEOUT_S: Mapping[str, float] = {
+    PIXHAWK_RTK_LIVE: 1.0,
+    PIXHAWK_RP_GPS_BASELINE_YAW: 1.0,
     CHECKERBOARD_STEREO: 3.0,
     HORIZON_HYBRID: 1.0,
     MOUNTAIN_GNSS: 3.0,
@@ -609,11 +612,15 @@ def evaluate_method_request(
     geometry = calculate_measurement_geometry(attempt)
     payload = _geometry_result_payload(geometry)
     reasons: tuple[str, ...] = ()
+    outcome_warnings = tuple(geometry.warnings)
     if geometry.match is None or geometry.triangulated is None or geometry.estimate is None:
         status = "BLOCKED"
         reasons = (str(geometry.triangulation_reason or "geometry_unavailable"),)
     else:
-        status = "ESTIMATED" if geometry.warnings else "VALID"
+        outcome_warnings = tuple(
+            dict.fromkeys((*geometry.warnings, *geometry.estimate.warnings))
+        )
+        status = "ESTIMATED" if outcome_warnings else "VALID"
     return MethodEvaluationOutcome(
         measurement_id=request.measurement_id,
         pair_id=request.pair_id,
@@ -628,7 +635,7 @@ def evaluate_method_request(
         geometry_sha256=attempt.measurement_geometry_sha256,
         result=payload,
         reasons=reasons,
-        warnings=tuple(geometry.warnings),
+        warnings=outcome_warnings,
         enqueued_monotonic_ns=request.enqueued_monotonic_ns,
         worker_started_monotonic_ns=started_ns,
         completed_monotonic_ns=time.monotonic_ns(),

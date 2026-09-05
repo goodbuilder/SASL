@@ -1,5 +1,6 @@
 from Workstation.workstation_core.runtime_camera_status import (
     decoder_presentation,
+    format_camera_input_metrics,
     format_runtime_camera_status,
     format_runtime_camera_timestamp,
     infer_runtime_camera_timestamp_reference,
@@ -64,14 +65,15 @@ def test_nvidia_runtime_identity_parser_keeps_model_driver_and_device_identity(t
     assert missing["error"]
 
 
-def test_timestamp_source_contract_does_not_mix_invalid_rtcp_with_source_time():
+def test_legacy_sr_pc_invalid_marker_is_diagnostic_not_timestamp_gate():
     metadata = {
         "rtcp_timing_invalid_reason": "sr_pc_offset",
+        "rtcp_frame_ntp_unix_s": 1_700_000_000.0,
         "source_timestamp_s": 12.5,
     }
 
-    assert infer_runtime_camera_timestamp_reference(metadata) == "rtcp-invalid"
-    assert format_runtime_camera_timestamp(metadata) == "RTCP invalid (SR-PC offset)"
+    assert infer_runtime_camera_timestamp_reference(metadata) == "rtcp-ntp"
+    assert "RTCP NTP" in format_runtime_camera_timestamp(metadata)
 
 
 def test_runtime_status_is_pure_and_reexported_by_workstation_owner():
@@ -92,3 +94,25 @@ def test_runtime_status_is_pure_and_reexported_by_workstation_owner():
     assert "10.0 Hz (CUDA)" in text
     assert "src 1.250000 s [source]" in text
     assert standalone_gui.format_runtime_camera_status is format_runtime_camera_status
+
+
+def test_camera_input_metrics_format_is_fixed_two_lines_and_safe_for_missing_data():
+    text = format_camera_input_metrics(
+        "left",
+        {
+            "rtp_packets_hz": 3722.4,
+            "rtp_missing_hz": 3300.1,
+            "rtp_loss_pct": 47.0,
+            "h264_au_hz": 18.5,
+            "decoded_hz": 2.1,
+        },
+    )
+
+    assert text.count("\n") == 1
+    assert "CAM L" in text
+    assert "RTP 3722.4 pkt/s" in text
+    assert "missing 3300.1 pkt/s" in text
+    assert "loss 47.0%" in text
+    assert "H.264 AU 18.5 /s" in text
+    assert "decoded 2.1 Hz" in text
+    assert "--" in format_camera_input_metrics("right", {"rtp_loss_pct": "bad"})

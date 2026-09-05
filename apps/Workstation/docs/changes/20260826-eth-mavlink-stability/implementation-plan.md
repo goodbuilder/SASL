@@ -27,6 +27,10 @@ to this ETH packet. Hardware Slice 8 and conditional documentation Slice 9 are n
    isolation, and verified recovery all succeed, update `Pixhawk.md` with the cause, remedy,
    evidence boundary, and residual firmware limitation. On failure, leave product truth unchanged
    and record the failure only in this packet.
+9. For the approved P1 IMU delivery amendment, track actual `SCALED_IMU/2/3` receive timestamps,
+   bounded-retry only missing/stale streams after the initial profile, and make the existing table's
+   `WAITING/LIVE/STALE/PARTIAL` state freshness-aware. Verify fake transport boundaries first, then
+   actual wire rate and AT-SPI table values without adding automatic USB or persistent PX4 writes.
 
 ## File and component map
 

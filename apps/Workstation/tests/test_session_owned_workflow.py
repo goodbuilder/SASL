@@ -64,6 +64,29 @@ def test_pre_session_calibration_is_allowed_but_alignment_still_requires_session
         OpticalPoseController(panel)._require_open_session_id()
 
 
+def test_sessionless_default_marker_uses_panel_owned_calibration_root(
+    tmp_path: Path,
+) -> None:
+    default_root = tmp_path / "workstation-source" / "calibration"
+    panel = SimpleNamespace(
+        app_root=tmp_path / "data-root",
+        default_calibration_root=default_root,
+        calib_dir_edit=_TextValue("calibration"),
+        _measurement_session_hierarchy_enabled=False,
+        _calibration_session_root=None,
+        _calibration_session_roots={},
+        _log=lambda _message: None,
+    )
+    controller = CalibrationWorkflowController(panel)
+
+    assert controller._calibration_dirs()[0] == default_root.resolve()
+    created = controller._ensure_calibration_session_root("manual")
+
+    assert created is not None
+    assert created.parent == default_root.resolve()
+    assert (created / "calibration_session.json").is_file()
+
+
 def test_pre_session_loaded_intrinsics_are_not_blocked_by_session_archiving(
     tmp_path: Path,
 ) -> None:

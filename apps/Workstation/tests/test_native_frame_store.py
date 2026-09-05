@@ -81,6 +81,22 @@ def test_missing_timestamp_reference_remains_unknown(tmp_path: Path) -> None:
     assert artifact.timestamp_reference == "unknown"
 
 
+def test_native_frame_store_can_share_timestamped_ledger_path(tmp_path: Path) -> None:
+    root = tmp_path / "session"
+    ledger = root / "native_frames_20260903_120000_000000001+0900.jsonl"
+    artifact = NativeFrameStore(root, events_path=ledger).persist(
+        side="left",
+        purpose="measurement",
+        frame_id="shared-ledger",
+        image=_image(8, 6),
+        metadata={"native_width": 8, "native_height": 6},
+    )
+
+    assert ledger.is_file()
+    assert artifact.relative_path == "frames/measurement/shared-ledger-left.png"
+    assert not (root / "native_frames.jsonl").exists()
+
+
 def test_native_frame_ledger_recovers_only_a_torn_final_record(tmp_path: Path) -> None:
     root = tmp_path / "session"
     root.mkdir()

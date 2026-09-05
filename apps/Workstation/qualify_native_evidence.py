@@ -279,6 +279,24 @@ def _failure(failures: list[str], message: str) -> None:
     failures.append(message)
 
 
+def _runtime_stream_path(root: Path, stem: str, runtime: str) -> Path:
+    """Resolve a legacy or timestamped stream containing one runtime."""
+
+    fixed = root / f"{stem}.jsonl"
+    candidates = [fixed]
+    candidates.extend(sorted(root.glob(f"{stem}_*.jsonl"), key=lambda path: path.name))
+    for path in candidates:
+        if not path.is_file() or path.is_symlink():
+            continue
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if runtime in line:
+                    return path
+        except (OSError, UnicodeError):
+            continue
+    return fixed if fixed.exists() else candidates[-1]
+
+
 def audit_native_evidence(
     data_root: str | Path,
     *,
@@ -288,8 +306,11 @@ def audit_native_evidence(
     runtime = str(runtime_generation or "").strip()
     if not runtime:
         raise ValueError("runtime_generation is required")
-    native_path = root / "native_frames.jsonl"
-    origin_paths = tuple(root / name for name in _ORIGIN_FILENAMES)
+    native_path = _runtime_stream_path(root, "native_frames", runtime)
+    origin_paths = tuple(
+        _runtime_stream_path(root, Path(name).stem, runtime)
+        for name in _ORIGIN_FILENAMES
+    )
     for path in (native_path, *origin_paths):
         if not path.is_file():
             raise ValueError(f"required evidence file is missing: {path}")

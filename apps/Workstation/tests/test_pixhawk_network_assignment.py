@@ -60,8 +60,11 @@ def test_pixhawk_workspace_separates_candidate_rows_from_side_assignments() -> N
         )
         for column in range(window.pixhawk.candidate_model.columnCount())
     ]
-    assert headers == ["Source", "NIC / Device", "Link", "Local IPv4", "Assigned"]
+    assert headers == ["Source", "NIC / Device", "Link / Kind", "Evidence", "Role"]
     assert window.pixhawk.candidate_model.item(0, 4).text() == "P1"
+    assert window.pixhawk.transport_combos["left"].currentText() == "P1 Telemetry Radio"
+    assert window.pixhawk.transport_combos["right"].currentText() == "P2 Telemetry Radio"
+    assert "drone" not in window.pixhawk.transport_combos
     assert window.pixhawk.network_assignment_values["left"]["nic"].value.text() == "enp5s0"
     assert (
         window.pixhawk.network_assignment_values["left"]["endpoint"].value.text()
@@ -76,6 +79,36 @@ def test_pixhawk_workspace_separates_candidate_rows_from_side_assignments() -> N
     window.close()
     window.deleteLater()
     app.processEvents()
+
+
+def test_usb_candidate_role_separates_saved_assignment_from_observed_identity(
+    tmp_path,
+) -> None:
+    from Workstation.workspaces import PixhawkWorkspace
+
+    resolved = tmp_path / "ttyUSB1"
+    resolved.touch()
+    stable = tmp_path / "p2-radio-by-id"
+    stable.symlink_to(resolved)
+    candidate = {
+        "source": "mavlink",
+        "kind": "USB",
+        "value": str(stable),
+        "resolved_device": str(resolved),
+        "system_id": 2,
+    }
+    panel = SimpleNamespace(
+        left_pixhawk_radio_device="",
+        right_pixhawk_radio_device=str(resolved),
+        drone_pixhawk_radio_device="",
+    )
+
+    assert PixhawkWorkspace._candidate_role_label(candidate, panel, {}) == "P2 saved · sysid 2"
+
+    panel.left_pixhawk_radio_device = str(stable)
+    assert PixhawkWorkspace._candidate_role_label(candidate, panel, {}) == (
+        "P1, P2 saved · P2 (sysid 2)"
+    )
 
 def test_pixhawk_network_discovery_lists_each_address_and_unconfigured_link(monkeypatch) -> None:
     from Workstation.workstation_core import network
@@ -638,6 +671,17 @@ def test_real_panel_find_network_runs_worker_and_publishes_network_rows(
         app_root=tmp_path,
         settings_path=tmp_path / "settings.json",
     )
+    panel._pixhawk_candidate_rows_by_source = {
+        "network": [{"kind": "NETWORK", "candidate_id": "stale-network"}],
+        "pc": [{"kind": "PC_IP", "value": "192.0.2.10"}],
+        "mavlink": [{"kind": "USB", "value": "/dev/stale-radio"}],
+    }
+    panel._sync_legacy_pixhawk_candidate_rows()
+    saved_assignments = {
+        side: dict(value)
+        for side, value in panel.pixhawk_network_assignments.items()
+    }
+    revision = panel.pixhawk_discovery_revision
 
     panel.discover_pixhawk_network()
     deadline = time.monotonic() + 2.0
@@ -650,6 +694,10 @@ def test_real_panel_find_network_runs_worker_and_publishes_network_rows(
     assert len(rows) == 1
     assert rows[0]["candidate_id"] == candidate.candidate_id
     assert rows[0]["p1_route_state"] == "ROUTE OK"
+    assert panel._pixhawk_candidate_rows_by_source["pc"] == []
+    assert panel._pixhawk_candidate_rows_by_source["mavlink"] == []
+    assert panel.pixhawk_discovery_revision == revision + 1
+    assert panel.pixhawk_network_assignments == saved_assignments
     assert panel.workstation_pixhawk_discovery_status == "FOUND 1 NETWORK CHOICES"
 
     panel.shutdown_for_close()
@@ -657,8 +705,11 @@ def test_real_panel_find_network_runs_worker_and_publishes_network_rows(
     app.processEvents()
 
 
-def test_real_panel_assignment_persists_across_restart(tmp_path, monkeypatch) -> None:
-    from Workstation import standalone_gui
+def test_real_panel_find_usb_replaces_snapshot_and_keeps_one_row_per_device(
+    tmp_path, monkeypatch
+) -> None:
+    from Workstation import device_runtime_workers, standalone_gui
+    from Workstation.workstation_core.pixhawk_attitude import UsbMavlinkIdentity
 
     monkeypatch.setattr(
         standalone_gui.WirisStereoDistancePanel, "_initial_status", lambda _self: None
@@ -667,6 +718,237 @@ def test_real_panel_assignment_persists_across_restart(tmp_path, monkeypatch) ->
         standalone_gui.WirisStereoDistancePanel,
         "_auto_load_intrinsics",
         lambda _self: None,
+    )
+    devices = ["/dev/serial/by-id/p1-radio", "/dev/serial/by-id/p2-radio"]
+    monkeypatch.setattr(
+        device_runtime_workers,
+        "usb_mavlink_device_candidates",
+        lambda: list(devices),
+    )
+    monkeypatch.setattr(
+        device_runtime_workers,
+        "probe_usb_mavlink_devices",
+        lambda *, candidates, timeout_s: [
+            UsbMavlinkIdentity(
+                device=candidates[1],
+                resolved_device="/dev/ttyUSB1",
+                baud=57_600,
+                system_id=2,
+                component_id=1,
+                observed_monotonic_s=123.5,
+            )
+        ],
+    )
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = standalone_gui.WirisStereoDistancePanel(
+        app_root=tmp_path,
+        settings_path=tmp_path / "settings.json",
+    )
+    panel._pixhawk_candidate_rows_by_source = {
+        "network": [{"kind": "NETWORK", "candidate_id": "stale-network"}],
+        "pc": [{"kind": "PC_IP", "value": "192.0.2.10"}],
+        "mavlink": [{"kind": "USB", "value": "/dev/stale-radio"}],
+    }
+    panel._sync_legacy_pixhawk_candidate_rows()
+    panel.left_pixhawk_radio_device = "/dev/saved-p1-radio"
+    panel.right_pixhawk_radio_device = "/dev/saved-p2-radio"
+    saved_assignments = {
+        side: dict(value)
+        for side, value in panel.pixhawk_network_assignments.items()
+    }
+    revision = panel.pixhawk_discovery_revision
+
+    panel.discover_usb_pixhawk_connections()
+    deadline = time.monotonic() + 2.0
+    while panel.pixhawk_usb_discovery_thread is not None and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.005)
+
+    assert panel.pixhawk_usb_discovery_thread is None
+    assert panel._pixhawk_candidate_rows_by_source["network"] == []
+    assert panel._pixhawk_candidate_rows_by_source["pc"] == []
+    rows = panel._pixhawk_candidate_rows_by_source["mavlink"]
+    assert [row["value"] for row in rows] == devices
+    assert [row["kind"] for row in rows] == ["USB", "USB"]
+    assert rows[1]["resolved_device"] == "/dev/ttyUSB1"
+    assert rows[1]["system_id"] == 2
+    assert rows[1]["component_id"] == 1
+    assert panel.pixhawk_discovery_revision == revision + 1
+    assert panel.left_pixhawk_radio_device == "/dev/saved-p1-radio"
+    assert panel.right_pixhawk_radio_device == "/dev/saved-p2-radio"
+    assert panel.pixhawk_network_assignments == saved_assignments
+    assert panel.workstation_pixhawk_discovery_status == "FOUND 2 USB ENDPOINTS"
+
+    panel.shutdown_for_close()
+    panel.deleteLater()
+    app.processEvents()
+
+
+def test_duplicate_usb_discovery_does_not_clear_the_active_snapshot() -> None:
+    from Workstation import standalone_gui
+
+    logs: list[str] = []
+    panel = SimpleNamespace(
+        pixhawk_usb_discovery_thread=object(),
+        _log=logs.append,
+        _begin_pixhawk_candidate_discovery=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("active discovery must not be reset")
+        ),
+    )
+
+    standalone_gui.WirisStereoDistancePanel.discover_usb_pixhawk_connections(panel)
+
+    assert logs == ["[픽스호크] USB Pixhawk 연결 탐색이 이미 진행 중입니다."]
+
+
+def test_pixhawk_host_discovery_cannot_join_an_active_candidate_snapshot() -> None:
+    from Workstation.device_runtime_controller import DeviceRuntimeController
+
+    logs: list[str] = []
+    panel = SimpleNamespace(
+        pixhawk_host_ip_discovery_thread=None,
+        _pixhawk_candidate_discovery_active=lambda: True,
+        _log=logs.append,
+    )
+
+    DeviceRuntimeController(panel).discover_pc_pixhawk_ip()
+
+    assert logs == [
+        "[픽스호크] 다른 Discovery가 진행 중이어서 PC IP 탐색을 시작하지 않았습니다."
+    ]
+
+
+def test_begin_pixhawk_discovery_clears_only_transient_evidence() -> None:
+    from Workstation import standalone_gui
+
+    replacements: list[tuple[list[dict[str, object]], object]] = []
+    panel = SimpleNamespace(
+        pixhawk_discovery_revision=4,
+        pixhawk_usb_identity_evidence=[{"system_id": 1}],
+        left_pixhawk_radio_device="/dev/saved-p1-radio",
+        pixhawk_network_assignments={"left": {"interface": "enx-pixhawk"}},
+        workstation_pixhawk_discovery_status="FOUND 9 ENDPOINTS",
+        _set_pixhawk_candidate_rows=lambda rows, source=None: replacements.append(
+            (list(rows), source)
+        ),
+    )
+
+    standalone_gui.WirisStereoDistancePanel._begin_pixhawk_candidate_discovery(
+        panel,
+        "SEARCHING USB",
+        clear_usb_identity=True,
+    )
+
+    assert replacements == [([], None)]
+    assert panel.pixhawk_usb_identity_evidence == []
+    assert panel.pixhawk_discovery_revision == 5
+    assert panel.workstation_pixhawk_discovery_status == "SEARCHING USB"
+    assert panel.left_pixhawk_radio_device == "/dev/saved-p1-radio"
+    assert panel.pixhawk_network_assignments == {"left": {"interface": "enx-pixhawk"}}
+
+
+def test_pixhawk_discovery_failures_cannot_restore_stale_rows() -> None:
+    from Workstation import standalone_gui
+    from Workstation.device_runtime_controller import DeviceRuntimeController
+
+    usb_replacements: list[list[dict[str, object]]] = []
+    usb_logs: list[str] = []
+    usb_panel = SimpleNamespace(
+        pixhawk_usb_identity_evidence=[{"system_id": 2}],
+        workstation_pixhawk_discovery_status="SEARCHING USB",
+        _set_pixhawk_candidate_rows=lambda rows: usb_replacements.append(list(rows)),
+        _log=usb_logs.append,
+    )
+
+    standalone_gui.WirisStereoDistancePanel._pixhawk_usb_discovery_failed(
+        usb_panel,
+        "probe failed",
+    )
+
+    assert usb_replacements == [[]]
+    assert usb_panel.pixhawk_usb_identity_evidence == []
+    assert usb_panel.workstation_pixhawk_discovery_status == "ERROR · probe failed"
+
+    network_replacements: list[list[dict[str, object]]] = []
+    network_logs: list[str] = []
+    connection_labels: list[str] = []
+    network_panel = SimpleNamespace(
+        workstation_pixhawk_discovery_status="SEARCHING NETWORK",
+        _set_pixhawk_candidate_rows=lambda rows: network_replacements.append(list(rows)),
+        pixhawk_connection_label=SimpleNamespace(setText=connection_labels.append),
+        _log=network_logs.append,
+        _refresh_operation_header=lambda: None,
+    )
+
+    DeviceRuntimeController(network_panel)._pixhawk_network_discovery_failed(
+        "route read failed"
+    )
+
+    assert network_replacements == [[]]
+    assert network_panel.workstation_pixhawk_discovery_status == "ERROR · route read failed"
+    assert connection_labels == ["Pixhawk network discovery failed: route read failed"]
+
+
+def test_empty_usb_discovery_publishes_an_empty_current_snapshot() -> None:
+    from Workstation import standalone_gui
+
+    replacements: list[tuple[list[dict[str, object]], object]] = []
+    logs: list[str] = []
+    panel = SimpleNamespace(
+        pixhawk_usb_identity_evidence=[{"system_id": 1}],
+        workstation_pixhawk_discovery_status="SEARCHING USB",
+        _set_pixhawk_candidate_rows=lambda rows, source=None: replacements.append(
+            (list(rows), source)
+        ),
+        _log=logs.append,
+    )
+
+    standalone_gui.WirisStereoDistancePanel._apply_pixhawk_usb_discovery(
+        panel,
+        {"candidates": [], "found": []},
+    )
+
+    assert replacements == [([], None)]
+    assert panel.pixhawk_usb_identity_evidence == []
+    assert panel.workstation_pixhawk_discovery_status == "FOUND 0 USB ENDPOINTS"
+    assert logs == [
+        "[픽스호크] USB Pixhawk 장치가 보이지 않습니다: /dev/ttyACM*, /dev/ttyUSB* 없음"
+    ]
+
+
+def test_real_panel_assignment_persists_across_restart(tmp_path, monkeypatch) -> None:
+    from Workstation import standalone_gui
+    from Workstation import device_runtime_workers
+    from Workstation.workstation_core.network import (
+        NetworkRoleInterfaceResult,
+        NetworkRoleOwnedEntries,
+    )
+
+    monkeypatch.setattr(
+        standalone_gui.WirisStereoDistancePanel, "_initial_status", lambda _self: None
+    )
+    monkeypatch.setattr(
+        standalone_gui.WirisStereoDistancePanel,
+        "_auto_load_intrinsics",
+        lambda _self: None,
+    )
+    monkeypatch.setattr(
+        device_runtime_workers,
+        "apply_network_role_transaction",
+        lambda requests: tuple(
+            NetworkRoleInterfaceResult(
+                request.interface,
+                "fake-profile",
+                request.desired,
+                NetworkRoleOwnedEntries(
+                    request.desired.addresses,
+                    request.desired.routes,
+                ),
+                request.desired.addresses,
+                request.desired.routes,
+            )
+            for request in requests
+        ),
     )
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     settings_path = tmp_path / "settings.json"
@@ -689,8 +971,17 @@ def test_real_panel_assignment_persists_across_restart(tmp_path, monkeypatch) ->
     )
     panel._set_pixhawk_candidate_rows([candidate], source="network")
 
+    def wait_for_role_operation() -> None:
+        deadline = time.monotonic() + 2.0
+        while panel.network_role_operation is not None and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(0.005)
+        assert panel.network_role_operation is None
+
     assert panel.assign_pixhawk_network_candidate(candidate["candidate_id"], "left") is True
+    wait_for_role_operation()
     assert panel.assign_pixhawk_network_candidate(candidate["candidate_id"], "right") is True
+    wait_for_role_operation()
     assert settings_path.exists()
     panel.shutdown_for_close()
     panel.deleteLater()
@@ -718,3 +1009,165 @@ def test_real_panel_assignment_persists_across_restart(tmp_path, monkeypatch) ->
     restarted.shutdown_for_close()
     restarted.deleteLater()
     app.processEvents()
+
+
+def _renamed_nic_panel(saved_stable_id: str) -> SimpleNamespace:
+    """One panel whose saved P1 NIC came back under a different kernel name."""
+
+    calls: list[object] = []
+    panel = SimpleNamespace(
+        calls=calls,
+        _pixhawk_candidate_rows_by_source={"network": [], "pc": [], "mavlink": []},
+        _set_pixhawk_candidate_rows=lambda rows, source=None: panel.__setattr__(
+            "published_rows", list(rows)
+        ),
+        workstation_pixhawk_discovery_status="",
+        pixhawk_network_assignments={
+            "left": {"interface": "enx-old", "local_address": "10.0.0.10"},
+            "right": {"interface": "", "local_address": ""},
+        },
+        pixhawk_network_assignment_status={"left": {}, "right": {}},
+        network_role_assignments={
+            "camera": {"interface": "enx-cam", "stable_id": "aa:bb:cc:dd:ee:ff"},
+            "p1": {"interface": "enx-old", "stable_id": saved_stable_id},
+            "p2": {"interface": "", "stable_id": ""},
+        },
+        settings=SimpleNamespace(
+            left_mavlink_interface_stable_id=saved_stable_id,
+            right_mavlink_interface_stable_id="",
+        ),
+        pixhawk_connection_label=SimpleNamespace(setText=lambda value: calls.append(("label", value))),
+        _px4_mag_camera_label=lambda side: "P1" if side == "left" else "P2",
+        _save_current_settings=lambda: calls.append("save"),
+        _log=lambda message: calls.append(("log", message)),
+        _refresh_operation_header=lambda: calls.append("refresh"),
+    )
+    return panel
+
+
+def test_renamed_nic_keeps_pixhawk_assignment_through_saved_mac() -> None:
+    from Workstation.device_runtime_controller import DeviceRuntimeController
+
+    panel = _renamed_nic_panel("00:11:22:33:44:55")
+    controller = DeviceRuntimeController(panel)
+
+    controller._apply_pixhawk_network_discovery(
+        (
+            {
+                "candidate_id": "9:enx-new:10.0.0.10/24",
+                "interface": "enx-new",
+                "mac": "00:11:22:33:44:55",
+                "carrier": "UP",
+                "local_cidr": "10.0.0.10/24",
+                "local_ip": "10.0.0.10",
+                "p1_route_state": "ROUTE OK",
+                "p2_route_state": "ROUTE OK",
+                "p1_route": "ROUTE OK · enx-new src=10.0.0.10",
+                "p2_route": "ROUTE OK · enx-new src=10.0.0.10",
+            },
+        )
+    )
+
+    status = panel.pixhawk_network_assignment_status["left"]
+    assert status["state"] == "ASSIGNED"
+    assert "enx-old -> enx-new" in status["detail"]
+    assert panel.pixhawk_network_assignments["left"]["interface"] == "enx-new"
+    assert panel.network_role_assignments["p1"] == {
+        "interface": "enx-new",
+        "stable_id": "00:11:22:33:44:55",
+    }
+    assert "save" in panel.calls
+
+
+def test_renamed_nic_without_saved_mac_still_requires_reassignment() -> None:
+    from Workstation.device_runtime_controller import DeviceRuntimeController
+
+    panel = _renamed_nic_panel("")
+    controller = DeviceRuntimeController(panel)
+
+    controller._apply_pixhawk_network_discovery(
+        (
+            {
+                "candidate_id": "9:enx-new:10.0.0.10/24",
+                "interface": "enx-new",
+                "mac": "00:11:22:33:44:55",
+                "carrier": "UP",
+                "local_cidr": "10.0.0.10/24",
+                "local_ip": "10.0.0.10",
+                "p1_route_state": "ROUTE OK",
+                "p2_route_state": "ROUTE OK",
+                "p1_route": "ROUTE OK",
+                "p2_route": "ROUTE OK",
+            },
+        )
+    )
+
+    assert panel.pixhawk_network_assignment_status["left"]["state"] == "REASSIGN REQUIRED"
+    assert panel.pixhawk_network_assignments["left"]["interface"] == "enx-old"
+    assert "save" not in panel.calls
+
+
+def test_saved_mac_present_but_address_moved_names_the_current_nic() -> None:
+    from Workstation.device_runtime_controller import DeviceRuntimeController
+
+    panel = _renamed_nic_panel("00:11:22:33:44:55")
+    controller = DeviceRuntimeController(panel)
+
+    controller._apply_pixhawk_network_discovery(
+        (
+            {
+                "candidate_id": "9:enx-new:192.168.5.4/24",
+                "interface": "enx-new",
+                "mac": "00:11:22:33:44:55",
+                "carrier": "UP",
+                "local_cidr": "192.168.5.4/24",
+                "local_ip": "192.168.5.4",
+                "p1_route_state": "NO ROUTE",
+                "p2_route_state": "NO ROUTE",
+                "p1_route": "NO ROUTE",
+                "p2_route": "NO ROUTE",
+            },
+        )
+    )
+
+    status = panel.pixhawk_network_assignment_status["left"]
+    assert status["state"] == "REASSIGN REQUIRED"
+    assert "00:11:22:33:44:55" in status["detail"]
+    assert "enx-new" in status["detail"] and "192.168.5.4/24" in status["detail"]
+    assert panel.pixhawk_network_assignments["left"]["interface"] == "enx-old"
+
+
+def test_pixhawk_workspace_role_column_follows_mac_not_interface_name() -> None:
+    from Workstation.workspaces import PixhawkWorkspace
+
+    network_roles = {
+        "camera": {"interface": "enx-old", "stable_id": "aa:bb:cc:dd:ee:ff"},
+        "p1": {"interface": "enx-old", "stable_id": "00:11:22:33:44:55"},
+        "p2": {"interface": "", "stable_id": ""},
+    }
+    renamed = {
+        "source": "network",
+        "interface": "enx-new",
+        "mac": "00:11:22:33:44:55",
+    }
+    recycled_name = {
+        "source": "network",
+        "interface": "enx-old",
+        "mac": "de:ad:be:ef:00:01",
+    }
+
+    assert PixhawkWorkspace._candidate_role_label(renamed, None, network_roles) == "P1"
+    assert PixhawkWorkspace._candidate_role_label(recycled_name, None, network_roles) == "--"
+
+
+def test_pixhawk_workspace_role_column_falls_back_to_name_without_stable_id() -> None:
+    from Workstation.workspaces import PixhawkWorkspace
+
+    network_roles = {
+        "camera": {"interface": "", "stable_id": ""},
+        "p1": {"interface": "enx-legacy", "stable_id": ""},
+        "p2": {"interface": "", "stable_id": ""},
+    }
+    row = {"source": "network", "interface": "enx-legacy", "mac": "00:11:22:33:44:55"}
+
+    assert PixhawkWorkspace._candidate_role_label(row, None, network_roles) == "P1"

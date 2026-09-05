@@ -30,7 +30,7 @@ from Workstation.workstation_core.optical_pose import (
 )
 from Workstation.workstation_core.rtk_geometry import GpsPositionState, ned_delta_m
 from Workstation.workstation_core.terrain import TerrainMetadata
-from Workstation.workstation_core.measurement_methods import HORIZON_HYBRID
+from Workstation.workstation_core.measurement_methods import HORIZON_HYBRID, MOUNTAIN_GNSS
 from Workstation.workstation_core.measurement_attempt import AttitudeSnapshot, GpsSnapshot
 from Workstation.workstation_core.optical_pose_auto_select import (
     AutoSelectionResult,
@@ -830,6 +830,10 @@ def test_gnss_mountain_uses_mountain_rotation_and_gnss_metric_baseline(tmp_path:
             "annotations": annotations,
             "gnss_baseline_ned_m": [0.0, 2.0, 0.25],
             "gnss_fix_quality": "DEGRADED",
+            "gnss_left_fix_type": 3,
+            "gnss_right_fix_type": 4,
+            "gnss_left_rtk_label": "3D_FIX",
+            "gnss_right_rtk_label": "3D_FIX",
         }
     )
 
@@ -843,7 +847,23 @@ def test_gnss_mountain_uses_mountain_rotation_and_gnss_metric_baseline(tmp_path:
     assert "lever arm UNMODELED" in " ".join(candidate["warnings"])
     assert "no GeoTIFF" in " ".join(candidate["warnings"])
     assert "fix quality=DEGRADED" in " ".join(candidate["warnings"])
+    assert "without RTK_FIXED" in " ".join(candidate["warnings"])
+    assert "remains ESTIMATED" in " ".join(candidate["warnings"])
+    assert candidate["observable_dof"]["north_m"] is True
+    assert candidate["observable_dof"]["east_m"] is True
+    assert candidate["observable_dof"]["down_m"] is True
+    assert candidate["quality_metrics"]["gnss_left_fix_type"] == pytest.approx(3.0)
+    assert candidate["quality_metrics"]["gnss_right_fix_type"] == pytest.approx(4.0)
     assert candidate["right_pose"]["center_ned_m"] == pytest.approx([0.0, 2.0, 0.25])
+    relative_pose = candidate["relative_pose_rdf"]
+    assert relative_pose["frame_contract"] == (
+        "X_right = R_right_from_left_rdf * X_left + t_right_from_left_rdf_m"
+    )
+    assert relative_pose["unit"] == "m"
+    assert len(relative_pose["rotation_right_from_left_rdf"]) == 3
+    assert all(len(row) == 3 for row in relative_pose["rotation_right_from_left_rdf"])
+    assert len(relative_pose["translation_right_from_left_rdf_m"]) == 3
+    assert len(relative_pose["right_origin_in_left_rdf_m"]) == 3
     assert candidate["input_hashes"]["lever_arm_status"] == "UNMODELED"
     assert candidate["input_hashes"]["left_anchor_pose_sha256"]
     assert "reprojection_error_px" not in candidate["quality_metrics"]
@@ -1432,6 +1452,165 @@ def test_gnss_mountain_uses_capture_time_baseline_not_live_gps(tmp_path: Path) -
     expected_m = math.sqrt(sum(v * v for v in expected_baseline))
     assert baseline_m == pytest.approx(expected_m, rel=1.0e-6)
     assert baseline_m < 100.0  # metres; a live-GPS leak would be ~1500 km
+
+
+def test_gnss_mountain_capture_translation_accepts_3d_fix_or_better(tmp_path: Path) -> None:
+    panel = _panel(tmp_path)
+    panel.latest_gps = {
+        "left": _gps_state(
+            "left",
+            timestamp_s=100.0,
+            latitude_deg=37.0,
+            longitude_deg=127.0,
+            altitude_m=50.0,
+            fix_type=3,
+        ),
+        "right": _gps_state(
+            "right",
+            timestamp_s=100.0,
+            latitude_deg=37.00002,
+            longitude_deg=127.0,
+            altitude_m=50.2,
+            fix_type=5,
+        ),
+    }
+    controller = OpticalPoseController(panel)
+    frozen = controller.capture_workstation_optical_pose_burst({})
+
+    snapshot = controller.solve_workstation_optical_pose_gnss_mountain(
+        {"annotations": _mountain_annotations(frozen)}
+    )
+
+    candidate = snapshot["candidates"][-1]
+    assert candidate["observable_dof"]["north_m"] is True
+    assert candidate["observable_dof"]["east_m"] is True
+    assert candidate["observable_dof"]["down_m"] is True
+    assert candidate["quality_metrics"]["gnss_minimum_fix_type"] == pytest.approx(3.0)
+    assert candidate["quality_metrics"]["gnss_left_fix_type"] == pytest.approx(3.0)
+    assert candidate["quality_metrics"]["gnss_right_fix_type"] == pytest.approx(5.0)
+    warning_text = " ".join(candidate["warnings"])
+    assert "accepted with 3D fix or better" in warning_text
+    assert "remains ESTIMATED" in warning_text
+
+    panel.settings = SimpleNamespace(
+        measurement_preferred_method=MOUNTAIN_GNSS,
+        measurement_method_fallback_order=(MOUNTAIN_GNSS,),
+    )
+    panel._workstation_setting = lambda _name, default=None: default
+    panel._optical_pose_controller = lambda: controller
+    panel._selected_baseline_gps_states = lambda: (
+        panel.latest_gps["left"],
+        panel.latest_gps["right"],
+    )
+    panel.latest_extrinsics = {}
+    panel.latest_rtk_baseline = None
+    panel.gnss_operation_gate_active = False
+    panel.checkerboard_extrinsics_profile = panel.selected_extrinsics_profile
+    panel.checkerboard_extrinsics_candidate_profile = None
+    panel.optical_pose_extrinsics_profile = None
+    measurement = MeasurementViewController(panel)
+
+    config = measurement.measurement_method_config_for_new_measurement()
+    frozen_mountain = config["measurement_frozen_comparison_inputs"][MOUNTAIN_GNSS]
+    assert frozen_mountain["kind"] == "optical_pose_draft"
+    assert frozen_mountain["candidate_id"] == candidate["candidate_id"]
+    assert "remains ESTIMATED" in " ".join(
+        frozen_mountain["candidate"]["warnings"]
+    )
+
+    panel._measurement_id = "m000001"
+    panel._measurement_run_metadata = config
+    mountain_status = next(
+        row
+        for row in measurement._measurement_method_statuses()
+        if row.method_id == MOUNTAIN_GNSS
+    )
+    assert mountain_status.ready is True
+    assert mountain_status.instance_id == f"frozen-draft:{candidate['candidate_id']}"
+    assert "remains ESTIMATED" in " ".join(mountain_status.warnings)
+
+
+def test_gnss_mountain_capture_translation_rejects_sub_3d_fix(tmp_path: Path) -> None:
+    panel = _panel(tmp_path)
+    panel.latest_gps = {
+        "left": _gps_state(
+            "left",
+            timestamp_s=100.0,
+            latitude_deg=37.0,
+            longitude_deg=127.0,
+            altitude_m=50.0,
+            fix_type=2,
+        ),
+        "right": _gps_state(
+            "right",
+            timestamp_s=100.0,
+            latitude_deg=37.00002,
+            longitude_deg=127.0,
+            altitude_m=50.2,
+            fix_type=3,
+        ),
+    }
+    controller = OpticalPoseController(panel)
+    frozen = controller.capture_workstation_optical_pose_burst({})
+
+    snapshot = controller.solve_workstation_optical_pose_gnss_mountain(
+        {"annotations": _mountain_annotations(frozen)}
+    )
+
+    candidate = snapshot["candidates"][-1]
+    assert candidate["observable_dof"]["north_m"] is False
+    assert candidate["observable_dof"]["east_m"] is False
+    assert candidate["observable_dof"]["down_m"] is False
+    warning_text = " ".join(candidate["warnings"])
+    assert "fix_type >= 3" in warning_text
+    assert "left_fix_type=2" in warning_text
+
+
+def test_gnss_mountain_capture_rejects_nonfinite_position(tmp_path: Path) -> None:
+    panel = _panel(tmp_path)
+    panel.latest_gps = {
+        "left": _gps_state(
+            "left",
+            timestamp_s=100.0,
+            latitude_deg=float("nan"),
+            longitude_deg=127.0,
+            altitude_m=50.0,
+            fix_type=3,
+        ),
+        "right": _gps_state(
+            "right",
+            timestamp_s=100.0,
+            latitude_deg=37.00002,
+            longitude_deg=127.0,
+            altitude_m=50.2,
+            fix_type=3,
+        ),
+    }
+    controller = OpticalPoseController(panel)
+    controller.capture_workstation_optical_pose_burst({})
+
+    with pytest.raises(RuntimeError, match="non-finite left/right GNSS position"):
+        controller._resolve_gnss_baseline_for_mountain({})
+
+
+def test_gnss_mountain_capture_rejects_zero_baseline(tmp_path: Path) -> None:
+    panel = _panel(tmp_path)
+    panel.latest_gps = {
+        side: _gps_state(
+            side,
+            timestamp_s=100.0,
+            latitude_deg=37.0,
+            longitude_deg=127.0,
+            altitude_m=50.0,
+            fix_type=3,
+        )
+        for side in ("left", "right")
+    }
+    controller = OpticalPoseController(panel)
+    controller.capture_workstation_optical_pose_burst({})
+
+    with pytest.raises(ValueError, match="non-zero finite GNSS baseline"):
+        controller._resolve_gnss_baseline_for_mountain({})
 
 
 def test_gnss_mountain_fails_closed_without_capture_baseline_or_override(tmp_path: Path) -> None:

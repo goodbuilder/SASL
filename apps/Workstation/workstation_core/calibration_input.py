@@ -122,10 +122,13 @@ class CalibrationInputSnapshot:
             raise ValueError("selection sidecar sha256 must be lowercase hex")
         if self.actual_exposure_verified and not self.precision_timing_qualified:
             raise ValueError("exposure verification requires precision timing qualification")
-        if "HOST_DISPATCH_PROXY" in self.timing_evidence_classes and (
+        if (
+            {"HOST_DISPATCH_PROXY", "HOST_RECEIVE_PROXY"}
+            & set(self.timing_evidence_classes)
+        ) and (
             self.precision_timing_qualified or self.actual_exposure_verified
         ):
-            raise ValueError("host dispatch proxy cannot precision-qualify a snapshot")
+            raise ValueError("host timing proxy cannot precision-qualify a snapshot")
 
     @property
     def root_path(self) -> Path:
@@ -317,6 +320,8 @@ def build_calibration_input_snapshot(
                 "evidence_class": (
                     "HOST_DISPATCH_PROXY"
                     if basis.startswith("ftp-") and "dispatch" in basis
+                    else "HOST_RECEIVE_PROXY"
+                    if basis == "app-receive-monotonic"
                     else "CAMERA_TIMESTAMP_VERIFIED"
                     if basis == "rtcp-ntp"
                     else "UNKNOWN"

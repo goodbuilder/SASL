@@ -13,6 +13,7 @@ from Workstation.workstation_core.gnss_monitor import (
     NtripHealthState,
     evaluate_ntrip_health,
 )
+from Workstation.workstation_core.mavlink_liveness import MAVLINK_QUALIFICATION_S
 from Workstation.workstation_core.runtime_camera_status import decoder_presentation
 
 
@@ -189,6 +190,7 @@ class BackendStatusAdapter(QtCore.QObject):
             ("lrf", self._refresh_lrf, (panel, now_s)),
             ("pixhawk.left", self._refresh_pixhawk, (panel, "left", "P1", now_s)),
             ("pixhawk.right", self._refresh_pixhawk, (panel, "right", "P2", now_s)),
+            ("pixhawk.drone", self._refresh_pixhawk, (panel, "drone", "Drone", now_s)),
             ("gnss.base", self._refresh_base_gnss, (panel, now_s)),
             ("ntrip", self._refresh_ntrip, (panel, now_s)),
             ("gnss", self._refresh_gnss, (panel, now_s)),
@@ -254,6 +256,27 @@ class BackendStatusAdapter(QtCore.QObject):
             fallback_reason=(fallback_reasons.get(side) if isinstance(fallback_reasons, Mapping) else ""),
         )
         detail = f"{detail}; decoder={decoder.value_text}"
+        camera_metadata = getattr(panel, "camera_frame_metadata", {}) or {}
+        side_metadata = (
+            camera_metadata.get(side, {})
+            if isinstance(camera_metadata, Mapping)
+            else {}
+        )
+        side_metadata = side_metadata if isinstance(side_metadata, Mapping) else {}
+        recovery_basis = str(side_metadata.get("media_recovery_basis") or "")
+        if recovery_basis == "wiris_non_idr_intra_experimental":
+            detail += (
+                "; EXPERIMENTAL NON-IDR INTRA"
+                "; IDR/keyframe guarantee=no"
+            )
+            if severity is StatusSeverity.OK:
+                severity = StatusSeverity.WARN
+        if (
+            bool(side_metadata.get("media_integrity_unverified"))
+        ):
+            detail += "; INPUT UNVERIFIED; H264/RTP integrity latched"
+            if severity is StatusSeverity.OK:
+                severity = StatusSeverity.WARN
         if decoder.fallback_active and decoder.detail:
             detail += f"; {decoder.detail}"
         if decoder.severity == "warn" and severity is StatusSeverity.OK:
@@ -505,8 +528,15 @@ class BackendStatusAdapter(QtCore.QObject):
         mavlink_sides = set(_safe_call(panel, "_mavlink_open_sides", default=()) or ())
         attitude_times = getattr(panel, "pixhawk_attitude_times", {}) or {}
         age_s = _sample_age(attitude_times.get(side, []), now_s)
-        transport = "MAVLink" if side in mavlink_sides else "telemetry"
         subscriber = getattr(panel, "mavlink_pixhawk", None)
+        selected_transport = str(
+            (getattr(subscriber, "transports", {}) or {}).get(
+                side,
+                getattr(panel, f"{side}_pixhawk_transport", "ethernet"),
+            )
+            or "ethernet"
+        ).upper()
+        transport = selected_transport if side in mavlink_sides else f"{selected_transport} telemetry"
         active_command_cameras = getattr(subscriber, "_active_command_cameras", ()) or ()
         command_active = side in active_command_cameras
         health_reader = getattr(subscriber, "mavlink_health_snapshot", None)
@@ -514,7 +544,14 @@ class BackendStatusAdapter(QtCore.QObject):
             health = health_reader(side, now_s=now_s) if callable(health_reader) else None
         except Exception:
             health = None
-        if command_active or getattr(health, "active_command", None):
+        active_command_label = str(getattr(health, "active_command", "") or "").upper()
+        shell_command_active = active_command_label in {"PX4 SHELL", "RM3100 SHELL POLL"}
+        if shell_command_active:
+            state, severity = "SHELL SYNC", StatusSeverity.OK
+            detail = "PX4 Shell sensor_mag 조회 중 (정상)"
+            projected_age_s = None
+            source = "MAVLink exclusive Shell command reservation"
+        elif command_active or getattr(health, "active_command", None):
             state, severity = "PARAM SYNC", StatusSeverity.OK
             detail = "PX4 파라미터 조회 중 (정상)"
             projected_age_s = None
@@ -533,7 +570,10 @@ class BackendStatusAdapter(QtCore.QObject):
                 "ERROR": StatusSeverity.BAD,
             }.get(state, StatusSeverity.UNKNOWN)
             qualification_elapsed_s = max(0.0, float(getattr(health, "qualification_elapsed_s", 0.0)))
-            qualification_required_s = max(1.0, float(getattr(health, "qualification_required_s", 600.0)))
+            qualification_required_s = max(
+                1.0,
+                float(getattr(health, "qualification_required_s", MAVLINK_QUALIFICATION_S)),
+            )
             shown_elapsed_s = min(qualification_elapsed_s, qualification_required_s)
             elapsed_minutes, elapsed_seconds = divmod(int(shown_elapsed_s), 60)
             required_minutes, required_seconds = divmod(int(qualification_required_s), 60)
@@ -550,6 +590,7 @@ class BackendStatusAdapter(QtCore.QObject):
                 return f"{value:.2f}s" if value < 10.0 else f"{value:.1f}s"
 
             detail_parts = [
+                f"transport={selected_transport}",
                 f"endpoint={getattr(health, 'endpoint', '') or '--'}",
                 f"peer={getattr(health, 'peer_host', '') or '--'}",
                 (
@@ -562,6 +603,15 @@ class BackendStatusAdapter(QtCore.QObject):
             ]
             if state in {"QUALIFYING", "RECOVERING"}:
                 detail_parts.append(f"qualification={qualification_text}")
+            policy_reader = getattr(subscriber, "radio_stream_policy_snapshot", None)
+            if selected_transport == "RADIO" and callable(policy_reader):
+                try:
+                    policy = policy_reader(side, now_s=now_s)
+                except Exception:
+                    policy = None
+                if policy is not None:
+                    tier = getattr(getattr(policy, "tier", None), "name", "UNKNOWN")
+                    detail_parts.append(f"optional-tier={tier}")
             if state in {"CONNECTING", "MAVLINK INITIAL RX TIMEOUT"}:
                 listener_age_s = getattr(health, "listener_age_s", None)
                 if listener_age_s is not None:
@@ -847,7 +897,9 @@ class BackendStatusAdapter(QtCore.QObject):
         if pair_basis:
             pair_parts.append(f"basis={pair_basis}")
         if rtc_delta is not None:
-            pair_parts.append(f"RTCP/NTP Δ={float(rtc_delta) * 1000.0:.1f} ms")
+            pair_parts.append(
+                f"RTCP/NTP Δ={float(rtc_delta) * 1000.0:.1f} ms (record-only)"
+            )
         detail = "; ".join((reason, *pair_parts))
         self.model.set_status(
             "synchronization",
@@ -855,8 +907,8 @@ class BackendStatusAdapter(QtCore.QObject):
             state,
             severity,
             detail=detail,
-            source="camera_sync_status + selected runtime frame pair",
-            clock="app_receive_monotonic; RTCP/NTP when present",
+            source="record-only camera_sync_status + authoritative app pair",
+            clock="distance=app_receive_monotonic; NTP=record_only",
             observed_monotonic_s=now_s,
         )
 

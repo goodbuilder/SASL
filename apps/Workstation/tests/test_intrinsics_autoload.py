@@ -383,6 +383,35 @@ def test_saving_new_calibration_replaces_previous_persisted_exact_profile(
     )
 
 
+def test_source_owned_default_calibration_saves_and_imports_portable_profile(
+    autoload_panel_factory,
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "workstation-source" / "calibration"
+    panel, _auto_load = autoload_panel_factory(
+        AppSettings(
+            calibration_root="calibration",
+            calibration_validation_root="calibration",
+            calibration_zoom_level=4,
+        )
+    )
+    panel.default_calibration_root = source_root
+    panel._calibration_session_root = None
+    panel._calibration_session_roots = {}
+    panel.calib_dir_edit.setText("calibration")
+    panel.last_calibration_result = _intrinsics_result(focal_px=1500.0)
+    panel.last_calibration_zoom_level = 4
+
+    panel.save_intrinsics()
+
+    assert (source_root / "intrinsics_zoom_04.json").is_file()
+    assert (source_root / "profiles" / "intrinsics").is_dir()
+    persisted = load_settings(panel.settings_path)
+    assert persisted.calibration_root == "calibration"
+    assert persisted.intrinsics_path.startswith("calibration/imported/")
+    assert (panel.app_root / persisted.intrinsics_path).is_file()
+
+
 def test_save_intrinsics_rejects_external_calibration_root_without_writing(
     autoload_panel_factory,
     tmp_path: Path,

@@ -13,7 +13,10 @@ from pathlib import Path
 from PyQt5 import QtGui, QtWidgets
 
 from Workstation.drone_telemetry_controller import normalize_drone_rtcm_source
-from Workstation.runtime_paths import portable_workstation_data_path_text
+from Workstation.runtime_paths import (
+    import_workstation_asset_file,
+    portable_workstation_data_path_text,
+)
 from Workstation.workstation_core.gnss_operation import (
     GnssOperationConfig,
     GnssOperationMode,
@@ -22,6 +25,8 @@ from Workstation.workstation_core.gnss_operation import (
 from Workstation.workstation_core.network import DEFAULT_CAMERA_URLS, DEFAULT_HOST_ADDRESS, DEFAULT_INTERFACE
 from Workstation.workstation_core.settings import (
     AppSettings,
+    normalize_live_distance_time_basis,
+    normalize_rtsp_encoded_queue_mode,
     resolve_settings_path,
     save_settings as _save_shared_settings,
 )
@@ -171,6 +176,7 @@ class WorkstationSettingsController:
             "right_mavlink_url": "right_mavlink_url_edit",
             "left_pixhawk_bootstrap_url": "left_pixhawk_bootstrap_url_edit",
             "right_pixhawk_bootstrap_url": "right_pixhawk_bootstrap_url_edit",
+            "drone_pixhawk_bootstrap_url": "drone_pixhawk_bootstrap_url_edit",
             "gnss_base_serial_port": "gnss_base_serial_port_edit",
         }
         for name, attribute in simple_text.items():
@@ -194,6 +200,17 @@ class WorkstationSettingsController:
 
         if has("drone_telemetry_url"):
             panel.drone_telemetry_url = str(values["drone_telemetry_url"] or "")
+        for name in (
+            "left_pixhawk_transport",
+            "right_pixhawk_transport",
+            "drone_pixhawk_transport",
+            "left_pixhawk_radio_device",
+            "right_pixhawk_radio_device",
+            "drone_pixhawk_radio_device",
+            "drone_pixhawk_eth_ip",
+        ):
+            if has(name):
+                setattr(panel, name, str(values[name] or ""))
 
         simple_values = {
             "wiris_control_port": "zoom_port_spin",
@@ -209,6 +226,7 @@ class WorkstationSettingsController:
             "right_mavlink_baud": "right_mavlink_baud_spin",
             "left_pixhawk_bootstrap_baud": "left_pixhawk_bootstrap_baud_spin",
             "right_pixhawk_bootstrap_baud": "right_pixhawk_bootstrap_baud_spin",
+            "drone_pixhawk_bootstrap_baud": "drone_pixhawk_bootstrap_baud_spin",
             "mavlink_stream_rate": "mavlink_stream_rate_spin",
             "gnss_base_baud": "gnss_base_baud_spin",
             "gnss_base_survey_in_min_duration_s": "gnss_base_survey_duration_spin",
@@ -219,6 +237,13 @@ class WorkstationSettingsController:
 
         if has("drone_telemetry_baud"):
             panel.drone_telemetry_baud = int(values["drone_telemetry_baud"])
+        for name in (
+            "left_pixhawk_radio_baud",
+            "right_pixhawk_radio_baud",
+            "drone_pixhawk_radio_baud",
+        ):
+            if has(name):
+                setattr(panel, name, int(values[name]))
         simple_checks = {
             "stip_reboot": "stip_reboot_checkbox",
             "mavlink_configure_streams": "mavlink_configure_streams_checkbox",
@@ -239,6 +264,18 @@ class WorkstationSettingsController:
         set_combo("stream_backend", "stream_backend_combo", "gstreamer")
         set_combo("rtsp_transport", "rtsp_transport_combo", "tcp")
         set_combo("pixhawk_ethernet_mode", "pixhawk_ethernet_mode_combo", "mavlink")
+        set_combo("camera_sync_mode", "camera_sync_mode_combo", "manual")
+        if has("camera_sync_interval_s"):
+            panel.camera_sync_interval_spin.setValue(
+                round(float(values["camera_sync_interval_s"]) / 60.0)
+            )
+        scheduler = getattr(panel, "_stus_scheduler", None)
+        set_policy = getattr(scheduler, "set_policy", None)
+        if callable(set_policy):
+            set_policy(
+                mode=str(panel.camera_sync_mode_combo.currentData() or "manual"),
+                interval_s=float(panel.camera_sync_interval_spin.value()) * 60.0,
+            )
 
         if has("manual_focal_override"):
             panel.manual_focal_checkbox.setChecked(bool(values["manual_focal_override"]))
@@ -399,6 +436,10 @@ class WorkstationSettingsController:
             if mode not in {"pixhawk", "checkerboard"}:
                 raise ValueError(f"unsupported distance mode: {mode}")
             panel._set_combo_data(panel.distance_mode_combo, mode)
+        if has("measurement_baseline_yaw_reverse"):
+            panel._workstation_setting_overrides[
+                "measurement_baseline_yaw_reverse"
+            ] = bool(values["measurement_baseline_yaw_reverse"])
         source_setter = getattr(panel, "set_pixhawk_gnss_source", None)
         if callable(source_setter):
             if has("pixhawk_left_gnss_source"):
@@ -422,7 +463,30 @@ class WorkstationSettingsController:
         set_text("class_gate", "yolo_gate_class_edit")
         set_checked("matching_gate_enabled", "yolo_gate_matching_checkbox")
         if has("time_basis"):
-            panel._set_combo_data(panel.yolo_gate_time_basis_combo, str(values["time_basis"] or "camera_rtcp"))
+            selected_time_basis = normalize_live_distance_time_basis(
+                values["time_basis"]
+            )
+            panel._set_combo_data(
+                panel.yolo_gate_time_basis_combo,
+                selected_time_basis,
+            )
+            panel._workstation_setting_overrides[
+                "yolo_gate_time_basis"
+            ] = selected_time_basis
+            owner = getattr(panel, "_measurement_view_controller_owner", None)
+            if not str(getattr(panel, "_measurement_id", "") or ""):
+                begin_pairing_generation = getattr(
+                    owner,
+                    "begin_pairing_generation",
+                    None,
+                )
+                if callable(begin_pairing_generation):
+                    begin_pairing_generation()
+            else:
+                panel._log(
+                    "[설정] 거리 timing 기준 변경은 현재 Measurement를 유지하고 "
+                    "다음 Measurement부터 적용합니다."
+                )
         set_checked("time_delta_gate_enabled", "yolo_gate_time_delta_checkbox")
         set_value("max_pair_delta_s", "yolo_gate_time_delta_spin")
         set_checked("vertical_delta_gate_enabled", "yolo_gate_vertical_delta_checkbox")
@@ -435,6 +499,22 @@ class WorkstationSettingsController:
         set_value("camera_sync_clock_rate_error_pct", "camera_sync_clock_rate_error_spin")
         set_value("camera_sync_required_sr_count", "camera_sync_required_sr_count_spin")
         set_value("camera_sync_warmup_timeout_s", "camera_sync_warmup_timeout_spin")
+        if has("camera_sync_mode"):
+            panel._set_combo_data(
+                panel.camera_sync_mode_combo,
+                str(values["camera_sync_mode"] or "manual"),
+            )
+        if has("camera_sync_interval_s"):
+            panel.camera_sync_interval_spin.setValue(
+                round(float(values["camera_sync_interval_s"]) / 60.0)
+            )
+        scheduler = getattr(panel, "_stus_scheduler", None)
+        set_policy = getattr(scheduler, "set_policy", None)
+        if callable(set_policy):
+            set_policy(
+                mode=str(panel.camera_sync_mode_combo.currentData() or "manual"),
+                interval_s=float(panel.camera_sync_interval_spin.value()) * 60.0,
+            )
 
         panel._set_focal_override_enabled(panel.manual_focal_checkbox.isChecked())
         panel._refresh_yolo_gate_controls()
@@ -551,12 +631,50 @@ class WorkstationSettingsController:
             else:
                 root, _left_dir, _right_dir = panel._calibration_dirs()
                 path = root / "intrinsics.json"
+
+        def portable_intrinsics_path(value: Path) -> str:
+            try:
+                return portable_workstation_data_path_text(
+                    value,
+                    data_root=panel.app_root,
+                    field_name="intrinsics_path",
+                )
+            except ValueError as portability_error:
+                candidate = Path(value).expanduser()
+                resolved = (
+                    candidate.resolve(strict=False)
+                    if candidate.is_absolute()
+                    else (Path(panel.app_root) / candidate).resolve(strict=False)
+                )
+                default_root = Path(
+                    getattr(
+                        panel,
+                        "default_calibration_root",
+                        Path(panel.app_root) / "calibration",
+                    )
+                ).expanduser().resolve(strict=False)
+                try:
+                    resolved.relative_to(default_root)
+                except ValueError:
+                    raise portability_error
+                if not resolved.is_file():
+                    raise ValueError(
+                        "intrinsics_path does not name a file under the default "
+                        f"calibration root: {resolved}"
+                    )
+                imported = import_workstation_asset_file(
+                    resolved,
+                    category="calibration",
+                    data_root=panel.app_root,
+                )
+                return portable_workstation_data_path_text(
+                    imported,
+                    data_root=panel.app_root,
+                    field_name="intrinsics_path",
+                )
+
         portable_paths = {
-            "intrinsics_path": portable_workstation_data_path_text(
-                path,
-                data_root=panel.app_root,
-                field_name="intrinsics_path",
-            ),
+            "intrinsics_path": portable_intrinsics_path(Path(path)),
             "yolo_weights_path": portable_workstation_data_path_text(
                 panel.weights_edit.text().strip() or DEFAULT_YOLO_WEIGHTS,
                 data_root=panel.app_root,
@@ -581,10 +699,15 @@ class WorkstationSettingsController:
             "measurement_data_root": portable_workstation_data_path_text(
                 panel._workstation_setting(
                     "measurement_data_root",
-                    getattr(panel.settings, "measurement_data_root", "measurement_data"),
+                    getattr(
+                        panel.settings,
+                        "measurement_data_root",
+                        AppSettings.measurement_data_root,
+                    ),
                 ),
                 data_root=panel.app_root,
                 field_name="measurement_data_root",
+                allow_empty=True,
             ),
         }
         panel.settings = AppSettings(
@@ -629,7 +752,9 @@ class WorkstationSettingsController:
             yolo_gate_vertical_delta_enabled=panel.yolo_gate_vertical_delta_checkbox.isChecked(),
             yolo_gate_max_vertical_delta_px=panel.yolo_gate_vertical_delta_spin.value(),
             yolo_gate_max_time_delta_s=panel.yolo_gate_time_delta_spin.value(),
-            yolo_gate_time_basis=str(panel.yolo_gate_time_basis_combo.currentData() or "camera_rtc_required"),
+            yolo_gate_time_basis=normalize_live_distance_time_basis(
+                panel.yolo_gate_time_basis_combo.currentData()
+            ),
             preview_width=panel.preview_width_spin.value(),
             calibration_zoom_level=panel.zoom_level_spin.value(),
             calibration_inner_cols=panel.calib_cols_spin.value(),
@@ -656,6 +781,16 @@ class WorkstationSettingsController:
             calibration_validation_pair_count=panel.checkerboard_validation_random_pair_count_spin.value(),
             calibration_validation_seed=panel.checkerboard_validation_seed_spin.value(),
             rtsp_latency_ms=panel.rtsp_latency_spin.value(),
+            rtsp_encoded_queue_mode=normalize_rtsp_encoded_queue_mode(
+                panel._workstation_setting(
+                    "rtsp_encoded_queue_mode",
+                    getattr(
+                        panel.settings,
+                        "rtsp_encoded_queue_mode",
+                        AppSettings.rtsp_encoded_queue_mode,
+                    ),
+                )
+            ),
             yolo_event_queue_size=panel.yolo_event_queue_size_spin.value(),
             yolo_frame_queue_size=panel.yolo_frame_queue_size_spin.value(),
             rtsp_decoder=panel.decoder_combo.currentData(),
@@ -675,9 +810,45 @@ class WorkstationSettingsController:
             camera_sync_max_clock_rate_error=panel.camera_sync_clock_rate_error_spin.value() / 100.0,
             camera_sync_required_sr_count=panel.camera_sync_required_sr_count_spin.value(),
             camera_sync_warmup_timeout_s=panel.camera_sync_warmup_timeout_spin.value(),
+            camera_sync_mode=str(panel.camera_sync_mode_combo.currentData() or "manual"),
+            camera_sync_interval_s=float(panel.camera_sync_interval_spin.value()) * 60.0,
             pixhawk_host_address=panel.pixhawk_host_address_edit.text().strip(),
+            pixhawk_transport_schema_version=1,
+            left_pixhawk_transport=str(
+                panel._workstation_setting("left_pixhawk_transport", panel.left_pixhawk_transport)
+            ),
+            right_pixhawk_transport=str(
+                panel._workstation_setting("right_pixhawk_transport", panel.right_pixhawk_transport)
+            ),
+            drone_pixhawk_transport=str(
+                panel._workstation_setting("drone_pixhawk_transport", panel.drone_pixhawk_transport)
+            ),
+            left_pixhawk_radio_device=str(
+                panel._workstation_setting("left_pixhawk_radio_device", panel.left_pixhawk_radio_device)
+            ),
+            right_pixhawk_radio_device=str(
+                panel._workstation_setting("right_pixhawk_radio_device", panel.right_pixhawk_radio_device)
+            ),
+            drone_pixhawk_radio_device=str(
+                panel._workstation_setting("drone_pixhawk_radio_device", panel.drone_pixhawk_radio_device)
+            ),
+            left_pixhawk_radio_usb_serial=str(getattr(panel, "left_pixhawk_radio_usb_serial", "")),
+            right_pixhawk_radio_usb_serial=str(getattr(panel, "right_pixhawk_radio_usb_serial", "")),
+            drone_pixhawk_radio_usb_serial=str(getattr(panel, "drone_pixhawk_radio_usb_serial", "")),
+            left_pixhawk_radio_baud=int(
+                panel._workstation_setting("left_pixhawk_radio_baud", panel.left_pixhawk_radio_baud)
+            ),
+            right_pixhawk_radio_baud=int(
+                panel._workstation_setting("right_pixhawk_radio_baud", panel.right_pixhawk_radio_baud)
+            ),
+            drone_pixhawk_radio_baud=int(
+                panel._workstation_setting("drone_pixhawk_radio_baud", panel.drone_pixhawk_radio_baud)
+            ),
             left_pixhawk_eth_ip=panel.left_pixhawk_eth_ip_edit.text().strip(),
             right_pixhawk_eth_ip=panel.right_pixhawk_eth_ip_edit.text().strip(),
+            drone_pixhawk_eth_ip=str(
+                panel._workstation_setting("drone_pixhawk_eth_ip", panel.drone_pixhawk_eth_ip)
+            ),
             left_mavlink_url=panel.left_mavlink_url_edit.text().strip(),
             right_mavlink_url=panel.right_mavlink_url_edit.text().strip(),
             left_mavlink_baud=panel.left_mavlink_baud_spin.value(),
@@ -692,6 +863,7 @@ class WorkstationSettingsController:
                     "interface", ""
                 )
             ),
+            drone_mavlink_interface=str(getattr(panel.settings, "drone_mavlink_interface", "")),
             left_mavlink_local_address=str(
                 (getattr(panel, "pixhawk_network_assignments", {}).get("left") or {}).get(
                     "local_address", ""
@@ -702,6 +874,30 @@ class WorkstationSettingsController:
                     "local_address", ""
                 )
             ),
+            drone_mavlink_local_address=str(
+                getattr(panel.settings, "drone_mavlink_local_address", "")
+            ),
+            camera_network_stable_id=str(
+                (getattr(panel, "network_role_assignments", {}).get("camera") or {}).get(
+                    "stable_id", ""
+                )
+            ),
+            left_mavlink_interface_stable_id=str(
+                (getattr(panel, "network_role_assignments", {}).get("p1") or {}).get(
+                    "stable_id", ""
+                )
+            ),
+            right_mavlink_interface_stable_id=str(
+                (getattr(panel, "network_role_assignments", {}).get("p2") or {}).get(
+                    "stable_id", ""
+                )
+            ),
+            drone_mavlink_interface_stable_id=str(
+                getattr(panel.settings, "drone_mavlink_interface_stable_id", "")
+            ),
+            network_role_owned_entries=dict(
+                getattr(panel, "network_role_owned_entries", {}) or {}
+            ),
             drone_telemetry_url=str(getattr(panel, "drone_telemetry_url", "") or ""),
             drone_telemetry_baud=int(getattr(panel, "drone_telemetry_baud", 57_600)),
             drone_telemetry_rtcm_forward=bool(getattr(panel, "drone_telemetry_rtcm_forward", True)),
@@ -710,8 +906,10 @@ class WorkstationSettingsController:
             ),
             left_pixhawk_bootstrap_url=panel.left_pixhawk_bootstrap_url_edit.text().strip(),
             right_pixhawk_bootstrap_url=panel.right_pixhawk_bootstrap_url_edit.text().strip(),
+            drone_pixhawk_bootstrap_url=panel.drone_pixhawk_bootstrap_url_edit.text().strip(),
             left_pixhawk_bootstrap_baud=panel.left_pixhawk_bootstrap_baud_spin.value(),
             right_pixhawk_bootstrap_baud=panel.right_pixhawk_bootstrap_baud_spin.value(),
+            drone_pixhawk_bootstrap_baud=panel.drone_pixhawk_bootstrap_baud_spin.value(),
             mavlink_configure_streams=panel.mavlink_configure_streams_checkbox.isChecked(),
             mavlink_stream_rate=panel.mavlink_stream_rate_spin.value(),
             pixhawk_ethernet_mode=panel._pixhawk_ethernet_mode(),
@@ -735,6 +933,12 @@ class WorkstationSettingsController:
                 panel._workstation_setting(
                     "measurement_method_fallback_order",
                     panel.settings.measurement_method_fallback_order,
+                )
+            ),
+            measurement_baseline_yaw_reverse=bool(
+                panel._workstation_setting(
+                    "measurement_baseline_yaw_reverse",
+                    panel.settings.measurement_baseline_yaw_reverse,
                 )
             ),
             measurement_display_mode=panel._measurement_display_mode(),

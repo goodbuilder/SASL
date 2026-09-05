@@ -21,6 +21,130 @@ def test_default_camera_host_address_preserves_camera_pixhawk_nic_isolation() ->
 
     assert settings.camera_host_address == "10.0.0.11/32"
     assert settings.pixhawk_host_address == "10.0.0.10"
+    assert settings.camera_sync_rtcp_pair_max_delta_s == pytest.approx(0.100)
+    assert settings.pixhawk_transport_schema_version == 2
+    assert (
+        settings.left_pixhawk_transport,
+        settings.right_pixhawk_transport,
+        settings.drone_pixhawk_transport,
+    ) == ("radio", "radio", "radio")
+    assert settings.left_pixhawk_radio_device == ""
+    assert settings.right_pixhawk_radio_device == ""
+    assert settings.drone_pixhawk_radio_device == ""
+
+
+def test_legacy_pixhawk_settings_migrate_once_to_radio_without_reusing_drone_serial(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    from Workstation.workstation_core.settings import load_settings
+
+    path = tmp_path / "legacy-pixhawk.json"
+    legacy = {
+        "left_mavlink_url": "udpin:0.0.0.0:14550",
+        "right_mavlink_url": "udpin:0.0.0.0:14551",
+        "drone_telemetry_url": "/dev/serial/by-id/p2-ground-radio",
+        "left_mavlink_interface": "enx-left",
+        "right_mavlink_interface": "enx-right",
+        "mavlink_configure_streams": True,
+    }
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    migrated = load_settings(path)
+    persisted_once = path.read_bytes()
+    reloaded = load_settings(path)
+
+    assert migrated.pixhawk_transport_schema_version == 2
+    assert migrated.left_pixhawk_transport == "radio"
+    assert migrated.right_pixhawk_transport == "radio"
+    assert migrated.drone_pixhawk_transport == "radio"
+    assert migrated.left_mavlink_url == legacy["left_mavlink_url"]
+    assert migrated.right_mavlink_url == legacy["right_mavlink_url"]
+    assert migrated.drone_telemetry_url == legacy["drone_telemetry_url"]
+    assert migrated.drone_pixhawk_radio_device == ""
+    assert migrated.left_mavlink_interface == "enx-left"
+    assert migrated.right_mavlink_interface == "enx-right"
+    assert reloaded == migrated
+    assert path.read_bytes() == persisted_once
+
+
+def test_invalid_pixhawk_transport_fails_closed_to_radio(tmp_path: Path) -> None:
+    from Workstation.workstation_core.settings import load_settings
+
+    path = tmp_path / "invalid-pixhawk-transport.json"
+    path.write_text(
+        '{"pixhawk_transport_schema_version":1,"left_pixhawk_transport":"magic"}',
+        encoding="utf-8",
+    )
+
+    assert load_settings(path).left_pixhawk_transport == "radio"
+
+
+def test_stus_schedule_settings_migrate_to_manual_and_bound_interval(tmp_path: Path) -> None:
+    from Workstation.workstation_core.settings import load_settings
+
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text("{}", encoding="utf-8")
+    migrated = load_settings(legacy)
+    assert migrated.camera_sync_mode == "manual"
+    assert migrated.camera_sync_interval_s == pytest.approx(1800.0)
+
+    configured = tmp_path / "configured.json"
+    configured.write_text(
+        '{"camera_sync_mode":"AUTO","camera_sync_interval_s":1}',
+        encoding="utf-8",
+    )
+    loaded = load_settings(configured)
+    assert loaded.camera_sync_mode == "auto"
+    assert loaded.camera_sync_interval_s == pytest.approx(300.0)
+
+
+def test_legacy_live_time_basis_migrates_to_rtcp_preferred_with_app_fallback(
+    tmp_path: Path,
+) -> None:
+    from Workstation.workstation_core.settings import load_settings
+
+    path = tmp_path / "legacy-time-basis.json"
+    path.write_text(
+        '{"yolo_gate_matching_enabled":false,'
+        '"yolo_gate_time_delta_enabled":false,'
+        '"yolo_gate_max_time_delta_s":0.5,'
+        '"yolo_gate_time_basis":"camera_rtc_required"}',
+        encoding="utf-8",
+    )
+
+    settings = load_settings(path)
+
+    assert settings.yolo_gate_matching_enabled is True
+    assert settings.yolo_gate_time_delta_enabled is True
+    assert settings.yolo_gate_max_time_delta_s == pytest.approx(0.100)
+    assert settings.yolo_gate_time_basis == "camera_rtcp"
+
+
+def test_missing_or_invalid_live_time_basis_uses_app_receive_default(
+    tmp_path: Path,
+) -> None:
+    from Workstation.workstation_core.settings import load_settings
+
+    missing = tmp_path / "missing-time-basis.json"
+    missing.write_text("{}", encoding="utf-8")
+    invalid = tmp_path / "invalid-time-basis.json"
+    invalid.write_text('{"yolo_gate_time_basis":"unknown"}', encoding="utf-8")
+
+    assert load_settings(missing).yolo_gate_time_basis == "app_receive_monotonic"
+    assert load_settings(invalid).yolo_gate_time_basis == "app_receive_monotonic"
+
+
+def test_rtcp_preference_round_trips_through_persisted_app_settings(
+    tmp_path: Path,
+) -> None:
+    from Workstation.workstation_core.settings import AppSettings, load_settings, save_settings
+
+    path = tmp_path / "settings.json"
+    save_settings(AppSettings(yolo_gate_time_basis="camera_rtcp"), path)
+
+    assert load_settings(path).yolo_gate_time_basis == "camera_rtcp"
 
 
 def test_save_settings_failure_leaves_existing_settings_file_intact(
@@ -277,7 +401,10 @@ def test_workstation_exposes_complete_system_settings_surface() -> None:
     app.processEvents()
     settings = window.settings_workspace
     assert window.workspace_host.currentWidget().widget() is settings
-    assert settings.tabs.count() == 6
+    assert settings.tabs.count() == 7
+    assert settings.settings_widgets["left_pixhawk_transport"].itemText(0) == "P1 Telemetry Radio"
+    assert settings.settings_widgets["right_pixhawk_transport"].itemText(0) == "P2 Telemetry Radio"
+    assert settings.settings_widgets["drone_pixhawk_transport"].itemText(0) == "Drone Telemetry Radio"
     assert not any(
         "Units/frames" in label.text()
         for label in settings.findChildren(QtWidgets.QLabel)
@@ -288,10 +415,13 @@ def test_workstation_exposes_complete_system_settings_surface() -> None:
         "yolo_weights_path",
         "yolo_input_size",
         "rtsp_transport",
+        "rtsp_encoded_queue_mode",
         "pixhawk_host_address",
         "pixhawk_ethernet_mode",
         "intrinsics_path",
         "measurement_data_root",
+        "camera_sync_mode",
+        "camera_sync_interval_s",
         "gnss_operation_mode",
         "gnss_network_caster_host",
         "gnss_network_tls",
@@ -318,6 +448,15 @@ def test_workstation_exposes_complete_system_settings_surface() -> None:
     assert settings.settings_widgets["gnss_network_caster_host"].text() == ""
     assert settings.settings_widgets["yolo_input_size"].value() == 416
     assert "next Detection start" in settings.settings_widgets["yolo_input_size"].toolTip()
+    assert settings.settings_widgets["rtsp_encoded_queue_mode"].currentData() == "latest"
+    measurement_root = settings.settings_widgets["measurement_data_root"]
+    assert measurement_root.text() == ""
+    assert "recordings" in measurement_root.placeholderText()
+    assert settings.settings_payload()["measurement_data_root"] == ""
+    settings.settings_widgets["rtsp_encoded_queue_mode"].setCurrentIndex(
+        settings.settings_widgets["rtsp_encoded_queue_mode"].findData("reference_safe")
+    )
+    assert settings.settings_payload()["rtsp_encoded_queue_mode"] == "reference_safe"
     assert "hostname only" in settings.settings_widgets["gnss_network_caster_host"].placeholderText()
     assert "측정 데이터의 현장 메모" in settings.settings_widgets["gnss_site_label"].toolTip()
     assert "기록용" in settings.settings_widgets["gnss_site_address"].toolTip()
@@ -565,17 +704,31 @@ def test_workstation_every_flat_app_setting_has_an_editable_surface() -> None:
         "triangulation_extrinsics_source",
         "measurement_preferred_method",
         "measurement_method_fallback_order",
+        "measurement_baseline_yaw_reverse",
         "pixhawk_left_gnss_source",
         "pixhawk_right_gnss_source",
     }
     pixhawk_workspace_owned_settings = {
+        "pixhawk_transport_schema_version",
         # These machine-local values are selected by Find network + Assign
         # P1/P2 in the Pixhawk workspace.  Free-form Settings edits would
         # bypass the route evidence bound to that operator selection.
         "left_mavlink_interface",
         "right_mavlink_interface",
+        "drone_mavlink_interface",
         "left_mavlink_local_address",
         "right_mavlink_local_address",
+        "drone_mavlink_local_address",
+        # Stable physical identity and exact app-owned NM entries are
+        # produced only by the confirmed role-application workflow.
+        "camera_network_stable_id",
+        "left_mavlink_interface_stable_id",
+        "right_mavlink_interface_stable_id",
+        "drone_mavlink_interface_stable_id",
+        "left_pixhawk_radio_usb_serial",
+        "right_pixhawk_radio_usb_serial",
+        "drone_pixhawk_radio_usb_serial",
+        "network_role_owned_entries",
     }
     flat_fields = {field.name for field in fields(AppSettings)} - {"gnss_operation"}
 
@@ -595,7 +748,7 @@ def test_workstation_every_flat_app_setting_has_an_editable_surface() -> None:
     } <= measurement_keys
     assert set(sync_aliases.values()) <= time_keys
     assert set(calibration_aliases.values()) <= calibration_keys
-    assert window.settings_workspace.measurement_fallback_list.count() == 8
+    assert window.settings_workspace.measurement_fallback_list.count() == 9
     assert "zoom_level" not in calibration_keys
     assert window.advanced.zoom_level_spin.value() > 0
     assert not set(sync_aliases.values()) & measurement_keys
@@ -603,6 +756,68 @@ def test_workstation_every_flat_app_setting_has_an_editable_surface() -> None:
     window.close()
     window.deleteLater()
     app.processEvents()
+
+
+def test_measurement_workspace_exposes_app_default_and_rtcp_preference(
+    workstation_qapplication,
+) -> None:
+    window = WorkstationMainWindow(backend=_FakeBackend())
+    basis = window.measurement.settings_widgets["time_basis"]
+    matching = window.measurement.settings_widgets["matching_gate_enabled"]
+    delta_gate = window.measurement.settings_widgets["time_delta_gate_enabled"]
+    delta = window.measurement.settings_widgets["max_pair_delta_s"]
+
+    assert basis.currentData() == "app_receive_monotonic"
+    assert basis.isEnabled() is True
+    assert basis.count() == 2
+    assert basis.itemData(1) == "camera_rtcp"
+    assert matching.isChecked() is True
+    assert matching.isEnabled() is False
+    assert delta_gate.isChecked() is True
+    assert delta_gate.isEnabled() is False
+    assert delta.maximum() == pytest.approx(0.100)
+    assert "Settings preferred" in window.measurement.distance_timing_contract.text()
+    assert "fallback APP RECEIVE" in window.measurement.distance_timing_contract.text()
+
+    window.close()
+    window.deleteLater()
+    workstation_qapplication.processEvents()
+
+
+def test_measurement_timing_status_projects_effective_fallback_without_relayout(
+    workstation_qapplication,
+) -> None:
+    from Workstation.workstation_core.detection_pair_coordinator import PairTimingDecision
+
+    window = WorkstationMainWindow(backend=_FakeBackend())
+    panel = SimpleNamespace(
+        _yolo_time_basis=lambda: "camera_rtcp",
+        _coordinated_pairing_result=SimpleNamespace(
+            timing=PairTimingDecision(
+                requested_basis="camera_rtcp",
+                effective_basis="app_receive_monotonic",
+                left_timestamp_s=10.0,
+                right_timestamp_s=10.02,
+                signed_delta_ns=20_000_000,
+                abs_delta_ns=20_000_000,
+                fallback_reason="CLOCK_NOT_VERIFIED",
+            )
+        ),
+    )
+
+    window.measurement._refresh_distance_timing_contract(panel)
+
+    text = window.measurement.distance_timing_contract.text()
+    assert "RTCP/NTP → APP RECEIVE" in text
+    assert "fallback=CLOCK_NOT_VERIFIED" in text
+    assert (
+        window.measurement.distance_timing_contract.sizePolicy().horizontalPolicy()
+        == QtWidgets.QSizePolicy.Ignored
+    )
+
+    window.close()
+    window.deleteLater()
+    workstation_qapplication.processEvents()
 
 def test_evidence_projects_measurement_settings_and_session_csv_without_conversion(tmp_path, monkeypatch) -> None:
     from Workstation.workstation_core import settings as settings_module
@@ -637,6 +852,11 @@ def test_evidence_projects_measurement_settings_and_session_csv_without_conversi
     assert measurement["yolo_input_size_px"] == 640
     assert measurement["class_gate"] == "person"
     assert measurement["distance_mode"] == "pixhawk"
+    assert measurement["time_basis"] == "camera_rtcp"
+    assert measurement["time_basis_role"] == "preferred_with_app_receive_fallback"
+    assert measurement["ntp_evidence_role"] == "preferred_when_selected_and_verified"
+    assert measurement["matching_gate_enabled"] is True
+    assert measurement["time_delta_gate_enabled"] is True
     assert measurement["camera_sync_rtcp_pair_max_delta_ms"] == 50.0
     assert "bbox_gate_enabled" not in measurement
     assert "min_bbox_width_px" not in measurement
@@ -711,6 +931,119 @@ def test_system_measurement_and_time_save_apply_visible_payload_before_persist()
     app.processEvents()
     window.deleteLater()
     app.processEvents()
+
+
+def test_measurement_start_applies_selected_yolo_weights_before_detection() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    window = WorkstationMainWindow(backend=backend)
+    window.status_adapter.stop()
+    selected_weights = "models/yolov8n-military-student.pt"
+    window.settings_workspace.settings_widgets["yolo_weights_path"].setText(
+        selected_weights
+    )
+    backend.calls.clear()
+
+    assert window.commands.invoke("detection.toggle") is True
+
+    assert backend.calls == [
+        ("settings_apply", {"yolo_weights_path": selected_weights}),
+        "detection",
+    ]
+
+    window.close()
+    app.processEvents()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_measurement_start_rejection_does_not_fall_back_to_stale_yolo_weights() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+
+    def reject_settings(settings: dict[str, object]) -> bool:
+        backend.calls.append(("settings_apply", dict(settings)))
+        return False
+
+    backend.apply_workstation_system_settings = reject_settings
+    window = WorkstationMainWindow(backend=backend)
+    window.status_adapter.stop()
+    selected_weights = "models/yolov8m-defence.pt"
+    window.settings_workspace.settings_widgets["yolo_weights_path"].setText(
+        selected_weights
+    )
+    backend.calls.clear()
+
+    assert window.commands.invoke("detection.toggle") is False
+    assert backend.calls == [
+        ("settings_apply", {"yolo_weights_path": selected_weights})
+    ]
+
+    window.close()
+    app.processEvents()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_measurement_stop_does_not_require_a_new_yolo_model_selection() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    backend.panel._measurement_run_state = "RUNNING"
+    window = WorkstationMainWindow(backend=backend)
+    window.status_adapter.stop()
+    window.settings_workspace.settings_widgets["yolo_weights_path"].clear()
+    backend.calls.clear()
+
+    assert window.commands.invoke("detection.toggle") is True
+    assert backend.calls == ["detection"]
+
+    window.close()
+    app.processEvents()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_measurement_start_forwards_selected_weights_to_real_yolo_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from Workstation import standalone_gui
+    from Workstation.standalone_backend import StandalonePanelBackend
+
+    monkeypatch.setattr(
+        standalone_gui.WirisStereoDistancePanel,
+        "_initial_status",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        standalone_gui.WirisStereoDistancePanel,
+        "_auto_load_intrinsics",
+        lambda self: None,
+    )
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = standalone_gui.WirisStereoDistancePanel(app_root=tmp_path)
+    captured_configs: list[dict[str, object]] = []
+    panel.toggle_yolo_detection = lambda: captured_configs.append(
+        panel.yolo_kwargs()
+    )
+    window = WorkstationMainWindow(backend=StandalonePanelBackend(panel))
+    window.status_adapter.stop()
+    selected_weights = "models/yolov8m-defence.pt"
+    window.settings_workspace.settings_widgets["yolo_weights_path"].setText(
+        selected_weights
+    )
+
+    assert window.commands.invoke("detection.toggle") is True
+
+    assert panel.weights_edit.text() == selected_weights
+    assert len(captured_configs) == 1
+    assert str(captured_configs[0]["weights_path"]).endswith(selected_weights)
+
+    window.close()
+    app.processEvents()
+    window.deleteLater()
+    app.processEvents()
+
 
 def test_settings_save_does_not_persist_when_visible_payload_apply_is_rejected() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])

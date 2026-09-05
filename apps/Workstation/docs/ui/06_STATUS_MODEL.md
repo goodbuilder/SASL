@@ -97,6 +97,8 @@ promote a side to CONNECTING/LIVE. Same-NIC topology is not a warning/status dim
 - `RECOVERING`: expected packet returned after stall/reboot; qualification restarted at zero.
 - `PARAM SYNC`: bounded receive-path reservation; it suppresses false stall and requires fresh
   post-command HB+ATT before qualification restarts.
+- `SHELL SYNC`: bounded Stable-PX4 `sensor_mag`/active-device Shell readback; it is not a
+  parameter lookup and returns to the normal transport state after the readback.
 
 Display endpoint, observed/expected sysid, HB/ATT/ANY ages, qualification `mm:ss / 10:00`, and RTCM
 block evidence without resizing cards or moving controls. Only `LIVE` satisfies Pixhawk readiness.
@@ -117,6 +119,30 @@ without presenting them as current. `WAITING` means no finite non-zero horizonta
 comparable attitude. The formulas are `Baseline−Pn=wrap180(azimuth(P1→P2)-Pn yaw)` and
 `P2−P1=wrap180(P2 yaw-P1 yaw)`. These states are source availability/freshness only; there is no
 GOOD/WARN/BAD angle verdict.
+
+The Pixhawk `Dr` geometry projection is a separate latest-state aid. It displays midpoint→Dr in
+`gnss_baseline_center_local_level_frd`, P1→Dr in P1 `px4_frd`, and P2→Dr in P2 `px4_frd`, each
+with `F/R/D/Rg` metre values and source age. `∠Dr-P1-P2` and `∠Dr-P2-P1` are independent
+unsigned internal angles calculated from horizontal GNSS North/East vectors only; Down and yaw
+are excluded. Missing/non-finite rays are `WAITING`, stale finite source geometry is `STALE`,
+and no new global status key, command, persistence, or measurement semantic is introduced.
+
+Pixhawk magnetometer rows expose raw and calibration-corrected yaw without changing the global
+status model. `RAW yaw°` is `wrap180(atan2(-y,x))` in the producer sensor axes and is diagnostic
+only. `Corrected yaw°` follows PX4's `Magnetometer::Correct()` order (`R * S * (data - offset)`) using
+the device's read-back `CAL_MAG` slot; it remains waiting until those parameters are manually read.
+The IMU table contains the three standard `SCALED_IMU/2/3` rows and the dedicated RM3100
+`DEBUG_VECT` `CAN1_MAG`/`CAN2_MAG` rows; RM3100 rows retain the `mavlink/DEBUG_VECT` topic and
+Gauss unit.
+On Stable PX4, the same RM3100 rows may instead be populated by the bounded Shell
+`listener sensor_mag` path and retain a `px4-shell/sensor_mag/<instance>` topic/source.
+`PX4 yaw°` and `Δyaw°` remain backend diagnostic fields and are not operator-table columns. `WAITING`,
+`STALE`, `PARAM 대기`, `PARAM 불완전`, and `전류 보정 대기` remain visible as corrected-yaw
+states. The Pixhawk MAG control adds side-specific `PARAM APPLYING`,
+`PARAM VERIFIED`, `VERIFYING`, `ACTIVE VERIFIED`, `STALE`, `TIMEOUT`, and `ERROR` evidence; it
+does not create a global status key. Live-Pixhawk Measurement admission consumes the public
+side-specific verification snapshot and records its selection provenance; no stream request,
+firmware change, or persistent parameter schema is added.
 
 ## 13. Detection
 
@@ -144,6 +170,10 @@ runtime status key). It evaluates camera LIVE, RTCP/NTP SYNCED, detection RUNNIN
 active calibration, and the selected Pixhawk/GNSS or checkerboard geometry evidence.
 It returns `READY` only when all required checks pass; it never treats a command
 acceptance as proof that a source is live. Storage state is observable but never a Measurement gate.
+
+The Data Status stream projection exposes the authoritative JSONL path/state and the independent
+same-stem CSV path/state. CSV `FAILED`/`RETRYING`/`DROPPED` is diagnostic evidence only; JSONL and
+Measurement remain available and `Retry Storage` is the recovery action.
 
 ### 15.1 Latest Measurement XLSX
 

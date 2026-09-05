@@ -3,10 +3,10 @@ schema: modify-gui-change-state-v1
 change_id: 20260826-nvidia-decoder-status
 status: verifying
 mode: backend-coupled
-updated: 2026-08-26
+updated: 2026-09-04
 baseline_ref: c4397995d864576c966702cfd3c398b6032f8990
-last_completed: "Software slices 1-5 PASS: focused 101, full 1231 passed/1 skipped, doctor auto->nvh264dec, CUDA-memory synthetic decode, stable UI sequence, and live Workstation process/window"
-next_question: "After closing the separately running StereoWIRIS app, start Workstation Preview and verify Left/Right both show GPU · nvh264dec with live frames and sustained resource evidence"
+last_completed: "Added CUDA Driver API (cuInit(0)) as the NVDEC preflight gate; 36 runtime tests and 89 decoder/recovery tests passed with one capability skip; both launchers now truthfully select avdec_h264 on the current reboot-required host"
+next_question: "After stopping Workstation Preview, reboot the host, rerun both --check commands, and verify real Left/Right WIRIS Preview reaches GPU · nvh264dec before closing this packet"
 read_next:
   - docs/changes/20260826-nvidia-decoder-status/approval-summary.md
   - docs/changes/20260826-nvidia-decoder-status/current-behavior.md

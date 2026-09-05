@@ -17,17 +17,69 @@ from Workstation.workstation_core.yolo_stream import (
     DEFAULT_CPU_YOLO_ADAPTIVE_MAX_RATE_HZ,
     DEFAULT_CPU_YOLO_INITIAL_RATE_HZ,
     DEFAULT_PREVIEW_DISPLAY_RATE_HZ,
+    RollingCounterRateEstimator,
     RollingFrameRateEstimator,
     YoloStreamWorker,
     CameraIpcCounters,
     _BoundedProcessOutputQueue,
     _activate_cpu_fallback_rate_limiter,
+    app_receive_monotonic_sample,
     _process_frame_for_output,
     _should_emit_preview_frame,
+    should_suppress_decoded_output,
     filter_detections_by_class_gate,
     DetectionBox,
 )
 from Workstation.workstation_core.native_frame_ring import FrameKey
+
+
+def test_app_receive_sample_uses_one_exact_integer_monotonic_reading(monkeypatch) -> None:
+    from Workstation.workstation_core import yolo_stream
+
+    monkeypatch.setattr(yolo_stream.time, "monotonic_ns", lambda: 123_456_789_012_345)
+
+    monotonic_ns, monotonic_s = app_receive_monotonic_sample()
+
+    assert monotonic_ns == 123_456_789_012_345
+    assert monotonic_s == pytest.approx(123_456.789012345)
+
+
+def test_permanent_tolerant_policy_relaxes_only_decoded_suppression() -> None:
+    assert should_suppress_decoded_output(
+        active_decoder="nvh264dec",
+        rtp_discontinuity_latched=True,
+    ) is True
+    assert should_suppress_decoded_output(
+        active_decoder="nvh264dec",
+        rtp_discontinuity_latched=True,
+        tolerant_input=True,
+    ) is False
+    assert should_suppress_decoded_output(
+        active_decoder="nvh264dec",
+        rtp_discontinuity_latched=False,
+        tolerant_input=True,
+    ) is False
+
+
+def test_decoded_backends_capture_app_time_at_their_receipt_boundary() -> None:
+    from Workstation.workstation_core import yolo_stream
+
+    source = Path(yolo_stream.__file__).read_text(encoding="utf-8")
+
+    gst_receipt = source.index('sample = sink.emit("try-pull-sample", 200_000_000)')
+    gst_capture = source.index("app_receive_monotonic_sample()", gst_receipt)
+    gst_buffer = source.index("buffer = sample.get_buffer()", gst_receipt)
+    assert gst_receipt < gst_capture < gst_buffer
+
+    opencv_receipt = source.index("ok, frame = cap.read()")
+    opencv_capture = source.index("app_receive_monotonic_sample()", opencv_receipt)
+    opencv_validation = source.index("if not ok or frame is None:", opencv_receipt)
+    assert opencv_receipt < opencv_capture < opencv_validation
+
+    pyav_receipt = source.index("for av_frame in packet.decode():")
+    pyav_capture = source.index("app_receive_monotonic_sample()", pyav_receipt)
+    pyav_conversion = source.index('av_frame.to_ndarray(format="bgr24")', pyav_receipt)
+    assert pyav_receipt < pyav_capture < pyav_conversion
 
 
 def test_shared_error_throttle_suppresses_only_the_same_recent_message() -> None:
@@ -198,6 +250,53 @@ def test_preview_output_rate_limiter_accepts_invalid_or_unlimited_values() -> No
     assert _should_emit_preview_frame({"display_rate_hz": -1.0}, 1.0)
 
 
+def test_forced_nal1_preview_bypasses_only_display_rate_coalescing() -> None:
+    from Workstation.workstation_core.yolo_stream import _emit_preview_frame
+
+    class Array:
+        shape = (2, 2, 3)
+
+        @staticmethod
+        def tobytes() -> bytes:
+            return bytes(12)
+
+    class Cv2:
+        COLOR_BGR2RGB = 1
+
+        @staticmethod
+        def cvtColor(_frame, _conversion):
+            return Array()
+
+    messages: list[object] = []
+    output = SimpleNamespace(put=messages.append)
+    config = {"preview_max_width": 2, "display_rate_hz": 10.0}
+
+    assert _emit_preview_frame(
+        Cv2,
+        Array(),
+        config,
+        output,
+        timestamp_s=1.0,
+    )
+    assert not _emit_preview_frame(
+        Cv2,
+        Array(),
+        config,
+        output,
+        timestamp_s=1.01,
+    )
+    assert _emit_preview_frame(
+        Cv2,
+        Array(),
+        config,
+        output,
+        timestamp_s=1.02,
+        extra_metadata={"h264_nal1_non_idr_intra": True},
+        force_emit=True,
+    )
+    assert len(messages) == 2
+
+
 def test_decoded_rate_uses_a_rolling_window_and_expires_after_a_gap() -> None:
     estimator = RollingFrameRateEstimator(window_s=5.0)
     for index in range(100):
@@ -205,6 +304,62 @@ def test_decoded_rate_uses_a_rolling_window_and_expires_after_a_gap() -> None:
 
     assert estimator.rate(5.0) == pytest.approx(19.8)
     assert estimator.rate(10.1) == 0.0
+
+
+def test_transport_counter_rate_uses_cumulative_delta_and_resets_cleanly() -> None:
+    estimator = RollingCounterRateEstimator(window_s=5.0)
+    estimator.add(0.0, 0)
+    estimator.add(1.0, 100)
+    estimator.add(2.0, 250)
+
+    assert estimator.rate(2.0) == pytest.approx(125.0)
+
+    estimator.add(3.0, 4)
+    assert estimator.rate(3.0) == 0.0
+    estimator.add(4.0, 14)
+    assert estimator.rate(4.0) == pytest.approx(10.0)
+
+
+def test_worker_stats_preserves_optional_rtp_metrics_payload() -> None:
+    worker = YoloStreamWorker(
+        url="rtsp://camera.invalid/visible",
+        weights_path="weights.pt",
+        device="cpu",
+        input_size=640,
+        conf_threshold=0.5,
+        iou_threshold=0.45,
+        max_rate_hz=0.0,
+        enable_detection=False,
+    )
+    received: list[dict[str, object]] = []
+    worker.stats_ready.connect(received.append, QtCore.Qt.DirectConnection)
+
+    worker._handle_worker_message(
+        (
+            "stats",
+            2.1,
+            2.0,
+            0.0,
+            1280,
+            720,
+            0.0,
+            "cpu",
+            "cpu",
+            False,
+            {
+                "rtp_packets_hz": 3722.4,
+                "rtp_missing_hz": 3300.1,
+                "rtp_loss_pct": 47.0,
+                "h264_au_hz": 18.5,
+                "rtp_metrics_available": True,
+            },
+        )
+    )
+
+    assert received[0]["rtp_packets_hz"] == pytest.approx(3722.4)
+    assert received[0]["rtp_missing_hz"] == pytest.approx(3300.1)
+    assert received[0]["rtp_loss_pct"] == pytest.approx(47.0)
+    assert received[0]["h264_au_hz"] == pytest.approx(18.5)
 
 
 def test_preview_queue_replaces_stale_frame_but_preserves_events() -> None:
@@ -219,6 +374,18 @@ def test_preview_queue_replaces_stale_frame_but_preserves_events() -> None:
     assert frame_queue.get_nowait()[4] == b"latest"
     assert event_queue.get_nowait()[0] == "detection"
     assert DEFAULT_PREVIEW_DISPLAY_RATE_HZ == 15.0
+
+
+def test_preview_queue_preserves_nal1_candidate_over_ordinary_frame() -> None:
+    event_queue: queue.Queue = queue.Queue(maxsize=1)
+    frame_queue: queue.Queue = queue.Queue(maxsize=1)
+    output_queue = _BoundedProcessOutputQueue(event_queue, frame_queue)
+    candidate_metadata = {"h264_nal1_non_idr_intra": True}
+
+    output_queue.put(("frame", candidate_metadata, 1, 1, b"candidate"))
+    output_queue.put(("frame", {}, 1, 1, b"ordinary"))
+
+    assert frame_queue.get_nowait()[4] == b"candidate"
 
 
 def test_preview_metadata_and_control_channels_are_independently_bounded() -> None:
@@ -400,6 +567,8 @@ def test_spawned_camera_worker_publishes_only_descriptor_for_native_frame() -> N
         assert len(detections) == 1
         metadata = detections[0]["timestamp_metadata"]
         assert metadata["frame_key"] == "left:4:1"
+        assert metadata["app_receive_monotonic_ns"] == 3_500_000_000
+        assert metadata["app_receive_timestamp_role"] == "legacy_float_derived"
         assert native_images == []
         ring = worker.native_frame_ring
         assert ring is not None

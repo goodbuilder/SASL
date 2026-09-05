@@ -19,9 +19,11 @@ from Workstation.workstation_core.calibration import (
 )
 from Workstation.workstation_core.calibration_input import CalibrationInputSnapshot
 from Workstation.workstation_core.calibration_timing import (
+    HOST_RECEIVE_PROXY,
     INTRINSICS_ONLY,
     INVALID_METADATA,
     LEGACY_UNVERIFIED,
+    CalibrationTimingEvidence,
     classify_calibration_pair_usage,
     load_calibration_pair_usage,
 )
@@ -94,6 +96,20 @@ def test_pair_usage_is_fail_closed_for_explicit_rejection_and_legacy_compatible(
     invalid = load_calibration_pair_usage(malformed)
     assert invalid.state == INVALID_METADATA
     assert invalid.stereo_eligible is False
+
+
+def test_host_receive_proxy_cannot_claim_precision_timing() -> None:
+    with pytest.raises(ValueError, match="host timing proxy"):
+        CalibrationTimingEvidence(
+            HOST_RECEIVE_PROXY,
+            True,
+            True,
+            False,
+            "app-receive-monotonic",
+            0.010,
+            0.100,
+            "invalid precision claim",
+        )
 
 
 def test_intrinsics_only_capture_stays_in_kd_inputs_but_not_stereo_snapshot(
@@ -253,6 +269,59 @@ def test_visible_root_snapshot_overrides_hidden_root_and_freezes_selection_hashe
     assert worker.left_intrinsic_paths == snapshot.left_paths
     assert worker.right_intrinsic_paths == snapshot.right_paths
     assert worker.stereo_pairs == snapshot.pair_paths
+
+
+def test_host_receive_proxy_snapshot_is_eligible_but_never_precision_qualified(
+    tmp_path: Path,
+) -> None:
+    root = _photo_root(tmp_path, "host-receive", count=3)
+    for index, metadata_path in enumerate(
+        sorted((root / "capture_metadata").glob("capture_*.json")),
+        start=1,
+    ):
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        payload.update(
+            {
+                "stereo_pair_saved": True,
+                "pair_persistence_allowed": True,
+                "pair_time_basis": "app-receive-monotonic",
+                "left_app_receive_monotonic_ns": index * 1_000_000_000,
+                "right_app_receive_monotonic_ns": index * 1_000_000_000 + 10_000_000,
+                "pair_delta_ns": 10_000_000,
+                "pair_delta_s": 0.010,
+                "calibration_timing_evidence": {
+                    "schema": "workstation-calibration-timing-evidence-v1",
+                    "evidence_class": "HOST_RECEIVE_PROXY",
+                    "pair_persistence_allowed": True,
+                    "precision_qualified": False,
+                    "actual_exposure_verified": False,
+                    "timestamp_reference": "app-receive-monotonic",
+                    "pair_delta_s": 0.010,
+                    "maximum_delta_s": 0.100,
+                    "detail": "decoded-frame app receipt; exposure unverified",
+                },
+            }
+        )
+        metadata_path.write_text(json.dumps(payload), encoding="utf-8")
+    controller = _controller(tmp_path, root)
+
+    snapshot, source_pair_count, explicit = controller._calibration_input_snapshot(
+        {"root": str(root), "mode": "checkerboard", "pair_limit": 0}
+    )
+
+    assert source_pair_count == 3
+    assert explicit is False
+    assert len(snapshot.stereo_pairs) == 3
+    assert snapshot.timing_evidence_classes == ("HOST_RECEIVE_PROXY",)
+    assert snapshot.precision_timing_qualified is False
+    assert snapshot.actual_exposure_verified is False
+    assert CalibrationInputSnapshot.from_mapping(snapshot.to_mapping()) == snapshot
+
+    invalid = snapshot.to_mapping()
+    invalid.pop("snapshot_sha256")
+    invalid["precision_timing_qualified"] = True
+    with pytest.raises(ValueError, match="host timing proxy"):
+        CalibrationInputSnapshot.from_mapping(invalid)
 
 
 def test_worker_rechecks_snapshot_bytes_before_solver(

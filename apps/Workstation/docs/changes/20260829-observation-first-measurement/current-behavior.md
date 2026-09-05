@@ -26,3 +26,25 @@ evidence and run release are currently coupled. Reactivation reuses the current 
 The sessionless contract says persistence never gates Measurement, but artifact-enqueue retry can
 delay `finish_measurement_run`. Existing tests encode camera-backed RUNNING and broad recording
 locks; both must change under the approved observation-first contract.
+
+## 2026-09-02 real-device regression
+
+The operator reported that the cameras disconnected immediately after pressing Measurement. The
+saved runtime evidence reproduces a controller rollback defect rather than a physical camera or
+network disconnect:
+
+- `recordings/events.jsonl` records `measurement_start_requested` at 09:07:56, followed by a
+  `camera/decoder start request was rejected` transition for both camera and recording sources.
+- `recordings/application_log.jsonl` records the exact preflight rejection: explicit NVIDIA mode
+  could not use `nvh264dec` and instructed the operator to choose Auto or Software.
+- The same log then records both already-running Preview panes as `중지됨` and `종료 대기 중`.
+- The later `run.log` sequence shows the operator-selected Auto policy choosing `avdec_h264` and
+  successfully starting both Preview workers. This proves that the reported outage was caused by
+  the application's rejection rollback, not loss of WIRIS reachability.
+
+`_start_camera_streams()` rejects an unavailable explicit decoder before it starts a replacement
+worker. `start_yolo()` nevertheless routes that no-mutation preflight rejection through
+`_rollback_camera_start()`, which unconditionally stops both existing panes and clears the public
+camera state. That behavior conflicts with the approved source-failure-isolation contract: the
+Measurement may continue with its measurement camera sources unavailable, but an existing Preview
+must remain live.

@@ -42,3 +42,11 @@ state text. Recovery confirmation names the side and explains that measurement r
 A P1 failure changes only P1 and any measurement method that requires P1. P2 and unrelated camera,
 calibration, recording, and NTRIP source status remain stable. GNSS status explicitly identifies a
 disabled correction target instead of presenting aggregate success.
+
+## IMU stream rows
+
+The existing P1/P2 `IMU stream 1/2/3` table remains the only primary surface. Each row is
+`WAITING` before its first actual `SCALED_IMU*` packet, `LIVE` only while the app-receive timestamp
+is fresh, `STALE` when a cached sample exceeds the stream freshness threshold, and `PARTIAL` only
+for a fresh packet without all xmag/ymag/zmag fields. Values, mG unit, topic, producer sensor-axis
+contract, and exact age remain visible; rapid updates do not resize columns or move selection.

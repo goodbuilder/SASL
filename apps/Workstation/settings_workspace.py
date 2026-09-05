@@ -8,6 +8,7 @@ from PyQt5 import QtCore, QtWidgets
 
 from Workstation.runtime_paths import (
     WORKSTATION_DATA_ROOT,
+    WORKSTATION_MEASUREMENT_DATA_ROOT,
     import_workstation_asset_file,
     portable_workstation_data_path_text,
 )
@@ -60,6 +61,7 @@ class SettingsWorkspace(QtWidgets.QWidget):
         self._build_pixhawk_tab()
         self._build_storage_tab()
         self._build_runtime_tab()
+        self._build_time_sync_tab()
         self._build_gnss_tab()
         layout.addWidget(self.tabs, 1)
 
@@ -373,7 +375,8 @@ class SettingsWorkspace(QtWidgets.QWidget):
         weights_edit = self._text("yolo_weights_path")
         weights_edit.setToolTip(
             "YOLO model path relative to SASL_WORKSTATION_DATA_ROOT. "
-            "Apply takes effect at the next Detection start; Save persists it."
+            "Measurement applies the current selection immediately before Detection starts; "
+            "Save persists it for later Workstation runs."
         )
         weights_row = QtWidgets.QWidget()
         weights_layout = QtWidgets.QHBoxLayout(weights_row)
@@ -388,7 +391,8 @@ class SettingsWorkspace(QtWidgets.QWidget):
         self.yolo_weights_browse_button.clicked.connect(self._browse_yolo_weights)
         weights_layout.addWidget(self.yolo_weights_browse_button)
         self.yolo_weights_selection_status = QtWidgets.QLabel(
-            "Apply 후 다음 Detection 시작부터 선택한 모델을 사용합니다."
+            "다음 Measurement 시작 직전에 현재 선택 모델을 적용합니다. "
+            "Save는 즉시 저장하며 기존 정상 종료 저장 동작도 유지됩니다."
         )
         self.yolo_weights_selection_status.setObjectName("statusStrip")
         self.yolo_weights_selection_status.setWordWrap(True)
@@ -419,6 +423,18 @@ class SettingsWorkspace(QtWidgets.QWidget):
             "Manual ends a failed camera worker without nested reconnect loops. "
             "Automatic restores local RTSP and child-process retries."
         )
+        encoded_queue_mode = self._combo(
+            "rtsp_encoded_queue_mode",
+            (
+                ("Latest (drop old)", "latest"),
+                ("Reference-safe (preserve 8)", "reference_safe"),
+            ),
+        )
+        encoded_queue_mode.setToolTip(
+            "Latest protects latency by dropping old compressed access units. "
+            "Reference-safe preserves up to eight at each pre-decode boundary "
+            "and may increase latency. Applies on the next camera Preview start."
+        )
         layout.addWidget(
             self._group(
                 "Stream backend",
@@ -432,6 +448,7 @@ class SettingsWorkspace(QtWidgets.QWidget):
                         ),
                     ),
                     ("RTSP transport", self._combo("rtsp_transport", (("UDP", "udp"), ("TCP interleaved", "tcp")))),
+                    ("H.264 compressed queue", encoded_queue_mode),
                     ("Reconnect policy", reconnect_policy),
                 ],
             )
@@ -515,7 +532,9 @@ class SettingsWorkspace(QtWidgets.QWidget):
             return
         weights_edit.setText(portable)
         action = "가져오기 및 SHA-256 검증 완료" if external_selection else "모델 선택 완료"
-        self.yolo_weights_selection_status.setText(f"{action}: {portable}")
+        self.yolo_weights_selection_status.setText(
+            f"{action} · 다음 Measurement 시작 시 적용: {portable}"
+        )
 
     def _build_pixhawk_tab(self) -> None:
         layout = self._tab("PX4 / MAVLink")
@@ -531,8 +550,48 @@ class SettingsWorkspace(QtWidgets.QWidget):
             self._group(
                 "Pixhawk endpoints",
                 [
+                    (
+                        "P1 transport",
+                        self._combo(
+                            "left_pixhawk_transport",
+                            (
+                                ("P1 Telemetry Radio", "radio"),
+                                ("Ethernet", "ethernet"),
+                                ("USB", "usb"),
+                            ),
+                        ),
+                    ),
+                    (
+                        "P2 transport",
+                        self._combo(
+                            "right_pixhawk_transport",
+                            (
+                                ("P2 Telemetry Radio", "radio"),
+                                ("Ethernet", "ethernet"),
+                                ("USB", "usb"),
+                            ),
+                        ),
+                    ),
+                    (
+                        "Drone transport",
+                        self._combo(
+                            "drone_pixhawk_transport",
+                            (
+                                ("Drone Telemetry Radio", "radio"),
+                                ("Ethernet", "ethernet"),
+                                ("USB", "usb"),
+                            ),
+                        ),
+                    ),
+                    ("P1 Radio device", self._text("left_pixhawk_radio_device", placeholder="/dev/serial/by-id/...")),
+                    ("P2 Radio device", self._text("right_pixhawk_radio_device", placeholder="/dev/serial/by-id/...")),
+                    ("Drone Radio device", self._text("drone_pixhawk_radio_device", placeholder="/dev/serial/by-id/...")),
+                    ("P1 Radio baud", self._integer("left_pixhawk_radio_baud", 1, 10_000_000)),
+                    ("P2 Radio baud", self._integer("right_pixhawk_radio_baud", 1, 10_000_000)),
+                    ("Drone Radio baud", self._integer("drone_pixhawk_radio_baud", 1, 10_000_000)),
                     ("Left Ethernet IP", self._text("left_pixhawk_eth_ip")),
                     ("Right Ethernet IP", self._text("right_pixhawk_eth_ip")),
+                    ("Drone Ethernet IP", self._text("drone_pixhawk_eth_ip")),
                     ("Left MAVLink URL", self._text("left_mavlink_url")),
                     ("Right MAVLink URL", self._text("right_mavlink_url")),
                     ("Left MAVLink baud", self._integer("left_mavlink_baud", 1, 10_000_000)),
@@ -557,6 +616,8 @@ class SettingsWorkspace(QtWidgets.QWidget):
                     ("Right bootstrap URL", self._text("right_pixhawk_bootstrap_url")),
                     ("Left bootstrap baud", self._integer("left_pixhawk_bootstrap_baud", 1, 10_000_000)),
                     ("Right bootstrap baud", self._integer("right_pixhawk_bootstrap_baud", 1, 10_000_000)),
+                    ("Drone bootstrap URL", self._text("drone_pixhawk_bootstrap_url")),
+                    ("Drone bootstrap baud", self._integer("drone_pixhawk_bootstrap_baud", 1, 10_000_000)),
                 ],
             )
         )
@@ -565,7 +626,13 @@ class SettingsWorkspace(QtWidgets.QWidget):
                 "PX4 transport setup",
                 [
                     ("Ethernet mode", self._combo("pixhawk_ethernet_mode", (("MAVLink", "mavlink"),))),
-                    ("Configure MAVLink streams", self._toggle("mavlink_configure_streams", "Apply stream parameters after MAVLink connect")),
+                    (
+                        "Legacy auto stream setup",
+                        self._toggle(
+                            "mavlink_configure_streams",
+                            "Compatibility value only; Connect never applies persistent PX4 parameters",
+                        ),
+                    ),
                     ("MAVLink stream rate", self._integer("mavlink_stream_rate", 1, 10_000_000)),
                 ],
             )
@@ -576,11 +643,12 @@ class SettingsWorkspace(QtWidgets.QWidget):
         layout = self._tab("Storage")
         path_edit = self._text(
             "measurement_data_root",
-            placeholder="measurement_data",
+            placeholder=f"Default: {WORKSTATION_MEASUREMENT_DATA_ROOT}",
         )
         path_edit.setToolTip(
-            "Directory relative to SASL_WORKSTATION_DATA_ROOT. Active capture keeps its "
-            "current owner; an applied change is used by the next capture."
+            "Leave blank for the default recordings folder. A custom directory must be "
+            "relative to SASL_WORKSTATION_DATA_ROOT. Active capture keeps its current owner; "
+            "an applied change is used by the next capture."
         )
         path_row = QtWidgets.QWidget()
         path_layout = QtWidgets.QHBoxLayout(path_row)
@@ -604,9 +672,8 @@ class SettingsWorkspace(QtWidgets.QWidget):
         self.storage_path_status_label.setWordWrap(True)
         layout.addWidget(self.storage_path_status_label)
         paths = QtWidgets.QLabel(
-            "Fixed append files: "
-            + ", ".join(sorted({path.as_posix() for path in STREAM_PATHS.values()}))
-            + ". Native video, image, and ULog bytes use creation-time names."
+            "Timestamped append files: <stream>_<creation timestamp>.jsonl; legacy fixed names remain readable. "
+            "Native video, image, and ULog bytes use creation-time names."
         )
         paths.setObjectName("compactContract")
         paths.setWordWrap(True)
@@ -617,8 +684,13 @@ class SettingsWorkspace(QtWidgets.QWidget):
     def _browse_measurement_data_root(self) -> None:
         data_root = self._workstation_data_root()
         edit = self.settings_widgets["measurement_data_root"]
-        current = Path(str(edit.text() or "measurement_data")).expanduser()
-        if not current.is_absolute():
+        current_text = str(edit.text() or "").strip()
+        current = (
+            WORKSTATION_MEASUREMENT_DATA_ROOT
+            if not current_text
+            else Path(current_text).expanduser()
+        )
+        if current_text and not current.is_absolute():
             current = data_root / current
         start = current if current.is_dir() else current.parent
         if not start.is_dir():
@@ -630,16 +702,25 @@ class SettingsWorkspace(QtWidgets.QWidget):
         )
         if not selected:
             return
+        selected_path = Path(selected).expanduser().resolve(strict=False)
+        if selected_path == WORKSTATION_MEASUREMENT_DATA_ROOT.resolve(strict=False):
+            edit.clear()
+            self.storage_path_status_label.setText(
+                f"Pending data folder: {WORKSTATION_MEASUREMENT_DATA_ROOT} (default) "
+                "· applies to the next capture."
+            )
+            return
         try:
             portable = portable_workstation_data_path_text(
-                selected,
+                selected_path,
                 data_root=data_root,
                 field_name="measurement_data_root",
             )
         except ValueError as exc:
             self.storage_path_status_label.setText(
-                f"Storage folder was not changed: {exc}. Set SASL_WORKSTATION_DATA_ROOT "
-                "to place all Workstation data on another volume."
+                f"Storage folder was not changed: {exc}. Leave the field blank for "
+                f"{WORKSTATION_MEASUREMENT_DATA_ROOT}, or set SASL_WORKSTATION_DATA_ROOT "
+                "to place custom Workstation data on another volume."
             )
             return
         edit.setText(portable)
@@ -685,6 +766,45 @@ class SettingsWorkspace(QtWidgets.QWidget):
             self._value("measurement_method_fallback_order", ())
         )
         layout.addWidget(fallback_group)
+        layout.addStretch(1)
+
+    def _build_time_sync_tab(self) -> None:
+        layout = self._tab("Time / Sync")
+        interval = QtWidgets.QSpinBox()
+        interval.setRange(5, 1440)
+        interval.setValue(
+            max(
+                5,
+                min(
+                    1440,
+                    round(float(self._value("camera_sync_interval_s", 1800.0)) / 60.0),
+                ),
+            )
+        )
+        interval.setSuffix(" min")
+        self.settings_widgets["camera_sync_interval_s"] = interval
+        layout.addWidget(
+            self._group(
+                "STUS scheduling",
+                [
+                    (
+                        "Mode",
+                        self._combo(
+                            "camera_sync_mode",
+                            (("Manual", "manual"), ("Auto", "auto")),
+                        ),
+                    ),
+                    ("Auto interval", interval),
+                ],
+            )
+        )
+        note = QtWidgets.QLabel(
+            "Auto requires one manually VERIFIED STUS after every Workstation start/new camera "
+            "connection. Scheduled STUS keeps Preview, YOLO and MP4 workers running."
+        )
+        note.setObjectName("statusStrip")
+        note.setWordWrap(True)
+        layout.addWidget(note)
         layout.addStretch(1)
 
     def _measurement_fallback_order(self) -> tuple[str, ...]:
@@ -965,6 +1085,9 @@ class SettingsWorkspace(QtWidgets.QWidget):
 
     def settings_payload(self) -> dict[str, object]:
         payload = {key: self._widget_value(widget) for key, widget in self.settings_widgets.items()}
+        payload["camera_sync_interval_s"] = (
+            float(payload.get("camera_sync_interval_s") or 30.0) * 60.0
+        )
         payload["measurement_method_fallback_order"] = list(
             self._measurement_fallback_order()
         )
@@ -1075,7 +1198,11 @@ class SettingsWorkspace(QtWidgets.QWidget):
                 return
         elif isinstance(widget, QtWidgets.QSpinBox):
             try:
-                widget.setValue(int(value))
+                widget.setValue(
+                    round(float(value) / 60.0)
+                    if key == "camera_sync_interval_s"
+                    else int(value)
+                )
             except (TypeError, ValueError):
                 return
 

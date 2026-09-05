@@ -36,6 +36,7 @@ import json
 from Workstation.runtime_paths import (
     WORKSTATION_CALIBRATION_ROOT,
     WORKSTATION_DATA_ROOT,
+    WORKSTATION_MEASUREMENT_DATA_ROOT,
     WORKSTATION_MODELS_ROOT,
     WORKSTATION_RECORDINGS_ROOT,
     WORKSTATION_SETTINGS_PATH,
@@ -50,6 +51,7 @@ print(json.dumps({
     "recordings": str(WORKSTATION_RECORDINGS_ROOT),
     "calibration": str(WORKSTATION_CALIBRATION_ROOT),
     "models": str(WORKSTATION_MODELS_ROOT),
+    "measurement_data": str(WORKSTATION_MEASUREMENT_DATA_ROOT),
     "default_settings": str(DEFAULT_SETTINGS_PATH),
     "intrinsics": settings.intrinsics_path,
     "calibration_setting": settings.calibration_root,
@@ -78,8 +80,9 @@ print(json.dumps({
         "data": str(data_root),
         "settings": str(data_root / "stereo_distance_settings.json"),
         "recordings": str(data_root / "recordings"),
-        "calibration": str(data_root / "calibration"),
+        "calibration": str(REPOSITORY_ROOT / "apps" / "Workstation" / "calibration"),
         "models": str(data_root / "models"),
+        "measurement_data": str(data_root / "recordings"),
         "default_settings": str(data_root / "stereo_distance_settings.json"),
         "intrinsics": "calibration/intrinsics.json",
         "calibration_setting": "calibration",
@@ -89,6 +92,53 @@ print(json.dumps({
         "resolved_intrinsics": str(data_root / "calibration" / "intrinsics.json"),
         "resolved_weights": str(data_root / "models" / "yolov8m.pt"),
     }
+
+
+def test_default_measurement_root_is_repository_recordings_from_any_cwd(
+    tmp_path: Path,
+) -> None:
+    environment = os.environ.copy()
+    environment.pop("SASL_WORKSTATION_DATA_ROOT", None)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (
+            str(APPS_ROOT),
+            str(REPOSITORY_ROOT),
+            str(COMMON_PYTHON_ROOT),
+            environment.get("PYTHONPATH", ""),
+        )
+    )
+    script = """
+import json
+from Workstation.runtime_paths import (
+    WORKSTATION_CALIBRATION_ROOT,
+    WORKSTATION_DATA_ROOT,
+    WORKSTATION_MEASUREMENT_DATA_ROOT,
+)
+print(json.dumps({
+    "data": str(WORKSTATION_DATA_ROOT),
+    "calibration": str(WORKSTATION_CALIBRATION_ROOT),
+    "measurement_data": str(WORKSTATION_MEASUREMENT_DATA_ROOT),
+}))
+"""
+    observed = []
+    for cwd in (tmp_path, tmp_path / "different-cwd"):
+        cwd.mkdir(exist_ok=True)
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=cwd,
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        observed.append(json.loads(result.stdout))
+
+    expected = {
+        "data": str(REPOSITORY_ROOT / ".local" / "workstation_data"),
+        "calibration": str(REPOSITORY_ROOT / "apps" / "Workstation" / "calibration"),
+        "measurement_data": str(REPOSITORY_ROOT / "recordings"),
+    }
+    assert observed == [expected, expected]
 
 
 def test_relative_data_root_override_is_repository_anchored(tmp_path: Path) -> None:
@@ -175,6 +225,7 @@ def test_settings_preserve_custom_paths_and_read_known_legacy_defaults(
                 "calibration_validation_root": "calibration_captures",
                 "calibration_validation_json": "calibration_captures/intrinsics.json",
                 "yolo_weights_path": ".local/models/yolov8m.pt",
+                "measurement_data_root": "measurement_data",
             }
         ),
         encoding="utf-8",
@@ -185,6 +236,7 @@ def test_settings_preserve_custom_paths_and_read_known_legacy_defaults(
     assert legacy.calibration_validation_root == str(legacy_calibration)
     assert legacy.calibration_validation_json == str(legacy_calibration / "intrinsics.json")
     assert legacy.yolo_weights_path == str(legacy_models / "yolov8m.pt")
+    assert legacy.measurement_data_root == ""
 
     legacy_nano = tmp_path / "legacy-nano-settings.json"
     legacy_nano.write_text(json.dumps({"yolo_weights_path": "yolov8n.pt"}), encoding="utf-8")
@@ -200,6 +252,7 @@ def test_settings_preserve_custom_paths_and_read_known_legacy_defaults(
         "calibration_validation_root": "/not-yet-mounted/validation",
         "calibration_validation_json": "custom/validation.json",
         "yolo_weights_path": "models/custom.pt",
+        "measurement_data_root": "field/run-a",
     }
     custom_path = tmp_path / "custom-settings.json"
     custom_path.write_text(json.dumps(custom_payload), encoding="utf-8")

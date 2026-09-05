@@ -83,6 +83,58 @@ def test_sequential_runs_receive_new_transient_generations_without_package_state
     ]
 
 
+def test_each_measurement_freezes_current_timing_preference_at_its_boundary() -> None:
+    panel = _panel()
+    selected = {"basis": "app_receive_monotonic"}
+    boundaries: list[str] = []
+    owner = SimpleNamespace(
+        begin_pairing_generation=lambda: boundaries.append(selected["basis"]),
+        measurement_method_config_for_new_measurement=lambda: {
+            "measurement_preferred_method": "pixhawk_rtk_live",
+            "measurement_pairing_time_basis_requested": selected["basis"],
+        },
+    )
+    panel._measurement_view_controller = lambda: owner
+    controller = MeasurementRunController(panel)
+
+    assert controller.begin_measurement_run()
+    assert panel._measurement_run_metadata[
+        "measurement_pairing_time_basis_requested"
+    ] == "app_receive_monotonic"
+    selected["basis"] = "camera_rtcp"
+    assert panel._measurement_run_metadata[
+        "measurement_pairing_time_basis_requested"
+    ] == "app_receive_monotonic"
+
+    assert controller.request_measurement_stop()
+    assert controller.finish_measurement_run()
+    assert controller.begin_measurement_run()
+    assert panel._measurement_run_metadata[
+        "measurement_pairing_time_basis_requested"
+    ] == "camera_rtcp"
+    assert boundaries == ["app_receive_monotonic", "camera_rtcp"]
+
+
+def test_measurement_start_records_verified_pixhawk_mag_selection() -> None:
+    panel = _panel()
+    panel._last_measurement_mag_gate = {
+        "schema": "pixhawk-mag-measurement-gate-v1",
+        "required": True,
+        "required_sides": ["left", "right"],
+        "ready": True,
+        "blockers": [],
+        "sides": {
+            "left": {"state": "ACTIVE VERIFIED", "actual_device_id": 10},
+            "right": {"state": "ACTIVE VERIFIED", "actual_device_id": 20},
+        },
+    }
+    controller = MeasurementRunController(panel)
+
+    assert controller.begin_measurement_run()
+    assert panel._measurement_run_metadata["pixhawk_mag_selection"]["ready"] is True
+    assert panel._measurement_run_metadata["pixhawk_mag_selection"]["sides"]["right"]["actual_device_id"] == 20
+
+
 def test_busy_start_is_queued_and_duplicate_live_start_is_rejected() -> None:
     panel = _panel()
     controller = MeasurementRunController(panel)

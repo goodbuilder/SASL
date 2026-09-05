@@ -1112,7 +1112,6 @@ def test_full_pixhawk_disconnect_retires_subscriber_bound_rtcm_worker() -> None:
         mavlink_pixhawk=subscriber,
         pixhawk_connection_thread=None,
         pixhawk_attitude_times={"left": []},
-        _px4_calibration_auto_refreshed_sides=set(),
         _gnss_runtime_controller=lambda: runtime,
         _clear_px4_mag_manager_connection_state=lambda _camera: None,
         _clear_px4_attitude_cal_connection_state=lambda _camera: None,

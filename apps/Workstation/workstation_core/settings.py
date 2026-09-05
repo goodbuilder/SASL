@@ -18,6 +18,12 @@ from Workstation.workstation_core.measurement_methods import (
     normalize_measurement_method_fallback_order,
     normalize_measurement_method_id,
 )
+from Workstation.workstation_core.stus_scheduler import (
+    STUS_DEFAULT_INTERVAL_S,
+    STUS_MODE_MANUAL,
+    normalize_stus_interval_s,
+    normalize_stus_mode,
+)
 
 
 APP_ROOT = Path(__file__).resolve().parents[1]
@@ -29,14 +35,106 @@ DEFAULT_SETTINGS_PATH = WORKSTATION_SETTINGS_PATH
 DEFAULT_CALIBRATION_ROOT = "calibration"
 DEFAULT_INTRINSICS_PATH = "calibration/intrinsics.json"
 DEFAULT_YOLO_WEIGHTS_PATH = "models/yolov8m.pt"
+DEFAULT_MEASUREMENT_DATA_ROOT = ""
+LEGACY_DEFAULT_MEASUREMENT_DATA_ROOT = "measurement_data"
 PIXHAWK_ETHERNET_MODES = ("mavlink",)
 DEFAULT_PIXHAWK_ETHERNET_MODE = "mavlink"
+PIXHAWK_TRANSPORT_SCHEMA_VERSION = 2
+PIXHAWK_TRANSPORT_RADIO = "radio"
+PIXHAWK_TRANSPORT_ETHERNET = "ethernet"
+PIXHAWK_TRANSPORT_USB = "usb"
+PIXHAWK_TRANSPORTS = (
+    PIXHAWK_TRANSPORT_RADIO,
+    PIXHAWK_TRANSPORT_ETHERNET,
+    PIXHAWK_TRANSPORT_USB,
+)
+# Radio and USB both open one exclusive serial device; only the bandwidth
+# policy differs, so endpoint locking and path preflight key off this set.
+PIXHAWK_SERIAL_TRANSPORTS = (PIXHAWK_TRANSPORT_RADIO, PIXHAWK_TRANSPORT_USB)
 PIXHAWK_GNSS_SOURCES = ("GPS1", "GPS2")
+RTSP_ENCODED_QUEUE_MODE_LATEST = "latest"
+RTSP_ENCODED_QUEUE_MODE_REFERENCE_SAFE = "reference_safe"
+RTSP_ENCODED_QUEUE_MODES = (
+    RTSP_ENCODED_QUEUE_MODE_LATEST,
+    RTSP_ENCODED_QUEUE_MODE_REFERENCE_SAFE,
+)
+LIVE_DISTANCE_TIME_BASIS_APP_RECEIVE = "app_receive_monotonic"
+LIVE_DISTANCE_TIME_BASIS_RTCP_PREFERRED = "camera_rtcp"
+LIVE_DISTANCE_TIME_BASES = (
+    LIVE_DISTANCE_TIME_BASIS_APP_RECEIVE,
+    LIVE_DISTANCE_TIME_BASIS_RTCP_PREFERRED,
+)
+
+
+def normalize_rtsp_encoded_queue_mode(value: object) -> str:
+    mode = str(value or RTSP_ENCODED_QUEUE_MODE_LATEST).strip().lower()
+    return (
+        mode
+        if mode in RTSP_ENCODED_QUEUE_MODES
+        else RTSP_ENCODED_QUEUE_MODE_LATEST
+    )
+
+
+def normalize_live_distance_time_basis(value: object) -> str:
+    """Normalize the persisted preference while preserving mandatory app fallback.
+
+    ``camera_rtc_required`` was the former strict live value.  The current
+    operator contract has no strict live mode, so it migrates to the RTCP
+    preference whose runtime fallback is app-receive monotonic.
+    """
+
+    basis = str(value or LIVE_DISTANCE_TIME_BASIS_APP_RECEIVE).strip().lower()
+    if basis in {LIVE_DISTANCE_TIME_BASIS_RTCP_PREFERRED, "camera_rtc_required"}:
+        return LIVE_DISTANCE_TIME_BASIS_RTCP_PREFERRED
+    return LIVE_DISTANCE_TIME_BASIS_APP_RECEIVE
+
+
+def normalize_measurement_data_root(value: object) -> str:
+    """Map the former implicit default onto the repository recordings root.
+
+    An empty value is a portable sentinel resolved by ``DataStorageController``.
+    Explicit custom paths remain relative to ``SASL_WORKSTATION_DATA_ROOT``.
+    """
+
+    text = str(value or "").strip()
+    return "" if text in {"", LEGACY_DEFAULT_MEASUREMENT_DATA_ROOT} else text
 
 
 def normalize_pixhawk_gnss_source(value: object, default: str = "GPS1") -> str:
     source = str(value or default).strip().upper()
     return source if source in PIXHAWK_GNSS_SOURCES else default
+
+
+def normalize_pixhawk_transport(value: object) -> str:
+    transport = str(value or PIXHAWK_TRANSPORT_RADIO).strip().lower()
+    return transport if transport in PIXHAWK_TRANSPORTS else PIXHAWK_TRANSPORT_RADIO
+
+
+def normalize_network_role_owned_entries(value: object) -> dict[str, dict[str, list[str]]]:
+    """Keep only JSON-safe exact entries attributed to Workstation."""
+
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, dict[str, list[str]]] = {}
+    for raw_key, raw_entries in value.items():
+        key = str(raw_key or "").strip()
+        if not key or not isinstance(raw_entries, dict):
+            continue
+        addresses = [
+            str(item)
+            for item in (raw_entries.get("addresses") or ())
+            if str(item or "").strip()
+        ]
+        routes = [
+            str(item)
+            for item in (raw_entries.get("routes") or ())
+            if str(item or "").strip()
+        ]
+        normalized[key] = {
+            "addresses": list(dict.fromkeys(addresses)),
+            "routes": list(dict.fromkeys(routes)),
+        }
+    return normalized
 
 
 def _default_path_with_legacy_read(
@@ -150,15 +248,14 @@ class AppSettings:
     yolo_iou_threshold: float = 0.45
     yolo_gate_class_enabled: bool = False
     yolo_gate_class_text: str = ""
-    yolo_gate_matching_enabled: bool = False
-    yolo_gate_time_delta_enabled: bool = False
+    yolo_gate_matching_enabled: bool = True
+    yolo_gate_time_delta_enabled: bool = True
     yolo_gate_vertical_delta_enabled: bool = False
     yolo_gate_max_vertical_delta_px: float = 80.0
     yolo_gate_max_time_delta_s: float = 0.1
-    # Prefer RTCP/NTP when the two cameras agree, but allow live pairing to
-    # fall back to the app's monotonic receive clock when their camera clocks
-    # are not mutually synchronized.
-    yolo_gate_time_basis: str = "camera_rtcp"
+    # Operator preference for live pair selection. App receive is the default
+    # and mandatory fallback when preferred RTCP timing is unusable.
+    yolo_gate_time_basis: str = "app_receive_monotonic"
     preview_width: int = 1280
     calibration_zoom_level: int = 10
     calibration_inner_cols: int = 13
@@ -173,7 +270,7 @@ class AppSettings:
     calibration_pair_max_delta_s: float = 0.100
     calibration_auto_interval_s: float = 1.0
     calibration_root: str = DEFAULT_CALIBRATION_ROOT
-    measurement_data_root: str = "measurement_data"
+    measurement_data_root: str = DEFAULT_MEASUREMENT_DATA_ROOT
     calibration_validation_mode: str = "pixhawk"
     calibration_validation_root: str = DEFAULT_CALIBRATION_ROOT
     calibration_validation_json: str = DEFAULT_INTRINSICS_PATH
@@ -181,6 +278,9 @@ class AppSettings:
     calibration_validation_pair_count: int = 0
     calibration_validation_seed: int = 0
     rtsp_latency_ms: int = 100
+    # Compressed H.264 queue policy is a Workstation-only tradeoff. It never
+    # changes WIRIS settings or the tolerant decoded-frame admission contract.
+    rtsp_encoded_queue_mode: str = RTSP_ENCODED_QUEUE_MODE_LATEST
     yolo_event_queue_size: int = 128
     yolo_frame_queue_size: int = 2
     rtsp_decoder: str = "auto"
@@ -193,15 +293,33 @@ class AppSettings:
     rtsp_transport: str = "tcp"
     camera_sync_history_window_s: float = 1.0
     camera_sync_receive_pair_max_delta_s: float = 0.350
-    camera_sync_rtcp_pair_max_delta_s: float = 0.050
+    camera_sync_rtcp_pair_max_delta_s: float = 0.100
     camera_sync_max_sr_age_s: float = 7.0
     camera_sync_max_pc_offset_s: float = 0.100
     camera_sync_max_clock_rate_error: float = 0.005
     camera_sync_required_sr_count: int = 2
     camera_sync_warmup_timeout_s: float = 30.0
+    camera_sync_mode: str = STUS_MODE_MANUAL
+    camera_sync_interval_s: float = STUS_DEFAULT_INTERVAL_S
     pixhawk_host_address: str = "10.0.0.10"
+    # Versioned, one-time transport migration. Radio selection never implies
+    # opening or assigning a serial device; explicit Connect owns that step.
+    pixhawk_transport_schema_version: int = PIXHAWK_TRANSPORT_SCHEMA_VERSION
+    left_pixhawk_transport: str = PIXHAWK_TRANSPORT_RADIO
+    right_pixhawk_transport: str = PIXHAWK_TRANSPORT_RADIO
+    drone_pixhawk_transport: str = PIXHAWK_TRANSPORT_RADIO
+    left_pixhawk_radio_device: str = ""
+    right_pixhawk_radio_device: str = ""
+    drone_pixhawk_radio_device: str = ""
+    left_pixhawk_radio_usb_serial: str = ""
+    right_pixhawk_radio_usb_serial: str = ""
+    drone_pixhawk_radio_usb_serial: str = ""
+    left_pixhawk_radio_baud: int = 57600
+    right_pixhawk_radio_baud: int = 57600
+    drone_pixhawk_radio_baud: int = 57600
     left_pixhawk_eth_ip: str = "10.0.0.2"
     right_pixhawk_eth_ip: str = "10.0.0.3"
+    drone_pixhawk_eth_ip: str = ""
     left_mavlink_url: str = "udpin:0.0.0.0:14550"
     right_mavlink_url: str = "udpin:0.0.0.0:14551"
     left_mavlink_baud: int = 57600
@@ -211,8 +329,15 @@ class AppSettings:
     # NIC with a different name must be reassigned from Find network.
     left_mavlink_interface: str = ""
     right_mavlink_interface: str = ""
+    drone_mavlink_interface: str = ""
     left_mavlink_local_address: str = ""
     right_mavlink_local_address: str = ""
+    drone_mavlink_local_address: str = ""
+    camera_network_stable_id: str = ""
+    left_mavlink_interface_stable_id: str = ""
+    right_mavlink_interface_stable_id: str = ""
+    drone_mavlink_interface_stable_id: str = ""
+    network_role_owned_entries: dict[str, dict[str, list[str]]] = field(default_factory=dict)
     # The third Pixhawk link is an active telemetry/correction endpoint for
     # the drone.  It is deliberately separate from the receive-only target
     # drone artifact path.
@@ -222,9 +347,13 @@ class AppSettings:
     drone_telemetry_rtcm_source: str = "base"
     left_pixhawk_bootstrap_url: str = ""
     right_pixhawk_bootstrap_url: str = ""
+    drone_pixhawk_bootstrap_url: str = ""
     left_pixhawk_bootstrap_baud: int = 57600
     right_pixhawk_bootstrap_baud: int = 57600
-    mavlink_configure_streams: bool = True
+    drone_pixhawk_bootstrap_baud: int = 57600
+    # Deprecated read-compatibility flag. Persistent MAV_2 setup is now an
+    # explicit command and this value never triggers work during Connect.
+    mavlink_configure_streams: bool = False
     mavlink_stream_rate: int = 2_000_000
     pixhawk_ethernet_mode: str = DEFAULT_PIXHAWK_ETHERNET_MODE
     pixhawk_left_gnss_source: str = "GPS1"
@@ -237,6 +366,7 @@ class AppSettings:
     measurement_method_fallback_order: tuple[str, ...] = (
         DEFAULT_MEASUREMENT_METHOD_FALLBACK_ORDER
     )
+    measurement_baseline_yaw_reverse: bool = False
     measurement_display_mode: str = "detection"
     use_rtk_baseline: bool = True
     require_rtk_fixed: bool = False
@@ -353,7 +483,7 @@ def load_settings(
             APP_ROOT / "calibration_captures" / "intrinsics.json",
         ),
     )
-    return AppSettings(
+    settings = AppSettings(
         intrinsics_path=intrinsics_path,
         yolo_weights_path=yolo_weights_path,
         interface_name=str(payload.get("interface_name", AppSettings.interface_name)),
@@ -436,22 +566,29 @@ def load_settings(
         yolo_iou_threshold=float(payload.get("yolo_iou_threshold", AppSettings.yolo_iou_threshold)),
         yolo_gate_class_enabled=bool(payload.get("yolo_gate_class_enabled", AppSettings.yolo_gate_class_enabled)),
         yolo_gate_class_text=str(payload.get("yolo_gate_class_text", AppSettings.yolo_gate_class_text)),
-        yolo_gate_matching_enabled=bool(
-            payload.get("yolo_gate_matching_enabled", AppSettings.yolo_gate_matching_enabled)
-        ),
-        yolo_gate_time_delta_enabled=bool(
-            payload.get("yolo_gate_time_delta_enabled", AppSettings.yolo_gate_time_delta_enabled)
-        ),
+        yolo_gate_matching_enabled=True,
+        yolo_gate_time_delta_enabled=True,
         yolo_gate_vertical_delta_enabled=bool(
             payload.get("yolo_gate_vertical_delta_enabled", AppSettings.yolo_gate_vertical_delta_enabled)
         ),
         yolo_gate_max_vertical_delta_px=float(
             payload.get("yolo_gate_max_vertical_delta_px", AppSettings.yolo_gate_max_vertical_delta_px)
         ),
-        yolo_gate_max_time_delta_s=float(
-            payload.get("yolo_gate_max_time_delta_s", AppSettings.yolo_gate_max_time_delta_s)
+        yolo_gate_max_time_delta_s=min(
+            0.100,
+            max(
+                0.0,
+                float(
+                    payload.get(
+                        "yolo_gate_max_time_delta_s",
+                        AppSettings.yolo_gate_max_time_delta_s,
+                    )
+                ),
+            ),
         ),
-        yolo_gate_time_basis=str(payload.get("yolo_gate_time_basis", AppSettings.yolo_gate_time_basis)),
+        yolo_gate_time_basis=normalize_live_distance_time_basis(
+            payload.get("yolo_gate_time_basis", AppSettings.yolo_gate_time_basis)
+        ),
         preview_width=int(payload.get("preview_width", AppSettings.preview_width)),
         calibration_zoom_level=max(
             0,
@@ -502,7 +639,7 @@ def load_settings(
             min(10.0, float(payload.get("calibration_auto_interval_s", AppSettings.calibration_auto_interval_s))),
         ),
         calibration_root=calibration_root,
-        measurement_data_root=str(
+        measurement_data_root=normalize_measurement_data_root(
             payload.get("measurement_data_root", AppSettings.measurement_data_root)
         ),
         calibration_validation_mode=calibration_validation_mode,
@@ -524,6 +661,12 @@ def load_settings(
             int(payload.get("calibration_validation_seed", AppSettings.calibration_validation_seed)),
         ),
         rtsp_latency_ms=int(payload.get("rtsp_latency_ms", AppSettings.rtsp_latency_ms)),
+        rtsp_encoded_queue_mode=normalize_rtsp_encoded_queue_mode(
+            payload.get(
+                "rtsp_encoded_queue_mode",
+                AppSettings.rtsp_encoded_queue_mode,
+            )
+        ),
         yolo_event_queue_size=max(
             1,
             int(payload.get("yolo_event_queue_size", AppSettings.yolo_event_queue_size)),
@@ -588,9 +731,41 @@ def load_settings(
             1.0,
             float(payload.get("camera_sync_warmup_timeout_s", AppSettings.camera_sync_warmup_timeout_s)),
         ),
+        camera_sync_mode=normalize_stus_mode(
+            payload.get("camera_sync_mode", AppSettings.camera_sync_mode)
+        ),
+        camera_sync_interval_s=normalize_stus_interval_s(
+            payload.get("camera_sync_interval_s", AppSettings.camera_sync_interval_s)
+        ),
         pixhawk_host_address=str(payload.get("pixhawk_host_address", AppSettings.pixhawk_host_address)),
+        pixhawk_transport_schema_version=PIXHAWK_TRANSPORT_SCHEMA_VERSION,
+        left_pixhawk_transport=normalize_pixhawk_transport(
+            payload.get("left_pixhawk_transport", PIXHAWK_TRANSPORT_RADIO)
+        ),
+        right_pixhawk_transport=normalize_pixhawk_transport(
+            payload.get("right_pixhawk_transport", PIXHAWK_TRANSPORT_RADIO)
+        ),
+        drone_pixhawk_transport=normalize_pixhawk_transport(
+            payload.get("drone_pixhawk_transport", PIXHAWK_TRANSPORT_RADIO)
+        ),
+        left_pixhawk_radio_device=str(payload.get("left_pixhawk_radio_device", "")),
+        right_pixhawk_radio_device=str(payload.get("right_pixhawk_radio_device", "")),
+        drone_pixhawk_radio_device=str(payload.get("drone_pixhawk_radio_device", "")),
+        left_pixhawk_radio_usb_serial=str(payload.get("left_pixhawk_radio_usb_serial", "")),
+        right_pixhawk_radio_usb_serial=str(payload.get("right_pixhawk_radio_usb_serial", "")),
+        drone_pixhawk_radio_usb_serial=str(payload.get("drone_pixhawk_radio_usb_serial", "")),
+        left_pixhawk_radio_baud=int(
+            payload.get("left_pixhawk_radio_baud", AppSettings.left_pixhawk_radio_baud)
+        ),
+        right_pixhawk_radio_baud=int(
+            payload.get("right_pixhawk_radio_baud", AppSettings.right_pixhawk_radio_baud)
+        ),
+        drone_pixhawk_radio_baud=int(
+            payload.get("drone_pixhawk_radio_baud", AppSettings.drone_pixhawk_radio_baud)
+        ),
         left_pixhawk_eth_ip=str(payload.get("left_pixhawk_eth_ip", AppSettings.left_pixhawk_eth_ip)),
         right_pixhawk_eth_ip=str(payload.get("right_pixhawk_eth_ip", AppSettings.right_pixhawk_eth_ip)),
+        drone_pixhawk_eth_ip=str(payload.get("drone_pixhawk_eth_ip", AppSettings.drone_pixhawk_eth_ip)),
         left_mavlink_url=str(payload.get("left_mavlink_url", AppSettings.left_mavlink_url)),
         right_mavlink_url=str(payload.get("right_mavlink_url", AppSettings.right_mavlink_url)),
         left_mavlink_baud=int(payload.get("left_mavlink_baud", AppSettings.left_mavlink_baud)),
@@ -601,11 +776,41 @@ def load_settings(
         right_mavlink_interface=str(
             payload.get("right_mavlink_interface", AppSettings.right_mavlink_interface)
         ),
+        drone_mavlink_interface=str(
+            payload.get("drone_mavlink_interface", AppSettings.drone_mavlink_interface)
+        ),
         left_mavlink_local_address=str(
             payload.get("left_mavlink_local_address", AppSettings.left_mavlink_local_address)
         ),
         right_mavlink_local_address=str(
             payload.get("right_mavlink_local_address", AppSettings.right_mavlink_local_address)
+        ),
+        drone_mavlink_local_address=str(
+            payload.get("drone_mavlink_local_address", AppSettings.drone_mavlink_local_address)
+        ),
+        camera_network_stable_id=str(
+            payload.get("camera_network_stable_id", AppSettings.camera_network_stable_id)
+        ),
+        left_mavlink_interface_stable_id=str(
+            payload.get(
+                "left_mavlink_interface_stable_id",
+                AppSettings.left_mavlink_interface_stable_id,
+            )
+        ),
+        right_mavlink_interface_stable_id=str(
+            payload.get(
+                "right_mavlink_interface_stable_id",
+                AppSettings.right_mavlink_interface_stable_id,
+            )
+        ),
+        drone_mavlink_interface_stable_id=str(
+            payload.get(
+                "drone_mavlink_interface_stable_id",
+                AppSettings.drone_mavlink_interface_stable_id,
+            )
+        ),
+        network_role_owned_entries=normalize_network_role_owned_entries(
+            payload.get("network_role_owned_entries")
         ),
         drone_telemetry_url=str(payload.get("drone_telemetry_url", AppSettings.drone_telemetry_url)),
         drone_telemetry_baud=int(payload.get("drone_telemetry_baud", AppSettings.drone_telemetry_baud)),
@@ -619,11 +824,17 @@ def load_settings(
         right_pixhawk_bootstrap_url=str(
             payload.get("right_pixhawk_bootstrap_url", AppSettings.right_pixhawk_bootstrap_url)
         ),
+        drone_pixhawk_bootstrap_url=str(
+            payload.get("drone_pixhawk_bootstrap_url", AppSettings.drone_pixhawk_bootstrap_url)
+        ),
         left_pixhawk_bootstrap_baud=int(
             payload.get("left_pixhawk_bootstrap_baud", AppSettings.left_pixhawk_bootstrap_baud)
         ),
         right_pixhawk_bootstrap_baud=int(
             payload.get("right_pixhawk_bootstrap_baud", AppSettings.right_pixhawk_bootstrap_baud)
+        ),
+        drone_pixhawk_bootstrap_baud=int(
+            payload.get("drone_pixhawk_bootstrap_baud", AppSettings.drone_pixhawk_bootstrap_baud)
         ),
         mavlink_configure_streams=bool(
             payload.get("mavlink_configure_streams", AppSettings.mavlink_configure_streams)
@@ -642,6 +853,12 @@ def load_settings(
         triangulation_extrinsics_source=triangulation_extrinsics_source,
         measurement_preferred_method=measurement_preferred_method,
         measurement_method_fallback_order=measurement_method_fallback_order,
+        measurement_baseline_yaw_reverse=bool(
+            payload.get(
+                "measurement_baseline_yaw_reverse",
+                AppSettings.measurement_baseline_yaw_reverse,
+            )
+        ),
         measurement_display_mode=str(payload.get("measurement_display_mode", AppSettings.measurement_display_mode)),
         use_rtk_baseline=bool(payload.get("use_rtk_baseline", True)),
         require_rtk_fixed=bool(payload.get("require_rtk_fixed", False)),
@@ -661,6 +878,14 @@ def load_settings(
         ),
         gnss_operation=gnss_operation,
     )
+    if (
+        create_if_missing
+        and read_path == settings_path
+        and int(payload.get("pixhawk_transport_schema_version", 0) or 0)
+        < PIXHAWK_TRANSPORT_SCHEMA_VERSION
+    ):
+        save_settings(settings, settings_path)
+    return settings
 
 
 def save_settings(settings: AppSettings, path: str | Path = DEFAULT_SETTINGS_PATH) -> None:

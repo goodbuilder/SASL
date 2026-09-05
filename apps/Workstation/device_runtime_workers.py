@@ -9,6 +9,10 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Sequence
 from ipaddress import IPv4Address
+import os
+from pathlib import Path
+import subprocess
+import sys
 import threading
 import time
 
@@ -16,6 +20,8 @@ from PyQt5 import QtCore
 
 from Workstation.workstation_core.network import (
     DEFAULT_HOST_ADDRESS,
+    NetworkRoleInterfaceRequest,
+    apply_network_role_transaction,
     apply_interface_address,
     discover_pixhawk_network_candidates,
     discover_host_interface_candidates,
@@ -23,7 +29,11 @@ from Workstation.workstation_core.network import (
     local_ipv4_interfaces,
     nm_connection_ipv4_addresses,
     nm_device_connection_name,
+    pixhawk_route_evidence,
     resolve_nm_interface_address,
+)
+from Workstation.workstation_core.drone_network_discovery import (
+    discover_drone_network_candidates,
 )
 from Workstation.workstation_core.pixhawk_attitude import (
     DualPixhawkMavlinkSubscriber,
@@ -34,14 +44,26 @@ from Workstation.workstation_core.pixhawk_attitude import (
     probe_usb_mavlink_devices,
     usb_mavlink_device_candidates,
 )
+from Workstation.workstation_core.pixhawk_mavftp import (
+    MavFtpOffsetClient,
+    atomic_write_transfer_evidence,
+)
+from Workstation.workstation_core.pixhawk_firmware import (
+    parse_px_uploader_output,
+    read_px4_firmware_identity,
+    verify_pinned_uploader,
+)
 from Workstation.workstation_core.px4_mag_manager import (
     BOARD_INTERNAL_MAG_ID,
     GPS1_MAG_ID,
     GPS2_MAG_ID,
     MAG_PARAM_NAMES,
+    MAG_PRIORITY_PARAM_NAMES,
     RM3100_BACKUP_IDS,
     RM3100_PRIMARY_IDS,
     build_mag_status,
+    mag_priority_slot_from_key,
+    mag_priority_slot_key,
 )
 from Workstation.workstation_core.px4_attitude_cal_manager import (
     ATTITUDE_CAL_PARAM_NAMES,
@@ -256,6 +278,29 @@ class CameraNetworkAddressApplyWorker(QtCore.QObject):
             self.finished.emit()
 
 
+class NetworkRoleApplyWorker(QtCore.QObject):
+    """Apply an approved multi-NIC role transaction off the GUI thread."""
+
+    completed = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self, requests: Sequence[NetworkRoleInterfaceRequest]) -> None:
+        super().__init__()
+        self.requests = tuple(requests)
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            results = apply_network_role_transaction(self.requests)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.completed.emit(results)
+        finally:
+            self.finished.emit()
+
+
 class InterfaceStatusWorker(QtCore.QObject):
     """Read one local interface status without blocking panel construction."""
 
@@ -345,6 +390,36 @@ class PixhawkNetworkDiscoveryWorker(QtCore.QObject):
             self.finished.emit()
 
 
+class DroneNetworkDiscoveryWorker(QtCore.QObject):
+    """Passively find UDP MAVLink sources and retain their reported identity."""
+
+    discovered = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self, *, timeout_s: float = 3.0) -> None:
+        super().__init__()
+        self.timeout_s = float(timeout_s)
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        def resolve_route(peer: str) -> tuple[str, str]:
+            evidence = pixhawk_route_evidence(peer)
+            return evidence.interface, evidence.source
+
+        try:
+            candidates = discover_drone_network_candidates(
+                timeout_s=self.timeout_s,
+                route_resolver=resolve_route,
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.discovered.emit(tuple(item.to_mapping() for item in candidates))
+        finally:
+            self.finished.emit()
+
+
 class PixhawkConnectionWorker(QtCore.QObject):
     """Open a MAVLink transport without touching the Workstation event loop."""
 
@@ -352,25 +427,55 @@ class PixhawkConnectionWorker(QtCore.QObject):
     failed = QtCore.pyqtSignal(str)
     finished = QtCore.pyqtSignal()
 
-    def __init__(self, subscriber: DualPixhawkMavlinkSubscriber, camera: str | None) -> None:
+    def __init__(
+        self,
+        subscriber: DualPixhawkMavlinkSubscriber,
+        camera: str | Sequence[str] | None,
+    ) -> None:
         super().__init__()
         self.subscriber = subscriber
-        self.camera = None if camera is None else str(camera)
+        if camera is None:
+            self.cameras: tuple[str, ...] | None = None
+            self.camera = None
+        elif isinstance(camera, str):
+            self.cameras = (str(camera),)
+            self.camera = str(camera)
+        else:
+            self.cameras = tuple(str(value) for value in camera)
+            self.camera = self.cameras[0] if len(self.cameras) == 1 else None
 
     @QtCore.pyqtSlot()
     def run(self) -> None:
         try:
-            self.subscriber.start(
-                self.camera,
-                start_timer=False,
-                apply_pending_setup=False,
-            )
+            if self.cameras is None:
+                self.subscriber.start(
+                    None,
+                    start_timer=False,
+                    apply_pending_setup=False,
+                )
+            else:
+                errors: list[str] = []
+                for camera in self.cameras:
+                    try:
+                        self.subscriber.start(
+                            camera,
+                            start_timer=False,
+                            apply_pending_setup=False,
+                        )
+                    except Exception as exc:
+                        errors.append(f"{camera}: {exc}")
+                if not any(
+                    camera in getattr(self.subscriber, "connections", {})
+                    for camera in self.cameras
+                ):
+                    raise RuntimeError("; ".join(errors) or "no requested Pixhawk connected")
         except Exception as exc:
             self.failed.emit(str(exc))
         else:
             self.completed.emit(
                 {
                     "camera": self.camera,
+                    "requested_cameras": self.cameras,
                     "connections": tuple(getattr(self.subscriber, "connections", {}).keys()),
                 }
             )
@@ -412,6 +517,232 @@ class PixhawkDisconnectWorker(QtCore.QObject):
                 }
             )
         finally:
+            self.finished.emit()
+
+
+class PixhawkMavFtpTransferWorker(QtCore.QObject):
+    """Run one explicit offset-aware MAVFTP upload for one Pixhawk role."""
+
+    progress = QtCore.pyqtSignal(object)
+    completed = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        subscriber: DualPixhawkMavlinkSubscriber,
+        *,
+        camera: str,
+        local_path: str,
+        remote_path: str,
+        resume: bool,
+        evidence_path: str,
+        direction: str = "upload",
+    ) -> None:
+        super().__init__()
+        self.subscriber = subscriber
+        self.camera = str(camera)
+        self.local_path = str(local_path)
+        self.remote_path = str(remote_path)
+        self.resume = bool(resume)
+        self.evidence_path = str(evidence_path)
+        self.direction = str(direction)
+        self._cancelled = threading.Event()
+
+    @QtCore.pyqtSlot()
+    def cancel(self) -> None:
+        self._cancelled.set()
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            connection = self.subscriber.connections.get(self.camera)
+            if connection is None:
+                raise RuntimeError(f"{self.camera} MAVLink connection is missing")
+            send_lock = self.subscriber._mavlink_send_locks.setdefault(
+                self.camera,
+                threading.RLock(),
+            )
+            with self.subscriber.exclusive_command(
+                self.camera,
+                hold_send_lock=False,
+            ):
+                client = MavFtpOffsetClient(
+                    connection,
+                    send_lock=send_lock,
+                    on_unmatched=lambda message: self.subscriber._defer_command_message(
+                        self.camera,
+                        message,
+                    ),
+                )
+                progress = lambda sent, total: self.progress.emit(
+                    {
+                        "camera": self.camera,
+                        "sent": int(sent),
+                        "total": int(total),
+                        "remote_path": self.remote_path,
+                        "direction": self.direction,
+                    }
+                )
+                if self.direction == "download":
+                    evidence = client.download(
+                        self.remote_path,
+                        self.local_path,
+                        resume=self.resume,
+                        progress=progress,
+                        cancelled=self._cancelled.is_set,
+                    )
+                elif self.direction == "upload":
+                    evidence = client.upload(
+                        self.local_path,
+                        self.remote_path,
+                        resume=self.resume,
+                        progress=progress,
+                        cancelled=self._cancelled.is_set,
+                    )
+                else:
+                    raise RuntimeError(f"unsupported MAVFTP direction: {self.direction}")
+            atomic_write_transfer_evidence(self.evidence_path, evidence)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            result = evidence.to_mapping()
+            result.update(
+                camera=self.camera,
+                evidence_path=self.evidence_path,
+                direction=self.direction,
+            )
+            self.completed.emit(result)
+        finally:
+            self.finished.emit()
+
+
+class PixhawkUsbFlashWorker(QtCore.QObject):
+    """Verify direct USB identity and run the pinned PX4 bootloader uploader."""
+
+    progress = QtCore.pyqtSignal(str)
+    completed = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        *,
+        camera: str,
+        expected_system_id: int,
+        usb_device: str,
+        firmware_path: str,
+        uploader_path: str,
+    ) -> None:
+        super().__init__()
+        self.camera = str(camera)
+        self.expected_system_id = int(expected_system_id)
+        self.usb_device = str(usb_device)
+        self.firmware_path = str(firmware_path)
+        self.uploader_path = str(uploader_path)
+        self._cancelled = threading.Event()
+        self._process: subprocess.Popen[str] | None = None
+
+    @QtCore.pyqtSlot()
+    def cancel(self) -> None:
+        self._cancelled.set()
+        process = self._process
+        if process is not None and process.poll() is None:
+            process.terminate()
+
+    def _probe_expected_usb(self, *, timeout_s: float) -> UsbMavlinkIdentity:
+        deadline = time.monotonic() + max(0.1, float(timeout_s))
+        last_seen: UsbMavlinkIdentity | None = None
+        while time.monotonic() < deadline and not self._cancelled.is_set():
+            identities = probe_usb_mavlink_devices(
+                candidates=[self.usb_device],
+                timeout_s=min(0.6, max(0.1, deadline - time.monotonic())),
+            )
+            if identities:
+                last_seen = identities[0]
+                if int(last_seen.system_id) == self.expected_system_id:
+                    return last_seen
+            time.sleep(0.1)
+        if self._cancelled.is_set():
+            raise RuntimeError("USB flash cancelled")
+        if last_seen is None:
+            raise RuntimeError("direct USB heartbeat was not received")
+        raise RuntimeError(
+            f"direct USB sysid mismatch: expected {self.expected_system_id}, got {last_seen.system_id}"
+        )
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            resolved = os.path.realpath(self.usb_device)
+            if not Path(resolved).name.startswith("ttyACM"):
+                raise RuntimeError(
+                    f"USB flash requires a direct Pixhawk CDC device, not a telemetry radio: {resolved}"
+                )
+            firmware = read_px4_firmware_identity(self.firmware_path)
+            uploader_sha256 = verify_pinned_uploader(self.uploader_path)
+            self.progress.emit("USB identity preflight")
+            preflight = self._probe_expected_usb(timeout_s=3.0)
+            command = [
+                sys.executable,
+                self.uploader_path,
+                "--port",
+                self.usb_device,
+                self.firmware_path,
+            ]
+            self.progress.emit("Bootloader erase/program/verify")
+            self._process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            output_lines: list[str] = []
+            assert self._process.stdout is not None
+            for line in self._process.stdout:
+                output_lines.append(line)
+                stripped = line.strip()
+                if stripped:
+                    self.progress.emit(stripped[-240:])
+                if self._cancelled.is_set():
+                    self._process.terminate()
+                    break
+            return_code = self._process.wait(timeout=5.0)
+            output = "".join(output_lines)
+            if self._cancelled.is_set():
+                raise RuntimeError("USB flash cancelled")
+            if return_code != 0:
+                raise RuntimeError(f"PX4 uploader exited {return_code}: {output[-800:]}")
+            uploader_result = parse_px_uploader_output(output)
+            if uploader_result["detected_board_id"] != firmware.board_id:
+                raise RuntimeError(
+                    f"bootloader board mismatch: firmware {firmware.board_id}, "
+                    f"detected {uploader_result['detected_board_id']}"
+                )
+            phases = tuple(uploader_result[name] for name in ("erase", "program", "verify", "reboot"))
+            if phases != ("PASS", "PASS", "PASS", "PASS"):
+                raise RuntimeError(f"USB uploader phase evidence is incomplete: {uploader_result}")
+            self.progress.emit("Post-flash USB identity verification")
+            postflight = self._probe_expected_usb(timeout_s=30.0)
+            result = {
+                "camera": self.camera,
+                "expected_system_id": self.expected_system_id,
+                "usb_device": self.usb_device,
+                "resolved_usb_device": resolved,
+                "uploader_sha256": uploader_sha256,
+                "firmware": firmware.to_mapping(),
+                "preflight": preflight.to_mapping(),
+                "postflight": postflight.to_mapping(),
+                **uploader_result,
+                "state": "FLASHED/VERIFIED",
+            }
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.completed.emit(result)
+        finally:
+            self._process = None
             self.finished.emit()
 
 
@@ -945,52 +1276,73 @@ class PixhawkShellCommandWorker(QtCore.QObject):
         subscriber: DualPixhawkMavlinkSubscriber,
         *,
         camera: str,
-        command: str,
+        command: str | tuple[str, ...],
         operation: str = "shell",
         timeout_s: float = 2.0,
     ) -> None:
         super().__init__()
         self.subscriber = subscriber
         self.camera = str(camera)
-        self.command = str(command)
+        self.command = command
         self.operation = str(operation)
         self.timeout_s = max(0.1, float(timeout_s))
 
     @QtCore.pyqtSlot()
     def run(self) -> None:
         try:
-            with self.subscriber.exclusive_command(self.camera):
+            commands = (
+                tuple(str(item) for item in self.command)
+                if isinstance(self.command, (tuple, list))
+                else (str(self.command),)
+            )
+            command_text = "; ".join(commands)
+            command_label = (
+                "RM3100 SHELL POLL"
+                if self.operation == "sensor_mag_shell_poll"
+                else "PX4 SHELL"
+            )
+            try:
+                command_context = self.subscriber.exclusive_command(
+                    self.camera,
+                    command_label=command_label,
+                    preserve_qualification=self.operation == "sensor_mag_shell_poll",
+                )
+            except TypeError:
+                # Keep older test doubles/compatibility adapters usable while
+                # production subscribers expose the explicit command label.
+                command_context = self.subscriber.exclusive_command(self.camera)
+            with command_context:
                 if self.operation == "reboot":
                     self.subscriber.reboot_autopilot(self.camera)
                     result: dict[str, object] = {
                         "camera": self.camera,
                         "operation": self.operation,
-                        "command": self.command,
+                        "command": command_text,
                         "output": "",
                         "flag_label": "command-sent",
                     }
                 else:
-                    shell_result = self.subscriber.send_shell_command_with_result(
-                        self.camera,
-                        self.command,
-                        timeout_s=self.timeout_s,
-                    )
-                    if isinstance(shell_result, MavlinkShellCommandResult):
-                        result = {
-                            "camera": self.camera,
-                            "operation": self.operation,
-                            "command": shell_result.command,
-                            "output": shell_result.output,
-                            "flag_label": shell_result.flag_label,
-                        }
-                    else:
-                        result = {
-                            "camera": self.camera,
-                            "operation": self.operation,
-                            "command": self.command,
-                            "output": str(getattr(shell_result, "output", "") or ""),
-                            "flag_label": str(getattr(shell_result, "flag_label", "unknown")),
-                        }
+                    output_parts: list[str] = []
+                    flag_labels: list[str] = []
+                    for command in commands:
+                        shell_result = self.subscriber.send_shell_command_with_result(
+                            self.camera,
+                            command,
+                            timeout_s=self.timeout_s,
+                        )
+                        if isinstance(shell_result, MavlinkShellCommandResult):
+                            output_parts.append(shell_result.output)
+                            flag_labels.append(shell_result.flag_label)
+                        else:
+                            output_parts.append(str(getattr(shell_result, "output", "") or ""))
+                            flag_labels.append(str(getattr(shell_result, "flag_label", "unknown")))
+                    result = {
+                        "camera": self.camera,
+                        "operation": self.operation,
+                        "command": command_text,
+                        "output": "".join(output_parts),
+                        "flag_label": "+".join(dict.fromkeys(label for label in flag_labels if label)),
+                    }
         except Exception as exc:
             self.failed.emit(str(exc))
         else:
@@ -1032,6 +1384,20 @@ class PixhawkParameterWorker(QtCore.QObject):
             for name in MAG_PARAM_NAMES
         }
 
+    def _read_mag_priority_params(self) -> dict[str, int | float | None]:
+        """Read only the identity/priority surface needed by ``mag_apply``.
+
+        Full correction coefficients remain available through the explicit
+        MAG refresh path. Priority Apply must not spend dozens of Radio PARAM
+        round trips reading unrelated REAL32 calibration fields before it can
+        write the requested priority.
+        """
+
+        return {
+            name: self.subscriber.read_param(self.camera, name, timeout_s=1.5)
+            for name in MAG_PRIORITY_PARAM_NAMES
+        }
+
     def _read_attitude_params(self) -> dict[str, int | float | None]:
         return {
             name: self.subscriber.read_param(self.camera, name, timeout_s=1.5)
@@ -1055,7 +1421,7 @@ class PixhawkParameterWorker(QtCore.QObject):
     def _run_mag_apply(self) -> dict[str, object]:
         if self.armed:
             raise RuntimeError("Disarm required before changing PX4 magnetometer parameters.")
-        params = self._read_mag_params()
+        params = self._read_mag_priority_params()
         before = build_mag_status(
             params,
             actual_selected_device_id=self.actual_selected_device_id,
@@ -1063,20 +1429,36 @@ class PixhawkParameterWorker(QtCore.QObject):
         )
         applied: list[str] = []
         missing = set(self.priorities)
+        slot_priorities: dict[int, int] = {}
+        role_priorities: dict[str, int] = {}
+        for key, value in self.priorities.items():
+            slot = mag_priority_slot_from_key(key)
+            if slot is None:
+                # Backward compatibility for callers that still submit the
+                # old logical-role payload. The visible UI submits CAL_MAGn.
+                role_priorities[str(key)] = int(value)
+            else:
+                slot_priorities[slot] = int(value)
         for slot in before.slots:
             role = self._role_for_device_id(slot.device_id)
-            if role is None or role not in self.priorities:
+            slot_key = mag_priority_slot_key(slot.slot)
+            if slot.slot in slot_priorities:
+                expected = slot_priorities[slot.slot]
+                missing.discard(slot_key)
+            elif role is not None and role in role_priorities:
+                expected = role_priorities[role]
+                missing.discard(role)
+            else:
                 continue
             name = f"CAL_MAG{slot.slot}_PRIO"
-            expected = int(self.priorities[role])
             actual = self.subscriber.set_param_int(self.camera, name, expected, timeout_s=2.0)
             if actual != expected:
                 raise RuntimeError(f"{name} readback mismatch: expected={expected}, actual={actual}")
-            applied.append(f"{role}:{name}={expected}")
-            missing.discard(role)
+            identity = role or f"ID={slot.device_id if slot.device_id is not None else 'N/A'}"
+            applied.append(f"{slot_key}({identity}):{name}={expected}")
         if not applied:
             raise RuntimeError("적용 가능한 BOARD/CAN/GPS MAG 슬롯을 찾지 못했습니다.")
-        after_params = self._read_mag_params()
+        after_params = self._read_mag_priority_params()
         status = build_mag_status(
             after_params,
             actual_selected_device_id=self.actual_selected_device_id,

@@ -14,6 +14,7 @@ from Workstation.workstation_core.latest_measurement_xlsx import (
     LATEST_MEASUREMENT_WORKBOOK_SCHEMA,
     LatestMeasurementExportCancelled,
     discover_latest_measurement,
+    timestamped_workbook_name,
     workbook_identity,
     write_latest_measurement_xlsx,
 )
@@ -175,6 +176,27 @@ def _fixture(root: Path) -> tuple[str, str]:
         },
     )
     _append(
+        root / "gnss_baseline_center.jsonl",
+        {
+            "measurement_id": old,
+            "sequence": 1,
+            "geometry_state": "CURRENT",
+            "gnss_baseline_center_forward_m": 987654.321,
+            "recorded_utc_ns": 1_700_000_005_500_000_000,
+        },
+        {
+            "measurement_id": latest,
+            "sequence": 2,
+            "geometry_state": "CURRENT",
+            "gnss_baseline_center_forward_m": 10.125,
+            "gnss_baseline_center_right_m": -2.5,
+            "gnss_baseline_center_down_m": 4.75,
+            "gnss_baseline_center_range_m": 11.45,
+            "three_source_timestamp_spread_ms": 999.9,
+            "recorded_utc_ns": 1_700_000_007_500_000_000,
+        },
+    )
+    _append(
         root / "native_frames.jsonl",
         {
             "runtime_generation": latest,
@@ -211,6 +233,7 @@ def test_latest_workbook_filters_generation_materializes_results_and_expands_met
     assert result.row_counts["MethodInputs"] == 1
     assert result.row_counts["CameraLeft"] == 2
     assert result.row_counts["PixhawkP2"] == 0
+    assert result.row_counts["GnssBaselineCenter"] == 1
     assert workbook_identity(result.path) == {
         "workstation_schema": LATEST_MEASUREMENT_WORKBOOK_SCHEMA,
         "runtime_generation": latest,
@@ -221,6 +244,7 @@ def test_latest_workbook_filters_generation_materializes_results_and_expands_met
     methods_xml = _worksheet_bytes(result.path, "MethodOutcomes")
     inputs_xml = _worksheet_bytes(result.path, "MethodInputs")
     camera_xml = _worksheet_bytes(result.path, "CameraLeft")
+    gnss_center_xml = _worksheet_bytes(result.path, "GnssBaselineCenter")
     assert b"11.5" in results_xml
     assert b"999" not in results_xml
     assert old.encode() not in history_xml
@@ -228,10 +252,52 @@ def test_latest_workbook_filters_generation_materializes_results_and_expands_met
     assert b"terrain_pnp" in methods_xml
     assert b"nested-wrong-generation" not in methods_xml
     assert b"nested-wrong-generation" not in inputs_xml
+    assert b"10.125" in gnss_center_xml
+    assert b"987654.321" not in gnss_center_xml
     assert b"NA()" in camera_xml
     assert b"#N/A" in camera_xml
     assert b"2023-11-15T" in history_xml
     assert b"1700000004000000456" in results_xml
+
+
+def test_latest_workbook_reads_timestamped_stream_files(tmp_path: Path) -> None:
+    generation = "run-timestamped"
+    store = MeasurementDataStore(
+        tmp_path,
+        timestamped_filenames=True,
+        file_stamp="20260903_120000_000000001+0900",
+    )
+    try:
+        assert store.enqueue(
+            "events",
+            {
+                "event_type": "measurement_stopped",
+                "runtime_generation": generation,
+                "stopped_utc_ns": 1_700_000_002,
+            },
+            priority=True,
+        )
+        assert store.enqueue(
+            "measurements",
+            {
+                "measurement_id": generation,
+                "_record_index": 0,
+                "_record_operation": "append",
+                "pair_id": "timestamped-pair",
+                "distance_m": 12.5,
+            },
+            priority=True,
+        )
+        assert store.close(timeout_s=2.0)
+    finally:
+        if store.alive:
+            assert store.close(timeout_s=2.0)
+
+    result = write_latest_measurement_xlsx(tmp_path, generation=generation)
+
+    assert result.row_counts["Results"] == 1
+    assert result.row_counts["ResultHistory"] == 1
+    assert result.issue_count == 0
 
 
 def test_formula_like_source_text_is_never_written_as_a_formula(tmp_path: Path) -> None:
@@ -434,7 +500,52 @@ def test_data_storage_controller_generates_and_reports_one_latest_workbook(
         assert snapshot["target_generation"] == generation
         assert snapshot["published_generation"] == generation
         assert snapshot["row_counts"]["Results"] == 1
-        assert Path(str(snapshot["output_path"])).is_file()
+        output = Path(str(snapshot["output_path"]))
+        assert output.is_file()
+        assert output.name == timestamped_workbook_name(
+            int(snapshot["requested_utc_ns"])
+        )
+    finally:
+        assert controller.close_workstation_data(timeout_s=3.0)
+
+
+def test_data_storage_controller_keeps_prior_timestamped_workbook_on_next_export(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import Workstation.data_storage_controller as controller_module
+
+    monkeypatch.setattr(controller_module, "LATEST_MEASUREMENT_XLSX_QUIET_S", 0.0)
+    panel = _storage_panel(tmp_path)
+    controller = controller_module.DataStorageController(panel)
+    try:
+        for generation, distance in (("run-first", 1.0), ("run-second", 2.0)):
+            assert controller.append_workstation_data(
+                "measurements",
+                {
+                    "measurement_id": generation,
+                    "_record_index": 0,
+                    "_record_operation": "append",
+                    "pair_id": generation,
+                    "distance_m": distance,
+                },
+                priority=True,
+            )
+            assert controller.request_latest_measurement_xlsx(
+                generation,
+                automatic=False,
+            )
+            _wait_until(
+                lambda: controller.latest_measurement_xlsx_snapshot()["state"]
+                in {"READY", "FAILED"}
+            )
+            snapshot = controller.latest_measurement_xlsx_snapshot()
+            assert snapshot["state"] == "READY", snapshot
+            assert snapshot["published_generation"] == generation
+
+        outputs = sorted(tmp_path.glob("latest_measurement_*.xlsx"))
+        assert len(outputs) == 2
+        assert outputs[0] != outputs[1]
     finally:
         assert controller.close_workstation_data(timeout_s=3.0)
 
@@ -550,7 +661,9 @@ def test_real_panel_stop_publishes_latest_xlsx_through_delegate_chain(
         snapshot = panel.latest_measurement_xlsx_snapshot()
         assert snapshot["state"] == "READY", snapshot
         assert snapshot["published_generation"] == generation
-        assert (tmp_path / "recordings" / LATEST_MEASUREMENT_WORKBOOK_NAME).is_file()
+        outputs = list((tmp_path / "recordings").glob("latest_measurement_*.xlsx"))
+        assert len(outputs) == 1
+        assert outputs[0].is_file()
     finally:
         assert panel.close_workstation_data(timeout_s=3.0)
         panel._shutdown_coordinator = SimpleNamespace(run=lambda: True)

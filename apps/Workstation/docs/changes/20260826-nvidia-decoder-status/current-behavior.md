@@ -41,3 +41,20 @@
   구분하기 어렵다.
 - 초기 NVIDIA failure는 이전 sandbox/driver-access 관측이며 현재 host kernel log에는 NVRM/Xid
   오류가 없고 real host probe/decode는 PASS다.
+
+## 2026-09-04 follow-up — CUDA driver API failure is the current fallback cause
+
+- 현재 실행 중인 Workstation 양쪽 로그는 `gst_parse_error: no element "nvh264dec"` 후
+  `avdec_h264`로 전환되며, source/RTSP 입력은 계속 수신된다.
+- `/usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstnvcodec.so`와
+  `gstreamer1.0-plugins-bad`는 설치돼 있고 `gst-inspect-1.0 nvcodec`는 plugin을 찾지만,
+  plugin 초기화 로그는 `Failed to init cuda, ret: 0x3e7`를 보고해 `nvh264dec` feature를
+  등록하지 않는다.
+- 독립적인 `cuInit(0)` probe도 `999 (CUDA_ERROR_UNKNOWN)`을 반환하는 반면
+  `nvidia-smi`는 GPU/driver를 표시한다. 따라서 `nvidia-smi` 단독 성공을 NVIDIA decoder
+  사용 가능으로 해석하는 현재 preflight는 실제 GStreamer 경계보다 낙관적이다.
+- `nvidia-smi -q`는 현재 `GPU Recovery Action: Reboot`를 보고하고, 현재 boot의 kernel log에는
+  `Xid 31`, UVM global fatal `0x60`, `Xid 154 (Node Reboot Required)`가 있다. 이는 application
+  restart만으로 GPU context를 복구할 수 없는 현재 host 상태의 독립 증거다.
+- 이번 수정은 CUDA Driver API를 decoder capability gate에 포함하고, API 초기화 실패 원인을
+  진단에 보존한다. NVIDIA driver/package 교체, reboot, worker/resource 정책 변경은 범위 밖이다.

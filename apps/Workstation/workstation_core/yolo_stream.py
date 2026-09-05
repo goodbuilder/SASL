@@ -6,10 +6,12 @@ import multiprocessing
 import math
 import queue
 import signal
+import subprocess
 import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import median
@@ -27,6 +29,12 @@ from Workstation.workstation_core.native_frame_ring import (
     DEFAULT_NATIVE_MAX_WIDTH,
     DEFAULT_NATIVE_RING_CAPACITY,
     SharedNativeFrameRing,
+)
+from Workstation.workstation_core.runtime_camera_status import is_sr_pc_diagnostic_reason
+from Workstation.workstation_core.settings import (
+    RTSP_ENCODED_QUEUE_MODE_LATEST,
+    RTSP_ENCODED_QUEUE_MODE_REFERENCE_SAFE,
+    normalize_rtsp_encoded_queue_mode,
 )
 
 
@@ -65,11 +73,11 @@ STREAM_BACKEND_OPENCV_AUTO = "opencv_auto"
 STREAM_BACKEND_PYAV = "pyav"
 RECORDING_ENCODING_H264_COPY_GATED = "h264_copy_integrity_gated"
 RECORDING_ENCODING_DECODED_REENCODE_UNVERIFIED = "decoded_reencode_unverified"
+RECORDING_ENCODING_DECODED_NVENC_LOSSLESS = "decoded_nvenc_lossless_reencode"
 RTSP_TRANSPORT_UDP = "udp"
 RTSP_TRANSPORT_TCP = "tcp"
 RTSP_RECONNECT_MANUAL = "manual"
 RTSP_RECONNECT_AUTOMATIC = "automatic"
-I_FRAME_ONLY_ENV = "STEREO_GST_I_FRAME_ONLY"
 NVIDIA_H264_DECODER = "nvh264dec"
 SOFTWARE_H264_DECODER = "avdec_h264"
 RED_BGR = (0, 0, 255)
@@ -83,18 +91,25 @@ MAX_RTP_TIMING_CACHE = 240
 MAX_RTP_PTS_MATCH_DELTA_NS = 5_000_000
 MAX_RTP_DISCONTINUITY_CACHE = 64
 H264_NAL_TYPE_IDR = 5
+H264_NAL_TYPE_NON_IDR_SLICE = 1
+H264_NAL_TYPE_SPS = 7
+H264_NAL_TYPE_PPS = 8
+H264_RECOVERY_BASIS_IDR = "h264_idr"
+H264_RECOVERY_BASIS_NON_IDR_INTRA_EXPERIMENTAL = (
+    "wiris_non_idr_intra_experimental"
+)
+H264_ACCESS_UNIT_KIND_NAL1_NON_IDR_INTRA = "nal1_non_idr_intra"
 MAX_RTCP_SR_ARRIVAL_CACHE = 128
 MAX_RTCP_RATE_SAMPLES = 12
 DEFAULT_RECORD_VIDEO_QUEUE_SIZE = 300
-MAX_RTCP_SR_PC_OFFSET_S = 0.5
 GST_RTSP_RECONNECT_DELAYS_S = (1.0, 2.0, 4.0, 8.0)
 GST_ENCODED_QUEUE_MAX_TIME_NS = 250_000_000
 GST_DECODED_QUEUE_MAX_BUFFERS = 8
 GST_RECORDING_QUEUE_MAX_TIME_NS = 5_000_000_000
 GST_RECORDING_EOS_TIMEOUT_S = 9.0
 INTEGRITY_RECOVERY_TIMEOUT_S = 30.0
-YOLO_COOPERATIVE_STOP_TIMEOUT_S = 12.0
-YOLO_KILL_AFTER_STOP_S = 20.0
+YOLO_COOPERATIVE_STOP_TIMEOUT_S = 30.0
+YOLO_KILL_AFTER_STOP_S = 40.0
 YOLO_KILL_JOIN_TIMEOUT_S = 1.0
 YOLO_PROCESS_CRASH_RESTART_DELAYS_S = (0.25, 0.5, 1.0)
 YOLO_PROCESS_STABLE_RUN_S = 30.0
@@ -107,6 +122,13 @@ GST_ERROR_RTSP_SOURCE = "rtsp-source"
 GST_ERROR_RECORDING_OUTPUT = "recording-output"
 GST_ERROR_DECODER_HEALTH = "decoder-health"
 GST_ERROR_PIPELINE = "pipeline"
+
+
+def app_receive_monotonic_sample() -> tuple[int, float]:
+    """Capture one exact host-monotonic decoded-frame receipt timestamp."""
+
+    monotonic_ns = time.monotonic_ns()
+    return monotonic_ns, monotonic_ns * 1.0e-9
 
 
 def _arm_linux_parent_death_signal() -> bool:
@@ -486,6 +508,279 @@ class AsyncVideoWriter:
             )
 
 
+class DecodedNv12Recorder:
+    """Own one isolated bounded raw-NV12 -> FFmpeg NVENC MP4 writer."""
+
+    def __init__(
+        self,
+        Gst,
+        *,
+        path: str,
+        width: int,
+        height: int,
+        fallback_fps: float,
+        output_queue,
+    ) -> None:
+        self.Gst = Gst
+        self.path = str(Path(path).expanduser())
+        self.width = int(width)
+        self.height = int(height)
+        self.expected_frame_bytes = self.width * self.height * 3 // 2
+        self.frame_period_ns = max(
+            1,
+            int(round(1_000_000_000.0 / max(1.0, float(fallback_fps)))),
+        )
+        self.output_queue = output_queue
+        self.submitted_frames = 0
+        self.written_frames = 0
+        self.dropped_frames = 0
+        self.duplicated_frames = 0
+        self._first_source_pts_ns: int | None = None
+        self._last_source_pts_ns: int | None = None
+        self._failed_detail = ""
+        self._closed = False
+        self._accepting = True
+        self.frames: queue.Queue[tuple[bytes, int] | None] = queue.Queue(
+            maxsize=2
+        )
+
+        output_path = Path(self.path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        command = [
+            "ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-n",
+            "-f",
+            "rawvideo",
+            "-pixel_format",
+            "nv12",
+            "-video_size",
+            f"{self.width}x{self.height}",
+            "-framerate",
+            f"{max(1.0, float(fallback_fps)):.6f}",
+            "-i",
+            "pipe:0",
+            "-an",
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "losslesshp",
+            "-tune",
+            "lossless",
+            "-rc",
+            "constqp",
+            "-qp",
+            "0",
+            "-bf",
+            "0",
+            "-g",
+            "30",
+            "-vsync",
+            "0",
+            self.path,
+        ]
+        self.process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        if self.process.stdin is None or self.process.stderr is None:
+            self.process.terminate()
+            raise RuntimeError("FFmpeg NVENC recorder pipes are unavailable")
+        self.thread = threading.Thread(
+            target=self._run,
+            name="stereo-nvenc-video-writer",
+            daemon=True,
+        )
+        self.thread.start()
+        _emit_status(
+            self.output_queue,
+            f"Decoded NV12 lossless FFmpeg/NVENC recording started: {self.path}",
+        )
+
+    def submit(self, buffer, *, observed_monotonic_ns: int) -> bool:
+        if self._closed or not self._accepting or self._failed_detail:
+            return False
+        if self.process.poll() is not None:
+            self._failed_detail = f"FFmpeg exited early: {self.process.returncode}"
+            return False
+        success, map_info = buffer.map(self.Gst.MapFlags.READ)
+        if not success:
+            return False
+        try:
+            data = bytes(map_info.data)
+        finally:
+            buffer.unmap(map_info)
+        if len(data) != self.expected_frame_bytes:
+            self._failed_detail = (
+                "NV12 buffer size mismatch: "
+                f"expected={self.expected_frame_bytes}, actual={len(data)}"
+            )
+            return False
+        source_pts_ns = int(
+            observed_monotonic_ns
+            if buffer.pts == self.Gst.CLOCK_TIME_NONE
+            else buffer.pts
+        )
+        if self._first_source_pts_ns is None:
+            self._first_source_pts_ns = source_pts_ns
+        self._last_source_pts_ns = source_pts_ns
+        self.submitted_frames += 1
+        item = (data, source_pts_ns)
+        try:
+            self.frames.put_nowait(item)
+            return True
+        except queue.Full:
+            pass
+        try:
+            self.frames.get_nowait()
+            self.frames.task_done()
+            self.dropped_frames += 1
+        except queue.Empty:
+            pass
+        try:
+            self.frames.put_nowait(item)
+            return True
+        except queue.Full:
+            self.dropped_frames += 1
+            return False
+
+    def _run(self) -> None:
+        assert self.process.stdin is not None
+        previous_data: bytes | None = None
+        previous_source_pts_ns: int | None = None
+        try:
+            while True:
+                item = self.frames.get()
+                try:
+                    if item is None:
+                        return
+                    data, source_pts_ns = item
+                    if previous_data is not None and previous_source_pts_ns is not None:
+                        elapsed_ns = max(0, source_pts_ns - previous_source_pts_ns)
+                        missing_intervals = max(
+                            0,
+                            int(round(elapsed_ns / self.frame_period_ns)) - 1,
+                        )
+                        for _ in range(min(30, missing_intervals)):
+                            self.process.stdin.write(previous_data)
+                            self.written_frames += 1
+                            self.duplicated_frames += 1
+                    self.process.stdin.write(data)
+                    self.written_frames += 1
+                    previous_data = data
+                    previous_source_pts_ns = source_pts_ns
+                finally:
+                    self.frames.task_done()
+        except (BrokenPipeError, OSError) as exc:
+            self._failed_detail = f"{type(exc).__name__}: {exc}"
+        finally:
+            try:
+                self.process.stdin.close()
+            except OSError:
+                pass
+
+    def _enqueue_stop(self) -> None:
+        try:
+            self.frames.put(None, timeout=GST_RECORDING_EOS_TIMEOUT_S)
+        except queue.Full:
+            self._failed_detail = "recorder queue did not drain for shutdown"
+
+    def _stderr_text(self) -> str:
+        if self.process.stderr is None:
+            return ""
+        try:
+            data = self.process.stderr.read(16_384)
+        except OSError:
+            return ""
+        return data.decode("utf-8", errors="replace").strip()
+
+    def close(self) -> bool:
+        if self._closed:
+            return not bool(self._failed_detail)
+        self._closed = True
+        self._accepting = False
+        self._enqueue_stop()
+        self.thread.join(timeout=1.0)
+        if self.thread.is_alive():
+            self._failed_detail = "recorder writer timeout"
+            self.process.terminate()
+            self.thread.join(timeout=1.0)
+        try:
+            returncode = self.process.wait(timeout=4.0)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            returncode = self.process.wait(timeout=1.0)
+            self._failed_detail = self._failed_detail or "FFmpeg exit timeout"
+        stderr_text = self._stderr_text()
+        if returncode != 0 and not self._failed_detail:
+            self._failed_detail = (
+                f"FFmpeg exitcode={returncode}"
+                + (f": {stderr_text}" if stderr_text else "")
+            )
+        elif returncode != 0 and stderr_text:
+            self._failed_detail = f"{self._failed_detail}: {stderr_text}"
+
+        output_path = Path(self.path)
+        try:
+            present = output_path.is_file() and output_path.stat().st_size > 0
+        except OSError:
+            present = False
+        success = bool(returncode == 0 and present and not self._failed_detail)
+        detail = (
+            "FFmpeg closed; lossless NVENC MP4 finalized; output validation pending"
+            if success
+            else self._failed_detail or "lossless NVENC MP4 unavailable"
+        )
+        _emit_recording_finalized(
+            self.output_queue,
+            path=self.path,
+            backend=STREAM_BACKEND_GSTREAMER,
+            success=success,
+            detail=detail,
+            contract=recording_integrity_contract(STREAM_BACKEND_GSTREAMER),
+            metrics={
+                "container_finalization_success": success,
+                "source_media_integrity_verified": False,
+                "recording_file_integrity_verified": False,
+                "integrity_validation_status": "PENDING" if success else "FAIL",
+                "integrity_failure_reasons": (
+                    ["finalized_mp4_output_validation_pending"]
+                    if success
+                    else ["decoded_nvenc_recording_failed"]
+                ),
+                "recording_usable": success,
+                "submitted_frames": self.submitted_frames,
+                "encoded_frames": self.written_frames,
+                "dropped_frames": self.dropped_frames,
+                "duplicated_frames": self.duplicated_frames,
+                "recording_timing_basis": "source_pts_fixed_rate_gap_duplication",
+                "source_duration_ns": (
+                    0
+                    if self._first_source_pts_ns is None
+                    or self._last_source_pts_ns is None
+                    else max(
+                        0,
+                        self._last_source_pts_ns - self._first_source_pts_ns,
+                    )
+                ),
+            },
+        )
+        _emit_status(
+            self.output_queue,
+            f"Decoded NVENC recording {'finalized' if success else 'failed'}: "
+            f"{self.path} (submitted={self.submitted_frames}, "
+            f"encoded={self.written_frames}, dropped={self.dropped_frames}, "
+            f"detail={detail})",
+        )
+        return success
+
+
 def _open_record_video_writer(cv2, config: dict[str, Any], output_queue, width: int, height: int):
     path = _record_video_path(config)
     if not path or width <= 0 or height <= 0:
@@ -741,11 +1036,77 @@ def h264_access_unit_has_idr(access_unit: bytes | bytearray | memoryview) -> boo
     return H264_NAL_TYPE_IDR in h264_byte_stream_nal_unit_types(access_unit)
 
 
-def should_suppress_decoded_output(*, active_decoder: str, rtp_discontinuity_latched: bool) -> bool:
-    """Keep decoder concealment frames out of preview, YOLO, and evidence."""
+def h264_nal1_non_idr_intra_metadata(
+    access_unit: bytes | bytearray | memoryview,
+    *,
+    pts_ns: int | None,
+    is_delta: bool,
+    is_corrupted: bool = False,
+) -> dict[str, object] | None:
+    """Return positive Auto-capture provenance for one exact NAL1 AU.
+
+    NAL type 1 alone also covers inter-predicted non-IDR pictures. The
+    parser-owned ``DELTA_UNIT`` flag is therefore part of the operational
+    capture contract. This evidence deliberately does not claim IDR or a
+    random-access integrity boundary.
+    """
+
+    if pts_ns is None or bool(is_delta) or bool(is_corrupted):
+        return None
+    nal_types = h264_byte_stream_nal_unit_types(access_unit)
+    if (
+        H264_NAL_TYPE_NON_IDR_SLICE not in nal_types
+        or H264_NAL_TYPE_IDR in nal_types
+    ):
+        return None
+    return {
+        "h264_access_unit_kind": H264_ACCESS_UNIT_KIND_NAL1_NON_IDR_INTRA,
+        "h264_access_unit_nal_types": list(nal_types),
+        "h264_access_unit_is_delta": False,
+        "h264_access_unit_pts_ns": int(pts_ns),
+        "h264_nal1_non_idr_intra": True,
+        "h264_random_access_guaranteed": False,
+    }
+
+
+def h264_access_unit_recovery_basis(
+    access_unit: bytes | bytearray | memoryview,
+    *,
+    is_delta: bool,
+    allow_non_idr_intra_experimental: bool = False,
+) -> str | None:
+    """Classify one parser-normalized AU without relabelling NAL1 as IDR.
+
+    ``h264parse`` owns the AU/non-delta classification.  The experimental
+    WIRIS branch additionally requires in-band SPS and PPS in that exact AU;
+    a bare NAL1 header or a parser flag alone is never a recovery candidate.
+    """
+
+    nal_types = h264_byte_stream_nal_unit_types(access_unit)
+    if H264_NAL_TYPE_IDR in nal_types:
+        return H264_RECOVERY_BASIS_IDR
+    if not allow_non_idr_intra_experimental or bool(is_delta):
+        return None
+    required_types = {
+        H264_NAL_TYPE_NON_IDR_SLICE,
+        H264_NAL_TYPE_SPS,
+        H264_NAL_TYPE_PPS,
+    }
+    if required_types.issubset(nal_types):
+        return H264_RECOVERY_BASIS_NON_IDR_INTRA_EXPERIMENTAL
+    return None
+
+
+def should_suppress_decoded_output(
+    *,
+    active_decoder: str,
+    rtp_discontinuity_latched: bool,
+    tolerant_input: bool = False,
+) -> bool:
+    """Keep decoder concealment frames out unless the YOLO trial opts in."""
 
     _ = active_decoder
-    return bool(rtp_discontinuity_latched)
+    return bool(rtp_discontinuity_latched) and not bool(tolerant_input)
 
 
 def normalize_stream_backend(backend: str | None) -> str:
@@ -765,19 +1126,29 @@ def recording_integrity_contract(backend: str | None) -> dict[str, str | bool]:
     normalized_backend = normalize_stream_backend(backend)
     if normalized_backend == STREAM_BACKEND_GSTREAMER:
         return {
-            "recording_encoding_mode": RECORDING_ENCODING_H264_COPY_GATED,
-            # This is a requirement, not a pre-finalization success claim.
-            # Per-file validation overrides it only after the finalized bytes
-            # pass IDR/frame_num, decoded-count, and MP4 timing checks.
+            "recording_encoding_mode": RECORDING_ENCODING_DECODED_NVENC_LOSSLESS,
             "recording_integrity_verified": False,
             "recording_integrity_scope": (
-                "finalized-mp4:h264-idr+frame-num+decode-count+sample-timing"
+                "decoded-nv12:nvenc-lossless+finalized-mp4;"
+                "source-media-integrity=tolerant-unverified"
             ),
         }
     return {
         "recording_encoding_mode": RECORDING_ENCODING_DECODED_REENCODE_UNVERIFIED,
         "recording_integrity_verified": False,
         "recording_integrity_scope": "decoded-frames-only",
+    }
+
+
+def h264_copy_recording_integrity_contract() -> dict[str, str | bool]:
+    """Historical direct-copy contract retained for old finalization evidence."""
+
+    return {
+        "recording_encoding_mode": RECORDING_ENCODING_H264_COPY_GATED,
+        "recording_integrity_verified": False,
+        "recording_integrity_scope": (
+            "finalized-mp4:h264-idr+frame-num+decode-count+sample-timing"
+        ),
     }
 
 
@@ -889,6 +1260,59 @@ class RollingFrameRateEstimator:
 
 
 @dataclass
+class RollingCounterRateEstimator:
+    """Estimate a rate from a monotonic cumulative counter."""
+
+    window_s: float = DEFAULT_DECODE_RATE_WINDOW_S
+    _samples: deque[tuple[float, int]] = field(default_factory=deque)
+
+    def __post_init__(self) -> None:
+        try:
+            window_s = float(self.window_s)
+        except (TypeError, ValueError):
+            window_s = DEFAULT_DECODE_RATE_WINDOW_S
+        self.window_s = max(1.0, window_s) if math.isfinite(window_s) else DEFAULT_DECODE_RATE_WINDOW_S
+
+    def _trim(self, now_s: float) -> None:
+        cutoff_s = now_s - self.window_s
+        while self._samples and self._samples[0][0] < cutoff_s:
+            self._samples.popleft()
+
+    def add(self, timestamp_s: float, total_count: int) -> None:
+        try:
+            timestamp_s = float(timestamp_s)
+            total_count = int(total_count)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(timestamp_s) or total_count < 0:
+            return
+        if self._samples and timestamp_s < self._samples[-1][0]:
+            return
+        if self._samples and total_count < self._samples[-1][1]:
+            # A worker reconnect or counter reset starts a fresh rate window.
+            self._samples.clear()
+        self._samples.append((timestamp_s, total_count))
+        self._trim(timestamp_s)
+
+    def rate(self, now_s: float) -> float:
+        try:
+            now_s = float(now_s)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(now_s):
+            return 0.0
+        self._trim(now_s)
+        if len(self._samples) < 2:
+            return 0.0
+        first_s, first_count = self._samples[0]
+        _last_s, last_count = self._samples[-1]
+        elapsed_s = min(self.window_s, max(0.0, now_s - first_s))
+        if elapsed_s <= 0.0:
+            return 0.0
+        return max(0, last_count - first_count) / elapsed_s
+
+
+@dataclass
 class AdaptiveYoloRateLimiter:
     enabled: bool
     target_rate_hz: float
@@ -985,10 +1409,6 @@ def normalize_yolo_input_size(input_size: int | str | None) -> int:
         value = 640
     value = max(YOLO_INPUT_SIZE_STRIDE, value)
     return ((value + YOLO_INPUT_SIZE_STRIDE - 1) // YOLO_INPUT_SIZE_STRIDE) * YOLO_INPUT_SIZE_STRIDE
-
-
-def env_flag_enabled(name: str) -> bool:
-    return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _configure_worker_thread_environment(thread_count: int) -> None:
@@ -1095,6 +1515,7 @@ class RtpSequenceRecovery:
     resume_pts_ns: int
     observed_monotonic_s: float
     blocked_duration_s: float
+    recovery_basis: str = H264_RECOVERY_BASIS_IDR
 
 
 @dataclass(frozen=True)
@@ -1169,19 +1590,6 @@ def rtcp_sender_report_pc_offset_s(
     return offset_s if abs(offset_s) <= 60.0 else None
 
 
-def rtcp_sender_report_is_pc_valid(
-    *,
-    sr_ntp_unix_s: float,
-    received_wall_s: float,
-    max_offset_s: float = MAX_RTCP_SR_PC_OFFSET_S,
-) -> bool:
-    offset_s = rtcp_sender_report_pc_offset_s(
-        sr_ntp_unix_s=sr_ntp_unix_s,
-        received_wall_s=received_wall_s,
-    )
-    return offset_s is not None and abs(offset_s) <= float(max_offset_s)
-
-
 def sender_report_clock_rates(
     previous: RtcpSenderReportTiming,
     current: RtcpSenderReportTiming,
@@ -1236,17 +1644,36 @@ def robust_sender_report_clock_rates(
 
 
 class GstRtpTimingTracker:
-    def __init__(self, Gst, GstRtp, *, status_callback: Callable[[str], None] | None = None) -> None:
+    def __init__(
+        self,
+        Gst,
+        GstRtp,
+        *,
+        status_callback: Callable[[str], None] | None = None,
+        allow_non_idr_intra_experimental: bool = False,
+        allow_unverified_encoded_output: bool = False,
+    ) -> None:
         self.Gst = Gst
         self.GstRtp = GstRtp
         self._status_callback = status_callback
+        self._allow_non_idr_intra_experimental = bool(
+            allow_non_idr_intra_experimental
+        )
+        self._allow_unverified_encoded_output = bool(
+            allow_unverified_encoded_output
+        )
         self._lock = threading.Lock()
         self._pending_rtp_frames: deque[RtpFrameTiming] = deque(maxlen=MAX_RTP_TIMING_CACHE)
         self._timing_by_pts_ns: dict[int, RtpFrameTiming] = {}
         self._pts_order: deque[int] = deque(maxlen=MAX_RTP_TIMING_CACHE)
+        self._nal1_metadata_by_pts_ns: dict[int, dict[str, object]] = {}
+        self._nal1_metadata_pts_order: deque[int] = deque()
         self._active_rtp_ssrc: int | None = None
         self._last_rtp_sequence: int | None = None
         self._rtp_packet_count = 0
+        self._rtp_gap_events_total = 0
+        self._rtp_missing_packets_total = 0
+        self._h264_access_units_total = 0
         self._last_rtp_packet_monotonic_s: float | None = None
         self._rtp_discontinuities: deque[RtpSequenceDiscontinuity] = deque(
             maxlen=MAX_RTP_DISCONTINUITY_CACHE
@@ -1267,11 +1694,14 @@ class GstRtpTimingTracker:
         self._blocked_since_monotonic_s: float | None = time.monotonic()
         self._recovery_candidate_pts_ns: int | None = None
         self._recovery_candidate_observed_s: float | None = None
+        self._recovery_candidate_basis: str | None = None
+        self._output_recovery_basis: str | None = None
         self._encoded_recovery_marker_pts_ns: int | None = None
         self._accepted_access_unit_seen = False
         self._access_unit_discontinuity_reported = False
         self._sr_by_ssrc: dict[int, RtcpSenderReportTiming] = {}
         self._sr_count_by_ssrc: dict[int, int] = {}
+        self._sr_history_by_ssrc: dict[int, deque[RtcpSenderReportTiming]] = {}
         self._clock_rate_samples_by_ssrc: dict[int, deque[dict[str, float]]] = {}
         self._clock_rates_by_ssrc: dict[int, dict[str, float]] = {}
         self._sr_arrival_by_key: dict[tuple[int, int], tuple[float, float]] = {}
@@ -1284,6 +1714,29 @@ class GstRtpTimingTracker:
     def _emit_status(self, text: str) -> None:
         if self._status_callback is not None:
             self._status_callback(text)
+
+    def _remember_nal1_metadata(self, metadata: dict[str, object]) -> None:
+        pts_ns = int(metadata["h264_access_unit_pts_ns"])
+        with self._lock:
+            if pts_ns not in self._nal1_metadata_by_pts_ns:
+                self._nal1_metadata_pts_order.append(pts_ns)
+            self._nal1_metadata_by_pts_ns[pts_ns] = dict(metadata)
+            while len(self._nal1_metadata_pts_order) > MAX_RTP_TIMING_CACHE:
+                stale_pts_ns = self._nal1_metadata_pts_order.popleft()
+                self._nal1_metadata_by_pts_ns.pop(stale_pts_ns, None)
+
+    def _pop_nal1_metadata(self, pts_ns: int | None) -> dict[str, object] | None:
+        if pts_ns is None:
+            return None
+        with self._lock:
+            normalized_pts_ns = int(pts_ns)
+            metadata = self._nal1_metadata_by_pts_ns.pop(normalized_pts_ns, None)
+            if metadata is not None:
+                try:
+                    self._nal1_metadata_pts_order.remove(normalized_pts_ns)
+                except ValueError:
+                    pass
+        return None if metadata is None else dict(metadata)
 
     def register_rtp_sequence(
         self,
@@ -1345,6 +1798,8 @@ class GstRtpTimingTracker:
                 rtp_pts_ns=normalized_pts_ns,
             )
             self._rtp_discontinuities.append(discontinuity)
+            self._rtp_gap_events_total += 1
+            self._rtp_missing_packets_total += int(discontinuity.missing_packets)
             # Popping the status event must not release this latch. Only a
             # parser-proven IDR followed by that exact decoded PTS can do so.
             self._latch_compressed_discontinuity_locked(
@@ -1370,6 +1825,18 @@ class GstRtpTimingTracker:
                 and last_s is not None
                 and observed_s - last_s <= max(0.0, float(max_age_s))
             )
+
+    def rtp_metrics_snapshot(self) -> dict[str, int | None]:
+        """Return transport and parser counters for the UI rate display."""
+
+        with self._lock:
+            return {
+                "rtp_packets_received_total": int(self._rtp_packet_count),
+                "rtp_gap_events_total": int(self._rtp_gap_events_total),
+                "rtp_missing_packets_total": int(self._rtp_missing_packets_total),
+                "h264_access_units_total": int(self._h264_access_units_total),
+                "rtp_active_ssrc": self._active_rtp_ssrc,
+            }
 
     def pop_rtp_discontinuity(self) -> RtpSequenceDiscontinuity | None:
         with self._lock:
@@ -1410,6 +1877,7 @@ class GstRtpTimingTracker:
             self._blocked_after_pts_ns = max(self._blocked_after_pts_ns, int(pts_ns))
         self._recovery_candidate_pts_ns = None
         self._recovery_candidate_observed_s = None
+        self._recovery_candidate_basis = None
         self._encoded_recovery_marker_pts_ns = None
 
     def _register_access_unit_locked(
@@ -1419,12 +1887,21 @@ class GstRtpTimingTracker:
         is_delta: bool,
         is_corrupted: bool,
         is_random_access: bool,
+        recovery_basis: str | None,
         observed_s: float,
     ) -> bool:
         _ = is_delta
+        normalized_basis = str(recovery_basis or "").strip()
+        if not normalized_basis and is_random_access:
+            normalized_basis = H264_RECOVERY_BASIS_IDR
+        allowed_basis = normalized_basis == H264_RECOVERY_BASIS_IDR or (
+            self._allow_non_idr_intra_experimental
+            and normalized_basis
+            == H264_RECOVERY_BASIS_NON_IDR_INTRA_EXPERIMENTAL
+        )
         if (
             not self._decoded_output_blocked
-            or not is_random_access
+            or not allowed_basis
             or is_corrupted
             or pts_ns is None
         ):
@@ -1435,6 +1912,7 @@ class GstRtpTimingTracker:
             return False
         self._recovery_candidate_pts_ns = int(pts_ns)
         self._recovery_candidate_observed_s = observed_s
+        self._recovery_candidate_basis = normalized_basis
         self._encoded_recovery_marker_pts_ns = int(pts_ns)
         self._encoded_output_blocked = False
         return True
@@ -1446,6 +1924,7 @@ class GstRtpTimingTracker:
         is_delta: bool,
         is_corrupted: bool,
         is_random_access: bool = False,
+        recovery_basis: str | None = None,
         observed_monotonic_s: float | None = None,
     ) -> bool:
         observed_s = time.monotonic() if observed_monotonic_s is None else float(observed_monotonic_s)
@@ -1456,6 +1935,7 @@ class GstRtpTimingTracker:
                 is_delta=bool(is_delta),
                 is_corrupted=bool(is_corrupted),
                 is_random_access=bool(is_random_access),
+                recovery_basis=recovery_basis,
                 observed_s=observed_s,
             )
 
@@ -1467,12 +1947,15 @@ class GstRtpTimingTracker:
         is_corrupted: bool,
         is_discontinuous: bool,
         is_random_access: bool = False,
+        recovery_basis: str | None = None,
         observed_monotonic_s: float | None = None,
     ) -> bool:
         """Keep an invalid AU and every dependent AU out of all consumers."""
 
         observed_s = time.monotonic() if observed_monotonic_s is None else float(observed_monotonic_s)
         normalized_pts_ns = None if pts_ns is None else int(pts_ns)
+        normalized_basis = str(recovery_basis or "").strip()
+        random_access_candidate = bool(is_random_access or normalized_basis)
         with self._lock:
             # GstBaseParse marks the first valid IDR DISCONT at a normal stream
             # or segment start. An explicitly parsed IDR is a safe reset for
@@ -1486,7 +1969,7 @@ class GstRtpTimingTracker:
                 if (
                     is_discontinuous
                     and self._accepted_access_unit_seen
-                    and not is_random_access
+                    and not random_access_candidate
                 )
                 else None
             )
@@ -1517,7 +2000,8 @@ class GstRtpTimingTracker:
                 pts_ns=normalized_pts_ns,
                 is_delta=bool(is_delta),
                 is_corrupted=bool(is_corrupted),
-                is_random_access=bool(is_random_access),
+                is_random_access=random_access_candidate,
+                recovery_basis=normalized_basis,
                 observed_s=observed_s,
             ):
                 self._accepted_access_unit_seen = True
@@ -1555,12 +2039,16 @@ class GstRtpTimingTracker:
                 return True
             observed_s = self._recovery_candidate_observed_s or time.monotonic()
             blocked_since_s = self._blocked_since_monotonic_s or observed_s
+            recovery_basis = (
+                self._recovery_candidate_basis or H264_RECOVERY_BASIS_IDR
+            )
             self._rtp_recoveries.append(
                 RtpSequenceRecovery(
                     ssrc=int(self._active_rtp_ssrc or 0),
                     resume_pts_ns=resume_pts_ns,
                     observed_monotonic_s=observed_s,
                     blocked_duration_s=max(0.0, observed_s - blocked_since_s),
+                    recovery_basis=recovery_basis,
                 )
             )
             self._decoded_output_blocked = False
@@ -1569,9 +2057,15 @@ class GstRtpTimingTracker:
             self._blocked_since_monotonic_s = None
             self._recovery_candidate_pts_ns = None
             self._recovery_candidate_observed_s = None
+            self._recovery_candidate_basis = None
             self._encoded_recovery_marker_pts_ns = None
             self._access_unit_discontinuity_reported = False
+            self._output_recovery_basis = recovery_basis
             return False
+
+    def current_output_recovery_basis(self) -> str | None:
+        with self._lock:
+            return self._output_recovery_basis
 
     def pop_rtp_recovery(self) -> RtpSequenceRecovery | None:
         with self._lock:
@@ -1583,6 +2077,8 @@ class GstRtpTimingTracker:
         self._pending_rtp_frames.clear()
         self._timing_by_pts_ns.clear()
         self._pts_order.clear()
+        self._nal1_metadata_by_pts_ns.clear()
+        self._nal1_metadata_pts_order.clear()
 
     def _register_sender_report(self, timing: RtcpSenderReportTiming) -> str | None:
         with self._lock:
@@ -1595,6 +2091,7 @@ class GstRtpTimingTracker:
                 return None
             self._sr_count_by_ssrc[timing.ssrc] = self._sr_count_by_ssrc.get(timing.ssrc, 0) + 1
             self._sr_by_ssrc[timing.ssrc] = timing
+            self._sr_history_by_ssrc.setdefault(timing.ssrc, deque(maxlen=8)).append(timing)
         if previous is None:
             return None
         interval_s = timing.received_monotonic_s - previous.received_monotonic_s
@@ -1625,6 +2122,92 @@ class GstRtpTimingTracker:
             f"ntp={timing.ntp_unix_s:.6f}{rate_text}"
         )
 
+    def poll_sender_reports(self, *, now_s: float | None = None) -> None:
+        """Refresh RTCP statistics without requiring a decoded frame."""
+
+        self._poll_rtcp_sender_reports(
+            time.monotonic() if now_s is None else float(now_s)
+        )
+
+    def sender_report_observations(
+        self,
+        *,
+        now_s: float | None = None,
+    ) -> list[dict[str, int | float | str | None]]:
+        """Return bounded pad-arrival SR evidence independent of decode output."""
+
+        observed_s = time.monotonic() if now_s is None else float(now_s)
+        with self._lock:
+            histories = {
+                ssrc: tuple(rows)
+                for ssrc, rows in self._sr_history_by_ssrc.items()
+            }
+            counts = dict(self._sr_count_by_ssrc)
+            rates = {
+                ssrc: dict(values)
+                for ssrc, values in self._clock_rates_by_ssrc.items()
+            }
+        observations: list[dict[str, int | float | str | None]] = []
+        for ssrc in sorted(histories):
+            clock_rates = rates.get(ssrc, {})
+            previous_timing: RtcpSenderReportTiming | None = None
+            for timing in histories[ssrc]:
+                offset_s = (
+                    None
+                    if timing.received_wall_s is None
+                    else rtcp_sender_report_pc_offset_s(
+                        sr_ntp_unix_s=timing.ntp_unix_s,
+                        received_wall_s=timing.received_wall_s,
+                    )
+                )
+                raw_offset_s = (
+                    None
+                    if timing.received_wall_s is None
+                    else float(timing.ntp_unix_s) - float(timing.received_wall_s)
+                )
+                host_clock_step_s = None
+                if (
+                    previous_timing is not None
+                    and previous_timing.received_wall_s is not None
+                    and timing.received_wall_s is not None
+                ):
+                    host_clock_step_s = (
+                        float(timing.received_wall_s)
+                        - float(previous_timing.received_wall_s)
+                        - (
+                            float(timing.received_monotonic_s)
+                            - float(previous_timing.received_monotonic_s)
+                        )
+                    )
+                observations.append(
+                    {
+                        "ssrc": int(timing.ssrc),
+                        "ntp_raw": int(timing.ntp_raw),
+                        "ntp_unix_s": float(timing.ntp_unix_s),
+                        "rtp_timestamp": int(timing.rtp_timestamp),
+                        "clock_rate_hz": int(timing.clock_rate_hz),
+                        "received_monotonic_s": float(timing.received_monotonic_s),
+                        "received_wall_s": timing.received_wall_s,
+                        "received_count": int(counts.get(ssrc, 0)),
+                        "age_s": max(0.0, observed_s - timing.received_monotonic_s),
+                        "arrival_basis": str(timing.arrival_basis),
+                        "sr_pc_offset_s": offset_s,
+                        "sr_pc_offset_raw_s": raw_offset_s,
+                        "ntp_rate": clock_rates.get("ntp_rate"),
+                        "media_rate": clock_rates.get("media_rate"),
+                        "host_clock_step_s": host_clock_step_s,
+                    }
+                )
+                previous_timing = timing
+        observations.sort(
+            key=lambda row: (
+                float(row["received_monotonic_s"]),
+                int(row["ssrc"]),
+                int(row["ntp_raw"]),
+            )
+        )
+        return observations
+
     def attach(self, pipeline) -> None:
         source = pipeline.get_by_name("src")
         depay = pipeline.get_by_name("depay")
@@ -1650,18 +2233,38 @@ class GstRtpTimingTracker:
         now_s: float,
         *,
         received_wall_s: float | None = None,
-    ) -> dict[str, int | float | str] | None:
+    ) -> dict[str, object] | None:
         received_wall_s = time.time() if received_wall_s is None else float(received_wall_s)
         self._poll_rtcp_sender_reports(now_s)
         pts_ns = None if buffer.pts == self.Gst.CLOCK_TIME_NONE else int(buffer.pts)
+        metadata = self._pop_nal1_metadata(pts_ns) or {}
+        if metadata:
+            metadata["decoded_buffer_pts_ns"] = pts_ns
         frame_timing = self._pop_frame_timing(pts_ns)
         if frame_timing is None:
-            return None
-        metadata: dict[str, int | float | str] = {
-            "rtp_timestamp": frame_timing.rtp_timestamp,
-            "rtp_ssrc": frame_timing.rtp_ssrc,
-            "rtp_marker_seq": frame_timing.rtp_marker_seq,
-        }
+            return metadata or None
+        metadata.update(
+            {
+                "rtp_timestamp": frame_timing.rtp_timestamp,
+                "rtp_ssrc": frame_timing.rtp_ssrc,
+                "rtp_marker_seq": frame_timing.rtp_marker_seq,
+            }
+        )
+        recovery_basis = self.current_output_recovery_basis()
+        if recovery_basis:
+            metadata.update(
+                {
+                    "media_recovery_basis": recovery_basis,
+                    "media_integrity_mode": (
+                        "experimental_non_idr_intra"
+                        if self._allow_non_idr_intra_experimental
+                        else "strict_idr"
+                    ),
+                    "media_random_access_guaranteed": (
+                        recovery_basis == H264_RECOVERY_BASIS_IDR
+                    ),
+                }
+            )
         if frame_timing.rtp_pts_s is not None:
             metadata["rtp_pts_s"] = frame_timing.rtp_pts_s
         sr_timing = self._sr_by_ssrc.get(frame_timing.rtp_ssrc)
@@ -1842,32 +2445,59 @@ class GstRtpTimingTracker:
         buffer = info.get_buffer()
         if buffer is None:
             return self.Gst.PadProbeReturn.OK
+        with self._lock:
+            self._h264_access_units_total += 1
         flags = buffer.get_flags()
         pts_ns = None if buffer.pts == self.Gst.CLOCK_TIME_NONE else int(buffer.pts)
-        is_random_access = False
+        is_delta = bool(flags & self.Gst.BufferFlags.DELTA_UNIT)
+        is_corrupted = bool(flags & self.Gst.BufferFlags.CORRUPTED)
+        is_discontinuous = bool(flags & self.Gst.BufferFlags.DISCONT)
+        recovery_basis = None
+        nal1_metadata = None
         map_info = None
-        if self.encoded_output_blocked() or bool(flags & self.Gst.BufferFlags.DISCONT):
+        if self.encoded_output_blocked() or is_discontinuous or not is_delta:
             try:
                 mapped, map_info = buffer.map(self.Gst.MapFlags.READ)
                 if mapped:
-                    is_random_access = h264_access_unit_has_idr(map_info.data)
+                    nal1_metadata = h264_nal1_non_idr_intra_metadata(
+                        map_info.data,
+                        pts_ns=pts_ns,
+                        is_delta=is_delta,
+                        is_corrupted=is_corrupted,
+                    )
+                    recovery_basis = h264_access_unit_recovery_basis(
+                        map_info.data,
+                        is_delta=is_delta,
+                        allow_non_idr_intra_experimental=(
+                            self._allow_non_idr_intra_experimental
+                        ),
+                    )
             except Exception:
                 # A boundary that cannot be inspected is not safe to recover on.
-                is_random_access = False
+                recovery_basis = None
             finally:
                 if map_info is not None:
                     try:
                         buffer.unmap(map_info)
                     except Exception:
                         pass
+        if nal1_metadata is not None:
+            self._remember_nal1_metadata(nal1_metadata)
         should_drop = self.should_drop_encoded_access_unit(
             pts_ns=pts_ns,
-            is_delta=bool(flags & self.Gst.BufferFlags.DELTA_UNIT),
-            is_corrupted=bool(flags & self.Gst.BufferFlags.CORRUPTED),
-            is_discontinuous=bool(flags & self.Gst.BufferFlags.DISCONT),
-            is_random_access=is_random_access,
+            is_delta=is_delta,
+            is_corrupted=is_corrupted,
+            is_discontinuous=is_discontinuous,
+            is_random_access=bool(recovery_basis),
+            recovery_basis=recovery_basis,
         )
         if should_drop:
+            if self._allow_unverified_encoded_output:
+                # Preview-only tolerant mode deliberately lets the decoder see
+                # the same incomplete AUs that the initial StereoWIRIS path
+                # exposed to its latest-frame consumer. The reader marks the
+                # resulting BGR sample UNVERIFIED; recording remains strict.
+                return self.Gst.PadProbeReturn.OK
             return self.Gst.PadProbeReturn.DROP
         if self.consume_encoded_recovery_marker(pts_ns):
             buffer.set_flags(self.Gst.BufferFlags.DISCONT)
@@ -2031,22 +2661,34 @@ def build_gst_pipeline_text(
     transport: str = RTSP_TRANSPORT_UDP,
     keyframe_only: bool = False,
     record_video_path: str = "",
+    encoded_queue_mode: str = RTSP_ENCODED_QUEUE_MODE_LATEST,
 ) -> str:
     latency_ms = max(0, int(latency_ms))
     rtsp_transport = normalize_rtsp_transport(transport)
     decoder_element = decoder_element_text(decoder)
-    # Preserve compressed access units and IDRs until the parser/decoder has
-    # consumed them. Only decoded raw frames may be dropped as stale.
+    record_path = str(record_video_path or "").strip()
+    # The permanent camera contract is latest-only decoded input. RTP/IDR
+    # integrity remains observable, but it never backpressures Preview, YOLO,
+    # native evidence, or Measurement.
     h264parse_element = (
         "h264parse config-interval=-1 disable-passthrough=true name=parse "
         "! video/x-h264,stream-format=byte-stream,alignment=au"
     )
-    encoded_queue = (
-        "queue "
-        "max-size-buffers=0 "
-        "max-size-bytes=0 "
-        f"max-size-time={GST_ENCODED_QUEUE_MAX_TIME_NS}"
-    )
+    if normalize_rtsp_encoded_queue_mode(encoded_queue_mode) == (
+        RTSP_ENCODED_QUEUE_MODE_REFERENCE_SAFE
+    ):
+        encoded_queue = (
+            "queue max-size-buffers=8 "
+            "max-size-bytes=0 "
+            "max-size-time=0"
+        )
+    else:
+        encoded_queue = (
+            "queue leaky=downstream "
+            "max-size-buffers=1 "
+            "max-size-bytes=0 "
+            "max-size-time=0"
+        )
     decoded_queue = (
         "queue leaky=downstream "
         f"max-size-buffers={GST_DECODED_QUEUE_MAX_BUFFERS} "
@@ -2059,30 +2701,7 @@ def build_gst_pipeline_text(
             "! identity drop-buffer-flags=delta-unit silent=true "
             "! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
         )
-    record_path = str(record_video_path or "").strip()
-    if record_path:
-        return (
-            f"rtspsrc name=src location={url} latency={latency_ms} protocols={rtsp_transport} "
-            "drop-on-latency=true do-rtcp=true "
-            "! rtph264depay name=depay source-info=true "
-            f"! {encoded_queue} "
-            f"! {h264parse_element} "
-            f"{keyframe_filter}"
-            "! tee name=encoded "
-            f"encoded. ! {encoded_queue} "
-            f"! {decoder_element} "
-            f"! {decoded_queue} "
-            "! videoconvert "
-            "! video/x-raw,format=BGR "
-            "! appsink name=sink emit-signals=false sync=false max-buffers=1 drop=true "
-            "encoded. ! queue max-size-buffers=0 max-size-bytes=0 "
-            f"max-size-time={GST_RECORDING_QUEUE_MAX_TIME_NS} "
-            "! h264parse config-interval=-1 "
-            "! video/x-h264,stream-format=avc,alignment=au "
-            "! mp4mux name=record_mux "
-            f"! filesink location={_gst_location(record_path)} sync=false"
-        )
-    return (
+    pipeline = (
         f"rtspsrc name=src location={url} latency={latency_ms} protocols={rtsp_transport} "
         "drop-on-latency=true do-rtcp=true "
         "! rtph264depay name=depay source-info=true "
@@ -2091,11 +2710,20 @@ def build_gst_pipeline_text(
         f"{keyframe_filter}"
         f"! {encoded_queue} "
         f"! {decoder_element} "
-        f"! {decoded_queue} "
+        "! tee name=decoded "
+        f"decoded. ! {decoded_queue} "
         "! videoconvert "
         "! video/x-raw,format=BGR "
         "! appsink name=sink emit-signals=false sync=false max-buffers=1 drop=true"
     )
+    if record_path:
+        pipeline += (
+            " decoded. ! queue name=record_capture_queue leaky=downstream "
+            "max-size-buffers=2 max-size-bytes=0 max-size-time=0 "
+            "! videoconvert ! video/x-raw,format=NV12 "
+            "! appsink name=record_sink emit-signals=false sync=false max-buffers=2 drop=true"
+        )
+    return pipeline
 
 
 def _launch_gst_pipeline(
@@ -2109,6 +2737,7 @@ def _launch_gst_pipeline(
     record_video_path: str,
     output_queue,
     rtp_timing_tracker: GstRtpTimingTracker | None = None,
+    encoded_queue_mode: str = RTSP_ENCODED_QUEUE_MODE_LATEST,
 ):
     last_error: str | None = None
     for decoder in decoder_candidates(decoder_mode):
@@ -2119,6 +2748,7 @@ def _launch_gst_pipeline(
             transport=transport,
             keyframe_only=keyframe_only,
             record_video_path=record_video_path,
+            encoded_queue_mode=encoded_queue_mode,
         )
         pipeline = None
         try:
@@ -2141,7 +2771,10 @@ def _launch_gst_pipeline(
                 "(PLAYING requested; current-generation frame pending)",
             )
             if record_video_path:
-                _emit_status(output_queue, f"GStreamer H264 원본 녹화 시작: {record_video_path}")
+                _emit_status(
+                    output_queue,
+                    f"GStreamer decoded NV12 recording capture ready: {record_video_path}",
+                )
             return pipeline, sink, bus, decoder
         except Exception as exc:
             last_error = f"{decoder}: {exc}"
@@ -2210,7 +2843,7 @@ def _finalize_gst_recording(
             backend=STREAM_BACKEND_GSTREAMER,
             success=success,
             detail=detail,
-            contract=recording_integrity_contract(STREAM_BACKEND_GSTREAMER),
+            contract=h264_copy_recording_integrity_contract(),
             metrics={
                 "container_finalization_success": bool(container_success),
                 "integrity_terminal_failure": (
@@ -2538,9 +3171,10 @@ def _emit_preview_frame(
     source_timestamp_s: float | None = None,
     timestamp_source: str = "app-receive",
     extra_metadata: dict[str, Any] | None = None,
+    force_emit: bool = False,
 ) -> bool:
     native_height, native_width = frame.shape[:2]
-    if not _should_emit_preview_frame(config, timestamp_s):
+    if not force_emit and not _should_emit_preview_frame(config, timestamp_s):
         return False
     display_frame = frame
     max_preview_width = int(config["preview_max_width"])
@@ -2567,6 +3201,7 @@ def _emit_preview_frame(
         "timestamp_reference",
         "rtcp-invalid"
         if metadata.get("rtcp_timing_invalid_reason")
+        and not is_sr_pc_diagnostic_reason(metadata.get("rtcp_timing_invalid_reason"))
         else "rtcp-ntp"
         if metadata.get("rtcp_frame_ntp_unix_s") is not None
         else "source"
@@ -2660,13 +3295,21 @@ def _run_gstreamer_stream_once(
         return False
 
     Gst.init(None)
-    keyframe_only = bool(config.get("keyframe_only", False)) or env_flag_enabled(I_FRAME_ONLY_ENV)
+    keyframe_only = False
+    encoded_queue_mode = normalize_rtsp_encoded_queue_mode(
+        config.get("rtsp_encoded_queue_mode", RTSP_ENCODED_QUEUE_MODE_LATEST)
+    )
+    tolerant_input = True
+    record_video_path = _record_video_path(config)
+    config["_media_input_policy"] = "tolerant_decoded"
+    config["_integrity_recovery_mode"] = "tolerant_decoded"
     rtp_timing_tracker = GstRtpTimingTracker(
         Gst,
         GstRtp,
         status_callback=lambda text: _emit_status(output_queue, text),
+        allow_non_idr_intra_experimental=False,
+        allow_unverified_encoded_output=True,
     )
-    record_video_path = _record_video_path(config)
     config.update(recording_integrity_contract(STREAM_BACKEND_GSTREAMER))
     config["_integrity_gap_events"] = 0
     config["_integrity_missing_packets"] = 0
@@ -2693,9 +3336,10 @@ def _run_gstreamer_stream_once(
             transport=str(config.get("rtsp_transport", RTSP_TRANSPORT_UDP)),
             keyframe_only=keyframe_only,
             record_video_path=record_video_path,
-            output_queue=output_queue,
-            rtp_timing_tracker=rtp_timing_tracker,
-        )
+                output_queue=output_queue,
+                rtp_timing_tracker=rtp_timing_tracker,
+                encoded_queue_mode=encoded_queue_mode,
+            )
     except Exception as exc:
         _emit_status(output_queue, f"GStreamer 오류: {exc}")
         return False
@@ -2722,6 +3366,17 @@ def _run_gstreamer_stream_once(
     latest_width = 0
     latest_height = 0
     stream_started_s = time.monotonic()
+    rtp_packet_rate = RollingCounterRateEstimator()
+    rtp_missing_rate = RollingCounterRateEstimator()
+    rtp_gap_event_rate = RollingCounterRateEstimator()
+    h264_access_unit_rate = RollingCounterRateEstimator()
+    for estimator in (
+        rtp_packet_rate,
+        rtp_missing_rate,
+        rtp_gap_event_rate,
+        h264_access_unit_rate,
+    ):
+        estimator.add(stream_started_s, 0)
     last_frame_received_s: float | None = None
     try:
         frame_timeout_s = float(
@@ -2745,6 +3400,67 @@ def _run_gstreamer_stream_once(
     reported_suppressed_frames = 0
     decoder_frame_announced = False
     rtp_gap_reporter = RtpDiscontinuityReporter()
+    record_sink = pipeline.get_by_name("record_sink") if record_video_path else None
+    record_reader_stop = threading.Event()
+    decoded_recorder: DecodedNv12Recorder | None = None
+    recorder_start_error = ""
+
+    def recording_loop() -> None:
+        nonlocal decoded_recorder, recorder_start_error
+        if record_sink is None:
+            recorder_start_error = "record appsink is unavailable"
+            return
+        while not stop_event.is_set() and not record_reader_stop.is_set():
+            sample = record_sink.emit("try-pull-sample", 200_000_000)
+            if sample is None:
+                continue
+            buffer = sample.get_buffer()
+            if decoded_recorder is None and not recorder_start_error:
+                try:
+                    structure = sample.get_caps().get_structure(0)
+                    sample_duration_ns = (
+                        None
+                        if buffer.duration == Gst.CLOCK_TIME_NONE
+                        else int(buffer.duration)
+                    )
+                    recording_fps = (
+                        _record_video_fps(config)
+                        if sample_duration_ns is None or sample_duration_ns <= 0
+                        else 1_000_000_000.0 / sample_duration_ns
+                    )
+                    decoded_recorder = DecodedNv12Recorder(
+                        Gst,
+                        path=record_video_path,
+                        width=int(structure.get_value("width")),
+                        height=int(structure.get_value("height")),
+                        fallback_fps=recording_fps,
+                        output_queue=output_queue,
+                    )
+                except Exception as exc:
+                    recorder_start_error = f"{type(exc).__name__}: {exc}"
+                    _emit_status(
+                        output_queue,
+                        f"Decoded NVENC recording unavailable; camera/YOLO continue: "
+                        f"{recorder_start_error}",
+                    )
+                    continue
+            if decoded_recorder is not None:
+                decoded_recorder.submit(
+                    buffer,
+                    observed_monotonic_ns=time.monotonic_ns(),
+                )
+
+    record_reader = (
+        threading.Thread(
+            target=recording_loop,
+            name="stereo-gst-nv12-recorder",
+            daemon=True,
+        )
+        if record_video_path
+        else None
+    )
+    if record_reader is not None:
+        record_reader.start()
 
     def reader_loop() -> None:
         nonlocal displayed_frames, last_frame_received_s
@@ -2754,19 +3470,21 @@ def _run_gstreamer_stream_once(
             sample = sink.emit("try-pull-sample", 200_000_000)
             if sample is None:
                 continue
+            receive_monotonic_ns, receive_s = app_receive_monotonic_sample()
             buffer = sample.get_buffer()
             decoded_pts_ns = None if buffer.pts == Gst.CLOCK_TIME_NONE else int(buffer.pts)
+            initially_integrity_latched = rtp_timing_tracker.should_suppress_decoded_buffer(
+                decoded_pts_ns
+            )
             if should_suppress_decoded_output(
                 active_decoder=active_decoder,
-                rtp_discontinuity_latched=rtp_timing_tracker.should_suppress_decoded_buffer(
-                    decoded_pts_ns
-                ),
+                rtp_discontinuity_latched=initially_integrity_latched,
+                tolerant_input=tolerant_input,
             ):
                 with latest_lock:
                     latest_frame = None
                 suppressed_decoded_frames += 1
                 continue
-            receive_s = time.monotonic()
             with latest_lock:
                 decoded_rate.add(receive_s)
             receive_wall_s = time.time()
@@ -2781,6 +3499,9 @@ def _run_gstreamer_stream_once(
             ) or {}
             rtp_timing_metadata.update(
                 {
+                    "app_receive_monotonic_ns": receive_monotonic_ns,
+                    "app_receive_timestamp_role": "authoritative_distance",
+                    "decoded_buffer_pts_ns": decoded_pts_ns,
                     "active_decoder": active_decoder,
                     "requested_decoder": _requested_decoder_mode(config),
                 }
@@ -2794,16 +3515,38 @@ def _run_gstreamer_stream_once(
                 buffer.unmap(map_info)
             # A gap can be observed by the RTP probe while this buffer is being
             # copied.  Check the latch again before publishing to any consumer.
+            after_copy_integrity_latched = rtp_timing_tracker.should_suppress_decoded_buffer(
+                decoded_pts_ns
+            )
             if should_suppress_decoded_output(
                 active_decoder=active_decoder,
-                rtp_discontinuity_latched=rtp_timing_tracker.should_suppress_decoded_buffer(
-                    decoded_pts_ns
-                ),
+                rtp_discontinuity_latched=after_copy_integrity_latched,
+                tolerant_input=tolerant_input,
             ):
                 with latest_lock:
                     latest_frame = None
                 suppressed_decoded_frames += 1
                 continue
+            unverified_tolerant_frame = (
+                initially_integrity_latched or after_copy_integrity_latched
+            )
+            rtp_timing_metadata.update(
+                {
+                    "media_integrity_mode": "tolerant_decoded",
+                    "media_integrity_unverified": unverified_tolerant_frame,
+                    "source_media_integrity_verified": (
+                        not unverified_tolerant_frame
+                    ),
+                    "rtp_integrity_latched": unverified_tolerant_frame,
+                    "media_random_access_guaranteed": (
+                        not unverified_tolerant_frame
+                        and rtp_timing_tracker.current_output_recovery_basis()
+                        == H264_RECOVERY_BASIS_IDR
+                    ),
+                    "measurement_input_admitted": True,
+                    "overlay_applied": False,
+                }
+            )
             rtp_timing_metadata.update(
                 _publish_native_frame_to_ring(
                     frame,
@@ -2822,12 +3565,19 @@ def _run_gstreamer_stream_once(
                 source_timestamp_s=source_timestamp_s,
                 timestamp_source="gstreamer-pts",
                 extra_metadata=rtp_timing_metadata,
+                force_emit=bool(
+                    rtp_timing_metadata.get("h264_nal1_non_idr_intra") is True
+                ),
             )
             if preview_emitted and not decoder_frame_announced:
                 decoder_frame_announced = True
                 _emit_status(
                     output_queue,
-                    f"GStreamer decoder frame verified: {active_decoder}",
+                    (
+                        f"GStreamer decoded frame admitted (INPUT UNVERIFIED): {active_decoder}"
+                        if unverified_tolerant_frame
+                        else f"GStreamer decoder frame verified: {active_decoder}"
+                    ),
                 )
             with latest_lock:
                 latest_sequence += 1
@@ -2851,11 +3601,21 @@ def _run_gstreamer_stream_once(
     last_rtp_recovery_s: float | None = None
     if keyframe_only:
         _emit_status(output_queue, "GStreamer I-frame only 진단 모드")
-    recording_text = ", 단일 RTSP H264->MP4 저장" if record_video_path else ""
+    recording_text = (
+        ", decoded NV12->lossless NVENC MP4"
+        if record_video_path
+        else ""
+    )
+    encoded_recovery_boundary_text = "RTP/H264 provenance retained; "
+    pending_recovery_text = (
+        "TOLERANT INPUT: RTP/H264 integrity unverified; decoded "
+        "Preview/YOLO/Measurement/recording continue "
+    )
     _emit_status(
         output_queue,
-        "RECOVERING_INTEGRITY: H264 IDR(NAL type 5) startup boundary 대기; "
-        "IDR까지 encoded 저장 차단, exact decoded PTS까지 preview/YOLO/native 차단"
+        "Permanent tolerant decoded input enabled: Preview, YOLO, native "
+        "evidence, Measurement, and decoded recording continue while source "
+        "media provenance remains INPUT UNVERIFIED"
         f"{recording_text}",
     )
     last_processed_sequence = 0
@@ -2865,14 +3625,12 @@ def _run_gstreamer_stream_once(
                 h264_discontinuity = rtp_timing_tracker.pop_h264_access_unit_discontinuity()
                 if h264_discontinuity is None:
                     break
-                with latest_lock:
-                    latest_frame = None
                 _emit_status(
                     output_queue,
                     "RECOVERING_INTEGRITY: H264 access-unit discontinuity "
                     f"reason={h264_discontinuity.reason}, pts_ns={h264_discontinuity.pts_ns}; "
-                    "complete IDR까지 encoded 저장 차단, "
-                    "exact decoded PTS까지 preview/YOLO/native 차단",
+                    + encoded_recovery_boundary_text
+                    + "decoded Preview/YOLO/Measurement/recording continue as INPUT UNVERIFIED",
                 )
             while True:
                 rtp_recovery = rtp_timing_tracker.pop_rtp_recovery()
@@ -2885,10 +3643,21 @@ def _run_gstreamer_stream_once(
                 )
                 reported_suppressed_frames = suppressed_decoded_frames
                 config["_integrity_suppressed_decoded_frames"] = suppressed_decoded_frames
+                if (
+                    rtp_recovery.recovery_basis
+                    == H264_RECOVERY_BASIS_NON_IDR_INTRA_EXPERIMENTAL
+                ):
+                    prefix = (
+                        "EXPERIMENTAL NON-IDR INTRA: exact decoded PTS에서 출력 복구; "
+                        "IDR/keyframe 보장 없음; direct-copy MP4 integrity 미검증 "
+                    )
+                else:
+                    prefix = "HEALTHY: H264 IDR random-access + exact decoded PTS에서 출력 복구 "
                 _emit_status(
                     output_queue,
-                    "HEALTHY: H264 IDR random-access + exact decoded PTS에서 출력 복구 "
-                    f"ssrc={rtp_recovery.ssrc}, pts_ns={rtp_recovery.resume_pts_ns}, "
+                    prefix
+                    + f"ssrc={rtp_recovery.ssrc}, pts_ns={rtp_recovery.resume_pts_ns}, "
+                    f"basis={rtp_recovery.recovery_basis}, "
                     f"blocked={rtp_recovery.blocked_duration_s:.3f}s, "
                     f"suppressed={newly_suppressed_frames}",
                 )
@@ -2897,14 +3666,12 @@ def _run_gstreamer_stream_once(
                 if rtp_discontinuity is None:
                     break
                 now_s = time.monotonic()
-                with latest_lock:
-                    latest_frame = None
                 if rtp_gap_reporter.total_events == 0:
                     _emit_status(
                         output_queue,
                         f"RECOVERING_INTEGRITY: {format_rtp_sequence_discontinuity(rtp_discontinuity)}; "
-                        "complete IDR까지 encoded 저장 차단, "
-                        "exact decoded PTS까지 preview/YOLO/native 차단",
+                        + encoded_recovery_boundary_text
+                        + "decoded Preview/YOLO/Measurement/recording continue as INPUT UNVERIFIED",
                     )
                 summary = rtp_gap_reporter.observe(rtp_discontinuity, now_s=now_s)
                 config["_integrity_gap_events"] = rtp_gap_reporter.total_events
@@ -2981,20 +3748,17 @@ def _run_gstreamer_stream_once(
             integrity_recovery_pending = rtp_timing_tracker.decoded_output_blocked()
             integrity_blocked_s = rtp_timing_tracker.blocked_duration_s(now_s=now_s)
             if integrity_recovery_pending and integrity_blocked_s >= integrity_recovery_timeout_s:
-                stream_failed = True
-                config["_integrity_manual_reconnect_required"] = True
                 config["_integrity_suppressed_decoded_frames"] = suppressed_decoded_frames
                 summary = rtp_gap_reporter.flush(now_s=now_s)
                 if summary is not None:
                     _emit_status(output_queue, f"RECOVERING_INTEGRITY: {summary}")
-                _emit_status(
-                    output_queue,
-                    "INTEGRITY_RECOVERY_TIMEOUT: "
-                    f"{integrity_blocked_s:.1f}s 동안 verified H264 IDR + exact decoded PTS 없음; "
-                    "이 side를 unavailable로 종료하고 자동 재연결하지 않습니다. "
-                    "카메라가 IDR을 송출한 뒤 수동 재연결이 필요합니다.",
-                )
-                break
+                if not config.get("_tolerant_integrity_timeout_reported"):
+                    _emit_status(
+                        output_queue,
+                        "TOLERANT INPUT: integrity remained unverified for "
+                        f"{integrity_blocked_s:.1f}s; all decoded consumers continue",
+                    )
+                    config["_tolerant_integrity_timeout_reported"] = True
             with latest_lock:
                 last_receive_s = last_frame_received_s
             frame_age_s = now_s - (
@@ -3041,7 +3805,7 @@ def _run_gstreamer_stream_once(
                         f"NVIDIA 디코더 오류: {strict_reason}; software fallback 금지, Auto로 변경하세요.",
                     )
                     break
-            if not integrity_recovery_pending and frame_age_s >= frame_timeout_s:
+            if frame_age_s >= frame_timeout_s:
                 stream_failed = True
                 phase = "첫 디코드 프레임" if last_receive_s is None else "새 디코드 프레임"
                 _emit_status(
@@ -3059,6 +3823,56 @@ def _run_gstreamer_stream_once(
                     decoded_hz = decoded_rate.rate(now_s)
                 displayed_hz = interval_displayed_frames / elapsed_s
                 inferred_hz = inferred_frames / elapsed_s
+                metrics_snapshot_reader = getattr(
+                    rtp_timing_tracker,
+                    "rtp_metrics_snapshot",
+                    None,
+                )
+                try:
+                    transport_snapshot = (
+                        dict(metrics_snapshot_reader())
+                        if callable(metrics_snapshot_reader)
+                        else {}
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    transport_snapshot = {}
+
+                def counter_value(key: str) -> int:
+                    try:
+                        return max(0, int(transport_snapshot.get(key, 0) or 0))
+                    except (TypeError, ValueError):
+                        return 0
+
+                rtp_packets_total = counter_value("rtp_packets_received_total")
+                rtp_missing_total = counter_value("rtp_missing_packets_total")
+                rtp_gap_events_total = counter_value("rtp_gap_events_total")
+                h264_access_units_total = counter_value("h264_access_units_total")
+                rtp_packet_rate.add(now_s, rtp_packets_total)
+                rtp_missing_rate.add(now_s, rtp_missing_total)
+                rtp_gap_event_rate.add(now_s, rtp_gap_events_total)
+                h264_access_unit_rate.add(now_s, h264_access_units_total)
+                rtp_packets_hz = rtp_packet_rate.rate(now_s)
+                rtp_missing_hz = rtp_missing_rate.rate(now_s)
+                rtp_loss_denominator = rtp_packets_hz + rtp_missing_hz
+                rtp_loss_pct = (
+                    100.0 * rtp_missing_hz / rtp_loss_denominator
+                    if rtp_loss_denominator > 0.0
+                    else None
+                )
+                stream_metrics = {
+                    "rtp_packets_hz": rtp_packets_hz,
+                    "rtp_missing_hz": rtp_missing_hz,
+                    "rtp_loss_pct": rtp_loss_pct,
+                    "rtp_gap_events_hz": rtp_gap_event_rate.rate(now_s),
+                    "h264_au_hz": h264_access_unit_rate.rate(now_s),
+                    "rtp_packets_received_total": rtp_packets_total,
+                    "rtp_missing_packets_total": rtp_missing_total,
+                    "rtp_gap_events_total": rtp_gap_events_total,
+                    "h264_access_units_total": h264_access_units_total,
+                    "rtp_active_ssrc": transport_snapshot.get("rtp_active_ssrc"),
+                    "rtp_metrics_window_s": DEFAULT_DECODE_RATE_WINDOW_S,
+                    "rtp_metrics_available": callable(metrics_snapshot_reader),
+                }
                 output_queue.put(
                     (
                         "stats",
@@ -3069,6 +3883,7 @@ def _run_gstreamer_stream_once(
                         stats_height,
                         rate_limiter.target_rate_hz,
                         *_yolo_device_stats(config),
+                        stream_metrics,
                     )
                 )
                 rate_limiter.update(decoded_hz=decoded_hz, inferred_hz=inferred_hz)
@@ -3081,8 +3896,8 @@ def _run_gstreamer_stream_once(
                     if integrity_recovery_pending:
                         _emit_status(
                             output_queue,
-                            "RECOVERING_INTEGRITY: H264 IDR + exact decoded PTS 대기 중 "
-                            f"({integrity_blocked_s:.1f}/{integrity_recovery_timeout_s:.0f}s)",
+                            pending_recovery_text
+                            + f"({integrity_blocked_s:.1f}/{integrity_recovery_timeout_s:.0f}s)",
                         )
                     else:
                         _emit_status(output_queue, "프레임 수신 대기 중")
@@ -3113,6 +3928,9 @@ def _run_gstreamer_stream_once(
                 "timestamp_reference",
                 "rtcp-invalid"
                 if detection_timestamp_metadata.get("rtcp_timing_invalid_reason")
+                and not is_sr_pc_diagnostic_reason(
+                    detection_timestamp_metadata.get("rtcp_timing_invalid_reason")
+                )
                 else "rtcp-ntp"
                 if detection_timestamp_metadata.get("rtcp_frame_ntp_unix_s") is not None
                 else "source"
@@ -3142,15 +3960,47 @@ def _run_gstreamer_stream_once(
     finally:
         reader_stop.set()
         reader.join(timeout=1.0)
+        record_reader_stop.set()
+        if record_reader is not None:
+            record_reader.join(timeout=1.0)
         config["_integrity_suppressed_decoded_frames"] = suppressed_decoded_frames
-        _finalize_gst_recording(
-            Gst,
-            pipeline,
-            bus,
-            output_queue,
-            record_video_path,
-            config=config,
-        )
+        if decoded_recorder is not None:
+            _emit_recording_finalized(
+                output_queue,
+                path=record_video_path,
+                backend=STREAM_BACKEND_GSTREAMER,
+                success=False,
+                detail="decoded NVENC recorder finalization started",
+                contract=recording_integrity_contract(STREAM_BACKEND_GSTREAMER),
+                metrics={
+                    "container_finalization_success": False,
+                    "source_media_integrity_verified": False,
+                    "recording_file_integrity_verified": False,
+                    "integrity_validation_status": "FINALIZING",
+                    "integrity_failure_reasons": [],
+                    "recording_usable": False,
+                },
+            )
+            decoded_recorder.close()
+        elif record_video_path:
+            _emit_recording_finalized(
+                output_queue,
+                path=record_video_path,
+                backend=STREAM_BACKEND_GSTREAMER,
+                success=False,
+                detail=recorder_start_error or "no decoded NV12 recording frame",
+                contract=recording_integrity_contract(STREAM_BACKEND_GSTREAMER),
+                metrics={
+                    "container_finalization_success": False,
+                    "source_media_integrity_verified": False,
+                    "recording_file_integrity_verified": False,
+                    "integrity_validation_status": "FAIL",
+                    "integrity_failure_reasons": [
+                        "decoded_nvenc_recorder_unavailable"
+                    ],
+                    "recording_usable": False,
+                },
+            )
         pipeline.set_state(Gst.State.NULL)
         if not stream_failed or stop_event.is_set():
             _emit_status(output_queue, "중지됨")
@@ -3332,7 +4182,7 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
         nonlocal displayed_frames, height, latest_frame, latest_sequence, record_writer_state, width
         while not stop_event.is_set() and not reader_stop.is_set():
             ok, frame = cap.read()
-            receive_s = time.monotonic()
+            receive_monotonic_ns, receive_s = app_receive_monotonic_sample()
             if not ok or frame is None:
                 time.sleep(0.02)
                 continue
@@ -3349,6 +4199,12 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
                 output_queue,
                 timestamp_s=receive_s,
                 source_timestamp_s=None,
+            )
+            native_metadata.update(
+                {
+                    "app_receive_monotonic_ns": receive_monotonic_ns,
+                    "app_receive_timestamp_role": "authoritative_distance",
+                }
             )
             preview_emitted = _emit_preview_frame(
                 cv2,
@@ -3519,7 +4375,7 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
                 for av_frame in packet.decode():
                     if stop_event.is_set() or reader_stop.is_set():
                         break
-                    receive_s = time.monotonic()
+                    receive_monotonic_ns, receive_s = app_receive_monotonic_sample()
                     with latest_lock:
                         decoded_rate.add(receive_s)
                     frame = av_frame.to_ndarray(format="bgr24")
@@ -3547,6 +4403,12 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
                         output_queue,
                         timestamp_s=receive_s,
                         source_timestamp_s=source_timestamp_s,
+                    )
+                    native_metadata.update(
+                        {
+                            "app_receive_monotonic_ns": receive_monotonic_ns,
+                            "app_receive_timestamp_role": "authoritative_distance",
+                        }
                     )
                     preview_emitted = _emit_preview_frame(
                         cv2,
@@ -3768,17 +4630,47 @@ class _BoundedProcessOutputQueue:
         if self.counters is not None:
             CameraIpcCounters._increment(getattr(self.counters, name))
 
-    def _replace_latest(self, target_queue, message, *, replaced: str, dropped: str) -> None:
+    @staticmethod
+    def _is_nal1_candidate_frame(message: object) -> bool:
+        return bool(
+            isinstance(message, tuple)
+            and len(message) >= 2
+            and message[0] == "frame"
+            and isinstance(message[1], dict)
+            and message[1].get("h264_nal1_non_idr_intra") is True
+        )
+
+    def _replace_latest(
+        self,
+        target_queue,
+        message,
+        *,
+        replaced: str,
+        dropped: str,
+        protect_nal1_candidate: bool = False,
+    ) -> None:
         try:
             target_queue.put_nowait(message)
             return
         except queue.Full:
             pass
         try:
-            target_queue.get_nowait()
-            self._count(replaced)
+            previous = target_queue.get_nowait()
         except queue.Empty:
-            pass
+            previous = None
+        if (
+            protect_nal1_candidate
+            and self._is_nal1_candidate_frame(previous)
+            and not self._is_nal1_candidate_frame(message)
+        ):
+            try:
+                target_queue.put_nowait(previous)
+            except queue.Full:
+                pass
+            self._count(dropped)
+            return
+        if previous is not None:
+            self._count(replaced)
         try:
             target_queue.put_nowait(message)
         except queue.Full:
@@ -3791,6 +4683,7 @@ class _BoundedProcessOutputQueue:
                 message,
                 replaced="preview_replaced",
                 dropped="preview_dropped",
+                protect_nal1_candidate=True,
             )
             return
         kind = message[0] if message else ""
@@ -3871,6 +4764,7 @@ class YoloStreamWorker(QtCore.QObject):
         display_rate_hz: float = DEFAULT_PREVIEW_DISPLAY_RATE_HZ,
         preview_max_width: int = 960,
         rtsp_latency_ms: int = DEFAULT_RTSP_LATENCY_MS,
+        rtsp_encoded_queue_mode: str = RTSP_ENCODED_QUEUE_MODE_LATEST,
         decoder: str = DECODER_AUTO,
         stream_backend: str = STREAM_BACKEND_GSTREAMER,
         rtsp_transport: str = RTSP_TRANSPORT_UDP,
@@ -3911,6 +4805,9 @@ class YoloStreamWorker(QtCore.QObject):
             "display_rate_hz": display_rate_hz,
             "preview_max_width": preview_max_width,
             "rtsp_latency_ms": rtsp_latency_ms,
+            "rtsp_encoded_queue_mode": normalize_rtsp_encoded_queue_mode(
+                rtsp_encoded_queue_mode
+            ),
             "decoder": normalize_decoder_mode(decoder),
             "stream_backend": normalize_stream_backend(stream_backend),
             "rtsp_transport": normalize_rtsp_transport(rtsp_transport),
@@ -4225,6 +5122,22 @@ class YoloStreamWorker(QtCore.QObject):
 
     def _handle_worker_message(self, message) -> None:
         kind = message[0]
+
+        def ensure_app_receive_metadata(
+            metadata: dict[str, object],
+            timestamp_s: object,
+        ) -> None:
+            if metadata.get("app_receive_monotonic_ns") is None:
+                metadata["app_receive_monotonic_ns"] = int(
+                    round(float(timestamp_s) * 1_000_000_000.0)
+                )
+                metadata.setdefault(
+                    "app_receive_timestamp_role", "legacy_float_derived"
+                )
+            else:
+                metadata.setdefault(
+                    "app_receive_timestamp_role", "authoritative_distance"
+                )
         if kind == "decoder_fallback":
             payload = dict(message[1] or {}) if len(message) > 1 else {}
             reason = str(payload.get("reason") or "unknown decoder fallback")
@@ -4269,6 +5182,7 @@ class YoloStreamWorker(QtCore.QObject):
                     "source_timestamp_s": None,
                     "timestamp_source": "legacy-frame",
                 }
+            ensure_app_receive_metadata(metadata, metadata.get("timestamp_s", 0.0))
             metadata.setdefault("rtsp_transport", self.config["rtsp_transport"])
             metadata.setdefault("stream_backend", self.config["stream_backend"])
             metadata.setdefault(
@@ -4306,6 +5220,7 @@ class YoloStreamWorker(QtCore.QObject):
                 }
             )
             timestamp_s = float(metadata.get("timestamp_s", time.monotonic()))
+            ensure_app_receive_metadata(metadata, timestamp_s)
             metadata.setdefault("rtsp_transport", self.config["rtsp_transport"])
             metadata.setdefault("stream_backend", self.config["stream_backend"])
             metadata.setdefault(
@@ -4337,6 +5252,7 @@ class YoloStreamWorker(QtCore.QObject):
                 _kind, timestamp_s, width, height, best_detection, detections = message
                 timestamp_metadata = {}
             timestamp_metadata = dict(timestamp_metadata or {})
+            ensure_app_receive_metadata(timestamp_metadata, timestamp_s)
             timestamp_metadata.setdefault("rtsp_transport", self.config["rtsp_transport"])
             timestamp_metadata.setdefault("stream_backend", self.config["stream_backend"])
             timestamp_metadata.setdefault(
@@ -4363,6 +5279,7 @@ class YoloStreamWorker(QtCore.QObject):
             )
             return
         if kind == "stats":
+            stream_metrics: dict[str, object] = {}
             if len(message) >= 10:
                 (
                     _kind,
@@ -4375,7 +5292,9 @@ class YoloStreamWorker(QtCore.QObject):
                     requested_device,
                     active_device,
                     cpu_fallback,
-                ) = message
+                ) = message[:10]
+                if len(message) >= 11 and isinstance(message[10], Mapping):
+                    stream_metrics = dict(message[10])
             elif len(message) >= 7:
                 _kind, decoded_hz, displayed_hz, inferred_hz, width, height, target_rate_hz = message
                 requested_device = self.config.get("_requested_yolo_device", self.config["device"])
@@ -4420,6 +5339,7 @@ class YoloStreamWorker(QtCore.QObject):
                     "yolo_requested_device": requested_device,
                     "yolo_actual_device": active_device,
                     "yolo_cpu_fallback": cpu_fallback,
+                    **stream_metrics,
                     "preview_queue_capacity": int(
                         self.config["frame_queue_size"]
                     ),

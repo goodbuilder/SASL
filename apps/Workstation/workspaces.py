@@ -26,14 +26,22 @@ from Workstation.workstation_core.optical_pose_auto_select import (
     validate_horizon_suggestion_points,
     validate_mountain_suggestion_points,
 )
-from Workstation.workstation_core.pixhawk_attitude import MAVLINK_MAG_STREAMS
 from Workstation.workstation_core.runtime_camera_status import decoder_presentation
 from Workstation.workstation_core.px4_attitude_cal_manager import (
     board_rotation_label,
 )
 from Workstation.workstation_core.px4_calibration_groups import PX4_CALIBRATION_GROUPS
 from Workstation.workstation_core.px4_mag_manager import (
+    BOARD_INTERNAL_MAG_ID,
+    build_mag_selection_preview,
+    GPS1_MAG_ID,
+    GPS2_MAG_ID,
+    MAG_PRIORITY_KEYS,
     MAG_PRIORITY_LEVELS,
+    MAG_SLOTS,
+    RM3100_BACKUP_IDS,
+    RM3100_PRIMARY_IDS,
+    mag_priority_slot_key,
     mag_priority_display,
 )
 from Workstation.workstation_core.theme import (
@@ -92,6 +100,18 @@ def _display_number(value: object, *, digits: int = 3, suffix: str = "") -> str:
         return f"{value}{suffix}"
 
 
+def _display_signed_number(value: object, *, digits: int = 3, suffix: str = "") -> str:
+    if value in (None, ""):
+        return "--"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "--"
+    if not math.isfinite(number):
+        return "--"
+    return f"{number:+.{digits}f}{suffix}"
+
+
 def _display_compass_deg(value: object) -> str:
     if value in (None, ""):
         return "--"
@@ -122,6 +142,43 @@ def _display_signed_deg(value: object) -> str:
     if round(wrapped, 2) >= 180.0:
         wrapped = -180.0
     return f"{wrapped:+07.2f}"
+
+
+def _display_magnetometer_px4_yaw(row: Mapping[str, object]) -> str:
+    """Render PX4 yaw only when the evidence row is exactly selected."""
+
+    value = _display_signed_deg(row.get("px4_yaw_deg"))
+    if value != "--":
+        return value
+    return {
+        "WAITING": "대기",
+        "STALE": "STALE",
+        "ACTIVE ID WAITING": "active ID 대기",
+        "IDENTITY UNKNOWN": "ID 확인 대기",
+        "NOT SELECTED": "미선택",
+    }.get(str(row.get("px4_yaw_state", "WAITING")), "--")
+
+
+def _display_magnetometer_corrected_yaw(row: Mapping[str, object]) -> str:
+    value = _display_signed_deg(row.get("corrected_yaw_deg"))
+    if value != "--":
+        return value
+    return {
+        "WAITING": "대기",
+        "PARAM WAITING": "PARAM 대기",
+        "PARAM INCOMPLETE": "PARAM 불완전",
+        "POWER COMP PENDING": "전류 보정 대기",
+        "BOARD ROTATION WAITING": "보드 회전 대기",
+        "IDENTITY UNKNOWN": "ID 확인 대기",
+    }.get(str(row.get("corrected_yaw_state", "WAITING")), "--")
+
+
+def _magnetometer_yaw_summary(row: Mapping[str, object]) -> str:
+    """Build a compact Inspector summary for raw and corrected yaw."""
+
+    raw = _display_signed_deg(row.get("raw_yaw_deg"))
+    corrected = _display_magnetometer_corrected_yaw(row)
+    return f"RAW={raw}° · Corrected={corrected}"
 
 
 def _compact_text(value: object, *, limit: int = 128) -> str:
@@ -2345,6 +2402,21 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         preview_row.setStretchFactor(0, 1)
         preview_row.setStretchFactor(1, 1)
         upstream_layout.addWidget(preview_row)
+        self.distance_timing_contract = QtWidgets.QLabel(
+            "Timing: Settings preferred · fallback APP RECEIVE · |Δ|≤100 ms"
+        )
+        self.distance_timing_contract.setObjectName("compactContract")
+        self.distance_timing_contract.setWordWrap(False)
+        self.distance_timing_contract.setMinimumWidth(0)
+        self.distance_timing_contract.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Preferred,
+        )
+        self.distance_timing_contract.setToolTip(
+            "App receive is the default. RTCP/NTP preferred selects pairs only with VERIFIED, "
+            "current same-epoch evidence; any timing fault falls back to exact app receive."
+        )
+        upstream_layout.addWidget(self.distance_timing_contract)
         self.upstream_values: dict[str, EngineeringValue] = {}
         upstream_fields = (
             ("camera.left", "CAM L"),
@@ -2609,6 +2681,15 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             geometry_form.addWidget(QtWidgets.QLabel(label), row, column)
             geometry_form.addWidget(widget, row, column + 1)
         settings_layout.addLayout(geometry_form)
+        reverse_yaw = toggle(
+            "measurement_baseline_yaw_reverse",
+            "Reverse baseline yaw branch (persistent)",
+        )
+        reverse_yaw.setToolTip(
+            "새 baseline-yaw Measurement에서 Auto 선택 branch를 반대로 사용합니다. "
+            "현재 Measurement는 시작 시 고정된 branch를 유지합니다."
+        )
+        settings_layout.addWidget(reverse_yaw)
 
         gate_group = QtWidgets.QGroupBox("Pair gates")
         gate_form = QtWidgets.QGridLayout(gate_group)
@@ -2618,23 +2699,37 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         gate_form.setColumnStretch(4, 1)
         gate_form.addWidget(toggle("class_gate_enabled", "Class gate"), 0, 0)
         gate_form.addWidget(text_edit("class_gate", "class id or name"), 0, 1, 1, 2)
-        gate_form.addWidget(toggle("matching_gate_enabled", "Time matching"), 1, 0)
-        gate_form.addWidget(
-            combo(
-                "time_basis",
-                (("RTCP/NTP required", "camera_rtc_required"), ("RTCP/NTP preferred", "camera_rtcp"), ("App receive", "detection")),
+        matching_toggle = toggle("matching_gate_enabled", "Time matching")
+        matching_toggle.setChecked(True)
+        matching_toggle.setEnabled(False)
+        gate_form.addWidget(matching_toggle, 1, 0)
+        time_basis_combo = combo(
+            "time_basis",
+            (
+                ("App receive (default)", "app_receive_monotonic"),
+                ("RTCP/NTP preferred · fallback App receive", "camera_rtcp"),
             ),
-            1,
-            1,
         )
-        gate_form.addWidget(toggle("time_delta_gate_enabled", "Max Δt"), 1, 2)
-        gate_form.addWidget(double_spin("max_pair_delta_s", 0.0, 10.0, 3, " s"), 1, 3)
+        time_basis_combo.setToolTip(
+            "RTCP/NTP is used only while Clock and current frame timing are usable; "
+            "otherwise live distance uses exact app-receive monotonic time."
+        )
+        gate_form.addWidget(time_basis_combo, 1, 1)
+        time_delta_toggle = toggle("time_delta_gate_enabled", "Max Δt")
+        time_delta_toggle.setChecked(True)
+        time_delta_toggle.setEnabled(False)
+        gate_form.addWidget(time_delta_toggle, 1, 2)
+        app_delta_spin = double_spin("max_pair_delta_s", 0.0, 0.100, 3, " s")
+        app_delta_spin.setToolTip(
+            "Authoritative app-receive pair limit; values may be stricter than 100 ms."
+        )
+        gate_form.addWidget(app_delta_spin, 1, 3)
         gate_form.addWidget(toggle("vertical_delta_gate_enabled", "Vertical Δ"), 1, 4)
         gate_form.addWidget(double_spin("max_vertical_delta_px", 0.0, 5000.0, 1, " px"), 1, 5)
         settings_layout.addWidget(gate_group)
 
         self.measurement_settings_status = QtWidgets.QLabel(
-            "Changes apply now; Save keeps them for the next run."
+            "Apply updates idle preview now; an active Measurement keeps timing until the next run. Save persists."
         )
         self.measurement_settings_status.setObjectName("statusStrip")
         self.measurement_settings_status.setWordWrap(True)
@@ -2963,6 +3058,11 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         selected_method = str(values.get("selected_method_id") or "")
         selected_instance = str(values.get("selected_instance_id") or "")
         selection_reason = str(values.get("selection_reason") or "")
+        reverse_yaw_widget = self.settings_widgets.get(
+            "measurement_baseline_yaw_reverse"
+        )
+        if reverse_yaw_widget is not None:
+            reverse_yaw_widget.setEnabled(not bool(values.get("fill_policy_locked", False)))
         previous_fill_method = str(self.measurement_fill_method_combo.currentData() or "")
         self.measurement_fill_method_combo.setProperty("refreshing", True)
         try:
@@ -3014,9 +3114,26 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             component_text = ", ".join(
                 f"{key}={value}" for key, value in dict(components or {}).items()
             )
+            input_values = current.get("input_values")
+            input_values = input_values if isinstance(input_values, Mapping) else {}
+            branch = input_values.get("baseline_yaw_selection")
+            branch = branch if isinstance(branch, Mapping) else {}
+            branch_text = ""
+            if branch:
+                selected_yaw = branch.get("selected_yaw_deg")
+                offset = branch.get("selected_offset_deg")
+                mode = str(branch.get("mode") or "auto")
+                selected_text = "--" if selected_yaw is None else f"{float(selected_yaw):.2f}°"
+                offset_text = "--" if offset is None else f"{float(offset):+.0f}°"
+                branch_text = f" · yaw={selected_text} ({offset_text}, {mode})"
+                if branch.get("low_margin"):
+                    branch_text += " · low margin"
+                if branch.get("consensus") is False:
+                    branch_text += " · P1/P2 disagree"
             self.measurement_method_status.setText(
                 f"{selection_reason or 'selected'} · instance={selected_instance or current.get('instance_id', '--')}"
                 + (f" · {component_text}" if component_text else "")
+                + branch_text
             )
         finally:
             self.measurement_method_combo.setProperty("refreshing", False)
@@ -3533,6 +3650,7 @@ class MeasurementWorkspace(QtWidgets.QWidget):
     def refresh(self, snapshot: dict[str, RuntimeStatus]) -> None:
         panel = getattr(self.backend, "panel", self.backend)
         self._refresh_preview_metadata(panel)
+        self._refresh_distance_timing_contract(panel)
         measurement_status = snapshot.get("measurement")
         self._refresh_quality(panel, measurement_status)
         self._refresh_measurement_methods()
@@ -3605,6 +3723,40 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             for row in (getattr(panel, "geometry_comparison_rows", ()) or ())
         )
         _sync_table_rows(self.geometry_comparison_model, comparison_rows)
+
+
+    def _refresh_distance_timing_contract(self, panel: object) -> None:
+        requested_reader = getattr(panel, "_yolo_time_basis", None)
+        requested = (
+            str(requested_reader())
+            if callable(requested_reader)
+            else str(
+                getattr(
+                    getattr(panel, "settings", None),
+                    "yolo_gate_time_basis",
+                    "app_receive_monotonic",
+                )
+            )
+        )
+        result = getattr(panel, "_coordinated_pairing_result", None)
+        timing = getattr(result, "timing", None)
+        effective = str(getattr(timing, "effective_basis", requested) or requested)
+        fallback_reason = str(getattr(timing, "fallback_reason", "") or "")
+        requested_text = "RTCP/NTP" if requested == "camera_rtcp" else "APP RECEIVE"
+        effective_text = "RTCP/NTP" if effective == "camera_rtcp" else "APP RECEIVE"
+        suffix = f" · fallback={fallback_reason}" if fallback_reason else ""
+        basis_text = (
+            requested_text
+            if requested_text == effective_text
+            else f"{requested_text} → {effective_text}"
+        )
+        self.distance_timing_contract.setText(
+            f"Timing: {basis_text}{suffix} · |Δ|≤100 ms"
+        )
+        self.distance_timing_contract.setToolTip(
+            "The active Measurement request is frozen at start. RTCP/NTP is selected only with "
+            "VERIFIED/current same-epoch evidence; otherwise exact app receive is authoritative."
+        )
 
 
 class PixhawkWorkspace(QtWidgets.QWidget):
@@ -3842,35 +3994,66 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         layout.addWidget(receiver_group)
         self._receiver_row_keys: tuple[tuple[str, str], ...] = ()
 
-        magnetometer_group = QtWidgets.QGroupBox("IMU magnetometer (MAVLink)")
+        magnetometer_group = QtWidgets.QGroupBox("Magnetometer by CAL_MAG slot")
         magnetometer_layout = QtWidgets.QVBoxLayout(magnetometer_group)
         magnetometer_hint = QtWidgets.QLabel(
-            "IMU stream 1/2/3 · SCALED_IMU/2/3 xmag/ymag/zmag · producer sensor axes · "
-            "mG · no CAN-port mapping or NED/ENU/FRD conversion"
+            "CAL_MAG0..3 순서 · Device ID로 실제 센서 sample 연결 · "
+            "RAW yaw=atan2(-y,x) · Corrected yaw=CAL_MAG 보정값"
         )
         magnetometer_hint.setObjectName("statusStrip")
         magnetometer_hint.setWordWrap(True)
         magnetometer_layout.addWidget(magnetometer_hint)
         self.magnetometer_model = _table_model(
             self,
-            ("Pixhawk", "IMU stream", "State", "xmag", "ymag", "zmag", "Norm", "Unit", "Age", "Topic"),
+            (
+                "Pixhawk",
+                "CAL_MAG",
+                "Sensor",
+                "Device ID",
+                "State",
+                "xmag",
+                "ymag",
+                "zmag",
+                "Norm",
+                "RAW yaw°",
+                "Corrected yaw°",
+                "Δyaw°",
+                "Priority",
+                "Unit",
+                "Age",
+                "Topic",
+            ),
         )
         self.magnetometer_table = QtWidgets.QTableView()
         self.magnetometer_table.setModel(self.magnetometer_model)
         self.magnetometer_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.magnetometer_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.magnetometer_table.verticalHeader().setVisible(False)
-        self.magnetometer_table.setMaximumHeight(220)
-        self.magnetometer_table.horizontalHeader().setStretchLastSection(True)
+        # P1/P2 each expose the four configured CAL_MAG slots. Keep all
+        # eight rows visible so the table does not acquire an inner scrollbar.
+        self.magnetometer_table.setMinimumHeight(300)
+        self.magnetometer_table.setMaximumHeight(300)
+        self.magnetometer_table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        magnetometer_header = self.magnetometer_table.horizontalHeader()
+        magnetometer_header.setStretchLastSection(False)
+        magnetometer_header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
+        for column, width in enumerate(
+            (72, 76, 190, 100, 72, 72, 72, 72, 72, 88, 96, 88, 88, 52, 72, 190)
+        ):
+            magnetometer_header.resizeSection(column, width)
+        magnetometer_header.setSectionHidden(10, False)
+        magnetometer_header.setSectionHidden(11, True)
         self.magnetometer_table.clicked.connect(self._inspect_magnetometer_row)
         magnetometer_layout.addWidget(self.magnetometer_table)
         layout.addWidget(magnetometer_group)
+
+        self._build_mag_priority_group(layout)
 
         can_magnetometer_group = QtWidgets.QGroupBox("CAN magnetometer (dedicated MAVLink)")
         can_magnetometer_layout = QtWidgets.QVBoxLayout(can_magnetometer_group)
         can_magnetometer_hint = QtWidgets.QLabel(
             "CAN1/CAN2 값은 PX4 DEBUG_VECT CAN_MAG 호환 메시지가 수신될 때만 표시 · "
-            "SCALED_IMU* 및 CAL_MAG 설정값을 대체 사용하지 않음"
+            "RAW yaw=센서축 진단값 · Corrected yaw=CAL_MAG 보정값"
         )
         can_magnetometer_hint.setObjectName("statusStrip")
         can_magnetometer_hint.setWordWrap(True)
@@ -3887,6 +4070,9 @@ class PixhawkWorkspace(QtWidgets.QWidget):
                 "ymag",
                 "zmag",
                 "Norm",
+                "RAW yaw°",
+                "Corrected yaw°",
+                "Δyaw°",
                 "Unit",
                 "Age",
                 "Topic",
@@ -3898,7 +4084,14 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         self.can_magnetometer_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.can_magnetometer_table.verticalHeader().setVisible(False)
         self.can_magnetometer_table.setMaximumHeight(160)
-        self.can_magnetometer_table.horizontalHeader().setStretchLastSection(True)
+        self.can_magnetometer_table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        can_magnetometer_header = self.can_magnetometer_table.horizontalHeader()
+        can_magnetometer_header.setStretchLastSection(False)
+        can_magnetometer_header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
+        for column, width in enumerate((72, 72, 72, 112, 72, 72, 72, 72, 72, 88, 96, 88, 52, 72, 220)):
+            can_magnetometer_header.resizeSection(column, width)
+        can_magnetometer_header.setSectionHidden(10, False)
+        can_magnetometer_header.setSectionHidden(11, True)
         self.can_magnetometer_table.clicked.connect(self._inspect_can_magnetometer_row)
         can_magnetometer_layout.addWidget(self.can_magnetometer_table)
         layout.addWidget(can_magnetometer_group)
@@ -3984,6 +4177,78 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         baseline_yaw_group_layout.addWidget(self.baseline_yaw_plot, 1)
         self.baseline_yaw_group = baseline_yaw_group
         layout.addWidget(baseline_yaw_group)
+
+        drone_geometry_group = QtWidgets.QGroupBox("Drone Pixhawk geometry · F/R/D/Rg")
+        drone_geometry_layout = QtWidgets.QVBoxLayout(drone_geometry_group)
+        drone_geometry_layout.setContentsMargins(8, 8, 8, 8)
+        drone_geometry_layout.setSpacing(5)
+        drone_geometry_hint = QtWidgets.QLabel(
+            "Dr = Drone Pixhawk · Dr from reference means reference→Dr · "
+            "F/R/D/Rg = Forward/Right/Down/Range (m)"
+        )
+        drone_geometry_hint.setObjectName("statusStrip")
+        drone_geometry_hint.setWordWrap(True)
+        drone_geometry_layout.addWidget(drone_geometry_hint)
+        self.drone_geometry_model = _table_model(
+            self,
+            ("State", "Vector", "F (m)", "R (m)", "D (m)", "Rg (m)", "Frame", "Age"),
+        )
+        self.drone_geometry_table = QtWidgets.QTableView()
+        self.drone_geometry_table.setModel(self.drone_geometry_model)
+        self.drone_geometry_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.drone_geometry_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.drone_geometry_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.drone_geometry_table.setAlternatingRowColors(True)
+        self.drone_geometry_table.verticalHeader().setVisible(False)
+        self.drone_geometry_table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        self.drone_geometry_table.setMinimumHeight(118)
+        self.drone_geometry_table.setMaximumHeight(142)
+        geometry_header = self.drone_geometry_table.horizontalHeader()
+        geometry_header.setStretchLastSection(False)
+        geometry_header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        geometry_header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        for column in (2, 3, 4, 5):
+            geometry_header.setSectionResizeMode(column, QtWidgets.QHeaderView.Fixed)
+            geometry_header.resizeSection(column, 86)
+        geometry_header.setSectionResizeMode(6, QtWidgets.QHeaderView.Stretch)
+        geometry_header.setSectionResizeMode(7, QtWidgets.QHeaderView.ResizeToContents)
+        self.drone_geometry_table.clicked.connect(self._inspect_drone_geometry_vector)
+        drone_geometry_layout.addWidget(self.drone_geometry_table)
+
+        drone_angle_title = QtWidgets.QLabel("Horizontal triangle angles (F/R only)")
+        drone_angle_title.setObjectName("compactContract")
+        drone_geometry_layout.addWidget(drone_angle_title)
+        angle_layout = QtWidgets.QGridLayout()
+        angle_layout.setContentsMargins(0, 0, 0, 0)
+        angle_layout.setHorizontalSpacing(12)
+        angle_layout.setVerticalSpacing(3)
+        self.drone_geometry_angle_values: dict[str, EngineeringValue] = {}
+        for column, (key, label) in enumerate(
+            (("dr_p1_p2", "∠Dr-P1-P2"), ("dr_p2_p1", "∠Dr-P2-P1"))
+        ):
+            value = EngineeringValue(label)
+            value.value.setMinimumWidth(value.value.fontMetrics().horizontalAdvance("180.00"))
+            value.activated.connect(
+                lambda key=key: self._inspect_drone_geometry_angle(key)
+            )
+            self.drone_geometry_angle_values[key] = value
+            angle_layout.addWidget(value, 0, column)
+            angle_layout.setColumnStretch(column, 1)
+        drone_geometry_layout.addLayout(angle_layout)
+        self.drone_geometry_status_label = QtWidgets.QLabel("WAITING · geometry evidence 대기 중")
+        self.drone_geometry_status_label.setObjectName("statusStrip")
+        self.drone_geometry_status_label.setFixedHeight(32)
+        self.drone_geometry_status_label.setWordWrap(False)
+        drone_geometry_layout.addWidget(self.drone_geometry_status_label)
+        self.drone_geometry_contract_label = QtWidgets.QLabel(
+            "Angles: ∠Dr-P1-P2 / ∠Dr-P2-P1 · horizontal North/East only · unsigned internal angle"
+        )
+        self.drone_geometry_contract_label.setObjectName("compactContract")
+        self.drone_geometry_contract_label.setWordWrap(True)
+        self.drone_geometry_contract_label.setFixedHeight(32)
+        drone_geometry_layout.addWidget(self.drone_geometry_contract_label)
+        self.drone_geometry_group = drone_geometry_group
+        layout.addWidget(drone_geometry_group)
         layout.addWidget(recovery_group)
 
         gnss_source_group = QtWidgets.QGroupBox("GNSS used for Pixhawk calculation")
@@ -4017,6 +4282,250 @@ class PixhawkWorkspace(QtWidgets.QWidget):
             }
         )
         layout.addStretch(1)
+
+    @staticmethod
+    def _mag_role_for_device_id(device_id: int | None) -> str | None:
+        if device_id == BOARD_INTERNAL_MAG_ID:
+            return "BOARD"
+        if device_id in RM3100_PRIMARY_IDS:
+            return "CAN1"
+        if device_id in RM3100_BACKUP_IDS:
+            return "CAN2"
+        if device_id == GPS1_MAG_ID:
+            return "GPS1_MAG"
+        if device_id == GPS2_MAG_ID:
+            return "GPS2_MAG"
+        return None
+
+    def _build_mag_priority_group(self, layout: QtWidgets.QVBoxLayout) -> None:
+        group = QtWidgets.QGroupBox("MAG Priority / active selection")
+        group_layout = QtWidgets.QVBoxLayout(group)
+        self._mag_status_auto_refresh_requested: set[str] = set()
+        hint = QtWidgets.QLabel(
+            "P1/P2는 독립적으로 적용됩니다. CAL_MAGn_PRIO를 직접 수정하며, "
+            "Apply 후 PARAM readback, 실제 active device ID, fresh ATTITUDE가 모두 확인되어야 "
+            "ACTIVE VERIFIED가 됩니다."
+        )
+        hint.setObjectName("statusStrip")
+        hint.setWordWrap(True)
+        group_layout.addWidget(hint)
+        cards = QtWidgets.QHBoxLayout()
+        self.mag_priority_combos: dict[str, dict[str, QtWidgets.QComboBox]] = {}
+        self.mag_priority_status_labels: dict[str, QtWidgets.QLabel] = {}
+        self.mag_priority_preview_labels: dict[str, QtWidgets.QLabel] = {}
+        self.mag_priority_refresh_buttons: dict[str, QtWidgets.QPushButton] = {}
+        self.mag_priority_apply_buttons: dict[str, QtWidgets.QPushButton] = {}
+        defaults = {key: 0 for key in MAG_PRIORITY_KEYS}
+        for side, label, code in (("left", "P1", "p1"), ("right", "P2", "p2")):
+            card = QtWidgets.QGroupBox(label)
+            card_layout = QtWidgets.QGridLayout(card)
+            card_layout.setContentsMargins(6, 6, 6, 6)
+            controls = QtWidgets.QHBoxLayout()
+            refresh = _command_button(
+                "Refresh MAG",
+                f"pixhawk.mag.refresh.{code}",
+                self._invoke_command,
+            )
+            apply = _command_button(
+                "Apply & Verify",
+                f"pixhawk.mag.apply.{code}",
+                self._invoke_command,
+            )
+            refresh.setToolTip("이 side의 CAL_MAG Priority를 다시 읽습니다.")
+            apply.setToolTip("이 side만 Priority를 적용하고 실제 active MAG/ATTITUDE를 검증합니다.")
+            controls.addWidget(refresh)
+            controls.addWidget(apply)
+            controls.addStretch(1)
+            card_layout.addLayout(controls, 0, 0, 1, 2)
+            self.mag_priority_refresh_buttons[side] = refresh
+            self.mag_priority_apply_buttons[side] = apply
+            combos: dict[str, QtWidgets.QComboBox] = {}
+            for row, slot_key in enumerate(MAG_PRIORITY_KEYS, start=1):
+                combo = _build_px4_priority_combo(defaults[slot_key])
+                combo.setAccessibleName(f"{label} {slot_key} priority")
+                combo.setToolTip(
+                    f"{slot_key}_PRIO 값을 설정합니다. 센서 identity는 {slot_key}_ID에서 읽습니다."
+                )
+                card_layout.addWidget(QtWidgets.QLabel(slot_key), row, 0)
+                card_layout.addWidget(combo, row, 1)
+                combos[slot_key] = combo
+            self.mag_priority_combos[side] = combos
+            for role, combo in combos.items():
+                combo.currentIndexChanged.connect(
+                    lambda _index, side=side: self._refresh_mag_priority_preview(side)
+                )
+            status = QtWidgets.QLabel("PARAM readback 대기 중")
+            status.setObjectName("statusStrip")
+            status.setWordWrap(True)
+            status.setMinimumHeight(42)
+            card_layout.addWidget(status, 6, 0, 1, 2)
+            self.mag_priority_status_labels[side] = status
+            preview = QtWidgets.QLabel("Selection preview: topology readback 대기 중")
+            preview.setObjectName("statusStrip")
+            preview.setWordWrap(True)
+            preview.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            preview.setMinimumHeight(58)
+            preview.setMaximumHeight(92)
+            card_layout.addWidget(preview, 7, 0, 1, 2)
+            self.mag_priority_preview_labels[side] = preview
+            cards.addWidget(card, 1)
+        group_layout.addLayout(cards)
+        self.mag_priority_group = group
+        layout.addWidget(group)
+
+    def mag_priority_payload(self, side: str) -> dict[str, int]:
+        controls = self.mag_priority_combos.get(str(side), {})
+        return {slot_key: _px4_priority_combo_value(combo) for slot_key, combo in controls.items()}
+
+    @staticmethod
+    def _mag_preview_role_label(role: str | None) -> str:
+        return str(role or "UNKNOWN")
+
+    def _refresh_mag_priority_preview(self, side: str) -> None:
+        label = self.mag_priority_preview_labels.get(str(side))
+        if label is None:
+            return
+        panel = getattr(self.backend, "panel", self.backend)
+        status_cache = getattr(panel, "_px4_mag_status_cache", {})
+        status = status_cache.get(str(side)) if isinstance(status_cache, Mapping) else None
+        topology_store = getattr(panel, "latest_sensor_mag_instances", {})
+        topology = topology_store.get(str(side), {}) if isinstance(topology_store, Mapping) else {}
+        if not isinstance(topology, Mapping) or not topology:
+            label.setText("Selection preview: topology readback 대기 중")
+            return
+        instance_device_ids = {
+            int(instance): int(getattr(state, "device_id"))
+            for instance, state in topology.items()
+            if getattr(state, "device_id", None) is not None
+        }
+        params = getattr(status, "params", {}) if status is not None else {}
+        if not isinstance(params, Mapping):
+            label.setText("Selection preview: CAL_MAG PARAM readback 대기 중")
+            return
+        preview = build_mag_selection_preview(
+            params,
+            instance_device_ids,
+            requested_priorities=self.mag_priority_payload(str(side)),
+            actual_selected_device_id=getattr(panel, "latest_vehicle_mag_device_ids", {}).get(str(side)),
+        )
+        topology_text = " · ".join(
+            f"i{candidate.instance}:{candidate.role} id={candidate.device_id} "
+            f"CAL_MAG{candidate.cal_slot if candidate.cal_slot is not None else '-'}"
+            for candidate in preview.candidates
+        )
+        if preview.predicted_device_id is None:
+            candidate_text = "N/A"
+        else:
+            predicted_slot = next(
+                (
+                    candidate.cal_slot
+                    for candidate in preview.candidates
+                    if candidate.device_id == preview.predicted_device_id
+                ),
+                None,
+            )
+            candidate_text = (
+                f"{self._mag_preview_role_label(preview.predicted_role)} "
+                f"id={preview.predicted_device_id} inst={preview.predicted_instance} "
+                f"CAL_MAG{predicted_slot if predicted_slot is not None else '-'} "
+                f"prio={preview.predicted_priority}"
+            )
+            if preview.priority_tie:
+                candidate_text += " (tie)"
+        actual_text = (
+            "N/A"
+            if preview.actual_device_id is None
+            else f"{self._mag_preview_role_label(preview.actual_role)} id={preview.actual_device_id}"
+        )
+        label.setText(
+            f"Topology: {topology_text}\n"
+            f"Priority candidate: {candidate_text}\n"
+            f"Actual PX4: {actual_text}"
+        )
+
+    def _refresh_mag_priority_group(self, snapshot: dict[str, RuntimeStatus]) -> None:
+        panel = getattr(self.backend, "panel", self.backend)
+        status_cache = getattr(panel, "_px4_mag_status_cache", {})
+        open_sides = getattr(panel, "_mavlink_open_sides", None)
+        connected = set(open_sides()) if callable(open_sides) else set()
+        for side, label, code in (("left", "P1", "p1"), ("right", "P2", "p2")):
+            status = status_cache.get(side) if isinstance(status_cache, Mapping) else None
+            controls = self.mag_priority_combos.get(side, {})
+            if side not in connected:
+                self._mag_status_auto_refresh_requested.discard(side)
+            elif (
+                status is None
+                and self._invoke_command_available
+                and side not in getattr(panel, "pixhawk_parameter_threads", {})
+                and side not in self._mag_status_auto_refresh_requested
+            ):
+                # The CAL_MAG-slot table and priority combos need a live
+                # CAL_MAGn_ID/_PRIO param readback to know which physical
+                # sensor sits in which slot. Request it automatically once
+                # per connect so the table doesn't sit empty until the
+                # operator manually presses "Refresh MAG".
+                self._mag_status_auto_refresh_requested.add(side)
+                self._invoke_command(f"pixhawk.mag.refresh.{code}")
+            if status is not None:
+                slots_data = getattr(status, "slots", ()) or ()
+                if slots_data:
+                    for slot in slots_data:
+                        slot_key = mag_priority_slot_key(getattr(slot, "slot", -1))
+                        if slot_key in controls:
+                            _set_px4_priority_combo_value(controls[slot_key], getattr(slot, "priority", None))
+                else:
+                    # ``status.slots`` is derived from ``status.params`` (see
+                    # build_mag_status). When only the raw params are available
+                    # (e.g. before the slots readback lands) fall back to the
+                    # same CAL_MAGn_PRIO source so the combos still reflect the
+                    # live PX4 state instead of staying at their placeholder 0.
+                    params = getattr(status, "params", {})
+                    if isinstance(params, Mapping):
+                        for slot_number in MAG_SLOTS:
+                            slot_key = mag_priority_slot_key(slot_number)
+                            if slot_key in controls:
+                                _set_px4_priority_combo_value(
+                                    controls[slot_key], params.get(f"CAL_MAG{slot_number}_PRIO")
+                                )
+            verification_reader = getattr(self.backend, "pixhawk_mag_verification_snapshot", None)
+            verification = {}
+            if callable(verification_reader):
+                try:
+                    value = verification_reader(side)
+                    verification = dict(value) if isinstance(value, Mapping) else {}
+                except (RuntimeError, TypeError, ValueError):
+                    verification = {}
+            if verification.get("verification_started_s") is not None:
+                status_text = (
+                    f"{label}: {verification.get('state', 'VERIFYING')} · "
+                    f"expected={verification.get('expected_device_id', '--')} · "
+                    f"actual={verification.get('actual_device_id', '--')} · "
+                    f"ATT={_display_number(verification.get('attitude_age_s'), digits=2, suffix='s')}\n"
+                    f"{verification.get('reason', '')}"
+                )
+            elif status is None:
+                status_text = f"{label}: PARAM readback 대기 중"
+            else:
+                active = getattr(panel, "latest_vehicle_mag_device_ids", {}).get(side)
+                status_text = (
+                    f"{label}: PARAM VERIFIED · actual={active if active is not None else '--'} · "
+                    "Apply & Verify를 눌러 active selection을 확인하세요."
+                )
+            self.mag_priority_status_labels[side].setText(status_text)
+            self._refresh_mag_priority_preview(side)
+            active_operation = side in getattr(panel, "pixhawk_parameter_threads", {})
+            manager = getattr(panel, "px4_mag_managers", {}).get(side)
+            armed = bool(getattr(manager, "armed", False))
+            enabled = (
+                self._invoke_command_available
+                and side in connected
+                and not active_operation
+                and not self._recording_locked
+            )
+            self.mag_priority_refresh_buttons[side].setEnabled(enabled)
+            self.mag_priority_apply_buttons[side].setEnabled(enabled and not armed)
+            tooltip = "Disarm required" if armed else ""
+            self.mag_priority_apply_buttons[side].setToolTip(tooltip or "이 side만 Priority를 적용하고 검증합니다.")
 
     def _build_px4_parameter_group(self, layout: QtWidgets.QVBoxLayout) -> None:
         group = QtWidgets.QGroupBox("Pixhawk Parameters · calibration-owned groups")
@@ -4437,22 +4946,55 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         _sync_table_rows(self.receiver_model, tuple(receiver_rows))
         magnetometer_rows: list[tuple[object, ...]] = []
         for side in ("left", "right"):
-            for row in evidence.magnetometers(side):
+            for row in evidence.magnetometers_for_cal_mag_view(side):
                 magnetometer_rows.append(
                     (
                         row.get("pixhawk", "--"),
-                        row.get("imu", "--"),
+                        row.get("cal_mag", "--"),
+                        row.get("sensor", "--"),
+                        row.get("device_id", "--"),
                         row.get("state", "WAITING"),
                         _display_number(row.get("xmag")),
                         _display_number(row.get("ymag")),
                         _display_number(row.get("zmag")),
                         _display_number(row.get("norm")),
+                        _display_signed_deg(row.get("raw_yaw_deg")),
+                        _display_magnetometer_corrected_yaw(row),
+                        _display_signed_deg(row.get("delta_yaw_deg")),
+                        mag_priority_display(row.get("priority")),
                         row.get("unit", "--"),
                         _display_number(row.get("age_s"), digits=2, suffix="s"),
                         row.get("topic", "--"),
                     )
                 )
         _sync_table_rows(self.magnetometer_model, tuple(magnetometer_rows))
+        ui_yaw_signature = tuple(
+            (
+                str(row[0]),
+                str(row[1]),
+                str(row[9]),
+                str(row[10]),
+                str(row[11]),
+                str(row[15]),
+            )
+            for row in magnetometer_rows
+        )
+        if (
+            len(ui_yaw_signature) == 8
+            and all(row[2] != "--" for row in ui_yaw_signature)
+        ):
+            previous_signature = getattr(self, "_last_ui_yaw_signature", None)
+            if previous_signature != ui_yaw_signature:
+                self._last_ui_yaw_signature = ui_yaw_signature
+                logger = getattr(panel, "_log", None)
+                if callable(logger):
+                    logger(
+                        "[픽스호크 UI] P1/P2 5-MAG yaw cells populated: "
+                        + "; ".join(
+                            f"{pixhawk}/{mag} RAW={raw} CORR={px4} Δ={delta} topic={topic}"
+                            for pixhawk, mag, raw, px4, delta, topic in ui_yaw_signature
+                        )
+                    )
         can_magnetometer_rows: list[tuple[object, ...]] = []
         for side in ("left", "right"):
             for row in evidence.can_magnetometers(side):
@@ -4467,12 +5009,16 @@ class PixhawkWorkspace(QtWidgets.QWidget):
                         _display_number(row.get("ymag")),
                         _display_number(row.get("zmag")),
                         _display_number(row.get("norm")),
+                        _display_signed_deg(row.get("raw_yaw_deg")),
+                        _display_magnetometer_corrected_yaw(row),
+                        _display_signed_deg(row.get("delta_yaw_deg")),
                         row.get("unit", "--"),
                         _display_number(row.get("age_s"), digits=2, suffix="s"),
                         row.get("topic", "--"),
                     )
                 )
         _sync_table_rows(self.can_magnetometer_model, tuple(can_magnetometer_rows))
+        self._refresh_mag_priority_group(snapshot)
         self._refresh_px4_parameter_group(snapshot)
         baseline = evidence.baseline()
         projection_state = str(baseline.get("p1_body_frd_state", "WAITING") or "WAITING")
@@ -4493,6 +5039,7 @@ class PixhawkWorkspace(QtWidgets.QWidget):
                 valid=valid,
             )
         self._refresh_baseline_yaw_alignment(evidence.baseline_yaw_alignment())
+        self._refresh_drone_pixhawk_geometry(evidence.drone_pixhawk_geometry())
 
     def _refresh_baseline_yaw_alignment(self, data: Mapping[str, object]) -> None:
         state = str(data.get("state") or "WAITING")
@@ -4584,33 +5131,257 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         )
         self.baseline_yaw_plot.set_snapshot(data)
 
+    def _refresh_drone_pixhawk_geometry(self, data: Mapping[str, object]) -> None:
+        state = str(data.get("state") or "WAITING")
+        reason = str(data.get("reason") or "geometry evidence waiting")
+        vector_rows = tuple(
+            row for row in (data.get("vectors") or ()) if isinstance(row, Mapping)
+        )
+        table_rows = tuple(
+            (
+                str(row.get("state") or "WAITING"),
+                str(row.get("label") or "--"),
+                _display_signed_number(row.get("forward_m")),
+                _display_signed_number(row.get("right_m")),
+                _display_signed_number(row.get("down_m")),
+                _display_number(row.get("range_m")),
+                str(row.get("frame") or "--"),
+                _display_number(row.get("age_s"), digits=2, suffix="s"),
+            )
+            for row in vector_rows
+        )
+        _sync_table_rows(self.drone_geometry_model, table_rows)
+        for row_index, row in enumerate(vector_rows):
+            item = self.drone_geometry_model.item(row_index, 1)
+            if item is None:
+                continue
+            item.setToolTip(
+                "\n".join(
+                    (
+                        str(row.get("label") or "--"),
+                        f"State: {row.get('state', 'WAITING')}",
+                        (
+                            "F/R/D/Rg="
+                            f"{_display_signed_number(row.get('forward_m'))}/"
+                            f"{_display_signed_number(row.get('right_m'))}/"
+                            f"{_display_signed_number(row.get('down_m'))}/"
+                            f"{_display_number(row.get('range_m'))} m"
+                        ),
+                        f"Frame: {row.get('frame', '--')}",
+                        f"From: {row.get('source', '--')}",
+                        f"Reason: {row.get('reason', '--')}",
+                    )
+                )
+            )
+            for column in range(self.drone_geometry_model.columnCount()):
+                cell = self.drone_geometry_model.item(row_index, column)
+                if cell is not None:
+                    cell.setToolTip(item.toolTip())
+
+        status_text = f"{state} · {reason}"
+        status_tooltip = (
+            f"{status_text}\n"
+            f"P1 source={data.get('p1_gps_source', 'GPS1')} "
+            f"age={_display_number(data.get('p1_gps_age_s'), digits=2, suffix='s')}\n"
+            f"P2 source={data.get('p2_gps_source', 'GPS1')} "
+            f"age={_display_number(data.get('p2_gps_age_s'), digits=2, suffix='s')}\n"
+            f"Dr source=Drone GNSS age={_display_number(data.get('drone_gps_age_s'), digits=2, suffix='s')}\n"
+            f"Source: {data.get('source', '')}\n"
+            f"Clock: {data.get('clock', '')}"
+        )
+        self.drone_geometry_status_label.setText(_compact_text(status_text, limit=160))
+        self.drone_geometry_status_label.setToolTip(status_tooltip)
+        self.drone_geometry_contract_label.setToolTip(
+            f"{data.get('frame_contract', '')}\n{data.get('angle_contract', '')}\n"
+            "Latest-state display; GNSS/ATTITUDE samples are not simultaneous measurement evidence."
+        )
+
+        angle_rows = {
+            str(row.get("key")): row
+            for row in (data.get("angles") or ())
+            if isinstance(row, Mapping)
+        }
+        for key, value in self.drone_geometry_angle_values.items():
+            row = angle_rows.get(key, {})
+            value.set_value(
+                _display_number(row.get("angle_deg"), digits=2),
+                unit="°",
+                source=str(row.get("source") or data.get("source") or ""),
+                age_s=row.get("age_s"),
+                frame=str(row.get("frame") or "horizontal local NED (North/East only)"),
+            )
+            angle_tooltip = "\n".join(
+                (
+                    f"State: {row.get('state', 'WAITING')}",
+                    f"Value: {_display_number(row.get('angle_deg'), digits=2)}°",
+                    f"Vertex: {row.get('vertex', '--')}",
+                    f"Frame: {row.get('frame', 'horizontal local NED (North/East only)')}",
+                    f"From: {row.get('source', data.get('source', '--'))}",
+                    f"Reason: {row.get('reason', reason)}",
+                    f"Age: {_display_number(row.get('age_s'), digits=2, suffix='s')}",
+                )
+            )
+            value.setToolTip(angle_tooltip)
+            value.value.setToolTip(angle_tooltip)
+
+    def _inspect_drone_geometry_vector(self, index: QtCore.QModelIndex) -> None:
+        if index.row() < 0:
+            return
+        data = _evidence(self.backend).drone_pixhawk_geometry()
+        rows = tuple(
+            row for row in (data.get("vectors") or ()) if isinstance(row, Mapping)
+        )
+        if index.row() >= len(rows):
+            return
+        key = str(rows[index.row()].get("key") or "")
+        self.inspection_requested.emit(
+            _live_inspection(
+                self._drone_geometry_vector_inspection(key),
+                lambda key=key: self._drone_geometry_vector_inspection(key),
+            )
+        )
+
+    def _drone_geometry_vector_inspection(self, key: str) -> dict[str, object]:
+        data = _evidence(self.backend).drone_pixhawk_geometry()
+        rows = tuple(
+            row for row in (data.get("vectors") or ()) if isinstance(row, Mapping)
+        )
+        row = next((row for row in rows if str(row.get("key")) == key), {})
+        return {
+            "selection": str(row.get("label") or key),
+            "value": (
+                "F/R/D/Rg="
+                f"{_display_signed_number(row.get('forward_m'))}/"
+                f"{_display_signed_number(row.get('right_m'))}/"
+                f"{_display_signed_number(row.get('down_m'))}/"
+                f"{_display_number(row.get('range_m'))} m"
+            ),
+            "freshness": (
+                f"state={row.get('state', 'WAITING')} · "
+                f"age={_display_number(row.get('age_s'), digits=2, suffix='s')}"
+            ),
+            "contract": (
+                f"frame={row.get('frame', '--')} · "
+                "vector direction is named reference → Dr; F/R/D/Rg are metres"
+            ),
+            "verdict": str(row.get("state", "WAITING")),
+            "source": str(row.get("source", data.get("source", "geometry evidence"))),
+        }
+
+    def _inspect_drone_geometry_angle(self, key: str) -> None:
+        self.inspection_requested.emit(
+            _live_inspection(
+                self._drone_geometry_angle_inspection(key),
+                lambda key=key: self._drone_geometry_angle_inspection(key),
+            )
+        )
+
+    def _drone_geometry_angle_inspection(self, key: str) -> dict[str, object]:
+        data = _evidence(self.backend).drone_pixhawk_geometry()
+        rows = {
+            str(row.get("key")): row
+            for row in (data.get("angles") or ())
+            if isinstance(row, Mapping)
+        }
+        row = rows.get(key, {})
+        return {
+            "selection": str(row.get("label") or key),
+            "value": f"{_display_number(row.get('angle_deg'), digits=2)}°",
+            "freshness": (
+                f"state={row.get('state', 'WAITING')} · "
+                f"age={_display_number(row.get('age_s'), digits=2, suffix='s')}"
+            ),
+            "contract": str(row.get("frame") or data.get("angle_contract") or "horizontal F/R angle"),
+            "verdict": str(row.get("state", "WAITING")),
+            "source": str(row.get("source", data.get("source", "geometry evidence"))),
+        }
+
     def _inspect_magnetometer_row(self, index: QtCore.QModelIndex) -> None:
         if index.row() < 0 or index.row() >= self.magnetometer_model.rowCount():
             return
-        side = "left" if index.row() < len(MAVLINK_MAG_STREAMS) else "right"
-        stream_index = index.row() % len(MAVLINK_MAG_STREAMS)
-        rows = _evidence(self.backend).magnetometers(side)
-        if stream_index >= len(rows):
+        rows_per_side = len(MAG_SLOTS)
+        side = "left" if index.row() < rows_per_side else "right"
+        view_index = index.row() % rows_per_side
+        rows = _evidence(self.backend).magnetometers_for_cal_mag_view(side)
+        if view_index >= len(rows):
             return
-        row = rows[stream_index]
+        row = rows[view_index]
+        selection = (
+            f"{row.get('pixhawk', '--')} {row.get('cal_mag', '--')} · "
+            f"{row.get('sensor', 'Magnetometer')}"
+        )
+        refresh = lambda side=side, source_index=view_index: self._cal_mag_magnetometer_inspection(
+            side, source_index
+        )
+        fallback_source = "PX4 CAL_MAG slot readback"
         self.inspection_requested.emit(
             _live_inspection(
                 {
-                    "selection": f"{row.get('pixhawk', '--')} {row.get('imu', '--')} magnetometer",
+                    "selection": selection,
                     "value": (
                         f"x/y/z={_display_number(row.get('xmag'))}/"
                         f"{_display_number(row.get('ymag'))}/"
                         f"{_display_number(row.get('zmag'))} {row.get('unit', '')} · "
-                        f"norm={_display_number(row.get('norm'))}"
+                        + (
+                            f"node={row.get('node_id', '--')} device={row.get('device_id', '--')} · "
+                            if row.get('node_id') is not None
+                            else f"device={row.get('device_id', '--')} · "
+                        )
+                        + f"norm={_display_number(row.get('norm'))} · "
+                        + f"{_magnetometer_yaw_summary(row)}"
                     ),
-                    "freshness": f"age={_display_number(row.get('age_s'), digits=2, suffix='s')}",
-                    "contract": str(row.get("axis_contract", "producer sensor axes; no coordinate conversion")),
-                    "verdict": str(row.get("state", "WAITING")),
-                    "source": str(row.get("source", "MAVLink SCALED_IMU telemetry")),
+                    "freshness": (
+                        f"MAG age={_display_number(row.get('age_s'), digits=2, suffix='s')} · "
+                        f"Corrected={row.get('corrected_yaw_state', 'WAITING')}"
+                    ),
+                    "contract": (
+                        f"{row.get('axis_contract', 'producer sensor axes; no coordinate conversion')} · "
+                        f"{row.get('raw_yaw_contract', 'RAW sensor-axis azimuth; no correction')} · "
+                        f"{row.get('corrected_yaw_contract', 'CAL_MAG corrected sensor vector')}"
+                    ),
+                    "verdict": (
+                        f"{row.get('state', 'WAITING')} · "
+                        f"Corrected {row.get('corrected_yaw_state', 'WAITING')}"
+                    ),
+                    "source": str(row.get("source", fallback_source)),
                 },
-                lambda side=side, stream_index=stream_index: self._magnetometer_inspection(side, stream_index),
+                refresh,
             )
         )
+
+    def _cal_mag_magnetometer_inspection(self, side: str, slot_index: int) -> dict[str, object]:
+        rows = _evidence(self.backend).magnetometers_for_cal_mag_view(side)
+        if slot_index < 0 or slot_index >= len(rows):
+            return {"selection": "CAL_MAG", "verdict": "WAITING"}
+        row = rows[slot_index]
+        return {
+            "selection": (
+                f"{row.get('pixhawk', '--')} {row.get('cal_mag', '--')} · "
+                f"{row.get('sensor', 'Magnetometer')}"
+            ),
+            "value": (
+                f"x/y/z={_display_number(row.get('xmag'))}/"
+                f"{_display_number(row.get('ymag'))}/"
+                f"{_display_number(row.get('zmag'))} {row.get('unit', '')} · "
+                f"device={row.get('device_id', '--')} · "
+                f"{_magnetometer_yaw_summary(row)}"
+            ),
+            "freshness": (
+                f"MAG age={_display_number(row.get('age_s'), digits=2, suffix='s')} · "
+                f"Priority={mag_priority_display(row.get('priority'))} · "
+                f"Corrected={row.get('corrected_yaw_state', 'WAITING')}"
+            ),
+            "contract": (
+                f"{row.get('axis_contract', 'producer sensor axes; no coordinate conversion')} · "
+                f"{row.get('raw_yaw_contract', 'RAW sensor-axis azimuth; no correction')} · "
+                f"{row.get('corrected_yaw_contract', 'CAL_MAG corrected sensor vector')}"
+            ),
+            "verdict": (
+                f"{row.get('state', 'WAITING')} · "
+                f"Corrected {row.get('corrected_yaw_state', 'WAITING')}"
+            ),
+            "source": str(row.get("source", "PX4 CAL_MAG slot readback")),
+        }
 
     def _inspect_can_magnetometer_row(self, index: QtCore.QModelIndex) -> None:
         if index.row() < 0 or index.row() >= self.can_magnetometer_model.rowCount():
@@ -4629,11 +5400,22 @@ class PixhawkWorkspace(QtWidgets.QWidget):
                         f"x/y/z={_display_number(row.get('xmag'))}/"
                         f"{_display_number(row.get('ymag'))}/"
                         f"{_display_number(row.get('zmag'))} {row.get('unit', '')} · "
-                        f"node={row.get('node_id', '--')} device={row.get('device_id', '--')}"
+                        f"node={row.get('node_id', '--')} device={row.get('device_id', '--')} · "
+                        f"{_magnetometer_yaw_summary(row)}"
                     ),
-                    "freshness": f"age={_display_number(row.get('age_s'), digits=2, suffix='s')}",
-                    "contract": str(row.get("axis_contract", "producer sensor axes; no coordinate conversion")),
-                    "verdict": str(row.get("state", "WAITING")),
+                    "freshness": (
+                        f"MAG age={_display_number(row.get('age_s'), digits=2, suffix='s')} · "
+                        f"Corrected={row.get('corrected_yaw_state', 'WAITING')}"
+                    ),
+                    "contract": (
+                        f"{row.get('axis_contract', 'producer sensor axes; no coordinate conversion')} · "
+                        f"{row.get('raw_yaw_contract', 'RAW sensor-axis azimuth; no correction')} · "
+                        f"{row.get('corrected_yaw_contract', 'CAL_MAG corrected sensor vector')}"
+                    ),
+                    "verdict": (
+                        f"{row.get('state', 'WAITING')} · "
+                        f"Corrected {row.get('corrected_yaw_state', 'WAITING')}"
+                    ),
                     "source": str(row.get("source", "PX4 DEBUG_VECT CAN_MAG compatibility telemetry")),
                 },
                 lambda side=side, port_index=port_index: self._can_magnetometer_inspection(side, port_index),
@@ -4650,11 +5432,22 @@ class PixhawkWorkspace(QtWidgets.QWidget):
             "value": (
                 f"x/y/z={_display_number(row.get('xmag'))}/"
                 f"{_display_number(row.get('ymag'))}/"
-                f"{_display_number(row.get('zmag'))} {row.get('unit', '')}"
+                f"{_display_number(row.get('zmag'))} {row.get('unit', '')} · "
+                f"{_magnetometer_yaw_summary(row)}"
             ),
-            "freshness": f"age={_display_number(row.get('age_s'), digits=2, suffix='s')}",
-            "contract": str(row.get("axis_contract", "producer sensor axes; no coordinate conversion")),
-            "verdict": str(row.get("state", "WAITING")),
+            "freshness": (
+                f"MAG age={_display_number(row.get('age_s'), digits=2, suffix='s')} · "
+                f"Corrected={row.get('corrected_yaw_state', 'WAITING')}"
+            ),
+            "contract": (
+                f"{row.get('axis_contract', 'producer sensor axes; no coordinate conversion')} · "
+                f"{row.get('raw_yaw_contract', 'RAW sensor-axis azimuth; no correction')} · "
+                f"{row.get('corrected_yaw_contract', 'CAL_MAG corrected sensor vector')}"
+            ),
+            "verdict": (
+                f"{row.get('state', 'WAITING')} · "
+                f"Corrected {row.get('corrected_yaw_state', 'WAITING')}"
+            ),
             "source": str(row.get("source", "PX4 DEBUG_VECT CAN_MAG compatibility telemetry")),
         }
 
@@ -4668,11 +5461,22 @@ class PixhawkWorkspace(QtWidgets.QWidget):
             "value": (
                 f"x/y/z={_display_number(row.get('xmag'))}/"
                 f"{_display_number(row.get('ymag'))}/"
-                f"{_display_number(row.get('zmag'))} {row.get('unit', '')}"
+                f"{_display_number(row.get('zmag'))} {row.get('unit', '')} · "
+                f"{_magnetometer_yaw_summary(row)}"
             ),
-            "freshness": f"age={_display_number(row.get('age_s'), digits=2, suffix='s')}",
-            "contract": str(row.get("axis_contract", "producer sensor axes; no coordinate conversion")),
-            "verdict": str(row.get("state", "WAITING")),
+            "freshness": (
+                f"MAG age={_display_number(row.get('age_s'), digits=2, suffix='s')} · "
+                f"Corrected={row.get('corrected_yaw_state', 'WAITING')}"
+            ),
+            "contract": (
+                f"{row.get('axis_contract', 'producer sensor axes; no coordinate conversion')} · "
+                f"{row.get('raw_yaw_contract', 'RAW sensor-axis azimuth; no correction')} · "
+                f"{row.get('corrected_yaw_contract', 'CAL_MAG corrected sensor vector')}"
+            ),
+            "verdict": (
+                f"{row.get('state', 'WAITING')} · "
+                f"Corrected {row.get('corrected_yaw_state', 'WAITING')}"
+            ),
             "source": str(row.get("source", "MAVLink SCALED_IMU telemetry")),
         }
 
@@ -5007,7 +5811,47 @@ class TelemetryWorkspace(QtWidgets.QWidget):
         position_layout.addWidget(position_hint)
         layout.addWidget(position_group)
 
-        rtcm_group = QtWidgets.QGroupBox("RTCM delivery")
+        self.gnss_baseline_center_group = QtWidgets.QGroupBox(
+            "GNSS BASELINE_CENTER F/R/D/Rg/Angle"
+        )
+        gnss_baseline_center_layout = QtWidgets.QVBoxLayout(self.gnss_baseline_center_group)
+        self.gnss_baseline_center_model = _table_model(
+            self,
+            (
+                "State",
+                "F m",
+                "R m",
+                "D m",
+                "Rg m",
+                "Baseline↔Drone angle°",
+                "90° error°",
+                "Max age s",
+                "Spread ms",
+                "Fix P1/P2/Drone",
+            ),
+        )
+        self.gnss_baseline_center_table = QtWidgets.QTableView()
+        self.gnss_baseline_center_table.setModel(self.gnss_baseline_center_model)
+        self.gnss_baseline_center_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.gnss_baseline_center_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.gnss_baseline_center_table.verticalHeader().setVisible(False)
+        self.gnss_baseline_center_table.setMaximumHeight(96)
+        self.gnss_baseline_center_table.horizontalHeader().setStretchLastSection(True)
+        gnss_baseline_center_layout.addWidget(self.gnss_baseline_center_table)
+        self.gnss_baseline_center_status = QtWidgets.QLabel("WAITING")
+        self.gnss_baseline_center_status.setObjectName("statusStrip")
+        gnss_baseline_center_layout.addWidget(self.gnss_baseline_center_status)
+        self.gnss_baseline_center_contract = QtWidgets.QLabel(
+            "GNSS antenna-midpoint local-level FRD geometry: origin is the midpoint of the "
+            "selected P1/P2 GNSS antennas, not camera baseline_center_frd. Right is horizontal "
+            "P1→P2, Down is world NED Down, Forward is Right×Down."
+        )
+        self.gnss_baseline_center_contract.setObjectName("compactContract")
+        self.gnss_baseline_center_contract.setWordWrap(True)
+        gnss_baseline_center_layout.addWidget(self.gnss_baseline_center_contract)
+        layout.addWidget(self.gnss_baseline_center_group)
+
+        self.rtcm_group = rtcm_group = QtWidgets.QGroupBox("RTCM delivery")
         rtcm_form = QtWidgets.QGridLayout(rtcm_group)
         self.rtcm_values: dict[str, QtWidgets.QLabel] = {}
         for row, (key, title) in enumerate(
@@ -5127,6 +5971,7 @@ class TelemetryWorkspace(QtWidgets.QWidget):
             self._invoke_command_available and not usb_discovery_active
         )
         self._refresh_position_table(data)
+        self._refresh_gnss_baseline_center(data)
         self._refresh_rtcm(data)
         self._refresh_disparity(data)
 
@@ -5153,6 +5998,36 @@ class TelemetryWorkspace(QtWidgets.QWidget):
                 )
             )
         _sync_table_rows(self.position_model, tuple(rows))
+
+    def _refresh_gnss_baseline_center(self, data: Mapping[str, object]) -> None:
+        geometry = data.get("gnss_baseline_center_frd")
+        geometry = geometry if isinstance(geometry, Mapping) else {}
+        state = str(geometry.get("state", "WAITING") or "WAITING")
+        reason = str(geometry.get("reason", "") or "")
+        fix_labels = geometry.get("fix_labels")
+        fix_labels = fix_labels if isinstance(fix_labels, Mapping) else {}
+        angle_text = _display_number(geometry.get("baseline_drone_angle_deg"), digits=2)
+        row = (
+            state,
+            _display_signed_number(geometry.get("forward_m"), digits=3),
+            _display_signed_number(geometry.get("right_m"), digits=3),
+            _display_signed_number(geometry.get("down_m"), digits=3),
+            _display_number(geometry.get("range_m"), digits=3),
+            angle_text,
+            _display_number(geometry.get("baseline_drone_angle_error_deg"), digits=2),
+            _display_number(geometry.get("maximum_age_s"), digits=2, suffix="s"),
+            _display_number(geometry.get("timestamp_spread_ms"), digits=1),
+            "{} / {} / {}".format(
+                fix_labels.get("p1", "UNKNOWN"),
+                fix_labels.get("p2", "UNKNOWN"),
+                fix_labels.get("drone", "UNKNOWN"),
+            ),
+        )
+        _sync_table_rows(self.gnss_baseline_center_model, (row,))
+        self.gnss_baseline_center_status.setText(f"{state} · angle={angle_text}°")
+        self.gnss_baseline_center_status.setToolTip(
+            f"{state} · angle={angle_text}°" + (f" · {reason}" if reason else "")
+        )
 
     def _refresh_rtcm(self, data: Mapping[str, object]) -> None:
         rtcm = data.get("rtcm")
@@ -8176,6 +9051,64 @@ class OpticalPosePane(QtWidgets.QWidget):
         "right_pitch_sensitivity_1px_deg",
     )
 
+    @staticmethod
+    def _candidate_relative_pose_text(candidate: Mapping[str, object]) -> str:
+        """Render the owner-projected Mountain relative OpenCV R/t readout."""
+
+        if str(candidate.get("method", "") or "") != "gnss-constrained-mountain-uv":
+            return ""
+        relative = candidate.get("relative_pose_rdf")
+        if not isinstance(relative, Mapping):
+            return ""
+        raw_rotation = relative.get("rotation_right_from_left_rdf")
+        raw_translation = relative.get("translation_right_from_left_rdf_m")
+        raw_origin = relative.get("right_origin_in_left_rdf_m")
+        if not isinstance(raw_rotation, (tuple, list)) or len(raw_rotation) != 3:
+            return ""
+        if not isinstance(raw_translation, (tuple, list)) or len(raw_translation) != 3:
+            return ""
+        try:
+            rotation = []
+            for row in raw_rotation:
+                if not isinstance(row, (tuple, list)) or len(row) != 3:
+                    return ""
+                values = tuple(float(value) for value in row)
+                if not all(math.isfinite(value) for value in values):
+                    return ""
+                rotation.append(values)
+            translation = tuple(float(value) for value in raw_translation)
+            if not all(math.isfinite(value) for value in translation):
+                return ""
+            origin = None
+            if isinstance(raw_origin, (tuple, list)) and len(raw_origin) == 3:
+                parsed_origin = tuple(float(value) for value in raw_origin)
+                if all(math.isfinite(value) for value in parsed_origin):
+                    origin = parsed_origin
+        except (TypeError, ValueError, OverflowError):
+            return ""
+
+        lines = [
+            "relative_frame: OpenCV optical RDF",
+            "equation: X_right = R_right_from_left_rdf * X_left + t_right_from_left_rdf_m",
+            "R_right_from_left_rdf:",
+        ]
+        lines.extend(
+            "  [" + ", ".join(f"{value:+.9f}" for value in row) + "]"
+            for row in rotation
+        )
+        lines.append(
+            "t_right_from_left_rdf_m: ["
+            + ", ".join(f"{value:+.9f}" for value in translation)
+            + "]"
+        )
+        if origin is not None:
+            lines.append(
+                "right_origin_in_left_rdf_m: ["
+                + ", ".join(f"{value:+.9f}" for value in origin)
+                + "]"
+            )
+        return "\n".join(lines)
+
     @classmethod
     def _candidate_detail_text(cls, candidate: Mapping[str, object]) -> str:
         """Render provenance/quality/warnings for the selected candidate.
@@ -8187,6 +9120,10 @@ class OpticalPosePane(QtWidgets.QWidget):
         """
 
         lines: list[str] = []
+        relative_pose_text = cls._candidate_relative_pose_text(candidate)
+        if relative_pose_text:
+            lines.extend(relative_pose_text.splitlines())
+            lines.append("")
         input_hashes = candidate.get("input_hashes")
         input_hashes = input_hashes if isinstance(input_hashes, Mapping) else {}
         for key in cls._CANDIDATE_DETAIL_INPUT_HASH_KEYS:
@@ -13224,7 +14161,17 @@ class RecordingWorkspace(QtWidgets.QWidget):
         self.artifact_model = _table_model(
             self,
             (
-                ("Type", "Path", "State", "Dropped", "Last write", "Error")
+                (
+                    "Type",
+                    "JSONL path",
+                    "JSONL state",
+                    "CSV path",
+                    "CSV state",
+                    "JSONL drop",
+                    "CSV drop",
+                    "Last write",
+                    "Error",
+                )
                 if self._sessionless
                 else ("File", "Path", "Kind")
             ),
@@ -13416,22 +14363,35 @@ class RecordingWorkspace(QtWidgets.QWidget):
         rows = []
         for name, raw in sorted(streams.items()):
             value = raw if isinstance(raw, Mapping) else {}
+            csv_value = value.get("csv")
+            csv_value = csv_value if isinstance(csv_value, Mapping) else {}
             last = value.get("last_write_utc_ns")
             last_text = "--" if last in (None, "") else str(last)
+            errors = []
+            jsonl_error = str(value.get("last_error") or "").strip()
+            csv_error = str(csv_value.get("last_error") or "").strip()
+            if jsonl_error:
+                errors.append(f"JSONL: {jsonl_error}")
+            if csv_error:
+                errors.append(f"CSV: {csv_error}")
             rows.append(
                 (
                     name,
                     value.get("path", "--"),
                     value.get("state", "IDLE"),
+                    csv_value.get("path", "--"),
+                    csv_value.get("state", "IDLE"),
                     value.get("dropped_records", 0),
+                    csv_value.get("dropped_records", 0),
                     last_text,
-                    _compact_text(value.get("last_error", ""), limit=96) or "--",
+                    _compact_text(" · ".join(errors), limit=96) or "--",
                 )
             )
         _sync_table_rows(self.artifact_model, tuple(rows))
         root = str(storage.get("root") or "--")
         state = str(storage.get("state") or "UNAVAILABLE")
         dropped = int(storage.get("dropped_records") or 0)
+        csv_dropped = int(storage.get("csv_dropped_records") or 0)
         self.session_values["state"].set_value(
             state,
             source="MeasurementDataStore",
@@ -13444,7 +14404,8 @@ class RecordingWorkspace(QtWidgets.QWidget):
         self.session_values["output_dir"].set_value(root, source="measurement_data_root")
         self.session_values["status_label"].set_value(
             f"priority={int(storage.get('priority_pending') or 0)} · "
-            f"bulk={int(storage.get('bulk_pending') or 0)} · dropped={dropped}",
+            f"bulk={int(storage.get('bulk_pending') or 0)} · "
+            f"dropped={dropped} · csv_dropped={csv_dropped}",
             source="bounded writer queues",
         )
         self._refresh_latest_measurement_xlsx()

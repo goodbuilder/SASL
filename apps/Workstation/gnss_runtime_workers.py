@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import errno as errno_module
 import queue
+import socket
 import threading
 import time
 
@@ -968,16 +970,49 @@ class GnssBaseSerialWorker(QtCore.QObject):
             self.command_sent.emit(label, len(payload))
 
 
+def _is_transient_network_error(exc: BaseException) -> bool:
+    """Tell a link outage that clears itself from a fault that never will.
+
+    Field uplinks are phone hotspots and LTE modems: they drop the uplink DNS
+    server mid-session and come back seconds later. ``EAI_AGAIN`` ("Temporary
+    failure in name resolution") is exactly that case and is worth waiting out.
+
+    A wrong hostname (``EAI_NONAME``), rejected credentials, or an unknown
+    mountpoint are the opposite -- retrying repeats the same rejection forever
+    -- so those stay on the short fatal count.
+    """
+
+    if isinstance(exc, socket.gaierror):
+        # EAI_AGAIN only. EAI_NONAME means the caster host itself is wrong.
+        return exc.errno == socket.EAI_AGAIN
+    if isinstance(exc, (socket.timeout, TimeoutError, ConnectionError)):
+        return True
+    if isinstance(exc, OSError):
+        return exc.errno in {
+            errno_module.ENETUNREACH,
+            errno_module.EHOSTUNREACH,
+            errno_module.ENETDOWN,
+            errno_module.ENETRESET,
+        }
+    return False
+
+
 class NtripNetworkWorker(QtCore.QObject):
     """Qt adapter for the blocking, dependency-free NTRIP client."""
 
-    # A caster rejection (bad credentials, unknown mountpoint, DNS failure)
+    # A caster rejection (bad credentials, unknown mountpoint, wrong host)
     # never clears itself by retrying -- it just repeats the same
     # "reconnecting" message forever, leaving the UI's Start control disabled
     # (see start_gnss_network's early-return guard) with no visible fault.
     # Once a failure repeats this many times in a row, treat it as fatal:
     # stop retrying and let ``failed`` surface it instead.
     MAX_CONSECUTIVE_FAILURES = 3
+    # A dropped uplink is not a rejection. It clears itself once the hotspot
+    # or modem comes back, so give it the length of a real field outage
+    # instead of the three strikes meant for a caster that keeps saying no.
+    # At the default 5 s reconnect interval this is roughly five minutes,
+    # and every attempt still reports progress through ``reconnecting``.
+    MAX_CONSECUTIVE_TRANSIENT_FAILURES = 60
 
     connected = QtCore.pyqtSignal(str, object)
     stats_changed = QtCore.pyqtSignal(object)
@@ -1065,10 +1100,21 @@ class NtripNetworkWorker(QtCore.QObject):
                         self.failed.emit(error_text)
                         break
                     consecutive_failures += 1
-                    if consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
-                        self.failed.emit(str(exc))
+                    transient = _is_transient_network_error(exc)
+                    failure_limit = (
+                        self.MAX_CONSECUTIVE_TRANSIENT_FAILURES
+                        if transient
+                        else self.MAX_CONSECUTIVE_FAILURES
+                    )
+                    if consecutive_failures >= failure_limit:
+                        self.failed.emit(error_text)
                         break
-                    self.reconnecting.emit(str(exc))
+                    if transient:
+                        self.reconnecting.emit(
+                            f"{error_text} (uplink 대기 {consecutive_failures}/{failure_limit})"
+                        )
+                    else:
+                        self.reconnecting.emit(error_text)
                     # The failed client is closed before retrying.  A fresh
                     # client owns the interruptible reconnect delay because a
                     # closed client intentionally never retries.

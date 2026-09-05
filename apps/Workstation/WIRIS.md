@@ -175,9 +175,31 @@ route의 source는 `10.0.0.11`이며 이 NIC는 기본 route를 소유하지 않
 
 `bitrate=0`은 constant-quality mode이며 QP가 유효한 조건이다. Bitrate에 대해서는 테스트 중
 `SEBR` 명령을 보내지 않는다. 모든 변경 전후에 `GEBR VISIBLE=0`을 readback한다.
-2026-08-29 GOP A/B 사전·rollback readback은 양쪽 visible `0/1/30/0`, `GSSS=0`,
-`GETH=TRUE`, `IRCR=FALSE`였으며 이번 시험은 `SEIR`을 전송하지 않았다. 과거 `GEIR=1`은
-설정 readback일 뿐이었고, 당시 bounded raw capture에서는 NAL type 5를 관측하지 못했다.
+과거 `GEIR=1`은 설정 readback일 뿐 이 FW의 실제 random-access 증거가 아니었다. 순차 재부팅 전후,
+RTSP 비활성/활성 중 수행한 당시 bounded raw capture에서는 두 visible stream 모두 NAL type 5를
+한 번도 내보내지 않았다.
+
+2026-08-27 실내 재검증은 decoder를 완전히 제외한
+`rtspsrc -> rtph264depay -> Annex-B filesink` 원시 경계에서 수행했다. 왼쪽 IDR interval
+`0/1/2/3`은 모두 SDK ACK와 `GEIR` readback이 요청값과 일치했지만 모든 artifact가
+`NAL5=0`이었고, FFprobe가 찾은 I picture도 전부 `key_frame=0`인 non-IDR NAL1이었다. 따라서
+NVDEC/Software decoder 선택은 해당 short-capture zero-IDR의 원인이 아니다. 상세 byte count와 SHA-256은
+`docs/changes/20260826-integrated-field-stability/evidence/indoor-wiris-idr-sdk-20260827.md`에
+있다. 해당 2026-08-27 시험 종료 상태는 양쪽 `GETH=TRUE`, `GSSS=0`, `IRCR=FALSE`, visible
+`0/1/30/1`이었다. 2026-08-29 GOP A/B 사전·rollback readback은 양쪽 `0/1/30/0`,
+`GSSS=0`, `GETH=TRUE`, `IRCR=FALSE`이며, 이번 시험은 `SEIR`을 전송하지 않았다.
+
+2026-08-28 왼쪽 단독 재검증에서도 `SEIR VISIBLE 0`과 `SEIR VISIBLE 1` 모두 문제를 해결하지
+못했다. `0`은 SDK `OK`와 `GEIR=0` readback 후 30초 strict worker에서 IDR을 하나도 내보내지
+않았고, `1`은 SDK `OK`와 `GEIR=1` readback 후에도 IDR/exact PTS 복구에 실패했다. `SETH
+FALSE -> TRUE`와 `REBT`로 RTSP 서비스를 재시작한 뒤 `SEIR VISIBLE 1`을 다시 적용해도 결과는
+같았다. `SEIR` 값의 ACK/readback은 설정 수락 증거일 뿐 실제 visible RTSP elementary stream의
+NAL5/IDR 송출 증거가 아니다.
+
+과거 process-local non-IDR qualification 플래그는 2026-08-29 영구 tolerant 계약으로
+폐기됐다. 현재 제품 실행 경로에는 strict/tolerant 또는 NAL1 실험 환경변수 분기가 없다.
+tracker는 IDR/RTP 상태를 provenance로 계속 관찰하지만 decoded-frame admission을 차단하지
+않는다.
 
 ### Thermal encoder
 
@@ -594,8 +616,46 @@ SEGS VISIBLE 30   # current
 SEGS VISIBLE 90   # rollback
 ```
 
-## 10. Change log
+## 10. Workstation 영구 처리 계약
 
+`SEIR VISIBLE 0`과 `SEIR VISIBLE 1`은 모두 SDK ACK/readback에는 성공했지만, fresh stream에서
+검증 가능한 NAL5/IDR 또는 손상 없는 원본 압축 스트림을 만들지 못했다. 따라서 Workstation은
+`SEIR` 값을 영상 복구 수단으로 사용하지 않는다. 자동 연결·Preview·Measurement는 기존처럼
+`SEBR/SEQZ/SEGS/SEIR`을 쓰지 않으며 현재 장비 설정을 변경하지 않는다.
+
+일반 `run.sh` 실행은 항상 decoded-frame tolerant 경로를 사용한다. RTP gap 또는 IDR 부재는
+`INPUT UNVERIFIED` provenance로 남지만, 현재 디코더가 출력한 프레임은 Preview, YOLO, native
+evidence, 공식 Measurement에 전달된다. 기존 시간·캘리브레이션·대응점·기하 gate가 모두
+통과하면 거리 결과는 이 provenance와 별개로 `VALID`가 될 수 있다.
+
+Calibration Auto capture만은 별도의 수집 정책을 사용한다. `h264parse`가 non-delta로 표시하고
+NAL 목록에 type 1이 있으며 type 5가 없는 AU를 exact PTS로 decoded frame에 연결한 뒤, 그
+checkerboard observation의 current-generation `FrameKey`를 그대로 pin/read한다. 이는 NAL1을
+IDR로 승격하지 않으며 Preview·YOLO·Measurement·recording을 I-frame-only로 바꾸지 않는다.
+FrameKey가 이미 overwrite됐으면 timestamp가 가까운 다른 frame을 쓰지 않고 다음 NAL1
+candidate를 기다린다.
+
+자동 MP4는 원본 H.264 직접복사가 아니다. overlay 전 decoded NV12를 bounded oldest-drop
+queue로 분리해 FFmpeg `h264_nvenc` lossless로 기록한다. 이는 디코더가 출력한 픽셀을 보존할
+뿐 카메라/RTP 단계에서 이미 사라진 정보를 복원하지 않으며, source media integrity는 계속
+unverified다. 녹화 실패나 queue drop은 YOLO/거리 처리를 중단하지 않고 CPU encoder fallback도
+사용하지 않는다.
+
+`Settings > YOLO / RTSP > H.264 compressed queue`에서 Workstation 압축 H.264 queue 정책을
+선택할 수 있다. `Latest (drop old)`는 low-latency 기본값이고, `Reference-safe (preserve 8)`는
+디코딩 전 두 경계에서 최대 8개 access unit을 보존해 Workstation 자체 reference loss를 줄일
+수 있다. 다음 Preview 시작부터 적용되며 WIRIS SDK 명령이나 `SEIR` 값은 변경하지 않는다.
+
+## 11. Change log
+
+- `2026-08-29`: Calibration Auto capture를 NAL1/non-delta AU에 한정하고 AU PTS와 decoded PTS가
+  정확히 같은 native `FrameKey`만 저장하도록 했다. 기존 1 ms timestamp-near lookup은 Auto에서
+  제거했으며, stale/evicted/generation-mismatch key는 인접 frame 대체 없이 다음 candidate를
+  기다린다. NAL1은 여전히 non-IDR이며 일반 camera consumer 동작은 바뀌지 않는다.
+- `2026-08-29`: `SEIR 0/1` 실패 판정을 유지한 채 Workstation을 항상 tolerant decoded-frame
+  admission으로 전환했다. 공식 Measurement의 `VALID`와 `INPUT UNVERIFIED`를 분리하고,
+  자동 녹화를 decoded NV12 기반 FFmpeg/NVENC lossless MP4로 변경했다. WIRIS SDK/RTSP/NIC 및
+  물리 encoder profile은 변경하지 않았다.
 - `2026-08-29`: 양쪽 visible GOP `30 -> 15 -> 30` controlled A/B에서 cadence는 소폭 개선됐지만
   오른쪽 RTP gap/missing이 크게 증가해 GOP 15를 FIELD FAIL로 판정했다. 양쪽을
   `0/1/30/0`, `GSSS=0`으로 rollback하고 SDK/RTSP/Workstation Preview 복구를 확인했다. 같은 날
@@ -627,6 +687,18 @@ SEGS VISIBLE 90   # rollback
   확인했으며, sender omission 자체의 해결로 판정하지 않는다.
 - `2026-08-27`: 사용자 승인으로 양쪽 `SEIR VISIBLE 1`을 적용하고 순차 SDK 재부팅, fresh RTSP,
   active-stream 재적용까지 확인했다. 최종 readback은 `GETH=TRUE`, `0/1/30/1`, `GSSS=0`,
-  `IRCR=FALSE`지만 모든 elementary stream의 NAL5는 0이었다. 공개 최신 SDK rev 241106EN에는
+  `IRCR=FALSE`지만 당시 captured elementary stream의 NAL5는 모두 0이었다. 공개 최신 SDK rev 241106EN에는
   별도 visible encoder restart 명령이 없으므로 추가 임의 SET 없이 Workswell firmware/support
   답변을 기다린다.
+- `2026-08-27`: decoder 이전 Annex-B 실내 A/B로 왼쪽 `SEIR VISIBLE 1/2/3`의 exact ACK/readback과
+  무관하게 모든 stream이 NAL1 only/NAL5 zero임을 확정했다. 반복 GET 중 오른쪽 SDK/RTSP/FTP
+  service-collapse도 재현됐으며, 사용자 물리 전원 재인가 후 양쪽을 `0/1/30/1`, `GSSS=0`,
+  `GETH=TRUE`, `IRCR=FALSE`로 복구했다.
+- `2026-08-27`: Workstation 실시간 거리 time truth를 decoded-frame app-receive monotonic으로
+  고정했다. WIRIS STUS/NTP/SR/RTP와 clock epoch는 거리와 독립된 저장 전용 clock evidence로
+  유지되며, STUS 실행·실패는 app-timed 거리 pairing을 중단하거나 강등하지 않는다.
+- `2026-08-28`: 왼쪽 단독 실장비에서 `SEIR VISIBLE 0`과 `SEIR VISIBLE 1`을 각각 적용하고
+  readback 및 fresh strict worker를 확인했다. 두 값 모두 SDK `OK`/readback은 통과했지만
+  verified IDR/exact PTS를 만들지 못해 영상 문제를 해결하지 못했다. `SETH FALSE -> TRUE`와
+  `REBT` 후 `SEIR VISIBLE 1`을 재적용해도 동일했으며, 최종 상태는 `GETH=TRUE`,
+  `GEIR VISIBLE=1`, `GSSS=0`, `IRCR=FALSE`로 복구했다.

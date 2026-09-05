@@ -2,13 +2,14 @@
 
 This module deliberately keeps two independent decisions separate:
 
-* the operating image must use the exact per-camera ``K,D`` profile; and
+* the operating image must use the selected ``K,D`` profile on its native raster; and
 * a stereo ``R,t`` estimated at another zoom may still be selected.
 
-Pixels and intrinsics use OpenCV optical RDF (right, down, forward).  Zoom,
-serial, stabilization, and image-size checks only establish whether a saved
-``K,D`` profile applies to the current optical stream.  They do not transform
-or reinterpret stereo extrinsics, PX4 body FRD, or world NED values.
+Pixels and intrinsics use OpenCV optical RDF (right, down, forward).  Applied
+profile identity and native image size establish whether saved ``K,D`` applies
+to the current optical stream.  Zoom, serial, and stabilization remain
+provenance only.  None of these fields transform or reinterpret stereo
+extrinsics, PX4 body FRD, or world NED values.
 """
 
 from __future__ import annotations
@@ -623,11 +624,6 @@ class IntrinsicsApplicability:
         }
 
 
-def _normalized_state(value: str | None) -> str | None:
-    normalized = _optional_text(value)
-    return None if normalized is None else normalized.casefold()
-
-
 def evaluate_intrinsics_applicability(
     profile: OperatingIntrinsicsProfile | None,
     left_evidence: OperatingCameraEvidence,
@@ -637,19 +633,20 @@ def evaluate_intrinsics_applicability(
     max_zoom_age_s: float = 5.0,
     extrinsics_source_zoom_index: int | None = None,
 ) -> IntrinsicsApplicability:
-    """Check exact operating ``K,D`` evidence without gating cross-zoom R,t.
+    """Check operating ``K,D`` identity and native-raster applicability.
 
-    Missing legacy zoom/serial/stabilization provenance remains unknown and
-    blocks derived geometry.  Raw recording remains allowed for every result.
-    ``extrinsics_source_zoom_index`` is reported only; a 3x R,t with 12x K,D
-    is intentionally just as applicable as a same-zoom 7x/7x selection.
+    Zoom, camera serial, and stabilization are retained as evidence but never
+    gate geometry.  ``max_zoom_age_s`` remains validated for caller
+    compatibility but no longer changes readiness.  Raw recording remains
+    allowed for every result.  ``extrinsics_source_zoom_index`` is reported
+    only; a 3x R,t with 12x K,D is intentionally just as applicable as a
+    same-zoom 7x/7x selection.
     """
 
     if left_evidence.side != "left" or right_evidence.side != "right":
         raise ValueError("evidence must preserve left/right camera identity")
     now = _finite_float(now_monotonic_s, name="now_monotonic_s")
-    maximum_age = _finite_float(max_zoom_age_s, name="max_zoom_age_s")
-    if maximum_age < 0.0:
+    if _finite_float(max_zoom_age_s, name="max_zoom_age_s") < 0.0:
         raise ValueError("max_zoom_age_s must be non-negative")
     extrinsics_zoom = _optional_nonnegative_int(
         extrinsics_source_zoom_index,
@@ -661,31 +658,14 @@ def evaluate_intrinsics_applicability(
     if profile is None:
         reasons.append("operating_intrinsics_profile_missing")
     else:
-        nominal_profile = profile.provenance.get("quality") == NOMINAL_INTRINSICS_QUALITY
         for side, expected, observed in (
             ("left", profile.left, left_evidence),
             ("right", profile.right, right_evidence),
         ):
-            if expected.source_zoom_index is None:
-                reasons.append(f"{side}_intrinsics_zoom_unknown")
-            if observed.zoom_index is None:
-                reasons.append(f"{side}_zoom_readback_unknown")
-            if observed.zoom_updated_monotonic_s is None:
-                reasons.append(f"{side}_zoom_readback_age_unknown")
-            else:
+            if observed.zoom_updated_monotonic_s is not None:
                 age = now - observed.zoom_updated_monotonic_s
-                if age < 0.0:
-                    reasons.append(f"{side}_zoom_readback_from_future")
-                else:
+                if age >= 0.0:
                     ages[side] = age
-                    if age > maximum_age:
-                        reasons.append(f"{side}_zoom_readback_stale")
-            if (
-                expected.source_zoom_index is not None
-                and observed.zoom_index is not None
-                and expected.source_zoom_index != observed.zoom_index
-            ):
-                reasons.append(f"{side}_operating_zoom_mismatch")
 
             if observed.frame_width_px is None or observed.frame_height_px is None:
                 reasons.append(f"{side}_frame_resolution_unknown")
@@ -695,32 +675,12 @@ def evaluate_intrinsics_applicability(
             ):
                 reasons.append(f"{side}_frame_resolution_mismatch")
 
-            if nominal_profile:
-                continue
-            if expected.camera_serial is None:
-                reasons.append(f"{side}_profile_serial_unknown")
-            elif observed.camera_serial is None:
-                reasons.append(f"{side}_camera_serial_unknown")
-            elif expected.camera_serial != observed.camera_serial:
-                reasons.append(f"{side}_camera_serial_mismatch")
-
-            expected_stabilization = _normalized_state(expected.stabilization_state)
-            observed_stabilization = _normalized_state(observed.stabilization_state)
-            if expected_stabilization is None:
-                reasons.append(f"{side}_profile_stabilization_unknown")
-            elif observed_stabilization is None:
-                reasons.append(f"{side}_camera_stabilization_unknown")
-            elif expected_stabilization != observed_stabilization:
-                reasons.append(f"{side}_camera_stabilization_mismatch")
-
     observed_zoom = None
     if (
         left_evidence.zoom_index is not None
         and right_evidence.zoom_index is not None
     ):
-        if left_evidence.zoom_index != right_evidence.zoom_index:
-            reasons.append("left_right_zoom_disagree")
-        else:
+        if left_evidence.zoom_index == right_evidence.zoom_index:
             observed_zoom = left_evidence.zoom_index
 
     # De-duplicate without losing the stable diagnostic order.

@@ -3,13 +3,15 @@ schema: modify-gui-change-state-v1
 change_id: 20260829-observation-first-measurement
 status: verifying
 mode: backend-coupled
-updated: 2026-08-29
+updated: 2026-09-02
 baseline_ref: a8f92b91691ca272af44b7a0910267b44afa304d
-last_completed: "Observation-first commit index verified; 1482 passed, 1 skipped; runtime check PASS"
-next_question: "Run the real-device join/rejoin matrix when WIRIS/P1/P2/GNSS/NTRIP hardware is available"
+last_completed: "Corrected decoder-preflight rollback; 2 focused and 133 dependent tests plus 1889-test full suite passed"
+next_question: "With live Preview and explicit NVIDIA unavailable, press Measurement once and confirm both Preview panes remain live; then Stop, select Auto, and confirm Measurement starts with decoded frames"
 read_next:
   - docs/changes/20260829-observation-first-measurement/implementation-plan.md
   - docs/changes/20260829-observation-first-measurement/backend-contract.md
+  - docs/changes/20260829-observation-first-measurement/current-behavior.md
+  - docs/changes/20260829-observation-first-measurement/decisions.md
   - docs/changes/20260829-observation-first-measurement/verification.md
 affected_product_docs:
   - README.md

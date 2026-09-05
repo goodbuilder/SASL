@@ -105,7 +105,7 @@ def test_optical_pose_nominal_fallback_rejects_left_right_zoom_mismatch(monkeypa
     assert controller._operating_intrinsics_profile() is None
 
 
-def test_calibrated_zoom_mismatch_selects_fresh_nominal_profile(monkeypatch) -> None:
+def test_calibrated_zoom_mismatch_keeps_selected_profile(monkeypatch) -> None:
     camera = CameraIntrinsics(
         width=1280,
         height=720,
@@ -138,11 +138,12 @@ def test_calibrated_zoom_mismatch_selects_fresh_nominal_profile(monkeypatch) -> 
     snapshot = controller._intrinsics_snapshot(use_frozen=False)
 
     assert snapshot["applicability"]["geometry_allowed"] is True
-    assert snapshot["profile"]["provenance"]["quality"] == NOMINAL_INTRINSICS_QUALITY
-    assert snapshot["profile"]["left"]["source_zoom_index"] == 8
+    assert snapshot["applicability"]["reasons"] == []
+    assert snapshot["profile"]["left"]["source_zoom_index"] == 7
+    assert snapshot["profile"]["left"]["camera_matrix"][0][0] == 7000.0
 
 
-def test_calibrated_zoom_mismatch_does_not_use_stale_nominal_profile(monkeypatch) -> None:
+def test_calibrated_zoom_mismatch_and_stale_readback_keep_selected_profile(monkeypatch) -> None:
     camera = CameraIntrinsics(
         width=1280,
         height=720,
@@ -173,8 +174,9 @@ def test_calibrated_zoom_mismatch_does_not_use_stale_nominal_profile(monkeypatch
 
     snapshot = controller._intrinsics_snapshot(use_frozen=False)
 
-    assert snapshot["applicability"]["geometry_allowed"] is False
-    assert "left_operating_zoom_mismatch" in snapshot["applicability"]["reasons"]
+    assert snapshot["applicability"]["geometry_allowed"] is True
+    assert snapshot["applicability"]["reasons"] == []
+    assert snapshot["profile"]["left"]["source_zoom_index"] == 7
     with pytest.raises(ValueError, match="positive native raster"):
         build_nominal_operating_intrinsics_profile(
             zoom_index=8,
@@ -264,15 +266,15 @@ def test_same_zoom_7_to_7_is_ready_and_not_cross_zoom() -> None:
     assert result.cross_zoom is False
 
 
-def test_operating_mismatch_blocks_geometry_but_not_raw_recording() -> None:
+def test_zoom_serial_and_stabilization_mismatch_are_evidence_only() -> None:
     left = _evidence("left", 11, updated=80.0)
     right = OperatingCameraEvidence(
         side="right",
         zoom_index=12,
         zoom_ratio=12.0,
-        zoom_updated_monotonic_s=99.0,
-        frame_width_px=1280,
-        frame_height_px=720,
+        zoom_updated_monotonic_s=110.0,
+        frame_width_px=1920,
+        frame_height_px=1080,
         camera_serial="WRONG-SERIAL",
         stabilization_state="disabled",
     )
@@ -286,19 +288,98 @@ def test_operating_mismatch_blocks_geometry_but_not_raw_recording() -> None:
         extrinsics_source_zoom_index=3,
     )
 
-    assert result.state == "BLOCKED"
-    assert result.geometry_allowed is False
+    assert result.state == "READY"
+    assert result.geometry_allowed is True
     assert result.raw_recording_allowed is True
-    assert "left_zoom_readback_stale" in result.reasons
-    assert "left_operating_zoom_mismatch" in result.reasons
-    assert "left_right_zoom_disagree" in result.reasons
-    assert "right_frame_resolution_mismatch" in result.reasons
-    assert "right_camera_serial_mismatch" in result.reasons
-    assert "right_camera_stabilization_mismatch" in result.reasons
+    assert result.reasons == ()
+    assert result.left_zoom_age_s == 20.0
+    assert result.right_zoom_age_s is None
     assert result.cross_zoom is None
 
 
-def test_legacy_unknown_zoom_is_not_replaced_by_requested_zoom() -> None:
+def test_frame_resolution_mismatch_still_blocks_geometry() -> None:
+    right = OperatingCameraEvidence(
+        side="right",
+        zoom_index=None,
+        zoom_ratio=None,
+        zoom_updated_monotonic_s=None,
+        frame_width_px=1280,
+        frame_height_px=720,
+        camera_serial=None,
+        stabilization_state=None,
+    )
+
+    result = evaluate_intrinsics_applicability(
+        _profile(12),
+        _evidence("left", 11, updated=80.0),
+        right,
+        now_monotonic_s=100.0,
+        max_zoom_age_s=5.0,
+        extrinsics_source_zoom_index=3,
+    )
+
+    assert result.state == "BLOCKED"
+    assert result.geometry_allowed is False
+    assert result.raw_recording_allowed is True
+    assert result.reasons == ("right_frame_resolution_mismatch",)
+
+
+def test_frame_resolution_unknown_still_blocks_geometry() -> None:
+    right = OperatingCameraEvidence(
+        side="right",
+        zoom_index=None,
+        zoom_ratio=None,
+        zoom_updated_monotonic_s=None,
+        frame_width_px=None,
+        frame_height_px=None,
+        camera_serial=None,
+        stabilization_state=None,
+    )
+
+    result = evaluate_intrinsics_applicability(
+        _profile(12),
+        _evidence("left"),
+        right,
+        now_monotonic_s=100.0,
+        extrinsics_source_zoom_index=3,
+    )
+
+    assert result.state == "BLOCKED"
+    assert result.geometry_allowed is False
+    assert result.reasons == ("right_frame_resolution_unknown",)
+
+
+def test_missing_zoom_serial_and_stabilization_are_evidence_only() -> None:
+    evidence = {
+        side: OperatingCameraEvidence(
+            side=side,
+            zoom_index=None,
+            zoom_ratio=None,
+            zoom_updated_monotonic_s=None,
+            frame_width_px=1920,
+            frame_height_px=1080,
+            camera_serial=None,
+            stabilization_state=None,
+        )
+        for side in ("left", "right")
+    }
+
+    result = evaluate_intrinsics_applicability(
+        _profile(12),
+        evidence["left"],
+        evidence["right"],
+        now_monotonic_s=100.0,
+        extrinsics_source_zoom_index=3,
+    )
+
+    assert result.state == "READY"
+    assert result.geometry_allowed is True
+    assert result.reasons == ()
+    assert result.operating_zoom_index is None
+    assert result.cross_zoom is None
+
+
+def test_legacy_unknown_profile_zoom_is_evidence_only() -> None:
     camera = CameraIntrinsics(
         width=1920,
         height=1080,
@@ -334,9 +415,11 @@ def test_legacy_unknown_zoom_is_not_replaced_by_requested_zoom() -> None:
         now_monotonic_s=100.0,
         extrinsics_source_zoom_index=3,
     )
-    assert result.state == "BLOCKED"
-    assert "left_intrinsics_zoom_unknown" in result.reasons
-    assert "right_intrinsics_zoom_unknown" in result.reasons
+    assert result.state == "READY"
+    assert result.geometry_allowed is True
+    assert result.reasons == ()
+    assert result.operating_zoom_index == 12
+    assert result.cross_zoom is True
     assert result.raw_recording_allowed is True
 
 

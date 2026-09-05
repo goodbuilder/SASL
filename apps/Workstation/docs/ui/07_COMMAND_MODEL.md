@@ -41,12 +41,18 @@ Automatic Measurement-stop submission uses the same backend request after the ru
 Cancellation, checkpoint timeout, malformed input, publication failure, and manual retry remain
 local to Data and cannot reject Measurement.
 
-Pixhawk `Find network` is a read-only contextual command. It inventories wired NIC/address/carrier
-and P1/P2 route evidence without changing host networking. The discovery row remains candidate-only;
-P1/P2 assignment cards separately expose each side's endpoint and route. `Assign P1/P2` persists operator intent;
-it disconnects only the selected side when that side is already open. `Connect` revalidates the
-stored interface/address against the current kernel route and attempts valid disconnected sides
-independently. Assign or socket-open acknowledgement is never link success.
+`Find network` is a read-only contextual command that inventories physical NIC identity,
+address/carrier and route evidence. `Assign Camera NIC/P1/P2` is a separate explicit mutation:
+native before/after confirmation -> OS authorization -> target-first app-owned NetworkManager delta
+-> dual readback -> role-scoped source cleanup -> `PRESS CONNECT`. Pixhawk owners never reconnect
+automatically after the host transaction; the operator's later Connect owns device evidence.
+One or many NICs and same-NIC role composition use the same command.
+
+Ordinary healthy Camera/Pixhawk owners on source/target NICs follow the selected role automatically;
+unrelated NIC owners never restart. Measurement/recording/save/finalization rejects before any stop
+or mutation. Assignment persistence commits last, rollback restores the original arrangement where
+possible, and incomplete rollback remains explicit. Connect continues side-specific route preflight.
+Assign acknowledgement, NetworkManager write, or socket open is never device success.
 
 ## 5. Stateful Commands
 
@@ -55,6 +61,8 @@ Transitions matter. Examples:
 - Measurement: IDLE → QUEUED(optional) → STARTING → RUNNING → STOPPING → IDLE
 - Manual recording: IDLE → STARTING → ACTIVE → STOPPING → IDLE
 - Preview: STOPPED → STARTING → LIVE → STOPPING → STOPPED
+- STUS: OBSERVER_PREFLIGHT → LEFT_COMMAND/ACK → RIGHT_COMMAND/ACK → RTCP_OBSERVING →
+  VERIFIED or one RELATIVE_CORRECTION round → VERIFIED/FAILED
 
 Avoid naive toggles where backend transitions are meaningful.
 
@@ -71,9 +79,47 @@ enabled only for `ETH MAVLINK RX STALLED`, while Measurement/recording/save/fina
 PX4 commands are idle. It requires one current unique USB heartbeat mapping (P1=sysid1/P2=sysid2),
 names side/device/sysid in the confirmation, and revalidates the same identity in a one-shot worker.
 Operator No, missing/stale/duplicate/changed identity, or revalidation failure sends no reboot.
+
+Telemetry Radio and Ethernet are per-board selections. Transport selection, endpoint edits,
+device return, startup flags and recovery actions cannot open a link; only explicit `Connect` can.
+Persistent `MAV_2_*` setup is a separate manual command and is never a first-heartbeat side effect.
+
+`Find USB` and `Find network` are mutually exclusive read-only Discovery commands. An accepted
+command clears the previous transient candidate snapshot before starting and publishes only its
+new result. A duplicate/concurrent request is rejected without clearing the active snapshot.
+Discovery never changes saved endpoints, NIC assignments, settings, or connection owners.
+
+Telemetry has its own bounded `Find Network` projection for the Drone role. It passively observes
+UDP MAVLink, permits `Use selected` only for current sysid-3 evidence, and fills the editable URL
+without Apply, Save, Disconnect or Connect. Apply/Save responses return the newly accepted URL;
+stale connection status cannot rewrite that configuration field.
+
+Explicit parameter, shell, reboot, persistent Ethernet, MAVFTP file/log and firmware-staging
+commands are available on Radio. RTCM activity creates no warning, modal or block; one bounded Log
+event records role, transport, category, start time and RTCM age. Upload/download interruption
+leaves a partial artifact. `Resume` requires exact prefix readback; otherwise `Restart` is required.
+Radio firmware staging is `STAGED`, not installed. USB flash is globally serialized, verifies
+direct-USB sysid and bootloader board ID, uses the pinned uploader without force flags, and leaves
+telemetry disconnected afterward.
+
+The topology workflow has four contextual commands owned by one controller:
+`pixhawk.topology.check`, `pixhawk.topology.start`, `pixhawk.topology.cancel`, and
+`pixhawk.topology.rollback`. The current-row action advances the controller state machine; it is
+never inferred from button text. `Check` is read-only. Every persistent SiK/PX4/SD-file action
+requires a fresh unique expected-sysid probe, physical isolation, disarmed evidence, exclusive
+endpoint ownership, and an explicit confirmation naming the target and mutation. The final settings
+commit occurs only after a fresh cross-radio/UDP readback. P2 provisioning first journals the exact
+pre-change parameter/file profile in a separate read-only action; a device write cannot begin if
+that evidence is not durable. Cancel after any persistent change remains `PARTIAL`, and
+rollback uses captured pre-change evidence. No topology command opens MAVLink, presses Connect,
+implements failover, or treats command acceptance as qualification.
+While the operation is active or partial, the duplicated Drone Telemetry Apply/Connect/Discovery
+surface and all conflicting Pixhawk administration are locked; an existing Disconnect remains
+available. Mid-operation topology-settings drift blocks the next write and final commit.
 The stalled Ethernet connection is never used as the reboot transport. The command writes no
-parameter/config/file and does not imply recovery; `RECOVERING` plus 10-minute qualification is the
-observable postcondition. Automatic reboot is not a supported command.
+parameter/config/file and does not imply recovery. The product postcondition is `RECOVERING` plus a
+1-minute qualification; a separate 10-minute post-recovery observation is required only for
+field-stability acceptance. Automatic reboot is not a supported command.
 
 ## 8. Command Ownership
 
@@ -118,11 +164,42 @@ of K,D/R,t and exact operating-profile applicability remain hard Apply gates.
 `측정 시작` immediately creates a transient observation run. It does not require a parent, save
 completion, storage health, camera, P1/P2, GNSS/NTRIP, Target, Alignment, exact K,D, or a ready
 method. Missing or invalid source configuration marks only that source unavailable; method-local
-gates still block unsupported results. Manual recording and busy camera resources transition only
-their branches while the run remains RUNNING. A duplicate active run is still rejected.
+gates still block unsupported results. Those gates accept a retained last valid attitude/GPS sample
+for a side that has already produced one, including a sample received before the current
+Measurement, and still block a side that never produced one. No command, confirmation, or clear
+action is added for that reuse. Manual recording and busy camera resources transition only
+their branches while the run remains RUNNING. A duplicate live interval is still rejected.
 
-Camera rejoin allocates a new MP4 segment. File existence produces `SAVED/PARTIAL/FAILED` without
-claiming usability. Finalization, integrity or artifact enqueue failure never stops or gates a run.
+The same command requests per-side decoded-NV12 lossless NVENC recording. Camera rejoin allocates a
+new segment rather than reopening a prior path. File existence produces `SAVED/PARTIAL/FAILED` and
+does not claim usability. Finalization, integrity, artifact enqueue, NVENC, queue or disk failure is
+recording-local and never commands a Detection/native-frame/Measurement stop or blocks the next
+run. There is no strict/tolerant toggle or CPU encoder fallback command.
+
+Manual and scheduled STUS stay enabled during Preview, Measurement, YOLO and recording. They own a
+separate decoder-free RTCP observer and never stop/restart CameraPane, YOLO or MP4. Observation is
+parallel; mutation is ordered Left exact-OK then Right. Per-camera SR-PC absolute magnitude is a
+diagnostic payload only. The command postcondition is fresh/stable Left/Right relative RTCP timing
+at or below 100 ms, not ACK, PC absolute proximity, or zero dropped frames. Auto requires one manual
+VERIFIED seed in the current application/camera-connection generation and executes only at its
+configured deadline.
+
+STUS is not a live-distance command or prerequisite. With the default App receive setting,
+distance continues on host monotonic time. With `RTCP/NTP preferred`, VERIFIED/current RTCP may
+select future pairs; STUS transition, failed/revoked Clock or unusable frame evidence causes exact
+app-receive fallback without an operator retry. STUS still owns only Clock mutation/status and
+cannot turn fallback into a successful Clock state.
+
+PX4 calibration PARAM readback is an explicit contextual command. Reaching `LIVE` never invokes
+it. `Refresh P1/P2 parameters` and the Advanced MAG/attitude controls retain the existing bounded
+worker, `PARAM SYNC`, result/error, and retry path. Reset/apply/save may invoke the same explicit
+verification readback after their operator-requested mutation.
+
+The visible Pixhawk page additionally exposes side-specific `Refresh MAG` and `Apply & Verify`
+commands. They reuse the existing per-camera PARAM/Shell owner; `Apply & Verify` succeeds only
+after PARAM readback, exact active `vehicle_magnetometer.device_id`, and fresh ATTITUDE. P1/P2
+commands are independent. A Measurement start that requires live Pixhawk data consumes this
+verification result and fails closed when a required side is unverified.
 
 ## 14. Detection / Recording / Calibration Separation
 
@@ -136,6 +213,9 @@ claiming usability. Finalization, integrity or artifact enqueue failure never st
 
 - Calibration global entry → Navigation/command
 - calibration steps → local workflow commands
+- Calibration Auto intent does not imply capture success. Success requires positive NAL1/non-delta
+  AU evidence, exact decoded PTS and native FrameKey, then the existing checkerboard/timing/save
+  postconditions. Missing/evicted evidence remains waiting; manual capture stays independent.
 
 ## 15. Command Logging
 

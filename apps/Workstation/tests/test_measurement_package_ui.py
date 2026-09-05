@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from PyQt5 import QtCore, QtTest, QtWidgets
 
 from Workstation.evidence import EvidenceAdapter
-from Workstation.status_model import StatusModel
+from Workstation.status_model import RuntimeStatus, StatusModel, StatusSeverity
 from Workstation.workspaces import MeasurementWorkspace, RecordingWorkspace, SessionWorkspace
 from Workstation.workstation_core.measurement_methods import (
     MEASUREMENT_METHOD_IDS,
@@ -892,6 +892,52 @@ class _RunSetupBackend:
             "source": "operator draft accepted",
         }
         return dict(self.snapshot)
+
+
+def test_data_status_includes_right_camera_indicator_and_defaults_target_to_uam(
+    monkeypatch,
+) -> None:
+    app = QtWidgets.QApplication.instance()
+    assert app is not None
+    monkeypatch.setattr(EvidenceAdapter, "session_catalog", lambda _self: ())
+    backend = _RunSetupBackend()
+    backend.panel._measurement_session_hierarchy_enabled = False
+
+    workspace = RecordingWorkspace(backend, StatusModel(), lambda: None)
+
+    assert workspace.run_platform_combo.currentData() == "uam"
+    assert workspace.target_drone_payload()["mode"] == "uam"
+    workspace.run_platform_combo.setCurrentIndex(
+        workspace.run_platform_combo.findData("drone")
+    )
+    assert workspace.run_platform_combo.currentData() == "drone"
+    assert workspace.target_drone_payload()["mode"] == "drone"
+
+    assert set(workspace.indicators) >= {
+        "camera.left",
+        "camera.right",
+    }
+    assert workspace.indicators["camera.left"].label.text() == "CAM L"
+    assert workspace.indicators["camera.right"].label.text() == "CAM R"
+
+    workspace.refresh(
+        {
+            "camera.right": RuntimeStatus(
+                key="camera.right",
+                label="CAM R",
+                state="LIVE",
+                severity=StatusSeverity.OK,
+                detail="right camera frame current",
+                source="test",
+                clock="test",
+                age_s=0.1,
+            )
+        }
+    )
+    assert workspace.indicators["camera.right"].state.text() == "LIVE"
+
+    workspace.deleteLater()
+    app.processEvents()
 
 
 def test_run_setup_draft_remains_editable_and_survives_unlocked_owner_poll(

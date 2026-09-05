@@ -149,7 +149,10 @@ class _FakeBackend:
             camera_sync_reason="STUS 동기화 후 RTCP/NTP 검증이 필요합니다.",
             selected_runtime_frame_pair_delta_s=None,
             selected_runtime_frame_pair_basis="",
+            selected_runtime_frame_pair_requested_basis="",
+            selected_runtime_frame_pair_fallback_reason="",
             selected_runtime_frame_pair_camera_rtc_delta_s=None,
+            _coordinated_pairing_result=None,
             latest_gps={},
             latest_rtk_baseline=None,
             custom_watch_specs=[],
@@ -182,7 +185,6 @@ class _FakeBackend:
             "recording_active": False,
             "error": "",
         }
-
     def toggle_camera(self) -> None:
         self.calls.append("camera")
 
@@ -505,6 +507,9 @@ class _FakeBackend:
 
     def advanced_refresh_px4_attitude_cal(self, camera: str, *, read_params: bool = True) -> None:
         self.calls.append(("advanced_px4_attitude", camera, read_params))
+
+    def advanced_refresh_px4_calibration_params(self, camera: str, *, read_params: bool = True) -> None:
+        self.calls.append(("advanced_px4_calibration", camera, read_params))
 
     def advanced_apply_px4_mag_priorities(self, camera: str, priorities: dict[str, int]) -> None:
         self.calls.append(("advanced_px4_apply_mag", camera, priorities))

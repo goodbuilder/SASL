@@ -214,6 +214,7 @@ class _MethodEvaluationRuntime:
         self._bundles_ready: deque[MethodEvaluationBundle] = deque()
         self._closed = False
         self._started = False
+        self._comparison_workers_started = False
         if start_workers:
             self.start()
 
@@ -231,7 +232,20 @@ class _MethodEvaluationRuntime:
         if self._started:
             return
         self._started = True
+        self._start_slot(METHOD_EVALUATION_PRIMARY_METHOD)
+        self._dispatch_all()
+
+    @property
+    def comparison_workers_started(self) -> bool:
+        return self._comparison_workers_started
+
+    def start_comparison_workers(self) -> None:
+        if self._closed or self._comparison_workers_started:
+            return
+        self._comparison_workers_started = True
         for method_id in MEASUREMENT_METHOD_IDS:
+            if method_id == METHOD_EVALUATION_PRIMARY_METHOD:
+                continue
             self._start_slot(method_id)
         self._dispatch_all()
 
@@ -277,6 +291,8 @@ class _MethodEvaluationRuntime:
     def submit(
         self,
         requests: Sequence[MethodEvaluationRequest],
+        *,
+        comparison_backpressure: bool = False,
     ) -> MethodEvaluationSubmission:
         if self._closed:
             raise RuntimeError("method evaluation coordinator is closed")
@@ -285,32 +301,21 @@ class _MethodEvaluationRuntime:
         key = (first.pair_id, first.request_generation)
         if key in self._jobs:
             raise ValueError("duplicate method evaluation pair submission")
-        if len(self._jobs) >= METHOD_EVALUATION_QUEUE_LIMIT:
-            outcomes = tuple(
-                failed_outcome(
+        job = _PairJob(requests=frozen)
+        if comparison_backpressure:
+            for request in frozen:
+                if request.method_id == METHOD_EVALUATION_PRIMARY_METHOD:
+                    continue
+                job.outcomes[request.method_id] = failed_outcome(
                     request,
                     status="BACKPRESSURE_BLOCKED",
                     reason=(
-                        f"method evaluation queue limit "
-                        f"{METHOD_EVALUATION_QUEUE_LIMIT} reached"
+                        "comparison method queue limit "
+                        f"{METHOD_EVALUATION_QUEUE_LIMIT} reached; "
+                        "primary evaluation remained admitted"
                     ),
                 )
-                for request in frozen
-            )
-            return MethodEvaluationSubmission(
-                accepted=False,
-                pair_id=first.pair_id,
-                backpressure_bundle=MethodEvaluationBundle(
-                    measurement_id=first.measurement_id,
-                    pair_id=first.pair_id,
-                    pair_sequence=first.pair_sequence,
-                    snapshot_sha256=first.snapshot_sha256,
-                    request_generation=first.request_generation,
-                    outcomes=outcomes,
-                    snapshot_payload=dict(first.snapshot_payload),
-                ),
-            )
-        self._jobs[key] = _PairJob(requests=frozen)
+        self._jobs[key] = job
         if self._started:
             self._dispatch_all()
         return MethodEvaluationSubmission(accepted=True, pair_id=first.pair_id)
@@ -590,6 +595,7 @@ class MethodEvaluationCoordinator:
         self._pending_requests: dict[
             tuple[str, int], tuple[MethodEvaluationRequest, ...]
         ] = {}
+        self._pending_primary_keys: set[tuple[str, int]] = set()
         self._worker_generations = {
             method_id: 0 for method_id in MEASUREMENT_METHOD_IDS
         }
@@ -639,13 +645,13 @@ class MethodEvaluationCoordinator:
         with self._lock:
             if key in self._pending_requests:
                 raise ValueError("duplicate method evaluation pair submission")
-            if len(self._pending_requests) >= METHOD_EVALUATION_QUEUE_LIMIT:
+            if len(self._pending_primary_keys) >= METHOD_EVALUATION_QUEUE_LIMIT:
                 outcomes = tuple(
                     failed_outcome(
                         request,
                         status="BACKPRESSURE_BLOCKED",
                         reason=(
-                            f"method evaluation queue limit "
+                            f"primary method queue limit "
                             f"{METHOD_EVALUATION_QUEUE_LIMIT} reached"
                         ),
                     )
@@ -664,8 +670,14 @@ class MethodEvaluationCoordinator:
                         snapshot_payload=dict(first.snapshot_payload),
                     ),
                 )
+            comparison_backpressure = (
+                len(self._pending_requests) >= METHOD_EVALUATION_QUEUE_LIMIT
+            )
             self._pending_requests[key] = frozen
-        self._commands.put(("submit", frozen))
+            self._pending_primary_keys.add(key)
+        self._commands.put(
+            ("submit", (frozen, comparison_backpressure))
+        )
         return MethodEvaluationSubmission(accepted=True, pair_id=first.pair_id)
 
     def poll(self) -> MethodEvaluationPoll:
@@ -700,7 +712,14 @@ class MethodEvaluationCoordinator:
     ) -> None:
         with self._lock:
             self._worker_generations = runtime.worker_generations
+            for outcome in polled.primary_outcomes:
+                self._pending_primary_keys.discard(
+                    (outcome.pair_id, outcome.request_generation)
+                )
             for bundle in polled.completed_bundles:
+                self._pending_primary_keys.discard(
+                    (bundle.pair_id, bundle.request_generation)
+                )
                 self._pending_requests.pop(
                     (bundle.pair_id, bundle.request_generation),
                     None,
@@ -713,6 +732,7 @@ class MethodEvaluationCoordinator:
         with self._lock:
             pending = tuple(self._pending_requests.values())
             self._pending_requests.clear()
+            self._pending_primary_keys.clear()
             self._actor_error = reason
         bundles: list[MethodEvaluationBundle] = []
         for requests in pending:
@@ -771,7 +791,13 @@ class MethodEvaluationCoordinator:
                         runtime.start()
                         continue
                     if command == "submit":
-                        submission = runtime.submit(payload)  # type: ignore[arg-type]
+                        requests, comparison_backpressure = payload  # type: ignore[misc]
+                        submission = runtime.submit(
+                            requests,
+                            comparison_backpressure=bool(
+                                comparison_backpressure
+                            ),
+                        )
                         if submission.backpressure_bundle is not None:
                             bundle = submission.backpressure_bundle
                             with self._lock:
@@ -783,7 +809,13 @@ class MethodEvaluationCoordinator:
                                 MethodEvaluationPoll(completed_bundles=(bundle,))
                             )
                 if not closing:
-                    self._publish_poll(runtime.poll(), runtime)
+                    polled = runtime.poll()
+                    self._publish_poll(polled, runtime)
+                    if (
+                        polled.primary_outcomes
+                        and not runtime.comparison_workers_started
+                    ):
+                        runtime.start_comparison_workers()
         except BaseException as exc:  # noqa: BLE001 - convert actor death to terminal outcomes.
             self._publish_actor_failure(exc)
         finally:
@@ -794,6 +826,7 @@ class MethodEvaluationCoordinator:
                     self._actor_error = f"runtime close failed: {exc}"
             with self._lock:
                 self._pending_requests.clear()
+                self._pending_primary_keys.clear()
             self._closed_event.set()
 
     def __enter__(self) -> Self:

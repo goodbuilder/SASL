@@ -249,7 +249,7 @@ def read_measurement_stream(
     measurement_root: Path | str,
     logical_role: str = "raw/stereo_measurements",
 ) -> RecordingStream:
-    """Read one logical stream, refusing Parquet fallback for a declared v3 JSONL."""
+    """Read one logical stream, refusing fallback for declared authoritative JSONL."""
 
     root = Path(measurement_root).expanduser().resolve(strict=True)
     if not root.is_dir():
@@ -265,18 +265,19 @@ def read_measurement_stream(
     details = manifest.get("artifact_details")
     details = details if isinstance(details, Mapping) else {}
     descriptor = details.get(jsonl_key)
-    is_jsonl_storage = str(manifest.get("schema") or "").endswith(
-        "measurement-storage-v3"
+    storage_schema = str(manifest.get("schema") or "")
+    is_jsonl_storage = storage_schema.endswith(
+        ("measurement-storage-v3", "measurement-storage-v4")
     )
     if is_jsonl_storage and manifest.get("status") != "finalized":
-        raise OSError("v3 measurement generation is not finalized")
+        raise OSError("authoritative measurement generation is not finalized")
     declared_measurement_id = str(manifest.get("measurement_id") or "")
     if (
         is_jsonl_storage
         and root.parent.name == "measurements"
         and declared_measurement_id != root.name
     ):
-        raise OSError("v3 measurement identity does not match its directory")
+        raise OSError("measurement identity does not match its directory")
     if isinstance(descriptor, Mapping):
         if descriptor.get("authoritative") is not True:
             raise OSError("declared canonical JSONL is not authoritative")

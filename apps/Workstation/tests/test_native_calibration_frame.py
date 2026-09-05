@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import multiprocessing
 from typing import Any
 
 import pytest
 from PyQt5 import QtGui
 
 from Workstation.workstation_core.camera_pane import CameraPane
+from Workstation.workstation_core.native_frame_ring import FrameKey, SharedNativeFrameRing
 
 
 def _image(width: int, height: int, color: tuple[int, int, int]) -> QtGui.QImage:
@@ -167,3 +169,84 @@ def test_calibration_frame_near_selects_the_closest_native_timestamp() -> None:
         maximum_delta_s=0.005,
         now_monotonic_s=400.1,
     ) is None
+
+
+def test_exact_calibration_frame_key_never_substitutes_a_nearby_frame() -> None:
+    ring = SharedNativeFrameRing.create(
+        camera_id="left",
+        stream_generation=7,
+        capacity=1,
+        max_width=4,
+        max_height=3,
+        channels=3,
+        mp_context=multiprocessing.get_context("spawn"),
+    )
+    pane = CameraPane("left")
+    pane.stream_generation = 7
+    pane.native_frame_ring = ring
+    try:
+        first = ring.publish_bytes(
+            bytes([1]) * (4 * 3 * 3),
+            width=4,
+            height=3,
+            channels=3,
+            timestamp_s=500.0000,
+        )
+        first_metadata = first.to_mapping()
+        first_metadata.update(
+            {
+                "native_lossless_source": True,
+                "overlay_applied": False,
+                "h264_nal1_non_idr_intra": True,
+                "h264_access_unit_pts_ns": 1_000,
+                "decoded_buffer_pts_ns": 1_000,
+            }
+        )
+        pane._remember_native_descriptor(first_metadata)
+
+        exact = pane.calibration_native_frame_for_key(
+            first.key,
+            now_monotonic_s=500.1,
+        )
+        assert exact is not None
+        assert exact[0] == first.key.text
+        assert exact[2]["h264_nal1_non_idr_intra"] is True
+        assert pane.calibration_native_frame_for_key(
+            FrameKey("right", 7, first.key.frame_id),
+            now_monotonic_s=500.1,
+        ) is None
+        assert pane.calibration_native_frame_for_key(
+            FrameKey("left", 6, first.key.frame_id),
+            now_monotonic_s=500.1,
+        ) is None
+
+        second = ring.publish_bytes(
+            bytes([2]) * (4 * 3 * 3),
+            width=4,
+            height=3,
+            channels=3,
+            timestamp_s=500.0001,
+        )
+        second_metadata = second.to_mapping()
+        second_metadata.update(
+            {
+                "native_lossless_source": True,
+                "overlay_applied": False,
+                "h264_nal1_non_idr_intra": True,
+                "h264_access_unit_pts_ns": 2_000,
+                "decoded_buffer_pts_ns": 2_000,
+            }
+        )
+        pane._remember_native_descriptor(second_metadata)
+
+        assert pane.calibration_native_frame_for_key(
+            first.key,
+            now_monotonic_s=500.1,
+        ) is None
+        assert pane.calibration_native_frame_for_key(
+            second.key,
+            now_monotonic_s=500.1,
+        ) is not None
+    finally:
+        ring.close()
+        ring.unlink()

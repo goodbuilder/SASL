@@ -50,6 +50,15 @@ def test_measurement_pairs_are_typed_and_dynamic_fields_round_trip_losslessly(
             "left_cx": "101.25",
             "distance_m": 17.5,
             "baseline_length_m": 2,
+            "pairing_time_basis_requested": "camera_rtcp",
+            "pairing_time_basis": "app_receive_monotonic",
+            "pairing_fallback_active": "true",
+            "pairing_fallback_reason": "CLOCK_NOT_VERIFIED",
+            "selected_pair_midpoint_ns": 9_007_199_254_740_999,
+            "app_receive_evidence_role": "selected_distance_pairing",
+            "left_media_recovery_basis": "wiris_non_idr_intra_experimental",
+            "left_media_integrity_mode": "experimental_non_idr_intra",
+            "left_media_random_access_guaranteed": "false",
             "odd_nested": {
                 "unicode": "산",
                 "values": [1, False, None, {"new_solver_field": 4.25}],
@@ -80,6 +89,23 @@ def test_measurement_pairs_are_typed_and_dynamic_fields_round_trip_losslessly(
     assert table.column("measurement_valid").to_pylist() == [True, False]
     assert table.column("left_bbox_center_x_px").to_pylist() == [101.25, None]
     assert table.column("baseline_m").to_pylist() == [2.0, None]
+    assert table.column("left_media_recovery_basis").to_pylist() == [
+        "wiris_non_idr_intra_experimental",
+        None,
+    ]
+    assert table.column("left_media_random_access_guaranteed").to_pylist() == [
+        False,
+        None,
+    ]
+    assert table.column("pairing_time_basis_requested").to_pylist() == [
+        "camera_rtcp",
+        None,
+    ]
+    assert table.column("pairing_fallback_active").to_pylist() == [True, None]
+    assert table.column("selected_pair_midpoint_ns").to_pylist() == [
+        9_007_199_254_740_999,
+        None,
+    ]
 
     expected_rows = [
         {
@@ -98,15 +124,15 @@ def test_measurement_pairs_are_typed_and_dynamic_fields_round_trip_losslessly(
     assert metadata.row_count == 2
     assert metadata.size_bytes == output.stat().st_size
     assert metadata.sha256 == hashlib.sha256(output.read_bytes()).hexdigest()
-    assert metadata.schema["id"] == "workstation-measurement-pairs-parquet-v1"
-    assert metadata.schema["version"] == 1
+    assert metadata.schema["id"] == "workstation-measurement-pairs-parquet-v4"
+    assert metadata.schema["version"] == 4
     assert len(metadata.schema_sha256) == 64
     assert metadata.authoritative is False
     assert metadata.verified is True
     mapping = metadata.to_mapping(relative_to=tmp_path)
     assert mapping["relative_path"] == MEASUREMENT_PAIRS_FILENAME
     assert mapping["size_bytes"] == output.stat().st_size
-    assert mapping["schema_version"] == 1
+    assert mapping["schema_version"] == 4
     assert mapping["derived_from"] == []
 
 
@@ -121,6 +147,9 @@ def test_camera_partitions_are_combined_with_non_nullable_side(
                 {
                     "sequence": 1,
                     "image_width_px": "1920",
+                    "media_recovery_basis": "wiris_non_idr_intra_experimental",
+                    "media_integrity_mode": "experimental_non_idr_intra",
+                    "media_random_access_guaranteed": False,
                     "odd_camera": {"rtcp": [1, 2]},
                 }
             ],
@@ -140,11 +169,22 @@ def test_camera_partitions_are_combined_with_non_nullable_side(
     assert table.schema.field("side").nullable is False
     assert table.column("side").to_pylist() == ["left", "right"]
     assert table.column("image_width_px").to_pylist() == [1920, None]
+    assert table.column("media_recovery_basis").to_pylist() == [
+        "wiris_non_idr_intra_experimental",
+        None,
+    ]
+    assert table.column("media_random_access_guaranteed").to_pylist() == [
+        False,
+        None,
+    ]
     assert read_lossless_rows(output, "camera_timeline") == [
         {
             "side": "left",
             "sequence": 1,
             "image_width_px": "1920",
+            "media_recovery_basis": "wiris_non_idr_intra_experimental",
+            "media_integrity_mode": "experimental_non_idr_intra",
+            "media_random_access_guaranteed": False,
             "odd_camera": {"rtcp": [1, 2]},
         },
         {
@@ -155,6 +195,8 @@ def test_camera_partitions_are_combined_with_non_nullable_side(
         },
     ]
     assert metadata.row_count == 2
+    assert metadata.schema["id"] == "workstation-camera-timeline-parquet-v3"
+    assert metadata.schema["version"] == 3
 
 
 def test_px4_partitions_are_combined_with_source_id_and_keep_payload(

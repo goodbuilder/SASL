@@ -150,7 +150,7 @@
 - Those MP4 bytes still fail R7 independently: zero IDR, decoder-visible loss, reference gaps and
   final `stts=0`. Full artifact: `evidence/exact-evidence-readiness-legacy-20260827.md`.
 - Focused Workstation evidence tests: **37 passed**. Legacy support and focused paths:
-  **95 + 16 passed**. Current complete Workstation suite: **1466 passed, 1 skipped**.
+  **95 + 16 passed**. Complete Workstation suite at that slice: **1466 passed, 1 skipped**.
 
 ### Fresh runtime and portability slice
 
@@ -293,6 +293,20 @@
   -313.712/-808.643 ms (~494.931 ms relative); zero-IDR blocked the bounded second round, so R3 is
   still CRITICAL FIELD FAIL.
 
+### STUS 30-minute relative oscillator holdover
+
+- A read-only 1,800.022-second dual RTCP/TCP run collected 381 Left and 377 Right Sender Reports in
+  one continuous segment per side with zero reconnects and no STUS/device mutation.
+- Robust RTC/NTP regression confirms Right faster than Left by **16.605 ppm**, conservative 95%
+  interval **+11.863 to +21.356 ppm**. Independent RTP media-clock regression agrees at
+  **+16.634 ppm**, interval **+11.965 to +21.401 ppm**.
+- The direct relative SR-PC difference moved +31.356 ms over 30 minutes (+17.420 ppm). Every
+  five-minute checkpoint retained the same direction. At the final point estimate, 100 ms
+  accumulates in about 100.4 minutes.
+- Exact method, checkpoints, caveats and raw artifact hash are in
+  `evidence/stus-relative-oscillator-30m-20260827.md`. This confirms oscillator-rate difference for
+  the current powered run; it does not close STUS phase convergence or post-reboot repeatability.
+
 ### Exact-frame reservation and evidence-integrity slice
 
 - `QT_QPA_PLATFORM=offscreen ../../.venv/bin/python -m pytest -q
@@ -337,7 +351,7 @@
 
 ## Regression and application evidence
 
-The current full Workstation suite passes fresh (**1466 passed, 1 skipped**). A broad StereoWIRIS suite remains affected by the known
+The current full Workstation suite passes fresh (**1515 passed, 1 skipped**). A broad StereoWIRIS suite remains affected by the known
 native Qt order-dependent abort; the relevant focused paths pass, and the test harness no longer
 writes the tracked operator settings. Root-suite collection's duplicate module-name conflict and
 the Legacy native-order residual remain visible rather than treated as product PASS evidence.
@@ -426,3 +440,319 @@ MP4 remain blocked by zero-IDR; full integrated NTRIP/cold-boot/60-minute accept
 The confirmed FW 2.18.72 zero-IDR sender is the common CRITICAL blocker for R1/R2/R3/R7. PX4
 MAVLink passes isolated-NIC short and ten-minute gates, while the internal shared-L2 stall mechanism
 remains unproven. Open-sky RTK Fixed, three independent cold boots and final 60 minutes remain.
+
+An additional indoor, decoder-free SDK qualification confirmed this boundary. Left visible IDR
+intervals 0/1/2/3 produced exact SDK ACK/readback but five fresh raw Annex-B artifacts across both
+cameras contained NAL1/SPS/PPS/AUD and zero NAL5. Non-IDR I pictures remained `key_frame=0`.
+Repeated read-only SDK access independently collapsed Right FTP/SDK/RTSP while ping remained live;
+operator physical power recovery restored all services, and both cameras finish at
+`GETH=TRUE`, `GSSS=0`, `IRCR=FALSE`, visible `0/1/30/1`. See
+`evidence/indoor-wiris-idr-sdk-20260827.md`.
+
+The requested pre-NTRIP shared-NIC A/B now fails on two different physical adapters. On the second
+adapter, no-camera direct ETH MAVLink returned 602/613 datagrams after 12 host heartbeats per side.
+Adding dual Preview then left P1 healthy but drove P2 to sustained ETH RX STALLED: a 10-second pcap
+had 1,586 P1 inbound packets, zero P2 inbound and 11 host heartbeats to each peer. P2 USB heartbeat
+remained alive, so the failure is Ethernet-instance-specific. NTRIP was never started. See
+`evidence/shared-nic-camera-pixhawk-baseline-20260827.md`.
+
+## Proposed app-receive fallback verification matrix — NOT_RUN / not approved
+
+| Slice | Independent evidence required | Status |
+|---|---|---|
+| Basis decision | hand-built VERIFIED, revoked, unseeded, transition and recovered state table | NOT_RUN |
+| Pair selection | distinct sentinel NTP/app timestamps; drifted NTP but app delta ≤100 ms selects app | NOT_RUN |
+| Failure bounds | app delta >100 ms, mixed basis generation, epoch transition/mismatch produce no pair | NOT_RUN |
+| Geometry isolation | identical pixels/calibration produce identical geometry across timing bases | NOT_RUN |
+| Persistence | independent readback proves selected/app/NTP fields and compact `sync_delta_ns` meaning | NOT_RUN |
+| Legacy read | v3 row without selected-basis fields retains historical interpretation | NOT_RUN |
+| UI | NTP→fallback→transition→recovery text, ESTIMATED validity and stable geometry/focus | NOT_RUN |
+| Integration | real drift/revocation keeps bounded app-timed distance and NTP evidence, then recovers | NOT_RUN |
+
+## STUS cadence reliability evaluation
+
+| Question | Current evidence | Status |
+|---|---|---|
+| Does a shorter interval reduce oscillator drift? | 16.605 ppm implies 4.98/9.96/14.94/29.89 ms per 5/10/15/30 min | PASS (model + 30m field data) |
+| Is current one-cycle STUS repeatable? | two preflight failures; one exact dual-OK action changed about 140 ms to about 3.11 s and never reached correction | FAIL |
+| Can 5-minute Auto make the current actuator reliable? | saves only about 25 ms versus 30 min; does not bound seconds-scale apply error | FAIL / unsafe to run repeatedly now |
+| Five consecutive repaired manual cycles | final delta ≤100 ms, target ≤50 ms, no continuity/resource failure | NOT_RUN |
+| Six-cycle 5-minute Auto stress | every due action converges and preserves active work | BLOCKED by manual-cycle gate |
+| Selected operational cadence soak | interval derived from residual + drift + safety margin | BLOCKED |
+
+## App-receive-authoritative distance verification — software PASS / hardware gate NOT_RUN
+
+| Slice | Independent evidence required | Status |
+|---|---|---|
+| Exact boundary | integer sentinel proves monotonic ns is captured at decoded appsink receipt before YOLO | SW PASS: one `monotonic_ns` read is reused for exact ns/compatibility float; capture sites precede copy/conversion/YOLO |
+| Pair truth | distinct app/NTP sentinels prove nearest pair and ≤100 ms gate use app only | SW PASS: 20 ms and exact 100 ms selected on app time |
+| NTP noninterference | missing, +9h, regressed and >100 ms NTP values produce identical app pair/result | SW PASS: Clock epoch transition/mismatch, +9 h, malformed and nonfinite NTP do not alter selection/snapshot |
+| App failure | missing/nonfinite/regressed or 100.1 ms app delta produces no pair/distance | SW PASS: explicit invalid/over-limit rejection, including exact 100 ms + 1 ns and malformed exact fields |
+| STUS continuity | active STUS and NTP clock-epoch changes do not pause, flush or degrade valid app pairs | SW PASS: distance policy token contains no Clock/epoch state |
+| Method validity | otherwise-ready app pair is normal VALID; other geometry/input blockers remain exact | SW PASS |
+| Persistence | independent readback proves selected/app delta equality and distinct record-only NTP fields | SW PASS: JSONL and Parquet v4 readback |
+| Schema compatibility | v3 RTCP rows retain original meaning; v4 compact sync delta is app selected truth | SW PASS |
+| Backend parity | GStreamer and every supported decoded backend emit the same app timestamp contract | SW PASS by boundary/source inspection plus worker regressions; hardware GStreamer receipt remains NOT_RUN |
+| UI stability | fixed APP RECEIVE, authoritative app delta, record-only NTP delta; no focus/layout churn | SW/UI PASS: offscreen tests plus AT-SPI and visual inspection |
+| Integration | sustained target-hardware app pairing during Clock failure/STUS with complete saved NTP | NOT_RUN: both FW 2.18.72 streams still emit zero NAL5, so no decoded-frame pair reaches this boundary |
+
+### App-receive-authoritative implementation evidence — 2026-08-27
+
+- GStreamer, OpenCV and PyAV decoded-frame readers call the same exact integer timestamp helper at
+  frame receipt. The exact nanoseconds and explicit `authoritative_distance` role survive worker
+  transport, immutable detection snapshots, pair identity, all method fan-out and storage.
+- Coordinator sentinels independently separate app and NTP values: a 20 ms app pair is selected
+  despite a +9-hour NTP difference and mismatched/transitioning Clock epochs; exact 100 ms is
+  accepted, while 100 ms + 1 ns or a noninteger/invalid exact app timestamp is rejected. Malformed
+  or nonfinite NTP is normalized as unavailable record-only evidence and cannot block the app pair.
+- Schema v4 raw JSONL and typed Parquet readback retain selected/app delta equality and a separately
+  named NTP delta. Schema-aware readers preserve the historical v3 RTCP-delta interpretation.
+- Focused boundary, pairing, snapshot/method, persistence, schema, settings and UI command:
+  `QT_QPA_PLATFORM=offscreen ../../.venv/bin/python -m pytest -q
+  tests/test_workstation_yolo_stream.py tests/test_detection_pair_coordinator.py
+  tests/test_measurement_canonical_evidence.py tests/test_measurement_methods.py
+  tests/test_recording_raw_artifacts.py tests/test_recording_reader.py
+  tests/test_session_parquet.py tests/test_workstation_settings.py
+  tests/test_workstation_contracts.py tests/test_workstation_camera.py` returned **244 passed**.
+- The final complete Workstation regression returned **1515 passed, 1 skipped** in 129.23 seconds.
+  `tools/gen_panel_delegate_stubs.py --check`, `git diff --check` and `./run.sh --check` pass.
+- The live Measurement surface was inspected offscreen and through AT-SPI: `APP RECEIVE` is fixed
+  and read-only, the hard gate is 0.100 seconds, the authoritative app delta and `NTP record-only`
+  labels are distinct, and the layout remains stable. Screenshot:
+  `/tmp/workstation_app_receive_measurement_ui_final_20260827.png`.
+- Target-hardware pairing is deliberately **NOT_RUN**, not PASS: the current camera firmware's
+  zero-NAL5 stream prevents decoded frames from reaching the newly timestamped boundary. That
+  external media blocker must be resolved before a sustained Clock-failure/STUS integration gate.
+
+## Proposed indoor 60-minute experiment matrix — NOT_RUN / awaiting approval
+
+| Slice | Independent evidence | Status |
+|---|---|---|
+| Strict default | flag absent still rejects every NAL1 and requires exact NAL5/PTS | NOT_RUN |
+| NAL1 classifier | hand-built AU cases: missing SPS/PPS, delta, mixed/malformed, bad PTS/flags reject | NOT_RUN |
+| Recovery state | exact candidate PTS opens only after decoded return; next gap relatches per side | NOT_RUN |
+| Provenance/UI | experimental basis visible/saved; never IDR/keyframe; stable focus/layout | NOT_RUN |
+| MP4 truth | bytes/EOS may pass; usable-IDR/portable integrity remains FAIL | NOT_RUN |
+| NTRIP secret | process-local SASL credential, HTTP 200, no log/settings/keyring secret | NOT_RUN |
+| Five-minute gate | dual camera/P1/P2/NTRIP/recording/UI/resource prerequisites | NOT_RUN |
+| 60-minute soak | twelve checkpoints, no required terminal failure, exact 3,600 s | NOT_RUN |
+| Saved evidence | app pair ≤100 ms, NTP record-only, RTCM/MAVLink counters, artifacts readable | NOT_RUN |
+| Shutdown/rollback | EOS/writer drain, no child/socket/ring residue, strict relaunch | NOT_RUN |
+
+Existing offline real artifacts provide feasibility only: 17/17 adjacent Left NAL1-I GOP segments
+started a fresh FFmpeg decoder with `-xerror`, while a Right segment failed after a later packet
+omission. This does not substitute for the proposed product/hardware run.
+
+### Prepared five-minute and checkpoint oracle
+
+The current idle real GUI exposes the required commands and diagnostics through AT-SPI, so the
+monitor does not infer liveness from button text alone. A checkpoint is valid only when one bounded
+AT-SPI traversal completes and the matching external PID/socket/file counters are sampled in the
+same interval.
+
+Five-minute admission requires:
+
+- both camera rows current with nonzero decoded FPS and explicit experimental provenance;
+- both Pixhawk rows have fresh expected-sysid heartbeat and attitude, not merely open UDP sockets;
+  both must become `LIVE` after 60 seconds, while the first 10-minute checkpoint separately proves
+  sustained continuity;
+- NTRIP HTTP 200/streaming, current CRC-valid RTCM and dual delivery failures equal zero;
+- Measurement/Detection active, or an exact no-target/no-geometry BLOCKED reason while frame/pair
+  evidence continues; recording files show positive growth;
+- GUI traversal below two seconds, no callback exception, storage OK, at least 100 GiB free, and no
+  unbounded queue/RSS trend.
+
+Every 300-second soak checkpoint records elapsed monotonic ns, side states/details/FPS, app pair
+delta/count/drop reason, Clock/SR observation, MAVLink ages/rates/counters, NTRIP GGA/RTCM/delivery,
+recording bytes/writer state, GUI traversal latency, process/child/socket/ring set, CPU/RSS, GPU
+utilization/memory/encoder sessions, NIC errors/drops and disk free. Secrets and exact credential
+environment values are excluded by schema.
+
+The user-approved location is now outdoor. Add P1/P2 actual rover fix type and horizontal/vertical
+accuracy to every checkpoint; preflight must observe current GNSS from both sides, and final
+qualification reports sustained RTK Fixed separately from transport/injection. The remaining matrix
+is unchanged and is now ready for implementation/execution.
+
+## Manual-only PX4 calibration PARAM verification amendment
+
+| Criterion | Evidence | Status |
+|---|---|---|
+| Repeated LIVE status refresh sends no PARAM work | controller regression with repeated status flush | SW PASS |
+| P1/P2 manual full refresh remains routed | command/backend regression | SW PASS |
+| Advanced MAG/attitude refresh remains routed | existing command regressions | SW PASS |
+| Reset/apply/save readback remains intact | focused PX4 manager/controller regressions | SW PASS |
+| No settings/schema/UI geometry change | source diff plus offscreen workspace regression | SW PASS |
+| Complete Workstation regression and launcher | canonical venv commands | SW PASS |
+
+No hardware request is required to prove removal of an implicit caller. Historical automatic PARAM
+pcaps remain valid old-build evidence and are not reclassified.
+
+Focused exact-path tests returned **3 passed**. The expanded MAVLink liveness, Pixhawk status,
+calibration manager, RTCM reservation and Workstation command/UI regression returned **183 passed**.
+Generated delegate check, Python compilation and `git diff --check` passed. These are software/fake
+results; the running pre-change 600-second field process remains a historical baseline and must not
+be presented as evidence for the restarted manual-only build.
+
+The complete canonical Workstation suite returned **1523 passed, 1 skipped in 138.70 s**. The
+documented `./run.sh --check` entry point passed with the canonical interpreter, all required
+GStreamer factories, Auto→`nvh264dec`, NVIDIA driver and declared runtime packages. Final
+compileall, generated-delegate check and `git diff --check` passed. The pre-change Workstation
+process exited after its 600-second baseline monitor, so the next launch uses this manual-only source.
+
+## 60-second operational MAVLink qualification verification amendment
+
+| Criterion | Independent evidence | Status |
+|---|---|---|
+| Exact boundary | fake monotonic 59.999 remains QUALIFYING; 60.000 with fresh HB+ATT is LIVE | SW PASS |
+| Recovery | all-RX stall/resume and remote reboot require a new 60-second interval | SW PASS |
+| Explicit command | manual PARAM boundary requires post-command HB+ATT plus 60 seconds | SW PASS |
+| Immediate blocking | ATTITUDE stale and all-RX stall thresholds remain unchanged | SW PASS |
+| No hidden PARAM | repeated LIVE status produces no automatic readback or reset | SW PASS |
+| UI/evidence | all operator/status/evidence text derives `01:00` from the health contract | SW PASS |
+| Monitor separation | external 10/60-minute stability duration remains independent of 60-second LIVE | SW PASS |
+| Full regression/launcher | canonical Workstation suite and documented runtime check | PASS |
+
+Coordinate review: this slice changes duration/state presentation only. PX4 body-FRD attitude,
+earth-NED, camera optical RDF, stereo-center and stored coordinate fields are unchanged.
+
+RED focused run returned the expected **10 failed, 114 passed** against the old 600-second source.
+After implementation, the exact focused set returned **124 passed** and the expanded MAVLink,
+Pixhawk, status, RTCM, manual-PARAM and UI command set returned **192 passed**. A dynamic 65-second
+sentinel additionally proves the transition log formats the snapshot-owned requirement rather than
+a new hard-coded `01:00` literal.
+
+The complete canonical Workstation suite returned **1524 passed, 1 skipped in 140.13 seconds**.
+`./run.sh --check`, generated panel delegates, direct system-Python monitor `--help`, portable path
+policy, Python compilation and full `git diff --check` all pass. The approved README target is
+`apps/Workstation/README.md`.
+
+Target-hardware latest-build 60-second confirmation is **NOT_RUN**: the operator disconnected every
+wired device before the optional final probe. The attempted app launch truthfully reported the
+configured NIC absent and then completed normal Quit with exit code zero; no P1/P2 packets were
+available, so no hardware PASS is claimed. Earlier 10-minute captures remain historical old-timer
+evidence and are not substituted for this new-build check.
+
+## Mountain GNSS 3D-fix verification amendment
+
+| Criterion | Independent evidence | Status |
+|---|---|---|
+| 3D-or-better admission | same-burst Left fix 3 + Right fix 5 exposes all translation axes | SW PASS |
+| Sub-3D fail-close | Left fix 2 leaves North/East/Down unobservable with numeric reason | SW PASS |
+| Baseline integrity | non-finite position and zero baseline each fail before candidate use | SW PASS |
+| Rotation isolation | existing Mountain robust inlier/rank/condition solve remains required | SW PASS |
+| Draft boundary | latest non-fixed 3D Mountain Draft freezes at next Measurement and is ready | SW PASS |
+| Quality/persistence | warning survives worker outcome as `ESTIMATED`; method ID is `mountain_gnss` | SW PASS |
+| Representative stability | canonical method order still starts with `pixhawk_rtk_live` | SW PASS |
+| Scope | no setting/schema migration/UI layout/device command; docs updated | SW PASS |
+| Full regression/runtime | canonical suite plus launcher/runtime and static checks | PASS |
+
+Exact Mountain-focused integration returned **9 passed**. The expanded optical-pose, Measurement,
+method-worker, canonical-evidence and UI-contract set returned **132 passed**. The complete
+canonical Workstation suite returned **1529 passed, 1 skipped in 122.82 seconds**.
+`./run.sh --check`, generated delegate verification, targeted compileall and targeted
+`git diff --check` all pass. This gate consumes immutable captured evidence and sends no hardware
+command, so a new device-side run is not required to verify the software amendment.
+
+## Mountain Use suggestion quality-separation verification — software/UI PASS
+
+| Criterion | Independent evidence | Status |
+|---|---|---|
+| Baseline | LOW_CONFIDENCE with distributed points leaves `Use suggestion` disabled | OBSERVED |
+| Confidence separation | structurally usable LOW_CONFIDENCE enables/copies with warning | SW/UI PASS |
+| Hard structure | <4, out-of-range, duplicate, near-collinear and malformed pairs reject | SW PASS |
+| Identity | adversarially retained stale proposal rejects by current frame ID/SHA contract | SW PASS |
+| Exclusions | one paired index set filters both sides and persists exact retained input | SW PASS |
+| Quality persistence | LOW_CONFIDENCE remains in accepted snapshot/UI warning | SW/UI PASS |
+| UI stability | same 770×164 group/control geometry; COPY READY/BLOCKED changes only state text | VISUAL PASS |
+| Horizon at Mountain-slice time | LOW_CONFIDENCE rejection was the then-current contract | HISTORICAL; superseded below |
+| Solver/GNSS isolation | Solve has no direct proposal path; K,D/GNSS/robust gates unchanged | SW PASS |
+| Direct Solve | not approved and not implemented | OUT OF SCOPE |
+| Regression/runtime | dependent and complete Workstation tests plus launcher/static checks | PASS |
+
+Focused command:
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 QT_QPA_PLATFORM=offscreen
+../../.venv/bin/python -m pytest -p no:cacheprovider -q
+tests/test_optical_pose_auto_select.py tests/test_optical_pose_workspace.py
+tests/test_optical_pose_session_persistence.py tests/test_optical_pose_controller_integration.py
+` returned **76 passed**.
+
+The dependent command added optical-pose workers, command/lifecycle routing, generated delegate and
+controller-delegation tests and returned **139 passed**. After the final native-dimension UI
+fail-close check, the complete current Workstation suite returned **1564 passed, 2 skipped in
+125.59 seconds** with no warnings.
+`./run.sh --check`, generated delegate verification, targeted compileall and full
+`git diff --check` all pass.
+
+Reconstructed before and actual after offscreen captures are
+`/tmp/workstation_mountain_use_suggestion_before_20260829.png` and
+`/tmp/workstation_mountain_use_suggestion_after_20260829.png`. Both are 770×164; the after image
+retains LOW_CONFIDENCE, enables the existing button and adds COPY READY without a layout change.
+This slice transforms only same-order native OpenCV `(u,v)` points and sends no hardware command;
+target-device verification is not required.
+
+## Horizon Use suggestion quality-separation verification — software/UI PASS
+
+| Criterion | Independent evidence | Status |
+|---|---|---|
+| Quality separation | structurally valid LOW_CONFIDENCE enables and accepts | SW/UI PASS |
+| Quality display | state, confidence, residual, reason and accepted warning remain | SW/UI PASS |
+| Endpoint structure | exact two-per-side, finite bounds and 25%-width separation | SW PASS |
+| Identity | stale frame ID/SHA and dimension mismatches reject | SW PASS |
+| Persistence | normalized endpoints, validated-input SHA and warning reach acceptance event/review | SW PASS |
+| UI stability | same 771×143 group/control geometry; COPY READY/BLOCKED changes only state text | VISUAL PASS |
+| Mountain regression | structural exclusions and LOW_CONFIDENCE copy remain passing | SW PASS |
+| Solve/Apply isolation | explicit Horizon Solve/Apply and exact K,D/observability gates unchanged | SW PASS |
+| Regression/runtime | focused, dependent, complete suite and launcher/static checks | PASS |
+
+Focused command:
+
+
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 QT_QPA_PLATFORM=offscreen
+../../.venv/bin/python -m pytest -p no:cacheprovider -q
+tests/test_optical_pose_auto_select.py tests/test_optical_pose_workspace.py
+tests/test_optical_pose_session_persistence.py tests/test_optical_pose_controller_integration.py`
+returned **82 passed**. Adding optical-pose workers, command/lifecycle routing, generated delegate
+and controller-delegation tests returned **145 passed**. The complete current Workstation suite
+returned **1583 passed, 2 skipped in 141.24 seconds**.
+
+Generated delegate verification, targeted compileall and full `git diff --check` pass.
+`./run.sh --check` exits zero; the current host emitted an unrelated optional warning that
+`nvh264dec` could not be instantiated and Auto selected `avdec_h264`. No Horizon code owns decoder
+selection.
+
+Reconstructed before and actual after captures are
+`/tmp/workstation_horizon_use_suggestion_before_20260829.png` and
+`/tmp/workstation_horizon_use_suggestion_after_20260829.png`. Both are 771×143. The after image
+retains LOW_CONFIDENCE/confidence/residual/reason, enables the existing button and adds COPY READY.
+This slice only validates/copies native OpenCV `(u,v)` endpoints and sends no hardware command;
+target-device verification is not required.
+
+## Approved Settings-preferred distance timing verification — implementing
+
+| Criterion | Independent evidence | Status |
+|---|---|---|
+| Default/migration | missing/invalid default, strict legacy migration and RTCP save/reload | SW PASS |
+| Healthy preference | distinct app/NTP sentinels prove selected healthy RTCP owns pair and PX4 result | SW PASS |
+| Mandatory fallback | Clock/frame/timestamp/epoch/delta failures select exact app; dual failure rejects | SW PASS |
+| Generation isolation | requested/effective changes flush buffers; stale revision input/result rejects | SW PASS |
+| Cross-layer identity | coordinator decision freezes through snapshot, PX4 host-time lookup and workers | SW PASS |
+| Persistence | schema-v5 JSON/Parquet v4 requested/effective/fallback and old-row semantics | SW PASS |
+| Preview regression | valid preview reaches UI/history with local input-integrity text | SW PASS |
+| UI stability | enabled combo plus fallback status at 1400×1000 without geometry expansion | SW/VISUAL PASS |
+| Regression/runtime | 299 focused PASS; complete Workstation suite and launcher | FOCUSED PASS / FULL NOT_RUN |
+
+Software implementation and verification are authorized. Hardware behavior remains separately
+NOT_RUN unless current devices can provide usable decoded-frame evidence without a device mutation.
+
+Focused command covered coordinator, canonical evidence, all method workers, Measurement boundary,
+package UI, raw recording/readers/Parquet, Settings, camera status, command contracts and field
+pairing and returned **299 passed**. Exact app/RTCP sentinels prove healthy RTCP 10 ms selection
+versus app 90 ms, and fallback selects exact app ns without adding a measurement warning. Synthetic
+Pixhawk-attitude/GNSS/K,D geometry returns a VALID approximately 9 m result under both healthy RTCP
+and app fallback. The successful non-multimethod preview path now displays `input=VERIFIED` without
+the former scope exception.
+
+Offscreen visual evidence `/tmp/workstation_timing_settings_20260831.png` is 1400×1000. It shows the
+existing dense Measurement layout, selectable RTCP preference, stable one-line
+`RTCP/NTP → APP RECEIVE · fallback=CLOCK_NOT_VERIFIED` status, explicit next-Measurement Apply note,
+no added card/modal/style, and unchanged control positions. Hardware/field timing remains NOT_RUN.

@@ -107,7 +107,7 @@ def _triangulate(inputs: MeasurementAttempt, warnings: tuple[str, ...]) -> _Tria
                 _with_warning(warnings, "triangulation waiting for checkerboard stereo extrinsics"),
                 "missing_checkerboard_extrinsics",
             )
-    elif inputs.left_attitude is None or inputs.right_attitude is None:
+    elif inputs.geometry_left_quaternion is None or inputs.geometry_right_quaternion is None:
         return _TriangulationAttempt(
             None,
             _with_warning(warnings, "triangulation waiting for Pixhawk R"),
@@ -184,7 +184,9 @@ def _triangulate_pixels_attempt(
             rotation_right_to_left=rotation_right_to_left,
             translation_right_in_left_m=translation_right_in_left_m,
         )
-    if inputs.left_attitude is None or inputs.right_attitude is None:
+    left_quaternion = inputs.geometry_left_quaternion
+    right_quaternion = inputs.geometry_right_quaternion
+    if left_quaternion is None or right_quaternion is None:
         return RayTriangulationAttempt(None, "missing_pixhawk_rotation")
     if inputs.translation_right_in_left_m is None:
         return RayTriangulationAttempt(None, "missing_rtk_translation")
@@ -193,7 +195,7 @@ def _triangulate_pixels_attempt(
         right_pixel=right_pixel,
         left_intrinsics=inputs.intrinsics.left,
         right_intrinsics=inputs.intrinsics.right,
-        left_body_to_world_q=inputs.left_attitude.quaternion_wxyz,
-        right_body_to_world_q=inputs.right_attitude.quaternion_wxyz,
+        left_body_to_world_q=left_quaternion,
+        right_body_to_world_q=right_quaternion,
         translation_right_in_left_m=inputs.translation_right_in_left_m,
     )

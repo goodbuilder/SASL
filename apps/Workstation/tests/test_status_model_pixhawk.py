@@ -7,6 +7,10 @@ from types import SimpleNamespace
 import pytest
 
 from Workstation.status_model import BackendStatusAdapter, StatusSeverity
+from Workstation.workstation_core.mavlink_liveness import (
+    MAVLINK_ALL_RX_STALL_S,
+    MAVLINK_INITIAL_RX_TIMEOUT_S,
+)
 
 
 @pytest.mark.parametrize(
@@ -44,6 +48,38 @@ def test_active_pixhawk_command_overrides_stale_or_disconnected_status(
     assert status.detail == "PX4 파라미터 조회 중 (정상)"
 
 
+def test_shell_poll_status_is_not_presented_as_parameter_sync() -> None:
+    from Workstation.workstation_core.pixhawk_attitude import DualPixhawkMavlinkSubscriber
+
+    subscriber = DualPixhawkMavlinkSubscriber(left_url="", right_url="")
+    subscriber.connections = {"left": object()}
+    model = subscriber._ensure_liveness_listener("left")
+    generation = model.connection_generation
+    for message_type in ("HEARTBEAT", "ATTITUDE"):
+        assert model.observe_packet(
+            system_id=1,
+            component_id=1,
+            message_type=message_type,
+            received_at_s=10.0,
+            generation=generation,
+        )
+    panel = SimpleNamespace(
+        _mavlink_open_sides=lambda: ("left",),
+        pixhawk_attitude_times={"left": [10.0]},
+        mavlink_pixhawk=subscriber,
+        latest_extrinsics={},
+    )
+    adapter = BackendStatusAdapter(SimpleNamespace(panel=panel))
+
+    with subscriber.exclusive_command("left", command_label="RM3100 SHELL POLL"):
+        adapter._refresh_pixhawk(panel, "left", "P1", now_s=10.1)
+
+    status = adapter.model.record("pixhawk.left")
+    assert status is not None
+    assert status.state == "SHELL SYNC"
+    assert status.detail == "PX4 Shell sensor_mag 조회 중 (정상)"
+
+
 def test_pixhawk_status_tracks_exclusive_command_lifecycle_per_side(monkeypatch) -> None:
     from Workstation.workstation_core import pixhawk_attitude
     from Workstation.workstation_core.pixhawk_attitude import DualPixhawkMavlinkSubscriber
@@ -71,10 +107,11 @@ def test_pixhawk_status_tracks_exclusive_command_lifecycle_per_side(monkeypatch)
     )
     adapter = BackendStatusAdapter(SimpleNamespace(panel=panel))
 
-    clock["value"] = 100.0
+    stall_now_s = 90.0 + MAVLINK_ALL_RX_STALL_S
+    clock["value"] = stall_now_s
     with subscriber.exclusive_command("left"):
-        adapter._refresh_pixhawk(panel, "left", "P1", now_s=100.0)
-        adapter._refresh_pixhawk(panel, "right", "P2", now_s=100.0)
+        adapter._refresh_pixhawk(panel, "left", "P1", now_s=stall_now_s)
+        adapter._refresh_pixhawk(panel, "right", "P2", now_s=stall_now_s)
 
         assert adapter.model.record("pixhawk.left").state == "PARAM SYNC"
         right = adapter.model.record("pixhawk.right")
@@ -98,7 +135,7 @@ def test_pixhawk_status_tracks_exclusive_command_lifecycle_per_side(monkeypatch)
     assert recovered is not None
     assert recovered.state == "QUALIFYING"
     assert recovered.severity == StatusSeverity.WARN
-    assert "00:00 / 10:00" in recovered.detail
+    assert "00:00 / 00:10" in recovered.detail
 
 
 def test_pixhawk_liveness_projection_distinguishes_qualification_attitude_stall_and_recovery(monkeypatch) -> None:
@@ -134,36 +171,38 @@ def test_pixhawk_liveness_projection_distinguishes_qualification_attitude_stall_
     adapter._refresh_pixhawk(panel, "left", "P1", now_s=0.0)
     qualifying = adapter.model.record("pixhawk.left")
     assert qualifying.state == "QUALIFYING"
-    assert "qualification=00:00 / 10:00" in qualifying.detail
+    assert "qualification=00:00 / 00:10" in qualifying.detail
 
-    for second in range(1, 601):
+    for second in range(1, 61):
         observe("HEARTBEAT", float(second))
         observe("ATTITUDE", float(second))
-    adapter._refresh_pixhawk(panel, "left", "P1", now_s=600.0)
+    adapter._refresh_pixhawk(panel, "left", "P1", now_s=60.0)
     live = adapter.model.record("pixhawk.left")
     assert live.state == "LIVE"
     assert live.severity == StatusSeverity.OK
 
-    observe("HEARTBEAT", 602.001)
-    observe("SYS_STATUS", 602.001)
-    adapter._refresh_pixhawk(panel, "left", "P1", now_s=602.001)
+    observe("HEARTBEAT", 62.001)
+    observe("SYS_STATUS", 62.001)
+    adapter._refresh_pixhawk(panel, "left", "P1", now_s=62.001)
     attitude_stale = adapter.model.record("pixhawk.left")
     assert attitude_stale.state == "ATTITUDE STALE"
     assert "bounded ATTITUDE request only" in attitude_stale.detail
 
-    adapter._refresh_pixhawk(panel, "left", "P1", now_s=612.001)
+    stall_now_s = 62.001 + MAVLINK_ALL_RX_STALL_S
+    adapter._refresh_pixhawk(panel, "left", "P1", now_s=stall_now_s)
     stalled = adapter.model.record("pixhawk.left")
     assert stalled.state == "ETH MAVLINK RX STALLED"
     assert stalled.severity == StatusSeverity.BAD
     assert "RTCM blocked" in stalled.detail
     assert "deadlock suspected" in stalled.detail
 
-    observe("HEARTBEAT", 612.1)
-    observe("ATTITUDE", 612.1)
-    adapter._refresh_pixhawk(panel, "left", "P1", now_s=612.1)
+    recovery_now_s = stall_now_s + 0.1
+    observe("HEARTBEAT", recovery_now_s)
+    observe("ATTITUDE", recovery_now_s)
+    adapter._refresh_pixhawk(panel, "left", "P1", now_s=recovery_now_s)
     recovering = adapter.model.record("pixhawk.left")
     assert recovering.state == "RECOVERING"
-    assert "qualification=00:00 / 10:00" in recovering.detail
+    assert "qualification=00:00 / 00:10" in recovering.detail
 
 
 def test_pixhawk_status_projects_initial_heartbeat_timeout_with_peer_and_reason(monkeypatch) -> None:
@@ -187,13 +226,18 @@ def test_pixhawk_status_projects_initial_heartbeat_timeout_with_peer_and_reason(
     )
     adapter = BackendStatusAdapter(SimpleNamespace(panel=panel))
 
-    clock["value"] = 10.0
-    adapter._refresh_pixhawk(panel, "left", "P1", now_s=10.0)
+    clock["value"] = MAVLINK_INITIAL_RX_TIMEOUT_S
+    adapter._refresh_pixhawk(
+        panel,
+        "left",
+        "P1",
+        now_s=MAVLINK_INITIAL_RX_TIMEOUT_S,
+    )
 
     status = adapter.model.record("pixhawk.left")
     assert status is not None
     assert status.state == "MAVLINK INITIAL RX TIMEOUT"
     assert status.severity == StatusSeverity.BAD
     assert "peer=10.0.0.2" in status.detail
-    assert "listener=10.0s" in status.detail
+    assert f"listener={MAVLINK_INITIAL_RX_TIMEOUT_S:.1f}s" in status.detail
     assert "expected-sysid HEARTBEAT not received" in status.detail

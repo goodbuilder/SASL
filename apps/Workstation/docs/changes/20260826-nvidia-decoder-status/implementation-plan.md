@@ -6,6 +6,8 @@ Approved at 2026-08-26T17:45:05+09:00 for Auto GPU-first, visible CPU fallback, 
 status/CAM tooltip/Performance placement, and `./README.md` documentation only.
 
 Software slices 1–5 are implemented and verified. Slice 6 real dual-WIRIS RTSP is NOT_RUN.
+The 2026-09-04 follow-up adds a CUDA Driver API preflight gate so the doctor and launcher agree
+with the actual GStreamer `nvh264dec` registration boundary.
 
 ## Slices and dependencies
 
@@ -16,6 +18,8 @@ Software slices 1–5 are implemented and verified. Slice 6 real dual-WIRIS RTSP
 5. Persist Auto setting, restart Workstation, run doctor and synthetic NVDEC decode.
 6. Run focused Camera/runtime/UI tests, full suite, layout sequence, and real WIRIS preview when
    devices are available.
+7. Re-probe CUDA Driver API failure separately from `nvidia-smi`, select software deterministically,
+   and verify the existing per-side fallback presentation remains unchanged.
 
 ## File and component map
 

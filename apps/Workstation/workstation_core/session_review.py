@@ -35,6 +35,7 @@ from Workstation.workstation_core.measurement_methods import (
     MEASUREMENT_METHOD_LABELS,
     MOUNTAIN_GNSS,
     PIXHAWK_RTK_LIVE,
+    PIXHAWK_RP_GPS_BASELINE_YAW,
     TERRAIN_PNP,
 )
 
@@ -61,6 +62,7 @@ BASE_SHEET_NAMES = (
 # compact while preserving a one-to-one mapping to the canonical method IDs.
 METHOD_SHEET_NAMES: dict[str, str] = {
     PIXHAWK_RTK_LIVE: "M_Pixhawk_RTK",
+    PIXHAWK_RP_GPS_BASELINE_YAW: "M_Pixhawk_RP_Yaw",
     CHECKERBOARD_STEREO: "M_Checkerboard",
     HORIZON_HYBRID: "M_Horizon",
     MOUNTAIN_GNSS: "M_Mountain_GNSS",

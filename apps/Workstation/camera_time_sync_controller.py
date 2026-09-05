@@ -12,14 +12,21 @@ from collections import deque
 from math import isfinite
 from statistics import median
 
+from PyQt5 import QtCore
+
 from Workstation.workstation_core.measurement_widgets import ClockOffsetPoint
-from Workstation.workstation_core.runtime_camera_status import infer_runtime_camera_timestamp_reference
+from Workstation.workstation_core.runtime_camera_status import (
+    infer_runtime_camera_timestamp_reference,
+    is_sr_pc_diagnostic_reason,
+)
 from Workstation.wiris_runtime_workers import (
     WIRIS_STUS_MAX_ABSOLUTE_COMPENSATION_S,
     WIRIS_STUS_MAX_ATTEMPTS,
     WIRIS_STUS_MAX_OPERATION_S,
 )
-CAMERA_RTCP_PAIR_MAX_DELTA_S = 0.050
+from Workstation.workstation_core.rtcp_clock_observer import RtcpClockObserverWorker
+from Workstation.workstation_core.stus_scheduler import STUS_MODE_AUTO, StusScheduler
+CAMERA_RTCP_PAIR_MAX_DELTA_S = 0.100
 CAMERA_RTCP_MAX_PC_OFFSET_S = 0.100
 CAMERA_SYNC_FRAME_HISTORY_WINDOW_S = 1.0
 CAMERA_SYNC_HISTORY_MAX_AGE_S = CAMERA_SYNC_FRAME_HISTORY_WINDOW_S
@@ -33,6 +40,7 @@ CAMERA_SYNC_MONITOR_POLL_INTERVAL_MS = 1000
 CAMERA_SYNC_CORRECTION_REQUIRED_UNIQUE_SR = 3
 CAMERA_SYNC_CORRECTION_MAX_OFFSET_SPAN_S = 0.050
 CAMERA_SYNC_CORRECTION_MAX_OFFSET_MAD_S = 0.020
+CAMERA_SYNC_MAX_HOST_CLOCK_STEP_S = 0.050
 CAMERA_SYNC_STATUS_NOT_VERIFIED = "not-verified"
 CAMERA_SYNC_STATUS_RECONNECTING = "reconnecting"
 CAMERA_SYNC_STATUS_WARMING = "warming"
@@ -48,35 +56,58 @@ def _finite_float(value: object) -> float | None:
     return parsed if isfinite(parsed) else None
 
 
-def stus_closed_loop_compensation_s(
+def stus_relative_pair_compensation_by_camera(
     *,
-    previous_compensation_s: object,
-    sr_pc_offset_s: object,
-) -> float:
-    """Return the next absolute STUS target lead from signed RTCP feedback.
+    previous_compensation_by_camera: dict[str, object],
+    sr_pc_offset_by_camera: dict[str, object],
+) -> tuple[dict[str, float], float, dict[str, float]]:
+    """Remove only differential Left/Right clock error from STUS targets.
 
-    ``rtcp_sr_pc_offset_s`` is ``camera SR NTP - PC receive UTC``.  With an
-    absolute-time STUS command, the next target lead is therefore the previous
-    lead minus that observed error.  Both the observation and resulting lead
-    are bounded before any external mutation is authorized.
+    Per-camera ``SR-PC`` is still observed, but its absolute/common-mode value
+    is not a success or mutation gate.  Subtracting the two-side median leaves
+    only relative error.  The resulting external target remains bounded.
     """
 
-    previous_s = _finite_float(previous_compensation_s)
-    offset_s = _finite_float(sr_pc_offset_s)
-    if previous_s is None or offset_s is None:
-        raise ValueError("STUS closed-loop input is not finite")
-    if abs(offset_s) > WIRIS_STUS_MAX_ABSOLUTE_COMPENSATION_S:
-        raise ValueError(
-            "STUS SR-PC feedback exceeds "
-            f"±{WIRIS_STUS_MAX_ABSOLUTE_COMPENSATION_S:.3f}s limit"
-        )
-    next_s = previous_s - offset_s
-    if abs(next_s) > WIRIS_STUS_MAX_ABSOLUTE_COMPENSATION_S:
-        raise ValueError(
-            "STUS closed-loop target exceeds "
-            f"±{WIRIS_STUS_MAX_ABSOLUTE_COMPENSATION_S:.3f}s limit"
-        )
-    return next_s
+    previous: dict[str, float] = {}
+    offsets: dict[str, float] = {}
+    for camera in ("left", "right"):
+        previous_s = _finite_float(previous_compensation_by_camera.get(camera))
+        offset_s = _finite_float(sr_pc_offset_by_camera.get(camera))
+        if previous_s is None or offset_s is None:
+            raise ValueError(f"{camera} STUS relative closed-loop input is not finite")
+        previous[camera] = previous_s
+        offsets[camera] = offset_s
+    common_mode_s = median(offsets.values())
+    relative_error_by_camera = {
+        camera: offsets[camera] - common_mode_s
+        for camera in ("left", "right")
+    }
+    next_by_camera = {
+        camera: previous[camera] - relative_error_by_camera[camera]
+        for camera in ("left", "right")
+    }
+    for camera, next_s in next_by_camera.items():
+        if abs(next_s) > WIRIS_STUS_MAX_ABSOLUTE_COMPENSATION_S:
+            raise ValueError(
+                f"{camera} STUS relative closed-loop target exceeds "
+                f"±{WIRIS_STUS_MAX_ABSOLUTE_COMPENSATION_S:.3f}s limit"
+            )
+    return next_by_camera, common_mode_s, relative_error_by_camera
+
+
+def _sr_pc_observation_s(row: dict[str, object]) -> float | None:
+    """Return raw SR-PC when available, otherwise its legacy bounded value."""
+
+    raw_s = _finite_float(row.get("sr_pc_offset_raw_s"))
+    return raw_s if raw_s is not None else _finite_float(row.get("sr_pc_offset_s"))
+
+
+def _format_sr_pc_diagnostic(offset_s: float) -> str:
+    return (
+        f"{offset_s * 1000.0:+.1f}ms"
+        if abs(offset_s) < 10.0
+        else f"{offset_s:+.3f}s"
+    )
 
 
 def current_frame_observation_age_s(
@@ -147,6 +178,16 @@ CAMERA_TIME_SYNC_METHODS = [
     "_camera_sync_warmup_timeout_s",
     "_camera_sync_readiness",
     "_camera_sync_correction_observation",
+    "_start_rtcp_clock_observer",
+    "_restart_rtcp_clock_observer",
+    "_stop_rtcp_clock_observer",
+    "_handle_rtcp_clock_observation",
+    "_rtcp_clock_observer_failed",
+    "_clear_rtcp_clock_observer",
+    "_reset_stus_schedule_for_connection",
+    "_poll_stus_schedule",
+    "_stus_schedule_snapshot",
+    "_decorate_clock_epoch_metadata",
     "_poll_camera_sync_state",
     "_begin_camera_sync_after_stus",
     "_clock_sync_side_summary",
@@ -167,6 +208,278 @@ CAMERA_TIME_SYNC_METHODS = [
 class CameraTimeSyncController:
     def __init__(self, panel):
         self.panel = panel
+
+    def _observer_targets(self) -> dict[str, dict[str, object]]:
+        latency_widget = getattr(self.panel, "rtsp_latency_spin", None)
+        latency_value = getattr(latency_widget, "value", None)
+        latency_ms = int(latency_value()) if callable(latency_value) else 100
+        transport_widget = getattr(self.panel, "rtsp_transport_combo", None)
+        transport_value = getattr(transport_widget, "currentData", None)
+        transport = str(transport_value() or "tcp") if callable(transport_value) else "tcp"
+        return {
+            "left": {
+                "url": str(self.panel.left_url_edit.text()).strip(),
+                "latency_ms": latency_ms,
+                "transport": transport,
+            },
+            "right": {
+                "url": str(self.panel.right_url_edit.text()).strip(),
+                "latency_ms": latency_ms,
+                "transport": transport,
+            },
+        }
+
+    def _start_rtcp_clock_observer(self, *, operation_id: str = "") -> bool:
+        if getattr(self.panel, "_rtcp_clock_observer_thread", None) is not None:
+            return False
+        targets = self._observer_targets()
+        if any(not str(row.get("url") or "") for row in targets.values()):
+            return False
+        generation = int(getattr(self.panel, "_rtcp_clock_observer_generation", 0)) + 1
+        self.panel._rtcp_clock_observer_generation = generation
+        histories = getattr(self.panel, "_rtcp_clock_observation_history", None)
+        if isinstance(histories, dict):
+            for side in ("left", "right"):
+                clear = getattr(histories.get(side), "clear", None)
+                if callable(clear):
+                    clear()
+        thread = QtCore.QThread(self.panel)
+        worker_factory = getattr(
+            self.panel,
+            "_rtcp_clock_observer_worker_factory",
+            RtcpClockObserverWorker,
+        )
+        worker = worker_factory(
+            targets,
+            observer_generation=generation,
+        )
+        self.panel._rtcp_clock_observer_thread = thread
+        self.panel._rtcp_clock_observer_worker = worker
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.observation_ready.connect(self.panel._handle_rtcp_clock_observation)
+        worker.status_changed.connect(
+            lambda text: self.panel._log(f"[시계/RTCP] {text}")
+        )
+        worker.failed.connect(self.panel._rtcp_clock_observer_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(
+            lambda thread=thread, worker=worker: self.panel._clear_rtcp_clock_observer(
+                thread,
+                worker,
+            )
+        )
+        operation = getattr(self.panel, "_camera_sync_stus_operation", None)
+        if isinstance(operation, dict) and str(operation.get("operation_id") or "") == str(
+            operation_id or ""
+        ):
+            operation["observer_generation"] = generation
+        thread.start()
+        return True
+
+    def _restart_rtcp_clock_observer(self, *, operation_id: str = "") -> bool:
+        self.panel._rtcp_clock_observer_pending_start = {
+            "operation_id": str(operation_id or ""),
+        }
+        worker = getattr(self.panel, "_rtcp_clock_observer_worker", None)
+        thread = getattr(self.panel, "_rtcp_clock_observer_thread", None)
+        if worker is not None or thread is not None:
+            cancel = getattr(worker, "cancel", None)
+            if callable(cancel):
+                cancel()
+            return True
+        pending = self.panel._rtcp_clock_observer_pending_start
+        self.panel._rtcp_clock_observer_pending_start = None
+        return self._start_rtcp_clock_observer(
+            operation_id=str((pending or {}).get("operation_id") or "")
+        )
+
+    def _stop_rtcp_clock_observer(self) -> None:
+        self.panel._rtcp_clock_observer_pending_start = None
+        worker = getattr(self.panel, "_rtcp_clock_observer_worker", None)
+        cancel = getattr(worker, "cancel", None)
+        if callable(cancel):
+            cancel()
+
+    def _clear_rtcp_clock_observer(self, thread: object, worker: object) -> None:
+        if getattr(self.panel, "_rtcp_clock_observer_thread", None) is thread:
+            self.panel._rtcp_clock_observer_thread = None
+        if getattr(self.panel, "_rtcp_clock_observer_worker", None) is worker:
+            self.panel._rtcp_clock_observer_worker = None
+        pending = getattr(self.panel, "_rtcp_clock_observer_pending_start", None)
+        if not isinstance(pending, dict):
+            return
+        self.panel._rtcp_clock_observer_pending_start = None
+        self._start_rtcp_clock_observer(
+            operation_id=str(pending.get("operation_id") or "")
+        )
+
+    def _handle_rtcp_clock_observation(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        try:
+            generation = int(payload.get("observer_generation"))
+        except (TypeError, ValueError):
+            return
+        if generation != int(getattr(self.panel, "_rtcp_clock_observer_generation", -1)):
+            return
+        side = str(payload.get("side") or "")
+        histories = getattr(self.panel, "_rtcp_clock_observation_history", None)
+        if side not in {"left", "right"} or not isinstance(histories, dict):
+            return
+        history = histories.get(side)
+        if history is None:
+            return
+        identity = (payload.get("ssrc"), payload.get("ntp_raw"))
+        if not any(
+            (row.get("ssrc"), row.get("ntp_raw")) == identity
+            for row in history
+        ):
+            history.append(dict(payload))
+            append_data = getattr(self.panel, "append_workstation_data", None)
+            if callable(append_data):
+                try:
+                    append_data(
+                        "events",
+                        {
+                            "event_type": "camera_clock_observation",
+                            **dict(payload),
+                            "coordinate_contract": (
+                                "camera RTCP/PC clock evidence; no NED/FRD/RDF conversion"
+                            ),
+                        },
+                        priority=False,
+                    )
+                except Exception as exc:  # noqa: BLE001 - observation remains live.
+                    self.panel._log(f"[시계] RTCP observation 기록 실패: {exc}")
+        operation = getattr(self.panel, "_camera_sync_stus_operation", None)
+        if not isinstance(operation, dict) or not operation.get("active"):
+            return
+        phase = str(operation.get("phase") or "")
+        if phase.startswith("observer-restarting-attempt-"):
+            if all(histories.get(camera) for camera in ("left", "right")):
+                attempt = int(operation.get("attempts_started") or 1)
+                operation["phase"] = f"observing-attempt-{attempt}"
+                self.panel._set_camera_sync_state(
+                    CAMERA_SYNC_STATUS_WARMING,
+                    f"STUS attempt {attempt}: post-ACK RTCP observer SR 안정화 대기",
+                )
+            return
+        if phase != "observer-preflight":
+            return
+        # One actual pad-probe SR per side proves the decoder-free observer
+        # boundary. The command worker independently owns 2-of-3 HIWS reachability
+        # preflight before any clock mutation.
+        ready = all(len(histories.get(camera) or ()) >= 1 for camera in ("left", "right"))
+        if not ready:
+            return
+        dispatch = getattr(self.panel, "_dispatch_wiris_time_sync_initial", None)
+        if callable(dispatch):
+            dispatch()
+
+    def _rtcp_clock_observer_failed(self, error: str) -> None:
+        reason = f"RTCP clock observer failed: {error}"
+        operation = getattr(self.panel, "_camera_sync_stus_operation", None)
+        if isinstance(operation, dict) and operation.get("active"):
+            self.panel._set_camera_sync_state(CAMERA_SYNC_STATUS_FAILED, reason)
+            finish = getattr(self.panel, "_finish_wiris_time_sync_operation", None)
+            if callable(finish):
+                finish("failed", reason)
+        elif str(getattr(self.panel, "camera_sync_status", "")) == CAMERA_SYNC_STATUS_VERIFIED:
+            self.panel._set_camera_sync_state(
+                CAMERA_SYNC_STATUS_FAILED,
+                "지속 동기화 검증 실패: " + reason,
+            )
+
+    def _reset_stus_schedule_for_connection(self) -> None:
+        generation = int(getattr(self.panel, "_stus_connection_generation", 0)) + 1
+        self.panel._stus_connection_generation = generation
+        scheduler = getattr(self.panel, "_stus_scheduler", None)
+        if isinstance(scheduler, StusScheduler):
+            scheduler.reset_for_connection(generation)
+
+    def _stus_schedule_snapshot(self) -> dict[str, object]:
+        scheduler = getattr(self.panel, "_stus_scheduler", None)
+        if not isinstance(scheduler, StusScheduler):
+            return {
+                "schema": "workstation-stus-schedule-v1",
+                "mode": "manual",
+                "state": "UNAVAILABLE",
+                "seeded": False,
+            }
+        return scheduler.snapshot(now_monotonic_s=time.monotonic())
+
+    def _poll_stus_schedule(self) -> None:
+        scheduler = getattr(self.panel, "_stus_scheduler", None)
+        if not isinstance(scheduler, StusScheduler):
+            return
+        operation = getattr(self.panel, "_camera_sync_stus_operation", None)
+        active = isinstance(operation, dict) and bool(operation.get("active"))
+        trigger = scheduler.poll(
+            now_monotonic_s=time.monotonic(),
+            operation_active=active,
+        )
+        if trigger != STUS_MODE_AUTO:
+            return
+        request = getattr(self.panel, "set_selected_wiris_time_from_pc", None)
+        if callable(request):
+            accepted = request(target="both", trigger=STUS_MODE_AUTO)
+            if accepted is False:
+                scheduler.mark_finished(
+                    now_monotonic_s=time.monotonic(),
+                    trigger=STUS_MODE_AUTO,
+                    verified=False,
+                    reason="scheduled STUS request rejected",
+                )
+
+    def _decorate_clock_epoch_metadata(
+        self,
+        camera: str,
+        metadata: dict[str, object],
+    ) -> dict[str, object]:
+        """Attach the logical STUS boundary without changing media timestamps."""
+
+        decorated = dict(metadata)
+        operation = getattr(self.panel, "_camera_sync_stus_operation", None)
+        last_sync = getattr(self.panel, "_last_wiris_pc_utc_sync", None)
+        epoch_id = ""
+        epoch_state = "unverified"
+        if isinstance(operation, dict) and bool(operation.get("active")):
+            epoch_id = str(operation.get("clock_epoch_id") or "")
+            epoch_state = "transition"
+        elif isinstance(last_sync, dict) and str(last_sync.get("result") or "") == "success":
+            epoch_id = str(last_sync.get("clock_epoch_id") or "")
+            closed_loop = last_sync.get("closed_loop_operation")
+            ack_by_camera = (
+                dict(closed_loop.get("last_stus_ack_finished_utc_by_camera") or {})
+                if isinstance(closed_loop, dict)
+                else {}
+            )
+            try:
+                post_ack = float(decorated.get("rtcp_sr_received_wall_s")) > float(
+                    ack_by_camera[camera]
+                )
+            except (KeyError, TypeError, ValueError):
+                post_ack = False
+            epoch_state = "current" if post_ack else "not-verified"
+        decorated["clock_epoch_id"] = epoch_id or None
+        decorated["clock_epoch_state"] = epoch_state
+        status_by_side = getattr(self.panel, "frame_timing_status_by_side", None)
+        if isinstance(status_by_side, dict) and camera in {"left", "right"}:
+            status_by_side[camera] = epoch_state
+            self.panel.frame_timing_status = (
+                "current"
+                if set(status_by_side.values()) == {"current"}
+                else "not-verified"
+            )
+            self.panel.frame_timing_reason = (
+                "both decoded streams have post-STUS RTCP mapping"
+                if self.panel.frame_timing_status == "current"
+                else "decoded frame mapping is pending or crosses a STUS clock epoch"
+            )
+        return decorated
 
     def _set_camera_sync_state(self, status: str, reason: str) -> None:
         self.panel.camera_sync_status = str(status)
@@ -253,301 +566,197 @@ class CameraTimeSyncController:
         )
 
     def _camera_sync_readiness(self) -> tuple[bool, str]:
-        if not self.panel.camera_connected:
-            return False, "좌우 RTSP 스트림이 실행 중이 아닙니다."
         now_mono_s = time.monotonic()
-        now_wall_s = time.time()
-        try:
-            self.panel.camera_frame_metadata_history
-        except (AttributeError, RuntimeError):
-            has_frame_history = False
-        else:
-            has_frame_history = True
-        if has_frame_history:
-            left_metadata, right_metadata = self.panel._clock_sync_pair_metadata(now_mono_s=now_mono_s)
-        else:
-            left_metadata = self.panel.camera_frame_metadata.get("left") or {}
-            right_metadata = self.panel.camera_frame_metadata.get("right") or {}
-        metadata_by_camera = {"left": left_metadata, "right": right_metadata}
-        sr_baseline = dict(getattr(self.panel, "_camera_sync_stus_sr_baseline", {}) or {})
+        histories = getattr(self.panel, "_rtcp_clock_observation_history", None)
+        if not isinstance(histories, dict):
+            return False, "RTCP clock observer history 없음"
+        observer_generation = int(
+            getattr(self.panel, "_rtcp_clock_observer_generation", -1)
+        )
         last_sr_counts = dict(getattr(self.panel, "_camera_sync_last_sr_counts", {}) or {})
         observed_sr_counts: dict[str, int] = {}
         missing: list[str] = []
-        history_window_reader = getattr(self.panel, "_camera_sync_history_window_s", None)
-        history_window_s = (
-            max(0.1, float(history_window_reader()))
-            if callable(history_window_reader)
-            else CAMERA_SYNC_FRAME_HISTORY_WINDOW_S
-        )
-        for camera, metadata in metadata_by_camera.items():
+        medians: dict[str, float] = {}
+        for camera in ("left", "right"):
             camera_name = self.panel._camera_name_ko(camera)
-            frame_age_s = current_frame_observation_age_s(
-                metadata,
-                now_monotonic_s=now_mono_s,
+            rows_by_identity: dict[tuple[int, int], dict[str, object]] = {}
+            for raw in list(histories.get(camera) or ()):
+                row = dict(raw)
+                try:
+                    generation = int(row.get("observer_generation"))
+                    identity = (int(row["ssrc"]), int(row["ntp_raw"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if generation != observer_generation:
+                    continue
+                rows_by_identity[identity] = row
+            rows = sorted(
+                rows_by_identity.values(),
+                key=lambda row: float(row.get("received_monotonic_s") or -1.0),
             )
-            if frame_age_s is None:
-                missing.append(f"{camera_name} frame age 없음")
-            elif frame_age_s > history_window_s:
-                missing.append(f"{camera_name} frame stale {frame_age_s:.2f}s")
-
-            try:
-                count = int(metadata.get("rtcp_sr_received_count"))
-            except (TypeError, ValueError):
-                count = 0
-            count = max(0, count)
+            count = len(rows)
             observed_sr_counts[camera] = count
-            required_sr_count = self.panel._camera_sync_required_sr_count()
+            required_sr_count = max(
+                CAMERA_SYNC_CORRECTION_REQUIRED_UNIQUE_SR,
+                self.panel._camera_sync_required_sr_count(),
+            )
             if count < required_sr_count:
-                missing.append(f"{camera_name} SR {count}/{required_sr_count}")
+                missing.append(f"{camera_name} observer SR {count}/{required_sr_count}")
                 continue
-            baseline_count = sr_baseline.get(camera)
-            if baseline_count is not None and count <= int(baseline_count):
-                missing.append(f"{camera_name} STUS 이후 새 SR 대기")
+            recent = rows[-CAMERA_SYNC_CORRECTION_REQUIRED_UNIQUE_SR:]
+            offsets = [
+                value
+                for value in (_sr_pc_observation_s(row) for row in recent)
+                if value is not None
+            ]
+            if len(offsets) != CAMERA_SYNC_CORRECTION_REQUIRED_UNIQUE_SR:
+                missing.append(f"{camera_name} SR-PC observation 없음")
                 continue
-            if str(metadata.get("rtcp_sr_arrival_basis") or "") != "rtcp-pad-probe":
-                missing.append(f"{camera_name} SR arrival pad-probe 없음")
-            invalid_reason = str(metadata.get("rtcp_timing_invalid_reason") or "").strip()
-            if invalid_reason:
-                missing.append(f"{camera_name} RTCP timing invalid={invalid_reason}")
-            signed_sr_pc_offset_s = _finite_float(metadata.get("rtcp_sr_pc_offset_s"))
-            if signed_sr_pc_offset_s is None:
-                missing.append(f"{camera_name} signed SR-PC offset 없음")
-            elif abs(signed_sr_pc_offset_s) > self.panel._camera_sync_max_pc_offset_s():
+            median_offset_s = median(offsets)
+            span_s = max(offsets) - min(offsets)
+            mad_s = median(abs(value - median_offset_s) for value in offsets)
+            # Robust median/MAD deliberately tolerates one isolated SR outlier;
+            # the full span remains evidence but does not revoke clock health.
+            if mad_s > CAMERA_SYNC_CORRECTION_MAX_OFFSET_MAD_S:
                 missing.append(
-                    f"{camera_name} signed SR-PC offset="
-                    f"{signed_sr_pc_offset_s * 1000.0:+.1f}ms"
+                    f"{camera_name} relative clock observation unstable "
+                    f"MAD={mad_s * 1000.0:.1f}ms "
+                    f"(span diagnostic={span_s * 1000.0:.1f}ms)"
                 )
+            medians[camera] = median_offset_s
             previous_count = last_sr_counts.get(camera)
             if previous_count is not None and count < int(previous_count):
                 missing.append(f"{camera_name} SR counter regressed {int(previous_count)}→{count}")
-            age_s = current_sender_report_age_s(
-                metadata,
-                now_monotonic_s=now_mono_s,
-                now_wall_s=now_wall_s,
-            )
+            latest = recent[-1]
+            received_mono_s = _finite_float(latest.get("received_monotonic_s"))
+            age_s = None if received_mono_s is None else max(0.0, now_mono_s - received_mono_s)
             if age_s is None:
                 missing.append(f"{camera_name} SR age 없음")
             elif age_s > self.panel._camera_sync_max_sr_age_s():
                 missing.append(f"{camera_name} SR stale {age_s:.2f}s")
-            for key, label in (
-                ("rtcp_camera_ntp_rate", "NTP clock"),
-                ("rtcp_camera_media_rate", "RTP clock"),
+            if str(latest.get("arrival_basis") or "") != "rtcp-pad-probe":
+                missing.append(f"{camera_name} SR arrival pad-probe 없음")
+            host_clock_step_s = _finite_float(latest.get("host_clock_step_s"))
+            if (
+                host_clock_step_s is not None
+                and abs(host_clock_step_s) > CAMERA_SYNC_MAX_HOST_CLOCK_STEP_S
             ):
-                try:
-                    rate = float(metadata.get(key))
-                except (TypeError, ValueError):
+                missing.append(
+                    f"PC clock step={host_clock_step_s * 1000.0:+.1f}ms"
+                )
+            for key, label in (
+                ("ntp_rate", "NTP clock"),
+                ("media_rate", "RTP clock"),
+            ):
+                rate = _finite_float(latest.get(key))
+                if rate is None:
                     missing.append(f"{camera_name} {label} 없음")
                     continue
-                if not isfinite(rate) or abs(rate - 1.0) > self.panel._camera_sync_max_clock_rate_error():
+                if abs(rate - 1.0) > self.panel._camera_sync_max_clock_rate_error():
                     missing.append(f"{camera_name} {label}={rate:.6f}")
-
-        metrics = self.panel._camera_time_sync_metrics(
-            left_metadata,
-            right_metadata,
-            now_wall_s=now_wall_s,
-            now_mono_s=now_mono_s,
-        )
-        pair_delta_s = _finite_float(metrics.get("pair_delta_s"))
-        if pair_delta_s is None:
-            missing.append("좌우 RTCP/NTP pair 없음")
-        elif abs(pair_delta_s) > self.panel._camera_sync_rtcp_pair_max_delta_s():
-            missing.append(f"좌우 RTCP/NTP Δt={abs(pair_delta_s) * 1000.0:.1f}ms")
-        receive_pair_delta_s = _finite_float(metrics.get("receive_pair_delta_s"))
-        if receive_pair_delta_s is None:
-            try:
-                receive_pair_delta_s = _finite_float(
-                    abs(float(right_metadata["timestamp_s"]) - float(left_metadata["timestamp_s"]))
-                )
-            except (KeyError, TypeError, ValueError):
-                receive_pair_delta_s = None
-        if receive_pair_delta_s is None:
-            missing.append("좌우 실제 수신시각 pair 없음")
-        elif receive_pair_delta_s > self.panel._camera_sync_receive_pair_max_delta_s():
-            missing.append(f"좌우 실제 수신 Δt={receive_pair_delta_s * 1000.0:.1f}ms")
-        max_sr_pc_offset_ms = _finite_float(metrics.get("max_sr_pc_offset_ms"))
-        if max_sr_pc_offset_ms is None:
-            missing.append("RTCP SR/PC UTC offset 없음")
-        elif abs(max_sr_pc_offset_ms) > self.panel._camera_sync_max_pc_offset_s() * 1000.0:
-            missing.append(f"RTCP SR/PC UTC offset={abs(max_sr_pc_offset_ms):.1f}ms")
+        if set(medians) == {"left", "right"}:
+            pair_delta_s = medians["right"] - medians["left"]
+            if abs(pair_delta_s) > self.panel._camera_sync_rtcp_pair_max_delta_s():
+                missing.append(f"좌우 RTCP clock Δt={abs(pair_delta_s) * 1000.0:.1f}ms")
+        else:
+            missing.append("좌우 RTCP clock pair 없음")
         if missing:
             return False, "; ".join(missing)
         self.panel._camera_sync_last_sr_counts = observed_sr_counts
-        return True, "RTCP/NTP·PC UTC·좌우 Δt 검증 완료"
+        return True, (
+            "RTCP observer 좌우 relative clock Δt 검증 완료; "
+            "SR-PC diagnostic-only "
+            f"L={_format_sr_pc_diagnostic(medians['left'])} "
+            f"R={_format_sr_pc_diagnostic(medians['right'])}"
+        )
 
     def _camera_sync_correction_observation(self) -> tuple[str, dict[str, object]]:
-        """Build one bounded correction candidate from fresh post-STUS SRs.
-
-        This method never sends a command.  It admits feedback only when both
-        sides have current frames, fresh/new Sender Reports, stable clock rates,
-        and a receive-close pair.  Missing evidence remains a warmup condition;
-        an out-of-bound signed offset or target is a terminal fail-closed result.
-        """
+        """Build one bounded candidate from decoder-independent post-STUS SRs."""
 
         operation = getattr(self.panel, "_camera_sync_stus_operation", None)
         if not isinstance(operation, dict) or not operation.get("active"):
             return "waiting", {"reason": "active STUS operation 없음"}
         if not str(operation.get("phase") or "").startswith("observing-attempt-"):
             return "waiting", {"reason": f"phase={operation.get('phase', 'unknown')}"}
-        if not bool(getattr(self.panel, "camera_connected", False)):
-            return "waiting", {"reason": "좌우 RTSP 스트림 재연결 대기"}
-
         now_mono_s = time.monotonic()
         now_wall_s = time.time()
-        left_metadata, right_metadata = self.panel._clock_sync_pair_metadata(
-            now_mono_s=now_mono_s
-        )
-        metadata_by_camera = {
-            "left": dict(left_metadata or {}),
-            "right": dict(right_metadata or {}),
-        }
-        baseline = dict(getattr(self.panel, "_camera_sync_stus_sr_baseline", {}) or {})
-        attempt_index = int(operation.get("attempts_started") or 1)
-        if int(operation.get("feedback_attempt_index") or 0) != attempt_index:
-            operation["feedback_attempt_index"] = attempt_index
-            operation["sr_feedback_samples_by_camera"] = {"left": [], "right": []}
-        sample_store = operation.setdefault(
-            "sr_feedback_samples_by_camera",
-            {"left": [], "right": []},
-        )
-        history_window_s = self.panel._camera_sync_history_window_s()
+        histories = getattr(self.panel, "_rtcp_clock_observation_history", None)
+        if not isinstance(histories, dict):
+            return "waiting", {"reason": "RTCP clock observer history 없음"}
+        observer_generation = int(operation.get("observer_generation") or -1)
         waiting: list[str] = []
         offsets: dict[str, float] = {}
-        pending_samples: dict[str, dict[str, object]] = {}
         offset_statistics: dict[str, dict[str, float | int]] = {}
         sr_counts: dict[str, int] = {}
         sr_ages: dict[str, float] = {}
-        pre_reconnect_generations = dict(
-            operation.get("pre_reconnect_stream_generation_by_camera") or {}
-        )
+        last_received_monotonic: dict[str, float] = {}
         ack_finished_by_camera = dict(
             operation.get("last_stus_ack_finished_utc_by_camera") or {}
         )
-        for camera, metadata in metadata_by_camera.items():
-            camera_gate_error_count = len(waiting)
-            camera_name = self.panel._camera_name_ko(camera)
-            frame_age_s = current_frame_observation_age_s(
-                metadata,
-                now_monotonic_s=now_mono_s,
-            )
-            if frame_age_s is None or frame_age_s > history_window_s:
-                waiting.append(f"{camera_name} current frame 대기")
-            previous_generation = pre_reconnect_generations.get(camera)
-            if previous_generation is not None:
-                try:
-                    observed_generation = int(metadata.get("stream_generation"))
-                except (TypeError, ValueError):
-                    observed_generation = -1
-                if observed_generation <= int(previous_generation):
-                    waiting.append(
-                        f"{camera_name} replacement stream generation 대기 "
-                        f"({observed_generation}<={int(previous_generation)})"
-                    )
-            try:
-                sr_count = max(0, int(metadata.get("rtcp_sr_received_count")))
-            except (TypeError, ValueError):
-                sr_count = 0
-            sr_counts[camera] = sr_count
-            if sr_count < self.panel._camera_sync_required_sr_count():
-                waiting.append(f"{camera_name} SR {sr_count}/{self.panel._camera_sync_required_sr_count()}")
-            baseline_count = baseline.get(camera)
-            if baseline_count is not None and sr_count <= int(baseline_count):
-                waiting.append(f"{camera_name} STUS 이후 새 SR 대기")
-            sr_age_s = current_sender_report_age_s(
-                metadata,
-                now_monotonic_s=now_mono_s,
-                now_wall_s=now_wall_s,
-            )
-            if sr_age_s is None or sr_age_s > self.panel._camera_sync_max_sr_age_s():
-                waiting.append(f"{camera_name} fresh SR 대기")
-            else:
-                sr_ages[camera] = sr_age_s
-            ack_finished_utc_s = _finite_float(ack_finished_by_camera.get(camera))
-            sr_received_wall_s = _finite_float(metadata.get("rtcp_sr_received_wall_s"))
-            if (
-                ack_finished_utc_s is not None
-                and (
-                    sr_received_wall_s is None
-                    or sr_received_wall_s <= ack_finished_utc_s
-                )
-            ):
-                waiting.append(f"{camera_name} post-ACK SR 대기")
-            for key, label in (
-                ("rtcp_camera_ntp_rate", "NTP clock"),
-                ("rtcp_camera_media_rate", "RTP clock"),
-            ):
-                rate = _finite_float(metadata.get(key))
-                if rate is None or abs(rate - 1.0) > self.panel._camera_sync_max_clock_rate_error():
-                    waiting.append(f"{camera_name} {label} 안정화 대기")
-            offset_s = _finite_float(metadata.get("rtcp_sr_pc_offset_s"))
-            if offset_s is None:
-                waiting.append(f"{camera_name} signed SR-PC offset 대기")
-            else:
-                arrival_basis = str(metadata.get("rtcp_sr_arrival_basis") or "")
-                sr_identity = metadata.get("rtcp_sr_ntp_raw")
-                if arrival_basis != "rtcp-pad-probe":
-                    waiting.append(f"{camera_name} SR arrival pad-probe 대기")
-                elif sr_identity is None:
-                    waiting.append(f"{camera_name} unique SR identity 대기")
-                elif len(waiting) != camera_gate_error_count:
-                    # Never let an old-generation, pre-ACK, stale, bad-rate or
-                    # otherwise inadmissible SR become one of the actuator's
-                    # three samples merely because it has a pad-probe identity.
-                    pass
-                else:
-                    pending_samples[camera] = {
-                        "sr_identity": sr_identity,
-                        "sr_count": sr_count,
-                        "offset_s": offset_s,
-                        "observed_monotonic_s": now_mono_s,
-                    }
-
-        metrics = self.panel._camera_time_sync_metrics(
-            metadata_by_camera["left"],
-            metadata_by_camera["right"],
-            now_wall_s=now_wall_s,
-            now_mono_s=now_mono_s,
-        )
-        pair_delta_s = _finite_float(metrics.get("pair_delta_s"))
-        receive_pair_delta_s = _finite_float(metrics.get("receive_pair_delta_s"))
-        if pair_delta_s is None:
-            waiting.append("좌우 RTCP/NTP pair 대기")
-        if (
-            receive_pair_delta_s is None
-            or receive_pair_delta_s > self.panel._camera_sync_receive_pair_max_delta_s()
-        ):
-            waiting.append("좌우 receive-close pair 대기")
-        if waiting:
-            return "waiting", {
-                "reason": "; ".join(waiting),
-                "sr_count_by_camera": sr_counts,
-                "sr_age_by_camera": sr_ages,
-                "offset_statistics_by_camera": offset_statistics,
-            }
-
-        # Admit the Left/Right SR identities atomically only after every
-        # per-side and receive-close pair boundary is valid. An invalid pair
-        # cannot pre-fill two of the three actuator samples.
         for camera in ("left", "right"):
-            sample = pending_samples.get(camera)
-            if sample is None:
-                waiting.append(f"{self.panel._camera_name_ko(camera)} admissible SR 대기")
-                continue
-            camera_samples = list(sample_store.get(camera) or [])
-            if not any(
-                row.get("sr_identity") == sample.get("sr_identity")
-                for row in camera_samples
-            ):
-                camera_samples.append(dict(sample))
-                camera_samples = camera_samples[-8:]
-                sample_store[camera] = camera_samples
-            recent_samples = camera_samples[-CAMERA_SYNC_CORRECTION_REQUIRED_UNIQUE_SR:]
+            camera_name = self.panel._camera_name_ko(camera)
+            ack_finished_utc_s = _finite_float(ack_finished_by_camera.get(camera))
+            rows_by_identity: dict[tuple[int, int], dict[str, object]] = {}
+            for raw in list(histories.get(camera) or ()):
+                row = dict(raw)
+                try:
+                    generation = int(row.get("observer_generation"))
+                    identity = (int(row["ssrc"]), int(row["ntp_raw"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if generation != observer_generation:
+                    continue
+                received_wall_s = _finite_float(row.get("received_wall_s"))
+                if (
+                    ack_finished_utc_s is not None
+                    and (received_wall_s is None or received_wall_s <= ack_finished_utc_s)
+                ):
+                    continue
+                if str(row.get("arrival_basis") or "") != "rtcp-pad-probe":
+                    continue
+                received_mono_s = _finite_float(row.get("received_monotonic_s"))
+                offset_s = _sr_pc_observation_s(row)
+                host_clock_step_s = _finite_float(row.get("host_clock_step_s"))
+                if received_mono_s is None or offset_s is None:
+                    continue
+                age_s = max(0.0, now_mono_s - received_mono_s)
+                if age_s > self.panel._camera_sync_max_sr_age_s():
+                    continue
+                if (
+                    host_clock_step_s is not None
+                    and abs(host_clock_step_s) > CAMERA_SYNC_MAX_HOST_CLOCK_STEP_S
+                ):
+                    continue
+                rows_by_identity[identity] = row
+            recent_samples = sorted(
+                rows_by_identity.values(),
+                key=lambda row: float(row["received_monotonic_s"]),
+            )[-CAMERA_SYNC_CORRECTION_REQUIRED_UNIQUE_SR:]
+            sr_counts[camera] = len(rows_by_identity)
             if len(recent_samples) < CAMERA_SYNC_CORRECTION_REQUIRED_UNIQUE_SR:
                 waiting.append(
-                    f"{self.panel._camera_name_ko(camera)} unique pad-probe SR "
+                    f"{camera_name} unique post-ACK observer SR "
                     f"{len(recent_samples)}/{CAMERA_SYNC_CORRECTION_REQUIRED_UNIQUE_SR}"
                 )
                 continue
-            values = [float(row["offset_s"]) for row in recent_samples]
+            values = [
+                float(value)
+                for row in recent_samples
+                if (value := _sr_pc_observation_s(row)) is not None
+            ]
+            if len(values) != CAMERA_SYNC_CORRECTION_REQUIRED_UNIQUE_SR:
+                waiting.append(f"{camera_name} SR-PC diagnostic observation 대기")
+                continue
+            latest_ntp_rate = _finite_float(recent_samples[-1].get("ntp_rate"))
+            latest_media_rate = _finite_float(recent_samples[-1].get("media_rate"))
+            if (
+                latest_ntp_rate is None
+                or latest_media_rate is None
+                or abs(latest_ntp_rate - 1.0) > self.panel._camera_sync_max_clock_rate_error()
+                or abs(latest_media_rate - 1.0) > self.panel._camera_sync_max_clock_rate_error()
+            ):
+                waiting.append(f"{camera_name} observer clock rate 안정화 대기")
+                continue
             median_offset_s = median(values)
             span_s = max(values) - min(values)
             mad_s = median(abs(value - median_offset_s) for value in values)
@@ -557,16 +766,17 @@ class CameraTimeSyncController:
                 "span_s": span_s,
                 "mad_s": mad_s,
             }
-            if (
-                span_s > CAMERA_SYNC_CORRECTION_MAX_OFFSET_SPAN_S
-                or mad_s > CAMERA_SYNC_CORRECTION_MAX_OFFSET_MAD_S
-            ):
+            if mad_s > CAMERA_SYNC_CORRECTION_MAX_OFFSET_MAD_S:
                 waiting.append(
-                    f"{self.panel._camera_name_ko(camera)} SR-PC feedback 분산 안정화 대기 "
-                    f"(span={span_s * 1000.0:.1f}ms, MAD={mad_s * 1000.0:.1f}ms)"
+                    f"{camera_name} relative clock feedback 안정화 대기 "
+                    f"(MAD={mad_s * 1000.0:.1f}ms, "
+                    f"span diagnostic={span_s * 1000.0:.1f}ms)"
                 )
             else:
                 offsets[camera] = median_offset_s
+                last_received = max(float(row["received_monotonic_s"]) for row in recent_samples)
+                last_received_monotonic[camera] = last_received
+                sr_ages[camera] = max(0.0, now_mono_s - last_received)
         if waiting:
             return "waiting", {
                 "reason": "; ".join(waiting),
@@ -575,37 +785,52 @@ class CameraTimeSyncController:
                 "offset_statistics_by_camera": offset_statistics,
             }
 
-        offset_limit_s = self.panel._camera_sync_max_pc_offset_s()
-        pair_limit_s = self.panel._camera_sync_rtcp_pair_max_delta_s()
-        needs_correction = any(abs(value) > offset_limit_s for value in offsets.values()) or (
-            pair_delta_s is not None and abs(pair_delta_s) > pair_limit_s
+        pair_delta_s = offsets["right"] - offsets["left"]
+        receive_pair_delta_s = abs(
+            last_received_monotonic["right"] - last_received_monotonic["left"]
         )
-        if not needs_correction:
+        pair_limit_s = self.panel._camera_sync_rtcp_pair_max_delta_s()
+        if abs(pair_delta_s) <= pair_limit_s:
             return "converged", {
-                "reason": "3 unique stable pad-probe SRs are within timing limits",
+                "reason": (
+                    "3 unique stable pad-probe SRs establish Left/Right relative "
+                    f"Δt={abs(pair_delta_s) * 1000.0:.1f}ms; SR-PC diagnostic-only "
+                    f"L={_format_sr_pc_diagnostic(offsets['left'])} "
+                    f"R={_format_sr_pc_diagnostic(offsets['right'])}"
+                ),
                 "sr_pc_offset_by_camera": offsets,
+                "sr_pc_role": "diagnostic-only",
+                "pair_delta_s": pair_delta_s,
                 "offset_statistics_by_camera": offset_statistics,
             }
         previous = dict(operation.get("last_compensation_by_camera") or {})
-        next_compensation: dict[str, float] = {}
         try:
-            for camera in ("left", "right"):
-                next_compensation[camera] = stus_closed_loop_compensation_s(
-                    previous_compensation_s=previous.get(camera),
-                    sr_pc_offset_s=offsets[camera],
-                )
+            (
+                next_compensation,
+                common_mode_s,
+                relative_error_by_camera,
+            ) = stus_relative_pair_compensation_by_camera(
+                previous_compensation_by_camera=previous,
+                sr_pc_offset_by_camera=offsets,
+            )
         except ValueError as exc:
             return "limit-failed", {
                 "reason": str(exc),
                 "sr_pc_offset_by_camera": offsets,
+                "sr_pc_role": "diagnostic-only",
+                "pair_delta_s": pair_delta_s,
                 "previous_compensation_by_camera": previous,
             }
         return "candidate", {
-            "schema": "workstation-stus-correction-observation-v1",
+            "schema": "workstation-stus-correction-observation-v3",
             "attempt_from": int(operation.get("attempts_started") or 1),
             "observed_at_unix_s": now_wall_s,
             "observed_at_monotonic_s": now_mono_s,
+            "observer_generation": observer_generation,
             "sr_pc_offset_by_camera": offsets,
+            "sr_pc_role": "diagnostic-only",
+            "sr_pc_common_mode_s": common_mode_s,
+            "relative_error_by_camera": relative_error_by_camera,
             "previous_compensation_by_camera": previous,
             "next_compensation_by_camera": next_compensation,
             "pair_delta_s": pair_delta_s,
@@ -617,10 +842,11 @@ class CameraTimeSyncController:
                 "max_attempts": int(operation.get("max_attempts") or WIRIS_STUS_MAX_ATTEMPTS),
                 "max_operation_s": WIRIS_STUS_MAX_OPERATION_S,
                 "max_abs_compensation_s": WIRIS_STUS_MAX_ABSOLUTE_COMPENSATION_S,
-                "max_sr_pc_offset_s": offset_limit_s,
                 "max_pair_delta_s": pair_limit_s,
+                "sr_pc_role": "diagnostic-only",
                 "required_unique_pad_probe_sr": CAMERA_SYNC_CORRECTION_REQUIRED_UNIQUE_SR,
-                "max_feedback_span_s": CAMERA_SYNC_CORRECTION_MAX_OFFSET_SPAN_S,
+                "feedback_span_reference_s": CAMERA_SYNC_CORRECTION_MAX_OFFSET_SPAN_S,
+                "feedback_span_role": "diagnostic-only",
                 "max_feedback_mad_s": CAMERA_SYNC_CORRECTION_MAX_OFFSET_MAD_S,
             },
         }
@@ -658,11 +884,6 @@ class CameraTimeSyncController:
                     + self.panel.camera_sync_reason
                 )
                 return
-            if self.panel._session_recording_active():
-                fail_operation(
-                    "STUS closed-loop correction aborted: recording owns the camera streams"
-                )
-                return
         phase = str(operation.get("phase") or "") if operation_active else ""
         if operation_active and phase in {"initial-command", "correction-command"}:
             attempts_started = int(operation.get("attempts_started") or 1)
@@ -681,6 +902,12 @@ class CameraTimeSyncController:
         observation: dict[str, object] = {"reason": reason}
         if operation_active:
             observation_state, observation = self.panel._camera_sync_correction_observation()
+            if observation_state == "converged":
+                ready = True
+                reason = str(
+                    observation.get("reason")
+                    or "RTCP clock observer convergence verified"
+                )
             if observation_state == "limit-failed":
                 fail_operation(
                     "STUS closed-loop fail-closed: "
@@ -710,7 +937,7 @@ class CameraTimeSyncController:
                             observation.get("next_compensation_by_camera") or {}
                         ),
                         feedback_offset_by_camera=dict(
-                            observation.get("sr_pc_offset_by_camera") or {}
+                            observation.get("relative_error_by_camera") or {}
                         ),
                         observation=dict(observation),
                     )
@@ -718,7 +945,7 @@ class CameraTimeSyncController:
                 if requested:
                     self.panel._set_camera_sync_state(
                         CAMERA_SYNC_STATUS_WARMING,
-                        "STUS closed-loop attempt 2/2: fresh signed SR-PC feedback applied; "
+                        "STUS closed-loop attempt 2/2: fresh Left/Right relative feedback applied; "
                         "Left OK ACK before Right mutation",
                     )
                 return
@@ -750,6 +977,10 @@ class CameraTimeSyncController:
             self.panel._camera_sync_timer.stop()
             revoked_reason = "지속 동기화 검증 실패: " + reason
             self.panel._set_camera_sync_state(CAMERA_SYNC_STATUS_FAILED, revoked_reason)
+            scheduler = getattr(self.panel, "_stus_scheduler", None)
+            mark_revoked = getattr(scheduler, "mark_clock_revoked", None)
+            if callable(mark_revoked):
+                mark_revoked(revoked_reason)
             last_sync = getattr(self.panel, "_last_wiris_pc_utc_sync", None)
             if isinstance(last_sync, dict) and last_sync.get("command") == "STUS":
                 last_sync["result"] = "revoked"
@@ -775,45 +1006,17 @@ class CameraTimeSyncController:
             if callable(finish):
                 finish("failed", "one or more STUS ACKs were not OK")
             return
-        if not self.panel.camera_connected:
-            self.panel._camera_sync_stus_sr_baseline = {}
-            self.panel._camera_sync_last_sr_counts = {}
-            self.panel._set_camera_sync_state(
-                CAMERA_SYNC_STATUS_NOT_VERIFIED,
-                "STUS는 완료됐지만 RTSP 스트림이 없어 검증을 시작하지 않았습니다.",
-            )
-            finish = getattr(self.panel, "_finish_wiris_time_sync_operation", None)
-            if callable(finish):
-                finish("not-verified", "RTSP stream unavailable after STUS")
-            return
-        if self.panel._session_recording_active():
-            reason = "세션 기록이 시작되어 RTSP 재연결을 건너뛰었습니다. 기록 종료 후 다시 동기화하세요."
-            self.panel._set_camera_sync_state(CAMERA_SYNC_STATUS_NOT_VERIFIED, reason)
-            self.panel._log(f"[시계] {reason}")
-            finish = getattr(self.panel, "_finish_wiris_time_sync_operation", None)
-            if callable(finish):
-                finish("failed", reason)
-            return
-        # The camera RTSP sender can keep the NTP/RTP mapping created when the
-        # session was opened even after STUS changes the camera wall clock.
-        # Recreate only the local RTSP/GStreamer sessions so the next Sender
-        # Reports use the new clock.  Do not toggle Ethernet Mode and do not
-        # override the configured UDP/TCP transport.
+        # The video/YOLO/MP4 owner must remain continuous across STUS. Recreate
+        # only the decoder-free RTCP observer so its next Sender Reports are a
+        # post-command mapping epoch. Never restart CameraPane here.
         self.panel._camera_sync_stus_sr_baseline = {"left": 0, "right": 0}
         self.panel._camera_sync_last_sr_counts = {}
         operation = getattr(self.panel, "_camera_sync_stus_operation", None)
         if isinstance(operation, dict) and operation.get("active"):
-            operation["phase"] = f"observing-attempt-{int(operation.get('attempts_started') or 1)}"
+            attempt_index = int(operation.get("attempts_started") or 1)
+            operation["phase"] = f"observer-restarting-attempt-{attempt_index}"
             operation["feedback_attempt_index"] = int(operation.get("attempts_started") or 1)
             operation["sr_feedback_samples_by_camera"] = {"left": [], "right": []}
-            pre_reconnect_generations: dict[str, int] = {}
-            for camera in ("left", "right"):
-                pane = getattr(self.panel, f"{camera}_pane", None)
-                try:
-                    pre_reconnect_generations[camera] = int(pane.stream_generation)
-                except (AttributeError, TypeError, ValueError):
-                    continue
-            operation["pre_reconnect_stream_generation_by_camera"] = pre_reconnect_generations
         self.panel._camera_sync_deadline_monotonic_s = time.monotonic() + self.panel._camera_sync_warmup_timeout_s()
         self.panel._camera_sync_transport_override = None
         set_interval = getattr(self.panel._camera_sync_timer, "setInterval", None)
@@ -821,15 +1024,20 @@ class CameraTimeSyncController:
             set_interval(CAMERA_SYNC_WARMUP_POLL_INTERVAL_MS)
         self.panel._set_camera_sync_state(
             CAMERA_SYNC_STATUS_RECONNECTING,
-            "STUS 완료: Ethernet Mode는 유지하고 로컬 RTSP 수신기만 재연결합니다.",
+            "STUS 완료: 영상/YOLO/MP4는 유지하고 RTCP clock observer만 재연결합니다.",
         )
-        started = self.panel._start_camera_streams(
-            enable_detection=self.panel.yolo_enabled,
-            switch_to_depth=self.panel.yolo_enabled,
+        restart_observer = getattr(self.panel, "_restart_rtcp_clock_observer", None)
+        operation_id = (
+            str(operation.get("operation_id") or "")
+            if isinstance(operation, dict)
+            else ""
         )
-        if started is False:
+        started = callable(restart_observer) and bool(
+            restart_observer(operation_id=operation_id)
+        )
+        if not started:
             self.panel._camera_sync_timer.stop()
-            reason = "STUS ACK는 완료됐지만 replacement RTSP stream 요청이 실패했습니다."
+            reason = "STUS ACK는 완료됐지만 replacement RTCP clock observer 요청이 실패했습니다."
             self.panel._set_camera_sync_state(CAMERA_SYNC_STATUS_FAILED, reason)
             finish = getattr(self.panel, "_finish_wiris_time_sync_operation", None)
             if callable(finish):
@@ -838,8 +1046,12 @@ class CameraTimeSyncController:
         self.panel._camera_sync_timer.start()
 
     def _clock_sync_side_summary(self, camera: str, metadata: dict[str, object], now_wall_s: float, now_mono_s: float) -> tuple[str, float | None]:
-        if metadata.get("rtcp_timing_invalid_reason"):
-            return f"{self.panel._camera_name_ko(camera)}: RTCP/NTP 무효(SR-PC offset 초과)", None
+        invalid_reason = metadata.get("rtcp_timing_invalid_reason")
+        if invalid_reason and not is_sr_pc_diagnostic_reason(invalid_reason):
+            return (
+                f"{self.panel._camera_name_ko(camera)}: RTCP/NTP 무효({invalid_reason})",
+                None,
+            )
         camera_rtc_s = self.panel._camera_rtc_timestamp_s_from_metadata(metadata)
         receive_mono_s = metadata.get("timestamp_s")
         if camera_rtc_s is None:
@@ -989,6 +1201,7 @@ class CameraTimeSyncController:
             self.panel._camera_name_ko(camera)
             for camera, metadata in (("left", left_metadata), ("right", right_metadata))
             if metadata.get("rtcp_timing_invalid_reason")
+            and not is_sr_pc_diagnostic_reason(metadata.get("rtcp_timing_invalid_reason"))
         ]
         offsets_ms: dict[str, float] = {}
         sr_offsets_ms: dict[str, float] = {}
@@ -997,7 +1210,10 @@ class CameraTimeSyncController:
             ("left", left_metadata, left_receive_mono_s, left_rtcp_s),
             ("right", right_metadata, right_receive_mono_s, right_rtcp_s),
         ):
-            if rtcp_s is None or metadata.get("rtcp_timing_invalid_reason"):
+            invalid_reason = metadata.get("rtcp_timing_invalid_reason")
+            if rtcp_s is None or (
+                invalid_reason and not is_sr_pc_diagnostic_reason(invalid_reason)
+            ):
                 continue
             sr_offset_s = metadata.get("rtcp_sr_pc_offset_s")
             try:
@@ -1044,22 +1260,19 @@ class CameraTimeSyncController:
             warning = (
                 f"좌우 RTCP/NTP 차이가 {self.panel._camera_sync_rtcp_pair_max_delta_s() * 1000.0:.0f} ms를 초과했습니다."
             )
-        elif invalid_cameras:
-            status = "absolute-rtcp-invalid"
-            warning = (
-                f"좌우 RTCP/NTP pair는 {abs(pair_delta_s) * 1000.0:.1f} ms 이내지만, "
-                f"{', '.join(invalid_cameras)} Sender Report NTP의 PC UTC 기준이 500 ms 이상 어긋났습니다. "
-                "절대 UTC 기준으로 사용할 수 없습니다."
-            )
-        elif max_offset_ms is not None and max_offset_ms > self.panel._camera_sync_max_pc_offset_s() * 1000.0:
-            status = "pc-offset-failed"
-            warning = (
-                f"RTCP/NTP와 PC UTC 차이가 {self.panel._camera_sync_max_pc_offset_s() * 1000.0:.0f} ms를 초과했습니다. "
-                "카메라 GDTI와 RTCP 매핑을 검증해야 합니다."
-            )
         else:
-            status = "within-threshold-unverified"
-            warning = "좌우/PC 오차는 임계값 이내지만 RTCP/NTP의 UTC 기준은 아직 검증되지 않았습니다."
+            status = "within-relative-threshold"
+            diagnostic_limit_ms = self.panel._camera_sync_max_pc_offset_s() * 1000.0
+            if max_sr_offset_ms is not None and max_sr_offset_ms > diagnostic_limit_ms:
+                warning = (
+                    f"좌우 RTCP/NTP Δt={abs(pair_delta_s) * 1000.0:.1f} ms는 기준 이내입니다. "
+                    f"SR-PC 최대 {max_sr_offset_ms:.1f} ms는 진단값이며 gate가 아닙니다."
+                )
+            else:
+                warning = (
+                    "좌우 상대 오차는 임계값 이내입니다. "
+                    "SR-PC 절대값은 진단 전용입니다."
+                )
         return {
             "status": status,
             "basis": "rtcp-sender-report-ntp",
@@ -1174,6 +1387,7 @@ class CameraTimeSyncController:
             self.panel._camera_name_ko(camera)
             for camera, metadata in (("left", left_metadata), ("right", right_metadata))
             if metadata.get("rtcp_timing_invalid_reason")
+            and not is_sr_pc_diagnostic_reason(metadata.get("rtcp_timing_invalid_reason"))
         ]
         if left_rtc_s is not None and right_rtc_s is not None:
             pair_delta_ms = (float(right_rtc_s) - float(left_rtc_s)) * 1000.0
@@ -1273,10 +1487,10 @@ class CameraTimeSyncController:
             compensation_method = str(stus_sync.get("compensation_method") or "control-rtt").strip()
             attempt_index = int(stus_sync.get("attempt_index") or 1)
             max_attempts = int(stus_sync.get("max_attempts") or WIRIS_STUS_MAX_ATTEMPTS)
-            if compensation_method == "rtcp-sr-closed-loop":
+            if compensation_method == "rtcp-relative-closed-loop":
                 target_detail = (
-                    "target lead = previous lead - median signed SR-PC offset; "
-                    "3 unique stable rtcp-pad-probe SRs"
+                    "target lead removes Left/Right differential around common mode; "
+                    "SR-PC absolute is diagnostic-only; 3 unique stable rtcp-pad-probe SRs"
                 )
             else:
                 target_detail = "initial target lead = bounded HIWS RTT/2 + parse margin"

@@ -8,6 +8,7 @@ Ubuntu packages; nothing in this module installs or mutates dependencies.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import importlib
 import os
 import re
@@ -15,6 +16,8 @@ import site
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from importlib import metadata
@@ -29,6 +32,7 @@ DECODER_NVIDIA = "nvidia"
 DECODER_SOFTWARE = "software"
 NVIDIA_H264_DECODER = "nvh264dec"
 SOFTWARE_H264_DECODER = "avdec_h264"
+GSTREAMER_REGISTRY_RETRY_DELAYS_S = (0.5, 1.0, 2.0)
 
 REQUIRED_GSTREAMER_ELEMENTS = (
     "rtspsrc",
@@ -104,6 +108,13 @@ class RuntimeReport:
 
 
 _LAST_GSTREAMER_CAPABILITIES: tuple[bool, bool, bool] | None = None
+_GSTREAMER_REGISTRY_TEMP_DIRECTORY: tempfile.TemporaryDirectory | None = None
+
+_CUDA_ERROR_NAMES: Mapping[int, str] = {
+    100: "CUDA_ERROR_NO_DEVICE",
+    101: "CUDA_ERROR_INVALID_DEVICE",
+    999: "CUDA_ERROR_UNKNOWN",
+}
 
 
 def repository_root() -> Path:
@@ -125,6 +136,140 @@ def venv_recovery_commands(root: Path) -> tuple[str, ...]:
         "python3 -m venv --system-site-packages .venv",
         ".venv/bin/python -m pip install -r requirements.txt",
     )
+
+
+def probe_cuda_driver(
+    *,
+    loader: Callable[[str], object] | None = None,
+) -> tuple[bool, str]:
+    """Check the CUDA Driver API used by GStreamer NVCodec.
+
+    ``nvidia-smi`` talks to NVML and can succeed while the CUDA driver API
+    still refuses initialization.  GStreamer ``nvcodec`` performs this same
+    driver-API initialization during plugin loading, so NVDEC capability must
+    use the closer boundary as evidence.
+    """
+
+    try:
+        driver = (loader or ctypes.CDLL)("libcuda.so.1")
+    except Exception as exc:  # noqa: BLE001 - ctypes loader boundary.
+        return False, f"libcuda.so.1 load failed: {type(exc).__name__}: {exc}"
+
+    cu_init = getattr(driver, "cuInit", None)
+    if not callable(cu_init):
+        return False, "libcuda.so.1 does not export cuInit"
+    try:
+        cu_init.argtypes = [ctypes.c_uint]
+        cu_init.restype = ctypes.c_int
+    except (AttributeError, TypeError):
+        # Small Python fakes used by the runtime tests need no ctypes metadata.
+        pass
+    try:
+        result = int(cu_init(0))
+    except Exception as exc:  # noqa: BLE001 - third-party driver boundary.
+        return False, f"cuInit(0) raised {type(exc).__name__}: {exc}"
+    if result != 0:
+        name = _CUDA_ERROR_NAMES.get(result, "CUDA_ERROR")
+        return False, f"cuInit(0) returned {name} ({result})"
+    return True, "CUDA Driver API initialized"
+
+
+def _new_gstreamer_registry_path() -> str:
+    """Create a process-owned registry file outside the persistent user cache."""
+
+    global _GSTREAMER_REGISTRY_TEMP_DIRECTORY
+    if _GSTREAMER_REGISTRY_TEMP_DIRECTORY is None:
+        _GSTREAMER_REGISTRY_TEMP_DIRECTORY = tempfile.TemporaryDirectory(
+            prefix="sasl-gstreamer-registry-"
+        )
+    descriptor, path = tempfile.mkstemp(
+        prefix="registry-",
+        suffix=".bin",
+        dir=_GSTREAMER_REGISTRY_TEMP_DIRECTORY.name,
+    )
+    os.close(descriptor)
+    return path
+
+
+def prepare_gstreamer_registry(
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    sleeper: Callable[[float], object] = time.sleep,
+    which: Callable[[str], str | None] = shutil.which,
+    cuda_probe: Callable[[], tuple[bool, str]] | None = None,
+) -> str:
+    """Use a fresh registry and retry an early-login NVCodec scan once the GPU settles.
+
+    GStreamer persists plugin discovery independently of NVIDIA runtime health.  A scan
+    performed while the desktop driver session is being replaced can therefore cache an
+    installed ``nvcodec`` plugin with zero features.  Reusing that file makes every later
+    application start select software decode even though CUDA/NVDEC is healthy again.
+    Keep an explicitly supplied ``GST_REGISTRY`` for diagnostics, but make the normal
+    operator process use a short-lived registry and bounded retry path.
+    """
+
+    existing = str(os.environ.get("GST_REGISTRY") or "").strip()
+    if existing:
+        return existing
+
+    registry_path = _new_gstreamer_registry_path()
+    os.environ["GST_REGISTRY"] = registry_path
+    gst_inspect = which("gst-inspect-1.0")
+    nvidia_smi = which("nvidia-smi")
+    if not gst_inspect or not nvidia_smi:
+        return registry_path
+
+    def inspect(element: str) -> subprocess.CompletedProcess[str] | None:
+        try:
+            return runner(
+                [gst_inspect, element],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                env=dict(os.environ),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    first_probe = inspect(NVIDIA_H264_DECODER)
+    if first_probe is not None and first_probe.returncode == 0:
+        return registry_path
+
+    # Retry only when the NVCodec plugin itself is installed and the management
+    # interface says a GPU is present.  A genuinely software-only host should not
+    # pay the retry delay on every launch.
+    nvcodec_probe = inspect("nvcodec")
+    if nvcodec_probe is None or nvcodec_probe.returncode != 0:
+        return registry_path
+
+    cuda_ok, _cuda_detail = (cuda_probe or probe_cuda_driver)()
+    if not cuda_ok:
+        return registry_path
+
+    for delay_s in GSTREAMER_REGISTRY_RETRY_DELAYS_S:
+        if delay_s > 0.0:
+            sleeper(delay_s)
+        try:
+            driver_probe = runner(
+                [nvidia_smi, "--query-gpu=name", "--format=csv,noheader"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                env=dict(os.environ),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return registry_path
+        if driver_probe.returncode != 0:
+            return registry_path
+
+        registry_path = _new_gstreamer_registry_path()
+        os.environ["GST_REGISTRY"] = registry_path
+        probe = inspect(NVIDIA_H264_DECODER)
+        if probe is not None and probe.returncode == 0:
+            break
+    return registry_path
 
 
 def _read_pyvenv_config(path: Path) -> Mapping[str, str]:
@@ -316,6 +461,8 @@ def select_decoder(
 
 def probe_nvidia_driver(
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    *,
+    cuda_probe: Callable[[], tuple[bool, str]] | None = None,
 ) -> tuple[bool, str]:
     try:
         result = runner(
@@ -328,7 +475,12 @@ def probe_nvidia_driver(
     except (OSError, subprocess.SubprocessError) as exc:
         return False, str(exc)
     detail = (result.stdout or result.stderr or "nvidia-smi returned no detail").strip()
-    return result.returncode == 0, detail
+    if result.returncode != 0:
+        return False, detail
+    cuda_ok, cuda_detail = (cuda_probe or probe_cuda_driver)()
+    if not cuda_ok:
+        return False, f"{detail}; CUDA Driver API unavailable: {cuda_detail}"
+    return True, detail
 
 
 def _module_loader(
@@ -357,6 +509,8 @@ def probe_gstreamer(
     nvidia_probe: Callable[[], tuple[bool, str]] | None = None,
 ) -> GStreamerReport:
     global _LAST_GSTREAMER_CAPABILITIES
+    if importer is None:
+        prepare_gstreamer_registry()
     load = _module_loader(importer)
     diagnostics: list[Diagnostic] = []
     missing_elements: list[str] = []
@@ -475,7 +629,12 @@ def probe_gstreamer(
             "PASS" if driver_ok else "WARN",
             "nvidia.driver",
             f"NVIDIA driver {'available' if driver_ok else 'unavailable'}: {driver_detail}",
-            recovery=() if driver_ok else ("Verify the NVIDIA driver with: nvidia-smi",),
+            recovery=()
+            if driver_ok
+            else (
+                "Run: nvidia-smi -q | rg 'Driver Version|GPU Recovery Action'",
+                "Repair/reboot the NVIDIA host state, then rerun this check until cuInit(0) passes.",
+            ),
         )
     )
     selection = select_decoder(

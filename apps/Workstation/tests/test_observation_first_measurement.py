@@ -5,11 +5,56 @@ from types import SimpleNamespace
 
 from Workstation.camera_stream_controller import CameraStreamLifecycleController
 from Workstation.recording_controller import RecordingController
+from Workstation.workstation_core.measurement_data_store import (
+    LiveDataRows,
+    MeasurementDataStore,
+)
 
 
 class _WidgetState:
     def setText(self, _text: str) -> None:
         pass
+
+
+def test_active_sessionless_live_rows_reject_clear_without_mutation(
+    tmp_path: Path,
+) -> None:
+    from Workstation.standalone_gui import WirisStereoDistancePanel
+
+    store = MeasurementDataStore(tmp_path)
+    rows = LiveDataRows(store, "measurements", priority=True)
+    assert rows.append({"result": "VALID"})
+    messages: list[str] = []
+    panel = SimpleNamespace(
+        _session_save_thread=None,
+        recording_status_label=SimpleNamespace(setText=messages.append),
+        distance_recording_enabled=True,
+        distance_recording_rows=rows,
+        distance_recording_keys=[("pair", 1)],
+        external_parameter_recording_rows=[],
+        camera_recording_rows={
+            "left": LiveDataRows(store, "camera.left"),
+            "right": LiveDataRows(store, "camera.right"),
+        },
+        px4_recording_rows={
+            "left": LiveDataRows(store, "px4.left"),
+            "right": LiveDataRows(store, "px4.right"),
+        },
+        gnss_base_recording_rows=LiveDataRows(store, "gnss.base"),
+        extrinsics_comparison_recording_rows=LiveDataRows(
+            store, "geometry.comparisons"
+        ),
+        method_evaluation_bundle_rows=LiveDataRows(
+            store, "method_evaluations", priority=True
+        ),
+    )
+
+    WirisStereoDistancePanel.clear_distance_history(panel)
+
+    assert len(rows) == 1
+    assert panel.distance_recording_keys == [("pair", 1)]
+    assert messages and "활성 Measurement/Manual record" in messages[-1]
+    assert store.close(timeout_s=2.0)
 
 
 def test_camera_rejoin_allocates_non_overwriting_video_segments(tmp_path: Path) -> None:

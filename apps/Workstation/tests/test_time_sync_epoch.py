@@ -4,7 +4,10 @@ import copy
 import hashlib
 import json
 
-from Workstation.workstation_core.recording_session import save_session_files
+from Workstation.workstation_core.recording_session import (
+    compact_camera_timeline_rows,
+    save_session_files,
+)
 from Workstation.workstation_core.time_sync_epoch import (
     TIME_SYNC_EPOCH_SCHEMA_VERSION,
     materialize_time_sync_epochs,
@@ -140,10 +143,30 @@ def test_ssrc_and_stream_generation_changes_create_observed_epochs() -> None:
     assert len({row["time_sync_epoch_id"] for row in rows}) == 3
 
 
+def test_stus_clock_epoch_change_splits_same_stream_generation_and_ssrc() -> None:
+    first = _camera_row(10_000, ssrc=101, generation=7)
+    first.update(clock_epoch_id="clock-a", clock_epoch_state="current")
+    transition = _camera_row(20_000, ssrc=101, generation=7)
+    transition.update(clock_epoch_id="clock-b", clock_epoch_state="transition")
+    second = _camera_row(30_000, ssrc=101, generation=7)
+    second.update(clock_epoch_id="clock-b", clock_epoch_state="current")
+
+    epochs = _materialize([first, transition, second])
+
+    assert [epoch["status"] for epoch in epochs] == ["valid", "invalid", "valid"]
+    assert [epoch["clock_epoch_id"] for epoch in epochs] == [
+        "clock-a",
+        "clock-b",
+        "clock-b",
+    ]
+    assert epochs[1]["trigger"] == "stus_clock_epoch_transition"
+    assert epochs[2]["trigger"] == "stus_clock_epoch_verified"
+
+
 def test_explicit_invalidation_is_recorded_without_claiming_utc_mapping() -> None:
     rows = [
         _camera_row(10_000),
-        _camera_row(20_000, invalid_reason="sr_pc_offset_exceeded"),
+        _camera_row(20_000, invalid_reason="rtcp_mapping_discontinuity"),
         _camera_row(30_000),
     ]
 
@@ -153,9 +176,34 @@ def test_explicit_invalidation_is_recorded_without_claiming_utc_mapping() -> Non
     assert epochs[1]["trigger"] == "mapping_invalidation"
     assert epochs[1]["utc_mapping_method"] is None
     assert epochs[1]["mapping_evidence"]["rtcp_timing_invalid_reason"] == (
-        "sr_pc_offset_exceeded"
+        "rtcp_mapping_discontinuity"
     )
     assert epochs[2]["trigger"] == "mapping_revalidated"
+
+
+def test_sr_pc_absolute_offset_marker_does_not_invalidate_clock_epoch() -> None:
+    rows = [
+        _camera_row(10_000),
+        _camera_row(20_000, invalid_reason="sr_pc_offset_exceeded"),
+        _camera_row(30_000),
+    ]
+
+    epochs = _materialize(rows)
+
+    assert len(epochs) == 1
+    assert epochs[0]["status"] == "valid"
+    assert all(row["time_sync_epoch_id"] == epochs[0]["time_sync_epoch_id"] for row in rows)
+
+    [compact] = compact_camera_timeline_rows(
+        [
+            {
+                **rows[1],
+                "rtcp_sr_pc_offset_s": 32_400.0,
+            }
+        ]
+    )
+    assert compact["timing_status"] == "valid_sr_pc_diagnostic"
+    assert compact["rtcp_sr_pc_offset_ns"] == 32_400_000_000_000
 
 
 def test_terminal_side_links_require_one_exact_epoch_and_stereo_id_remains_null() -> None:

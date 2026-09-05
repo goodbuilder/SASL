@@ -1,8 +1,9 @@
 """Derived XLSX view for the latest sessionless Workstation Measurement.
 
-Fixed JSONL remains authoritative.  This module reads an immutable byte-cutoff
-view of those files, selects one exact runtime generation, and atomically
-publishes a spreadsheet that can be regenerated at any time.
+Timestamped JSONL remains authoritative.  This module reads an immutable
+byte-cutoff view of timestamped or legacy files, selects one exact runtime
+generation, and atomically publishes a spreadsheet that can be regenerated at
+any time.
 """
 
 from __future__ import annotations
@@ -25,10 +26,15 @@ from xml.etree import ElementTree
 
 import xlsxwriter
 
-from Workstation.workstation_core.measurement_data_store import STREAM_PATHS
+from Workstation.workstation_core.measurement_data_store import (
+    STREAM_PATHS,
+    creation_timestamp_text,
+)
 
 
 LATEST_MEASUREMENT_WORKBOOK_NAME = "latest_measurement.xlsx"
+LATEST_MEASUREMENT_WORKBOOK_STEM = "latest_measurement"
+LATEST_MEASUREMENT_WORKBOOK_SUFFIX = ".xlsx"
 LATEST_MEASUREMENT_WORKBOOK_SCHEMA = "workstation-latest-measurement-xlsx-v1"
 EXCEL_MAX_ROWS = 1_048_576
 EXCEL_MAX_COLUMNS = 16_384
@@ -53,6 +59,7 @@ BASE_SHEET_NAMES = (
     "PixhawkP2",
     "PixhawkDrone",
     "GnssBase",
+    "GnssBaselineCenter",
     "Geometry",
     "NativeFrames",
     "Files",
@@ -103,6 +110,17 @@ _DEFAULT_COLUMNS: dict[str, tuple[str, ...]] = {
     "PixhawkP2": ("measurement_id", "sequence", "sample_type", "recorded_utc_ns"),
     "PixhawkDrone": ("measurement_id", "sequence", "sample_type", "recorded_utc_ns"),
     "GnssBase": ("measurement_id", "sequence", "sample_type", "recorded_utc_ns"),
+    "GnssBaselineCenter": (
+        "measurement_id",
+        "sequence",
+        "geometry_state",
+        "gnss_baseline_center_forward_m",
+        "gnss_baseline_center_right_m",
+        "gnss_baseline_center_down_m",
+        "gnss_baseline_center_range_m",
+        "three_source_timestamp_spread_ms",
+        "recorded_utc_ns",
+    ),
     "Geometry": ("measurement_id", "method", "recorded_utc_ns"),
     "NativeFrames": ("runtime_generation", "request_id", "event_type", "recorded_utc_ns"),
     "Files": ("runtime_generation", "event_type", "side", "path", "recorded_utc_ns"),
@@ -117,6 +135,22 @@ _EPOCH_FIELD = re.compile(r"(?:utc|unix)_(ns|us|s)$", re.IGNORECASE)
 
 class LatestMeasurementExportCancelled(RuntimeError):
     """Raised cooperatively before a generated workbook is published."""
+
+
+def timestamped_workbook_name(
+    utc_ns: int | None = None,
+    *,
+    sequence: int = 0,
+) -> str:
+    """Return a non-overwriting filename for one derived workbook."""
+
+    suffix = "" if int(sequence) == 0 else f"-{int(sequence):02d}"
+    return (
+        f"{LATEST_MEASUREMENT_WORKBOOK_STEM}_"
+        f"{creation_timestamp_text(utc_ns)}"
+        f"{suffix}"
+        f"{LATEST_MEASUREMENT_WORKBOOK_SUFFIX}"
+    )
 
 
 @dataclass(frozen=True)
@@ -265,6 +299,7 @@ _SHEET_SPECS: tuple[_SheetSpec, ...] = (
     _SheetSpec("PixhawkP2", "px4.right", _project_raw),
     _SheetSpec("PixhawkDrone", "px4.drone", _project_raw),
     _SheetSpec("GnssBase", "gnss.base", _project_raw),
+    _SheetSpec("GnssBaselineCenter", "gnss.baseline.center", _project_raw),
     _SheetSpec("Geometry", "geometry.comparisons", _project_raw),
     _SheetSpec("NativeFrames", "native.frames", _project_raw),
     _SheetSpec("Files", "artifacts", _project_raw),
@@ -282,9 +317,9 @@ def _iter_jsonl(
     byte_limit: int | None,
     issues: list[_JsonlIssue] | None,
     cancel_event: threading.Event | None,
+    path: Path | None = None,
 ) -> Iterator[dict[str, object]]:
-    relative = STREAM_PATHS[stream]
-    path = root / relative
+    path = root / STREAM_PATHS[stream] if path is None else Path(path)
     if not path.is_file() or path.is_symlink():
         return
     limit = max(0, path.stat().st_size if byte_limit is None else int(byte_limit))
@@ -330,10 +365,96 @@ def _iter_jsonl(
             yield {str(key): item for key, item in value.items()}
 
 
+def _stream_candidate_paths(
+    root: Path,
+    stream: str,
+    stream_paths: Mapping[str, object] | None,
+) -> tuple[Path, ...]:
+    """Resolve current, legacy, and timestamped files for one stream."""
+
+    relative = STREAM_PATHS[stream]
+    values: list[Path] = []
+    provided = None if stream_paths is None else stream_paths.get(stream)
+    if isinstance(provided, (str, Path)):
+        provided_values = (provided,)
+    elif isinstance(provided, Sequence):
+        provided_values = tuple(provided)
+    else:
+        provided_values = ()
+    for value in provided_values:
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        values.append(candidate)
+    values.append(root / relative)
+    values.extend(
+        sorted(
+            root.glob(f"{relative.stem}_*{relative.suffix}"),
+            key=lambda path: path.name,
+        )
+    )
+    unique: list[Path] = []
+    for candidate in values:
+        if candidate not in unique:
+            unique.append(candidate)
+    return tuple(unique)
+
+
+def _stream_path_limit(
+    root: Path,
+    stream: str,
+    path: Path,
+    *,
+    stream_byte_limits: Mapping[str, int] | None,
+    stream_byte_limits_by_path: Mapping[str, int] | None,
+) -> int | None:
+    """Return a checkpoint limit for one physical stream path."""
+
+    try:
+        key = path.relative_to(root).as_posix()
+    except ValueError:
+        key = path.as_posix()
+    if stream_byte_limits_by_path is not None and key in stream_byte_limits_by_path:
+        return max(0, int(stream_byte_limits_by_path[key]))
+    legacy = root / STREAM_PATHS[stream]
+    if path == legacy and stream_byte_limits is not None and stream in stream_byte_limits:
+        return max(0, int(stream_byte_limits[stream]))
+    return None
+
+
+def _iter_stream_jsonl(
+    root: Path,
+    stream: str,
+    *,
+    stream_paths: Mapping[str, object] | None,
+    stream_byte_limits: Mapping[str, int] | None,
+    stream_byte_limits_by_path: Mapping[str, int] | None,
+    issues: list[_JsonlIssue] | None,
+    cancel_event: threading.Event | None,
+) -> Iterator[dict[str, object]]:
+    for path in _stream_candidate_paths(root, stream, stream_paths):
+        yield from _iter_jsonl(
+            root,
+            stream,
+            byte_limit=_stream_path_limit(
+                root,
+                stream,
+                path,
+                stream_byte_limits=stream_byte_limits,
+                stream_byte_limits_by_path=stream_byte_limits_by_path,
+            ),
+            issues=issues,
+            cancel_event=cancel_event,
+            path=path,
+        )
+
+
 def discover_latest_measurement(
     root: Path | str,
     *,
     stream_byte_limits: Mapping[str, int] | None = None,
+    stream_paths: Mapping[str, object] | None = None,
+    stream_byte_limits_by_path: Mapping[str, int] | None = None,
     cancel_event: threading.Event | None = None,
 ) -> LatestMeasurementSelection:
     """Discover the newest completed generation, with a transparent fallback."""
@@ -341,10 +462,12 @@ def discover_latest_measurement(
     resolved = Path(root).expanduser().resolve(strict=False)
     limits = dict(stream_byte_limits or {})
     latest_stop: tuple[int, dict[str, object]] | None = None
-    for row in _iter_jsonl(
+    for row in _iter_stream_jsonl(
         resolved,
         "events",
-        byte_limit=limits.get("events"),
+        stream_paths=stream_paths,
+        stream_byte_limits=limits,
+        stream_byte_limits_by_path=stream_byte_limits_by_path,
         issues=None,
         cancel_event=cancel_event,
     ):
@@ -360,10 +483,12 @@ def discover_latest_measurement(
         stopped = latest_stop[1]
         generation = str(stopped["runtime_generation"])
         started_utc_ns: int | None = None
-        for row in _iter_jsonl(
+        for row in _iter_stream_jsonl(
             resolved,
             "events",
-            byte_limit=limits.get("events"),
+            stream_paths=stream_paths,
+            stream_byte_limits=limits,
+            stream_byte_limits_by_path=stream_byte_limits_by_path,
             issues=None,
             cancel_event=cancel_event,
         ):
@@ -393,14 +518,17 @@ def discover_latest_measurement(
         "px4.right",
         "px4.drone",
         "gnss.base",
+        "gnss.baseline.center",
         "geometry.comparisons",
         "native.frames",
         "artifacts",
     ):
-        for row in _iter_jsonl(
+        for row in _iter_stream_jsonl(
             resolved,
             stream,
-            byte_limit=limits.get(stream),
+            stream_paths=stream_paths,
+            stream_byte_limits=limits,
+            stream_byte_limits_by_path=stream_byte_limits_by_path,
             issues=None,
             cancel_event=cancel_event,
         ):
@@ -501,14 +629,19 @@ def _materialized_results(
     generation: str,
     *,
     byte_limit: int | None,
+    stream_paths: Mapping[str, object] | None,
+    stream_byte_limits: Mapping[str, int] | None,
+    stream_byte_limits_by_path: Mapping[str, int] | None,
     cancel_event: threading.Event | None,
 ) -> list[OrderedDict[str, object]]:
     current: OrderedDict[object, OrderedDict[str, object]] = OrderedDict()
     fallback = 0
-    for row in _iter_jsonl(
+    for row in _iter_stream_jsonl(
         root,
         "measurements",
-        byte_limit=byte_limit,
+        stream_paths=stream_paths,
+        stream_byte_limits=stream_byte_limits,
+        stream_byte_limits_by_path=stream_byte_limits_by_path,
         issues=None,
         cancel_event=cancel_event,
     ):
@@ -527,6 +660,8 @@ def _profile_export(
     generation: str,
     *,
     stream_byte_limits: Mapping[str, int],
+    stream_paths: Mapping[str, object] | None,
+    stream_byte_limits_by_path: Mapping[str, int] | None,
     cancel_event: threading.Event | None,
 ) -> tuple[
     dict[str, _SheetProfile],
@@ -544,10 +679,12 @@ def _profile_export(
         specs_by_stream.setdefault(spec.stream, []).append(spec)
 
     for stream, specs in specs_by_stream.items():
-        for row in _iter_jsonl(
+        for row in _iter_stream_jsonl(
             root,
             stream,
-            byte_limit=stream_byte_limits.get(stream),
+            stream_paths=stream_paths,
+            stream_byte_limits=stream_byte_limits,
+            stream_byte_limits_by_path=stream_byte_limits_by_path,
             issues=issues,
             cancel_event=cancel_event,
         ):
@@ -561,6 +698,9 @@ def _profile_export(
         root,
         generation,
         byte_limit=stream_byte_limits.get("measurements"),
+        stream_paths=stream_paths,
+        stream_byte_limits=stream_byte_limits,
+        stream_byte_limits_by_path=stream_byte_limits_by_path,
         cancel_event=cancel_event,
     )
     for row in result_rows:
@@ -576,12 +716,17 @@ def _iter_sheet_rows(
     generation: str,
     *,
     byte_limit: int | None,
+    stream_paths: Mapping[str, object] | None,
+    stream_byte_limits: Mapping[str, int] | None,
+    stream_byte_limits_by_path: Mapping[str, int] | None,
     cancel_event: threading.Event | None,
 ) -> Iterator[OrderedDict[str, object]]:
-    for row in _iter_jsonl(
+    for row in _iter_stream_jsonl(
         root,
         spec.stream,
-        byte_limit=byte_limit,
+        stream_paths=stream_paths,
+        stream_byte_limits=stream_byte_limits,
+        stream_byte_limits_by_path=stream_byte_limits_by_path,
         issues=None,
         cancel_event=cancel_event,
     ):
@@ -687,7 +832,7 @@ def _write_summary(
     worksheet.write_string(
         1,
         0,
-        "Derived view only; fixed JSONL remains authoritative. Manual edits may be replaced.",
+        "Derived view only; timestamped JSONL remains authoritative. Manual edits may be replaced.",
         formats["note"],
     )
     fields: tuple[tuple[str, object], ...] = (
@@ -806,6 +951,8 @@ def _write_workbook(
     root: Path,
     selection: LatestMeasurementSelection,
     stream_byte_limits: Mapping[str, int],
+    stream_paths: Mapping[str, object] | None,
+    stream_byte_limits_by_path: Mapping[str, int] | None,
     storage_snapshot: Mapping[str, object],
     source_states: Mapping[str, object],
     checkpoint_settled: bool,
@@ -818,6 +965,8 @@ def _write_workbook(
         root,
         selection.generation,
         stream_byte_limits=stream_byte_limits,
+        stream_paths=stream_paths,
+        stream_byte_limits_by_path=stream_byte_limits_by_path,
         cancel_event=cancel_event,
     )
     generated_utc_ns = time_ns()
@@ -834,7 +983,7 @@ def _write_workbook(
         workbook.set_properties(
             {
                 "title": "Workstation latest Measurement",
-                "comments": "Derived view; fixed JSONL remains authoritative.",
+                "comments": "Derived view; timestamped JSONL remains authoritative.",
             }
         )
         workbook.set_custom_property(
@@ -867,6 +1016,9 @@ def _write_workbook(
                     root,
                     selection.generation,
                     byte_limit=stream_byte_limits.get(spec.stream),
+                    stream_paths=stream_paths,
+                    stream_byte_limits=stream_byte_limits,
+                    stream_byte_limits_by_path=stream_byte_limits_by_path,
                     cancel_event=cancel_event,
                 )
             _write_table(
@@ -972,6 +1124,20 @@ def _publish_owned_workbook(temporary: Path, output: Path) -> None:
     _fsync_directory(output.parent)
 
 
+def _validated_workbook_name(value: str | None) -> str:
+    name = LATEST_MEASUREMENT_WORKBOOK_NAME if value is None else str(value).strip()
+    path = Path(name)
+    if (
+        not name
+        or path.name != name
+        or path.suffix.lower() != LATEST_MEASUREMENT_WORKBOOK_SUFFIX
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or "\x00" in name
+    ):
+        raise ValueError("latest Measurement workbook name must be one safe .xlsx filename")
+    return name
+
+
 def write_latest_measurement_xlsx(
     root: Path | str,
     *,
@@ -979,7 +1145,10 @@ def write_latest_measurement_xlsx(
     started_utc_ns: int | None = None,
     stopped_utc_ns: int | None = None,
     completion_evidence: str = "explicit",
+    output_name: str | None = None,
     stream_byte_limits: Mapping[str, int] | None = None,
+    stream_paths: Mapping[str, object] | None = None,
+    stream_byte_limits_by_path: Mapping[str, int] | None = None,
     storage_snapshot: Mapping[str, object] | None = None,
     source_states: Mapping[str, object] | None = None,
     checkpoint_settled: bool = True,
@@ -1005,6 +1174,8 @@ def write_latest_measurement_xlsx(
         selection = discover_latest_measurement(
             resolved,
             stream_byte_limits=limits,
+            stream_paths=stream_paths,
+            stream_byte_limits_by_path=stream_byte_limits_by_path,
             cancel_event=cancel_event,
         )
     else:
@@ -1019,7 +1190,7 @@ def write_latest_measurement_xlsx(
         )
     if cancel_event is not None and cancel_event.is_set():
         raise LatestMeasurementExportCancelled("latest Measurement export cancelled")
-    output = resolved / LATEST_MEASUREMENT_WORKBOOK_NAME
+    output = resolved / _validated_workbook_name(output_name)
     descriptor, temporary_name = tempfile.mkstemp(
         dir=resolved,
         prefix=f".{LATEST_MEASUREMENT_WORKBOOK_NAME}.",
@@ -1033,6 +1204,8 @@ def write_latest_measurement_xlsx(
             root=resolved,
             selection=selection,
             stream_byte_limits=limits,
+            stream_paths=stream_paths,
+            stream_byte_limits_by_path=stream_byte_limits_by_path,
             storage_snapshot=dict(storage_snapshot or {}),
             source_states=dict(source_states or {}),
             checkpoint_settled=bool(checkpoint_settled),
@@ -1066,6 +1239,7 @@ __all__ = [
     "EXCEL_MAX_COLUMNS",
     "EXCEL_MAX_ROWS",
     "LATEST_MEASUREMENT_WORKBOOK_NAME",
+    "LATEST_MEASUREMENT_WORKBOOK_STEM",
     "LATEST_MEASUREMENT_WORKBOOK_SCHEMA",
     "LatestMeasurementExportCancelled",
     "LatestMeasurementSelection",
@@ -1073,5 +1247,6 @@ __all__ = [
     "discover_latest_measurement",
     "prepare_excel_row",
     "workbook_identity",
+    "timestamped_workbook_name",
     "write_latest_measurement_xlsx",
 ]

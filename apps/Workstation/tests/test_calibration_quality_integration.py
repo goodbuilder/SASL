@@ -286,7 +286,32 @@ def _checkerboard_corners(
     ]
 
 
+def test_auto_capture_metadata_requires_exact_au_and_decoded_pts() -> None:
+    from Workstation.calibration_controller import (
+        is_nal1_non_idr_auto_capture_metadata,
+    )
+
+    metadata = {
+        "h264_access_unit_kind": "nal1_non_idr_intra",
+        "h264_access_unit_nal_types": [7, 8, 1],
+        "h264_access_unit_is_delta": False,
+        "h264_access_unit_pts_ns": 123,
+        "decoded_buffer_pts_ns": 123,
+        "h264_nal1_non_idr_intra": True,
+        "h264_random_access_guaranteed": False,
+    }
+    assert is_nal1_non_idr_auto_capture_metadata(metadata) is True
+
+    metadata["decoded_buffer_pts_ns"] = 124
+    assert is_nal1_non_idr_auto_capture_metadata(metadata) is False
+    metadata["decoded_buffer_pts_ns"] = 123
+    metadata["h264_access_unit_nal_types"] = [1, 5]
+    assert is_nal1_non_idr_auto_capture_metadata(metadata) is False
+
+
 def test_auto_capture_uses_native_raster_and_rejects_repeated_pose() -> None:
+    from Workstation.workstation_core.native_frame_ring import FrameKey
+
     _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     preview = QtGui.QImage(1280, 720, QtGui.QImage.Format_RGB888)
     native = QtGui.QImage(1920, 1080, QtGui.QImage.Format_RGB888)
@@ -299,19 +324,29 @@ def test_auto_capture_uses_native_raster_and_rejects_repeated_pose() -> None:
             self.side = side
             self.rtcp = rtcp
 
-        def calibration_native_frame_near(self, timestamp_s: float, **_kwargs):
+        def calibration_native_frame_for_key(self, key: FrameKey, **_kwargs):
+            assert key.camera_id == self.side
+            metadata = {
+                **key.to_mapping(),
+                "timestamp_s": now_s,
+                "rtcp_frame_ntp_unix_s": self.rtcp,
+                "native_width": 1920,
+                "native_height": 1080,
+                "native_lossless_source": True,
+                "overlay_applied": False,
+                "source_native_frame_id": key.text,
+                "h264_access_unit_kind": "nal1_non_idr_intra",
+                "h264_access_unit_nal_types": [1],
+                "h264_access_unit_is_delta": False,
+                "h264_access_unit_pts_ns": key.frame_id * 1_000,
+                "decoded_buffer_pts_ns": key.frame_id * 1_000,
+                "h264_nal1_non_idr_intra": True,
+                "h264_random_access_guaranteed": False,
+            }
             return (
-                f"native-{self.side}",
+                key.text,
                 native.copy(),
-                {
-                    "timestamp_s": float(timestamp_s),
-                    "rtcp_frame_ntp_unix_s": self.rtcp,
-                    "native_width": 1920,
-                    "native_height": 1080,
-                    "native_lossless_source": True,
-                    "overlay_applied": False,
-                    "source_native_frame_id": f"native-{self.side}",
-                },
+                metadata,
             )
 
     status = QtWidgets.QLabel()
@@ -331,12 +366,24 @@ def test_auto_capture_uses_native_raster_and_rejects_repeated_pose() -> None:
     )
     corners = _checkerboard_corners()
     for side, request_id, rtcp in (("left", 1, 100.000), ("right", 2, 100.002)):
+        key = FrameKey(side, 7, request_id)
         panel.calibration_preview_detection_results[side] = {
             "request_id": request_id,
             "image": preview.copy(),
             "found": True,
             "corners": corners,
-            "metadata": {"timestamp_s": now_s, "rtcp_frame_ntp_unix_s": rtcp},
+            "metadata": {
+                **key.to_mapping(),
+                "timestamp_s": now_s,
+                "rtcp_frame_ntp_unix_s": rtcp,
+                "h264_access_unit_kind": "nal1_non_idr_intra",
+                "h264_access_unit_nal_types": [1],
+                "h264_access_unit_is_delta": False,
+                "h264_access_unit_pts_ns": request_id * 1_000,
+                "decoded_buffer_pts_ns": request_id * 1_000,
+                "h264_nal1_non_idr_intra": True,
+                "h264_random_access_guaranteed": False,
+            },
         }
     controller = CalibrationWorkflowController(panel)
     controller._auto_capture_active = True
@@ -346,7 +393,7 @@ def test_auto_capture_uses_native_raster_and_rejects_repeated_pose() -> None:
     controller._auto_calibration_capture_tick()
     assert len(captures) == 1
     assert captures[0]["frames"]["left"].size() == native.size()
-    assert captures[0]["metadata_by_camera"]["left"]["frame_id"] == "native-left"
+    assert captures[0]["metadata_by_camera"]["left"]["frame_id"] == "left:7:1"
 
     controller._auto_capture_pose_views = {
         "left": [controller._auto_capture_pending_pose_views["left"]],
@@ -359,6 +406,96 @@ def test_auto_capture_uses_native_raster_and_rejects_repeated_pose() -> None:
 
     assert len(captures) == 1
     assert "거의 같" in status.text()
+
+
+def test_auto_capture_waits_for_positive_nal1_metadata_before_native_lookup() -> None:
+    preview = QtGui.QImage(32, 24, QtGui.QImage.Format_RGB888)
+    preview.fill(0)
+    native_calls: list[object] = []
+
+    class Pane:
+        def calibration_native_frame_for_key(self, key, **_kwargs):
+            native_calls.append(key)
+            return None
+
+    panel = SimpleNamespace(
+        checkerboard_calibration_thread=None,
+        calibration_status_label=QtWidgets.QLabel(),
+        left_pane=Pane(),
+        right_pane=Pane(),
+        calibration_preview_detection_results={
+            side: {
+                "request_id": index,
+                "image": preview.copy(),
+                "found": True,
+                "corners": _checkerboard_corners(columns=2, rows=2),
+                "metadata": {"timestamp_s": time.monotonic()},
+            }
+            for index, side in enumerate(("left", "right"), start=1)
+        },
+    )
+    controller = CalibrationWorkflowController(panel)
+    controller._auto_capture_active = True
+
+    controller._auto_calibration_capture_tick()
+
+    assert native_calls == []
+    assert "NAL1 non-delta" in panel.calibration_status_label.text()
+
+
+def test_auto_capture_does_not_fall_back_when_exact_frame_key_is_evicted() -> None:
+    from Workstation.workstation_core.native_frame_ring import FrameKey
+
+    preview = QtGui.QImage(640, 480, QtGui.QImage.Format_RGB888)
+    preview.fill(0)
+    exact_calls: list[FrameKey] = []
+
+    class Pane:
+        def calibration_native_frame_for_key(self, key: FrameKey, **_kwargs):
+            exact_calls.append(key)
+            return None
+
+        def calibration_native_frame_near(self, *_args, **_kwargs):
+            raise AssertionError("Auto capture must not use timestamp-near fallback")
+
+    detections: dict[str, dict[str, object]] = {}
+    for index, side in enumerate(("left", "right"), start=1):
+        key = FrameKey(side, 9, index)
+        detections[side] = {
+            "request_id": index,
+            "image": preview.copy(),
+            "found": True,
+            "corners": _checkerboard_corners(columns=2, rows=2),
+            "metadata": {
+                **key.to_mapping(),
+                "timestamp_s": time.monotonic(),
+                "h264_access_unit_kind": "nal1_non_idr_intra",
+                "h264_access_unit_nal_types": [1],
+                "h264_access_unit_is_delta": False,
+                "h264_access_unit_pts_ns": index * 100,
+                "decoded_buffer_pts_ns": index * 100,
+                "h264_nal1_non_idr_intra": True,
+                "h264_random_access_guaranteed": False,
+            },
+        }
+    panel = SimpleNamespace(
+        checkerboard_calibration_thread=None,
+        calibration_status_label=QtWidgets.QLabel(),
+        left_pane=Pane(),
+        right_pane=Pane(),
+        calibration_preview_detection_results=detections,
+        _checkerboard_config=lambda: CheckerboardConfig(2, 2, 0.1),
+    )
+    controller = CalibrationWorkflowController(panel)
+    controller._auto_capture_active = True
+    captures: list[object] = []
+    controller.capture_calibration_images = lambda **kwargs: captures.append(kwargs) or True  # type: ignore[method-assign]
+
+    controller._auto_calibration_capture_tick()
+
+    assert exact_calls == [FrameKey("left", 9, 1)]
+    assert captures == []
+    assert "exact native FrameKey" in panel.calibration_status_label.text()
 
 
 def test_manual_capture_rejects_implicit_preview_fallback() -> None:

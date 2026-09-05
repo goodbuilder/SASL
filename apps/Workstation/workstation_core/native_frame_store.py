@@ -53,10 +53,19 @@ def _safe_token(value: object, fallback: str) -> str:
 class NativeFrameStore:
     """Synchronous atomic writer intended for a dedicated controller/worker."""
 
-    def __init__(self, session_root: Path | str) -> None:
+    def __init__(
+        self,
+        session_root: Path | str,
+        *,
+        events_path: Path | str | None = None,
+    ) -> None:
         self.root = Path(session_root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
-        self.events_path = self.root / "native_frames.jsonl"
+        self.events_path = (
+            self.root / "native_frames.jsonl"
+            if events_path is None
+            else Path(events_path).expanduser().resolve()
+        )
         self.ledger_recovery = prepare_jsonl_append(self.events_path)
 
     def persist(
@@ -170,12 +179,18 @@ class AsyncNativeFrameStore(QtCore.QObject):
         *,
         max_pending: int = DEFAULT_MAX_PENDING,
         timestamp_filenames: bool = False,
+        events_path: Path | str | None = None,
         parent: QtCore.QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self.root = Path(session_root).expanduser().resolve()
         self.max_pending = max(1, int(max_pending))
         self.timestamp_filenames = bool(timestamp_filenames)
+        self.events_path = (
+            None
+            if events_path is None
+            else Path(events_path).expanduser().resolve()
+        )
         self._lock = threading.RLock()
         self._pending: set[str] = set()
         self._work_queue: queue.Queue[object] = queue.Queue(
@@ -293,7 +308,10 @@ class AsyncNativeFrameStore(QtCore.QObject):
         context: dict[str, object],
     ) -> dict[str, object]:
         if self._store is None:
-            self._store = NativeFrameStore(self.root)
+            self._store = NativeFrameStore(
+                self.root,
+                events_path=self.events_path,
+            )
         fields: dict[str, object] = {
             "native_pair_status": "complete",
             "evidence_state": "SAVED",

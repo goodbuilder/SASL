@@ -14,9 +14,9 @@ from Workstation.workstation_core.camera_pane import (
 )
 
 
-# Camera shutdown owns a 9-second MP4 EOS window inside its 12-second
+# Camera shutdown owns the recorder/container drain inside its 30-second
 # cooperative process-stop window. A shorter application deadline turns a
-# valid slow mp4mux finalization into a forced kill.
+# valid slow NVENC/MP4 finalization into a forced kill.
 SHUTDOWN_DEADLINE_S = CAMERA_STOP_TERMINATE_AFTER_S
 SHUTDOWN_FORCE_WAIT_S = 1.0
 SHUTDOWN_RESOURCE_REPORT_SCHEMA = "workstation-shutdown-resources-v1"
@@ -85,6 +85,9 @@ class AppLifecycleController:
         auto_capture_stopped = self.panel.stop_auto_calibration_capture()
         preview_stopped = self.panel._stop_calibration_preview_worker(wait=False)
         lrf_stopped = self.panel.stop_wiris_lrf_polling(wait=False)
+        stop_clock_observer = getattr(self.panel, "_stop_rtcp_clock_observer", None)
+        if callable(stop_clock_observer):
+            stop_clock_observer()
         measurement_owner = getattr(
             self.panel, "_measurement_view_controller_owner", None
         )
@@ -133,13 +136,16 @@ class AppLifecycleController:
             "oz_photo_capture_thread",
             "wiris_zoom_thread",
             "wiris_time_sync_thread",
+            "_rtcp_clock_observer_thread",
             "wiris_stip_thread",
             "camera_network_discovery_thread",
             "camera_network_apply_thread",
+            "network_role_apply_thread",
             "interface_status_thread",
             "pixhawk_usb_discovery_thread",
             "pixhawk_host_ip_discovery_thread",
             "pixhawk_network_discovery_thread",
+            "drone_telemetry_network_discovery_thread",
             "drone_telemetry_usb_discovery_thread",
             "rtsp_check_thread",
             "rtsp_enable_thread",

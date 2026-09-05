@@ -11,10 +11,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from math import cos, radians, sqrt
 
 from Workstation.workstation_core.baseline_alignment import BaselineVector, baseline_from_gps
-from Workstation.workstation_core.rtk_geometry import EARTH_RADIUS_M, GpsPositionState
+from Workstation.workstation_core.gnss_baseline_center import (
+    GnssBaselineCenterFrdEstimate,
+    estimate_gnss_baseline_center_frd,
+    gnss_baseline_center_frd_from_gps,
+)
+from Workstation.workstation_core.rtk_geometry import GpsPositionState
 
 
 @dataclass(frozen=True)
@@ -62,26 +66,10 @@ def target_distance_from_gps(
     is the Euclidean range from its midpoint to the Drone GNSS position.
     """
 
-    if not all(_valid_gps_position(state) for state in (left, right, drone)):
+    geometry = gnss_baseline_center_frd_from_gps(left, right, drone)
+    if geometry is None or geometry.range_m <= 0.0:
         return None
-    baseline = baseline_from_gps(left, right)
-    if baseline is None:
-        return None
-    reference_lat_rad = radians((float(left.latitude_deg) + float(right.latitude_deg)) / 2.0)
-    drone_north_m = radians(float(drone.latitude_deg) - float(left.latitude_deg)) * EARTH_RADIUS_M
-    drone_east_m = (
-        radians(float(drone.longitude_deg) - float(left.longitude_deg))
-        * EARTH_RADIUS_M
-        * cos(reference_lat_rad)
-    )
-    drone_up_m = float(drone.altitude_m) - float(left.altitude_m)
-    midpoint_relative = (
-        drone_east_m - baseline.east_m / 2.0,
-        drone_north_m - baseline.north_m / 2.0,
-        drone_up_m - baseline.up_m / 2.0,
-    )
-    distance = sqrt(sum(value * value for value in midpoint_relative))
-    return distance if math.isfinite(distance) and distance > 0.0 else None
+    return geometry.range_m
 
 
 def estimate_ideal_disparity(
@@ -92,39 +80,50 @@ def estimate_ideal_disparity(
     focal_length_px: float | None,
     now_s: float | None = None,
     maximum_gps_age_s: float | None = None,
+    maximum_gps_timestamp_spread_s: float | None = None,
+    gnss_estimate: GnssBaselineCenterFrdEstimate | None = None,
 ) -> IdealDisparityEstimate:
     """Build a UI-friendly estimate while preserving missing-data reasons."""
 
     if left is None or right is None or drone is None:
         return IdealDisparityEstimate("WAITING", "P1/P2/Drone GNSS 위치 대기 중")
-    baseline = baseline_from_gps(left, right)
-    if baseline is None:
-        return IdealDisparityEstimate("WAITING", "P1/P2 GNSS 위치가 유효하지 않음")
-    target_distance = target_distance_from_gps(left, right, drone)
+    if gnss_estimate is None:
+        gnss_estimate = estimate_gnss_baseline_center_frd(
+            left,
+            right,
+            drone,
+            now_s=now_s,
+            maximum_age_s=(maximum_gps_age_s if now_s is not None else None),
+            maximum_timestamp_spread_s=maximum_gps_timestamp_spread_s,
+        )
+    target_distance = gnss_estimate.range_m
     if target_distance is None:
         return IdealDisparityEstimate(
             "WAITING",
-            "세 GNSS 위치가 유효하지 않음",
-            baseline=baseline,
+            gnss_estimate.reason,
         )
-
-    if maximum_gps_age_s is not None and now_s is not None:
-        age_limit = max(0.0, float(maximum_gps_age_s))
-        oldest_age = max(
-            float(now_s) - float(left.timestamp_s),
-            float(now_s) - float(right.timestamp_s),
-            float(now_s) - float(drone.timestamp_s),
-        )
-        if oldest_age > age_limit:
-            return IdealDisparityEstimate(
-                "STALE",
-                f"세 GNSS age가 {age_limit:.1f}s를 초과함",
-                baseline=baseline,
-                focal_length_px=_finite_or_none(focal_length_px),
-                target_distance_m=target_distance,
-            )
-
+    if not all(isinstance(state, GpsPositionState) for state in (left, right, drone)):
+        return IdealDisparityEstimate("WAITING", "P1/P2/Drone GNSS 위치 형식이 유효하지 않음")
+    baseline = baseline_from_gps(left, right)
+    if baseline is None:
+        return IdealDisparityEstimate("WAITING", "P1/P2 GNSS 위치가 유효하지 않음")
     focal = _finite_or_none(focal_length_px)
+    if gnss_estimate.state == "STALE":
+        return IdealDisparityEstimate(
+            "STALE",
+            gnss_estimate.reason,
+            baseline=baseline,
+            focal_length_px=focal,
+            target_distance_m=target_distance,
+        )
+    if target_distance <= 0.0:
+        return IdealDisparityEstimate(
+            "WAITING",
+            "GNSS midpoint-to-Drone range must be positive for ideal disparity",
+            baseline=baseline,
+            focal_length_px=focal,
+            target_distance_m=target_distance,
+        )
     if focal is None or focal <= 0.0:
         return IdealDisparityEstimate(
             "WAITING",

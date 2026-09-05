@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import glob
+import hashlib
 import io
 from ipaddress import IPv4Address
 import math
@@ -11,7 +13,7 @@ import socket
 import struct
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -25,6 +27,11 @@ from Workstation.workstation_core.mavlink_liveness import (
     MavlinkLivenessState,
     MavlinkSideHealthSnapshot,
     MavlinkSideLiveness,
+)
+from Workstation.workstation_core.pixhawk_radio_policy import (
+    RadioStreamPolicy,
+    RadioStreamTier,
+    radio_stream_requests,
 )
 from Workstation.workstation_core.px4_mag_manager import (
     BOARD_INTERNAL_MAG_ID,
@@ -70,6 +77,18 @@ class CameraExtrinsicState:
 
 
 @dataclass(frozen=True)
+class RadioStatusState:
+    timestamp_s: float
+    rssi: int | None
+    remote_rssi: int | None
+    noise: int | None
+    remote_noise: int | None
+    txbuf_pct: int | None
+    rxerrors: int | None
+    fixed: int | None
+
+
+@dataclass(frozen=True)
 class MagSensorState:
     camera: str
     namespace: str
@@ -103,6 +122,7 @@ def parse_px4_sensor_mag_shell_output(
     *,
     camera: str,
     timestamp_s: float | None = None,
+    known_only: bool = True,
 ) -> tuple[MagSensorState, ...]:
     """Parse PX4 ``listener sensor_mag`` output for known CAN mags.
 
@@ -127,15 +147,20 @@ def parse_px4_sensor_mag_shell_output(
         if device_match is None:
             continue
         device_id = int(device_match.group(1))
+        instance_match = re.search(r"TOPIC:\s*sensor_mag\s+instance\s+(\d+)", block, re.IGNORECASE)
         if device_id in RM3100_PRIMARY_IDS:
             sensor_slot = "CAN1"
+            node_id = 0x7D if device_id == RM3100_PRIMARY_IDS[0] else 0x7C
         elif device_id in RM3100_BACKUP_IDS:
             sensor_slot = "CAN2"
+            node_id = 0x7B if device_id == RM3100_BACKUP_IDS[0] else None
         else:
-            continue
+            if known_only:
+                continue
+            sensor_slot = f"MAG{instance_match.group(1) if instance_match else '?'}"
+            node_id = None
         x, y, z = number("x"), number("y"), number("z")
         timestamp_us = number("timestamp")
-        instance_match = re.search(r"TOPIC:\s*sensor_mag\s+instance\s+(\d+)", block, re.IGNORECASE)
         states.append(
             MagSensorState(
                 camera=camera,
@@ -144,6 +169,7 @@ def parse_px4_sensor_mag_shell_output(
                 timestamp_s=received_s,
                 topic=f"px4-shell/sensor_mag/{instance_match.group(1) if instance_match else '?'}",
                 device_id=device_id,
+                node_id=node_id,
                 x=x,
                 y=y,
                 z=z,
@@ -152,6 +178,40 @@ def parse_px4_sensor_mag_shell_output(
             )
         )
     return tuple(states)
+
+
+def parse_px4_vehicle_magnetometer_shell_device_id(output: str) -> int | None:
+    """Parse the selected ``vehicle_magnetometer`` device ID from PX4 Shell.
+
+    Stable PX4 exposes the selected magnetometer through the uORB
+    ``vehicle_magnetometer`` topic, not through the standard SCALED_IMU
+    MAVLink streams.  The device ID is the only field needed here: raw
+    per-instance vectors come from ``sensor_mag`` and the existing yaw
+    projection owns the exact-identity/fresh-ATTITUDE gate.
+    """
+    if not output:
+        return None
+    blocks = re.split(
+        r"(?=TOPIC:\s*vehicle_magnetometer\b)",
+        str(output),
+        flags=re.IGNORECASE,
+    )
+    candidates: list[tuple[int, int, int]] = []
+    for block_index, block in enumerate(blocks):
+        if "TOPIC:" not in block or "vehicle_magnetometer" not in block.lower():
+            continue
+        device_match = re.search(r"^\s*device_id\s*:\s*(-?\d+)", block, re.MULTILINE)
+        if device_match is None:
+            continue
+        timestamp_match = re.search(r"^\s*timestamp\s*:\s*(-?\d+)", block, re.MULTILINE)
+        timestamp_us = int(timestamp_match.group(1)) if timestamp_match is not None else -1
+        candidates.append((timestamp_us, block_index, int(device_match.group(1))))
+    if not candidates:
+        return None
+    # Radio SERIAL_CONTROL can deliver a queued older listener block before
+    # the current one. PX4's uORB timestamp is the independent ordering key;
+    # block order is only a tie-breaker for samples without distinct time.
+    return max(candidates, key=lambda item: (item[0], item[1]))[2]
 
 
 def magnetometer_value_units(topic: object) -> str:
@@ -320,6 +380,9 @@ MAVLINK_MAG_STREAMS = (
     ("CAN2", "IMU stream 2", "SCALED_IMU2"),
     ("CAN3", "IMU stream 3", "SCALED_IMU3"),
 )
+MAVLINK_UI_IMU_STREAM_NAMES = tuple(
+    message_name for _sensor_slot, _imu_label, message_name in MAVLINK_MAG_STREAMS
+)
 MAVLINK_CAN_MAG_MESSAGE_TYPES = frozenset(("CAN_MAG", "CAN_MAGNETOMETER", "SASL_CAN_MAG"))
 MAVLINK_MAG_SLOT_BY_MESSAGE = {
     message_name: sensor_slot
@@ -371,12 +434,14 @@ MAVLINK_DUPLICATE_TTL_S = 0.250
 MAVLINK_DUPLICATE_CACHE_SIZE = 512
 MAVLINK_ATTITUDE_STALE_S = 2.0
 MAVLINK_ATTITUDE_RECOVERY_COOLDOWN_S = 10.0
+MAVLINK_IMU_STREAM_STALE_S = 1.0
+MAVLINK_IMU_STREAM_RECOVERY_COOLDOWN_S = 10.0
 MAVLINK_GCS_SOURCE_SYSTEM = 255
 MAVLINK_GCS_SOURCE_COMPONENT = 190
 MAVLINK_GCS_HEARTBEAT_INTERVAL_S = 1.0
 MAVLINK_COMMAND_RECEIVE_POLL_S = 0.05
 MAVLINK_RTCM_STATUS_INTERVAL_S = 5.0
-MAVLINK_EXPECTED_SYSTEM_IDS = {"left": 1, "right": 2}
+MAVLINK_EXPECTED_SYSTEM_IDS = {"left": 1, "right": 2, "drone": 3}
 MAVLINK_BOOT_TIME_UINT32_MODULUS = 1 << 32
 MAVLINK_BOOT_TIME_UINT32_HALF_RANGE = 1 << 31
 MAVLINK_BOOT_TIME_REORDER_TOLERANCE_MS = 2_000
@@ -649,7 +714,22 @@ def _seed_mavlink_udpin_peer(
 
 
 def camera_label_ko(camera: str) -> str:
-    return {"left": "왼쪽", "right": "오른쪽"}.get(camera, camera)
+    return {"left": "왼쪽", "right": "오른쪽", "drone": "Drone"}.get(camera, camera)
+
+
+def _normalize_transport(value: Any) -> str:
+    transport = str(value).strip().lower()
+    return transport if transport in {"radio", "usb"} else "ethernet"
+
+
+def _is_serial_transport(transport: Any) -> bool:
+    """Radio and USB open one exclusive serial device; Ethernet does not.
+
+    Only the bandwidth policy separates the two: Radio throttles optional
+    streams, USB carries the stock Ethernet-class stream set.
+    """
+
+    return str(transport).strip().lower() in {"radio", "usb"}
 
 
 def _finite_float(value: Any) -> float | None:
@@ -971,14 +1051,25 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         right_url: str,
         left_baud: int = 57600,
         right_baud: int = 57600,
+        drone_url: str = "",
+        drone_baud: int = 57600,
         custom_watches: tuple[dict[str, str], ...] = (),
         expected_system_ids: dict[str, int] | None = None,
         peer_hosts: dict[str, str] | None = None,
+        transports: dict[str, str] | None = None,
     ) -> None:
         super().__init__()
-        self.urls = {"left": left_url.strip(), "right": right_url.strip()}
-        self.baudrates = {"left": int(left_baud), "right": int(right_baud)}
-        self.peer_hosts = {"left": "", "right": ""}
+        self.urls = {
+            "left": left_url.strip(),
+            "right": right_url.strip(),
+            "drone": drone_url.strip(),
+        }
+        self.baudrates = {
+            "left": int(left_baud),
+            "right": int(right_baud),
+            "drone": int(drone_baud),
+        }
+        self.peer_hosts = {side: "" for side in self.urls}
         if peer_hosts is not None:
             self.peer_hosts.update(
                 {str(side): str(host).strip() for side, host in peer_hosts.items()}
@@ -988,6 +1079,18 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             self.expected_system_ids.update(
                 {str(side): int(system_id) for side, system_id in expected_system_ids.items()}
             )
+        self.transports = {side: "ethernet" for side in self.urls}
+        if transports is not None:
+            self.transports.update(
+                {
+                    str(side): _normalize_transport(value)
+                    for side, value in transports.items()
+                }
+            )
+        self._radio_stream_policies = {side: RadioStreamPolicy() for side in self.urls}
+        self._radio_rtcm_healthy = {side: True for side in self.urls}
+        self._radio_status: dict[str, RadioStatusState] = {}
+        self._radio_lock_handles: dict[str, Any] = {}
         self.connections: dict[str, Any] = {}
         self.last_connect_errors: dict[str, str] = {}
         self.custom_watches = list(custom_watches)
@@ -997,29 +1100,28 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         self._mavlink_stream_request_attempts: dict[str, int] = {}
         self._mavlink_stream_last_request_s: dict[str, float] = {}
         self._mavlink_boot_time_trackers = {
-            side: _MavlinkBootTimeTracker() for side in ("left", "right")
+            side: _MavlinkBootTimeTracker() for side in self.urls
         }
         self._sasl_can_mag_stream_confirmed: set[str] = set()
         self._last_attitude_message_s: dict[str, float] = {}
         self._attitude_stream_request_attempts: dict[str, int] = {}
         self._attitude_stream_last_request_s: dict[str, float] = {}
         self._attitude_stream_outage_reported: set[str] = set()
+        self._last_imu_stream_message_s: dict[tuple[str, str], float] = {}
+        self._imu_stream_request_attempts: dict[tuple[str, str], int] = {}
+        self._imu_stream_last_request_s: dict[tuple[str, str], float] = {}
+        self._imu_stream_outage_reported: set[tuple[str, str]] = set()
         self._mavlink_stream_config: dict[str, Any] | None = None
         self._mavlink_stream_configured: set[str] = set()
         self._latest_gnss_relative: dict[str, GnssRelativeState] = {}
         self._command_state_lock = threading.RLock()
-        self._mavlink_send_locks = {
-            "left": threading.RLock(),
-            "right": threading.RLock(),
-        }
+        self._mavlink_send_locks = {side: threading.RLock() for side in self.urls}
         self._active_command_cameras: set[str] = set()
         self._deferred_command_messages: dict[str, deque[Any]] = {
-            "left": deque(),
-            "right": deque(),
+            side: deque() for side in self.urls
         }
         self._recent_raw_packets: dict[str, deque[tuple[float, bytes]]] = {
-            "left": deque(maxlen=MAVLINK_DUPLICATE_CACHE_SIZE),
-            "right": deque(maxlen=MAVLINK_DUPLICATE_CACHE_SIZE),
+            side: deque(maxlen=MAVLINK_DUPLICATE_CACHE_SIZE) for side in self.urls
         }
         self._last_receive_errors: dict[str, tuple[str, float]] = {}
         self._last_gcs_heartbeat_errors: dict[str, tuple[str, float]] = {}
@@ -1037,7 +1139,7 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 peer_host=self.peer_hosts.get(side, ""),
                 clock=lambda: time.monotonic(),
             )
-            for side in ("left", "right")
+            for side in self.urls
         }
         self._stream_setup_requests_sent: set[str] = set()
         self.timer = QtCore.QTimer(self)
@@ -1045,7 +1147,14 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         self.timer.timeout.connect(self.spin_once)
 
     @contextmanager
-    def exclusive_command(self, camera: str):
+    def exclusive_command(
+        self,
+        camera: str,
+        *,
+        hold_send_lock: bool = True,
+        command_label: str = "MAVLINK COMMAND",
+        preserve_qualification: bool = False,
+    ):
         """Reserve one MAVLink receive path for a blocking command worker.
 
         ``spin_once`` is normally the sole receiver.  A PARAM or SERIAL_CONTROL
@@ -1057,14 +1166,18 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
 
         camera = str(camera)
         send_lock = self._mavlink_send_locks.setdefault(camera, threading.RLock())
-        with send_lock:
+        with (send_lock if hold_send_lock else nullcontext()):
             with self._command_state_lock:
                 if camera not in self.connections:
                     raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 연결이 없습니다.")
                 if camera in self._active_command_cameras:
                     raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 명령이 이미 진행 중입니다.")
                 model = self._ensure_liveness_listener(camera)
-                model.begin_command("MAVLINK COMMAND", now_s=time.monotonic())
+                model.begin_command(
+                    str(command_label),
+                    now_s=time.monotonic(),
+                    preserve_qualification=bool(preserve_qualification),
+                )
                 self._active_command_cameras.add(camera)
             try:
                 # The command worker owns both recv_match and this side's
@@ -1108,12 +1221,22 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 self.last_connect_errors.pop(side, None)
                 continue
             connection = None
+            radio_lock = None
             try:
                 _assert_mavlink_udpin_available(url)
+                if _is_serial_transport(self.transports.get(side)):
+                    transport_label = str(self.transports.get(side) or "").upper()
+                    for other, active_url in self.urls.items():
+                        if other != side and other in self.connections and active_url == url:
+                            raise RuntimeError(
+                                f"{transport_label} endpoint is already owned by "
+                                f"{camera_label_ko(other)}"
+                            )
+                    radio_lock = self._acquire_radio_endpoint_lock(side, url)
                 connection = mavutil.mavlink_connection(
                     url,
                     baud=self.baudrates.get(side, 57600),
-                    autoreconnect=True,
+                    autoreconnect=False,
                     robust_parsing=True,
                     dialect=sasl_dialect,
                     source_system=MAVLINK_GCS_SOURCE_SYSTEM,
@@ -1135,6 +1258,8 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                         connection.close()
                     except Exception:
                         pass
+                if radio_lock is not None:
+                    self._release_radio_endpoint_lock(side)
                 self.last_connect_errors[side] = str(exc)
                 self.status_changed.emit(f"{camera_label_ko(side)} MAVLink 연결 실패: {exc}")
                 continue
@@ -1188,6 +1313,38 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             return
         self.timer.stop()
 
+    def _acquire_radio_endpoint_lock(self, side: str, endpoint: str):
+        side = str(side)
+        if side in self._radio_lock_handles:
+            return self._radio_lock_handles[side]
+        resolved = os.path.realpath(str(endpoint))
+        digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:20]
+        runtime_root = Path(f"/run/user/{os.getuid()}")
+        if not runtime_root.is_dir():
+            runtime_root = Path("/tmp")
+        lock_path = runtime_root / f"workstation-pixhawk-radio-{digest}.lock"
+        handle = lock_path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            handle.close()
+            raise RuntimeError(f"Radio endpoint is busy: {endpoint}") from exc
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()} role={side} endpoint={resolved}\n")
+        handle.flush()
+        self._radio_lock_handles[side] = handle
+        return handle
+
+    def _release_radio_endpoint_lock(self, side: str) -> None:
+        handle = self._radio_lock_handles.pop(str(side), None)
+        if handle is None:
+            return
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
     def _open_liveness_generation(self, side: str, connection: Any) -> MavlinkSideLiveness:
         side = str(side)
         model = self._mavlink_liveness[side]
@@ -1228,8 +1385,27 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         observed_s = time.monotonic() if now_s is None else float(now_s)
         return {
             side: self.mavlink_health_snapshot(side, now_s=observed_s)
-            for side in ("left", "right")
+            for side in self.urls
         }
+
+    def _clear_mavlink_imu_stream_state(
+        self,
+        camera: str,
+        *,
+        clear_samples: bool,
+    ) -> None:
+        camera = str(camera)
+        keys = {
+            (camera, message_name)
+            for message_name in MAVLINK_UI_IMU_STREAM_NAMES
+        }
+        if clear_samples:
+            for key in keys:
+                self._last_imu_stream_message_s.pop(key, None)
+        for key in keys:
+            self._imu_stream_request_attempts.pop(key, None)
+            self._imu_stream_last_request_s.pop(key, None)
+        self._imu_stream_outage_reported.difference_update(keys)
 
     def stop(self, camera: str | None = None) -> None:
         if camera is None:
@@ -1259,6 +1435,7 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             self._attitude_stream_request_attempts.pop(side, None)
             self._attitude_stream_last_request_s.pop(side, None)
             self._attitude_stream_outage_reported.discard(side)
+            self._clear_mavlink_imu_stream_state(side, clear_samples=True)
             self._mavlink_stream_configured.discard(side)
             self._stream_setup_requests_sent.discard(side)
             self._latest_gnss_relative.pop(side, None)
@@ -1274,6 +1451,9 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 item for item in self._identity_mismatch_reported if item[0] != side
             }
             self._last_health_states.pop(side, None)
+            self._radio_stream_policies.setdefault(side, RadioStreamPolicy()).reset()
+            self._radio_status.pop(side, None)
+            self._release_radio_endpoint_lock(side)
         if not self.connections:
             self.stop_receive_timer()
         if camera is None:
@@ -1284,6 +1464,49 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
     def add_custom_watch(self, spec: dict[str, str]) -> None:
         if spec not in self.custom_watches:
             self.custom_watches.append(spec)
+
+    def set_transport(self, side: str, transport: str) -> None:
+        side = str(side)
+        if side not in self.urls:
+            raise ValueError(f"Unknown Pixhawk role: {side}")
+        normalized = _normalize_transport(transport)
+        if side in self.connections and normalized != self.transports.get(side):
+            raise RuntimeError(f"{camera_label_ko(side)} transport cannot change while connected")
+        self.transports[side] = normalized
+        self._radio_stream_policies.setdefault(side, RadioStreamPolicy()).reset()
+
+    def set_radio_rtcm_health(self, side: str, healthy: bool) -> None:
+        self._radio_rtcm_healthy[str(side)] = bool(healthy)
+
+    def radio_stream_policy_snapshot(self, side: str, *, now_s: float | None = None):
+        observed_s = time.monotonic() if now_s is None else float(now_s)
+        return self._radio_stream_policies[str(side)].snapshot(now_s=observed_s)
+
+    def radio_status_snapshot(self, side: str) -> RadioStatusState | None:
+        return self._radio_status.get(str(side))
+
+    def _active_stream_requests(self, camera: str) -> tuple[tuple[str, float], ...]:
+        if self.transports.get(str(camera)) != "radio":
+            return MAVLINK_STOCK_STREAM_REQUESTS
+        policy = self._radio_stream_policies.setdefault(str(camera), RadioStreamPolicy())
+        return radio_stream_requests(policy.tier)
+
+    def _advance_radio_stream_policy(self, camera: str, *, now_s: float) -> None:
+        camera = str(camera)
+        if self.transports.get(camera) != "radio":
+            return
+        health = self.mavlink_health_snapshot(camera, now_s=now_s)
+        qualified = health.state is MavlinkLivenessState.LIVE
+        healthy = qualified and self._radio_rtcm_healthy.get(camera, True)
+        policy = self._radio_stream_policies.setdefault(camera, RadioStreamPolicy())
+        if not policy.observe(qualified=qualified, healthy=healthy, now_s=now_s):
+            return
+        self._mavlink_stream_requests_sent.discard(camera)
+        self._clear_mavlink_imu_stream_state(camera, clear_samples=False)
+        self._request_mavlink_sensor_streams(camera)
+        self.status_changed.emit(
+            f"{camera_label_ko(camera)} Radio optional stream tier={policy.tier.name}"
+        )
 
     def remove_custom_watch(self, key: str) -> None:
         self.custom_watches = [spec for spec in self.custom_watches if str(spec.get("key", "")) != key]
@@ -1297,7 +1520,7 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         rate: int = 2_000_000,
         cameras: set[str] | tuple[str, ...] | list[str] | None = None,
     ) -> None:
-        sysids = sysids or {"left": 1, "right": 2}
+        sysids = sysids or dict(MAVLINK_EXPECTED_SYSTEM_IDS)
         self._mavlink_stream_config = {
             "host_ip": host_ip,
             "ports": dict(ports),
@@ -1500,7 +1723,7 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         target_system = int(getattr(connection, "target_system", 0) or 1)
         target_component = int(getattr(connection, "target_component", 0) or 1)
         now_s = time.monotonic()
-        requests = MAVLINK_STOCK_STREAM_REQUESTS
+        requests = self._active_stream_requests(camera)
         requested = []
         self._mavlink_stream_requests_sent.add(camera)
         self._mavlink_stream_request_attempts[camera] = 1
@@ -1533,8 +1756,111 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         if "ATTITUDE" in requested:
             self._attitude_stream_request_attempts[camera] = 1
             self._attitude_stream_last_request_s[camera] = now_s
+        for message_name in MAVLINK_UI_IMU_STREAM_NAMES:
+            if message_name not in requested:
+                continue
+            key = (camera, message_name)
+            self._imu_stream_request_attempts[key] = 1
+            self._imu_stream_last_request_s[key] = now_s
+            self._imu_stream_outage_reported.discard(key)
+        profile = (
+            f"Radio {self._radio_stream_policies[camera].tier.name}"
+            if self.transports.get(camera) == "radio"
+            else "Ethernet Stock"
+        )
         self.status_changed.emit(
-            f"{camera_label_ko(camera)} MAVLink Stock sensor stream 요청: {', '.join(requested)}"
+            f"{camera_label_ko(camera)} MAVLink {profile} sensor stream 요청: {', '.join(requested)}"
+        )
+
+    def _request_missing_mavlink_imu_streams(self, camera: str) -> None:
+        """Bound retries to UI-backed IMU streams with no fresh sample."""
+
+        camera = str(camera)
+        connection = self.connections.get(camera)
+        if connection is None or camera not in self._mavlink_stream_requests_sent:
+            return
+        now_s = time.monotonic()
+        health = self.mavlink_health_snapshot(camera, now_s=now_s)
+        if health.state is MavlinkLivenessState.RX_STALLED:
+            return
+        mav = getattr(connection, "mav", None)
+        if mav is None or not hasattr(mav, "command_long_send"):
+            return
+
+        due: list[tuple[str, tuple[str, str], int]] = []
+        active_rates = dict(self._active_stream_requests(camera))
+        for message_name in MAVLINK_UI_IMU_STREAM_NAMES:
+            if message_name not in active_rates:
+                continue
+            key = (camera, message_name)
+            last_sample_s = self._last_imu_stream_message_s.get(key)
+            if (
+                last_sample_s is not None
+                and now_s - last_sample_s <= MAVLINK_IMU_STREAM_STALE_S
+            ):
+                self._imu_stream_request_attempts.pop(key, None)
+                self._imu_stream_last_request_s.pop(key, None)
+                self._imu_stream_outage_reported.discard(key)
+                continue
+            attempts = self._imu_stream_request_attempts.get(key, 0)
+            last_request_s = self._imu_stream_last_request_s.get(
+                key,
+                float("-inf"),
+            )
+            if attempts >= MAVLINK_STREAM_REQUEST_MAX_ATTEMPTS:
+                if now_s - last_request_s < MAVLINK_IMU_STREAM_RECOVERY_COOLDOWN_S:
+                    if key not in self._imu_stream_outage_reported:
+                        self._imu_stream_outage_reported.add(key)
+                        self.status_changed.emit(
+                            f"{camera_label_ko(camera)} {message_name} stream 응답이 없습니다. "
+                            "재시도를 대기합니다."
+                        )
+                    continue
+                attempts = 0
+                self._imu_stream_outage_reported.discard(key)
+            if now_s - last_request_s < MAVLINK_STREAM_REQUEST_RETRY_S:
+                continue
+            due.append((message_name, key, attempts))
+        if not due:
+            return
+
+        mavlink = getattr(connection, "mavlink", None)
+        command_id = _mavlink_constant(
+            mavlink,
+            "MAV_CMD_SET_MESSAGE_INTERVAL",
+            511,
+        )
+        target_system = int(getattr(connection, "target_system", 0) or 1)
+        target_component = int(getattr(connection, "target_component", 0) or 1)
+        requested: list[str] = []
+        try:
+            with self._mavlink_send_locks.setdefault(camera, threading.RLock()):
+                for message_name, key, attempts in due:
+                    rate_hz = active_rates[message_name]
+                    mav.command_long_send(
+                        target_system,
+                        target_component,
+                        command_id,
+                        0,
+                        MAVLINK_MESSAGE_IDS[message_name],
+                        int(1_000_000 / float(rate_hz)),
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    )
+                    self._imu_stream_request_attempts[key] = attempts + 1
+                    self._imu_stream_last_request_s[key] = now_s
+                    requested.append(message_name)
+        except Exception as exc:
+            self.status_changed.emit(
+                f"{camera_label_ko(camera)} MAVLink IMU stream 요청 실패: {exc}"
+            )
+            return
+        self.status_changed.emit(
+            f"{camera_label_ko(camera)} MAVLink 누락 IMU stream 재요청: "
+            f"{', '.join(requested)}"
         )
 
     def _request_stale_attitude_stream(self, camera: str) -> None:
@@ -1674,9 +2000,6 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
 
     def spin_once(self) -> None:
         for camera, connection in list(self.connections.items()):
-            with self._command_state_lock:
-                if camera in self._active_command_cameras:
-                    continue
             self._ensure_liveness_listener(camera)
             # ``spin_once`` runs from a Qt timer.  A continuously busy serial
             # link must not monopolize the GUI thread while we drain it.
@@ -1685,8 +2008,6 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 deferred = False
                 received_at_s: float | None = None
                 with self._command_state_lock:
-                    if camera in self._active_command_cameras:
-                        break
                     try:
                         pending = self._deferred_command_messages.setdefault(
                             camera, deque()
@@ -1694,12 +2015,30 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                         if pending:
                             received_at_s, message = pending.popleft()
                             deferred = True
+                        elif camera in self._active_command_cameras:
+                            # A blocking PARAM/SERIAL_CONTROL worker owns
+                            # ``recv_match`` so it can receive its response.
+                            # It still forwards non-command telemetry into
+                            # this queue.  Drain that queue while the worker
+                            # is active; otherwise a Radio Shell poll can
+                            # make ATTITUDE age for the entire six-command
+                            # sequence even though packets are arriving.
+                            message = None
                         else:
                             message = connection.recv_match(blocking=False)
                             if message is not None:
                                 received_at_s = time.monotonic()
                     except Exception as exc:
                         self._emit_receive_error(camera, exc)
+                        # A serial read error means the device node is gone
+                        # (radio unpowered, USB cable pulled); the fd cannot
+                        # recover, so close and wait for an explicit Connect.
+                        if _is_serial_transport(self.transports.get(camera)):
+                            transport_label = str(self.transports.get(camera) or "").upper()
+                            self.stop(camera)
+                            self.status_changed.emit(
+                                f"{camera_label_ko(camera)} {transport_label} DISCONNECTED · PRESS CONNECT"
+                            )
                         break
                 if message is None:
                     break
@@ -1726,6 +2065,18 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 wait_for_send_lock=False,
             )
             self._emit_liveness_transition(camera, now_s=time.monotonic())
+            health = self.mavlink_health_snapshot(camera, now_s=time.monotonic())
+            if health.state in {
+                MavlinkLivenessState.INITIAL_RX_TIMEOUT,
+                MavlinkLivenessState.RX_STALLED,
+            }:
+                transport = self.transports.get(camera, "ethernet").upper()
+                self.stop(camera)
+                self.status_changed.emit(
+                    f"{camera_label_ko(camera)} {transport} DISCONNECTED · PRESS CONNECT"
+                )
+                continue
+            self._advance_radio_stream_policy(camera, now_s=time.monotonic())
 
     def _defer_command_message(self, camera: str, message: Any) -> None:
         """Retain telemetry consumed while a blocking command owns recv_match."""
@@ -1758,6 +2109,12 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         provenance = mavlink_message_provenance(message)
         system_id = provenance["mavlink_source_system"]
         component_id = provenance["mavlink_source_component"]
+        message_type = message.get_type() if hasattr(message, "get_type") else ""
+        # SiK/RFD local status frames are link diagnostics, not vehicle
+        # identity. Accept them without allowing them to establish or refresh
+        # expected-system liveness.
+        if message_type == "RADIO_STATUS":
+            return True
         expected_system_id = self.expected_system_ids[camera]
         if system_id is not None and int(system_id) != expected_system_id:
             mismatch = (camera, int(system_id))
@@ -1768,7 +2125,6 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                     f"expected sysid {expected_system_id}, got {int(system_id)}"
                 )
             return False
-        message_type = message.get_type() if hasattr(message, "get_type") else ""
         liveness_message_type = message_type
         if message_type == "ATTITUDE" and getattr(message, "time_boot_ms", None) is not None:
             # Count parseable transport now, but let the Qt receive owner
@@ -1878,9 +2234,14 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 "PX4/NuttX UDP task deadlock suspected"
             )
         elif health.state in {MavlinkLivenessState.QUALIFYING, MavlinkLivenessState.RECOVERING}:
+            elapsed_s = min(
+                max(0, int(health.qualification_elapsed_s)),
+                max(1, int(health.qualification_required_s)),
+            )
+            required_s = max(1, int(health.qualification_required_s))
             detail = (
-                f"; qualification={int(health.qualification_elapsed_s) // 60:02d}:"
-                f"{int(health.qualification_elapsed_s) % 60:02d}/10:00"
+                f"; qualification={elapsed_s // 60:02d}:{elapsed_s % 60:02d}/"
+                f"{required_s // 60:02d}:{required_s % 60:02d}"
             )
         self.status_changed.emit(
             f"{camera_label_ko(camera)} MAVLink liveness: {health.state.value}{detail}"
@@ -1985,6 +2346,7 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             self._mavlink_stream_requests_sent.discard(camera)
             self._mavlink_stream_request_attempts.pop(camera, None)
             self._mavlink_stream_last_request_s.pop(camera, None)
+            self._clear_mavlink_imu_stream_state(camera, clear_samples=True)
             model.note_remote_reboot(now_s=received_at_s)
         model.observe_packet(
             system_id=source_system,
@@ -2031,6 +2393,18 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         )
         if optional_row is not None:
             self.optional_timeline_changed.emit(camera, optional_row)
+        if message_type == "RADIO_STATUS":
+            self._radio_status[camera] = RadioStatusState(
+                timestamp_s=now_s,
+                rssi=_optional_int(message, "rssi"),
+                remote_rssi=_optional_int(message, "remrssi"),
+                noise=_optional_int(message, "noise"),
+                remote_noise=_optional_int(message, "remnoise"),
+                txbuf_pct=_optional_int(message, "txbuf"),
+                rxerrors=_optional_int(message, "rxerrors"),
+                fixed=_optional_int(message, "fixed"),
+            )
+            return
         if message_type == "ATTITUDE":
             self._last_attitude_message_s[camera] = now_s
             self._attitude_stream_request_attempts.pop(camera, None)
@@ -2122,6 +2496,11 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         if message_type in {"SCALED_IMU", "SCALED_IMU2", "SCALED_IMU3"}:
             mag = _mag_sensor_state_from_mavlink(camera, namespace, message, message_type, now_s)
             if mag is not None:
+                key = (camera, message_type)
+                self._last_imu_stream_message_s[key] = now_s
+                self._imu_stream_request_attempts.pop(key, None)
+                self._imu_stream_last_request_s.pop(key, None)
+                self._imu_stream_outage_reported.discard(key)
                 self.mag_sensor_changed.emit(camera, replace(mag, **provenance))
             return
         if message_type in MAVLINK_CAN_MAG_MESSAGE_TYPES:
@@ -2145,16 +2524,8 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             # run current-time stream setup or recovery for every historical
             # packet. The next live HEARTBEAT owns those actions.
             if allow_heartbeat_actions:
-                connection = self.connections.get(camera)
-                if (
-                    connection is not None
-                    and self._mavlink_stream_config is not None
-                    and camera not in self._mavlink_stream_configured
-                    and camera not in self._stream_setup_requests_sent
-                ):
-                    self._stream_setup_requests_sent.add(camera)
-                    self.stream_setup_required.emit(camera)
                 self._request_mavlink_sensor_streams(camera)
+                self._request_missing_mavlink_imu_streams(camera)
                 self._request_stale_attitude_stream(camera)
             if camera not in self._heartbeat_logged:
                 self._heartbeat_logged.add(camera)
@@ -2289,6 +2660,18 @@ def _mavlink_optional_timeline_row(
                 "mavlink_raw_mag_y": _optional_float(message, "ymag"),
                 "mavlink_raw_mag_z": _optional_float(message, "zmag"),
                 "mavlink_time_usec": _optional_int(message, "time_usec"),
+            }
+        )
+    elif message_type == "RADIO_STATUS":
+        row.update(
+            {
+                "mavlink_radio_rssi": _optional_int(message, "rssi"),
+                "mavlink_radio_remote_rssi": _optional_int(message, "remrssi"),
+                "mavlink_radio_noise": _optional_int(message, "noise"),
+                "mavlink_radio_remote_noise": _optional_int(message, "remnoise"),
+                "mavlink_radio_txbuf_pct": _optional_int(message, "txbuf"),
+                "mavlink_radio_rxerrors": _optional_int(message, "rxerrors"),
+                "mavlink_radio_fixed": _optional_int(message, "fixed"),
             }
         )
     else:

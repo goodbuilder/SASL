@@ -1924,7 +1924,7 @@ def test_gga_provider_rejects_stale_or_skewed_rover_positions() -> None:
     }
     for left_timestamp, right_timestamp, reason in (
         (now_s - 10.0, now_s - 0.01, "stale"),
-        (now_s - 0.20, now_s - 0.01, "timestamp delta"),
+        (now_s - 3.20, now_s - 0.01, "timestamp delta"),
     ):
         logged: list[str] = []
         panel = _gga_panel(
@@ -1938,6 +1938,76 @@ def test_gga_provider_rejects_stale_or_skewed_rover_positions() -> None:
 
         assert GnssRuntimeController(panel)._gnss_gga_provider() is None
         assert any(reason in message.lower() for message in logged)
+
+
+@pytest.mark.parametrize(
+    ("left_age_s", "right_age_s"),
+    (
+        (10.0, 7.0),  # Exact 10 s age and 3000 ms skew are admitted.
+        (8.5, 5.5),
+    ),
+)
+def test_system_center_gga_admits_ten_second_samples_and_three_second_skew(
+    monkeypatch: pytest.MonkeyPatch,
+    left_age_s: float,
+    right_age_s: float,
+) -> None:
+    now_s = 10_000.0
+    monkeypatch.setattr("Workstation.gnss_runtime_controller.time.monotonic", lambda: now_s)
+    base = {
+        "latitude_deg": 37.0,
+        "longitude_deg": 127.0,
+        "altitude_m": 50.0,
+        "has_position": True,
+        "fix_type": 4,
+        "satellites_used": 20,
+        "eph_m": 0.2,
+    }
+    panel = _gga_panel(
+        gga_policy=GgaPolicy.SYSTEM_CENTER,
+        log_sink=[],
+        latest_gps={
+            "left": SimpleNamespace(**base, timestamp_s=now_s - left_age_s),
+            "right": SimpleNamespace(**base, timestamp_s=now_s - right_age_s),
+        },
+    )
+
+    assert GnssRuntimeController(panel)._gnss_gga_provider().startswith("$GPGGA,")
+
+
+@pytest.mark.parametrize(
+    ("left_age_s", "right_age_s", "reason"),
+    (
+        (10.001, 7.001, "stale"),
+        (4.001, 1.0, "timestamp delta"),
+    ),
+)
+def test_system_center_gga_rejects_values_beyond_relaxed_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    left_age_s: float,
+    right_age_s: float,
+    reason: str,
+) -> None:
+    now_s = 10_000.0
+    monkeypatch.setattr("Workstation.gnss_runtime_controller.time.monotonic", lambda: now_s)
+    base = {
+        "latitude_deg": 37.0,
+        "longitude_deg": 127.0,
+        "altitude_m": 50.0,
+        "has_position": True,
+    }
+    logged: list[str] = []
+    panel = _gga_panel(
+        gga_policy=GgaPolicy.SYSTEM_CENTER,
+        log_sink=logged,
+        latest_gps={
+            "left": SimpleNamespace(**base, timestamp_s=now_s - left_age_s),
+            "right": SimpleNamespace(**base, timestamp_s=now_s - right_age_s),
+        },
+    )
+
+    assert GnssRuntimeController(panel)._gnss_gga_provider() is None
+    assert any(reason in message.lower() for message in logged)
 
 
 def test_left_gga_policy_never_substitutes_the_right_rover() -> None:
@@ -2016,3 +2086,87 @@ def test_survey_in_valid_requires_current_command_ack_and_active_observation() -
     controller._handle_gnss_base_survey_in(stale_valid)
 
     assert transitions == [GnssOperationState.LOCAL_RTCM_ACTIVE]
+
+
+def _rover_gps(*, timestamp_s: float, longitude_deg: float = 127.5) -> SimpleNamespace:
+    return SimpleNamespace(
+        latitude_deg=36.9,
+        longitude_deg=longitude_deg,
+        altitude_m=50.0,
+        has_position=True,
+        timestamp_s=timestamp_s,
+        fix_type=6,
+        satellites_used=18,
+        eph_m=0.02,
+    )
+
+
+def test_per_rover_session_gga_uses_the_only_connected_rover() -> None:
+    logged: list[str] = []
+    now_s = time.monotonic()
+    right = _rover_gps(timestamp_s=now_s, longitude_deg=127.50001)
+    # P1 is unplugged so P2 can be connected; only P2 delivers a position.
+    panel = _gga_panel(
+        gga_policy=GgaPolicy.PER_ROVER_SESSION,
+        log_sink=logged,
+        latest_gps={"right": right},
+    )
+
+    result = GnssRuntimeController(panel)._gnss_gga_provider()
+
+    assert result == gga_from_position(right)
+    assert logged == []
+
+
+def test_per_rover_session_gga_prefers_left_when_both_rovers_deliver() -> None:
+    logged: list[str] = []
+    now_s = time.monotonic()
+    left = _rover_gps(timestamp_s=now_s)
+    right = _rover_gps(timestamp_s=now_s, longitude_deg=127.50001)
+    panel = _gga_panel(
+        gga_policy=GgaPolicy.PER_ROVER_SESSION,
+        log_sink=logged,
+        latest_gps={"left": left, "right": right},
+    )
+
+    result = GnssRuntimeController(panel)._gnss_gga_provider()
+
+    assert result == gga_from_position(left)
+    assert logged == []
+
+
+def test_per_rover_session_gga_reports_when_no_rover_delivers() -> None:
+    logged: list[str] = []
+    stale = _rover_gps(timestamp_s=time.monotonic() - 3600.0)
+    panel = _gga_panel(
+        gga_policy=GgaPolicy.PER_ROVER_SESSION,
+        log_sink=logged,
+        latest_gps={"left": stale},
+    )
+
+    result = GnssRuntimeController(panel)._gnss_gga_provider()
+
+    assert result is None
+    assert any(
+        "no connected rover has a usable position" in message
+        and "left=stale or invalid timestamp" in message
+        and "right=no message received" in message
+        for message in logged
+    )
+
+
+def test_per_rover_session_gga_falls_back_to_right_when_left_is_stale() -> None:
+    logged: list[str] = []
+    now_s = time.monotonic()
+    stale_left = _rover_gps(timestamp_s=now_s - 3600.0)
+    right = _rover_gps(timestamp_s=now_s, longitude_deg=127.50001)
+    panel = _gga_panel(
+        gga_policy=GgaPolicy.PER_ROVER_SESSION,
+        log_sink=logged,
+        latest_gps={"left": stale_left, "right": right},
+    )
+
+    result = GnssRuntimeController(panel)._gnss_gga_provider()
+
+    assert result == gga_from_position(right)
+    assert logged == []

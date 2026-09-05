@@ -1,7 +1,7 @@
 # Pixhawk P1/P2 Ethernet MAVLink 설정
 
 이 문서는 `apps/Workstation` 현장 운용용 P1/P2 Pixhawk MAVLink 설정값과 복구 절차를 기록한다.
-기준일: 2026-08-29 (Asia/Seoul)
+기준일: 2026-09-04 (Asia/Seoul)
 
 ## 1. 네트워크 기준값
 
@@ -39,18 +39,33 @@ ip route
 ### Workstation `Find network` / Assign / Connect
 
 1. Pixhawk 화면에서 `Find network`를 누른다.
-2. 후보 표에서 NIC와 current local IPv4를 선택한다. 표 행은 NIC 후보이며 P1/P2 route를 섞어
-   표시하지 않는다.
-3. `Assign P1` 또는 `Assign P2`로 side별 NIC+endpoint를 저장한다.
+2. 후보 표에서 원하는 물리 NIC를 선택한다. 표 행은 NIC 후보이며 현재
+   `Camera/P1/P2` 역할 집합을 표시한다.
+3. `Assign P1` 또는 `Assign P2`를 누르고, 정확한 before/after 주소·route와 자동 재연결 대상을
+   확인한 뒤 OS 인증을 승인한다. Camera 화면의 `Assign Camera NIC`도 같은 역할 적용기를 사용한다.
 4. 분리된 P1/P2 assignment card에서 각자의 State/NIC/Local IPv4/Endpoint/Route를 확인한다.
-5. `Connect`를 누른다.
+5. 이전에 연결돼 있던 side는 자동 재연결되며 expected sysid HEARTBEAT+ATTITUDE를 확인한다.
+   이전에 연결되지 않았던 side는 `Connect`를 누른다.
 
-탐색과 Connect preflight는 read-only다. Workstation은 IP/route/NetworkManager profile을
-추가하거나 바꾸지 않는다. 배정한 local 주소가 NIC에 없거나 `.2/.3` route의 실제 `dev/src`가
-배정과 다르면 해당 side만 실패한다. P1/P2 partial connection은 허용하며 정상 side는 유지한다.
-마지막 interface name은 저장되지만 교체 NIC가 다른 `enx...` 이름을 받으면 자동 remap하지 않으므로
-다시 Find/Assign한다. Camera와 Pixhawk가 같은 NIC를 사용해도 UI 경고/gate는 없지만, 과거 shared-L2
-RTSP 부하에서 ETH MAVLink stall이 재현됐으므로 장시간 field 안정성 증거와는 구분한다.
+NIC 식별자는 커널 인터페이스 이름이 아니라 MAC이다. USB NIC를 다른 포트에 꽂거나 재부팅해서
+이름이 `enxAAAA` -> `enxBBBB`로 바뀌어도, 저장된 MAC과 같은 NIC가 같은 local IPv4를 그대로
+들고 있으면 `Find network`가 배정을 그대로 유지하고 새 이름을 기록한다. 이때 assignment card의
+Route detail에 `NIC renamed <이전> -> <현재>`가 남고 후보 표의 `Camera/P1/P2` 역할도 새 이름
+행에 그대로 표시된다. 같은 MAC은 있는데 저장된 주소가 그 NIC에 없으면 `REASSIGN REQUIRED`로
+내려가며, detail이 그 MAC이 현재 어느 NIC/주소에 있는지 알려준다. MAC이 저장되지 않은 옛
+설정만 이름 비교로 되돌아간다.
+
+`Find network`와 Connect preflight는 read-only다. 오직 확인된 Assign만 NetworkManager를
+변경한다. Workstation은 선택 NIC의 역할에 필요한 주소·host route만 합성하고 기본 route나
+다른 사용자 설정은 만들거나 제거하지 않는다. 한 NIC가 Camera+P1+P2를 모두 가질 수도 있고,
+여러 NIC에 임의로 나눌 수도 있다. 역할 이동은 대상 NIC를 먼저 적용·readback한 뒤 기존 NIC에서
+이동한 역할의 Workstation-owned 항목만 제거하며, 실패하면 기존 배치로 rollback한다.
+
+정상 Camera/Pixhawk가 영향을 받으면 해당 source/target NIC owner만 자동 stop/reconnect한다.
+Camera는 새 generation frame, Pixhawk는 expected sysid HEARTBEAT+ATTITUDE가 들어와야 저장한다.
+Measurement/기록/save/finalization 중에는 source identity 보호를 위해 변경 전 차단한다. P1/P2
+partial connection과 다른 NIC의 정상 장치는 유지한다. 같은 NIC 사용에는 UI 경고/gate가 없지만,
+과거 shared-L2 RTSP 부하에서 ETH MAVLink stall이 재현됐으므로 장시간 field 안정성 증거와는 구분한다.
 
 ## 2. PX4 MAVLink 파라미터
 
@@ -71,6 +86,171 @@ MAV_2_RATE=2000000
 
 P1과 P2의 `MAV_SYS_ID`는 반드시 달라야 한다. 두 보드에서 같은 system ID를 사용하면
 파라미터, command ACK, telemetry source를 구분할 수 없다.
+
+### MAG 슬롯 강제 선택별 P1/P2 yaw 오차 진단 (2026-09-04)
+
+P1/P2 모두 disarm 상태에서, 각 MAG 슬롯 하나만 priority `100`으로 두고 나머지 MAG 슬롯은
+`0`으로 둔 뒤 `vehicle_magnetometer.device_id`와 5초 ATTITUDE yaw 중앙값을 기록했다. 시험 전
+P1/P2의 가속도계·자이로·자력계 보정 correction과 level-horizon offset은 PX4 기본값으로
+초기화되어 있었다(`offset/보상=0`, `scale=1`). 따라서 아래 yaw는 최종 운용 캘리브레이션 결과가
+아니라 센서 선택별 진단값이다.
+
+`ΔYaw`는 `wrap180(P2 yaw - P1 yaw)`로 계산한 최단각이다. 각 행의 yaw는 순차 시험 중 중앙값이며,
+active device가 기대한 MAG ID와 다르면 fallback으로 표시한다.
+
+| 강제 조합 | 센서 | P1 active / yaw | P2 active / yaw | ΔYaw (P2-P1) |
+|---|---|---:|---:|---:|
+| MAG0 / MAG0 | 내부 BMM150 (`4395041`) | `4395041` / `178.88°` | `4395041` / `147.54°` | `-31.34°` |
+| MAG1 / MAG1 | GPS1 IST8310 (`396809`) | `396809` / `147.59°` | `396809` / `162.70°` | `+15.11°` |
+| MAG2 / MAG2 | P1 RM3100 `8944899`, P2 RM3100 `8944643` | `8944899` / `-149.43°` | `8944643` / `-152.96°` | `-3.53°` |
+| MAG3 / MAG3 | RM3100 backup 기대 ID `8944387` | `396817` fallback / `81.05°` | `396817` fallback / `86.69°` | `+5.64°`* |
+
+`*` MAG3 시험에서는 기대한 `8944387`이 선택되지 않고 GPS2 IST8310 (`396817`)으로
+fallback되었으므로 MAG3 조합의 센서 오차로 해석하지 않는다.
+
+진단 중 기본 MAG1 선택 상태의 동시 8초 샘플은 P1 `147.59°`, P2 `162.95°`, `ΔYaw
+≈+15.36°`였다. 이후 MAG2를 양쪽에서 선택하도록 priority를 변경했다.
+
+```text
+P1: CAL_MAG0_PRIO=0, CAL_MAG1_PRIO=75, CAL_MAG2_PRIO=100, CAL_MAG3_PRIO=0
+P2: CAL_MAG0_PRIO=0, CAL_MAG1_PRIO=75, CAL_MAG2_PRIO=100, CAL_MAG3_PRIO=0
+P1 active: device_id=8944899
+P2 active: device_id=8944643
+```
+
+MAG2 active 상태의 동시 8초 샘플은 다음과 같았다.
+
+```text
+P1 yaw = -149.229°
+P2 yaw = -150.144°
+ΔYaw   = -0.915°
+```
+
+따라서 현재 장비에서는 GPS1 내장 compass인 MAG1보다 RM3100인 MAG2를 P1/P2 공통 heading
+소스로 사용하는 편이 일관성이 높다. 초기 MAG2 선택 실험 당시에는 위 설정을 적용했으며, 이후
+MAG2/MAG3 재시험 및 오차순위 적용으로 현재 설정은 아래 후속 섹션에 기록되어 있다. 두
+보드의 MAG 보정값은 reset 상태이므로 실제 운용 전 QGroundControl에서 MAG2를 최종 장착
+상태로 다시 캘리브레이션해야 한다. `SENS_BOARD_ROT`, `CAL_MAG*_ROT`, 센서 ID는 이 시험에서
+변경하지 않았다.
+
+### MAG2/MAG3 재시험 및 오차순위 priority 적용 (2026-09-04)
+
+앞선 표의 MAG2/MAG3 결과를 다시 확인하기 위해 P1/P2를 각각 강제 선택했다. MAG2 시험에서는
+P1 RM3100 `8944899`, P2 RM3100 `8944643`가 실제 active device로 확인됐고, 6초 ATTITUDE
+중앙값은 다음과 같았다.
+
+```text
+P1 MAG2 yaw = -149.339°
+P2 MAG2 yaw = -148.721°
+MAG2 ΔYaw   = +0.62° (P2-P1)
+```
+
+MAG3 시험에서는 양쪽 모두 기대한 RM3100 backup `8944387`이 active device가 되지 않았다.
+P1은 GPS2 IST8310 `396817`으로 fallback했고, P2도 `8944387` active readback을 확인하지
+못했다. 따라서 MAG3의 yaw는 유효한 센서 조합 오차로 사용하지 않는다.
+
+운영 요청에 따라 MAG2를 `100`, MAG3를 `75`로 두고, 유효하게 측정된 기존 오차 순서에 따라
+MAG1을 `50`, MAG0을 `25`로 설정했다. MAG3 `75`는 센서 오차가 검증된 값이 아니라
+provisional fallback priority다.
+
+```text
+P1: CAL_MAG0_PRIO=25, CAL_MAG1_PRIO=50, CAL_MAG2_PRIO=100, CAL_MAG3_PRIO=75
+P2: CAL_MAG0_PRIO=25, CAL_MAG1_PRIO=50, CAL_MAG2_PRIO=100, CAL_MAG3_PRIO=75
+P1 active: device_id=8944899
+P2 active: device_id=8944643
+```
+
+두 보드 모두 disarm 상태에서 priority readback과 active MAG2를 확인했다. 현재 MAG 보정값은
+reset 상태이므로 위 priority 설정은 최종 calibration 품질을 의미하지 않는다. QGroundControl에서
+P1/P2 MAG2를 재캘리브레이션한 뒤 동일 자세에서 ΔYaw를 다시 측정해야 한다.
+
+### MAG2 1분 안정성 및 자이로 단독 캘리브레이션 전후 관찰 (2026-09-04)
+
+현재 MAG priority는 `MAG0=25, MAG1=50, MAG2=100, MAG3=75`이며, 측정 시작 전에 P1
+active device `8944899`, P2 active device `8944643`를 확인했다. 두 보드는 disarm 상태였고,
+가속도계·자력계·level 캘리브레이션은 추가로 실행하지 않았다. R/P/Y는 Workstation UI가
+아니라 각 보드의 raw MAVLink `ATTITUDE`를 직접 수집했다. Yaw 통계는 `[-180°, 180°)`
+경계를 피하도록 첫 샘플 기준으로 unwrap했다.
+
+#### MAG2 baseline과 gyro-only calibration
+
+| 단계 | P1 | P2 |
+|---|---:|---:|
+| MAG2 baseline wall time / samples | `60.011 s / 5,965` | `60.269 s / 212` |
+| 자이로 명령 | `MAV_CMD_PREFLIGHT_CALIBRATION`, `param1=1` | `MAV_CMD_PREFLIGHT_CALIBRATION`, `param1=1` |
+| calibration 결과 | ACK `0`, progress `0→100`, `calibration done: gyro` | ACK `0`, progress `30→100`, `calibration done: gyro` |
+| calibration 중 경고 | `GPS Horizontal Pos Error too high` | `GPS Speed Accuracy too low` |
+| MAG active 유지 | `8944899` | `8944643` |
+| post-calibration wall time / samples | `59.996 s / 6,000` | `60.015 s / 237` |
+
+`CAL_GYRO0~2_{X,Y,Z}OFF`는 캘리브레이션 전후 모두 정밀 PARAM readback에서 `0.0`이었고,
+gyro ID/priority/rotation도 변하지 않았다. 즉 이번 gyro calibration은 성공적으로 종료됐지만
+저장된 gyro offset을 실질적으로 바꾸지는 않았다.
+
+#### R/P/Y 통계
+
+`mean shift`와 `range shift`는 각각 post-calibration 값에서 baseline 값을 뺀 값이다.
+`drift`는 각 1분 구간의 시작값에서 끝값으로의 변화다. 단위는 모두 degree다.
+
+| 보드 | 축 | baseline mean | post mean | mean shift | baseline range | post range | baseline drift | post drift |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| P1 | R | `+0.6197` | `+0.6178` | `-0.0020` | `0.0198` | `0.0196` | `-0.0034` | `-0.0052` |
+| P1 | P | `+6.4405` | `+6.4387` | `-0.0018` | `0.0165` | `0.0157` | `-0.0057` | `+0.0016` |
+| P1 | Y | `-146.5760` | `-146.5607` | `+0.0152` | `0.1019` | `0.0663` | `-0.0349` | `-0.0576` |
+| P2 | R | `+0.1714` | `+0.1847` | `+0.0133` | `0.0218` | `0.0162` | `+0.0020` | `+0.0057` |
+| P2 | P | `+6.7177` | `+6.7173` | `-0.0004` | `0.0421` | `0.0218` | `+0.0045` | `+0.0008` |
+| P2 | Y | `-148.7710` | `-148.7302` | `+0.0407` | `0.0683` | `0.1339` | `-0.0269` | `-0.0576` |
+
+축별 표준편차는 P1에서 R/P/Y 각각 `0.0036/0.0036/0.0255°`에서
+`0.0035/0.0028/0.0171°`로 변했고, P2에서는 `0.0044/0.0071/0.0190°`에서
+`0.0035/0.0055/0.0369°`로 변했다. P1 yaw 범위는 줄었지만 P2 yaw 범위와 표준편차는
+늘어났으므로 gyro calibration이 R/P/Y 안정성을 일관되게 개선했다고 볼 수 없다. 1분 평균
+P2-P1 yaw 차이는 `-2.1950°`에서 `-2.1695°`로 약 `+0.0255°`만 변했다.
+
+이번 관찰에서는 gyro 명령 완료 자체는 PASS지만, `CAL_GYRO*` 값이 이미 0이어서 전후
+자세 변화의 원인을 gyro calibration 효과로 분리할 수 없다. MAG2 heading과 estimator의
+시간·온도·자기장 상태가 함께 영향을 줄 수 있으므로, 최종 운용 판단은 QGroundControl에서
+필요한 실제 sensor calibration을 완료한 뒤 반복 측정한다.
+
+#### P2 gyro calibration reset 후 1분 재관찰 (2026-09-04)
+
+P2의 `CAL_GYRO0~2_{X,Y,Z}OFF`만 PX4 기본값으로 다시 reset했다. P2는 disarm이고 MAG2
+`device_id=8944643`가 active인 상태였다. reset 전후 9개 offset의 정밀 PARAM readback은
+모두 `0.0`이었으므로, 이번 작업은 저장된 gyro 수치를 바꾸지 않은 no-op에 가깝다.
+
+reset 직후 raw MAVLink `ATTITUDE`를 60.093초 동안 253개 수집했다. 비교 기준은 바로 앞의
+gyro calibration 이후 P2 1분 관찰이다.
+
+| 축 | 이전 post-cal mean | reset 후 mean | mean shift | 이전 range | reset 후 range | range shift | 이전 drift | reset 후 drift |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| R | `+0.1847°` | `+0.1836°` | `-0.0011°` | `0.0162°` | `0.0212°` | `+0.0050°` | `+0.0057°` | `+0.0047°` |
+| P | `+6.7173°` | `+6.7200°` | `+0.0027°` | `0.0218°` | `0.0254°` | `+0.0036°` | `+0.0008°` | `+0.0033°` |
+| Y | `-148.7302°` | `-148.8971°` | `-0.1669°` | `0.1339°` | `0.1241°` | `-0.0098°` | `-0.0576°` | `+0.1058°` |
+
+P2의 표준편차는 R/P/Y 각각 `0.0035/0.0055/0.0369°`에서
+`0.0040/0.0053/0.0347°`로 변했다. Yaw 범위와 표준편차는 소폭 줄었지만, 1분 drift의
+방향이 음수에서 양수로 바뀌었고 평균도 `0.1669°` 이동했다. 그러나 gyro offset 자체가
+reset 전후 동일한 `0.0`이었으므로, 이 차이를 gyro reset 효과라고 단정할 수 없다. MAG2
+heading, estimator 상태, 시간·온도 변화가 포함된 재관찰 결과로 기록하며, P2는 실제 비행
+전에 gyro calibration을 다시 수행할 필요가 있다면 QGroundControl 절차로 확인한다.
+
+#### P2 MAG2 5분 장기 관찰 (2026-09-04)
+
+P2 `device_id=8944643` MAG2 active, `CAL_MAG0~3_PRIO=25/50/100/75`, disarm 상태에서
+자이로 offset reset 이후 raw MAVLink `ATTITUDE`를 300.069초 동안 1,193개 수집했다.
+Yaw는 첫 샘플 기준으로 unwrap했다.
+
+| 축 | mean | min | max | range | 표준편차 | start→end drift |
+|---|---:|---:|---:|---:|---:|---:|
+| R | `+0.1824°` | `+0.1704°` | `+0.1942°` | `0.0237°` | `0.0044°` | `-0.0038°` |
+| P | `+6.7202°` | `+6.7022°` | `+6.7374°` | `0.0352°` | `0.0062°` | `-0.0021°` |
+| Y | `-148.9040°` | `-148.9464°` | `-148.8592°` | `0.0872°` | `0.0187°` | `+0.0014°` |
+
+직전 P2 1분 관찰과 비교한 평균 이동은 R `-0.0012°`, P `+0.0002°`, Y `-0.0069°`였다.
+Yaw 표준편차는 `0.0347° → 0.0187°`로 줄었고, 5분 구간의 시작·끝 yaw 차이는 `+0.0014°`로
+누적 drift가 거의 없었다. R/P 범위는 관찰 시간이 길어져 각각 `0.0237°/0.0352°`로
+기록됐다. 이 결과는 정지 상태에서 P2 MAG2 heading이 5분 동안 크게 누적 표류하지 않았다는
+뜻이며, 움직임·온도 변화가 포함된 운용 조건의 정확도를 보증하지 않는다.
 
 ## 3. PX4 Ethernet 파일
 
@@ -245,8 +425,12 @@ instance가 중복 실행된 증거다. 단, 이 판정은 부팅 후 host가 �
 - P1/P2가 같은 `MAV_SYS_ID`를 사용하지 않도록 한다.
 - 두 보드가 같은 Ethernet MAC으로 보이면 ARP 충돌 가능성이 있으므로 두 보드의 MAC과 IP를
   별도로 확인한 뒤 운용한다.
-- `usb-FTDI_FT231X_USB_UART_DU0E49VU`는 현재 P2 MAVLink heartbeat가 확인되지 않은 포트다.
-  P2 직접 USB 제어에는 `usb-Auterion_PX4_FMU_v6X.x_0-if00`처럼 PX4 FMU로 인식되는 포트를
+- `usb-FTDI_FT231X_USB_UART_DU0E49VU`는 P2 Telemetry Radio ground 포트다. NETID 25/26 분리
+  전에는 이 포트에서 P2 heartbeat가 확인되지 않았으나, 2026-08-31 NETID 26 write/readback과
+  공중 라디오 전원 재인가 이후 sysid 2만 수신하는 것이 확인됐다(15초 298 메시지 / heartbeat 15).
+  P1은 `D30JNMVH`(NETID 25)를 사용한다. NETID를 바꾼 뒤에는 공중 라디오 전원을 완전히 다시
+  인가해야 링크가 살아난다. 근거는 `docs/changes/20260831-pixhawk-radio-fallback/verification.md`.
+- P2 직접 USB 제어에는 `usb-Auterion_PX4_FMU_v6X.x_0-if00`처럼 PX4 FMU로 인식되는 포트를
   사용하고, 연결 후 source system ID를 확인한다.
 - P1/P2 모두 `10.0.0.10/24`와 같은 Ethernet 대역에 있어야 한다.
 - running instance에 `mavlink stop`을 보내지 않는다. PX4 v1.17 signing callback의
@@ -352,3 +536,77 @@ soft reboot하여 `MAV_2_CONFIG`가 만든 브로드캐스트 stream 한 벌만 
 P2는 기존 custom firmware에서도 정상 동작했지만 동일한 latent null-slot bug를 포함할 수 있다.
 Workstation no-stop 변경과 단일 `MAV_2_CONFIG` owner로 알려진 trigger와 competing start를 제거했으며, 정비 가능 시 P2도
 위 patched artifact로 업데이트한다.
+## Port-swap baseline before CAN1/CAN2 diagnostic (2026-09-05 16:14 KST)
+
+This is the saved reference state immediately before physically swapping the P1/P2 CAN1 and
+CAN2 connections. GPS2 was removed and both Pixhawks had been rebooted. The Workstation was
+running over the P1/P2 Radio endpoints.
+
+### Topology and CAL_MAG identity
+
+```text
+P1 sensor_mag: instance 0=4395041 (internal), 1=396809 (GPS1),
+               2=8944899 (CAN1 RM3100), 3=8944387 (CAN2 RM3100)
+P2 sensor_mag: instance 0=4395041 (internal), 1=396809 (GPS1),
+               2=8944643 (CAN1 RM3100), 3=8944387 (CAN2 RM3100)
+
+P1 CAL_MAG0_ID=4395041, CAL_MAG1_ID=396809, CAL_MAG2_ID=8944899, CAL_MAG3_ID=8944387
+P2 CAL_MAG0_ID=4395041, CAL_MAG1_ID=396809, CAL_MAG2_ID=8944643, CAL_MAG3_ID=8944387
+P1/P2 CAL_MAG0~3_PRIO = 1 / 1 / 100 / 1
+```
+
+### RAW yaw comparison before port swap
+
+```text
+P1: GPS1 +159.271°, CAN1 -158.690°, CAN2 +156.432°, internal +174.359°
+P2: GPS1 +177.015°, CAN1 -163.745°, CAN2 +163.087°, internal +153.700°
+
+wrapped P2-P1 RAW yaw difference:
+GPS1 +17.744°, CAN1 -5.055°, CAN2 +6.655°, internal -20.660°
+```
+
+The smallest cross-Pixhawk RAW yaw difference was CAN1. The subsequent UI priority test set
+CAN1 to 100 and CAN2 to 1; direct PX4 readback selected P1 `8944899` and P2 `8944643`, with
+fresh ATTITUDE yaw P1 `-159.972°`, P2 `-167.249°`, wrapped delta `-7.277°`. This snapshot is
+the pre-swap comparison oracle; do not overwrite it when recording the post-swap result.
+
+### Post-swap result — yaw follows device identity (2026-09-05)
+
+After swapping the physical CAN1/CAN2 connections on both Pixhawks and rebooting:
+
+```text
+P1: instance 2 = CAN1 device 8944899, instance 3 = CAN2 device 8944387
+P2: instance 2 = CAN2 device 8944387, instance 3 = CAN1 device 8944643
+
+device-identity yaw:
+CAN1: P1 -158.7°, P2 -163.7°
+CAN2: P1 +156.4°, P2 +162.8°
+```
+
+The CAN1/CAN2 yaw characteristics therefore follow the RM3100 device identity rather than the
+physical Pixhawk CAN port. This points to sensor-specific axis/frame configuration or physical
+magnetic bias/placement, not a Pixhawk CAN-port transform. With the pre-swap priorities retained,
+the active devices remained P1 `8944899` and P2 `8944643`; live ATTITUDE was approximately
+P1 `-160.01°`, P2 `-168.26°` (wrapped difference about `-8.25°`).
+
+## GPS removal freshness check (2026-09-05)
+
+After the operator removed the GPS magnetometers and rebooted, the raw topic list must be read
+with freshness/health, not only by cached `device_id`. Direct P1/P2 checks showed:
+
+```text
+P1 sensors_status_mag:
+  device_ids = [4395041, 8944899, 8944387, 0]
+  healthy    = [True, True, True, False]
+  primary   = 8944899
+
+P2 sensors_status_mag:
+  device_ids = [4395041, 396809, 8944387, 8944643]
+  healthy    = [True, False, True, True]
+  MAG1 396809 timestamp age ≈229 s (stale, not live)
+  primary   = 8944643
+```
+
+Therefore P2 `MAG1=396809` appearing in a Shell/UI topology list does not prove that GPS1 is
+physically connected. The UI must surface stale/healthy state and the actual active device
+separately; the stale GPS1 record is not a live magnetometer input.

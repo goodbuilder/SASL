@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import hashlib
+import json
 import time
 from collections.abc import Sequence
 from datetime import datetime, timezone
@@ -56,9 +58,11 @@ WIRIS_CONTROL_METHODS = [
     "_wiris_command_needs_confirmation",
     "_stus_command_from_unix_time",
     "set_selected_wiris_time_from_pc",
+    "_dispatch_wiris_time_sync_initial",
     "_start_wiris_time_sync_worker",
     "_request_wiris_time_sync_correction",
     "_finish_wiris_time_sync_operation",
+    "_append_stus_event",
     "_apply_wiris_time_sync_result",
     "_wiris_time_sync_failed",
     "_clear_wiris_time_sync_worker",
@@ -316,25 +320,72 @@ class WirisControlController:
             microseconds -= 1_000_000
         return f"STUS {seconds} {microseconds}"
 
-    def set_selected_wiris_time_from_pc(self, target: str | None = None) -> bool | None:
+    def _append_stus_event(
+        self,
+        event_type: str,
+        payload: dict[str, object] | None = None,
+    ) -> None:
+        operation = getattr(self.panel, "_camera_sync_stus_operation", None)
+        operation_values = dict(operation) if isinstance(operation, dict) else {}
+        event: dict[str, object] = {
+            "schema": "workstation-stus-event-v1",
+            "event_type": str(event_type),
+            "operation_id": str(operation_values.get("operation_id") or ""),
+            "clock_epoch_id": str(operation_values.get("clock_epoch_id") or ""),
+            "trigger": str(operation_values.get("trigger") or "manual"),
+            "phase": str(operation_values.get("phase") or ""),
+            "attempt_index": int(operation_values.get("attempts_started") or 0),
+            "observed_at_unix_ns": time.time_ns(),
+            "observed_at_monotonic_ns": time.monotonic_ns(),
+            "coordinate_contract": "camera UTC/RTCP clock evidence; no NED/FRD/RDF conversion",
+            **dict(payload or {}),
+        }
+        canonical = json.dumps(
+            event,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        event["event_sha256"] = hashlib.sha256(canonical).hexdigest()
+        append_data = getattr(self.panel, "append_workstation_data", None)
+        if callable(append_data):
+            try:
+                append_data("events", dict(event), priority=True)
+            except Exception as exc:  # noqa: BLE001 - evidence failure remains diagnostic.
+                self.panel._log(f"[시계] STUS global event 기록 실패: {exc}")
+        append_run = getattr(self.panel, "append_workstation_run_event", None)
+        if callable(append_run) and str(getattr(self.panel, "_measurement_id", "") or ""):
+            try:
+                append_run(
+                    str(event_type),
+                    dict(event),
+                    source="WirisControlController",
+                    coordinate_contract=str(event["coordinate_contract"]),
+                )
+            except Exception as exc:  # noqa: BLE001 - do not mutate clock state from writer failure.
+                self.panel._log(f"[시계] STUS run event 기록 실패: {exc}")
+
+    def set_selected_wiris_time_from_pc(
+        self,
+        target: str | None = None,
+        *,
+        trigger: str = "manual",
+    ) -> bool | None:
         if bool(getattr(self.panel, "_shutdown_in_progress", False)):
             status_text = "Application shutdown is in progress; STUS start rejected"
             self.panel.wiris_command_status_label.setText(status_text)
             self.panel._log(f"[시계] {status_text}")
             return False
-        if self.panel._session_recording_active():
-            status_text = "세션 기록 중에는 WIRIS 시간을 변경할 수 없습니다."
-            self.panel.wiris_command_status_label.setText(status_text)
-            if hasattr(self.panel, "clock_sync_status_label"):
-                self.panel.clock_sync_status_label.setText(status_text)
-            self.panel._log(f"[시계] {status_text}")
-            return False
+        trigger = "auto" if str(trigger).strip().lower() == "auto" else "manual"
         if target is None:
             if hasattr(self.panel, "clock_wiris_time_target_combo"):
                 target = str(self.panel.clock_wiris_time_target_combo.currentData() or "both")
             else:
                 target = str(self.panel.wiris_command_target_combo.currentData() or "both")
         target = str(target or "both")
+        if trigger == "auto":
+            target = "both"
         operation = getattr(self.panel, "_camera_sync_stus_operation", None)
         if isinstance(operation, dict) and operation.get("active"):
             self.panel._log(
@@ -384,10 +435,12 @@ class WirisControlController:
         started_monotonic_s = time.monotonic()
         operation_id = f"stus-{time.time_ns()}"
         self.panel._camera_sync_stus_operation = {
-            "schema": "workstation-stus-closed-loop-v1",
+            "schema": "workstation-stus-closed-loop-v3",
             "operation_id": operation_id,
+            "clock_epoch_id": f"clock-epoch:{operation_id}",
+            "trigger": trigger,
             "active": True,
-            "phase": "initial-command",
+            "phase": "observer-preflight",
             "target": target,
             "target_infos": tuple(target_infos),
             "started_monotonic_s": started_monotonic_s,
@@ -401,6 +454,13 @@ class WirisControlController:
             "correction_observations": [],
             "last_compensation_by_camera": {},
         }
+        # A prior post-STUS observer warm-up may have left its shorter deadline
+        # behind after a failed operation.  The new operation is governed by
+        # its own overall deadline until the first STUS ACK starts a fresh
+        # post-command warm-up window.
+        self.panel._camera_sync_deadline_monotonic_s = None
+        self.panel._camera_sync_stus_sr_baseline = {}
+        self.panel._camera_sync_last_sr_counts = {}
         previous_sync = getattr(self.panel, "_last_wiris_pc_utc_sync", None)
         if isinstance(previous_sync, dict):
             self.panel._camera_sync_stus_operation["superseded_result"] = {
@@ -411,6 +471,8 @@ class WirisControlController:
         self.panel._last_wiris_pc_utc_sync = {
             "command": "STUS",
             "operation_id": operation_id,
+            "clock_epoch_id": f"clock-epoch:{operation_id}",
+            "trigger": trigger,
             "target": target,
             "result": "pending-command",
             "ack_result": "not-run",
@@ -418,6 +480,39 @@ class WirisControlController:
             "max_attempts": WIRIS_STUS_MAX_ATTEMPTS,
             "recorded_at_unix_s": time.time(),
         }
+        self._append_stus_event(
+            "camera_clock_sync_requested",
+            {
+                "target": target,
+                "max_attempts": WIRIS_STUS_MAX_ATTEMPTS,
+                "max_operation_s": WIRIS_STUS_MAX_OPERATION_S,
+            },
+        )
+        waiting_text = "PC UTC 설정: RTCP clock observer preflight..."
+        self.panel.wiris_command_status_label.setText(waiting_text)
+        self.panel._set_camera_sync_state("warming", waiting_text)
+        self.panel._camera_sync_timer.start()
+        restart_observer = getattr(self.panel, "_restart_rtcp_clock_observer", None)
+        if not callable(restart_observer) or not restart_observer(operation_id=operation_id):
+            reason = "RTCP clock observer preflight could not start"
+            self.panel._set_camera_sync_state("failed", reason)
+            self._finish_wiris_time_sync_operation("failed", reason)
+            return False
+        return None
+
+    def _dispatch_wiris_time_sync_initial(self) -> bool:
+        operation = getattr(self.panel, "_camera_sync_stus_operation", None)
+        if not isinstance(operation, dict) or not operation.get("active"):
+            return False
+        if str(operation.get("phase") or "") != "observer-preflight":
+            return False
+        if time.monotonic() >= float(operation.get("deadline_monotonic_s") or 0.0):
+            reason = f"STUS observer preflight exceeded {WIRIS_STUS_MAX_OPERATION_S:.0f}s deadline"
+            self.panel._set_camera_sync_state("failed", reason)
+            self._finish_wiris_time_sync_operation("failed", reason)
+            return False
+        operation["phase"] = "initial-command"
+        self._append_stus_event("camera_clock_sync_command_started")
         self.panel.wiris_command_status_label.setText(
             f"PC UTC 설정: STUS attempt 1/{WIRIS_STUS_MAX_ATTEMPTS} sending..."
         )
@@ -425,14 +520,13 @@ class WirisControlController:
             self.panel.clock_sync_status_label.setText(
                 f"PC UTC 설정: STUS attempt 1/{WIRIS_STUS_MAX_ATTEMPTS} sending..."
             )
-        self._start_wiris_time_sync_worker(
-            target=target,
-            target_infos=target_infos,
+        return self._start_wiris_time_sync_worker(
+            target=str(operation.get("target") or "both"),
+            target_infos=tuple(operation.get("target_infos") or ()),
             attempt_index=1,
-            operation_id=operation_id,
-            operation_deadline_monotonic_s=started_monotonic_s + WIRIS_STUS_MAX_OPERATION_S,
+            operation_id=str(operation.get("operation_id") or ""),
+            operation_deadline_monotonic_s=float(operation["deadline_monotonic_s"]),
         )
-        return None
 
     def _start_wiris_time_sync_worker(
         self,
@@ -489,11 +583,6 @@ class WirisControlController:
                 "closed-loop correction requires the dual-camera target",
             )
             return False
-        if self.panel._session_recording_active():
-            reason = "STUS closed-loop correction rejected because recording is active"
-            self.panel._set_camera_sync_state("failed", reason)
-            self._finish_wiris_time_sync_operation("failed", reason)
-            return False
         if self.panel.wiris_time_sync_thread is not None:
             return False
         deadline_s = float(operation.get("deadline_monotonic_s") or 0.0)
@@ -513,7 +602,7 @@ class WirisControlController:
             "left",
             "right",
         }:
-            reason = "STUS closed-loop requires bounded Left and Right feedback"
+            reason = "STUS closed-loop requires bounded Left and Right relative feedback"
             self.panel._set_camera_sync_state("failed", reason)
             self._finish_wiris_time_sync_operation("failed", reason)
             return False
@@ -551,6 +640,15 @@ class WirisControlController:
         operation["attempts_started"] = attempt_index
         operation["phase"] = "correction-command"
         operation.setdefault("correction_observations", []).append(dict(observation))
+        self._append_stus_event(
+            "camera_clock_sync_correction_requested",
+            {
+                "feedback_offset_by_camera": dict(normalized_feedback),
+                "feedback_role": "left-right-relative-error",
+                "compensation_by_camera": dict(normalized_compensation),
+                "observation": dict(observation),
+            },
+        )
         self.panel._camera_sync_timer.stop()
         self.panel.wiris_command_status_label.setText(
             f"PC UTC 설정: STUS closed-loop attempt {attempt_index}/{max_attempts} sending..."
@@ -583,6 +681,23 @@ class WirisControlController:
         operation["reason"] = str(reason)
         operation["finished_monotonic_s"] = time.monotonic()
         operation["finished_unix_s"] = time.time()
+        self._append_stus_event(
+            "camera_clock_sync_finished",
+            {
+                "result": str(state),
+                "reason": str(reason),
+                "attempts_completed": int(operation.get("attempts_completed") or 0),
+            },
+        )
+        scheduler = getattr(self.panel, "_stus_scheduler", None)
+        mark_finished = getattr(scheduler, "mark_finished", None)
+        if callable(mark_finished):
+            mark_finished(
+                now_monotonic_s=float(operation["finished_monotonic_s"]),
+                trigger=str(operation.get("trigger") or "manual"),
+                verified=state == "verified",
+                reason=str(reason),
+            )
         if state != "verified":
             cancel = getattr(
                 getattr(self.panel, "wiris_time_sync_worker", None),
@@ -683,6 +798,8 @@ class WirisControlController:
         one_way_delay_by_camera: dict[str, float | None] = {}
         compensation_by_camera: dict[str, float | None] = {}
         feedback_offset_by_camera: dict[str, float | None] = {}
+        rtt_probe_errors_by_camera: dict[str, list[str]] = {}
+        rtt_probe_warnings_by_camera: dict[str, list[str]] = {}
         timing_text_parts: list[str] = []
         attempt_index = max(1, int(data.get("stus_attempt_index") or 1))
         max_attempts = (
@@ -739,8 +856,12 @@ class WirisControlController:
             one_way_delay_by_camera[label] = one_way_delay_s
             compensation_by_camera[label] = compensation_s
             feedback_offset_by_camera[label] = feedback_offset_s
+            probe_errors = [str(value) for value in row.get("stus_rtt_probe_errors") or []]
+            probe_warnings = [str(value) for value in row.get("stus_rtt_probe_warnings") or []]
+            rtt_probe_errors_by_camera[label] = probe_errors
+            rtt_probe_warnings_by_camera[label] = probe_warnings
             compensation_source = str(row.get("stus_compensation_source") or "")
-            if compensation_source == "rtcp-sr-closed-loop":
+            if compensation_source == "rtcp-relative-closed-loop":
                 feedback_text = (
                     "--" if feedback_offset_s is None else f"{feedback_offset_s * 1000.0:+.2f}ms"
                 )
@@ -748,7 +869,7 @@ class WirisControlController:
                     "--" if compensation_s is None else f"{compensation_s * 1000.0:+.2f}ms"
                 )
                 timing_text_parts.append(
-                    f"{self.panel._camera_name_ko(label)} signed SR-PC={feedback_text}"
+                    f"{self.panel._camera_name_ko(label)} L/R relative feedback={feedback_text}"
                     f"→STUS target lead={compensation_text}"
                 )
             elif rtt_median_s is None:
@@ -759,10 +880,15 @@ class WirisControlController:
                     f"{self.panel._camera_name_ko(label)} RTT={rtt_median_s * 1000.0:.2f}ms"
                     f"→STUS 보정 {compensation_ms:.2f}ms"
                 )
-            warning_count = len(row.get("stus_rtt_probe_warnings") or [])
+            warning_count = len(probe_warnings)
             if warning_count:
                 timing_text_parts.append(
                     f"{self.panel._camera_name_ko(label)} high-latency HIWS warning={warning_count}"
+                )
+            if probe_errors:
+                timing_text_parts.append(
+                    f"{self.panel._camera_name_ko(label)} HIWS errors="
+                    + " | ".join(probe_errors[-3:])
                 )
         command_times = dict(data.get("command_times") or {})
         tcp_start_times = dict(data.get("tcp_start_times") or {})
@@ -805,10 +931,11 @@ class WirisControlController:
         if hasattr(self.panel, "clock_sync_status_label"):
             self.panel.clock_sync_status_label.setText(f"PC UTC 설정 전송: {status_text}")
             compensation_method = str(data.get("compensation_method") or "")
-            if compensation_method == "rtcp-sr-closed-loop":
+            if compensation_method == "rtcp-relative-closed-loop":
                 target_contract = (
-                    "STUS target = previous target lead - median signed SR-PC offset; "
-                    "3 unique RTCP pad-probe SRs and bounded dispersion required.\n"
+                    "STUS target removes Left/Right differential around the observed common mode; "
+                    "absolute SR-PC is diagnostic-only. 3 unique RTCP pad-probe SRs and bounded "
+                    "dispersion required.\n"
                 )
             else:
                 target_contract = (
@@ -869,6 +996,8 @@ class WirisControlController:
                 "dispatch_policy": data.get("dispatch_policy"),
                 "responses": dict(statuses),
                 "rtt_by_camera": dict(rtt_by_camera),
+                "rtt_probe_errors_by_camera": dict(rtt_probe_errors_by_camera),
+                "rtt_probe_warnings_by_camera": dict(rtt_probe_warnings_by_camera),
                 "feedback_offset_by_camera": dict(feedback_offset_by_camera),
                 "compensation_by_camera": dict(compensation_by_camera),
                 "requested_utc_by_camera": dict(requested_utc_by_camera),
@@ -890,6 +1019,14 @@ class WirisControlController:
                 else "failed"
             )
             operation_attempts = list(operation["attempts"])
+            self._append_stus_event(
+                "camera_clock_sync_acknowledged",
+                {
+                    "ack_result": ack_result_state,
+                    "result": result_state,
+                    "attempt": dict(attempt_record),
+                },
+            )
         self.panel._last_wiris_pc_utc_sync = {
             "command": "STUS",
             "target": target,
@@ -909,9 +1046,12 @@ class WirisControlController:
             "dispatch_policy": data.get("dispatch_policy"),
             "stus_parse_margin_s": data.get("stus_parse_margin_s"),
             "stus_rtt_by_camera": rtt_by_camera,
+            "stus_rtt_probe_errors_by_camera": rtt_probe_errors_by_camera,
+            "stus_rtt_probe_warnings_by_camera": rtt_probe_warnings_by_camera,
             "stus_one_way_delay_by_camera": one_way_delay_by_camera,
             "stus_compensation_by_camera": compensation_by_camera,
             "stus_feedback_offset_by_camera": feedback_offset_by_camera,
+            "stus_feedback_role": "left-right-relative-error",
             "stus_rtt_probe_by_camera": dict(data.get("stus_rtt_by_camera") or {}),
             "attempts": operation_attempts,
             "limits": {

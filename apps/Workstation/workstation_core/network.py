@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import shutil
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from ipaddress import IPv4Address, IPv4Interface, IPv4Network, ip_interface
@@ -28,6 +29,11 @@ DEFAULT_TCP_PORT_SCAN_WORKERS = 256
 PKEXEC_TIMEOUT_SECONDS = 15.0
 INTERFACE_STATUS_TIMEOUT_SECONDS = 2.0
 PIXHAWK_NETWORK_COMMAND_TIMEOUT_SECONDS = 2.0
+NETWORK_ROLE_APPLY_TIMEOUT_SECONDS = 60.0
+NETWORK_ROLE_CAMERA = "camera"
+NETWORK_ROLE_P1 = "p1"
+NETWORK_ROLE_P2 = "p2"
+NETWORK_ROLE_ORDER = (NETWORK_ROLE_CAMERA, NETWORK_ROLE_P1, NETWORK_ROLE_P2)
 
 
 @dataclass(frozen=True)
@@ -154,6 +160,284 @@ class PixhawkAssignmentValidation:
     state: str
     detail: str
     route: PixhawkRouteEvidence | None = None
+
+
+@dataclass(frozen=True)
+class NetworkRoleAssignment:
+    """Operator-owned placement of one logical device role on a physical NIC."""
+
+    role: str
+    interface: str
+    stable_id: str = ""
+
+
+@dataclass(frozen=True)
+class NetworkRoleRequirements:
+    """Canonical app-owned IPv4 entries required by a set of NIC roles."""
+
+    roles: tuple[str, ...]
+    addresses: tuple[str, ...]
+    routes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class NetworkRoleMovePlan:
+    """Pure before/after role placement used by the privileged transaction owner."""
+
+    role: str
+    source_interface: str
+    target_interface: str
+    before_assignments: tuple[NetworkRoleAssignment, ...]
+    after_assignments: tuple[NetworkRoleAssignment, ...]
+
+    @property
+    def affected_interfaces(self) -> tuple[str, ...]:
+        if self.source_interface and self.source_interface != self.target_interface:
+            return self.target_interface, self.source_interface
+        return (self.target_interface,)
+
+    def roles_by_interface(self, *, after: bool = True) -> dict[str, tuple[str, ...]]:
+        assignments = self.after_assignments if after else self.before_assignments
+        grouped: dict[str, list[str]] = {}
+        for assignment in assignments:
+            if assignment.interface:
+                grouped.setdefault(assignment.interface, []).append(assignment.role)
+        return {
+            interface: tuple(role for role in NETWORK_ROLE_ORDER if role in roles)
+            for interface, roles in grouped.items()
+        }
+
+
+@dataclass(frozen=True)
+class NetworkRoleOwnedEntries:
+    """Exact NetworkManager entries created by Workstation on one NIC."""
+
+    addresses: tuple[str, ...] = ()
+    routes: tuple[str, ...] = ()
+
+    @classmethod
+    def from_mapping(cls, value: object) -> NetworkRoleOwnedEntries:
+        data = value if isinstance(value, Mapping) else {}
+        return cls(
+            tuple(str(item) for item in (data.get("addresses") or ()) if str(item)),
+            tuple(str(item) for item in (data.get("routes") or ()) if str(item)),
+        )
+
+    def to_mapping(self) -> dict[str, list[str]]:
+        return {"addresses": list(self.addresses), "routes": list(self.routes)}
+
+
+@dataclass(frozen=True)
+class NetworkRoleEntryDelta:
+    addresses_after: tuple[str, ...]
+    routes_after: tuple[str, ...]
+    owned_after: NetworkRoleOwnedEntries
+    added_addresses: tuple[str, ...]
+    added_routes: tuple[str, ...]
+    removed_addresses: tuple[str, ...]
+    removed_routes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class NetworkManagerConnectionSnapshot:
+    interface: str
+    connection_name: str
+    exists: bool
+    active: bool
+    addresses: tuple[str, ...] = ()
+    routes: tuple[str, ...] = ()
+    ipv4_method: str = "manual"
+    never_default: str = "yes"
+
+
+@dataclass(frozen=True)
+class NetworkRoleInterfaceRequest:
+    interface: str
+    stable_id: str
+    desired: NetworkRoleRequirements
+    owned_before: NetworkRoleOwnedEntries = NetworkRoleOwnedEntries()
+    adoptable_before: NetworkRoleRequirements = NetworkRoleRequirements((), (), ())
+
+
+@dataclass(frozen=True)
+class NetworkRoleInterfaceResult:
+    interface: str
+    connection_name: str
+    desired: NetworkRoleRequirements
+    owned_after: NetworkRoleOwnedEntries
+    addresses: tuple[str, ...]
+    routes: tuple[str, ...]
+
+
+def _ordered_union(base: Sequence[str], additions: Iterable[str]) -> tuple[str, ...]:
+    values = list(base)
+    for value in additions:
+        if value not in values:
+            values.append(value)
+    return tuple(values)
+
+
+def network_role_entry_delta(
+    *,
+    current_addresses: Sequence[str],
+    current_routes: Sequence[str],
+    owned_before: NetworkRoleOwnedEntries,
+    desired: NetworkRoleRequirements,
+) -> NetworkRoleEntryDelta:
+    """Calculate a role-scoped delta without claiming pre-existing entries."""
+
+    desired_addresses = set(desired.addresses)
+    desired_routes = set(desired.routes)
+    owned_addresses = set(owned_before.addresses)
+    owned_routes = set(owned_before.routes)
+
+    removed_addresses = tuple(
+        value for value in current_addresses if value in owned_addresses - desired_addresses
+    )
+    removed_routes = tuple(
+        value for value in current_routes if value in owned_routes - desired_routes
+    )
+    retained_addresses = tuple(value for value in current_addresses if value not in removed_addresses)
+    retained_routes = tuple(value for value in current_routes if value not in removed_routes)
+    added_addresses = tuple(value for value in desired.addresses if value not in retained_addresses)
+    added_routes = tuple(value for value in desired.routes if value not in retained_routes)
+    addresses_after = _ordered_union(retained_addresses, added_addresses)
+    routes_after = _ordered_union(retained_routes, added_routes)
+    owned_after = NetworkRoleOwnedEntries(
+        tuple(
+            value
+            for value in desired.addresses
+            if value in owned_addresses or value in added_addresses
+        ),
+        tuple(
+            value
+            for value in desired.routes
+            if value in owned_routes or value in added_routes
+        ),
+    )
+    return NetworkRoleEntryDelta(
+        addresses_after,
+        routes_after,
+        owned_after,
+        added_addresses,
+        added_routes,
+        removed_addresses,
+        removed_routes,
+    )
+
+
+def _normalize_network_role(role: object) -> str:
+    normalized = str(role or "").strip().lower()
+    if normalized not in NETWORK_ROLE_ORDER:
+        raise ValueError(f"unsupported network role: {role}")
+    return normalized
+
+
+def _canonical_role_address(value: object, *, default_prefix: int) -> IPv4Interface:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("network role address is empty")
+    if "/" not in text:
+        text = f"{text}/{int(default_prefix)}"
+    address = ip_interface(text)
+    if not isinstance(address, IPv4Interface):
+        raise ValueError(f"network role address is not IPv4: {value}")
+    return address
+
+
+def _canonical_role_peer(value: object) -> str:
+    return str(IPv4Address(str(value or "").strip()))
+
+
+def network_role_requirements(
+    roles: Iterable[object],
+    *,
+    camera_local_address: object = "10.0.0.11/32",
+    camera_peers: Iterable[object] = ("10.0.0.231", "10.0.0.232"),
+    pixhawk_local_address: object = "10.0.0.10/24",
+    p1_peer: object = "10.0.0.2",
+    p2_peer: object = "10.0.0.3",
+) -> NetworkRoleRequirements:
+    """Compose exact app-owned address/route entries for one physical NIC.
+
+    Camera and Pixhawk entries deliberately coexist.  The camera /32 host
+    routes are more specific than the Pixhawk connected /24 and retain their
+    preferred source when every role shares one NIC.
+    """
+
+    normalized_roles = tuple(
+        role for role in NETWORK_ROLE_ORDER if role in {_normalize_network_role(value) for value in roles}
+    )
+    addresses: list[str] = []
+    routes: list[str] = []
+
+    def append_unique(values: list[str], value: str) -> None:
+        if value not in values:
+            values.append(value)
+
+    if NETWORK_ROLE_CAMERA in normalized_roles:
+        camera_address = _canonical_role_address(camera_local_address, default_prefix=32)
+        append_unique(addresses, str(camera_address))
+        for raw_peer in camera_peers:
+            peer = _canonical_role_peer(raw_peer)
+            append_unique(routes, f"{peer}/32 src={camera_address.ip}")
+
+    pixhawk_roles = {
+        role for role in normalized_roles if role in {NETWORK_ROLE_P1, NETWORK_ROLE_P2}
+    }
+    if pixhawk_roles:
+        pixhawk_address = _canonical_role_address(pixhawk_local_address, default_prefix=24)
+        append_unique(addresses, str(pixhawk_address))
+        if NETWORK_ROLE_P1 in pixhawk_roles:
+            append_unique(
+                routes,
+                f"{_canonical_role_peer(p1_peer)}/32 src={pixhawk_address.ip}",
+            )
+        if NETWORK_ROLE_P2 in pixhawk_roles:
+            append_unique(
+                routes,
+                f"{_canonical_role_peer(p2_peer)}/32 src={pixhawk_address.ip}",
+            )
+
+    return NetworkRoleRequirements(normalized_roles, tuple(addresses), tuple(routes))
+
+
+def plan_network_role_move(
+    current_assignments: Mapping[str, Mapping[str, object] | str],
+    *,
+    role: object,
+    target_interface: object,
+    target_stable_id: object = "",
+) -> NetworkRoleMovePlan:
+    """Return a role-scoped move plan without assuming NIC count or exclusivity."""
+
+    moved_role = _normalize_network_role(role)
+    target = str(target_interface or "").strip()
+    if not target:
+        raise ValueError("target interface is empty")
+
+    before: list[NetworkRoleAssignment] = []
+    by_role: dict[str, NetworkRoleAssignment] = {}
+    for raw_role in NETWORK_ROLE_ORDER:
+        raw = current_assignments.get(raw_role, {})
+        if isinstance(raw, Mapping):
+            interface = str(raw.get("interface") or "").strip()
+            stable_id = str(raw.get("stable_id") or "").strip()
+        else:
+            interface = str(raw or "").strip()
+            stable_id = ""
+        assignment = NetworkRoleAssignment(raw_role, interface, stable_id)
+        before.append(assignment)
+        by_role[raw_role] = assignment
+
+    source = by_role[moved_role].interface
+    by_role[moved_role] = NetworkRoleAssignment(
+        moved_role,
+        target,
+        str(target_stable_id or "").strip(),
+    )
+    after = tuple(by_role[role_name] for role_name in NETWORK_ROLE_ORDER)
+    return NetworkRoleMovePlan(moved_role, source, target, tuple(before), after)
 
 
 def rtsp_host_port(url: str) -> tuple[str, int]:
@@ -731,6 +1015,365 @@ def resolve_nm_interface_address(interface_name: str, host_hints: Iterable[str])
     return None
 
 
+def _nmcli_property(connection_name: str, property_name: str) -> str:
+    nmcli = shutil.which("nmcli")
+    if nmcli is None:
+        raise RuntimeError("nmcli is unavailable")
+    try:
+        result = subprocess.run(
+            [nmcli, "-g", property_name, "connection", "show", connection_name],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=PIXHAWK_NETWORK_COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f"timed out reading NetworkManager {property_name}") from exc
+    if result.returncode != 0:
+        error = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(error or f"nmcli read failed for {connection_name} {property_name}")
+    return (result.stdout or "").strip()
+
+
+def _nmcli_list_property(connection_name: str, property_name: str) -> tuple[str, ...]:
+    output = _nmcli_property(connection_name, property_name)
+    if not output or output == "--":
+        return ()
+    values: list[str] = []
+    for raw in output.replace("\n", ",").split(","):
+        value = raw.strip()
+        if value and value != "--" and value not in values:
+            values.append(value)
+    return tuple(values)
+
+
+def nm_connection_ipv4_routes(connection_id: str) -> tuple[str, ...]:
+    connection_id = str(connection_id).strip()
+    if not connection_id:
+        return ()
+    try:
+        return _nmcli_list_property(connection_id, "ipv4.routes")
+    except (RuntimeError, TimeoutError):
+        return ()
+
+
+def _network_role_connection_name(interface_name: str, stable_id: str) -> str:
+    token = re.sub(r"[^a-zA-Z0-9]+", "", stable_id) or re.sub(
+        r"[^a-zA-Z0-9]+", "-", interface_name
+    ).strip("-")
+    return f"sasl-workstation-{token.lower()}"
+
+
+def _nm_connection_exists(connection_name: str) -> bool:
+    nmcli = shutil.which("nmcli")
+    if nmcli is None:
+        return False
+    try:
+        result = subprocess.run(
+            [nmcli, "-g", "connection.id", "connection", "show", connection_name],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=PIXHAWK_NETWORK_COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    return result.returncode == 0
+
+
+def network_manager_connection_snapshot(
+    interface_name: str,
+    *,
+    stable_id: str = "",
+) -> NetworkManagerConnectionSnapshot:
+    interface_name = str(interface_name).strip()
+    if not interface_name:
+        raise ValueError("interface is empty")
+    active_name = nm_device_connection_name(interface_name)
+    connection_name = active_name or _network_role_connection_name(interface_name, stable_id)
+    exists = bool(active_name) or _nm_connection_exists(connection_name)
+    if not exists:
+        return NetworkManagerConnectionSnapshot(
+            interface=interface_name,
+            connection_name=connection_name,
+            exists=False,
+            active=False,
+        )
+    return NetworkManagerConnectionSnapshot(
+        interface=interface_name,
+        connection_name=connection_name,
+        exists=True,
+        active=active_name == connection_name,
+        addresses=_nmcli_list_property(connection_name, "ipv4.addresses"),
+        routes=_nmcli_list_property(connection_name, "ipv4.routes"),
+        ipv4_method=_nmcli_property(connection_name, "ipv4.method") or "manual",
+        never_default=_nmcli_property(connection_name, "ipv4.never-default") or "no",
+    )
+
+
+def _run_nmcli_mutation(args: Sequence[str]) -> None:
+    nmcli = shutil.which("nmcli")
+    if nmcli is None:
+        raise RuntimeError("nmcli is unavailable")
+    command = [nmcli, *[str(value) for value in args]]
+    if os.geteuid() != 0:
+        pkexec = shutil.which("pkexec")
+        headless_qt = os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen"
+        has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+        if pkexec is None or headless_qt or not has_display:
+            raise PermissionError(
+                "NetworkManager role application requires graphical authorization; "
+                f"run: sudo {' '.join(command)}"
+            )
+        command = [pkexec, *command]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=NETWORK_ROLE_APPLY_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"NetworkManager authorization/apply timed out after "
+            f"{NETWORK_ROLE_APPLY_TIMEOUT_SECONDS:.0f}s"
+        ) from exc
+    if result.returncode != 0:
+        error = (result.stderr or result.stdout or "").strip()
+        if result.returncode in {126, 127}:
+            raise PermissionError(error or "NetworkManager authorization was denied")
+        raise RuntimeError(error or f"nmcli mutation failed with rc={result.returncode}")
+
+
+def _apply_nm_connection_state(
+    snapshot: NetworkManagerConnectionSnapshot,
+    *,
+    addresses: Sequence[str],
+    routes: Sequence[str],
+) -> None:
+    address_text = ", ".join(addresses)
+    route_text = ", ".join(routes)
+    if snapshot.exists:
+        modify_args: list[str] = [
+            "connection",
+            "modify",
+            snapshot.connection_name,
+        ]
+        if addresses and snapshot.ipv4_method in {"disabled", "link-local"}:
+            modify_args.extend(("ipv4.method", "manual"))
+        elif not addresses and snapshot.ipv4_method == "manual":
+            modify_args.extend(("ipv4.method", "disabled"))
+        modify_args.extend(
+            (
+                "ipv4.addresses",
+                address_text,
+                "ipv4.routes",
+                route_text,
+            )
+        )
+        _run_nmcli_mutation(tuple(modify_args))
+        if snapshot.active:
+            _run_nmcli_mutation(("device", "reapply", snapshot.interface))
+        else:
+            _run_nmcli_mutation(
+                ("connection", "up", snapshot.connection_name, "ifname", snapshot.interface)
+            )
+        return
+    if not addresses:
+        return
+    args: list[str] = [
+        "connection",
+        "add",
+        "type",
+        "ethernet",
+        "ifname",
+        snapshot.interface,
+        "con-name",
+        snapshot.connection_name,
+        "ipv4.method",
+        "manual",
+        "ipv4.addresses",
+        address_text,
+        "ipv4.never-default",
+        "yes",
+        "ipv6.method",
+        "ignore",
+        "connection.autoconnect",
+        "yes",
+    ]
+    if routes:
+        args.extend(("ipv4.routes", route_text))
+    _run_nmcli_mutation(tuple(args))
+    _run_nmcli_mutation(
+        ("connection", "up", snapshot.connection_name, "ifname", snapshot.interface)
+    )
+
+
+def _restore_nm_connection_snapshot(snapshot: NetworkManagerConnectionSnapshot) -> None:
+    if not snapshot.exists:
+        if _nm_connection_exists(snapshot.connection_name):
+            _run_nmcli_mutation(("connection", "delete", snapshot.connection_name))
+        return
+    _run_nmcli_mutation(
+        (
+            "connection",
+            "modify",
+            snapshot.connection_name,
+            "ipv4.method",
+            snapshot.ipv4_method,
+            "ipv4.addresses",
+            ", ".join(snapshot.addresses),
+            "ipv4.routes",
+            ", ".join(snapshot.routes),
+            "ipv4.never-default",
+            snapshot.never_default,
+        )
+    )
+    if snapshot.active:
+        _run_nmcli_mutation(("connection", "up", snapshot.connection_name, "ifname", snapshot.interface))
+    elif nm_device_connection_name(snapshot.interface) == snapshot.connection_name:
+        _run_nmcli_mutation(("connection", "down", snapshot.connection_name))
+
+
+def _verify_network_role_profile(
+    snapshot: NetworkManagerConnectionSnapshot,
+    *,
+    desired: NetworkRoleRequirements,
+    delta: NetworkRoleEntryDelta,
+) -> None:
+    missing_addresses = set(desired.addresses) - set(snapshot.addresses)
+    missing_routes = set(desired.routes) - set(snapshot.routes)
+    retained_removed_addresses = set(delta.removed_addresses) & set(snapshot.addresses)
+    retained_removed_routes = set(delta.removed_routes) & set(snapshot.routes)
+    if missing_addresses or missing_routes or retained_removed_addresses or retained_removed_routes:
+        raise RuntimeError(
+            "NetworkManager readback mismatch: "
+            f"missing_addresses={sorted(missing_addresses)} "
+            f"missing_routes={sorted(missing_routes)} "
+            f"retained_removed_addresses={sorted(retained_removed_addresses)} "
+            f"retained_removed_routes={sorted(retained_removed_routes)}"
+        )
+
+
+def _verify_network_role_kernel(interface_name: str, desired: NetworkRoleRequirements) -> None:
+    addresses = _global_ipv4_inventory()
+    actual_ips = {str(address.ip) for address in addresses.get(interface_name, ())}
+    for address_text in desired.addresses:
+        address = _canonical_role_address(address_text, default_prefix=32)
+        if str(address.ip) not in actual_ips:
+            raise RuntimeError(
+                f"kernel readback missing {address.ip} on {interface_name}"
+            )
+    for route_text in desired.routes:
+        parts = route_text.split()
+        peer = parts[0].split("/", 1)[0]
+        source = next(
+            (part.split("=", 1)[1] for part in parts[1:] if part.startswith("src=")),
+            "",
+        )
+        evidence = pixhawk_route_evidence(peer, requested_source=source)
+        state = evidence.status_for(interface_name, source)
+        if state != "ROUTE OK":
+            raise RuntimeError(evidence.summary_for(interface_name, source))
+
+
+def apply_network_role_transaction(
+    requests: Sequence[NetworkRoleInterfaceRequest],
+) -> tuple[NetworkRoleInterfaceResult, ...]:
+    """Apply target-first role deltas and restore exact snapshots on failure."""
+
+    if not requests:
+        return ()
+    seen: set[str] = set()
+    for request in requests:
+        if not request.interface or request.interface in seen:
+            raise ValueError(f"duplicate/empty role transaction interface: {request.interface}")
+        seen.add(request.interface)
+
+    snapshots = {
+        request.interface: network_manager_connection_snapshot(
+            request.interface, stable_id=request.stable_id
+        )
+        for request in requests
+    }
+    deltas: dict[str, NetworkRoleEntryDelta] = {}
+    touched: list[NetworkManagerConnectionSnapshot] = []
+    results: list[NetworkRoleInterfaceResult] = []
+    try:
+        for request in requests:
+            before = snapshots[request.interface]
+            adoptable_addresses = set(request.adoptable_before.addresses) | set(
+                request.desired.addresses
+            )
+            adoptable_routes = set(request.adoptable_before.routes) | set(
+                request.desired.routes
+            )
+            effective_owned = NetworkRoleOwnedEntries(
+                _ordered_union(
+                    request.owned_before.addresses,
+                    (
+                        value
+                        for value in before.addresses
+                        if value in adoptable_addresses
+                    ),
+                ),
+                _ordered_union(
+                    request.owned_before.routes,
+                    (
+                        value for value in before.routes if value in adoptable_routes
+                    ),
+                ),
+            )
+            delta = network_role_entry_delta(
+                current_addresses=before.addresses,
+                current_routes=before.routes,
+                owned_before=effective_owned,
+                desired=request.desired,
+            )
+            deltas[request.interface] = delta
+            needs_apply = bool(
+                delta.added_addresses
+                or delta.added_routes
+                or delta.removed_addresses
+                or delta.removed_routes
+                or (request.desired.addresses and not before.active)
+            )
+            if needs_apply:
+                touched.append(before)
+                _apply_nm_connection_state(
+                    before,
+                    addresses=delta.addresses_after,
+                    routes=delta.routes_after,
+                )
+            after = network_manager_connection_snapshot(
+                request.interface, stable_id=request.stable_id
+            )
+            _verify_network_role_profile(after, desired=request.desired, delta=delta)
+            results.append(
+                NetworkRoleInterfaceResult(
+                    request.interface,
+                    after.connection_name,
+                    request.desired,
+                    delta.owned_after,
+                    after.addresses,
+                    after.routes,
+                )
+            )
+        for request in requests:
+            _verify_network_role_kernel(request.interface, request.desired)
+        return tuple(results)
+    except Exception as exc:
+        rollback_errors: list[str] = []
+        for snapshot in reversed(touched):
+            try:
+                _restore_nm_connection_snapshot(snapshot)
+            except Exception as rollback_exc:
+                rollback_errors.append(f"{snapshot.interface}: {rollback_exc}")
+        detail = f"; rollback incomplete: {' | '.join(rollback_errors)}" if rollback_errors else ""
+        raise RuntimeError(f"network role transaction failed: {exc}{detail}") from exc
+
+
 def interface_addresses(interface_name: str) -> str:
     try:
         result = subprocess.run(
@@ -910,6 +1553,76 @@ def _wired_link_inventory() -> list[dict[str, object]]:
             }
         )
     return links
+
+
+def network_interface_stable_id(interface_name: str) -> str:
+    """Return MAC, then device path, then a name-scoped fallback for one NIC."""
+
+    interface_name = str(interface_name).strip()
+    try:
+        inventory = _wired_link_inventory()
+    except (RuntimeError, TimeoutError):
+        inventory = []
+    for row in inventory:
+        if str(row.get("interface") or "") != interface_name:
+            continue
+        mac = str(row.get("mac") or "").strip().lower()
+        if mac:
+            return mac
+        device_path = str(row.get("device_path") or "").strip()
+        if device_path:
+            return device_path
+    return f"name:{interface_name}"
+
+
+def candidate_stable_id(candidate: Mapping[str, object]) -> str:
+    """Return the MAC-first identity carried by one discovered NIC candidate row.
+
+    Kernel interface names are not stable across replug or reboot, so the row's
+    own MAC is the identity contract.  The inventory lookup is only a fallback
+    for rows that predate MAC capture.
+    """
+
+    mac = str(candidate.get("mac") or "").strip().lower()
+    if mac:
+        return mac
+    device_path = str(candidate.get("device_path") or "").strip()
+    if device_path:
+        return device_path
+    return network_interface_stable_id(str(candidate.get("interface") or ""))
+
+
+def normalize_stable_id(value: object) -> str:
+    """Fold one stored or discovered stable id for comparison only."""
+
+    return str(value or "").strip().lower()
+
+
+def candidate_matches_stable_id(candidate: Mapping[str, object], stable_id: object) -> bool:
+    """Compare a discovered row against a stored identity without probing the host.
+
+    Only fields the row already carries are considered, so this is safe to call
+    from a UI refresh.  A row with no identity fields never matches, which lets
+    callers fall back to kernel-name comparison.
+    """
+
+    wanted = normalize_stable_id(stable_id)
+    if not wanted:
+        return False
+    for key in ("mac", "device_path"):
+        value = normalize_stable_id(candidate.get(key))
+        if value and value == wanted:
+            return True
+    interface_name = str(candidate.get("interface") or "").strip()
+    return bool(interface_name) and wanted == normalize_stable_id(f"name:{interface_name}")
+
+
+def candidate_has_stable_identity(candidate: Mapping[str, object]) -> bool:
+    """Report whether a discovered row carries a name-independent identity."""
+
+    return any(
+        normalize_stable_id(candidate.get(key)) for key in ("mac", "device_path")
+    )
 
 
 def _global_ipv4_inventory() -> dict[str, list[IPv4Interface]]:

@@ -770,7 +770,7 @@ def test_shutdown_deadline_force_terminates_an_unresponsive_worker(monkeypatch) 
         blocked_thread=Thread(),
         _log=lambda message: calls.append(message),
     )
-    monkeypatch.setattr(app_lifecycle_controller.time, "monotonic", lambda: 23.0)
+    monkeypatch.setattr(app_lifecycle_controller.time, "monotonic", lambda: 40.1)
 
     assert app_lifecycle_controller.AppLifecycleController(panel).shutdown_for_close() is False
     assert "terminate" in calls
@@ -792,7 +792,7 @@ def test_shutdown_preserves_camera_eos_window_beyond_old_five_second_deadline(
         def run(self) -> bool:
             # Model an MP4 EOS/finalization ACK arriving eight seconds after
             # the first close request: later than the historical 5 s global
-            # deadline, but within the declared 9 s EOS/12 s camera window.
+            # deadline, but within the declared bounded camera-finalization window.
             return clock[0] >= 108.0
 
     panel = SimpleNamespace(
@@ -805,8 +805,8 @@ def test_shutdown_preserves_camera_eos_window_beyond_old_five_second_deadline(
     monkeypatch.setattr(app_lifecycle_controller.time, "monotonic", lambda: clock[0])
 
     assert yolo_stream.GST_RECORDING_EOS_TIMEOUT_S == pytest.approx(9.0)
-    assert camera_pane.CAMERA_STOP_COOPERATIVE_WAIT_MS == 12_000
-    assert app_lifecycle_controller.SHUTDOWN_DEADLINE_S >= 12.0
+    assert camera_pane.CAMERA_STOP_COOPERATIVE_WAIT_MS == 30_000
+    assert app_lifecycle_controller.SHUTDOWN_DEADLINE_S >= 30.0
     assert controller.shutdown_for_close() is False
     clock[0] = 106.0
     assert controller.shutdown_for_close() is False
@@ -819,7 +819,7 @@ def test_shutdown_preserves_camera_eos_window_beyond_old_five_second_deadline(
 def test_shutdown_deadline_is_measured_from_late_camera_stop_request(monkeypatch) -> None:
     from Workstation import app_lifecycle_controller
 
-    clock = [113.0]
+    clock = [135.9]
     forced: list[float] = []
     panel = SimpleNamespace(
         _shutdown_coordinator=SimpleNamespace(run=lambda: False),
@@ -834,9 +834,9 @@ def test_shutdown_deadline_is_measured_from_late_camera_stop_request(monkeypatch
 
     assert controller.shutdown_for_close() is False
     assert forced == []
-    clock[0] = 118.1
+    clock[0] = 136.1
     assert controller.shutdown_for_close() is False
-    assert forced == [118.1]
+    assert forced == [136.1]
 
 
 def test_shutdown_auxiliary_gate_includes_active_oz_capture_thread() -> None:
@@ -922,7 +922,7 @@ def test_forced_shutdown_does_not_close_data_store_or_claim_success_for_stuck_ch
         append_workstation_data=lambda *_args, **_kwargs: True,
         _log=calls.append,
     )
-    clock = [13.0]
+    clock = [30.1]
     monkeypatch.setattr(app_lifecycle_controller.time, "monotonic", lambda: clock[0])
 
     assert app_lifecycle_controller.AppLifecycleController(panel).shutdown_for_close() is False
@@ -933,7 +933,7 @@ def test_forced_shutdown_does_not_close_data_store_or_claim_success_for_stuck_ch
     report = panel._shutdown_resource_report
     assert report["complete"] is False
     assert "camera-child:left" in report["live_processes"]
-    clock[0] = 21.0
+    clock[0] = 40.1
     assert app_lifecycle_controller.AppLifecycleController(panel).shutdown_for_close() is False
     assert "kill-child" in calls
     assert "terminate-camera-thread" not in calls
@@ -1001,7 +1001,7 @@ def test_forced_shutdown_reports_clean_mock_resources_before_success(monkeypatch
         append_workstation_data=lambda *_args, **_kwargs: True,
         _log=lambda _message: None,
     )
-    monkeypatch.setattr(app_lifecycle_controller.time, "monotonic", lambda: 13.0)
+    monkeypatch.setattr(app_lifecycle_controller.time, "monotonic", lambda: 30.1)
 
     assert app_lifecycle_controller.AppLifecycleController(panel).shutdown_for_close() is True
     assert panel._shutdown_resource_report["complete"] is True

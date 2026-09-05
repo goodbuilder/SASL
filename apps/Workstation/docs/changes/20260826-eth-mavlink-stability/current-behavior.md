@@ -96,3 +96,72 @@
 - 공식 PX4 issue `#25956`은 high UDP traffic에서 NuttX readahead queue/IOB 고갈로 blocking
   `sendto()`가 멈추며 restart만 복구하는 동일 계열 증상을 기록한다. 현재 장비의 stack trace는
   Stock SERIAL_CONTROL shell 제약으로 얻지 못했으므로 "고신뢰 추정"으로 표현해야 한다.
+
+## 2026-08-31 P1 IMU stream delivery boundary
+
+- Workstation PID `7231`가 P1/P2 UDP `14550/14551`을 단독 소유하고 양쪽 HB/ATT는 `LIVE`였다.
+- 독립 8초 P1 wire decode는 `ATTITUDE=107`이지만 `SCALED_IMU/2/3=0`, `RAW_IMU=0`이었다.
+  같은 코드/호스트의 P2 6초 decode는 `SCALED_IMU/2/3=102/102/102`여서 공통 parser/UI
+  결함이 아니라 P1 side command/delivery 경계로 분류한다.
+- P1은 `10.0.0.2:14550 -> 10.0.0.255:14550` broadcast telemetry를 계속 보냈지만 host
+  neighbor는 `10.0.0.2 INCOMPLETE`, ping은 100% loss였다. P1-only Disconnect/Connect capture에도
+  host `HEARTBEAT`와 `MAV_CMD_SET_MESSAGE_INTERVAL`은 wire에 0개였다.
+- P1 USB read-only inventory는 `sysid=1/component=1`, PX4/NuttX `1.17.0/11.0.0`, Ethernet
+  instance UDP `14550`, broadcast enabled를 확인했다. `ifconfig eth0`/`netman show`는
+  `10.0.0.2/24`, router `10.0.0.10`, MAC `1e:1e:b3:a4:ff:b5`를 보고했다.
+- USB shell에서 Ethernet instance에 runtime-only `mavlink stream -u 14550 -s
+  SCALED_IMU{,2,3} -r 20`을 보낸 뒤 `mavlink status streams`가 세 stream을 20 Hz로
+  확인했다. 이후 독립 6초 wire decode는 각 stream `102`개(약 17 Hz)를 확인했다.
+- Workstation의 기존 decoder/model/UI가 이 실제 packet을 소비해 P1 `IMU stream 1/2/3`
+  모두 `LIVE`, age `0.00–0.05 s`, 실시간 xmag/ymag/zmag 값으로 표시했다.
+- 이 명령은 parameter/config/file을 저장하지 않는 process/boot-local 복구다. P1 reboot 뒤
+  Ethernet command path와 automatic Stock profile이 정상 작동하는지는 아직 검증되지 않았다.
+
+## 2026-08-31 P1 USB-free persistence and cable-swap boundary
+
+- Operator-approved verified USB reboot reset P1 `ATTITUDE.time_boot_ms` from about `3,474,164` to
+  `3,579` ms. Workstation correctly projected only P1 as `RECOVERING`; P2 remained `LIVE`.
+- After reboot, P1 resumed broadcast heartbeat/ATTITUDE over Ethernet but emitted zero
+  `SCALED_IMU/2/3`. The host neighbor for `10.0.0.2` remained `INCOMPLETE` and P1 did not answer
+  ping or ARP. P2 continued to answer both.
+- A temporary operator-authorized static neighbor used P1's observed source MAC
+  `1e:1e:b3:a4:ff:b5`. This put Workstation GCS heartbeat, the full 15-command Stock profile, and
+  bounded `SCALED_IMU/2/3` retries onto the Ethernet wire to P1. P1 returned no `COMMAND_ACK` and
+  no IMU message.
+- USB `mavlink status` independently showed P1 Ethernet instance #1 receiving only self-originated
+  `sysid=1/component=1`; external GCS `255/190` was absent. Default Ethernet stream inventory had no
+  `SCALED_IMU*`. Thus the failed post-boot profile was not a host encoder/socket/UI failure.
+- Runtime `ifdown eth0` then `ifup eth0` did not repair RX (`ifup ... Failed`) and stopped P1
+  broadcast telemetry. A second verified USB reboot restored the original broadcast telemetry.
+- Verified USB runtime stream commands restored `SCALED_IMU/2/3`; subsequent telemetry data was
+  received over Ethernet at about 20 Hz. The temporary static neighbor was removed afterward.
+- Operator swapped only the P1/P2 Ethernet cable/port branches. The 180-second independent capture
+  recorded P1 ARP requests/replies `147/0` and P2 `5/5`; the fault stayed with `10.0.0.2`/P1 rather
+  than following the cable or switch port. This localizes the remaining boundary to P1's board-side
+  PHY/driver/NuttX RX path.
+- Current operational state was restored: P1/P2 and both cameras `LIVE`; P1 remains unable to
+  receive host Ethernet commands or RTCM, so USB-free recovery is not supported by this hardware
+  state even though P1 telemetry data can be received over Ethernet after USB stream activation.
+
+## 2026-08-31 official stock reflash and P2 comparison
+
+- P1 was reinstalled with the repository-pinned official v1.17.0 FMUv6X image after bootloader
+  `board_id=53` validation. Erase/program/verify/reboot passed without force options; all P1
+  `MAV_2_*`, netman, extras and parameter storage readbacks survived.
+- Reflash did not restore inbound Ethernet. Before USB stream activation, an 89.049-second capture
+  had P1 heartbeat `87`, ATTITUDE `1,299`, and `SCALED_IMU/2/3=0/0/0`; P1 ARP remained `90/0` while
+  P2 was `5/5`.
+- P1 static ARP lookup/insertion returned `no such entry` and then `ioctl failed: Out of memory`
+  despite 498,080 bytes free heap, a 420,608-byte largest block, and only 1,024/5,120 DMA bytes used.
+  The official v6X NuttX defconfig has `CONFIG_IOB_NBUFFERS=24`.
+- P1 Ethernet MAVLink reported RX `4,313 B/s`, loss `126.9%`, and only self `sysid=1`; P2 on the
+  same PX4 git hash and matching `MAV_2_CONFIG/BROADCAST/RATE` reported RX `38.9 B/s`, loss `0.1%`,
+  external GCS `sysid=255`, and a valid PC ARP entry. P2 therefore disproves a shared firmware or
+  primary parameter cause.
+- Physical board damage is not yet proven. The remaining P1-specific explanations are PHY/MAC RX
+  failure, NuttX IOB/ARP exhaustion associated with self-received traffic, or P1-specific duplicate
+  network initialization state. Boot evidence showed `ifup eth0` twice and more persistent
+  `netinit` tasks on P1 than P2.
+- A separate 619.397-second P1 capture proved stable outbound transport: 32,034 consecutive MAVLink2
+  packets, no duplicate/missing/reorder, ATTITUDE 15 Hz, GPS1 5 Hz, GPS2 1 Hz, heartbeat 1 Hz, and
+  no all-RX stall. GNSS content remained `NO_FIX` (`fix_type=0`, satellites `0`, zero lat/lon).

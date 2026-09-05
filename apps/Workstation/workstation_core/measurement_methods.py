@@ -13,6 +13,7 @@ from typing import Iterable, Mapping, Sequence
 
 
 PIXHAWK_RTK_LIVE = "pixhawk_rtk_live"
+PIXHAWK_RP_GPS_BASELINE_YAW = "pixhawk_rp_gps_baseline_yaw"
 CHECKERBOARD_STEREO = "checkerboard_stereo"
 HORIZON_HYBRID = "horizon_hybrid"
 MOUNTAIN_GNSS = "mountain_gnss"
@@ -23,6 +24,7 @@ COMBINED_HYBRID = "combined_hybrid"
 
 MEASUREMENT_METHOD_IDS: tuple[str, ...] = (
     PIXHAWK_RTK_LIVE,
+    PIXHAWK_RP_GPS_BASELINE_YAW,
     CHECKERBOARD_STEREO,
     HORIZON_HYBRID,
     MOUNTAIN_GNSS,
@@ -47,6 +49,7 @@ MEASUREMENT_FILL_LIVE_GNSS = "live_gnss"
 
 MEASUREMENT_METHOD_LABELS: Mapping[str, str] = {
     PIXHAWK_RTK_LIVE: "Pixhawk attitude + GPS/RTK",
+    PIXHAWK_RP_GPS_BASELINE_YAW: "Pixhawk R/P + GPS baseline yaw (90°)",
     CHECKERBOARD_STEREO: "Checkerboard stereo R,t",
     HORIZON_HYBRID: "Horizon R/P + live Pixhawk/GNSS",
     MOUNTAIN_GNSS: "Mountain + GNSS",
@@ -61,6 +64,12 @@ MEASUREMENT_METHOD_REQUIRED_INPUTS: Mapping[str, tuple[str, ...]] = {
         "exact operating K,D",
         "fresh left/right Pixhawk attitude",
         "usable P1→P2 GNSS NED baseline",
+    ),
+    PIXHAWK_RP_GPS_BASELINE_YAW: (
+        "exact operating K,D",
+        "left/right Pixhawk Roll/Pitch",
+        "usable P1→P2 GNSS NED baseline",
+        "P1/P2 Pixhawk yaw reference or persistent Reverse branch",
     ),
     CHECKERBOARD_STEREO: (
         "exact operating K,D",
@@ -95,6 +104,7 @@ MEASUREMENT_METHOD_REQUIRED_INPUTS: Mapping[str, tuple[str, ...]] = {
 
 MEASUREMENT_METHOD_MISSING_INSTANCE_REASONS: Mapping[str, str] = {
     PIXHAWK_RTK_LIVE: "live Pixhawk/RTK method status unavailable",
+    PIXHAWK_RP_GPS_BASELINE_YAW: "live Pixhawk R/P or GPS baseline yaw branch unavailable",
     CHECKERBOARD_STEREO: "checkerboard method status unavailable",
     HORIZON_HYBRID: "no Horizon candidate or compatible loaded profile",
     MOUNTAIN_GNSS: "no Mountain + GNSS candidate or compatible loaded profile",
@@ -351,6 +361,7 @@ __all__ = [
     "MOUNTAIN_GNSS",
     "MeasurementMethodStatus",
     "PIXHAWK_RTK_LIVE",
+    "PIXHAWK_RP_GPS_BASELINE_YAW",
     "TERRAIN_PNP",
     "choose_ready_measurement_method",
     "compatible_measurement_fill_source",

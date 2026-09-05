@@ -11,13 +11,33 @@ Pixhawk's MAVLink ATTITUDE yaw in a read-only `Baseline−P1`/`Baseline−P2` vi
 degrees and north-referenced top view make the two board directions directly observable while
 retaining raw NED, body-FRD, source, fix, age, and pair-time evidence separately.
 
-As of 2026-08-29, Measurement is an observation interval rather than a package-completion
-transaction. There is no Create, Open, Close, Finalize, Seal, recovery, completeness, source-
-readiness, media-integrity, or storage gate before a Measurement can start. Pressing `측정 시작`
-freezes a new run identity/time and immediately enters `RUNNING`, including with zero available
-sources. Camera, P1/P2, Base GNSS/NTRIP, Target and recording join or leave independently.
-Persisted data never owns admission. An old open or recoverable Session directory is inert
-historical data and cannot disable `측정 시작`.
+The same Pixhawk page also shows `Dr from Baseline Center`, `Dr from P1`, and `Dr from P2`
+as `F/R/D/Rg` metre values. `Dr` means Drone Pixhawk; the three rows explicitly identify the
+GNSS midpoint local-level FRD, P1 body-FRD, and P2 body-FRD frames. It separately reports the
+horizontal internal angles `∠Dr-P1-P2` and `∠Dr-P2-P1` in degrees. These are latest-state,
+read-only aids: the angles use only horizontal North/East data, while missing/stale GNSS or
+ATTITUDE remains visible as `WAITING`/`STALE` and no derived geometry is persisted.
+
+The same `Devices > Pixhawk` page shows `RAW yaw°` and `Corrected yaw°` beside each visible
+IMU/CAN magnetometer row. RAW is the signed `atan2(-y,x)` diagnostic in the producer sensor axes
+with no calibration, sensor rotation, board rotation, or tilt correction. Corrected yaw applies
+the manually read-back `CAL_MAG` transformation and shows `PARAM 대기` until that readback exists.
+PX4 yaw/Δ remain diagnostic read-model fields rather than operator-table columns. PX4 yaw is the current
+firmware `ATTITUDE.yaw` reference only when the row's exact device ID matches the active
+`vehicle_magnetometer` device and ATTITUDE is fresh; unmatched or identity-free rows show an
+explicit waiting/non-selected state. The same page also exposes independent P1/P2 `MAG Priority /
+active selection` controls for `BOARD`, `CAN1`, `CAN2`, `GPS1_MAG`, and `GPS2_MAG`. `Apply & Verify`
+requires Disarm, verifies the CAL_MAG PARAM readback, then waits for a post-apply
+`vehicle_magnetometer.device_id` and fresh ATTITUDE. A live-Pixhawk Measurement is blocked until
+each required side reaches `ACTIVE VERIFIED`; non-live-Pixhawk methods retain their existing gate.
+The Advanced PX4 MAG controls remain as a fallback.
+
+Measurement remains an observation interval rather than a package-completion transaction. There is
+still no storage/completeness gate before a Measurement can start, but a selected method that
+consumes live Pixhawk evidence now requires the independent per-side MAG active-selection check
+above. Pressing `측정 시작` freezes a new run identity/time and records the verified MAG selection
+provenance; camera, Base GNSS/NTRIP, Target and recording continue to follow their existing
+method-specific lifecycle.
 After an abnormal process exit, restart likewise leaves the incomplete run as inert append-only
 history and creates a new runtime generation only when the operator presses `측정 시작` again.
 
@@ -102,7 +122,9 @@ Before physical baseline/Roll/Pitch/Yaw alignment, open `Devices > Pixhawk` and 
 `Baseline−P1` and `Baseline−P2` signed values and top-view arrows. `+` means the P1→P2
 bearing is clockwise/right of that Pixhawk's Forward direction; `-` means
 counter-clockwise/left. `CURRENT/PARTIAL/STALE/WAITING` describes input freshness only and is not
-an alignment pass/fail verdict.
+an alignment pass/fail verdict. In the following `Drone Pixhawk geometry` group, read the three
+`Dr from ...` `F/R/D/Rg` rows and the two separately named horizontal angles. The vector direction
+is reference→Dr; `D` in the vector header means Down, and `Dr` in the point labels means Drone.
 
 Each manual `Connect cameras` request performs one WIRIS discovery, activation, and RTSP-frame
 verification attempt. A failed request does not retry the same camera IP in the background; press
@@ -162,7 +184,8 @@ at most once per side every five seconds; exact frame/packet/byte/failure counte
 unthrottled in their owning status surfaces.
 
 Camera Preview uses the persisted H.264 decoder mode. The supported field default is `Auto`: when
-the NVIDIA driver and GStreamer `nvh264dec` element are both usable, Auto requests NVDEC first.
+the NVIDIA driver, CUDA Driver API (`cuInit(0)`), and GStreamer `nvh264dec` element are all usable,
+Auto requests NVDEC first.
 `PLAYING` and decoder status text remain candidate evidence; only a decoded frame carrying the
 pane's current stream generation makes that side `GPU · nvh264dec`. A classified NVDEC launch or
 decoder-health failure records a side-specific software override and reason. Preview-only fallback
@@ -669,6 +692,23 @@ python3 tools/check_portable_paths.py
   `Baseline−Pn=wrap180(azimuth−Pn yaw)`, and `P2−P1 yaw`. Compass angles use North=0° and
   clockwise-positive; signed values use `[-180°,180°)`. The view keeps per-source age/fix/pair
   delta and never rewrites raw NED, P1 body FRD, camera RDF, or measurement coordinates.
+- `drone_pixhawk_geometry()` is a read-only latest-state interface over selected P1/P2 GNSS,
+  Drone GNSS, and P1/P2 ATTITUDE. It reports midpoint→Dr in
+  `gnss_baseline_center_local_level_frd`, P1→Dr in P1 `px4_frd`, and P2→Dr in P2 `px4_frd`,
+  each as `F/R/D/Rg` metres. `∠Dr-P1-P2` and `∠Dr-P2-P1` are independent unsigned internal
+  angles from horizontal North/East vectors only; they do not use Down or yaw, add no global
+  status key, and do not change Measurement semantics or persistence.
+- `magnetometers()` and `can_magnetometers()` add read-only `raw_yaw_deg`, `px4_yaw_deg`, and
+  `delta_yaw_deg` projections. `magnetometers_for_imu_view()` keeps the three standard
+  `SCALED_IMU*` rows and appends the existing stable-firmware `DEBUG_VECT` `CAN1_MAG`/`CAN2_MAG`
+  RM3100 rows; it never relabels RM3100 data as `SCALED_IMU`. The raw value is producer-axis
+  `atan2(-y,x)`; the PX4 value is correlated only on exact active device identity plus fresh
+  ATTITUDE, so a standard `SCALED_IMU*` row without a physical device ID does not receive a
+  copied estimator value. Stable PX4 additionally supplies RM3100 rows through the bounded PX4
+  Shell `listener sensor_mag` readback path; those rows retain a
+  `px4-shell/sensor_mag/<instance>` topic and are never relabelled as MAVLink `DEBUG_VECT`. The
+  selected-device gate reads `listener vehicle_magnetometer -n 1` through the same exclusive Shell
+  owner.
 - The approved patched v6X custom firmware is
   `firmware/px4_fmu-v6x_sasl_can_mag/px4_fmu-v6x_default.px4`, with SHA-256
   `3ef5736aabdaec9047cf97b0cd5eefa2cfc074672c3ae43776c3f0e12d2349ce`. It retains the custom
@@ -851,6 +891,16 @@ python3 tools/check_portable_paths.py
 
 ## Operational Rules
 
+- Read `RAW yaw°` as a sensor-axis diagnostic, not a calibrated compass heading. Read `PX4 yaw°`
+  as the firmware estimator reference for the verified active MAG; `Δyaw°` is
+  `PX4−RAW` wrapped to `[-180°,180°)`. `미선택`, `ID 확인 대기`, `STALE`, and `대기` are
+  intentional evidence states, not zero values or alignment verdicts.
+
+- To change a runtime MAG before a live-Pixhawk Measurement, open `Devices > Pixhawk`, choose the
+  P1 or P2 side independently, set the logical MAG priorities, and press `Apply & Verify`. Do not
+  treat PARAM readback alone as success: wait for `ACTIVE VERIFIED`. Save/Reboot remains a separate
+  explicit operation and is not required for an immediate runtime experiment.
+
 - Treat `Baseline−P1` and `Baseline−P2` as separate horizontal observations. A positive value
   means P1→P2 lies right/clockwise of that board's Forward direction. Do not interpret
   `CURRENT` as physical-alignment acceptance: the UI intentionally has no target angle or
@@ -864,9 +914,10 @@ python3 tools/check_portable_paths.py
   command state or changes the active calibration.
 
 - Camera Preview defaults to RTSP TCP with Auto decoder. Auto uses `nvh264dec` only when its
-  factory can be created and `nvidia-smi` confirms a working driver; otherwise it reports WARN and
-  starts with mandatory `avdec_h264`. A direct NVDEC element/health failure, or a 30-second decoded
-  first-frame/stall timeout while RTP input remains current, may authorize one software fallback.
+  factory can be created, `nvidia-smi` confirms a working driver, and CUDA `cuInit(0)` succeeds;
+  otherwise it reports WARN and starts with mandatory `avdec_h264`. A direct NVDEC element/health
+  failure, or a 30-second decoded first-frame/stall timeout while RTP input remains current, may
+  authorize one software fallback.
   RTSP/source/parser and MP4 mux/filesink failures retain their own error class and never trigger a
   decoder change. Explicit `NVIDIA` has no software fallback.
 - Decoder fallback ownership is per side. Preview-only fallback restarts only the failed side and
@@ -961,8 +1012,9 @@ python3 tools/check_portable_paths.py
   shows `PARAM SYNC` with detail `PX4 파라미터 조회 중 (정상)` instead of falsely reporting
   `STALE` or `DISCONNECTED`. Nonmatching ATTITUDE/GPS messages consumed by the blocking PARAM or
   shell receive path are deferred and replayed through the normal handler after the reservation;
-  they are not discarded. P1/P2 remain independent, and identical receive errors are reported at
-  most once per second per side.
+  they are not discarded. Stable-PX4 RM3100 polling uses a distinct `SHELL SYNC` status with
+  detail `PX4 Shell sensor_mag 조회 중 (정상)` and is not presented as parameter lookup. P1/P2
+  remain independent, and identical receive errors are reported at most once per second per side.
 - Pixhawk connect and disconnect operations are mutually exclusive. Their P1/P2 buttons are
   disabled while either worker owns the subscriber; rapid repeated clicks cannot start an
   overlapping socket transition or publish a connected label for a closed transport.
@@ -1274,6 +1326,28 @@ python3 tools/check_portable_paths.py
 
 ## Known Limitations and Workarounds
 
+### Magnetometer RAW/PX4 yaw is an observation aid
+
+`RAW yaw°` uses the raw producer-axis vector and `atan2(-y,x)` only. It does not apply
+`CAL_MAG` correction, sensor/board rotation, tilt compensation, magnetic declination, or PX4
+estimator fusion. `PX4 yaw°` is the firmware `ATTITUDE.yaw` value after PX4's own selected-sensor
+processing, but it is shown beside a row only when that row's exact device ID matches the active
+`vehicle_magnetometer` identity and its ATTITUDE sample is fresh. Standard `SCALED_IMU*` telemetry
+does not carry that physical device ID, so its corrected cell may remain `ID 확인 대기` even when
+RAW yaw is available.
+
+The IMU magnetometer table also contains RM3100 rows sourced from `DEBUG_VECT` names
+`CAN1_MAG`/`CAN2_MAG` or from Stable PX4 Shell `listener sensor_mag` readback. Shell rows retain
+the `px4-shell/sensor_mag/<instance>` topic and Gauss unit, and use the same RAW/PX4 yaw gates as
+the dedicated CAN table. Shell polling is diagnostic-rate and bounded; timeout or malformed output
+ages the last sample instead of fabricating a live MAVLink value. PX4 shell
+`listener vehicle_magnetometer -n 1` provides the active device identity for the PX4 yaw gate.
+
+Workaround: when comparing a priority A/B test, change one `CAL_MAG*_PRIO` through the existing
+disarmed workflow, verify `Actual selected MAG`/`vehicle_magnetometer.device_id`, and use the
+fresh `PX4 yaw°` value as the estimator result. Do not interpret a stale or fallback row as proof
+that the requested MAG was used.
+
 ### Baseline−P1/P2 is a latest-state physical-alignment aid
 
 The Pixhawk view combines the latest selected P1/P2 GNSS positions and latest independent
@@ -1285,6 +1359,20 @@ Workaround: use the view while the assembly is stationary or moving slowly and r
 source evidence. For offline reconstruction, join the existing `pixhawk_attitude` rows
 (yaw/quaternion and app/PX4 timestamps) with `gps_rtk` rows (receiver role, WGS84 position, fix and
 timestamps) and apply the documented formula. No additional derived-angle field is persisted.
+
+### Dr/P1/P2 geometry is a latest-state GNSS aid
+
+The Pixhawk geometry group uses the latest selected P1/P2 rover positions, the latest Drone GNSS
+position, and the latest P1/P2 ATTITUDE samples at the existing UI poll. `Dr from P1/P2` means
+reference→Drone expressed in that Pixhawk's body-FRD frame; `Dr from Baseline Center` uses the
+GNSS antenna-midpoint local-level FRD frame. The two displayed angles are `∠Dr-P1-P2` and
+`∠Dr-P2-P1`, calculated from horizontal North/East rays only, so they are not 3D angles or
+Pixhawk-yaw alignment verdicts. The streams are not interpolated or made simultaneous, and no
+derived vector/angle row is written to the existing evidence files.
+
+Workaround: require `CURRENT` source evidence before using the values for physical inspection.
+If a P1/P2 attitude is missing, only that board's body-FRD row is unavailable; restore the
+existing board connection/ATTITUDE source and let the read-only group refresh.
 
 ### NVIDIA NVDEC unavailable after `s2idle` resume — observed 2026-08-29
 
@@ -1317,6 +1405,9 @@ The post-fault symptoms are intentionally explicit:
 
 - `nvidia-smi` can still identify the GPU through the management interface, but reports
   `GPU Recovery Action: Reboot`; this is not proof that CUDA/NVDEC can create a context.
+- Workstation now checks the CUDA Driver API directly with `cuInit(0)` as part of the startup
+  capability gate. A `nvidia-smi` success combined with `CUDA_ERROR_UNKNOWN (999)` is reported as
+  NVIDIA unavailable and deterministically selects the existing Auto→`avdec_h264` path.
 - Loading GStreamer's installed `nvcodec` plugin fails CUDA initialization with `0x64`
   (`CUDA_ERROR_NO_DEVICE=100`). The plugin consequently registers no usable `nvh264dec` factory,
   and `gst-inspect-1.0 nvh264dec` reports `No such element or plugin`.
@@ -1686,6 +1777,39 @@ frozen Mountain image.
 
 ## Change Log
 
+- 2026-09-04: The Pixhawk IMU magnetometer table now keeps the three standard `SCALED_IMU*`
+  rows and appends RM3100 `CAN1_MAG`/`CAN2_MAG` rows received through stable-firmware
+  `DEBUG_VECT`. RM3100 keeps its `mavlink/DEBUG_VECT` topic, Gauss unit, and the same RAW/PX4
+  yaw correlation rules; no private `SASL_CAN_MAG` stream request was added.
+
+- 2026-09-04: Added per-row Pixhawk magnetometer `RAW yaw°`, exact active-device `PX4 yaw°`, and
+  wrapped `Δyaw°` readouts for IMU/CAN Magn telemetry. RAW remains explicitly sensor-axis
+  diagnostic; PX4 yaw is shown only for a fresh ATTITUDE sample matched to the verified active
+  device, with no priority, firmware, stream, persistence, or measurement semantic change.
+
+- 2026-09-05: Stable PX4 RM3100 readback now polls `listener sensor_mag` and
+  `listener vehicle_magnetometer` through the existing exclusive MAVLink Shell owner. The five
+  fixed rows per Pixhawk keep raw/PX4/Δyaw provenance and do not require custom firmware.
+
+- 2026-09-05: Added independent P1/P2 MAG Priority controls to `Devices > Pixhawk`. Runtime apply
+  now has a visible active-device/fresh-ATTITUDE verification state, and live-Pixhawk Measurement
+  start records the verified MAG selection and blocks unverified required sides.
+
+- 2026-09-05: MAG Priority cards now retain the live stable-PX4 `sensor_mag` instance/device map
+  and show the priority candidate beside the actual `vehicle_magnetometer` device. Priority
+  controls remain editable, including CAN2 when it is outside the stock selector range; no
+  automatic topology, slot, or calibration mutation is introduced.
+
+- 2026-09-04: Added the read-only Pixhawk `Dr from Baseline Center`, `Dr from P1`, and
+  `Dr from P2` F/R/D/Rg geometry rows plus separate horizontal `∠Dr-P1-P2` and
+  `∠Dr-P2-P1` values. Dr/P1/P2 vector frames, source age, WAITING/STALE behavior, and the
+  no-persistence/no-yaw/no-3D contract are explicit; existing baseline/yaw and measurement
+  semantics remain unchanged.
+
+- 2026-09-04: Added a CUDA Driver API (`cuInit(0)`) gate to the NVDEC capability check so a
+  management-interface-only success cannot hide a broken CUDA context; Auto now reports the
+  precise cause before using CPU decode.
+
 - 2026-09-01: Added a read-only `P1→P2 baseline / Pixhawk yaw` group below the Pixhawk raw
   baseline. It separately reports compass-normalized P1/P2 yaw, signed `Baseline−P1` and
   `Baseline−P2`, `P2−P1 yaw`, selected GNSS/fix/age/pair-delta evidence, and a fixed-height
@@ -1916,6 +2040,9 @@ frozen Mountain image.
   calibration-parameter refresh triggered by the first heartbeat. The status projection now reuses
   the subscriber's exclusive-command state, reports only the reserved P1/P2 side as `PARAM SYNC`,
   and returns to the normal ATTITUDE-age-based `LIVE` state after command completion.
+
+- 2026-09-05: Distinguished bounded Stable-PX4 RM3100 Shell polling as `SHELL SYNC` so the
+  operator does not mistake `sensor_mag` readback for a CAL_MAG parameter lookup.
 
 - 2026-08-24: Removed editable Candidate Apply-DOF checkboxes. Candidate Apply now derives its
   immutable mask from `optimized_dof`, requires every owned axis to be observable on both camera
