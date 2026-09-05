@@ -19,6 +19,10 @@ from math import isfinite
 from PyQt5 import QtCore
 
 from Workstation.workstation_core.attitude_geometry import relative_attitude, world_ned_vector_to_body_frd
+from Workstation.workstation_core.canonical_transform import (
+    flatten_rotation,
+    flatten_translation,
+)
 from Workstation.workstation_core.calibration import (
     StereoExtrinsics,
     StereoExtrinsicsProfile,
@@ -105,6 +109,7 @@ from Workstation.workstation_core.method_evaluation import (
 )
 from Workstation.workstation_core.method_evaluation_workers import (
     MethodEvaluationCoordinator,
+    MethodEvaluationPoll,
 )
 from Workstation.workstation_core.detection_pair_coordinator import (
     DetectionPairCoordinator,
@@ -231,9 +236,6 @@ class MeasurementViewController:
         self.panel = panel
         self._method_evaluation_coordinator: MethodEvaluationCoordinator | None = None
         self._method_evaluation_timer: QtCore.QTimer | None = None
-        self._retiring_method_evaluation_coordinators: list[
-            MethodEvaluationCoordinator
-        ] = []
         self._detection_pair_coordinator: DetectionPairCoordinator | None = None
         self._detection_pair_timer: QtCore.QTimer | None = None
         self._pairing_policy_token: tuple[object, ...] | None = None
@@ -561,20 +563,147 @@ class MeasurementViewController:
         self._ensure_method_evaluation_timer()
         return coordinator
 
+    def _measurement_registry(self):
+        getter = getattr(self.panel, "measurement_registry", None)
+        if not callable(getter):
+            return None
+        try:
+            registry = getter()
+        except Exception:  # noqa: BLE001 - evidence capture is optional here.
+            return None
+        return registry if hasattr(registry, "route_outcome") else None
+
+    def _registry_is_current(self, measurement_id: str) -> bool | None:
+        registry = self._measurement_registry()
+        if registry is None:
+            return None
+        try:
+            return registry.is_current(measurement_id)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _selected_method_id_for(self, measurement_id: str) -> str:
+        registry = self._measurement_registry()
+        record = None if registry is None else registry.record_for(measurement_id)
+        selected = "" if record is None else str(getattr(record, "selected_method_id", "") or "")
+        if not selected:
+            selected = str(
+                getattr(self.panel, "_measurement_recording_method_id", "") or PIXHAWK_RTK_LIVE
+            )
+        return selected if selected in MEASUREMENT_METHOD_IDS else PIXHAWK_RTK_LIVE
+
+    def measurement_calibration_snapshot(self) -> dict[str, object]:
+        """K,D actually frozen for the Measurement, for the workbook's 03_Calibration."""
+
+        result = getattr(self.panel, "_pending_measurement_frozen_intrinsics_result", None)
+        if result is None:
+            return {}
+
+        def camera(intrinsics: object) -> dict[str, object]:
+            return {
+                "width_px": int(getattr(intrinsics, "width", 0)),
+                "height_px": int(getattr(intrinsics, "height", 0)),
+                "camera_matrix": [
+                    [float(value) for value in row] for row in getattr(intrinsics, "camera_matrix", ())
+                ],
+                "distortion_coefficients": [
+                    float(value) for value in getattr(intrinsics, "distortion_coefficients", ())
+                ],
+                "reprojection_error_px": float(getattr(intrinsics, "reprojection_error_px", 0.0) or 0.0),
+                "image_count": int(getattr(intrinsics, "image_count", 0) or 0),
+            }
+
+        try:
+            profile_sha256 = intrinsics_content_sha256(result)
+        except Exception:  # noqa: BLE001 - provenance only.
+            profile_sha256 = ""
+        return {
+            "profile_sha256": profile_sha256,
+            "source_path": str(
+                getattr(self.panel, "_pending_measurement_frozen_intrinsics_path", "") or ""
+            ),
+            "left": camera(result.left),
+            "right": camera(result.right),
+        }
+
+    def measurement_alignment_rows(self) -> list[dict[str, object]]:
+        """R,t actually applied when the Measurement starts (04_Alignment)."""
+
+        rows: list[dict[str, object]] = []
+        now_ns = time.time_ns()
+        profile = getattr(self.panel, "checkerboard_extrinsics_profile", None)
+        extrinsics = getattr(profile, "extrinsics", None)
+        if extrinsics is not None:
+            try:
+                rows.append(
+                    {
+                        "timestamp_utc_ns": now_ns,
+                        "event_type": "applied_at_start",
+                        "method_id": CHECKERBOARD_STEREO,
+                        "source": f"profile:{getattr(profile, 'profile_id', '') or ''}",
+                        **flatten_rotation(extrinsics.rotation_left_to_right),
+                        **flatten_translation(extrinsics.translation_left_to_right_m),
+                        "source_sha256": str(getattr(profile, "content_sha256", "") or ""),
+                        "detail": (
+                            f"reprojection_error_px={getattr(extrinsics, 'reprojection_error_px', '')}; "
+                            f"pair_count={getattr(extrinsics, 'pair_count', '')}; "
+                            f"method={getattr(profile, 'method', '')}"
+                        ),
+                    }
+                )
+            except (AttributeError, TypeError, ValueError):
+                pass
+        try:
+            owner = self.panel._optical_pose_controller()
+            snapshot = owner.workstation_optical_pose_snapshot(include_frames=False)
+        except Exception:  # noqa: BLE001 - alignment view is optional evidence.
+            snapshot = None
+        if isinstance(snapshot, Mapping) and snapshot.get("active_selection"):
+            active = snapshot.get("active_selection")
+            method = None
+            if isinstance(active, Mapping):
+                method = measurement_method_id_for_candidate(active.get("method"))
+            rows.append(
+                {
+                    "timestamp_utc_ns": now_ns,
+                    "event_type": "optical_pose_active_at_start",
+                    "method_id": method or "",
+                    "source": str(
+                        active.get("candidate_id", "") if isinstance(active, Mapping) else ""
+                    ),
+                    "source_sha256": str(
+                        getattr(self.panel, "_active_optical_pose_profile_hash", "") or ""
+                    ),
+                    "detail": json.dumps(
+                        snapshot, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")
+                    )[:32_000],
+                }
+            )
+        return rows
+
     def close_method_evaluation_workers(self) -> bool:
+        """Shutdown-only: stop the app-lifetime workers and drain their evidence."""
+
         self._retry_pending_primary_measurements()
         self._retry_pending_method_bundles()
         coordinator = self._method_evaluation_coordinator
         self._method_evaluation_coordinator = None
+        remaining: list[MethodEvaluationCoordinator] = []
         if coordinator is not None:
             coordinator.close()
-            self._retiring_method_evaluation_coordinators.append(coordinator)
-        remaining: list[MethodEvaluationCoordinator] = []
-        for retiring in self._retiring_method_evaluation_coordinators:
-            retiring.close()
-            if not retiring.closed:
-                remaining.append(retiring)
-        self._retiring_method_evaluation_coordinators = remaining
+            if not coordinator.wait_closed(2.0):
+                remaining.append(coordinator)
+            try:
+                polled = coordinator.poll()
+            except Exception:  # noqa: BLE001 - drain is best effort at shutdown.
+                polled = MethodEvaluationPoll()
+            registry = self._measurement_registry()
+            if registry is not None:
+                for outcome in polled.outcomes:
+                    try:
+                        registry.route_outcome(outcome)
+                    except Exception:  # noqa: BLE001
+                        pass
         pending_persistence = bool(
             self._pending_primary_measurement_commits
             or self._pending_method_bundle_commits
@@ -2710,6 +2839,9 @@ class MeasurementViewController:
             self.panel.latest_right = detection
         if detection is not None:
             self.panel.detection_buffers[camera].add(detection)
+            registry = self._measurement_registry()
+            if registry is not None:
+                registry.observe_detection(camera, detection)
         coordinator = self._ensure_detection_pair_coordinator()
         reservation_source = None
         if detection is not None and self._exact_pair_reservation_supported():
@@ -4553,49 +4685,58 @@ class MeasurementViewController:
 
     def method_evaluation_pending_count(self) -> int:
         self._poll_method_evaluations()
-        coordinator = self._method_evaluation_coordinator
-        worker_pairs = 0 if coordinator is None else coordinator.pending_pair_count
-        # Primary row admission has independent background ownership and must
-        # not hold the sessionless Stop -> next Measurement boundary.
-        return int(worker_pairs) + len(self._pending_method_bundle_commits)
+        # Worker jobs are never a Stop -> next Measurement barrier (they may
+        # legitimately outlive the Measurement); only JSONL bundle retries
+        # count here.
+        return len(self._pending_method_bundle_commits)
 
-    def _method_evaluation_requests_for_pair(
+    def _plan_method_evaluations(
         self,
         pair: object,
-    ) -> tuple[MethodEvaluationRequest, ...]:
+    ) -> tuple[
+        tuple[MethodEvaluationRequest, ...],
+        dict[str, str],
+        dict[str, dict[str, object]],
+        FrozenMeasurementPairSnapshot,
+    ]:
+        """Requests for the ready methods only, plus why the others were not attempted."""
+
         frozen = self._freeze_measurement_pair_inputs(pair)
         snapshot = frozen.get("snapshot")
         if not isinstance(snapshot, FrozenMeasurementPairSnapshot):
             raise TypeError("frozen Measurement snapshot unavailable")
         statuses = latest_status_by_method(self._measurement_method_statuses())
         requests: list[MethodEvaluationRequest] = []
+        not_attempted: dict[str, str] = {}
+        evidence: dict[str, dict[str, object]] = {}
         enqueued_ns = time.monotonic_ns()
+        snapshot_sha256 = snapshot.canonical_sha256()
+        snapshot_payload = snapshot.canonical_payload()
         for method_id in MEASUREMENT_METHOD_IDS:
             status = statuses.get(method_id)
-            attempt_payload: Mapping[str, object] | None = None
-            reasons: tuple[str, ...]
-            instance_id = f"{method_id}:frozen-input-missing"
-            component_sources: tuple[tuple[str, str], ...] = ()
             if status is None:
-                reasons = (MEASUREMENT_METHOD_MISSING_INSTANCE_REASONS[method_id],)
-            else:
-                instance_id = status.instance_id
-                component_sources = status.component_sources
-                reasons = tuple(status.reasons)
-                try:
-                    attempt = self._build_measurement_attempt(
-                        pair,
-                        method_status=status,
-                        frozen_inputs=frozen,
-                        use_cache=False,
-                    )
-                    attempt_payload = attempt.canonical_payload()
-                except (AttributeError, KeyError, RuntimeError, TypeError, ValueError) as exc:
-                    reasons = tuple(
-                        dict.fromkeys((*reasons, f"frozen method input error: {exc}"))
-                    )
+                not_attempted[method_id] = MEASUREMENT_METHOD_MISSING_INSTANCE_REASONS[method_id]
+                continue
+            try:
+                evidence[method_id] = dict(status.to_mapping())
+            except Exception:  # noqa: BLE001 - evidence only.
+                evidence[method_id] = {"instance_id": status.instance_id}
+            if not status.ready:
+                not_attempted[method_id] = "; ".join(status.reasons) or "not ready"
+                continue
+            try:
+                attempt = self._build_measurement_attempt(
+                    pair,
+                    method_status=status,
+                    frozen_inputs=frozen,
+                    use_cache=False,
+                )
+                attempt_payload = attempt.canonical_payload()
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError) as exc:
+                not_attempted[method_id] = f"frozen method input error: {exc}"
+                continue
             uses_live_gnss = method_id == PIXHAWK_RTK_LIVE or "live_gnss" in dict(
-                component_sources
+                status.component_sources
             ).values()
             reused_inputs = snapshot.reused_inputs if uses_live_gnss else ()
             requests.append(
@@ -4603,38 +4744,67 @@ class MeasurementViewController:
                     measurement_id=snapshot.measurement_id,
                     pair_id=snapshot.pair_id,
                     pair_sequence=snapshot.pair_sequence,
-                    snapshot_sha256=snapshot.canonical_sha256(),
+                    snapshot_sha256=snapshot_sha256,
                     request_generation=snapshot.pair_sequence,
                     method_id=method_id,
-                    method_instance_id=instance_id,
-                    snapshot_payload=snapshot.canonical_payload(),
+                    method_instance_id=status.instance_id,
+                    snapshot_payload=snapshot_payload,
                     attempt_payload=attempt_payload,
-                    blocked_reasons=reasons,
                     reused_inputs=reused_inputs,
                     enqueued_monotonic_ns=enqueued_ns,
                 )
             )
-        return tuple(requests)
+        return tuple(requests), not_attempted, evidence, snapshot
+
+    def _method_evaluation_requests_for_pair(
+        self,
+        pair: object,
+    ) -> tuple[MethodEvaluationRequest, ...]:
+        return self._plan_method_evaluations(pair)[0]
 
     def _submit_method_evaluations(self, pair: object) -> None:
-        requests = self._method_evaluation_requests_for_pair(pair)
-        first = requests[0]
+        requests, not_attempted, evidence, snapshot = self._plan_method_evaluations(pair)
         submitted = getattr(self.panel, "_method_evaluation_submitted", None)
         if not isinstance(submitted, set):
             submitted = set()
             self.panel._method_evaluation_submitted = submitted
-        identity = (first.pair_id, first.request_generation)
+        identity = (snapshot.pair_id, snapshot.pair_sequence)
         if identity in submitted:
             return
-        submission = self._ensure_method_evaluation_coordinator().submit(requests)
         submitted.add(identity)
-        if submission.backpressure_bundle is not None:
-            self._commit_method_evaluation_bundle(submission.backpressure_bundle)
-            self.panel._set_distance_text(
-                "거리: method worker queue 포화 (20 pairs)",
-                quality="WARNING",
-                detail="원본 pair와 BACKPRESSURE_BLOCKED 결과는 저장했습니다.",
-            )
+        registry = self._measurement_registry()
+        record = None if registry is None else registry.record_for(snapshot.measurement_id)
+        if record is not None:
+            if record.stopped:
+                return
+            if not record.selected_method_id:
+                record.selected_method_id = str(
+                    getattr(self.panel, "_measurement_recording_method_id", "") or ""
+                )
+            try:
+                record.register_pair(
+                    snapshot.canonical_payload(),
+                    submitted_method_ids=tuple(request.method_id for request in requests),
+                    not_attempted=not_attempted,
+                    method_evidence=evidence,
+                )
+            except Exception as exc:  # noqa: BLE001 - evidence never blocks the solver path.
+                logger = getattr(self.panel, "_log", None)
+                if callable(logger):
+                    logger(f"[측정] pair 기록 실패(계속 진행): {exc}")
+        if not requests:
+            setter = getattr(self.panel, "_set_distance_text", None)
+            if callable(setter):
+                setter(
+                    "거리: 준비된 측정 방식 없음 (pair는 기록됨)",
+                    quality="WARNING",
+                    detail="; ".join(f"{k}: {v}" for k, v in not_attempted.items())[:400],
+                )
+            return
+        self._ensure_method_evaluation_coordinator().submit(
+            requests,
+            planned_methods=not_attempted,
+        )
 
     @staticmethod
     def _primary_outcome_key(
@@ -4664,6 +4834,9 @@ class MeasurementViewController:
         self,
         outcome: MethodEvaluationOutcome,
     ) -> bool:
+        registry_current = self._registry_is_current(outcome.measurement_id)
+        if registry_current is not None:
+            return registry_current
         if not bool(getattr(self.panel, "distance_recording_enabled", False)):
             return False
         sessionless = not bool(
@@ -5055,6 +5228,9 @@ class MeasurementViewController:
         current_generation = str(
             getattr(self.panel, "_measurement_run_generation", "") or ""
         )
+        registry_current = self._registry_is_current(bundle.measurement_id)
+        if registry_current is not None:
+            return registry_current, str(current_generation or bundle.measurement_id)
         run_state = str(
             getattr(self.panel, "_measurement_run_state", "IDLE") or "IDLE"
         ).upper()
@@ -5297,23 +5473,23 @@ class MeasurementViewController:
         identity = (bundle.pair_id, bundle.request_generation)
         if identity in committed:
             return
-        selected_method_id = str(
-            getattr(self.panel, "_measurement_recording_method_id", "")
-            or PIXHAWK_RTK_LIVE
-        )
-        if selected_method_id not in MEASUREMENT_METHOD_IDS:
-            selected_method_id = PIXHAWK_RTK_LIVE
-        selected_index = MEASUREMENT_METHOD_IDS.index(selected_method_id)
-        selected_outcome = bundle.outcomes[selected_index]
-        primary, current, persistence_state = self._commit_primary_method_outcome(
-            selected_outcome,
-            commit_source="bundle_fallback",
-            expected_method_id=selected_method_id,
-        )
-        if primary != selected_outcome:
-            outcomes = list(bundle.outcomes)
-            outcomes[selected_index] = primary
-            bundle = replace(bundle, outcomes=tuple(outcomes))
+        selected_method_id = self._selected_method_id_for(bundle.measurement_id)
+        selected_outcome = bundle.outcome_for(selected_method_id)
+        primary = None
+        current = False
+        persistence_state = "NOT_REQUESTED"
+        if selected_outcome is not None:
+            primary, current, persistence_state = self._commit_primary_method_outcome(
+                selected_outcome,
+                commit_source="bundle_fallback",
+                expected_method_id=selected_method_id,
+            )
+            if primary != selected_outcome:
+                outcomes = tuple(
+                    primary if outcome.method_id == selected_method_id else outcome
+                    for outcome in bundle.outcomes
+                )
+                bundle = replace(bundle, outcomes=outcomes)
 
         if not self._persist_method_evaluation_bundle(bundle):
             return
@@ -5347,17 +5523,23 @@ class MeasurementViewController:
         *,
         primary_method_id: str = PIXHAWK_RTK_LIVE,
     ) -> MethodEvaluationBundle:
-        outcomes = list(bundle.outcomes)
-        primary_index = MEASUREMENT_METHOD_IDS.index(primary_method_id)
-        primary = outcomes[primary_index]
-        outcomes[primary_index] = replace(
+        primary = bundle.outcome_for(primary_method_id)
+        if primary is None:
+            return bundle
+        failed = replace(
             primary,
             status="FAILED",
             result={},
             reasons=(str(reason),),
             warnings=tuple(dict.fromkeys((*primary.warnings, str(reason)))),
         )
-        return replace(bundle, outcomes=tuple(outcomes))
+        return replace(
+            bundle,
+            outcomes=tuple(
+                failed if outcome.method_id == primary_method_id else outcome
+                for outcome in bundle.outcomes
+            ),
+        )
 
     @staticmethod
     def _method_history_payload(
@@ -5447,11 +5629,19 @@ class MeasurementViewController:
             if callable(logger):
                 logger(f"[측정] method worker poll 실패(타이머 유지): {exc}")
             return
+        registry = self._measurement_registry()
+        if registry is not None:
+            # Every outcome reaches its own Measurement's workbook record first,
+            # whatever the current run is; the UI/JSONL paths below stay gated.
+            for outcome in polled.outcomes:
+                try:
+                    registry.route_outcome(outcome)
+                except Exception as exc:  # noqa: BLE001 - evidence must not break polling.
+                    logger = getattr(self.panel, "_log", None)
+                    if callable(logger):
+                        logger(f"[측정] workbook outcome 기록 실패: {exc}")
         for primary in polled.primary_outcomes:
-            selected_method_id = str(
-                getattr(self.panel, "_measurement_recording_method_id", "")
-                or PIXHAWK_RTK_LIVE
-            )
+            selected_method_id = self._selected_method_id_for(primary.measurement_id)
             if selected_method_id != PIXHAWK_RTK_LIVE:
                 # The fixed Pixhawk worker remains the early admission path;
                 # a non-Pixhawk selected method is committed only from the
@@ -5496,6 +5686,11 @@ class MeasurementViewController:
                 except Exception as nested_exc:  # noqa: BLE001 - last-resort isolation.
                     if callable(logger):
                         logger(f"[측정] FAILED bundle 기록도 실패: {nested_exc}")
+        if registry is not None:
+            try:
+                registry.tick()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _refresh_distance(self) -> None:
         self.panel.geometry_comparison_rows = ()

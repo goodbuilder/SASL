@@ -275,9 +275,11 @@ class DetectionSnapshot:
     candidate_class_ids: tuple[int, ...] = ()
     pixel_frame: str = CAMERA_FRAME
     pixel_unit: str = "px"
+    selected_candidate_index: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "camera", str(self.camera))
+        object.__setattr__(self, "selected_candidate_index", int(self.selected_candidate_index))
         object.__setattr__(self, "app_receive_monotonic_s", _finite_float(self.app_receive_monotonic_s, name="app_receive_monotonic_s"))
         object.__setattr__(self, "width_px", int(self.width_px))
         object.__setattr__(self, "height_px", int(self.height_px))
@@ -348,6 +350,7 @@ class DetectionSnapshot:
             pairing_timestamp_s=_finite_float(pairing_timestamp_s, name="pairing_timestamp_s"),
             timestamp_metadata_items=_metadata_items(getattr(observation, "timestamp_metadata", None)),
             candidate_class_ids=tuple(getattr(observation, "candidate_class_ids", ()) or ()),
+            selected_candidate_index=int(getattr(observation, "selected_candidate_index", 0) or 0),
         )
 
     @property
@@ -472,14 +475,15 @@ def live_pair_timing_evidence(
         raise ValueError(f"unsupported live pair timing basis: {effective}")
     selected_abs_delta_ns = abs(selected_delta_ns)
     limit_ns = max(0, int(max_abs_delta_ns))
-    if selected_abs_delta_ns > limit_ns:
-        code = (
+    # A pair beyond the configured window is still measured; the excess is
+    # recorded so the analysis can weigh it, never used to drop the pair.
+    limit_exceeded = selected_abs_delta_ns > limit_ns
+    limit_exceeded_code = ""
+    if limit_exceeded:
+        limit_exceeded_code = (
             "APP_RECEIVE_DELTA_EXCEEDED"
             if effective == TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC
             else "RTCP_DELTA_EXCEEDED"
-        )
-        raise ValueError(
-            f"{code}: {selected_abs_delta_ns}ns > {limit_ns}ns"
         )
     return {
         "schema": "workstation-live-pair-timing-v2",
@@ -503,6 +507,8 @@ def live_pair_timing_evidence(
         "selected_right_pairing_timestamp_s": right.pairing_timestamp_s,
         "pair_delta_s": selected_abs_delta_ns * 1.0e-9,
         "pair_timing_limit_ns": limit_ns,
+        "pair_timing_limit_exceeded": limit_exceeded,
+        "pair_timing_limit_exceeded_code": limit_exceeded_code,
         "app_receive_timestamp_source_by_side": {
             side: (
                 "exact_monotonic_ns"

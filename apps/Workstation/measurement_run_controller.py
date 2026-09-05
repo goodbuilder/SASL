@@ -263,14 +263,9 @@ class MeasurementRunController:
     ) -> bool:
         if self.state in {"STARTING", "RUNNING", "STOPPING"}:
             return False
-        owner = getattr(self.panel, "_measurement_view_controller_owner", None)
-        if owner is not None:
-            # Retire prior-generation workers without waiting; their callbacks
-            # are generation-filtered and cannot block this start.
-            try:
-                owner.close_method_evaluation_workers()
-            except Exception:
-                pass
+        # Method workers are application-lifetime: a previous Measurement's
+        # in-flight jobs keep running and their outcomes are routed to that
+        # Measurement's own record by measurement_id.
         method_config: dict[str, object] = {}
         factory = getattr(self.panel, "_measurement_view_controller", None)
         try:
@@ -334,6 +329,11 @@ class MeasurementRunController:
             method_id: {"VALID": 0, "BLOCKED": 0, "FAILED": 0}
             for method_id in MEASUREMENT_METHOD_IDS
         }
+        self._begin_measurement_record(
+            generation,
+            started_utc_ns=started_utc_ns,
+            started_monotonic_ns=started_monotonic_ns,
+        )
         retry = getattr(self.panel, "retry_data_storage", None)
         if callable(retry):
             try:
@@ -425,6 +425,11 @@ class MeasurementRunController:
         self.panel._measurement_package_finalize_requested = False
         self.panel._measurement_method_config_token = None
         self._set_state("IDLE", "Ready for next Measurement")
+        self._stop_measurement_record(
+            generation,
+            stopped_utc_ns=stopped_utc_ns,
+            stopped_monotonic_ns=stopped_monotonic_ns,
+        )
         append = getattr(self.panel, "append_workstation_data", None)
         if callable(append):
             try:
@@ -447,32 +452,85 @@ class MeasurementRunController:
                 flush()
             except Exception:
                 pass
-        request_xlsx = getattr(
-            self.panel,
-            "request_latest_measurement_xlsx",
-            None,
-        )
-        if callable(request_xlsx):
-            try:
-                request_xlsx(
-                    generation,
-                    started_utc_ns=getattr(
-                        self.panel,
-                        "_measurement_run_started_utc_ns",
-                        None,
-                    ),
-                    stopped_utc_ns=stopped_utc_ns,
-                    source_states=dict(
-                        getattr(self.panel, "_measurement_run_last_sources", {})
-                        or {}
-                    ),
-                    automatic=True,
-                )
-            except Exception:
-                # XLSX is a derived convenience view. Its request boundary is
-                # deliberately later than IDLE and can never retain the run.
-                pass
         return True
+
+    def _measurement_registry(self) -> Any | None:
+        getter = getattr(self.panel, "measurement_registry", None)
+        if not callable(getter):
+            return None
+        try:
+            registry = getter()
+        except Exception:
+            return None
+        return registry if hasattr(registry, "begin") and hasattr(registry, "stop") else None
+
+    def _begin_measurement_record(
+        self,
+        generation: str,
+        *,
+        started_utc_ns: int,
+        started_monotonic_ns: int,
+    ) -> Any | None:
+        """Open the per-Measurement workbook record; never gates the Start."""
+
+        self.panel._measurement_file_prefix = ""
+        registry = self._measurement_registry()
+        if registry is None:
+            return None
+        owner = getattr(self.panel, "_measurement_view_controller_owner", None)
+        calibration: dict[str, object] = {}
+        alignment_rows: list[Mapping[str, object]] = []
+        try:
+            snapshot = getattr(owner, "measurement_calibration_snapshot", None)
+            if callable(snapshot):
+                calibration = dict(snapshot() or {})
+        except Exception:
+            calibration = {}
+        try:
+            rows = getattr(owner, "measurement_alignment_rows", None)
+            if callable(rows):
+                alignment_rows = list(rows() or ())
+        except Exception:
+            alignment_rows = []
+        try:
+            record = registry.begin(
+                generation,
+                started_utc_ns=started_utc_ns,
+                started_monotonic_ns=started_monotonic_ns,
+                metadata=dict(getattr(self.panel, "_measurement_run_metadata", {}) or {}),
+                calibration=calibration,
+            )
+        except Exception:
+            return None
+        for row in alignment_rows:
+            try:
+                record.add_alignment_row(row)
+            except Exception:
+                continue
+        self.panel._measurement_file_prefix = str(record.file_prefix)
+        self.panel._measurement_method_result_counters = record.counters
+        return record
+
+    def _stop_measurement_record(
+        self,
+        generation: str,
+        *,
+        stopped_utc_ns: int,
+        stopped_monotonic_ns: int,
+    ) -> None:
+        self.panel._measurement_file_prefix = ""
+        registry = self._measurement_registry()
+        if registry is None:
+            return
+        try:
+            registry.stop(
+                generation,
+                stopped_utc_ns=stopped_utc_ns,
+                stopped_monotonic_ns=stopped_monotonic_ns,
+            )
+        except Exception:
+            # The workbook is evidence, never an admission gate.
+            pass
 
     def fail_measurement_start(self, reason: str) -> bool:
         """Keep the observation open when camera admission fails."""

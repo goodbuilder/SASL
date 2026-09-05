@@ -604,16 +604,28 @@ class RecordingController:
         short_generation = generation.removeprefix("run-")[:12] or "manual"
         created_utc_ns = time.time_ns() if utc_ns is None else int(utc_ns)
         try:
-            path = Path(
-                allocator(
-                    "videos",
-                    label=(
-                        f"{camera}-{short_generation}-segment-{segment_index:02d}"
-                    ),
-                    suffix=".mp4",
-                    utc_ns=created_utc_ns,
+            path = None
+            # A running Measurement names its video after the Measurement
+            # Start prefix so the MP4 sits next to its workbook.
+            prefixed_allocator = getattr(self.panel, "allocate_measurement_artifact", None)
+            if callable(prefixed_allocator) and generation == active_generation:
+                try:
+                    prefixed = prefixed_allocator(label=camera, suffix=".mp4")
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    prefixed = None
+                if prefixed is not None:
+                    path = Path(prefixed)
+            if path is None:
+                path = Path(
+                    allocator(
+                        "videos",
+                        label=(
+                            f"{camera}-{short_generation}-segment-{segment_index:02d}"
+                        ),
+                        suffix=".mp4",
+                        utc_ns=created_utc_ns,
+                    )
                 )
-            )
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             logger = getattr(self.panel, "_log", None)
             if callable(logger):

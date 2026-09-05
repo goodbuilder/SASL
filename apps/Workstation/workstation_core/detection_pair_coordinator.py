@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from Workstation.workstation_core.stereo import (
     DetectionObservation,
     TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC,
+    correspondence_advisories,
     correspondence_rejection_reason,
 )
 from Workstation.workstation_core.sync import match_nearest_pair
@@ -379,13 +380,20 @@ class DetectionPairCoordinator:
             timestamp=_app_timestamp,
         )
         if pair is None:
-            return None, "APP_RECEIVE_DELTA_EXCEEDED"
+            # The window only prefers close partners. Without one, the nearest
+            # available partner is still paired and the excess is reported.
+            pair = match_nearest_pair(
+                left_valid,
+                right_valid,
+                max_delta_s=float("inf"),
+                timestamp=_app_timestamp,
+            )
+            if pair is None:
+                return None, "APP_RECEIVE_TIMESTAMP_INVALID"
         left_ns = _app_timestamp_ns(pair.left)
         right_ns = _app_timestamp_ns(pair.right)
         if left_ns is None or right_ns is None:
             return None, "APP_RECEIVE_TIMESTAMP_INVALID"
-        if abs(right_ns - left_ns) > limit_ns:
-            return None, "APP_RECEIVE_DELTA_EXCEEDED"
         return pair, ""
 
     def _match_rtcp(
@@ -459,7 +467,23 @@ class DetectionPairCoordinator:
             is not None
         ]
         if not candidates:
-            return None, "RTCP_DELTA_EXCEEDED"
+            # No partner inside the preferred window: still pair the nearest
+            # RTCP-timestamped partner and let the excess become an advisory.
+            candidates = [
+                pair
+                for left_group, right_group in epoch_groups
+                if (
+                    pair := match_nearest_pair(
+                        left_group,
+                        right_group,
+                        max_delta_s=float("inf"),
+                        timestamp=_camera_timestamp,
+                    )
+                )
+                is not None
+            ]
+        if not candidates:
+            return None, "RTCP_TIMESTAMP_UNAVAILABLE"
         return min(candidates, key=lambda item: (item.delta_s, -item.midpoint_s)), ""
 
     def _match(self, policy: PairingPolicy) -> PairingResult:
@@ -549,16 +573,23 @@ class DetectionPairCoordinator:
                     )
 
         if pair is not None:
-            reason = correspondence_rejection_reason(pair.left, pair.right) or ""
-            if reason:
+            correspondence_reason = correspondence_rejection_reason(pair.left, pair.right)
+            if correspondence_reason:
+                reason = correspondence_reason
                 pair = None
                 timing = None
-            else:
-                vertical_delta = abs(pair.left.center[1] - pair.right.center[1])
-                if vertical_delta > float(policy.max_vertical_delta_px):
-                    advisories.append(
-                        f"vertical bbox delta {vertical_delta:.3f}px exceeds configured limit"
-                    )
+        if pair is not None:
+            advisories.extend(correspondence_advisories(pair.left, pair.right))
+            if timing is not None and timing.abs_delta_ns > self._delta_limit_ns(policy):
+                advisories.append(
+                    f"pair_delta_exceeds_window: {timing.abs_delta_ns}ns > "
+                    f"{self._delta_limit_ns(policy)}ns"
+                )
+            vertical_delta = abs(pair.left.center[1] - pair.right.center[1])
+            if vertical_delta > float(policy.max_vertical_delta_px):
+                advisories.append(
+                    f"vertical bbox delta {vertical_delta:.3f}px exceeds configured limit"
+                )
 
         reservation = None
         reservation_error = ""

@@ -214,13 +214,6 @@ def test_healthy_rtcp_preference_actually_selects_rtcp_pair() -> None:
             (100.0, None),
             "RTCP_TIMESTAMP_UNAVAILABLE",
         ),
-        (
-            True,
-            {"clock_epoch_id": "epoch", "clock_epoch_state": "current"},
-            {"clock_epoch_id": "epoch", "clock_epoch_state": "current"},
-            (100.0, 100.101),
-            "RTCP_DELTA_EXCEEDED",
-        ),
     ),
 )
 def test_rtcp_timing_faults_fall_back_to_exact_app_receive(
@@ -271,7 +264,48 @@ def test_rtcp_timing_faults_fall_back_to_exact_app_receive(
         assert coordinator.close()
 
 
-def test_rtcp_and_app_timing_failure_returns_precise_final_rejection() -> None:
+def test_rtcp_pair_beyond_window_is_still_paired_on_rtcp_with_advisory() -> None:
+    coordinator = DetectionPairCoordinator()
+    try:
+        policy = PairingPolicy(
+            timestamp_basis="camera_rtcp",
+            max_delta_s=0.100,
+            allow_app_fallback=True,
+            rtcp_clock_verified=True,
+            require_current_clock_epoch=True,
+        )
+        for side, timestamp_s, app_ns, rtc_s in (
+            ("left", 5.000, 5_000_000_000, 100.0),
+            ("right", 5.020, 5_020_000_000, 100.101),
+        ):
+            coordinator.submit(
+                side,
+                _detection(
+                    side,
+                    timestamp_s,
+                    rtc_s=rtc_s,
+                    timestamp_metadata={
+                        "clock_epoch_id": "epoch",
+                        "clock_epoch_state": "current",
+                        "app_receive_monotonic_ns": app_ns,
+                    },
+                ),
+                policy,
+            )
+
+        result = _await_result(coordinator)
+
+        assert result.pair is not None
+        assert result.timing is not None
+        assert result.timing.effective_basis == "camera_rtcp"
+        assert result.uses_app_fallback is False
+        assert result.timing.abs_delta_ns == 101_000_000
+        assert any(item.startswith("pair_delta_exceeds_window") for item in result.advisories)
+    finally:
+        assert coordinator.close()
+
+
+def test_rtcp_unverified_and_app_beyond_window_still_pairs_with_fallback_and_advisory() -> None:
     coordinator = DetectionPairCoordinator()
     try:
         policy = PairingPolicy(
@@ -287,10 +321,12 @@ def test_rtcp_and_app_timing_failure_returns_precise_final_rejection() -> None:
 
         result = _await_result(coordinator)
 
-        assert result.pair is None
+        assert result.pair is not None
         assert result.primary_rejection_reason == "CLOCK_NOT_VERIFIED"
-        assert result.fallback_rejection_reason == "APP_RECEIVE_DELTA_EXCEEDED"
-        assert result.rejection_reason == "APP_RECEIVE_DELTA_EXCEEDED"
+        assert result.fallback_rejection_reason == ""
+        assert result.rejection_reason == ""
+        assert result.uses_app_fallback is True
+        assert any(item.startswith("pair_delta_exceeds_window") for item in result.advisories)
     finally:
         assert coordinator.close()
 
@@ -452,7 +488,7 @@ def test_app_receive_pairing_ignores_ntp_value_and_clock_epoch() -> None:
         assert coordinator.close()
 
 
-def test_app_receive_pairing_hard_rejects_over_100ms_even_when_ntp_is_close() -> None:
+def test_app_receive_pairing_over_100ms_is_paired_with_window_advisory() -> None:
     coordinator = DetectionPairCoordinator()
     try:
         policy = PairingPolicy(
@@ -473,14 +509,17 @@ def test_app_receive_pairing_hard_rejects_over_100ms_even_when_ntp_is_close() ->
 
         result = _await_result(coordinator)
 
-        assert result.pair is None
-        assert result.rejection_reason == "APP_RECEIVE_DELTA_EXCEEDED"
+        assert result.pair is not None
+        assert result.rejection_reason == ""
+        assert result.timing is not None
+        assert result.timing.effective_basis == "app_receive_monotonic"
+        assert any(item.startswith("pair_delta_exceeds_window") for item in result.advisories)
     finally:
         assert coordinator.close()
 
 
 @pytest.mark.parametrize("configured_limit_s", [0.100, 0.500, float("inf")])
-def test_app_receive_pairing_rejects_exact_100ms_plus_one_ns(
+def test_app_receive_pairing_keeps_exact_100ms_plus_one_ns_as_advisory(
     configured_limit_s: float,
 ) -> None:
     coordinator = DetectionPairCoordinator()
@@ -510,8 +549,32 @@ def test_app_receive_pairing_rejects_exact_100ms_plus_one_ns(
 
         result = _await_result(coordinator)
 
+        assert result.pair is not None
+        assert result.rejection_reason == ""
+        assert result.timing is not None
+        assert result.timing.abs_delta_ns == 100_000_001
+        assert any(item.startswith("pair_delta_exceeds_window") for item in result.advisories)
+    finally:
+        assert coordinator.close()
+
+
+def test_class_mismatch_rejects_the_pair_with_correspondence_reason() -> None:
+    from dataclasses import replace
+
+    coordinator = DetectionPairCoordinator()
+    try:
+        policy = PairingPolicy(timestamp_basis="app_receive_monotonic", max_delta_s=0.100)
+        coordinator.submit("left", _detection("left", 30.0), policy)
+        coordinator.submit(
+            "right",
+            replace(_detection("right", 30.01), class_id=1, candidate_class_ids=(1,)),
+            policy,
+        )
+
+        result = _await_result(coordinator)
+
         assert result.pair is None
-        assert result.rejection_reason == "APP_RECEIVE_DELTA_EXCEEDED"
+        assert result.rejection_reason == "correspondence_class_mismatch"
     finally:
         assert coordinator.close()
 

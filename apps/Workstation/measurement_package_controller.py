@@ -718,7 +718,6 @@ class MeasurementPackageController:
             self.panel, "_measurement_view_controller_owner", None
         )
         if measurement_owner is not None:
-            measurement_owner.close_method_evaluation_workers()
             begin_pairing_generation = getattr(
                 measurement_owner,
                 "begin_pairing_generation",

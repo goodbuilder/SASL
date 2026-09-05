@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 
 
 DATA_STORE_SCHEMA = "workstation-measurement-data-store-v1"
@@ -331,6 +331,8 @@ class MeasurementDataStore:
         self._active_operations = 0
         self._next_sequence = 0
         self._pending_sequences: set[int] = set()
+        self._enqueue_observers: list[Callable[[str, Mapping[str, Any]], None]] = []
+        self._enqueue_observer_errors = 0
         self._retry_reserve: deque[_QueuedRecord] = deque()
         self._retry_reserve_bytes = 0
         self._csv_retry_reserve: deque[_QueuedRecord] = deque()
@@ -422,6 +424,20 @@ class MeasurementDataStore:
         self._lifecycle_rejected_records += 1
         return False
 
+    def add_enqueue_observer(
+        self,
+        observer: Callable[[str, Mapping[str, Any]], None],
+    ) -> None:
+        if observer not in self._enqueue_observers:
+            self._enqueue_observers.append(observer)
+
+    def remove_enqueue_observer(
+        self,
+        observer: Callable[[str, Mapping[str, Any]], None],
+    ) -> None:
+        if observer in self._enqueue_observers:
+            self._enqueue_observers.remove(observer)
+
     def enqueue(
         self,
         stream: str,
@@ -432,6 +448,13 @@ class MeasurementDataStore:
         name = str(stream)
         if name not in STREAM_PATHS:
             raise ValueError(f"unknown measurement data stream: {name}")
+        # Observers see every producer record before admission so evidence
+        # capture never depends on JSONL success, lifecycle, or queue space.
+        for observer in tuple(self._enqueue_observers):
+            try:
+                observer(name, value)
+            except Exception:  # noqa: BLE001 - observers must never affect storage.
+                self._enqueue_observer_errors += 1
         with self._state_lock:
             if self._lifecycle_state != STORE_LIFECYCLE_OPEN:
                 return self._reject_enqueue_for_lifecycle_unlocked(name)

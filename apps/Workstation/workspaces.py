@@ -15396,59 +15396,43 @@ class RecordingWorkspace(QtWidgets.QWidget):
             self.retry_storage_button = QtWidgets.QPushButton("Retry Storage")
             self.retry_storage_button.setObjectName("dataWorkspaceRetryStorage")
             self.retry_storage_button.clicked.connect(self._retry_data_storage)
-            self.update_latest_xlsx_button = QtWidgets.QPushButton(
-                "Update Latest XLSX"
+            self.open_measurement_workbook_button = QtWidgets.QPushButton(
+                "Open Latest Measurement XLSX"
             )
-            self.update_latest_xlsx_button.setObjectName(
-                "dataWorkspaceUpdateLatestXlsx"
+            self.open_measurement_workbook_button.setObjectName(
+                "dataWorkspaceOpenMeasurementWorkbook"
             )
-            self.update_latest_xlsx_button.setAccessibleName(
-                "Update latest Measurement XLSX"
+            self.open_measurement_workbook_button.setAccessibleName(
+                "Open latest Measurement workbook"
             )
-            self.update_latest_xlsx_button.setToolTip(
-                "Generate a timestamped Measurement XLSX from the most recent "
-                "saved Measurement. Timestamped JSONL remains authoritative."
+            self.open_measurement_workbook_button.setToolTip(
+                "Open the newest <start time>_measurement.xlsx in the data folder "
+                "with the system spreadsheet application. Each Measurement "
+                "(Start to Stop) has its own workbook."
             )
-            self.update_latest_xlsx_button.clicked.connect(
-                self._request_latest_measurement_xlsx
-            )
-            self.open_latest_xlsx_button = QtWidgets.QPushButton(
-                "Open Latest XLSX"
-            )
-            self.open_latest_xlsx_button.setObjectName(
-                "dataWorkspaceOpenLatestXlsx"
-            )
-            self.open_latest_xlsx_button.setAccessibleName(
-                "Open latest Measurement XLSX"
-            )
-            self.open_latest_xlsx_button.setToolTip(
-                "Open the successfully published timestamped Measurement XLSX with "
-                "the system spreadsheet application."
-            )
-            self.open_latest_xlsx_button.clicked.connect(
-                self._open_latest_measurement_xlsx
+            self.open_measurement_workbook_button.clicked.connect(
+                self._open_measurement_workbook
             )
             data_actions.addWidget(self.open_data_folder_button, 0, 0)
             data_actions.addWidget(self.open_legacy_recordings_button, 0, 1)
             data_actions.addWidget(self.retry_storage_button, 0, 2)
-            data_actions.addWidget(self.update_latest_xlsx_button, 1, 0)
-            data_actions.addWidget(self.open_latest_xlsx_button, 1, 1)
+            data_actions.addWidget(self.open_measurement_workbook_button, 1, 0)
             data_actions.setColumnStretch(3, 1)
             data_layout.addLayout(data_actions)
-            self.latest_xlsx_status_label = QtWidgets.QLabel(
-                "Latest XLSX · NOT CREATED"
+            self.measurement_workbook_status_label = QtWidgets.QLabel(
+                "Measurement XLSX · IDLE"
             )
-            self.latest_xlsx_status_label.setObjectName("statusStrip")
-            self.latest_xlsx_status_label.setTextInteractionFlags(
+            self.measurement_workbook_status_label.setObjectName("statusStrip")
+            self.measurement_workbook_status_label.setTextInteractionFlags(
                 QtCore.Qt.TextSelectableByMouse
             )
-            self.latest_xlsx_status_label.setWordWrap(True)
+            self.measurement_workbook_status_label.setWordWrap(True)
             status_height = (
-                self.latest_xlsx_status_label.fontMetrics().lineSpacing() * 2 + 8
+                self.measurement_workbook_status_label.fontMetrics().lineSpacing() * 2 + 8
             )
-            self.latest_xlsx_status_label.setMinimumHeight(status_height)
-            self.latest_xlsx_status_label.setMaximumHeight(status_height)
-            data_layout.addWidget(self.latest_xlsx_status_label)
+            self.measurement_workbook_status_label.setMinimumHeight(status_height)
+            self.measurement_workbook_status_label.setMaximumHeight(status_height)
+            data_layout.addWidget(self.measurement_workbook_status_label)
         tab_layouts["current"].addWidget(data_group)
 
         review_group = QtWidgets.QGroupBox("Review")
@@ -15602,14 +15586,14 @@ class RecordingWorkspace(QtWidgets.QWidget):
             f"dropped={dropped} · csv_dropped={csv_dropped}",
             source="bounded writer queues",
         )
-        self._refresh_latest_measurement_xlsx()
+        self._refresh_measurement_workbook()
 
-    def _latest_measurement_xlsx_snapshot(self) -> dict[str, object]:
-        method = getattr(self.backend, "latest_measurement_xlsx_snapshot", None)
+    def _measurement_workbook_snapshot(self) -> dict[str, object]:
+        method = getattr(self.backend, "measurement_workbook_snapshot", None)
         if not callable(method):
             method = getattr(
                 getattr(self.backend, "panel", self.backend),
-                "latest_measurement_xlsx_snapshot",
+                "measurement_workbook_snapshot",
                 None,
             )
         try:
@@ -15618,84 +15602,59 @@ class RecordingWorkspace(QtWidgets.QWidget):
             value = {"state": "FAILED", "error": str(exc)}
         return dict(value) if isinstance(value, Mapping) else {}
 
-    def _refresh_latest_measurement_xlsx(self) -> None:
-        if not self._sessionless or not hasattr(self, "latest_xlsx_status_label"):
+    def _refresh_measurement_workbook(self) -> None:
+        if not self._sessionless or not hasattr(self, "measurement_workbook_status_label"):
             return
-        snapshot = self._latest_measurement_xlsx_snapshot()
-        state = str(snapshot.get("state") or "NOT_CREATED").replace("_", " ")
-        target = str(snapshot.get("target_generation") or "")
-        published = str(snapshot.get("published_generation") or "")
-        row_counts = snapshot.get("row_counts")
-        total_rows = 0
-        if isinstance(row_counts, Mapping):
-            for value in row_counts.values():
-                try:
-                    total_rows += max(0, int(value or 0))
-                except (TypeError, ValueError):
-                    continue
-        generation = target or published or "--"
-        visible_generation = _compact_text(generation, limit=34)
+        snapshot = self._measurement_workbook_snapshot()
+        state = str(snapshot.get("state") or "IDLE").replace("_", " ")
+        latest = str(snapshot.get("latest_path") or "")
+        latest_name = Path(latest).name if latest else "--"
+        pending = int(snapshot.get("pending_method_jobs") or 0)
         error = str(snapshot.get("error") or "")
         detail = (
             _compact_text(error, limit=88)
             if error
-            else f"generation={visible_generation} · rows={total_rows}"
+            else f"file={_compact_text(latest_name, limit=40)} · pending methods={pending}"
         )
-        self.latest_xlsx_status_label.setText(
-            f"Latest XLSX · {state} · {detail}"
+        self.measurement_workbook_status_label.setText(
+            f"Measurement XLSX · {state} · {detail}"
         )
-        output = str(snapshot.get("output_path") or "")
-        self.latest_xlsx_status_label.setToolTip(
+        records = snapshot.get("records")
+        record_lines = []
+        if isinstance(records, (list, tuple)):
+            for row in records:
+                if not isinstance(row, Mapping):
+                    continue
+                record_lines.append(
+                    f"{row.get('measurement_id', '--')}: {row.get('state', '--')} · "
+                    f"pending={row.get('pending_method_jobs', 0)} · "
+                    f"{Path(str(row.get('workbook_path') or '')).name or '--'}"
+                )
+        self.measurement_workbook_status_label.setToolTip(
             "\n".join(
                 value
                 for value in (
                     f"State: {state}",
-                    f"Target generation: {target or '--'}",
-                    f"Published generation: {published or '--'}",
-                    f"Output: {output or '--'}",
+                    f"Latest workbook: {latest or '--'}",
+                    f"Writes: {snapshot.get('write_count', 0)} · failures: {snapshot.get('failure_count', 0)}",
                     f"Error: {error}" if error else "",
+                    *record_lines,
                 )
                 if value
             )
         )
-        active = bool(snapshot.get("recording_active", False))
-        generating = str(snapshot.get("state") or "") == "GENERATING"
-        self.update_latest_xlsx_button.setEnabled(not active and not generating)
-        self.open_latest_xlsx_button.setEnabled(
-            bool(published and output and Path(output).is_file())
+        self.open_measurement_workbook_button.setEnabled(
+            bool(latest and Path(latest).is_file())
         )
 
-    def _request_latest_measurement_xlsx(self) -> None:
-        method = getattr(self.backend, "request_latest_measurement_xlsx", None)
-        if not callable(method):
-            method = getattr(
-                getattr(self.backend, "panel", self.backend),
-                "request_latest_measurement_xlsx",
-                None,
-            )
-        accepted = False
-        error = ""
-        try:
-            accepted = bool(method()) if callable(method) else False
-        except Exception as exc:
-            error = str(exc)
-        if not accepted:
-            self.latest_xlsx_status_label.setText(
-                "Latest XLSX · REQUEST REJECTED"
-                + (f" · {_compact_text(error, limit=88)}" if error else "")
-            )
-            self.latest_xlsx_status_label.setToolTip(error)
-            return
-        self._refresh_latest_measurement_xlsx()
-
-    def _open_latest_measurement_xlsx(self) -> None:
-        snapshot = self._latest_measurement_xlsx_snapshot()
-        path = Path(str(snapshot.get("output_path") or ""))
+    def _open_measurement_workbook(self) -> None:
+        snapshot = self._measurement_workbook_snapshot()
+        path = Path(str(snapshot.get("latest_path") or ""))
         if not path.is_file():
-            self._refresh_latest_measurement_xlsx()
+            self._refresh_measurement_workbook()
             return
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
-        self._refresh_latest_measurement_xlsx()
+        self._refresh_measurement_workbook()
 
     def _open_data_folder(self) -> None:
         root = Path(str(self._data_storage_snapshot().get("root") or ""))

@@ -33,7 +33,6 @@ from Workstation.workstation_core.measurement_methods import (
 )
 from Workstation.workstation_core.method_evaluation import (
     METHOD_EVALUATION_QUEUE_LIMIT,
-    METHOD_EVALUATION_TIMEOUT_S,
     FrozenMeasurementPairSnapshot,
     MethodEvaluationBundle,
     MethodEvaluationOutcome,
@@ -435,7 +434,7 @@ def test_non_positive_primary_distance_is_committed_without_blocking_other_data(
         result={**result, "triangulated": triangulated, "estimate": estimate},
     )
     controller, _panel, events, commits = _primary_poll_controller(
-        [MethodEvaluationPoll(primary_outcomes=(primary,))]
+        [MethodEvaluationPoll(outcomes=(primary,))]
     )
 
     controller._poll_method_evaluations()
@@ -545,6 +544,43 @@ def _slow_primary_worker(
         )
         if method_id == PIXHAWK_RTK_LIVE:
             time.sleep(2.0)
+        outcome = evaluate_method_request(
+            request,
+            worker_started_monotonic_ns=started_ns,
+        )
+        output_queue.put({"kind": "outcome", "outcome": outcome.to_record()})
+
+
+def _crashing_horizon_worker(
+    method_id: str,
+    _expected_parent_pid: int,
+    input_queue: object,
+    output_queue: object,
+) -> None:
+    """Spawn-safe test worker whose Horizon process dies mid-evaluation."""
+
+    import os as _os
+
+    while True:
+        payload = input_queue.get()
+        if payload is None:
+            return
+        request = MethodEvaluationRequest.from_mapping(payload)
+        started_ns = time.monotonic_ns()
+        output_queue.put(
+            {
+                "kind": "started",
+                "measurement_id": request.measurement_id,
+                "pair_id": request.pair_id,
+                "pair_sequence": request.pair_sequence,
+                "snapshot_sha256": request.snapshot_sha256,
+                "request_generation": request.request_generation,
+                "method_id": request.method_id,
+                "worker_started_monotonic_ns": started_ns,
+            }
+        )
+        if method_id == "horizon_hybrid":
+            _os._exit(3)
         outcome = evaluate_method_request(
             request,
             worker_started_monotonic_ns=started_ns,
@@ -731,7 +767,7 @@ def test_missing_frozen_input_produces_an_explicit_blocked_outcome() -> None:
     assert outcome.queue_wait_ms == pytest.approx(0.001)
 
 
-def test_bundle_requires_all_methods_in_canonical_order_and_verifies_hashes() -> None:
+def test_bundle_accepts_canonical_subsets_and_verifies_hashes() -> None:
     base = evaluate_method_request(
         _request(attempt_payload=None, blocked_reasons=("not ready",)),
         worker_started_monotonic_ns=2_000,
@@ -751,21 +787,36 @@ def test_bundle_requires_all_methods_in_canonical_order_and_verifies_hashes() ->
         snapshot_sha256=base.snapshot_sha256,
         request_generation=base.request_generation,
         outcomes=outcomes,
+        planned_methods={"terrain_pnp": "no Terrain PnP candidate"},
     )
 
     assert MethodEvaluationBundle.from_mapping(bundle.to_record()) == bundle
+    assert bundle.primary is outcomes[0]
     with pytest.raises(ValueError, match="canonical order"):
         replace(bundle, outcomes=tuple(reversed(outcomes)))
+    with pytest.raises(ValueError, match="duplicate"):
+        replace(bundle, outcomes=(outcomes[2], outcomes[2]))
+    with pytest.raises(ValueError, match="at least one"):
+        replace(bundle, outcomes=())
     tampered = bundle.to_record()
     tampered["outcomes"][0]["status"] = "FAILED"
     with pytest.raises(ValueError, match="hash mismatch"):
         MethodEvaluationBundle.from_mapping(tampered)
 
+    subset = replace(bundle, outcomes=(outcomes[2], outcomes[5]))
+    assert subset.primary is None
+    assert subset.submitted_method_ids == (outcomes[2].method_id, outcomes[5].method_id)
+    assert subset.outcome_for(outcomes[5].method_id) is outcomes[5]
+    record = subset.to_record()
+    assert record["primary_outcome_sha256"] == ""
+    assert record["submitted_method_ids"] == list(subset.submitted_method_ids)
+    assert MethodEvaluationBundle.from_mapping(record) == subset
 
-def test_worker_policy_has_eight_timeouts_and_twenty_primary_queue_slots() -> None:
-    assert tuple(METHOD_EVALUATION_TIMEOUT_S) == MEASUREMENT_METHOD_IDS
-    assert METHOD_EVALUATION_TIMEOUT_S["horizon_hybrid"] == 1.0
-    assert METHOD_EVALUATION_TIMEOUT_S["terrain_pnp"] == 10.0
+
+def test_worker_policy_has_no_compute_timeout_and_twenty_slots_per_method() -> None:
+    from Workstation.workstation_core import method_evaluation
+
+    assert not hasattr(method_evaluation, "METHOD_EVALUATION_TIMEOUT_S")
     assert METHOD_EVALUATION_QUEUE_LIMIT == 20
 
 
@@ -871,24 +922,32 @@ def test_request_fanout_uses_one_snapshot_and_canonical_method_order() -> None:
     assert requests[1].reused_inputs == ()
 
 
-def test_pair_queue_rejects_the_twenty_first_pair_as_persistable_backpressure() -> None:
+def test_saturated_method_gets_backpressure_while_other_methods_stay_admitted() -> None:
     coordinator = MethodEvaluationCoordinator(start_workers=False)
     try:
         for sequence in range(1, METHOD_EVALUATION_QUEUE_LIMIT + 1):
             assert coordinator.submit(_blocked_requests(sequence)).accepted is True
 
         overflow = coordinator.submit(_blocked_requests(21))
+        assert overflow.accepted is True
+        assert overflow.submitted_method_ids == MEASUREMENT_METHOD_IDS
 
-        assert overflow.accepted is False
-        assert overflow.backpressure_bundle is not None
-        assert {row.status for row in overflow.backpressure_bundle.outcomes} == {
-            "BACKPRESSURE_BLOCKED"
-        }
+        blocked: dict[str, MethodEvaluationOutcome] = {}
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and len(blocked) < len(MEASUREMENT_METHOD_IDS):
+            for outcome in coordinator.poll().outcomes:
+                if outcome.pair_sequence == 21:
+                    blocked[outcome.method_id] = outcome
+            time.sleep(0.01)
+        assert {row.status for row in blocked.values()} == {"BACKPRESSURE_BLOCKED"}
+        assert set(blocked) == set(MEASUREMENT_METHOD_IDS)
+        assert (blocked["horizon_hybrid"].pair_id, 3) not in coordinator.pending_jobs()
     finally:
         coordinator.close()
+        assert coordinator.wait_closed(10.0)
 
 
-def test_comparison_backlog_does_not_reject_the_next_primary_pair() -> None:
+def test_slow_method_backlog_only_blocks_that_method() -> None:
     coordinator = MethodEvaluationCoordinator(
         mp_context=multiprocessing.get_context("spawn"),
         process_target=_slow_horizon_worker,
@@ -909,37 +968,42 @@ def test_comparison_backlog_does_not_reject_the_next_primary_pair() -> None:
             )
             time.sleep(0.01)
         assert len(primary_pairs) == METHOD_EVALUATION_QUEUE_LIMIT
-        assert coordinator.pending_pair_count >= METHOD_EVALUATION_QUEUE_LIMIT
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline and any(
+            methods != ("horizon_hybrid",)
+            for methods in coordinator.pending_jobs().values()
+        ):
+            coordinator.poll()
+            time.sleep(0.01)
+        assert coordinator.pending_pair_count >= 1
+        assert all(
+            methods == ("horizon_hybrid",)
+            for methods in coordinator.pending_jobs().values()
+        )
 
         admitted = coordinator.submit(_blocked_requests(21))
         assert admitted.accepted is True
-        assert admitted.backpressure_bundle is None
 
-        primary_21 = None
-        bundle_21 = None
+        outcomes_21: dict[str, MethodEvaluationOutcome] = {}
         deadline = time.monotonic() + 4.0
-        while time.monotonic() < deadline and bundle_21 is None:
-            polled = coordinator.poll()
-            for outcome in polled.primary_outcomes:
+        while time.monotonic() < deadline and len(outcomes_21) < len(MEASUREMENT_METHOD_IDS) - 1:
+            for outcome in coordinator.poll().outcomes:
                 if outcome.pair_sequence == 21:
-                    primary_21 = outcome
-            for bundle in polled.completed_bundles:
-                if bundle.pair_sequence == 21:
-                    bundle_21 = bundle
+                    outcomes_21[outcome.method_id] = outcome
             time.sleep(0.01)
-        assert primary_21 is not None
-        assert primary_21.status == "BLOCKED"
-        assert bundle_21 is not None
-        assert bundle_21.primary == primary_21
-        assert {
-            outcome.status for outcome in bundle_21.outcomes[1:]
-        } == {"BACKPRESSURE_BLOCKED"}
+        assert outcomes_21[PIXHAWK_RTK_LIVE].status == "BLOCKED"
+        assert outcomes_21["horizon_hybrid"].status == "BACKPRESSURE_BLOCKED"
+        assert all(
+            outcome.status == "BLOCKED"
+            for method_id, outcome in outcomes_21.items()
+            if method_id != "horizon_hybrid"
+        )
     finally:
         coordinator.close()
         assert coordinator.wait_closed(10.0)
 
 
-def test_primary_timeout_still_releases_comparison_workers_and_bundle() -> None:
+def test_slow_primary_is_never_timed_out_and_completes() -> None:
     coordinator = MethodEvaluationCoordinator(
         mp_context=multiprocessing.get_context("spawn"),
         process_target=_slow_primary_worker,
@@ -948,7 +1012,7 @@ def test_primary_timeout_still_releases_comparison_workers_and_bundle() -> None:
     bundle = None
     try:
         assert coordinator.submit(_blocked_requests(1)).accepted is True
-        deadline = time.monotonic() + 6.0
+        deadline = time.monotonic() + 8.0
         while time.monotonic() < deadline and bundle is None:
             polled = coordinator.poll()
             if polled.primary_outcomes:
@@ -957,60 +1021,108 @@ def test_primary_timeout_still_releases_comparison_workers_and_bundle() -> None:
                 bundle = polled.completed_bundles[0]
             time.sleep(0.01)
         assert primary is not None
-        assert primary.status == "TIMEOUT"
+        assert primary.status == "BLOCKED"
+        assert primary.evaluation_duration_ms is not None
+        assert primary.evaluation_duration_ms >= 1_900.0
         assert bundle is not None
-        assert bundle.primary.status == "TIMEOUT"
-        assert all(
-            outcome.status == "BLOCKED" for outcome in bundle.outcomes[1:]
-        )
-        assert all(
-            generation >= 1
-            for generation in coordinator.worker_generations.values()
-        )
+        assert bundle.primary == primary
+        assert coordinator.worker_generations[PIXHAWK_RTK_LIVE] == 1
     finally:
         coordinator.close()
         assert coordinator.wait_closed(10.0)
 
 
-def test_comparison_workers_run_independently_and_timed_out_worker_restarts() -> None:
+def test_subset_submission_runs_only_requested_methods() -> None:
     coordinator = MethodEvaluationCoordinator(
         mp_context=multiprocessing.get_context("spawn"),
         process_target=_slow_horizon_worker,
     )
-    primary_seen_at: float | None = None
     bundle = None
-    poll_durations: list[float] = []
-    started_at = time.monotonic()
     try:
-        assert coordinator.submit(_blocked_requests(1)).accepted is True
-        deadline = started_at + 8.0
+        requests = tuple(
+            request
+            for request in _blocked_requests(1)
+            if request.method_id in {PIXHAWK_RTK_LIVE, "checkerboard_stereo"}
+        )
+        submission = coordinator.submit(
+            requests,
+            planned_methods={"terrain_pnp": "no Terrain PnP candidate"},
+        )
+        assert submission.submitted_method_ids == (PIXHAWK_RTK_LIVE, "checkerboard_stereo")
+        deadline = time.monotonic() + 8.0
         while time.monotonic() < deadline and bundle is None:
-            poll_started_s = time.monotonic()
             polled = coordinator.poll()
-            poll_durations.append(time.monotonic() - poll_started_s)
-            if polled.primary_outcomes and primary_seen_at is None:
-                primary_seen_at = time.monotonic()
             if polled.completed_bundles:
                 bundle = polled.completed_bundles[0]
-                break
             time.sleep(0.01)
-
         assert bundle is not None
-        assert primary_seen_at is not None
-        assert primary_seen_at - started_at < 1.0
-        assert bundle.outcomes[MEASUREMENT_METHOD_IDS.index("horizon_hybrid")].status == "TIMEOUT"
+        assert bundle.submitted_method_ids == (PIXHAWK_RTK_LIVE, "checkerboard_stereo")
+        assert bundle.planned_methods == {"terrain_pnp": "no Terrain PnP candidate"}
+        assert coordinator.pending_pair_count == 0
+        with pytest.raises(ValueError, match="canonical order"):
+            coordinator.submit(tuple(reversed(requests)))
+    finally:
+        coordinator.close()
+        assert coordinator.wait_closed(10.0)
+
+
+def test_crashed_worker_yields_failed_outcome_and_restarts() -> None:
+    coordinator = MethodEvaluationCoordinator(
+        mp_context=multiprocessing.get_context("spawn"),
+        process_target=_crashing_horizon_worker,
+    )
+    bundle = None
+    try:
+        assert coordinator.submit(_blocked_requests(1)).accepted is True
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and bundle is None:
+            polled = coordinator.poll()
+            if polled.completed_bundles:
+                bundle = polled.completed_bundles[0]
+            time.sleep(0.01)
+        assert bundle is not None
+        horizon = bundle.outcome_for("horizon_hybrid")
+        assert horizon is not None
+        assert horizon.status == "FAILED"
+        assert "exited unexpectedly" in horizon.reasons[0]
         assert all(
             outcome.status == "BLOCKED"
             for outcome in bundle.outcomes
             if outcome.method_id != "horizon_hybrid"
         )
         assert coordinator.worker_generations["horizon_hybrid"] >= 2
-        assert max(poll_durations, default=0.0) < 0.05
     finally:
-        close_started_s = time.monotonic()
         coordinator.close()
-        assert time.monotonic() - close_started_s < 0.05
         assert coordinator.wait_closed(10.0)
+
+
+def test_close_marks_unfinished_methods_failed_instead_of_dropping_them() -> None:
+    coordinator = MethodEvaluationCoordinator(
+        mp_context=multiprocessing.get_context("spawn"),
+        process_target=_slow_horizon_worker,
+    )
+    assert coordinator.submit(_blocked_requests(1)).accepted is True
+    primary_seen = False
+    deadline = time.monotonic() + 6.0
+    while time.monotonic() < deadline and not primary_seen:
+        primary_seen = bool(coordinator.poll().primary_outcomes)
+        time.sleep(0.01)
+    assert primary_seen
+
+    close_started_s = time.monotonic()
+    coordinator.close()
+    assert time.monotonic() - close_started_s < 0.05
+    assert coordinator.wait_closed(10.0)
+
+    polled = coordinator.poll()
+    failed = {
+        outcome.method_id: outcome
+        for outcome in polled.outcomes
+        if outcome.status == "FAILED"
+    }
+    assert "horizon_hybrid" in failed
+    assert "closed before completion" in failed["horizon_hybrid"].reasons[0]
+    assert polled.completed_bundles and polled.completed_bundles[0].outcome_for("horizon_hybrid") is not None
 
 
 @pytest.mark.parametrize("status", ("VALID", "ESTIMATED"))
@@ -1019,7 +1131,7 @@ def test_running_sessionless_primary_success_commits_before_display_without_bund
 ) -> None:
     primary = _primary_outcome(status)
     controller, _panel, events, commits = _primary_poll_controller(
-        [MethodEvaluationPoll(primary_outcomes=(primary,))]
+        [MethodEvaluationPoll(outcomes=(primary,))]
     )
 
     controller._poll_method_evaluations()
@@ -1047,9 +1159,9 @@ def test_duplicate_primary_and_blocked_comparison_bundle_commit_measurement_once
     bundle = _bundle_with_primary(primary)
     controller, panel, _events, commits = _primary_poll_controller(
         [
-            MethodEvaluationPoll(primary_outcomes=(primary,)),
+            MethodEvaluationPoll(outcomes=(primary,)),
             MethodEvaluationPoll(
-                primary_outcomes=(primary,),
+                outcomes=(primary,),
                 completed_bundles=(bundle,),
             ),
         ]
@@ -1133,7 +1245,7 @@ def test_stopped_or_idle_primary_outcome_has_no_measurement_commit_or_ui(
 ) -> None:
     primary = _primary_outcome()
     controller, _panel, events, commits = _primary_poll_controller(
-        [MethodEvaluationPoll(primary_outcomes=(primary,))],
+        [MethodEvaluationPoll(outcomes=(primary,))],
         admissions=(),
         run_state=run_state,
     )
@@ -1153,7 +1265,7 @@ def test_nonsuccess_primary_outcome_never_commits_a_measurement(
 ) -> None:
     primary = _primary_outcome(status)
     controller, _panel, events, commits = _primary_poll_controller(
-        [MethodEvaluationPoll(primary_outcomes=(primary,))],
+        [MethodEvaluationPoll(outcomes=(primary,))],
         admissions=(),
     )
 
@@ -1168,7 +1280,7 @@ def test_rejected_early_primary_enqueue_retries_in_background_without_second_his
     bundle = _bundle_with_primary(primary)
     controller, panel, events, commits = _primary_poll_controller(
         [
-            MethodEvaluationPoll(primary_outcomes=(primary,)),
+            MethodEvaluationPoll(outcomes=(primary,)),
             MethodEvaluationPoll(completed_bundles=(bundle,)),
         ],
         admissions=(False, True),
@@ -1200,7 +1312,7 @@ def test_saved_bundle_keeps_rejected_primary_retry_owned_and_ui_degraded() -> No
     bundle = _bundle_with_primary(primary)
     controller, panel, _events, commits = _primary_poll_controller(
         [
-            MethodEvaluationPoll(primary_outcomes=(primary,)),
+            MethodEvaluationPoll(outcomes=(primary,)),
             MethodEvaluationPoll(completed_bundles=(bundle,)),
         ],
         admissions=(False, False, False, False, True),
@@ -1259,7 +1371,7 @@ def test_saved_bundle_keeps_rejected_primary_retry_owned_and_ui_degraded() -> No
 def test_rejected_old_primary_retries_late_direct_without_blocking_next_run() -> None:
     primary = _primary_outcome()
     controller, panel, _events, commits = _primary_poll_controller(
-        [MethodEvaluationPoll(primary_outcomes=(primary,))],
+        [MethodEvaluationPoll(outcomes=(primary,))],
         admissions=(False, False),
     )
     displays: list[dict[str, object]] = []
@@ -1630,7 +1742,7 @@ def test_conflicting_bundle_preserves_first_primary_commit_and_status() -> None:
     bundle = _bundle_with_primary(conflicting)
     controller, panel, events, commits = _primary_poll_controller(
         [
-            MethodEvaluationPoll(primary_outcomes=(primary,)),
+            MethodEvaluationPoll(outcomes=(primary,)),
             MethodEvaluationPoll(completed_bundles=(bundle,)),
         ]
     )

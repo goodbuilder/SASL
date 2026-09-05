@@ -38,6 +38,8 @@ export SASL_WORKSTATION_DATA_ROOT=/absolute/path/to/workstation_data
 
 | 데이터 유형 | 지정 파일 |
 | --- | --- |
+| Measurement 워크북 (Start→Stop 1건) | `YYYYMMDD_HHMMSS[-NN]_measurement.xlsx` |
+| Measurement 영상 | `YYYYMMDD_HHMMSS[-NN]_left.mp4`, `..._right.mp4` (동일 Start prefix) |
 | 실행/장치/캡처 이벤트 | `events.jsonl`, `capture_events.jsonl` |
 | 측정 결과 | `measurements.jsonl` |
 | 8개 방법 평가 | `method_evaluations.jsonl` |
@@ -50,6 +52,14 @@ export SASL_WORKSTATION_DATA_ROOT=/absolute/path/to/workstation_data
 | RTCM 바이너리/인덱스 | `raw/gnss/*.rtcm`, `raw/gnss/*.rtcm.jsonl` |
 
 이 파일은 앱을 재시작해도 같은 파일에 계속 append된다. 자동 rotation, Parquet, `review.xlsx`, Measurement 폴더 확정은 없다.
+
+Measurement 워크북은 사람이 직접 읽는 기본 기록이다. 탭: `00_Summary`, `01/02_*_Detections`(모든 detection 후보),
+`03_Calibration`(K,D), `04_Alignment`(적용 R,t), Method 탭 `10_Pixhawk_RTK`…`18_Pixhawk_RP_GPS_Yaw`
+(모두 동일 섹션 A 결과/R,t · B 선택 detection · C 실제 u,v/ray · D R,t 근거 · E 진단), PX4 P1/P2/Drone
+telemetry 탭(Attitude/GNSS_RTK/IMU_Mag/Position/System, downsampling 없음), `43_Base_GNSS`, `50_Events`,
+`90_Flat`, `91_Exact`(float.hex), `98_Provenance`, `99_Definitions`. 값이 없으면 `N/A`. 워크북은 임시 파일을
+완성·fsync한 뒤 atomic replace로 갱신되므로 크래시 시에도 마지막 정상 파일이 남는다. 워크북 저장 실패는
+`Data > Status`와 `50_Events`에만 나타나며 측정·JSONL·MP4·ULog·RTCM 저장을 막지 않는다.
 
 MP4, 사진, native PNG, ULog의 파일명은 `YYYYMMDD_HHMMSS_nanoseconds+offset_label.ext`다. 충돌하면 `-01`, `-02` 등을 붙이며 기존 파일은 덮어쓰지 않는다.
 
@@ -93,12 +103,17 @@ IDLE → QUEUED(필요 시) → STARTING → RUNNING → STOPPING → IDLE
   `ESTIMATED`로 도착하면 UI를 갱신하기 전 `measurements.jsonl` priority 큐에
   넣는다. enqueue 시도와 그 결과 확인이 먼저고 현재 테이블·이력·그래프·거리 banner
   갱신은 나중이다. 거부된 enqueue는 degraded evidence로 표시될 수 있다.
-- primary worker를 먼저 시작·dispatch하고 primary terminal 또는 1초 timeout 후 비교
-  worker를 시작한다. primary와 comparison은 각각 20-pair 한도를 쓴다. comparison만
-  포화되면 primary는 계속 받고 그 pair의 comparison만 `BACKPRESSURE_BLOCKED`로 남긴다.
-- primary `BLOCKED`/`FAILED`/`TIMEOUT`/`BACKPRESSURE_BLOCKED`는 대표 측정 행을
-  만들지 않고 `method_evaluations.jsonl`에만 남는다. 8개 method의 전체 결과도
-  나중에 같은 파일에 bundle로 append된다.
+- pair마다 준비된 Method만 worker에 제출한다. 준비되지 않은 Method는 워크북에
+  `Attempted=NO / Status=N/A`와 사유로 남는다. Method 계산에는 자동 timeout이 없다:
+  worker 프로세스가 죽거나 앱이 종료될 때만 `FAILED`가 된다. Method별 대기 한도(20 pair)를
+  넘긴 요청만 해당 Method에 한해 `BACKPRESSURE_BLOCKED`가 된다.
+- 여러 detection이 있어도, Δt·수직 편차·시차가 커도, depth가 음수여도 결과는 계산·저장된다
+  (경고 첨부). 좌·우 detection의 class가 다르면 pair를 만들지 않는다(`correspondence_class_mismatch`).
+  수학적으로 정의되지 않는 경우(baseline 0, 평행 ray, 입력 결손/비정상, 비유한 해)만 F/R/D/Range가
+  `N/A`이며 입력·R,t·사유는 그대로 남는다.
+- primary `BLOCKED`/`FAILED`/`BACKPRESSURE_BLOCKED`는 대표 측정 행을 만들지 않고
+  `method_evaluations.jsonl`에만 남는다. 제출된 Method의 결과가 모두 도착하면 같은 파일에
+  bundle로 append되고, 개별 결과는 도착 즉시 워크북에 반영된다.
 - 여기서 즉시 저장은 비동기 priority enqueue를 뜻한다. 해당 시점에 디스크
   write/flush/`fsync`까지 완료됐다는 뜻은 아니다.
 - 8-method bundle은 enqueue가 승인된 뒤에만 commit/count한다. 활성 행 enqueue가 거부되면
@@ -142,6 +157,10 @@ GNSS/RTK 거리가 나타날 때까지 기다린 뒤 Stop한다. 사용하지 �
 `Data > Status`의 store lifecycle가 `OPEN`인지도 확인한다. `CLOSING`/`CLOSED`는 새
 enqueue를 받지 않으므로, 필요한 대표 행이 없다면 정상 `OPEN` store로 새 Measurement를
 시작하고 거리 표시 후 Stop한다.
+
+Stop 시점에 계산 중이던 Method는 계속 실행되며, 그 결과는 나중에 도착해도 원래 Measurement의
+워크북에 반영된다(`Data > Status`의 pending methods 수로 확인). Method worker는 앱 수명 동안 유지되므로
+다음 측정 시작이 이전 측정의 계산을 끊지 않으며, 이전 결과가 새 측정에 섞이지 않는다.
 
 실제 카메라 worker가 종료하면 Run은 `IDLE`로 돌아가고 바로 다음 측정을 시작할 수 있다. 나중에 하나의 실험 묶음으로 만들려면 `recorded_utc_ns`, source timestamp, `runtime_generation`과 timestamped binary 파일명을 기준으로 외부에서 모은다.
 

@@ -29,6 +29,15 @@ class MeasurementGeometryResult:
 
 
 def calculate_measurement_geometry(inputs: MeasurementAttempt) -> MeasurementGeometryResult:
+    """Compute two-ray geometry for one frozen pair.
+
+    Pair-quality conditions (ambiguous candidates, time delta, vertical delta,
+    small disparity, signed depth, ray gap) never prevent the computation;
+    they are carried as warnings. Only a missing side, a Left/Right class
+    mismatch, or a mathematically undefined solution leaves ``triangulated``
+    empty.
+    """
+
     correspondence_reason = correspondence_rejection_reason(
         inputs.left_detection,
         inputs.right_detection,
@@ -54,9 +63,12 @@ def calculate_measurement_geometry(inputs: MeasurementAttempt) -> MeasurementGeo
             triangulated=None,
             estimate=None,
             warnings=tuple(inputs.warnings),
-            triangulation_reason=correspondence_reason or "correspondence_rejected",
+            triangulation_reason=correspondence_reason or "missing_input",
         )
-    triangulation = _triangulate(inputs, tuple(inputs.warnings))
+    triangulation = _triangulate(
+        inputs,
+        tuple(dict.fromkeys((*inputs.warnings, *match.warnings))),
+    )
     estimate = None
     if triangulation.result is not None:
         estimate = stereo_estimate_from_match(match, distance_m=triangulation.result.range_m)

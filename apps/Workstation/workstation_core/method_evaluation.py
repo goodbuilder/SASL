@@ -1,10 +1,12 @@
 """Canonical per-method Measurement evaluation contracts.
 
-One matched detection pair owns one immutable snapshot.  Every canonical
-Measurement method produces exactly one terminal outcome for that snapshot;
-the primary Pixhawk/RTK outcome and the comparison outcomes never
-overwrite one another.  This module is Qt-free so the same evaluator can run
-in the main process, a reference test, or an isolated worker process.
+One matched detection pair owns one immutable snapshot.  Only the methods
+that are actually ready for that pair are submitted; each submitted method
+produces exactly one terminal outcome and outcomes never overwrite one
+another.  There is no compute deadline: a method runs until it returns, the
+worker dies, or the application shuts down.  This module is Qt-free so the
+same evaluator can run in the main process, a reference test, or an
+isolated worker process.
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ import hashlib
 import json
 import math
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
 from Workstation.workstation_core.measurement_attempt import MeasurementAttempt
@@ -22,16 +24,8 @@ from Workstation.workstation_core.measurement_controller import (
     calculate_measurement_geometry,
 )
 from Workstation.workstation_core.measurement_methods import (
-    CHECKERBOARD_STEREO,
-    COMBINED_HYBRID,
-    DRONE_RTK_MULTIVIEW,
-    DRONE_RTK_ROTATION_HYBRID,
-    HORIZON_HYBRID,
     MEASUREMENT_METHOD_IDS,
-    MOUNTAIN_GNSS,
     PIXHAWK_RTK_LIVE,
-    PIXHAWK_RP_GPS_BASELINE_YAW,
-    TERRAIN_PNP,
 )
 
 METHOD_EVALUATION_SCHEMA = "workstation-method-evaluation-v1"
@@ -40,6 +34,8 @@ METHOD_EVALUATION_BUNDLE_SCHEMA = "workstation-method-evaluation-bundle-v1"
 METHOD_EVALUATION_PRIMARY_METHOD = PIXHAWK_RTK_LIVE
 METHOD_EVALUATION_QUEUE_LIMIT = 20
 
+# "TIMEOUT" is accepted only when reading rows written before compute
+# deadlines were removed; no new outcome can carry it.
 METHOD_EVALUATION_STATUSES = frozenset(
     {
         "VALID",
@@ -50,18 +46,24 @@ METHOD_EVALUATION_STATUSES = frozenset(
         "BACKPRESSURE_BLOCKED",
     }
 )
+METHOD_EVALUATION_TERMINAL_FAILURE_STATUSES = frozenset({"FAILED", "BACKPRESSURE_BLOCKED"})
 
-METHOD_EVALUATION_TIMEOUT_S: Mapping[str, float] = {
-    PIXHAWK_RTK_LIVE: 1.0,
-    PIXHAWK_RP_GPS_BASELINE_YAW: 1.0,
-    CHECKERBOARD_STEREO: 3.0,
-    HORIZON_HYBRID: 1.0,
-    MOUNTAIN_GNSS: 3.0,
-    DRONE_RTK_ROTATION_HYBRID: 3.0,
-    DRONE_RTK_MULTIVIEW: 5.0,
-    TERRAIN_PNP: 10.0,
-    COMBINED_HYBRID: 3.0,
-}
+
+def canonical_method_order(method_ids: Iterable[str]) -> tuple[str, ...]:
+    """Validate a submitted method subset and return it in canonical order."""
+
+    ordered = tuple(method_ids)
+    if not ordered:
+        raise ValueError("at least one measurement method is required")
+    unknown = [method_id for method_id in ordered if method_id not in MEASUREMENT_METHOD_IDS]
+    if unknown:
+        raise ValueError(f"unsupported measurement method: {unknown[0]}")
+    if len(set(ordered)) != len(ordered):
+        raise ValueError("duplicate measurement method in submission")
+    canonical = tuple(method_id for method_id in MEASUREMENT_METHOD_IDS if method_id in ordered)
+    if canonical != ordered:
+        raise ValueError("methods must be listed in canonical order")
+    return canonical
 
 METHOD_RESULT_RELATIVE_PATHS: Mapping[str, str] = {
     method_id: f"data/raw/method_results/{method_id}.jsonl"
@@ -426,6 +428,13 @@ class MethodEvaluationOutcome:
 
 @dataclass(frozen=True)
 class MethodEvaluationBundle:
+    """Every terminal outcome of the methods that were submitted for one pair.
+
+    The subset may be any non-empty selection of canonical methods, listed in
+    canonical order; ``planned_methods`` optionally records the methods that
+    were considered but not submitted (with their not-ready reasons).
+    """
+
     measurement_id: str
     pair_id: str
     pair_sequence: int
@@ -433,6 +442,7 @@ class MethodEvaluationBundle:
     request_generation: int
     outcomes: tuple[MethodEvaluationOutcome, ...]
     snapshot_payload: Mapping[str, object] = field(default_factory=dict)
+    planned_methods: Mapping[str, str] = field(default_factory=dict)
     schema: str = METHOD_EVALUATION_BUNDLE_SCHEMA
 
     def __post_init__(self) -> None:
@@ -447,9 +457,15 @@ class MethodEvaluationBundle:
             snapshot = FrozenMeasurementPairSnapshot.from_mapping(self.snapshot_payload)
             if snapshot.canonical_sha256() != self.snapshot_sha256:
                 raise ValueError("bundle snapshot payload does not match snapshot_sha256")
-        method_ids = tuple(outcome.method_id for outcome in self.outcomes)
-        if method_ids != MEASUREMENT_METHOD_IDS:
-            raise ValueError("bundle outcomes must contain every method in canonical order")
+        try:
+            canonical_method_order(outcome.method_id for outcome in self.outcomes)
+        except ValueError as exc:
+            raise ValueError(f"bundle outcomes must be a canonical order subset: {exc}") from exc
+        object.__setattr__(
+            self,
+            "planned_methods",
+            {str(key): str(value) for key, value in dict(self.planned_methods).items()},
+        )
         for outcome in self.outcomes:
             if (
                 outcome.measurement_id != self.measurement_id
@@ -461,10 +477,21 @@ class MethodEvaluationBundle:
                 raise ValueError("bundle outcome identity mismatch")
 
     @property
-    def primary(self) -> MethodEvaluationOutcome:
-        return self.outcomes[MEASUREMENT_METHOD_IDS.index(METHOD_EVALUATION_PRIMARY_METHOD)]
+    def submitted_method_ids(self) -> tuple[str, ...]:
+        return tuple(outcome.method_id for outcome in self.outcomes)
+
+    def outcome_for(self, method_id: str) -> MethodEvaluationOutcome | None:
+        for outcome in self.outcomes:
+            if outcome.method_id == method_id:
+                return outcome
+        return None
+
+    @property
+    def primary(self) -> MethodEvaluationOutcome | None:
+        return self.outcome_for(METHOD_EVALUATION_PRIMARY_METHOD)
 
     def canonical_payload(self) -> dict[str, object]:
+        primary = self.primary
         return {
             "schema": self.schema,
             "measurement_id": self.measurement_id,
@@ -473,7 +500,9 @@ class MethodEvaluationBundle:
             "snapshot_sha256": self.snapshot_sha256,
             "request_generation": int(self.request_generation),
             "primary_method_id": METHOD_EVALUATION_PRIMARY_METHOD,
-            "primary_outcome_sha256": self.primary.canonical_sha256(),
+            "primary_outcome_sha256": "" if primary is None else primary.canonical_sha256(),
+            "submitted_method_ids": list(self.submitted_method_ids),
+            "planned_methods": dict(self.planned_methods),
             "snapshot_payload": dict(self.snapshot_payload),
             "outcomes": [outcome.to_record() for outcome in self.outcomes],
         }
@@ -508,11 +537,16 @@ class MethodEvaluationBundle:
                 if isinstance(payload.get("snapshot_payload"), Mapping)
                 else {}
             ),
+            planned_methods=(
+                dict(payload.get("planned_methods"))
+                if isinstance(payload.get("planned_methods"), Mapping)
+                else {}
+            ),
         )
         supplied_primary_sha256 = str(payload.get("primary_outcome_sha256") or "")
-        if (
-            supplied_primary_sha256
-            and supplied_primary_sha256 != bundle.primary.canonical_sha256()
+        primary = bundle.primary
+        if supplied_primary_sha256 and (
+            primary is None or supplied_primary_sha256 != primary.canonical_sha256()
         ):
             raise ValueError("primary method evaluation hash mismatch")
         supplied_sha256 = str(payload.get("method_evaluation_bundle_sha256") or "")
@@ -545,6 +579,10 @@ def _geometry_result_payload(result: MeasurementGeometryResult) -> dict[str, obj
             "point_m": list(triangulated.point_m),
             "range_m": float(triangulated.range_m),
             "closest_gap_m": float(triangulated.closest_gap_m),
+            "ray_angle_deg": float(triangulated.ray_angle_deg),
+            "left_depth_m": float(triangulated.left_depth_m),
+            "right_depth_m": float(triangulated.right_depth_m),
+            "output_frame": str(triangulated.output_frame),
             "source_point_left_rdf_m": (
                 None
                 if triangulated.source_point_left_rdf_m is None
@@ -590,6 +628,9 @@ def evaluate_method_request(
     if attempt.measurement_method_id != request.method_id:
         raise ValueError("request method does not match MeasurementAttempt")
     if request.blocked_reasons:
+        # The submitter declared this method not ready; honour that without
+        # inventing a result (the live controller no longer submits such
+        # requests, but the contract stays explicit for direct callers).
         return MethodEvaluationOutcome(
             measurement_id=request.measurement_id,
             pair_id=request.pair_id,
@@ -614,11 +655,13 @@ def evaluate_method_request(
     reasons: tuple[str, ...] = ()
     outcome_warnings = tuple(geometry.warnings)
     if geometry.match is None or geometry.triangulated is None or geometry.estimate is None:
+        # Only mathematically undefined geometry ends here; every quality
+        # condition above is a warning on a computed result.
         status = "BLOCKED"
         reasons = (str(geometry.triangulation_reason or "geometry_unavailable"),)
     else:
         outcome_warnings = tuple(
-            dict.fromkeys((*geometry.warnings, *geometry.estimate.warnings))
+            dict.fromkeys((*outcome_warnings, *geometry.estimate.warnings))
         )
         status = "ESTIMATED" if outcome_warnings else "VALID"
     return MethodEvaluationOutcome(
@@ -650,7 +693,7 @@ def failed_outcome(
     reason: str,
     worker_started_monotonic_ns: int = 0,
 ) -> MethodEvaluationOutcome:
-    if status not in {"FAILED", "TIMEOUT", "BACKPRESSURE_BLOCKED"}:
+    if status not in METHOD_EVALUATION_TERMINAL_FAILURE_STATUSES:
         raise ValueError("failed_outcome requires a terminal failure status")
     return MethodEvaluationOutcome(
         measurement_id=request.measurement_id,
@@ -682,12 +725,13 @@ __all__ = [
     "METHOD_EVALUATION_REQUEST_SCHEMA",
     "METHOD_EVALUATION_SCHEMA",
     "METHOD_EVALUATION_STATUSES",
-    "METHOD_EVALUATION_TIMEOUT_S",
+    "METHOD_EVALUATION_TERMINAL_FAILURE_STATUSES",
     "METHOD_RESULT_RELATIVE_PATHS",
     "FrozenMeasurementPairSnapshot",
     "MethodEvaluationBundle",
     "MethodEvaluationOutcome",
     "MethodEvaluationRequest",
+    "canonical_method_order",
     "evaluate_method_request",
     "failed_outcome",
 ]

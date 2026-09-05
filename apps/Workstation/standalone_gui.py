@@ -234,6 +234,7 @@ from Workstation.workstation_core.settings import (
 from Workstation.workstation_core.stereo import (
     DetectionObservation,
     TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC,
+    correspondence_advisories,
     correspondence_rejection_reason,
     detection_timestamp_for_basis,
 )
@@ -10296,13 +10297,15 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             )
             if app_timestamp_invalid:
                 timing_rejection = "APP_RECEIVE_TIMESTAMP_INVALID"
-            elif match_nearest_pair(
-                left_samples,
-                right_samples,
-                max_delta_s=float("inf"),
-                timestamp=self._yolo_match_timestamp_s,
-            ) is not None:
-                timing_rejection = "APP_RECEIVE_DELTA_EXCEEDED"
+            else:
+                # The window only prefers close partners; the nearest pair is
+                # still measured and its excess becomes an advisory.
+                pair = match_nearest_pair(
+                    left_samples,
+                    right_samples,
+                    max_delta_s=float("inf"),
+                    timestamp=self._yolo_match_timestamp_s,
+                )
         if pair is not None:
             try:
                 exact_app_delta_ns = abs(
@@ -10313,14 +10316,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 pair = None
                 timing_rejection = "APP_RECEIVE_TIMESTAMP_INVALID"
             else:
-                if exact_app_delta_ns > app_delta_limit_ns:
-                    pair = None
-                    timing_rejection = "APP_RECEIVE_DELTA_EXCEEDED"
+                del exact_app_delta_ns
 
         validated = self._validated_correspondence_pair(pair, left_samples, right_samples)
         if timing_rejection:
             self._last_correspondence_rejection_reason = timing_rejection
         if validated is not None:
+            advisories.extend(correspondence_advisories(validated.left, validated.right))
             if validated.delta_s > app_delta_limit_s:
                 advisories.append(
                     f"camera pair delta {validated.delta_s:.6f}s exceeds configured limit"
@@ -10830,11 +10832,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def data_storage_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
         def retry_data_storage(self, *args: Any, **kwargs: Any) -> Any: ...
         def allocate_workstation_data_artifact(self, *args: Any, **kwargs: Any) -> Any: ...
+        def allocate_measurement_artifact(self, *args: Any, **kwargs: Any) -> Any: ...
         def flush_workstation_data(self, *args: Any, **kwargs: Any) -> Any: ...
         def close_workstation_data(self, *args: Any, **kwargs: Any) -> Any: ...
-        def request_latest_measurement_xlsx(self, *args: Any, **kwargs: Any) -> Any: ...
-        def latest_measurement_xlsx_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
-        def cancel_latest_measurement_xlsx_export(self, *args: Any, **kwargs: Any) -> Any: ...
+        def measurement_registry(self, *args: Any, **kwargs: Any) -> Any: ...
+        def measurement_workbook_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
+        def latest_measurement_workbook_path(self, *args: Any, **kwargs: Any) -> Any: ...
+        def finalize_measurement_workbooks(self, *args: Any, **kwargs: Any) -> Any: ...
         def reset_workstation_optical_pose_session(self, *args: Any, **kwargs: Any) -> Any: ...
         def workstation_optical_pose_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
         def register_workstation_optical_pose_candidate(self, *args: Any, **kwargs: Any) -> Any: ...

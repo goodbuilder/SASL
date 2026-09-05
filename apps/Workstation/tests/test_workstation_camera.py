@@ -1663,7 +1663,7 @@ def test_runtime_pair_status_shows_healthy_rtcp_and_app_fallback_reason() -> Non
     assert "NTP Δ 10.0 ms (record-only)" in fallback_text
 
 
-def test_noncoordinator_app_pair_path_hard_rejects_100ms_plus_one_ns() -> None:
+def test_noncoordinator_app_pair_path_keeps_100ms_plus_one_ns_as_advisory() -> None:
     from Workstation.standalone_gui import WirisStereoDistancePanel
     from Workstation.workstation_core.stereo import (
         DetectionObservation,
@@ -1707,8 +1707,9 @@ def test_noncoordinator_app_pair_path_hard_rejects_100ms_plus_one_ns() -> None:
 
     pair = WirisStereoDistancePanel._matched_detection_pair(panel)
 
-    assert pair is None
-    assert panel._last_correspondence_rejection_reason == "APP_RECEIVE_DELTA_EXCEEDED"
+    assert pair is not None
+    assert panel._last_correspondence_rejection_reason == ""
+    assert any("camera pair delta" in item for item in panel._last_pair_advisories)
     assert panel._runtime_pair_uses_app_fallback is False
 
 

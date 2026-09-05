@@ -110,9 +110,7 @@ class AppLifecycleController:
         latest_xlsx_stopped = (
             True
             if data_owner is None
-            else bool(
-                data_owner.cancel_latest_measurement_xlsx_export(timeout_s=0.0)
-            )
+            else bool(data_owner.finalize_measurement_workbooks(timeout_s=5.0))
         )
         native_rings_stopped = True
         for side in ("left", "right"):

@@ -1156,13 +1156,14 @@ def _materialize_method_evaluation_rows(
         bundle_record = bundle.to_record()
         bundles.append(bundle_record)
         bundle_sha256 = str(bundle_record["method_evaluation_bundle_sha256"])
-        primary_sha256 = bundle.primary.canonical_sha256()
+        primary = bundle.primary
+        primary_sha256 = "" if primary is None else primary.canonical_sha256()
         for outcome in bundle.outcomes:
             method_rows[outcome.method_id].append(
                 {
                     **outcome.to_record(),
                     "method_evaluation_bundle_sha256": bundle_sha256,
-                    "primary_method_id": bundle.primary.method_id,
+                    "primary_method_id": "" if primary is None else primary.method_id,
                     "primary_outcome_sha256": primary_sha256,
                 }
             )

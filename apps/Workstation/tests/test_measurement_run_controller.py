@@ -30,10 +30,6 @@ def _panel(*, storage_accepts: bool = True) -> SimpleNamespace:
         retry_data_storage=lambda: {"state": "UNAVAILABLE"},
         append_workstation_data=append,
         flush_workstation_data=lambda: True,
-        request_latest_measurement_xlsx=lambda *args, **kwargs: exports.append(
-            (args, dict(kwargs))
-        )
-        or True,
         data_storage_snapshot=lambda: {
             "state": "UNAVAILABLE" if not storage_accepts else "OK",
             "streams": {},
@@ -217,33 +213,65 @@ def test_stop_boundary_immediately_admits_a_new_run_before_old_teardown() -> Non
     assert panel._measurement_run_generation == current
 
 
-def test_stop_requests_latest_xlsx_after_releasing_measurement_state() -> None:
+def test_start_and_stop_open_and_close_the_measurement_record_after_state_release() -> None:
     panel = _panel()
     observed_states: list[str] = []
-    requests: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    calls: list[tuple[str, str, dict[str, object]]] = []
 
-    def request(*args: object, **kwargs: object) -> bool:
-        observed_states.append(str(panel._measurement_run_state))
-        requests.append((args, dict(kwargs)))
-        return True
+    class _Record:
+        file_prefix = "20260906_143005"
+        counters = {"pixhawk_rtk_live": {"VALID": 0}}
 
-    panel.request_latest_measurement_xlsx = request
+        def add_alignment_row(self, row):
+            calls.append(("alignment", "", dict(row)))
+
+    class _Registry:
+        def begin(self, measurement_id, **kwargs):
+            observed_states.append(str(panel._measurement_run_state))
+            calls.append(("begin", measurement_id, dict(kwargs)))
+            return _Record()
+
+        def stop(self, measurement_id, **kwargs):
+            observed_states.append(str(panel._measurement_run_state))
+            calls.append(("stop", measurement_id, dict(kwargs)))
+
+    panel.measurement_registry = lambda: _Registry()
+    panel._measurement_view_controller_owner = SimpleNamespace(
+        measurement_calibration_snapshot=lambda: {"profile_sha256": "c" * 64},
+        measurement_alignment_rows=lambda: [{"method_id": "checkerboard_stereo"}],
+    )
     controller = MeasurementRunController(panel)
     assert controller.begin_measurement_run()
     generation = panel._measurement_run_generation
     started_utc_ns = panel._measurement_run_started_utc_ns
-    assert controller.measurement_source_transition(
-        "camera.left", "LIVE", "fixture source"
-    )
+    assert panel._measurement_file_prefix == "20260906_143005"
+    assert panel._measurement_method_result_counters is _Record.counters
 
     assert controller.request_measurement_stop()
 
-    assert observed_states == ["IDLE"]
-    assert requests[0][0] == (generation,)
-    assert requests[0][1]["started_utc_ns"] == started_utc_ns
-    assert requests[0][1]["stopped_utc_ns"] >= started_utc_ns
-    assert requests[0][1]["source_states"]["camera.left"]["state"] == "LIVE"
-    assert requests[0][1]["automatic"] is True
+    assert observed_states == ["IDLE", "IDLE"]
+    assert calls[0][0] == "begin" and calls[0][1] == generation
+    assert calls[0][2]["started_utc_ns"] == started_utc_ns
+    assert calls[0][2]["calibration"] == {"profile_sha256": "c" * 64}
+    assert calls[1] == ("alignment", "", {"method_id": "checkerboard_stereo"})
+    assert calls[2][0] == "stop" and calls[2][1] == generation
+    assert calls[2][2]["stopped_utc_ns"] >= started_utc_ns
+    assert panel._measurement_file_prefix == ""
+
+
+def test_start_never_retires_previous_measurement_workers() -> None:
+    panel = _panel()
+    closed: list[str] = []
+    panel._measurement_view_controller_owner = SimpleNamespace(
+        close_method_evaluation_workers=lambda: closed.append("closed") or True,
+    )
+    controller = MeasurementRunController(panel)
+
+    assert controller.begin_measurement_run()
+    assert controller.request_measurement_stop()
+    assert controller.begin_measurement_run()
+
+    assert closed == []
 
 
 def test_persistence_exceptions_never_gate_start_stop_or_next_run() -> None:
@@ -257,12 +285,13 @@ def test_persistence_exceptions_never_gate_start_stop_or_next_run() -> None:
 
     panel.append_workstation_data = fail_append
     panel.flush_workstation_data = fail_flush
-    panel.request_latest_measurement_xlsx = lambda *_args, **_kwargs: (_ for _ in ()).throw(
-        OSError("xlsx offline")
+    panel.measurement_registry = lambda: SimpleNamespace(
+        begin=lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("workbook offline")),
+        stop=lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("workbook offline")),
     )
     panel._measurement_view_controller_owner = SimpleNamespace(
-        close_method_evaluation_workers=lambda: (_ for _ in ()).throw(
-            RuntimeError("old worker teardown failed")
+        measurement_calibration_snapshot=lambda: (_ for _ in ()).throw(
+            RuntimeError("calibration unavailable")
         )
     )
     panel._measurement_view_controller = lambda: (_ for _ in ()).throw(
@@ -314,13 +343,30 @@ def test_real_panel_ignores_old_session_and_prepares_type_owned_paths(
     assert panel.measurement_run_snapshot()["state"] == "RUNNING"
     assert starts == [{"enable_detection": True, "switch_to_depth": True}]
     assert panel.data_storage_snapshot()["root"] == str(tmp_path / "recordings")
+    # Measurement-owned videos share the workbook's Start prefix, flat in the root.
+    prefix = panel._measurement_file_prefix
+    assert prefix
+    assert {path.name for path in panel.video_recording_paths.values()} == {
+        f"{prefix}_left.mp4",
+        f"{prefix}_right.mp4",
+    }
     assert all(
-        path.parent == tmp_path / "recordings" / "videos"
+        path.parent == tmp_path / "recordings"
         for path in panel.video_recording_paths.values()
     )
+    assert panel.measurement_workbook_snapshot()["current_measurement_id"] == panel._measurement_id
     assert not (tmp_path / "recordings" / "session.json").exists()
 
-    assert panel.close_workstation_data(timeout_s=2.0)
+    assert panel.close_workstation_data(timeout_s=5.0)
+    # Shutdown finalises the running Measurement into its own workbook.
+    workbooks = sorted((tmp_path / "recordings").glob("*_measurement.xlsx"))
+    assert [path.name for path in workbooks] == [f"{prefix}_measurement.xlsx"]
+    from Workstation.workstation_core.measurement_xlsx_read import read_workbook, table_rows
+
+    sheets = read_workbook(workbooks[0])
+    assert "10_Pixhawk_RTK" in sheets and "99_Definitions" in sheets
+    events = {row["event_type"] for row in table_rows(sheets["50_Events"])}
+    assert {"MEASUREMENT_STARTED", "APPLICATION_SHUTDOWN"} <= events
     panel._shutdown_coordinator = SimpleNamespace(run=lambda: True)
     panel.close()
     panel.deleteLater()

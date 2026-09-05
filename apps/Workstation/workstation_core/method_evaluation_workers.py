@@ -1,9 +1,10 @@
 """Isolated persistent workers for per-method Measurement evaluation.
 
-The coordinator owns one process per canonical method.  A pair is committed
-only after all eight workers have produced terminal outcomes; the Pixhawk/RTK
-outcome is also surfaced as soon as its dedicated worker finishes so the UI
-does not wait for comparison solvers.
+The coordinator owns one process per canonical method for the lifetime of
+the application.  A pair submits only the methods that are ready for it;
+every outcome is published as soon as its worker returns, and a pair is
+"complete" when all *submitted* methods are terminal.  There is no compute
+deadline: a worker is only replaced when its process exits.
 """
 
 from __future__ import annotations
@@ -29,14 +30,16 @@ from Workstation.workstation_core.measurement_methods import MEASUREMENT_METHOD_
 from Workstation.workstation_core.method_evaluation import (
     METHOD_EVALUATION_PRIMARY_METHOD,
     METHOD_EVALUATION_QUEUE_LIMIT,
-    METHOD_EVALUATION_TIMEOUT_S,
     MethodEvaluationBundle,
     MethodEvaluationOutcome,
     MethodEvaluationRequest,
+    canonical_method_order,
     failed_outcome,
 )
 
-METHOD_WORKER_START_TIMEOUT_S = 5.0
+# A spawned child that never acknowledges its first request is a broken
+# process, not a slow solver; this is the only clock-based guard left.
+METHOD_WORKER_START_TIMEOUT_S = 30.0
 METHOD_WORKER_THREAD_ENV: Mapping[str, str] = {
     "OMP_NUM_THREADS": "1",
     "OPENBLAS_NUM_THREADS": "1",
@@ -159,28 +162,42 @@ def method_evaluation_worker_main(
 class MethodEvaluationSubmission:
     accepted: bool
     pair_id: str
-    backpressure_bundle: MethodEvaluationBundle | None = None
+    submitted_method_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class MethodEvaluationPoll:
-    primary_outcomes: tuple[MethodEvaluationOutcome, ...] = ()
+    """Outcomes published since the previous poll, plus fully terminal pairs."""
+
+    outcomes: tuple[MethodEvaluationOutcome, ...] = ()
     completed_bundles: tuple[MethodEvaluationBundle, ...] = ()
+
+    @property
+    def primary_outcomes(self) -> tuple[MethodEvaluationOutcome, ...]:
+        return tuple(
+            outcome
+            for outcome in self.outcomes
+            if outcome.method_id == METHOD_EVALUATION_PRIMARY_METHOD
+        )
 
 
 @dataclass
 class _PairJob:
-    requests: tuple[MethodEvaluationRequest, ...]
+    requests: dict[str, MethodEvaluationRequest]
+    planned_methods: dict[str, str] = field(default_factory=dict)
     outcomes: dict[str, MethodEvaluationOutcome] = field(default_factory=dict)
     dispatched: set[str] = field(default_factory=set)
-    primary_emitted: bool = False
 
     @property
     def first(self) -> MethodEvaluationRequest:
-        return self.requests[0]
+        return next(iter(self.requests.values()))
+
+    @property
+    def complete(self) -> bool:
+        return set(self.outcomes) == set(self.requests)
 
     def request_for(self, method_id: str) -> MethodEvaluationRequest:
-        return self.requests[MEASUREMENT_METHOD_IDS.index(method_id)]
+        return self.requests[method_id]
 
 
 @dataclass
@@ -195,6 +212,26 @@ class _WorkerSlot:
     started_monotonic_ns: int = 0
 
 
+def validate_submission(
+    requests: Sequence[MethodEvaluationRequest],
+) -> tuple[MethodEvaluationRequest, ...]:
+    """Validate one pair's request subset and return it in canonical order."""
+
+    frozen = tuple(requests)
+    canonical_method_order(request.method_id for request in frozen)
+    first = frozen[0]
+    for request in frozen:
+        if (
+            request.measurement_id != first.measurement_id
+            or request.pair_id != first.pair_id
+            or request.pair_sequence != first.pair_sequence
+            or request.snapshot_sha256 != first.snapshot_sha256
+            or request.request_generation != first.request_generation
+        ):
+            raise ValueError("submission request identity mismatch")
+    return frozen
+
+
 class _MethodEvaluationRuntime:
     """Synchronous process runtime owned only by the coordinator actor thread."""
 
@@ -204,13 +241,15 @@ class _MethodEvaluationRuntime:
         mp_context: multiprocessing.context.BaseContext | None = None,
         process_target: Callable[..., None] = method_evaluation_worker_main,
         start_workers: bool = True,
+        queue_limit: int = METHOD_EVALUATION_QUEUE_LIMIT,
     ) -> None:
         self._context = mp_context or multiprocessing.get_context("spawn")
         self._process_target = process_target
+        self._queue_limit = max(1, int(queue_limit))
         self._jobs: OrderedDict[tuple[str, int], _PairJob] = OrderedDict()
         self._slots: dict[str, _WorkerSlot] = {}
         self._slot_generations = {method_id: 0 for method_id in MEASUREMENT_METHOD_IDS}
-        self._primary_ready: deque[MethodEvaluationOutcome] = deque()
+        self._outcomes_ready: deque[MethodEvaluationOutcome] = deque()
         self._bundles_ready: deque[MethodEvaluationBundle] = deque()
         self._closed = False
         self._started = False
@@ -221,6 +260,13 @@ class _MethodEvaluationRuntime:
     @property
     def pending_pair_count(self) -> int:
         return len(self._jobs)
+
+    def pending_method_count(self, method_id: str) -> int:
+        return sum(
+            1
+            for job in self._jobs.values()
+            if method_id in job.requests and method_id not in job.outcomes
+        )
 
     @property
     def worker_generations(self) -> dict[str, int]:
@@ -269,56 +315,44 @@ class _MethodEvaluationRuntime:
             generation=generation,
         )
 
-    @staticmethod
-    def _validate_requests(
-        requests: Sequence[MethodEvaluationRequest],
-    ) -> tuple[MethodEvaluationRequest, ...]:
-        frozen = tuple(requests)
-        if tuple(request.method_id for request in frozen) != MEASUREMENT_METHOD_IDS:
-            raise ValueError("submission must contain every method in canonical order")
-        first = frozen[0]
-        for request in frozen:
-            if (
-                request.measurement_id != first.measurement_id
-                or request.pair_id != first.pair_id
-                or request.pair_sequence != first.pair_sequence
-                or request.snapshot_sha256 != first.snapshot_sha256
-                or request.request_generation != first.request_generation
-            ):
-                raise ValueError("submission request identity mismatch")
-        return frozen
-
     def submit(
         self,
         requests: Sequence[MethodEvaluationRequest],
         *,
-        comparison_backpressure: bool = False,
+        planned_methods: Mapping[str, str] | None = None,
     ) -> MethodEvaluationSubmission:
         if self._closed:
             raise RuntimeError("method evaluation coordinator is closed")
-        frozen = self._validate_requests(requests)
+        frozen = validate_submission(requests)
         first = frozen[0]
         key = (first.pair_id, first.request_generation)
         if key in self._jobs:
             raise ValueError("duplicate method evaluation pair submission")
-        job = _PairJob(requests=frozen)
-        if comparison_backpressure:
-            for request in frozen:
-                if request.method_id == METHOD_EVALUATION_PRIMARY_METHOD:
-                    continue
-                job.outcomes[request.method_id] = failed_outcome(
+        job = _PairJob(
+            requests={request.method_id: request for request in frozen},
+            planned_methods=dict(planned_methods or {}),
+        )
+        for request in frozen:
+            if self.pending_method_count(request.method_id) >= self._queue_limit:
+                outcome = failed_outcome(
                     request,
                     status="BACKPRESSURE_BLOCKED",
                     reason=(
-                        "comparison method queue limit "
-                        f"{METHOD_EVALUATION_QUEUE_LIMIT} reached; "
-                        "primary evaluation remained admitted"
+                        f"{request.method_id} pending queue limit "
+                        f"{self._queue_limit} reached"
                     ),
                 )
+                job.outcomes[request.method_id] = outcome
+                self._outcomes_ready.append(outcome)
         self._jobs[key] = job
         if self._started:
             self._dispatch_all()
-        return MethodEvaluationSubmission(accepted=True, pair_id=first.pair_id)
+        self._seal_completed_jobs()
+        return MethodEvaluationSubmission(
+            accepted=True,
+            pair_id=first.pair_id,
+            submitted_method_ids=tuple(request.method_id for request in frozen),
+        )
 
     def _dispatch_all(self) -> None:
         for method_id in MEASUREMENT_METHOD_IDS:
@@ -329,7 +363,11 @@ class _MethodEvaluationRuntime:
         if slot is None or slot.current is not None:
             return
         for job in self._jobs.values():
-            if method_id in job.outcomes or method_id in job.dispatched:
+            if (
+                method_id not in job.requests
+                or method_id in job.outcomes
+                or method_id in job.dispatched
+            ):
                 continue
             request = job.request_for(method_id)
             try:
@@ -357,6 +395,8 @@ class _MethodEvaluationRuntime:
         job = self._jobs.get(key)
         if job is None or outcome.method_id in job.outcomes:
             return
+        if outcome.method_id not in job.requests:
+            return
         request = job.request_for(outcome.method_id)
         if (
             outcome.measurement_id != request.measurement_id
@@ -371,9 +411,7 @@ class _MethodEvaluationRuntime:
                 worker_started_monotonic_ns=outcome.worker_started_monotonic_ns,
             )
         job.outcomes[outcome.method_id] = outcome
-        if outcome.method_id == METHOD_EVALUATION_PRIMARY_METHOD and not job.primary_emitted:
-            job.primary_emitted = True
-            self._primary_ready.append(outcome)
+        self._outcomes_ready.append(outcome)
 
     def _finish_slot_with(self, slot: _WorkerSlot, outcome: MethodEvaluationOutcome) -> None:
         self._record_outcome(outcome)
@@ -473,33 +511,17 @@ class _MethodEvaluationRuntime:
                 )
             self._restart_slot(slot.method_id)
             return
-        if request is None:
+        if request is None or slot.started_monotonic_ns:
             return
-        if not slot.started_monotonic_ns:
-            if now_ns - slot.dispatched_monotonic_ns <= int(
-                METHOD_WORKER_START_TIMEOUT_S * 1_000_000_000
-            ):
-                return
-            self._record_outcome(
-                failed_outcome(
-                    request,
-                    status="FAILED",
-                    reason=f"{slot.method_id} worker did not acknowledge start",
-                )
-            )
-            self._restart_slot(slot.method_id)
-            return
-        timeout_s = METHOD_EVALUATION_TIMEOUT_S.get(slot.method_id)
-        if timeout_s is None:
-            return
-        if now_ns - slot.started_monotonic_ns <= int(timeout_s * 1_000_000_000):
+        if now_ns - slot.dispatched_monotonic_ns <= int(
+            METHOD_WORKER_START_TIMEOUT_S * 1_000_000_000
+        ):
             return
         self._record_outcome(
             failed_outcome(
                 request,
-                status="TIMEOUT",
-                reason=f"{slot.method_id} exceeded {timeout_s:.3f}s worker timeout",
-                worker_started_monotonic_ns=slot.started_monotonic_ns,
+                status="FAILED",
+                reason=f"{slot.method_id} worker did not acknowledge start",
             )
         )
         self._restart_slot(slot.method_id)
@@ -507,7 +529,7 @@ class _MethodEvaluationRuntime:
     def _seal_completed_jobs(self) -> None:
         completed_keys: list[tuple[str, int]] = []
         for key, job in self._jobs.items():
-            if len(job.outcomes) != len(MEASUREMENT_METHOD_IDS):
+            if not job.complete:
                 continue
             first = job.first
             bundle = MethodEvaluationBundle(
@@ -516,11 +538,14 @@ class _MethodEvaluationRuntime:
                 pair_sequence=first.pair_sequence,
                 snapshot_sha256=first.snapshot_sha256,
                 request_generation=first.request_generation,
-                outcomes=tuple(job.outcomes[method_id] for method_id in MEASUREMENT_METHOD_IDS),
+                outcomes=tuple(
+                    job.outcomes[method_id]
+                    for method_id in MEASUREMENT_METHOD_IDS
+                    if method_id in job.outcomes
+                ),
                 snapshot_payload=dict(first.snapshot_payload),
+                planned_methods=dict(job.planned_methods),
             )
-            if not job.primary_emitted:
-                self._primary_ready.append(bundle.primary)
             self._bundles_ready.append(bundle)
             completed_keys.append(key)
         for key in completed_keys:
@@ -537,18 +562,17 @@ class _MethodEvaluationRuntime:
                 self._check_slot_health(slot, now_ns)
         self._seal_completed_jobs()
         self._dispatch_all()
-        primary = tuple(self._primary_ready)
+        outcomes = tuple(self._outcomes_ready)
         bundles = tuple(self._bundles_ready)
-        self._primary_ready.clear()
+        self._outcomes_ready.clear()
         self._bundles_ready.clear()
-        return MethodEvaluationPoll(
-            primary_outcomes=primary,
-            completed_bundles=bundles,
-        )
+        return MethodEvaluationPoll(outcomes=outcomes, completed_bundles=bundles)
 
-    def close(self) -> None:
+    def close(self) -> MethodEvaluationPoll:
+        """Stop every worker; unfinished requests become FAILED evidence."""
+
         if self._closed:
-            return
+            return MethodEvaluationPoll()
         self._closed = True
         for slot in tuple(self._slots.values()):
             try:
@@ -559,9 +583,24 @@ class _MethodEvaluationRuntime:
         for slot in tuple(self._slots.values()):
             self._terminate_slot(slot)
         self._slots.clear()
+        for job in self._jobs.values():
+            for method_id, request in job.requests.items():
+                if method_id in job.outcomes:
+                    continue
+                self._record_outcome(
+                    failed_outcome(
+                        request,
+                        status="FAILED",
+                        reason="method worker closed before completion",
+                    )
+                )
+        self._seal_completed_jobs()
         self._jobs.clear()
-        self._primary_ready.clear()
+        outcomes = tuple(self._outcomes_ready)
+        bundles = tuple(self._bundles_ready)
+        self._outcomes_ready.clear()
         self._bundles_ready.clear()
+        return MethodEvaluationPoll(outcomes=outcomes, completed_bundles=bundles)
 
     def __enter__(self) -> Self:
         self.start()
@@ -574,9 +613,11 @@ class _MethodEvaluationRuntime:
 class MethodEvaluationCoordinator:
     """Non-blocking facade for the isolated per-method process runtime.
 
-    Process spawn, join, timeout termination, and restart all run on one
-    dedicated daemon actor thread.  ``submit()``, ``poll()``, and ``close()``
-    therefore remain bounded operations suitable for a 20 ms Qt timer.
+    Process spawn, join, and restart all run on one dedicated daemon actor
+    thread.  ``submit()``, ``poll()``, and ``close()`` therefore remain
+    bounded operations suitable for a 20 ms Qt timer.  The coordinator is
+    intended to live for the whole application; Measurement Start/Stop never
+    creates or destroys it.
     """
 
     def __init__(
@@ -585,17 +626,19 @@ class MethodEvaluationCoordinator:
         mp_context: multiprocessing.context.BaseContext | None = None,
         process_target: Callable[..., None] = method_evaluation_worker_main,
         start_workers: bool = True,
+        queue_limit: int = METHOD_EVALUATION_QUEUE_LIMIT,
     ) -> None:
         self._context = mp_context or multiprocessing.get_context("spawn")
         self._process_target = process_target
         self._start_workers = bool(start_workers)
+        self._queue_limit = max(1, int(queue_limit))
         self._commands: queue.Queue[tuple[str, object]] = queue.Queue()
         self._results: queue.Queue[MethodEvaluationPoll] = queue.Queue()
         self._lock = threading.RLock()
         self._pending_requests: dict[
             tuple[str, int], tuple[MethodEvaluationRequest, ...]
         ] = {}
-        self._pending_primary_keys: set[tuple[str, int]] = set()
+        self._pending_jobs: dict[tuple[str, int], set[str]] = {}
         self._worker_generations = {
             method_id: 0 for method_id in MEASUREMENT_METHOD_IDS
         }
@@ -614,6 +657,24 @@ class MethodEvaluationCoordinator:
     def pending_pair_count(self) -> int:
         with self._lock:
             return len(self._pending_requests)
+
+    def pending_jobs(self) -> dict[tuple[str, int], tuple[str, ...]]:
+        """(pair_id, request_generation) -> method ids without a terminal outcome."""
+
+        with self._lock:
+            return {
+                key: tuple(sorted(methods))
+                for key, methods in self._pending_jobs.items()
+                if methods
+            }
+
+    def pending_job_count_for_measurement(self, measurement_id: str) -> int:
+        with self._lock:
+            return sum(
+                len(methods)
+                for key, methods in self._pending_jobs.items()
+                if methods and self._pending_requests[key][0].measurement_id == measurement_id
+            )
 
     @property
     def worker_generations(self) -> dict[str, int]:
@@ -636,62 +697,38 @@ class MethodEvaluationCoordinator:
     def submit(
         self,
         requests: Sequence[MethodEvaluationRequest],
+        *,
+        planned_methods: Mapping[str, str] | None = None,
     ) -> MethodEvaluationSubmission:
         if self._close_requested:
             raise RuntimeError("method evaluation coordinator is closed")
-        frozen = _MethodEvaluationRuntime._validate_requests(requests)
+        frozen = validate_submission(requests)
         first = frozen[0]
         key = (first.pair_id, first.request_generation)
         with self._lock:
             if key in self._pending_requests:
                 raise ValueError("duplicate method evaluation pair submission")
-            if len(self._pending_primary_keys) >= METHOD_EVALUATION_QUEUE_LIMIT:
-                outcomes = tuple(
-                    failed_outcome(
-                        request,
-                        status="BACKPRESSURE_BLOCKED",
-                        reason=(
-                            f"primary method queue limit "
-                            f"{METHOD_EVALUATION_QUEUE_LIMIT} reached"
-                        ),
-                    )
-                    for request in frozen
-                )
-                return MethodEvaluationSubmission(
-                    accepted=False,
-                    pair_id=first.pair_id,
-                    backpressure_bundle=MethodEvaluationBundle(
-                        measurement_id=first.measurement_id,
-                        pair_id=first.pair_id,
-                        pair_sequence=first.pair_sequence,
-                        snapshot_sha256=first.snapshot_sha256,
-                        request_generation=first.request_generation,
-                        outcomes=outcomes,
-                        snapshot_payload=dict(first.snapshot_payload),
-                    ),
-                )
-            comparison_backpressure = (
-                len(self._pending_requests) >= METHOD_EVALUATION_QUEUE_LIMIT
-            )
             self._pending_requests[key] = frozen
-            self._pending_primary_keys.add(key)
-        self._commands.put(
-            ("submit", (frozen, comparison_backpressure))
+            self._pending_jobs[key] = {request.method_id for request in frozen}
+        self._commands.put(("submit", (frozen, dict(planned_methods or {}))))
+        return MethodEvaluationSubmission(
+            accepted=True,
+            pair_id=first.pair_id,
+            submitted_method_ids=tuple(request.method_id for request in frozen),
         )
-        return MethodEvaluationSubmission(accepted=True, pair_id=first.pair_id)
 
     def poll(self) -> MethodEvaluationPoll:
-        primary: list[MethodEvaluationOutcome] = []
+        outcomes: list[MethodEvaluationOutcome] = []
         bundles: list[MethodEvaluationBundle] = []
         while True:
             try:
                 result = self._results.get_nowait()
             except queue.Empty:
                 break
-            primary.extend(result.primary_outcomes)
+            outcomes.extend(result.outcomes)
             bundles.extend(result.completed_bundles)
         return MethodEvaluationPoll(
-            primary_outcomes=tuple(primary),
+            outcomes=tuple(outcomes),
             completed_bundles=tuple(bundles),
         )
 
@@ -708,63 +745,73 @@ class MethodEvaluationCoordinator:
     def _publish_poll(
         self,
         polled: MethodEvaluationPoll,
-        runtime: _MethodEvaluationRuntime,
+        runtime: _MethodEvaluationRuntime | None,
     ) -> None:
         with self._lock:
-            self._worker_generations = runtime.worker_generations
-            for outcome in polled.primary_outcomes:
-                self._pending_primary_keys.discard(
-                    (outcome.pair_id, outcome.request_generation)
-                )
+            if runtime is not None:
+                self._worker_generations = runtime.worker_generations
+            for outcome in polled.outcomes:
+                pending = self._pending_jobs.get((outcome.pair_id, outcome.request_generation))
+                if pending is not None:
+                    pending.discard(outcome.method_id)
             for bundle in polled.completed_bundles:
-                self._pending_primary_keys.discard(
-                    (bundle.pair_id, bundle.request_generation)
-                )
-                self._pending_requests.pop(
-                    (bundle.pair_id, bundle.request_generation),
-                    None,
-                )
-        if polled.primary_outcomes or polled.completed_bundles:
+                key = (bundle.pair_id, bundle.request_generation)
+                self._pending_jobs.pop(key, None)
+                self._pending_requests.pop(key, None)
+        if polled.outcomes or polled.completed_bundles:
             self._results.put(polled)
 
     def _publish_actor_failure(self, exc: BaseException) -> None:
         reason = f"method evaluation runtime failed: {type(exc).__name__}: {exc}"
         with self._lock:
             pending = tuple(self._pending_requests.values())
+            pending_jobs = dict(self._pending_jobs)
             self._pending_requests.clear()
-            self._pending_primary_keys.clear()
+            self._pending_jobs.clear()
             self._actor_error = reason
+        outcomes: list[MethodEvaluationOutcome] = []
         bundles: list[MethodEvaluationBundle] = []
         for requests in pending:
             first = requests[0]
-            bundles.append(
-                MethodEvaluationBundle(
-                    measurement_id=first.measurement_id,
-                    pair_id=first.pair_id,
-                    pair_sequence=first.pair_sequence,
-                    snapshot_sha256=first.snapshot_sha256,
-                    request_generation=first.request_generation,
-                    outcomes=tuple(
-                        failed_outcome(
-                            request,
-                            status="FAILED",
-                            reason=reason,
-                        )
-                        for request in requests
-                    ),
-                    snapshot_payload=dict(first.snapshot_payload),
+            remaining = pending_jobs.get((first.pair_id, first.request_generation), set())
+            failed = tuple(
+                failed_outcome(request, status="FAILED", reason=reason)
+                for request in requests
+                if request.method_id in remaining
+            )
+            outcomes.extend(failed)
+            # Completed methods of this pair were already published; the
+            # bundle is reconstructed from failures only when everything
+            # submitted is still pending (otherwise the pair stays partial).
+            if len(failed) == len(requests):
+                bundles.append(
+                    MethodEvaluationBundle(
+                        measurement_id=first.measurement_id,
+                        pair_id=first.pair_id,
+                        pair_sequence=first.pair_sequence,
+                        snapshot_sha256=first.snapshot_sha256,
+                        request_generation=first.request_generation,
+                        outcomes=failed,
+                        snapshot_payload=dict(first.snapshot_payload),
+                    )
+                )
+        if outcomes or bundles:
+            self._results.put(
+                MethodEvaluationPoll(
+                    outcomes=tuple(outcomes),
+                    completed_bundles=tuple(bundles),
                 )
             )
-        if bundles:
-            self._results.put(MethodEvaluationPoll(completed_bundles=tuple(bundles)))
 
     def _run_actor(self) -> None:
         runtime: _MethodEvaluationRuntime | None = None
+        actor_failed = False
         try:
             runtime = _MethodEvaluationRuntime(
                 mp_context=self._context,
                 process_target=self._process_target,
                 start_workers=False,
+                queue_limit=self._queue_limit,
             )
             if self._start_workers:
                 runtime.start()
@@ -791,23 +838,8 @@ class MethodEvaluationCoordinator:
                         runtime.start()
                         continue
                     if command == "submit":
-                        requests, comparison_backpressure = payload  # type: ignore[misc]
-                        submission = runtime.submit(
-                            requests,
-                            comparison_backpressure=bool(
-                                comparison_backpressure
-                            ),
-                        )
-                        if submission.backpressure_bundle is not None:
-                            bundle = submission.backpressure_bundle
-                            with self._lock:
-                                self._pending_requests.pop(
-                                    (bundle.pair_id, bundle.request_generation),
-                                    None,
-                                )
-                            self._results.put(
-                                MethodEvaluationPoll(completed_bundles=(bundle,))
-                            )
+                        requests, planned_methods = payload  # type: ignore[misc]
+                        runtime.submit(requests, planned_methods=planned_methods)
                 if not closing:
                     polled = runtime.poll()
                     self._publish_poll(polled, runtime)
@@ -817,16 +849,19 @@ class MethodEvaluationCoordinator:
                     ):
                         runtime.start_comparison_workers()
         except BaseException as exc:  # noqa: BLE001 - convert actor death to terminal outcomes.
+            actor_failed = True
             self._publish_actor_failure(exc)
         finally:
             if runtime is not None:
                 try:
-                    runtime.close()
+                    closed = runtime.close()
+                    if not actor_failed:
+                        self._publish_poll(closed, None)
                 except Exception as exc:  # noqa: BLE001 - actor must always publish closed.
                     self._actor_error = f"runtime close failed: {exc}"
             with self._lock:
                 self._pending_requests.clear()
-                self._pending_primary_keys.clear()
+                self._pending_jobs.clear()
             self._closed_event.set()
 
     def __enter__(self) -> Self:
@@ -845,4 +880,5 @@ __all__ = [
     "MethodEvaluationPoll",
     "MethodEvaluationSubmission",
     "method_evaluation_worker_main",
+    "validate_submission",
 ]

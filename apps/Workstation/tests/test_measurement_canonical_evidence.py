@@ -82,12 +82,16 @@ def test_app_receive_pair_timing_is_authoritative_and_ntp_is_record_only() -> No
     assert timing["left_clock_epoch_state"] == "transition"
 
 
-def test_app_receive_pair_timing_rejects_exact_integer_delta_over_100ms() -> None:
+def test_app_receive_pair_timing_records_exact_integer_delta_over_100ms() -> None:
     left = _detection("left", 10.0)
     right = _detection("right", 10.100_000_001)
 
-    with pytest.raises(ValueError, match="APP_RECEIVE_DELTA_EXCEEDED"):
-        app_receive_pair_timing_evidence(left, right)
+    timing = app_receive_pair_timing_evidence(left, right)
+
+    assert timing["selected_pair_abs_delta_ns"] == 100_000_001
+    assert timing["pair_timing_limit_ns"] == 100_000_000
+    assert timing["pair_timing_limit_exceeded"] is True
+    assert timing["pair_timing_limit_exceeded_code"] == "APP_RECEIVE_DELTA_EXCEEDED"
 
 
 def test_live_pair_timing_records_selected_rtcp_and_distinct_app_delta() -> None:

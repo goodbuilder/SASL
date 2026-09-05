@@ -4,6 +4,7 @@ from math import sqrt
 from typing import Iterable
 
 from sasl_common.stereo_geometry import (
+    GEOMETRY_POLICY_DIAGNOSTIC_SIGNED_DEPTH,
     PinholeIntrinsics,
     RayTriangulationAttempt,
     RayTriangulationResult,
@@ -12,6 +13,10 @@ from sasl_common.stereo_geometry import (
     result_as_baseline_center_frd,
     triangulate_rays as triangulate_common_rays,
 )
+
+# Workstation keeps every finite two-ray solution, including negative depth and
+# large ray gaps, as measurement evidence; only undefined geometry is rejected.
+WORKSTATION_GEOMETRY_POLICY = GEOMETRY_POLICY_DIAGNOSTIC_SIGNED_DEPTH
 from Workstation.workstation_core.attitude_geometry import (
     Quaternion,
     normalize_quaternion,
@@ -177,6 +182,62 @@ def _right_camera_ray_to_left_camera_normalized(
     return body_frd_vector_to_camera(right_ray_left_body)
 
 
+def rotation_left_from_right_from_body_quaternions(
+    left_body_to_world_q: Iterable[float],
+    right_body_to_world_q: Iterable[float],
+) -> list[list[float]]:
+    """``R_left_from_right`` in optical RDF from two PX4 body->NED attitudes.
+
+    Evaluates the live right-ray rotation chain on the three right-camera
+    basis vectors, so ``R @ ray`` reproduces the chain as a plain matrix.
+    """
+
+    left_q = normalize_quaternion(left_body_to_world_q)
+    right_q = normalize_quaternion(right_body_to_world_q)
+    columns = [
+        _right_camera_ray_to_left_camera_normalized(
+            basis,
+            left_body_to_world_q=left_q,
+            right_body_to_world_q=right_q,
+        )
+        for basis in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+    ]
+    return [[columns[column][row] for column in range(3)] for row in range(3)]
+
+
+def canonical_transform_from_kernel_inputs(
+    rotation_left_from_right: list[list[float]],
+    right_origin_in_left_m: tuple[float, float, float],
+) -> tuple[list[list[float]], tuple[float, float, float]]:
+    """(R_left_from_right, C_right_in_left) -> canonical (R_right_from_left, T).
+
+    ``X_right = R * X_left + T`` with ``T = -R * C``. ``T`` and ``C`` are
+    distinct vectors and never aliased.
+    """
+
+    r = [[float(rotation_left_from_right[column][row]) for column in range(3)] for row in range(3)]
+    c = tuple(float(value) for value in right_origin_in_left_m)
+    rc = _rotate_matrix(r, c)  # type: ignore[arg-type]
+    return r, (-rc[0], -rc[1], -rc[2])
+
+
+def pixhawk_canonical_transform(
+    *,
+    left_body_to_world_q: Iterable[float],
+    right_body_to_world_q: Iterable[float],
+    translation_right_in_left_m: tuple[float, float, float],
+) -> tuple[list[list[float]], tuple[float, float, float]]:
+    """Canonical (R, T) exactly as the live Pixhawk triangulation applies it."""
+
+    return canonical_transform_from_kernel_inputs(
+        rotation_left_from_right_from_body_quaternions(
+            left_body_to_world_q,
+            right_body_to_world_q,
+        ),
+        translation_right_in_left_m,
+    )
+
+
 def relative_rotation_quaternion(left_q: Iterable[float], right_q: Iterable[float]):
     # Legacy helper for callers that already express camera rays in the Pixhawk attitude convention.
     # Live Pixhawk triangulation uses triangulate_pixels_with_pixhawk_mount instead.
@@ -230,6 +291,7 @@ def triangulate_rays_attempt(
         right_origin_left_rdf_m=translation_right_in_left_m,
         left_ray_left_rdf=left_ray,
         right_ray_left_rdf=right_ray_in_left,
+        geometry_policy=WORKSTATION_GEOMETRY_POLICY,
     )
     if attempt.result is None:
         return attempt
@@ -317,35 +379,30 @@ def triangulate_pixels_with_pixhawk_mount_attempt(
             {"error": "camera translation unavailable for RTK baseline"},
         )
     try:
-        left_q = normalize_quaternion(left_body_to_world_q)
-        right_q = normalize_quaternion(right_body_to_world_q)
+        rotation_right_from_left, translation_right_from_left_m = pixhawk_canonical_transform(
+            left_body_to_world_q=left_body_to_world_q,
+            right_body_to_world_q=right_body_to_world_q,
+            translation_right_in_left_m=translation_right_in_left_m,
+        )
     except (TypeError, ValueError, OverflowError) as exc:
         return RayTriangulationAttempt(
             None,
             "invalid_quaternion",
             {"error": str(exc)},
         )
-    left_ray = normalized_ray_from_pixel(left_pixel[0], left_pixel[1], left_intrinsics)
-    right_ray = normalized_ray_from_pixel(right_pixel[0], right_pixel[1], right_intrinsics)
-    right_ray_in_left = normalize_vector(
-        _right_camera_ray_to_left_camera_normalized(
-            right_ray,
-            left_body_to_world_q=left_q,
-            right_body_to_world_q=right_q,
-        )
+    # Round-trip through the canonical (R, T) so a workbook holding only
+    # R, T, K, D, u, v reproduces this result bit for bit.
+    rotation_right_to_left, right_origin_in_left_m = invert_left_to_right_camera_transform(
+        rotation_right_from_left,
+        translation_right_from_left_m,
     )
-    right_forward_in_left = normalize_vector(
-        _right_camera_ray_to_left_camera_normalized(
-            (0.0, 0.0, 1.0),
-            left_body_to_world_q=left_q,
-            right_body_to_world_q=right_q,
-        )
-    )
-    return triangulate_rays_attempt(
-        left_ray,
-        right_ray_in_left,
-        translation_right_in_left_m,
-        right_forward_in_left=right_forward_in_left,
+    return triangulate_pixels_with_relative_pose_attempt(
+        left_pixel=left_pixel,
+        right_pixel=right_pixel,
+        left_intrinsics=left_intrinsics,
+        right_intrinsics=right_intrinsics,
+        rotation_right_to_left=rotation_right_to_left,
+        translation_right_in_left_m=right_origin_in_left_m,
     )
 
 

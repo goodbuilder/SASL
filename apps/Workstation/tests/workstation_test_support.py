@@ -176,12 +176,15 @@ class _FakeBackend:
         )
         self.panel._session_recording_active = lambda: bool(self.panel.recording_active)
         self.panel.data_storage_snapshot = self.data_storage_snapshot
-        self._latest_xlsx_snapshot: dict[str, object] = {
-            "state": "NOT_CREATED",
-            "output_path": "/tmp/measurement_data/latest_measurement.xlsx",
-            "target_generation": "",
-            "published_generation": "",
-            "row_counts": {},
+        self._measurement_workbook_snapshot: dict[str, object] = {
+            "state": "IDLE",
+            "latest_path": "",
+            "last_path": "",
+            "current_measurement_id": "",
+            "records": [],
+            "pending_method_jobs": 0,
+            "write_count": 0,
+            "failure_count": 0,
             "recording_active": False,
             "error": "",
         }
@@ -218,14 +221,8 @@ class _FakeBackend:
         self.calls.append("retry_data_storage")
         return self.data_storage_snapshot()
 
-    def latest_measurement_xlsx_snapshot(self) -> dict[str, object]:
-        return dict(self._latest_xlsx_snapshot)
-
-    def request_latest_measurement_xlsx(self) -> bool:
-        self.calls.append("request_latest_measurement_xlsx")
-        self._latest_xlsx_snapshot["state"] = "WAITING"
-        self._latest_xlsx_snapshot["target_generation"] = "run-latest"
-        return True
+    def measurement_workbook_snapshot(self) -> dict[str, object]:
+        return dict(self._measurement_workbook_snapshot)
 
     def optical_pose_reset(self) -> None:
         self.calls.append("optical_pose_reset")
