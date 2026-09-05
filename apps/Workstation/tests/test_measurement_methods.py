@@ -965,6 +965,109 @@ def test_no_ready_method_pair_is_retained_as_blocked_recording_evidence() -> Non
     assert row["ntp_evidence_role"] == "record_only"
 
 
+def _blocked_pair_fixture(pair_key: tuple[str, float, float]) -> BlockedMeasurementPair:
+    def detection(side: str) -> DetectionSnapshot:
+        observation = DetectionObservation(
+            camera=side,
+            timestamp_s=10.0 if side == "left" else 10.01,
+            width=640,
+            height=480,
+            x1=100.0,
+            y1=120.0,
+            x2=180.0,
+            y2=220.0,
+            confidence=0.9,
+            class_id=1,
+        )
+        return DetectionSnapshot.from_observation(
+            observation,
+            pairing_timestamp_basis="detection",
+            pairing_timestamp_s=observation.timestamp_s,
+        )
+
+    return BlockedMeasurementPair(
+        detection_pair_key=pair_key,
+        created_monotonic_s=11.0,
+        created_wall_s=20.0,
+        timestamp_basis="detection",
+        left_detection=detection("left"),
+        right_detection=detection("right"),
+        status="matched_no_ready_measurement_method",
+        reasons=("no ready measurement method",),
+        readiness_sha256="a" * 64,
+    )
+
+
+def _blocked_pair_panel(rows: object, writes: list[dict[str, object]]) -> SimpleNamespace:
+    def append_workstation_data(stream: str, payload: dict, *, priority: bool = False) -> bool:
+        writes.append({"stream": stream, "payload": dict(payload), "priority": priority})
+        return True
+
+    return SimpleNamespace(
+        distance_recording_enabled=True,
+        recording_session_id="session-1",
+        _recording_pair_row_index={},
+        distance_recording_rows=rows,
+        distance_recording_keys=[],
+        _append_recording_table_row=lambda _row: None,
+        _refresh_recording_table=lambda: None,
+        _refresh_recording_status_label=lambda: None,
+        _refresh_operation_header=lambda: None,
+        append_workstation_data=append_workstation_data,
+    )
+
+
+def test_blocked_pair_append_on_unavailable_owner_goes_direct_and_stays_untracked() -> None:
+    from Workstation.workstation_core.recording_session import SpoolRows
+
+    rows = SpoolRows(supports_updates=True)  # unbound: append is UNAVAILABLE
+    writes: list[dict[str, object]] = []
+    panel = _blocked_pair_panel(rows, writes)
+    controller = RecordingController(panel)
+
+    controller._record_blocked_measurement_pair(_blocked_pair_fixture(("no-owner", 10.0, 10.01)))
+
+    assert len(rows) == 0
+    assert panel._recording_pair_row_index == {}
+    assert controller._pair_recording_row_leases == {}
+    assert controller._native_row_owners == {}
+    assert len(writes) == 1
+    assert writes[0]["stream"] == "measurements"
+    assert writes[0]["priority"] is True
+    payload = writes[0]["payload"]
+    assert payload["row_persistence_mode"] == "direct_owner_unavailable"
+    assert payload["measurement_valid"] == "false"
+    assert payload["pair_status"] == "matched_no_ready_measurement_method"
+    assert payload["row_owner_unavailable_reason"]
+
+
+def test_blocked_pair_replace_on_unavailable_owner_goes_direct_and_drops_tracking(tmp_path) -> None:
+    from Workstation.workstation_core.recording_session import SpoolRows
+
+    rows = SpoolRows(supports_updates=True)
+    rows.bind(tmp_path / "blocked.jsonl")
+    writes: list[dict[str, object]] = []
+    panel = _blocked_pair_panel(rows, writes)
+    controller = RecordingController(panel)
+    key = ("replace-later", 10.0, 10.01)
+
+    controller._record_blocked_measurement_pair(_blocked_pair_fixture(key))
+    assert len(rows) == 1
+    assert panel._recording_pair_row_index == {key: 0}
+    assert writes == []
+
+    assert rows.close() is True
+    controller._record_blocked_measurement_pair(_blocked_pair_fixture(key))
+
+    assert len(rows) == 1
+    assert key not in panel._recording_pair_row_index
+    assert key not in controller._pair_recording_row_leases
+    assert len(writes) == 1
+    assert writes[0]["stream"] == "measurements"
+    assert writes[0]["payload"]["row_persistence_mode"] == "direct_owner_unavailable"
+    assert writes[0]["payload"]["sample_index"] == 0
+
+
 def test_preflight_explicitly_blocks_when_method_snapshot_has_no_ready_source() -> None:
     snapshot = {
         "camera.left": SimpleNamespace(state="LIVE"),

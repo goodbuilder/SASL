@@ -6282,37 +6282,106 @@ class RecordingController:
                 vector_frd_range_m=(None, None, None, None),
             )
         )
+        owner = self.panel.distance_recording_rows
         row_index = self.panel._recording_pair_row_index.get(key)
         if row_index is None:
-            row_index = len(self.panel.distance_recording_rows)
-            row["sample_index"] = row_index
-            row["pair_sequence"] = row_index
+            row["sample_index"] = len(owner)
+            row["pair_sequence"] = row["sample_index"]
+            atomic_appender = getattr(owner, "append_with_admission", None)
+            if callable(atomic_appender):
+                admission = atomic_appender(row)
+            else:
+                appended = owner.append(row)
+                admission = RowWriteAdmission(
+                    ROW_WRITE_ADMITTED if appended is not False else ROW_WRITE_RETRYABLE,
+                    row_index=len(owner) - 1,
+                )
+            if admission.state not in (ROW_WRITE_ADMITTED, ROW_WRITE_RETRYABLE):
+                # The store did not (and will not) acquire a slot for this row,
+                # so the BLOCKED evidence goes straight to the measurements
+                # stream (same fallback as _upsert_pair_recording_row). The
+                # pair is left untracked: there is no owner row for a native
+                # completion to replace, and tracking len(owner) would alias
+                # onto whatever row happens to occupy this index next.
+                self.panel._recording_pair_row_index.pop(key, None)
+                self._pair_recording_row_leases.pop(key, None)
+                self._append_measurement_row_direct(row, reason=admission.reason)
+                self.panel._refresh_recording_status_label()
+                self.panel._refresh_operation_header()
+                return
+            row_index = int(admission.row_index if admission.row_index is not None else row["sample_index"])
             self.panel._recording_pair_row_index[key] = row_index
-            self.panel.distance_recording_rows.append(row)
+            if admission.lease is not None:
+                self._pair_recording_row_leases[key] = admission.lease
             self.panel.distance_recording_keys.append(key)
             if len(self.panel.distance_recording_keys) > RECORDING_KEY_CACHE_LIMIT:
                 self.panel.distance_recording_keys.pop(0)
             minimum_cached_index = max(
                 0,
-                len(self.panel.distance_recording_rows) - RECORDING_KEY_CACHE_LIMIT,
+                len(owner) - RECORDING_KEY_CACHE_LIMIT,
             )
             self.panel._recording_pair_row_index = {
                 cached_key: cached_index
                 for cached_key, cached_index in self.panel._recording_pair_row_index.items()
                 if cached_index >= minimum_cached_index
             }
-            self._track_pending_native_row(row_index, row)
+            self._pair_recording_row_leases = {
+                cached_key: lease
+                for cached_key, lease in self._pair_recording_row_leases.items()
+                if cached_key in self.panel._recording_pair_row_index
+            }
+            self._track_pending_native_row(row_index, row, row_lease=admission.lease)
             self.panel._append_recording_table_row(row)
         else:
-            current = self.panel.distance_recording_rows[row_index]
+            current = owner[row_index]
             sample_index = current.get("sample_index", row_index)
             pair_sequence = current.get("pair_sequence", row_index)
             current.update(row)
             current["sample_index"] = sample_index
             current["pair_sequence"] = pair_sequence
-            if isinstance(self.panel.distance_recording_rows, (SpoolRows, LiveDataRows)):
-                self.panel.distance_recording_rows.replace(row_index, current)
-            self._track_pending_native_row(row_index, row)
+            atomic_replacer = getattr(owner, "replace_with_admission", None)
+            if callable(atomic_replacer):
+                admission = atomic_replacer(
+                    row_index,
+                    current,
+                    lease=self._pair_recording_row_leases.get(key),
+                )
+            else:
+                replacer = getattr(owner, "replace", None)
+                try:
+                    replaced = (
+                        replacer(row_index, current)
+                        if callable(replacer)
+                        else owner.__setitem__(row_index, current)
+                    )
+                except (IndexError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                    admission = RowWriteAdmission(
+                        ROW_WRITE_UNAVAILABLE,
+                        f"legacy measurement replacement failed: {exc}",
+                        row_index=row_index,
+                    )
+                else:
+                    admission = RowWriteAdmission(
+                        ROW_WRITE_ADMITTED if replaced is not False else ROW_WRITE_RETRYABLE,
+                        "" if replaced is not False else "legacy measurement replacement was not admitted",
+                        row_index=row_index,
+                    )
+            if admission.state == ROW_WRITE_UNAVAILABLE:
+                # The lease is stale (row cleared/reused underneath us) or the
+                # owner can no longer take writes; stop tracking this pair
+                # instead of silently rewriting whatever row now lives at this
+                # index, and keep the BLOCKED evidence via the direct path.
+                self.panel._recording_pair_row_index.pop(key, None)
+                self._pair_recording_row_leases.pop(key, None)
+                self._append_measurement_row_direct(current, reason=admission.reason)
+                self.panel._refresh_recording_status_label()
+                self.panel._refresh_operation_header()
+                return
+            if admission.lease is not None:
+                self._pair_recording_row_leases[key] = admission.lease
+            self._track_pending_native_row(
+                row_index, row, row_lease=self._pair_recording_row_leases.get(key)
+            )
             self.panel._refresh_recording_table()
         self.panel._refresh_recording_status_label()
         self.panel._refresh_operation_header()
