@@ -61,6 +61,7 @@ from Workstation.workstation_core.px4_mag_manager import (
     mag_priority_slot_key,
 )
 from Workstation.workstation_core.rtk_geometry import GpsPositionState
+from Workstation.workstation_core.settings import normalize_live_distance_time_basis
 
 from Workstation.workstation_core.coordinate_contract import (
     BASELINE_TRANSLATION_FRAME,
@@ -1229,11 +1230,17 @@ class EvidenceAdapter:
         return tuple(rows)
 
     def can_magnetometers(self, side: str, *, now_s: float | None = None) -> tuple[dict[str, object], ...]:
-        """Project only firmware-provided per-CAN magnetometer messages.
+        """Project firmware CAN_MAG telemetry, with a CAL_MAG identity fallback.
 
-        A CAN row is never populated from SCALED_IMU* or CAL_MAG parameters.
-        Those identify onboard IMU streams and configuration, respectively,
-        rather than proving that a CAN sensor is currently online.
+        xmag/ymag/zmag/Norm are never derived from CAL_MAG parameters -- only
+        PX4's DEBUG_VECT CAN_MAG compatibility message proves a CAN sensor is
+        currently online and sampling. When that message is absent (older
+        firmware, or simply no packet yet on the active transport --
+        USB/radio telemetry/Ethernet all work the same way here), Node
+        ID/Device ID are instead read from the last CAL_MAG*_ID parameter
+        readout in ``panel._px4_mag_status_cache`` (populated by the PX4 MAG
+        calibration "Read" action). That is a fixed configuration value, not
+        a live sample, so the row is marked "CONFIG" rather than LIVE/STALE.
         """
 
         now = time.monotonic() if now_s is None else float(now_s)
@@ -1771,11 +1778,11 @@ class EvidenceAdapter:
             "p2_gps_age_s": gps_ages["right"],
             "baseline_quality": baseline.get("state", "NO DATA"),
             "baseline_length_m": finite_number(baseline.get("length_m")),
-            "source": "selected P1/P2 GpsPositionState + MAVLink ATTITUDE",
+            "source": "selected P1/P2 GpsPositionState + P1/P2 MAVLink ATTITUDE",
             "clock": "latest app receive monotonic snapshots; not simultaneous measurement",
-            "frame_contract": "P1→P2 horizontal local NED; Pixhawk body FRD yaw in world NED",
+            "frame_contract": "P1→P2 horizontal local NED; P1/P2 body FRD yaw in world NED",
             "angle_contract": (
-                "Baseline-Pn = wrap180(azimuth(P1→P2) - Pn yaw); "
+                "Baseline-Pn = wrap180(azimuth(P1→P2) - Pn yaw), Pn=P1/P2; "
                 "+ is clockwise/right, - is counter-clockwise/left"
             ),
         }
@@ -2476,6 +2483,17 @@ class EvidenceAdapter:
                     "host_ip": str(row.get("host_ip", "") or ""),
                 }
             )
+        raw_network_roles = getattr(self.panel, "network_role_assignments", {}) or {}
+        if not isinstance(raw_network_roles, Mapping) or not raw_network_roles:
+            interface_edit = getattr(self.panel, "interface_edit", None)
+            interface_name = (
+                interface_edit.text().strip()
+                if interface_edit is not None and hasattr(interface_edit, "text")
+                else ""
+            )
+            raw_network_roles = {
+                "camera": {"interface": interface_name, "stable_id": ""}
+            }
         return {
             "candidates": tuple(candidates),
             "discovery_active": any(
@@ -2483,6 +2501,15 @@ class EvidenceAdapter:
                 for name in ("camera_network_discovery_thread", "camera_auto_detect_thread")
             ),
             "status": str(getattr(self.panel, "workstation_camera_discovery_status", "NOT RUN") or "NOT RUN"),
+            "network_role_status": dict(
+                getattr(self.panel, "network_role_status", {}) or {}
+            ),
+            "network_role_active": getattr(self.panel, "network_role_operation", None) is not None,
+            "network_roles": {
+                role: dict(value or {})
+                for role, value in raw_network_roles.items()
+                if isinstance(value, Mapping)
+            },
             "contract": "Network/RTSP/control endpoint metadata; no image coordinates or camera-frame values",
         }
 
@@ -2504,7 +2531,11 @@ class EvidenceAdapter:
                         "source_row": source_row,
                         "kind": str(row.get("kind", "") or ""),
                         "value": str(row.get("value", "") or ""),
+                        "resolved_device": str(row.get("resolved_device", "") or ""),
                         "baud": _integer(row.get("baud")),
+                        "system_id": _integer(row.get("system_id")),
+                        "component_id": _integer(row.get("component_id")),
+                        "observed_monotonic_s": _number(row.get("observed_monotonic_s")),
                         "status": str(row.get("status", "") or ""),
                         "interface": str(row.get("interface", "") or ""),
                         "candidate_id": str(row.get("candidate_id", "") or ""),
@@ -2522,6 +2553,23 @@ class EvidenceAdapter:
                         "device_path": str(row.get("device_path", "") or ""),
                     }
                 )
+        pixhawk_assignments = getattr(self.panel, "pixhawk_network_assignments", {}) or {}
+        raw_network_roles = getattr(self.panel, "network_role_assignments", {}) or {}
+        if not isinstance(raw_network_roles, Mapping) or not raw_network_roles:
+            raw_network_roles = {
+                "p1": {
+                    "interface": str(
+                        (pixhawk_assignments.get("left") or {}).get("interface") or ""
+                    ),
+                    "stable_id": "",
+                },
+                "p2": {
+                    "interface": str(
+                        (pixhawk_assignments.get("right") or {}).get("interface") or ""
+                    ),
+                    "stable_id": "",
+                },
+            }
         return {
             "candidates": tuple(candidates),
             "discovery_active": any(
@@ -2533,10 +2581,11 @@ class EvidenceAdapter:
                 )
             ),
             "status": str(getattr(self.panel, "workstation_pixhawk_discovery_status", "NOT RUN") or "NOT RUN"),
+            "revision": int(getattr(self.panel, "pixhawk_discovery_revision", 0) or 0),
             "assignments": {
                 side: {
                     **dict(
-                        (getattr(self.panel, "pixhawk_network_assignments", {}) or {}).get(side)
+                        pixhawk_assignments.get(side)
                         or {}
                     ),
                     **dict(
@@ -2545,6 +2594,15 @@ class EvidenceAdapter:
                     ),
                 }
                 for side in ("left", "right")
+            },
+            "network_role_status": dict(
+                getattr(self.panel, "network_role_status", {}) or {}
+            ),
+            "network_role_active": getattr(self.panel, "network_role_operation", None) is not None,
+            "network_roles": {
+                role: dict(value or {})
+                for role, value in raw_network_roles.items()
+                if isinstance(value, Mapping)
             },
             "contract": "Host/serial/MAVLink endpoint metadata; no attitude, position, or baseline values",
         }
@@ -2627,8 +2685,8 @@ class EvidenceAdapter:
                 "IDLE": "대기",
                 "RUNNING": "USB identity 재검증 및 one-shot reboot 진행 중",
                 "COMMAND_SENT": "USB reboot command 전송; Ethernet packet 재개 대기",
-                "QUALIFYING": "Ethernet packet 재개; 10분 qualification 진행 중",
-                "RECOVERED": "10분 qualification 통과",
+                "QUALIFYING": "Ethernet packet 재개; 1분 qualification 진행 중",
+                "RECOVERED": "1분 qualification 통과",
                 "CANCELLED": "operator 취소",
                 "ERROR": "결과 없음",
             }.get(state, "결과 없음")
@@ -2652,7 +2710,7 @@ class EvidenceAdapter:
             "qualification_elapsed_s": _number(getattr(health, "qualification_elapsed_s", None)),
             "contract": (
                 "unique current USB heartbeat sysid + operator confirmation + one-shot reboot; "
-                "success requires Ethernet HB/ATT 10-minute qualification"
+                "success requires Ethernet HB/ATT 1-minute qualification"
             ),
         }
 
@@ -2790,8 +2848,27 @@ class EvidenceAdapter:
             "iou": _number(_widget_value(getattr(self.panel, "iou_spin", None), setting("yolo_iou_threshold"))),
             "class_gate": _widget_text(getattr(self.panel, "yolo_gate_class_edit", None), str(setting("yolo_gate_class_text", ""))),
             "gate_enabled": tuple(gate_names),
-            "max_delta_s": _number(_widget_value(getattr(self.panel, "yolo_gate_time_delta_spin", None), setting("yolo_gate_max_time_delta_s"))),
-            "time_basis": str(_combo_data(getattr(self.panel, "yolo_gate_time_basis_combo", None), setting("yolo_gate_time_basis", "")) or ""),
+            "max_delta_s": min(
+                0.100,
+                max(
+                    0.0,
+                    _number(
+                        _widget_value(
+                            getattr(self.panel, "yolo_gate_time_delta_spin", None),
+                            setting("yolo_gate_max_time_delta_s"),
+                        ),
+                        0.100,
+                    ),
+                ),
+            ),
+            "time_basis": normalize_live_distance_time_basis(
+                _combo_data(
+                    getattr(self.panel, "yolo_gate_time_basis_combo", None),
+                    setting("yolo_gate_time_basis", "app_receive_monotonic"),
+                )
+            ),
+            "time_basis_role": "preferred_with_app_receive_fallback",
+            "ntp_evidence_role": "preferred_when_selected_and_verified",
             "max_vertical_delta_px": _number(_widget_value(getattr(self.panel, "yolo_gate_vertical_delta_spin", None), setting("yolo_gate_max_vertical_delta_px"))),
             "source": "AppSettings + existing YOLO configuration widgets",
         }
@@ -2866,11 +2943,8 @@ class EvidenceAdapter:
                 getattr(self.panel, "yolo_gate_class_edit", None),
                 str(setting("yolo_gate_class_text", "")),
             ),
-            "matching_gate_enabled": _widget_checked(
-                getattr(self.panel, "yolo_gate_matching_checkbox", None),
-                bool(setting("yolo_gate_matching_enabled", False)),
-            ),
-            "time_basis": str(
+            "matching_gate_enabled": True,
+            "time_basis": normalize_live_distance_time_basis(
                 _combo_data(
                     getattr(self.panel, "yolo_gate_time_basis_combo", None),
                     setting("yolo_gate_time_basis", "app_receive_monotonic"),
@@ -2879,12 +2953,19 @@ class EvidenceAdapter:
             ),
             "time_basis_role": "preferred_with_app_receive_fallback",
             "ntp_evidence_role": "preferred_when_selected_and_verified",
-            "time_delta_gate_enabled": _widget_checked(
-                getattr(self.panel, "yolo_gate_time_delta_checkbox", None),
-                bool(setting("yolo_gate_time_delta_enabled", False)),
-            ),
-            "max_pair_delta_s": _number(
-                _widget_value(getattr(self.panel, "yolo_gate_time_delta_spin", None), setting("yolo_gate_max_time_delta_s"))
+            "time_delta_gate_enabled": True,
+            "max_pair_delta_s": min(
+                0.100,
+                max(
+                    0.0,
+                    _number(
+                        _widget_value(
+                            getattr(self.panel, "yolo_gate_time_delta_spin", None),
+                            setting("yolo_gate_max_time_delta_s"),
+                        ),
+                        0.100,
+                    ),
+                ),
             ),
             "vertical_delta_gate_enabled": _widget_checked(
                 getattr(self.panel, "yolo_gate_vertical_delta_checkbox", None),
@@ -2926,6 +3007,7 @@ class EvidenceAdapter:
                     _number(setting("camera_sync_max_pc_offset_s"), 0.0) * 1000.0,
                 )
             ),
+            "camera_sync_max_pc_offset_role": "diagnostic-only",
             "camera_sync_clock_rate_error_pct": _number(
                 _widget_value(
                     getattr(self.panel, "camera_sync_clock_rate_error_spin", None),
@@ -2944,6 +3026,20 @@ class EvidenceAdapter:
                     setting("camera_sync_warmup_timeout_s"),
                 )
             ),
+            "camera_sync_mode": str(
+                _combo_data(
+                    getattr(self.panel, "camera_sync_mode_combo", None),
+                    setting("camera_sync_mode", "manual"),
+                )
+                or "manual"
+            ),
+            "camera_sync_interval_s": _number(
+                _widget_value(
+                    getattr(self.panel, "camera_sync_interval_spin", None),
+                    _number(setting("camera_sync_interval_s"), 1800.0) / 60.0,
+                )
+            )
+            * 60.0,
             "source": "existing Measurement/Time-Sync owner widgets + AppSettings",
             "coordinate_contract": f"intrinsics/extrinsics source selectors; public output {MEASUREMENT_FRAME} [{MEASUREMENT_AXIS_CONTRACT}]",
         }

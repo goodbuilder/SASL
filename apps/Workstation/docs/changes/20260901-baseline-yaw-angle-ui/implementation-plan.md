@@ -28,3 +28,16 @@ No migration. Rollback the additive domain/read-model/presentation fields and ma
 
 Stop and return to approval if a new setting, command, persistence/schema field, worker/device
 change, measurement-semantic change, or ownership transfer becomes necessary.
+
+## 2026-09-03 corrected implementation plan
+
+1. Add a GNSS-only horizontal baseline-to-midpoint-Drone angle property and absolute 90° error to
+   the existing GNSS baseline-center read mapping; use `atan2(|Forward|, |Right|)`.
+2. Add independent cardinal/90°/zero-vector tests and preserve the existing F/R/D/Rg record
+   contract.
+3. Add the two read-only Telemetry table columns, fixed formatting, tooltips, and stable geometry
+   checks for CURRENT/STALE/WAITING and long values.
+4. Remove the unneeded Drone ATTITUDE/yaw amendment from this packet's presentation/read model;
+   keep the existing P1/P2 yaw diagnostic separate and unchanged.
+5. Update the Workstation README, numbered UI contracts, and this packet; run focused, dependent,
+   full Workstation, and launcher verification.

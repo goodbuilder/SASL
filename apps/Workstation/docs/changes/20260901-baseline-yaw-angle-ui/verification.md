@@ -102,3 +102,22 @@ packet; no field claim is made.
 - Real-rig CURRENT/PARTIAL/STALE/recovery and outdoor GNSS readability remain hardware-manual.
 - The unrelated NVIDIA lossless-recorder test currently fails in isolation because its recorder
   rejects the second frame; all selected non-NVIDIA regression tests passed.
+
+## 2026-09-03 corrected GNSS installation-angle verification
+
+- GNSS baseline-center pure/controller/Telemetry plus retained P1/P2-yaw compatibility suite:
+  `47 passed in 1.52s`.
+- Corrected scope is verified in code and tests: angle is `atan2(|Forward|,|Right|)` from
+  P1/P2/Drone GNSS only; 90° error is `|90°−angle|`; no Drone ATTITUDE/yaw input and no recording
+  schema change.
+- Dependent Workstation boundary (`baseline`, `Telemetry`, P1/P2 Pixhawk, status, lifecycle, UI,
+  and contract tests): `237 passed in 33.12s`.
+- Full Workstation suite: `1899 passed, 2 skipped, 1 failed`; the only failure was
+  `tests/test_drone_network_discovery.py::test_passive_discovery_reports_source_port_listen_port_and_sysid`
+  because sandbox policy denied UDP socket creation (`PermissionError: [Errno 1] Operation not permitted`).
+  Rerunning that exact boundary with socket access produced `1 passed in 0.94s`.
+- Launcher after implementation: `./run.sh --check` exited `0`; only optional `nvh264dec`/NVIDIA
+  warnings remain.
+- Real three-GNSS installation geometry remains hardware/manual evidence. The latest saved session
+  row contains the angle inputs but is `STALE` because its three-source timestamp spread exceeded
+  1000 ms.

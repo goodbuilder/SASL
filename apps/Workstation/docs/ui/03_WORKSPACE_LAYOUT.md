@@ -52,6 +52,12 @@ Default width candidate: 220–280 px, initial ~240 px, minimum ~180 px. Use hie
 
 Should receive approximately 55–65% or more of horizontal space under default layout. Local tabs are allowed inside one engineering context.
 
+Camera and Pixhawk network candidate tables retain compact native QTableView geometry while adding
+an `Assigned` role-set projection. Candidate count is runtime-variable. `Assign Camera NIC/P1/P2`
+opens one native before/after confirmation; asynchronous STOPPING/APPLYING/VERIFYING/RECONNECTING/
+ROLLING BACK status stays in the existing bounded status region and never rebuilds the table, moves
+selection, changes scroll, or resizes adjacent controls.
+
 ## 7. Inspector Dock
 
 Default width candidate: 280–340 px, initial ~300 px, minimum ~240 px. Contextual, compact, collapsible.
@@ -90,6 +96,10 @@ Camera readiness actions are ordered as IP discovery, WIRIS control, RTSP enable
 and RTSP frame check. Left/right mapping and saving camera settings are kept in a separate
 mapping/settings group.
 
+The details region also contains a fixed-height `RTP / decode` text group for each side. It shows
+worker-measured five-second rolling RTP packets/s, sequence-gap missing packets/s, estimated loss,
+H.264 access-units/s, and decoded Hz without changing preview geometry.
+
 ## 14. Time / Sync Workspace
 
 The field clock sequence is visible together: set WIRIS time from the PC, edit/apply/save
@@ -116,8 +126,14 @@ and OpenCV RDF contracts.
 
 ## 16. Calibration Workspace
 
-Uses local Setup, Capture/intrinsics, and Validation tabs. The advanced preview button
-opens the Workstation `Advanced` preview tab rather than exposing the internal owner UI.
+The primary surface keeps the local `촬영`, `계산·적용`, and `프로파일` tabs. `촬영` places
+checkerboard status, capture commands, current-run/current-set counters, and the latest factual
+status before an equal-width Left/Right overlay pair. This keeps critical evidence and commands
+inside the unscrolled 1366x768 viewport even when Navigation, Inspector, and Diagnostics are open;
+the preview continues immediately below. Live status rows have fixed height and elide long detail
+into a tooltip, so they do not move controls, focus, selection, or scroll. Photo-set roots, exact
+file selection, setup, diagnostics, raw K,D/R,t evidence and detailed command responses remain under
+collapsed `고급 캘리브레이션`; the hidden owner UI is not a fallback.
 
 ## 17. Pixhawk / GNSS / Detection / Recording / Analysis
 
@@ -161,10 +177,12 @@ app-lifetime state and is not a second calibration owner.
 The Alignment evidence keeps raw RTK NED `[N,E,D]` and the separate P1 body-FRD
 `[F,R,D]` projection in adjacent groups so the operator can use the intuitive P1
 orientation without confusing it with camera optical RDF or public measurement output.
-The Pixhawk page places one compact `P1→P2 baseline / Pixhawk yaw` group immediately below its
-raw baseline group. A fixed numeric summary at left keeps Baseline−P1 and Baseline−P2 separate;
-a fixed-height north-referenced top view at right draws baseline, P1 Forward and P2 Forward with
-labels and distinct line/color treatment. Live 4 Hz updates replace values in place and never
+The Pixhawk page keeps the raw P1/P2 ATTITUDE diagnostic separate from GNSS installation alignment.
+The Telemetry page places one fixed `GNSS BASELINE_CENTER F/R/D/Rg/Angle` group immediately below its
+three-row `Live position` table and before RTCM delivery. A non-selectable one-row table keeps
+State, signed Forward/Right/Down metres, Rg, the acute horizontal baseline↔Drone angle, absolute
+90° error, maximum age, maximum three-GNSS receive delta, and P1/P2/Drone fix labels in stable
+columns. Live updates replace values in place and never
 resize the group, move controls, change focus/selection, or jump the outer scroll position.
 Immediately below this baseline/yaw group, Pixhawk adds one compact read-only `Drone Pixhawk
 geometry · F/R/D/Rg` table with `Dr from Baseline Center`, `Dr from P1`, and `Dr from P2` rows.
@@ -172,6 +190,15 @@ The midpoint row is GNSS baseline-center local-level FRD; the P1/P2 rows are the
 PX4 body-FRD vectors. Its separate `∠Dr-P1-P2` and `∠Dr-P2-P1` values use horizontal F/R only,
 are unsigned internal angles, and do not add a 3D/yaw verdict. Fixed formats and in-place refresh
 preserve group height, focus, row selection, and outer scroll.
+
+Its Discovery candidate table uses fixed source-neutral `Source`, `NIC / Device`, `Link / Kind`,
+`Evidence`, and `Role` columns. A new USB/network search intentionally clears prior table selection
+and feedback without moving the assignment cards, controls, docks, splitters, or outer scroll.
+Network rows may say `P1, P2 (shared NIC)`; USB rows show one physical endpoint and the observed
+P1/P2/Drone sysid separately, so a shared host NIC cannot be mistaken for a shared Radio.
+The bounded reason and static coordinate-contract hint
+remain visible without moving controls, focus, selection, scroll, docks, or splitters at the
+existing visible-workspace refresh cadence.
 Data Capture keeps Target reference connectivity, HR purpose/import events, and a PX4 ULog table.
 UAM target telemetry is shown as deferred rather
 than erroneous; target Drone data is a separate receive-only source and never replaces P1/P2

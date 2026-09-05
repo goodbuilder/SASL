@@ -32,5 +32,8 @@ timestamps, so the approved derived angle can be reconstructed offline.
 ## Documentation, code, test, and runtime conflicts
 
 Product documents require value/unit/source/age/frame clarity and preserve raw NED separately from
-derived FRD. No product document currently specifies a visible signed horizontal baseline/yaw
-read model. Hardware visual behavior remains unverified until a real P1/P2/GNSS run.
+derived GNSS local-level FRD. The existing Telemetry `GNSS BASELINE_CENTER F/R/D/Rg` calculation
+already has the exact midpoint-to-Drone vector needed for the requested angle, but its UI exposes no
+angle/error field. The uncommitted Drone-yaw amendment is superseded by the operator clarification:
+Drone ATTITUDE is not an input. A real three-GNSS current/stale display remains hardware/manual
+evidence.

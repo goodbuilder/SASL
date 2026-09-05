@@ -86,7 +86,7 @@ def calculate_baseline_yaw_alignment(
     The Down component is validated and retained by the input contract but
     intentionally does not affect this horizontal operator aid.  A baseline
     with no horizontal direction returns ``None`` instead of inventing an
-    azimuth.  Optional yaw inputs remain independent so one live Pixhawk can
+    azimuth. Optional yaw inputs remain independent so one live Pixhawk can
     still produce its own comparison while the other is unavailable.
     """
 

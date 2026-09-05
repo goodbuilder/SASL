@@ -19,6 +19,32 @@ part of the Workstation runtime or its operator sequence. The launcher also bran
 the ROS2/PX4 overlay bootstrap for `--ui workstation`; ROS2 Python bindings in the shared
 telemetry module are lazy-loaded only by a Legacy ROS2 operation.
 
+2026-09-02 topology audit amendment: the fixed Pixhawk topology group must preserve the existing
+manual controls and fixed workspace geometry. Audit the operation journal, restart-to-PARTIAL
+behavior, exclusive serial/UDP ownership, immediate identity/isolation/disarmed revalidation,
+explicit mutation confirmation, exact readback, commit-last persistence, guided rollback, and
+lifecycle cancellation. `COMPLETE` must never be used as evidence of Connect or field
+qualification; physical radio removal, cable insertion, and power cycling stay operator-owned.
+
+2026-09-02 GNSS baseline-center audit amendment: verify that the Telemetry result is named
+`gnss_baseline_center_local_level_frd`, uses the P1/P2 GNSS antenna midpoint and local-level axes,
+and cannot alias optical `baseline_center_frd`. Audit exact signed sentinel math, 2.0 s/1000 ms
+timing boundaries, stale-value retention, missing-data non-zero fabrication, fix-as-evidence,
+shared Rg/readiness with ideal disparity, absence of persistence/workers/device I/O, and fixed
+one-row table geometry/focus/scroll across live states and target screen sizes.
+
+2026-09-03 GNSS installation-angle audit amendment: verify that the Telemetry table derives the
+acute horizontal angle from existing GNSS midpoint `Forward/Right` components as
+`atan2(|Forward|,|Right|)`, shows absolute `|90°−angle|` error, keeps Drone ATTITUDE/yaw out of the
+contract, preserves CURRENT/STALE/WAITING source timing semantics, and remains fixed-height and
+scroll/focus stable at target screen sizes.
+
+2026-09-02 GNSS recording audit amendment: verify primary-Drone-only/recording-only trigger,
+one-row-per-callback ordering after raw evidence, self-contained exact source clocks/selection,
+CURRENT/STALE/WAITING null semantics, <=4 KiB row, best-effort bulk failure isolation, fixed stream
+append/restart/checkpoint, Data Status truth, latest-generation XLSX filtering, and absence of raw
+row/canonical Measurement/legacy Parquet/settings/worker/device changes.
+
 ## 1. Audit Role
 
 Act as an independent senior software architect, Qt engineer, and adversarial UI reviewer. Treat design documents as hypotheses, not truth.

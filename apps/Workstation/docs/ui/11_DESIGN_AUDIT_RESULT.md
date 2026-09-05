@@ -8,6 +8,30 @@ Older findings below may mention those paths as audit history; such paths remain
 The Workstation launcher now skips ROS2/PX4 overlay bootstrap, and the shared telemetry
 module lazy-loads ROS2 Python bindings only for a Legacy ROS2 operation.
 
+2026-09-02 topology amendment: the approved implementation adds one fixed-height Pixhawk field
+topology group without replacing manual transport/connect controls. A journaled controller and
+bounded worker keep writes off the UI thread and fail closed on ambiguous identity, non-isolation,
+armed state, endpoint ownership, missing readback, or interrupted persistence. Resume always starts
+with a fresh probe; cancellation after a persistent write remains `PARTIAL`; guided rollback uses
+captured pre-change evidence. Software tests and offscreen inspection may close the UI slice, but
+the final P1/Drone radio plus P2 Ethernet cold-boot/qualification remains a hardware condition.
+
+2026-09-02 GNSS baseline-center amendment: the approved implementation adds a read-only Telemetry
+projection, not a new Measurement coordinate. Its central coordinate constants and pure transform
+keep GNSS antenna-midpoint local-level F/R/D/Rg separate from optical-center
+`baseline_center_frd`; the controller remains the only snapshot owner and the widget only formats
+that mapping. The fixed one-row table uses existing Qt engineering-table language and no command,
+settings/persistence/schema, worker, device, Measurement or Recording dependency. Automated
+sentinel/timing/UI and offscreen state-sequence evidence govern software acceptance; live three-
+receiver comparison remains separately labelled hardware/manual evidence.
+
+2026-09-02 GNSS recording amendment: persistence remains within the existing Recording ->
+DataStorageController -> MeasurementDataStore boundary. Sensor presentation emits one explicit
+primary-Drone handoff but owns no file; the fixed stream is bulk and optional. A self-contained row
+preserves selected source clocks/fix/provenance and the non-canonical GNSS frame, while Latest XLSX
+is derived. Raw PX4 rows, Measurement/Parquet schemas, recording admission, UI layout, workers and
+devices remain independent.
+
 - 감사일: 2026-08-08
 - 감사 브랜치: `audit/20260808-audit-prompt`
 - 감사 시작 기준 커밋: `b5f11bc`

@@ -2,23 +2,23 @@
 
 ## Affected operators and workflow IDs
 
-Field operator; physical baseline and Roll/Pitch/Yaw alignment steps 5–7.
+Field operator; camera installation alignment using P1/P2/Drone GNSS.
 
 ## Current workflow
 
-Open Pixhawk, read yaw and baseline in separate regions, mentally derive direction, then continue
-the physical adjustment/sample procedure.
+Open Telemetry, read P1/P2/Drone GNSS and F/R/D/Rg, mentally derive the angle, then adjust the
+camera installation.
 
 ## Proposed workflow
 
-Open Pixhawk, read the existing raw values, then use the adjacent live baseline/yaw summary and top
-view to observe P1/P2 horizontal direction. Continue the existing physical adjustment and evidence
-sampling procedure unchanged.
+Open Telemetry, read the existing three GNSS positions, then use the adjacent live
+`Baseline↔Drone angle` and `90° error` values. Move/rotate the camera installation until the angle
+is 90°, while keeping the existing source freshness evidence visible.
 
 ## Preserved, added, removed, and reordered steps
 
-One read-only observation is added after raw baseline inspection. No step is removed, reordered,
-automated, or made blocking.
+One read-only angle observation is added after GNSS position inspection. No step is removed,
+reordered, automated, or made blocking.
 
 ## Decisions, confirmations, handoffs, waits, and artifacts
 
@@ -42,11 +42,12 @@ alignment sample or continue adjusting hardware.
 
 ## Training, operating-procedure, and compatibility impact
 
-Document `+` as clockwise/right of Forward and `-` as counter-clockwise/left. Existing files,
-settings, commands, and procedures remain compatible.
+Document the angle as the acute horizontal line angle between P1→P2 and midpoint→Drone. 90° means
+the Drone lies on the perpendicular through the P1/P2 GNSS midpoint. Existing files, settings,
+commands, and procedures remain compatible.
 
 ## Workflow-to-screen, command, state, and regression traceability
 
-`Devices > Pixhawk` -> existing evidence adapter -> new read-only summary/plot. No command path.
-Regression covers raw attitude/baseline presentation, independent side loss, stale recovery,
-role/source selection, rapid refresh, and shutdown.
+`Devices > Telemetry` -> existing DroneTelemetryController GNSS snapshot -> new read-only table
+columns. No command path. Regression covers GNSS source selection, missing/stale/zero-vector cases,
+90° target/error formatting, rapid refresh, table geometry, focus/scroll, and shutdown.

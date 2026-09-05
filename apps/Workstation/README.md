@@ -6,10 +6,15 @@ This package provides the operator Workstation for synchronized stereo-camera ca
 calibration, Measurement, Pixhawk/GNSS evidence, and recording. It owns its runtime and UI
 independently from the Legacy application.
 
-`Devices > Pixhawk` combines the selected live P1→P2 horizontal GNSS baseline with each
-Pixhawk's MAVLink ATTITUDE yaw in a read-only `Baseline−P1`/`Baseline−P2` view. The signed
-degrees and north-referenced top view make the two board directions directly observable while
-retaining raw NED, body-FRD, source, fix, age, and pair-time evidence separately.
+`Devices > Pixhawk` keeps the raw P1/P2 ATTITUDE and GNSS evidence. The camera-installation
+alignment value is shown separately in `Devices > Telemetry`: it is the horizontal angle between
+the P1→P2 GNSS baseline and the vector from the P1/P2 GNSS midpoint to Drone GNSS, plus its absolute
+error from the 90° target. Drone ATTITUDE/yaw is not used for this value.
+
+Calibration's default `촬영` surface shows the existing Left/Right checkerboard overlays together
+with source-backed board state, current-process inspection outcomes, and persisted capture-set
+candidate counts. Those counters explain capture evidence; they never replace the K,D/R,t quality
+and Apply gates.
 
 The same Pixhawk page also shows `Dr from Baseline Center`, `Dr from P1`, and `Dr from P2`
 as `F/R/D/Rg` metre values. `Dr` means Drone Pixhawk; the three rows explicitly identify the
@@ -41,28 +46,30 @@ method-specific lifecycle.
 After an abnormal process exit, restart likewise leaves the incomplete run as inert append-only
 history and creates a new runtime generation only when the operator presses `측정 시작` again.
 
-Structured records append to fixed, type-owned files beneath the repository-root `recordings/`
+Structured records append to timestamped, type-owned files beneath the repository-root `recordings/`
 folder by default. A blank `measurement_data_root` selects that default; an explicit custom value
-remains relative to `SASL_WORKSTATION_DATA_ROOT`. Videos, still images, native PNGs, and ULogs use
-their own creation-time filename with local UTC offset and never replace an existing file. Each row
-retains its UTC, monotonic, and available source-clock evidence, so an operator can collect or join
-records later.
+remains relative to `SASL_WORKSTATION_DATA_ROOT`. Each new data writer uses one shared creation-time
+token in names such as `measurements_YYYYMMDD_HHMMSS_nnnnnnn+0900.jsonl`; legacy fixed JSONL names
+remain readable. Videos, still images, native PNGs, and ULogs use their own creation-time filename
+and never replace an existing file. Each row retains its UTC, monotonic, and available source-clock
+evidence, so an operator can collect or join records later.
 Storage failures and bounded-queue drops are visible in `Data > Status`, but do not stop camera,
 Detection, GNSS/RTCM routing, target telemetry, or the next Measurement. Result/event queues are
 reserved ahead of bulk camera/PX4/GNSS traffic.
 
-The same data root may contain one derived `latest_measurement.xlsx` for the most recently stopped
-Measurement. It is generated only after the run has returned to `IDLE`, may be updated/opened from
-`Data > Status`, and never replaces fixed JSONL as the source of truth. A missing source or field is
-shown as zero rows/Excel `#N/A`; unlike-rate sources are kept on separate sheets rather than joined
-by an invented timestamp rule.
+The same data root may contain timestamped derived workbooks such as
+`latest_measurement_YYYYMMDD_HHMMSS_nnnnnnn+0900.xlsx` for stopped Measurements. Each export uses a
+new filename, is generated only after the run has returned to `IDLE`, and may be updated/opened from
+`Data > Status`. Timestamped JSONL remains the source of truth. A missing source or field is shown as
+zero rows/Excel `#N/A`; unlike-rate sources are kept on separate sheets rather than joined by an
+invented timestamp rule.
 
 If an essential stream (`events`, `measurements`, or `method_evaluations`) cannot write, the
 background owner retains FIFO records in a 256-record/8 MiB reserve and retries with bounded
 backoff. Video and high-rate telemetry are never accumulated without bound; their drops remain
 visible and the observation continues.
 
-The top-level `Data` workspace exposes writer health, fixed paths, capture tools, the current data
+The top-level `Data` workspace exposes writer health, timestamped paths, capture tools, the current data
 folder, and a separate file-manager link to historical data-root `recordings/`. It does not scan,
 recover, migrate, or mutate legacy Session catalogs. Alignment is app-lifetime state: Apply persists an append-only
 Alignment event, and the active Alignment remains available across Measurements until Revert,
@@ -72,10 +79,59 @@ Runtime fault isolation keeps one callback, device, camera child, or evidence wr
 silently taking down unrelated links. High-rate camera, PX4, GNSS, RTCM, and target traffic stays
 on bounded worker-owned paths while the Qt UI consumes latest-state snapshots.
 
+Each board transport is `Radio`, `Ethernet`, or `USB`. Radio and USB are both serial links that
+open one exclusive device path and share the same Connect preflight; they differ in bandwidth
+policy, so Radio keeps its tiered stream throttle while USB carries the stock stream set of a
+direct cable. USB connects through the board's existing bootstrap endpoint, so the saved Radio
+endpoint survives a transport switch. The application never pretends to
+remove a radio, plug in Ethernet, or power-cycle a board; it waits for actual sysid, carrier,
+readback, and cross-endpoint evidence before enabling the next action.
+
+`Devices > Telemetry` exposes one read-only `GNSS BASELINE_CENTER F/R/D/Rg/Angle` reference whenever
+selected P1/P2 and Drone GNSS positions are available. Its origin is the P1/P2 GNSS antenna
+midpoint; Right is horizontal P1→P2, Down is NED Down, and Forward is Right×Down. The horizontal
+baseline↔Drone angle is `atan2(|Forward|,|Right|)` and the displayed installation error is
+`|90°−angle|`. This GNSS-derived local-level frame is explicitly separate from the optical-center/camera-axis
+`baseline_center_frd` Measurement contract.
+While Measurement or Manual Record is active, every primary Drone GNSS callback also attempts one
+self-contained best-effort row in `gnss_baseline_center.jsonl`; raw P1/P2/Drone files remain
+unchanged.
+
+The same Telemetry workspace provides bounded read-only `Find Network` discovery for an Ethernet
+Drone Pixhawk. It passively observes UDP MAVLink ports, shows NIC/source IP/listen port/system ID,
+and permits selection only when a HEARTBEAT identifies `sysid=3`. `Use selected` fills the existing
+MAVLink URL; Apply, Save and Connect remain separate explicit commands. Apply/Save preserve the
+accepted URL instead of allowing an older runtime snapshot to replace the edit.
+
+Workstation live-distance pairing follows `Measurement > Pair gates > Time basis`. The default is
+exact host-monotonic app receipt. `RTCP/NTP preferred` actually selects a pair only while Clock is
+VERIFIED and both decoded frames carry finite, current, same-epoch evidence inside the configured
+limit; every timing fault falls back to exact `app_receive_monotonic_ns`. The selected basis is
+hard-capped at 100 ms. Fallback provenance is visible and stored but does not by itself downgrade
+otherwise-valid geometry.
+
+Camera media admission is permanently tolerant. Decoded frames continue to Preview, YOLO, native
+evidence, and official Measurement even when RTP loss or the WIRIS IDR defect prevents compressed-
+source integrity verification. Existing timing, calibration, correspondence, and geometry gates
+remain authoritative, so a distance may be `VALID` while the camera and result independently show
+`INPUT UNVERIFIED`. This behavior has no setting, environment switch, or strict-mode toggle.
+
 Calibration now presents a StereoWIRIS-style primary workflow while retaining the full Workstation
 calibration implementation. The default surface exposes only `촬영`, `계산·적용`, and
 `프로파일`; file selection, photo-set roots, per-view diagnostics, subset evidence, checkerboard
 setup, and raw K,D/R,t details remain available under the collapsed `고급 캘리브레이션` area.
+Calibration Live/Auto pair admission uses the same decoded-frame host-monotonic app-receive clock,
+while retaining NTP/RTCP as separately labelled record-only evidence. This is a host-receipt proxy,
+not proof of simultaneous camera exposure. FTP still pairing retains its separate CPTR-dispatch proxy.
+Auto capture additionally admits only parser-observed NAL type 1, non-delta frames and binds the
+checkerboard observation to the same decoded native `FrameKey`; it does not treat NAL1 as IDR.
+Each successful Auto Start begins a new visible `이번 촬영` counter run without deleting or
+renumbering the persisted capture set.
+
+Applied operating K,D is admitted by immutable profile identity and exact native left/right raster.
+Live zoom readback presence, age, and value, left/right zoom agreement, physical camera serial,
+and stabilization state remain saved provenance only; they never block or warn in Measurement
+readiness. This does not bypass Calibration quality/Apply rules or native-raster matching.
 
 ## Current Run Flow
 
@@ -94,6 +150,32 @@ tools/check_operator_runtime.sh --execution
 ./apps/Workstation/run.sh --check
 ./apps/Workstation/run.sh
 ```
+
+No media-integrity environment variable is required. A normal `run.sh` launch always uses the
+tolerant decoded-frame contract. The historical non-IDR trial switch is no longer a product
+behavior input.
+
+For Calibration Auto capture, leave Preview running and move the checkerboard only after a saved
+pair or a duplicate-pose message. Auto waits for a positive NAL1/non-delta candidate on each side,
+then saves only the exact native FrameKeys used by checkerboard detection. An expired ring key is
+not replaced by a nearby timestamp; the next live candidate is the retry.
+After Stop, wait for any in-flight capture worker to finish before pressing Start again. A successful
+restart resets `검사`, `Stereo 저장`, `K,D 전용`, and `실패` under `이번 촬영` to zero; the files and
+the separate cumulative `촬영 세트` counts remain.
+
+The field workflow is deliberately start-first: press `측정 시작` at the observation boundary,
+then recover unavailable inputs while the run remains active. Busy camera resources join after
+release. A failed camera rejoins only after the operator uses its existing Reactivate action and a
+new-generation frame is observed. Recovered video always uses a new no-overwrite MP4 segment.
+If Measurement requests explicit `NVIDIA` while `nvh264dec` is unavailable, the observation still
+opens but its camera/recording sources are marked unavailable. Any already-live Preview remains
+visible. Stop that observation, select `Auto` or `Software`, and retry; Workstation does not silently
+override an explicit decoder choice.
+
+Before installing the camera, open `Devices > Telemetry` and inspect the P1/P2/Drone GNSS rows and
+the `GNSS BASELINE_CENTER F/R/D/Rg/Angle` row. Adjust the camera position/orientation until the
+horizontal baseline↔Drone angle is 90° and the displayed 90° error is near 0°. `CURRENT/STALE/WAITING`
+describes GNSS freshness/timing only; it is not a camera measurement verdict.
 
 The Workstation/Legacy launchers and common runtime doctor start from a closed operator
 environment: user-site packages and ambient Python, loader, GI and GStreamer plugin/system/scanner
@@ -126,6 +208,10 @@ an alignment pass/fail verdict. In the following `Drone Pixhawk geometry` group,
 `Dr from ...` `F/R/D/Rg` rows and the two separately named horizontal angles. The vector direction
 is reference→Dr; `D` in the vector header means Down, and `Dr` in the point labels means Drone.
 
+For a LAN Drone, open `Devices > Telemetry`, press `Find Network`, select the `DRONE VERIFIED`
+row, and press `Use selected`. Review the URL, then press `Apply`, `Save`, and `Connect`. LIVE
+requires the expected system-3 heartbeat and telemetry; discovery alone is not connection success.
+
 Each manual `Connect cameras` request performs one WIRIS discovery, activation, and RTSP-frame
 verification attempt. A failed request does not retry the same camera IP in the background; press
 `Connect cameras` again to start a fresh discovery after correcting power, Ethernet mode, or IP.
@@ -141,40 +227,82 @@ needed), then use `프로파일` to load and apply the verified bundle. Open `�
 only when selecting exact photo files, reviewing quality reasons, changing board/setup parameters,
 or inspecting persisted profile evidence.
 
+During capture, `보드 L/R` reports current checkerboard detection and corner count, `이번 촬영`
+reports checkerboard validation jobs that actually started, and `현재 캡처 세트` reports the files
+recoverable from the active root. `Stereo 저장 후보` is before manual exclusion and solver pose
+filtering. Before `K,D 계산`, select one Photo set, keep each camera's input at one native raster,
+and enter the board's exact inner-corner dimensions. A mixed raster or wrong pattern fails closed;
+a finite K,D result still requires the quality panel to pass before Apply.
+
 The field dual-Pixhawk profile uses Workstation `10.0.0.10/24`, P1/Left
 `10.0.0.2:14550` with MAVLink system ID `1`, and P2/Right `10.0.0.3:14551` with system ID `2`.
 Save each board's Ethernet profile over USB once, reboot it, then verify both heartbeats with USB
 removed. The exact parameters, SD-card files, recovery sequence, and field checks are recorded in
 [`Pixhawk.md`](Pixhawk.md).
 
-The current field wiring isolates camera and Pixhawk Layer-2 traffic on separate NICs. Cameras use
+One field-qualified wiring reference isolates camera and Pixhawk Layer-2 traffic on separate NICs. Cameras use
 `enx588694fce07e` with `10.0.0.11/32` and preferred-source host routes to `.231/.232`; P1/P2 use
 the replacement RTL8156B `enx0023a40a2e39` with `10.0.0.10/24` and `.2/.3` routes. Neither device
 profile supplies a default route. This remains the field-qualified topology because a shared
 camera/Pixhawk broadcast domain reproduced a persistent dual-PX4 MAVLink service stall under RTSP
-load. The UI nevertheless permits the same physical NIC to be assigned to Camera and Pixhawk
-without a topology warning or readiness gate; that selectable layout is not a claim of sustained
-field stability. Both Workstation and Legacy defaults preserve the split, and a clean or reset
-settings file does not propose the Pixhawk NIC's `.10/24` address for the camera interface.
+load. The operator may nevertheless use one combined NIC or any multi-NIC split; that selectable
+layout is not a claim of sustained shared-NIC field stability.
 
-On the Pixhawk page, `Find network` performs a read-only inventory of physical wired NICs, their
-current IPv4 addresses, carrier state, and the kernel-selected P1/P2 routes. It never adds an IP,
-route, NetworkManager profile, or default gateway. The candidate table shows only NIC/local-address
-choices and their P1/P2 assignment labels; it does not mix both routes/endpoints into one row.
-Select a row and press `Assign P1` or `Assign P2`. Independent P1/P2 cards then show that side's
-State, NIC, Local IPv4, Endpoint and Route, and the last assignment is saved. P1/P2 may share a NIC
-or use different NICs. `Connect` re-reads each selected side's existing address and
-`destination -> dev/src` route before opening its MAVLink socket. A missing interface/address,
-link-down, or route mismatch fails only that side; an independently valid side remains connected.
-Replacing a NIC changes its `enx...` name, so run `Find network` and Assign that side again.
+`Find network` is always read-only and inventories every current physical wired NIC, stable
+identity, current IPv4/carrier, and P1/P2 route evidence. Camera uses `Assign Camera NIC`; Pixhawk
+uses `Assign P1` and `Assign P2`. An Assign request shows the exact current/proposed roles,
+addresses/routes, and active devices that will restart. Only after operator confirmation and OS
+authorization does Workstation change NetworkManager. It changes only exact Workstation-owned role
+entries, never adds a default route, and permits `Camera,P1,P2` on one NIC or arbitrary splits.
+
+Pixhawk `Find USB` and `Find network` each start a new transient Discovery snapshot. Prior rows,
+selection, and candidate feedback are cleared, and completion shows only the newly requested USB or
+network result; saved Radio endpoints, network assignments, settings, and live connections are not
+cleared. USB aliases are deduplicated to one row per physical serial endpoint. A heartbeat enriches
+that row with the observed role (`P1=sysid 1`, `P2=sysid 2`, `Drone=sysid 3`) instead of creating a
+second MAVLink row. Discovery remains read-only and never assigns or connects a board.
+
+For the guided field topology, open `Devices > Pixhawk`, select
+`P1 Radio · P2 Ethernet · Drone Radio`, and press `Check`. Keep every board disarmed and disconnect
+all Workstation Pixhawk links first. Follow only the enabled row action: isolate Drone while P1/P2
+air radios are off, confirm the exact Drone NETID25→26 write, fully power-cycle the Drone air radio,
+verify Drone sysid3 only on DU, remove the P2 air radio, and verify/provision P2
+`10.0.0.3:14551` over its unique direct USB when required. `Save topology` commits settings only
+after both hardware postconditions; then use the existing P1/P2/Drone `Connect` buttons. No link is
+opened automatically.
+
+If setup is interrupted, restart shows `PARTIAL`. Run `Check` again, then use the current Resume
+action or `Guided rollback`. A saved device change is never hidden by Cancel. A malformed operation
+record is archived before a new read-only Check. P2 Ethernet failure after completion disconnects
+only P2; DU remains owned by Drone and there is no automatic Radio fallback.
+
+After P1, P2 and Drone positions appear in `Devices > Telemetry`, inspect the fixed
+`GNSS BASELINE_CENTER F/R/D/Rg/Angle` row directly below `Live position`. `CURRENT` requires each
+source age to be at most 2.0 s and the three application-receive timestamps to span at most 1000 ms.
+`STALE` retains the finite signed values and angle with actual age/skew and reason; `WAITING` uses
+`--` for missing/invalid geometry. Fix labels remain evidence and do not require RTK Fixed. The existing
+ideal-disparity reference consumes the same Rg/readiness and needs no additional operator action.
+During Measurement or Manual Record, the same primary Drone callback—not the UI refresh—writes one
+CURRENT/STALE/WAITING evidence row. Check `Data > Status > gnss.baseline.center` for admitted,
+dropped, or failed writes. The timestamped latest Measurement workbook includes the latest generation
+in a `GnssBaselineCenter` sheet.
+
+The target role is applied and read back before the moved role is removed from its old NIC. If
+Camera/Pixhawk is already healthy, Workstation stops only owners on the source/target NICs,
+reconnects the previously active set on the selected NIC, and requires a new decoded Camera frame
+or expected-system Pixhawk HEARTBEAT+ATTITUDE before saving. Other NICs continue. Failure restores
+the previous network/owner state where possible and reports any incomplete rollback. An active
+Measurement/recording/save/finalization rejects the change before any stop or host mutation.
 
 At runtime Workstation identifies itself on both Ethernet links as MAVLink GCS `255/190`. Connect
 immediately seeds each configured peer with one GCS heartbeat to break PX4's pre-identity broadcast
 deadlock, then sends at most one heartbeat per side per second. A new or rebooted
 P1/P2 link remains `QUALIFYING` until expected-system HEARTBEAT and ATTITUDE stay continuously fresh
-for 10 minutes. `ATTITUDE STALE` means other MAVLink traffic is still arriving; `ETH MAVLINK RX
+for 60 seconds. `ATTITUDE STALE` means other MAVLink traffic is still arriving; `ETH MAVLINK RX
 STALLED` means all expected-system traffic has been silent for 10 seconds. Only `LIVE` passes the
-Pixhawk readiness gate.
+Pixhawk readiness gate. This one-minute product gate permits routine attitude-dependent operation;
+the separate 10-minute comparison/cold-boot runs and 60-minute integrated soak remain the evidence
+for long-duration field stability.
 
 Pixhawk Connect opens transport on its worker, but status, completion, failure, cleanup and receive-
 timer work that touches Qt is queued to the GUI owner. Progress cannot restyle topology buttons
@@ -205,9 +333,11 @@ export SASL_WORKSTATION_DATA_ROOT=/absolute/path/to/workstation_data
 
 The settings JSON itself stores required asset paths relative to that data root. Selecting an
 external intrinsics or YOLO file imports verified bytes into a content-addressed
-`calibration/imported/` or `models/imported/` child before persistence. A calibration directory
-outside the data root remains usable only for the current workflow until it is explicitly migrated;
-Save rejects it instead of creating a machine-specific absolute dependency.
+`calibration/imported/` or `models/imported/` child before persistence. The default Calibration
+photo/output owner is the repository-relative `apps/Workstation/calibration/`; generated K,D saved
+there is hash-verified into the data-root `calibration/imported/` store before its restart dependency
+is persisted. Any other calibration directory outside these two owned roots remains current-run
+only and Save rejects it instead of creating a machine-specific absolute dependency.
 
 GStreamer is the default stream backend. Install the optional PyAV overlay only when the selected
 settings profile uses PyAV:
@@ -232,7 +362,9 @@ Measurement view and `Open Latest XLSX` opens only a successfully published app-
 `WAITING`, `GENERATING`, `STALE`, `FAILED`, or `CANCELLED` remains local Data status and never owns
 Measurement admission.
 
-Calibration can be completed at any time against the reusable calibration root. Alignment can
+Calibration can be completed at any time against the reusable
+`apps/Workstation/calibration/` root. New runs allocate new timestamped children and do not merge,
+move, or delete historical `.local/workstation_data/calibration/` bytes. Alignment can
 also be captured and applied before or between Measurements. The active Alignment is reused until
 `Revert active pose`, `Reset Alignment`, or application restart; starting or ending a Measurement
 does not clear it.
@@ -242,12 +374,14 @@ For an ordinary run:
 1. Connect the intended WIRIS, P1/P2, GNSS/RTCM, and optional Target Drone inputs.
 2. Apply the intended operating-zoom `K,D` and stereo `R,t`/Alignment source, then inspect
    readiness. Missing geometry may make a result BLOCKED, but it does not prevent data collection.
+   Leave timing at the default `App receive`, or select `RTCP/NTP preferred` in Measurement
+   Settings. A change made during a running Measurement is saved for the next Measurement.
 3. Press `측정 시작`. If Manual record is active, Workstation stops it first and queues this start.
    If a still capture, camera command, time sync, discovery, or RTSP activation owns the cameras,
    the transient run shows `QUEUED` and starts automatically when that owner releases them.
 4. Press `측정 종료` when finished. Camera/Detection/video owners stop and the run returns to
    `IDLE`; no save, hash, manifest, RTCM drain, workbook, or previous data state can delay the next
-   start. After that boundary, Workstation queues a background `latest_measurement.xlsx` rebuild.
+   start. After that boundary, Workstation queues a background timestamped latest Measurement XLSX rebuild.
 5. Repeat whenever needed, including after long gaps. For a quick one-run review, wait for
    `Latest XLSX · READY` and use `Open Latest XLSX`; for authoritative or multi-run analysis, join
    the type-owned records using their per-row timestamps and transient generation identity.
@@ -255,9 +389,19 @@ For an ordinary run:
 Every matched pair is still evaluated independently by Pixhawk, Checkerboard, Horizon, Mountain,
 Drone Rotation, Drone Multi-view, Terrain, and Combined against the frozen inputs for that run.
 The representative result remains `Pixhawk attitude + GPS/RTK`; another method is not promoted
-when the primary method is blocked or fails. Result and method events append immediately to their
-fixed JSONL streams. No automatic Parquet or legacy Session `review.xlsx` is produced; the
-distinct latest-only XLSX is a non-authoritative post-stop projection.
+when the primary method is blocked or fails. While that Measurement is still `RUNNING`, a terminal
+`pixhawk_rtk_live` `VALID` or `ESTIMATED` outcome is priority-enqueued to `measurements.jsonl`
+before the table, history, plot, or distance banner is updated. The primary worker starts and
+publishes first; comparison workers start only after that primary becomes terminal, including its
+one-second timeout. It does not wait for any comparison method or the eight-method bundle.
+If that primary enqueue is rejected, it keeps independent background retry ownership even after the
+eight-method bundle is saved. The UI remains `EVIDENCE DEGRADED` until admission. If Stop or the
+next run wins first, the retry switches to a compact `late_primary_measurement_outcome` record in
+`measurements.jsonl` and never projects into the new run's table, counters, history, plot, or banner.
+Primary `BLOCKED`, `FAILED`, `TIMEOUT`, and `BACKPRESSURE_BLOCKED` outcomes remain only in
+`method_evaluations.jsonl`. Here "immediate" means bounded asynchronous priority enqueue, not a
+synchronous write or `fsync`. No automatic Parquet or legacy Session `review.xlsx` is produced;
+the distinct latest-only XLSX is a non-authoritative post-stop projection.
 
 Manual recording remains under `Advanced > Files`. It uses the same fixed structured streams and
 timestamped binary paths. Starting Measurement stops Manual record and does not resume it after the
@@ -270,7 +414,9 @@ timestamps, video paths, and UI state, and releases only resources allocated by 
 For checkerboard calibration, select the calibration zoom, command both cameras to that
 zoom, confirm the actual zoom readback, and capture checkerboard observations. A capture over
 `Max Live pair Δt` is retained per camera for independent `K,D` but is never passed to stereo
-`R,t`; timing-eligible captures remain stereo candidates. Calculate and save the required
+`R,t`; Live/Auto compares signed Right-minus-Left decoded-frame app-receive monotonic time and
+applies the gate to its absolute value. NTP/RTCP does not substitute for missing app-receive
+evidence. Timing-eligible captures remain stereo candidates. Calculate and save the required
 intrinsics or stereo `R,t` profile. At measurement time, load the `K,D` profile for
 the intended operating zoom and independently load the chosen `R,t` profile, then apply the
 bundle. This primary workflow uses independent K,D and R,t candidates. The Advanced validation
@@ -325,7 +471,12 @@ configured path is the calibration root's missing `intrinsics.json` alias may st
 that root's `intrinsics_zoom_XX.json`, under the same zoom check. A missing explicit external path
 never falls through to unrelated storage bytes.
 
-Measurement Settings does not select Intrinsics or a manual focal value. The active exact `K,D`
+That startup rule chooses which profile may be applied; it is separate from runtime K,D readiness.
+After a profile is active, later missing/stale/mismatched zoom, serial, or stabilization evidence
+does not replace it with another profile and does not block geometry. Profile identity and native
+left/right frame dimensions remain authoritative.
+
+Measurement Settings does not select Intrinsics or a manual focal value. The active selected `K,D`
 comes from `Calibration > Intrinsics > Profiles`. Apply the compatible stereo bundle under
 `Calibration > Extrinsics > Profiles`. Configure `YOLO input size` under
 `Settings > YOLO / RTSP`; Apply updates the runtime owner and the new size is used from the next
@@ -335,24 +486,31 @@ Select detector weights under `Settings > YOLO / RTSP > YOLO runtime` with `파�
 `Weights path`. Selecting a file outside `SASL_WORKSTATION_DATA_ROOT` atomically imports and
 SHA-256-verifies it under `models/imported/<sha256>/`, then fills the portable relative path.
 Cancellation or import failure preserves the previous selection and reports the failure in the
-same settings group. `Apply` uses the selected model from the next Detection start; `Save` also
-persists that relative path for later Workstation runs. The picker accepts `.pt`, `.onnx`,
-`.engine`, and `.torchscript` files.
+same settings group. `측정 시작` applies the currently displayed weights path to the runtime owner
+before Detection starts, so an older applied or persisted model cannot replace the current
+selection. If that handoff is rejected, Measurement does not start with the stale model. `Apply`
+still applies the complete Settings form, while `Save` explicitly persists the relative path.
+The existing normal-shutdown whole-settings save behavior is unchanged. The picker accepts `.pt`,
+`.onnx`, `.engine`, and `.torchscript` files.
 
 Workstation uses the single `field_measurement_v1` policy. When no calibrated profile is active,
 fresh equal left/right zoom readbacks plus known native rasters automatically generate a
-`NOMINAL_UNVERIFIED` pinhole profile from the 1280x720 WIRIS zoom focal table. A structurally valid
-calibrated profile whose zoom differs from the fresh readback also yields to that nominal profile.
-The generated K,D uses centered principal points and zero distortion, records its formula/hash, and
-always retains `precision_qualified=false`. Malformed K,D, stale/unknown/disagreeing zoom, and
-native-raster mismatch remain hard failures.
+`NOMINAL_UNVERIFIED` pinhole profile from the 1280x720 WIRIS zoom focal table. The generated K,D
+uses centered principal points and zero distortion, records its formula/hash, and always retains
+`precision_qualified=false`. A selected calibrated profile no longer yields to nominal K,D because
+live zoom/serial/stabilization evidence is missing, stale, or different. Malformed/missing K,D,
+invalid profile identity, and unknown/mismatched native raster remain hard failures. Zoom evidence
+can still prevent constructing nominal K,D when no calibrated profile is available because the
+nominal focal table needs a definite common zoom.
 
-Field measurement blocks only missing/ambiguous correspondence, missing or malformed K,D/R,t,
+Field measurement blocks only missing/ambiguous correspondence, the effective pair delta over
+the configured limit or 100 ms hard cap, failure of both preferred RTCP timing and app fallback,
+missing or malformed K,D/R,t,
 current-run telemetry absence for live geometry, non-finite/frame-invalid inputs, impossible
 two-ray geometry, an already-running camera interval, unapplied geometry
-candidates, and missing/mismatched candidate-to-active K,D identity. RTCP/NTP availability, pair
-delta, vertical delta, telemetry age, GNSS fix/accuracy/readiness, and nominal K,D remain visible
-advisories while a finite result is recorded as `ESTIMATED`.
+candidates, and missing/mismatched candidate-to-active K,D identity. An RTCP timing fault alone is
+not a result advisory: it activates app-receive timing provenance. Vertical delta, telemetry age,
+GNSS fix/accuracy/readiness, and nominal K,D retain their existing advisory behavior.
 
 Calibration capture now saves a lossless, no-overlay native frame and records its native,
 preview, and saved raster grids; a preview-resized image is not used as the calibration input.
@@ -462,6 +620,11 @@ RTCM frame has been observed yet, and `RTCM_ACTIVE` means fresh parsed RTCM is a
 also shows chunk/byte counters, receive rate, last chunk age, RTCM message types, and reconnect
 count. The compact `NTRIP` status-bar indicator keeps the same state visible from other pages.
 
+For `SYSTEM_CENTER` GGA, both selected P1/P2 GNSS positions must have arrived within the last
+10.0 seconds and their application-receive timestamps may differ by at most 3000 ms. Exact boundary
+values are accepted. These relaxed limits apply only to the NTRIP center-position hint; Measurement
+and P1→P2 baseline readiness retain their stricter freshness and synchronization gates.
+
 The Base GNSS `RTCM distribution` table reports correction delivery independently for `P1`,
 `P2`, and Telemetry (`T`). Each row shows frames, MAVLink packets, bytes, failures, and the
 age of the last successful delivery. A `T` row with increasing counters is evidence that NTRIP
@@ -554,11 +717,23 @@ Runtime evaluation uses one dedicated persistent process for
 thread counts are capped at one. Comparison timeouts start only after that method worker reports
 actual execution start: Checkerboard 3 s, Horizon 1 s, Mountain 3 s, Drone Rotation 3 s, Drone
 Multi-view 5 s, Terrain PnP 10 s, and Combined 3 s. A timeout or crash terminates and recreates only
-that method process. The primary Pixhawk result may appear immediately, but permanent pair commit
-waits for all eight terminal outcomes and writes them in canonical method order. At most 20 pair
-snapshots may be pending; the next pair is still persisted as `BACKPRESSURE_BLOCKED`. Queue payloads
-contain paths/hashes and immutable numeric metadata, never QImage or raw pixel bytes; native PNGs
-are stored before enqueue.
+that method process. The primary process is spawned and dispatched before comparison processes; a
+terminal primary outcome or its one-second timeout releases comparison startup. Primary and
+comparison backlog use independent 20-pair limits. A full comparison backlog therefore marks only
+that newly admitted pair's seven comparison outcomes `BACKPRESSURE_BLOCKED`; its primary remains
+admitted unless the separate primary queue itself is full. A `VALID` or `ESTIMATED` primary outcome
+received while the run is `RUNNING` is priority-enqueued to `measurements.jsonl` before any
+table/history/plot/banner projection.
+All eight terminal outcomes are still written later in canonical method order to
+`method_evaluations.jsonl`; that comparison bundle is independent of the already-enqueued primary
+row. A bundle is committed and counted only after its enqueue is admitted. A rejected active-row
+append remains pending and retries the same logical row; if Stop wins before retry, that retry is
+labelled `late=true`. Row admission carries an owner-epoch/index lease, so clear, rebind, close, or
+numeric-index reuse cannot redirect an old retry into a new row. An unavailable owner is detached
+and the record is retried through the direct priority writer. Primary and bundle retry owners each
+use a 1-record-per-tick budget plus 1,024-record/8 MiB bounds; overflow and shutdown-budget drops
+are explicit counters/log/status evidence, never silent growth. Queue payloads contain paths/hashes
+and immutable numeric metadata, never QImage or raw pixel bytes; native PNGs are stored before enqueue.
 
 Each Alignment method tab shows method-specific evidence alongside the read-only Candidate
 observability summary: Horizon shows model/RMS/sensitivity, Mountain shows pair/inlier/Sampson/baseline/lever-arm
@@ -566,10 +741,11 @@ metrics, Terrain shows GeoTIFF/2D↔3D/reprojection/rank data, Drone tabs show t
 and 3D-spread data, References shows profile compatibility, and Combine shows source/axis conflict
 status. References only registers reusable sources; Combine only composes them.
 
-`Clear` removes the selected annotation mode from both frozen frames. `Import` loads a
-left/right frozen pair from disk. The WIRIS alternatives are labeled `Capture HR Still (FTP)`
-and `Capture OZ Still (FTP)`, while local files use `Import Pair`. Low-level WIRIS `GLRD` remains available through Advanced command
-tools, but no LRF status card or refresh command is exposed in Alignment.
+`Clear` removes the selected annotation mode from both frozen frames. Local `Import Pair` asks only
+for the Left and Right image paths and dispatches them without a zoom dialog or synthetic
+`zoom_index`; missing zoom remains provenance only. The WIRIS alternatives are labeled
+`Capture HR Still (FTP)` and `Capture OZ Still (FTP)`. Low-level WIRIS `GLRD` remains available
+through Advanced command tools, but no LRF status card or refresh command is exposed in Alignment.
 
 The bottom `Diagnostics > FTP` tab keeps the recent FTP lifecycle separate from the combined
 Log tab. It shows HR/OZ camera-local capture, FTP download, checkerboard-save, OZ sync/delete,
@@ -650,11 +826,30 @@ python3 tools/check_portable_paths.py
 
 ## Inputs/Outputs and Interfaces
 
+Drone network discovery listens passively on bounded UDP MAVLink ports 14550–14559 for one scan.
+Its candidate rows are transient and read-only. The selected URL keeps the existing
+`udpin:0.0.0.0:<port>` interface and is persisted only by Telemetry `Save`.
+
+- Operating-intrinsics snapshots retain selected profile/hash, native dimensions, zoom evidence,
+  camera serial, and stabilization provenance. Admission consumes only profile presence/identity
+  and native left/right raster; zoom/serial/stabilization fields remain record-only. The verified
+  `intrinsics_zoom_08_20260831.json` profile is 1280x720 K,D-only input and requires a separately
+  selected R,t for methods that use stereo extrinsics.
+- `alignment.pose.import_burst` from local `Import Pair` carries only
+  `sources.left.path`/`sources.right.path`. It does not request, infer, or serialize a zoom index.
+  Startup auto-load zoom selection and no-active-profile nominal K,D construction remain separate
+  workflows with their existing zoom requirements.
+
 - The simple Calibration controls dispatch the existing `calibration.*` command IDs; they do not
   implement a second solver or persistence path. `calibration.run_intrinsic`,
   `calibration.run_extrinsics`, Save/Load, and `calibration.apply_bundle` therefore retain the same
   frozen photo-set, quality, zoom, native-raster, immutable-profile, and rollback contracts as the
   advanced controls.
+- `workstation_calibration_capture_snapshot()` exposes additive
+  `workstation-calibration-capture-status-v1` evidence: per-side detection state/corners/age,
+  current-process request and outcome counts, current-root Left/Right/K,D-only/stereo-candidate
+  inventory, minimum image setting, and the latest controller status. It is read-only and is not a
+  persisted calibration profile or solver result.
 
 - `detection.toggle` is an always-available operator request shared by the Measurement button,
   menu, and toolbar. Presentation state never disables one surface independently of another. A
@@ -665,6 +860,10 @@ python3 tools/check_portable_paths.py
   `PENDING/WAITING_RESOURCE/LIVE/UNAVAILABLE/LEFT`, join/leave clocks, and factual detail. Every
   persisted transition carries `runtime_generation` so late callbacks cannot mutate or masquerade
   as the next run.
+- `AppSettings.yolo_gate_time_basis` stores `app_receive_monotonic` or `camera_rtcp`. Missing and
+  invalid values use app receive; historical `camera_rtc_required` migrates to RTCP preferred with
+  mandatory app fallback. Each new pair records requested/effective basis, fallback reason,
+  selected delta, and distinct app/RTCP deltas. A Measurement freezes its request at start.
 
 - Dual-Pixhawk Ethernet input is received on `udpin:0.0.0.0:14550` for P1/Left and
   `udpin:0.0.0.0:14551` for P2/Right, with expected system IDs `1` and `2`. Operational connections
@@ -680,6 +879,23 @@ python3 tools/check_portable_paths.py
   a fresh `ATTITUDE` sample immediately clears that outage cycle. When all expected-system RX is
   silent for 10 seconds, stream/parameter commands and RTCM are fail-closed instead of cycling the
   host socket.
+  `SCALED_IMU/2/3` uses the same command-is-intent boundary: only an actual expected-system sample
+  confirms delivery. After the initial profile, Workstation retries only missing or older-than-one-
+  second IMU streams up to the bounded three-attempt cycle, then waits ten seconds; any fresh sample
+  clears its stream retry immediately. The existing P1/P2 IMU table shows `WAITING` before the first
+  sample, `LIVE` only for fresh app-receive evidence, and `STALE` with the retained values and exact
+  age otherwise. All-RX stall suppresses these retries. No automatic USB command or PX4 persistent
+  write is part of this path.
+- Physical NIC roles are a runtime interface. `Find network` emits candidates only; the confirmed
+  `Assign Camera NIC/P1/P2` command applies a role-scoped NetworkManager delta. Settings persist
+  stable NIC identity, intended roles and only the exact address/route entries Workstation created
+  or explicitly adopted as matching role entries. Pre-existing unrelated profile values remain
+  external and are never removed by a role move.
+- `pixhawk_connection_candidates()` exposes one revisioned transient Discovery snapshot. Candidate
+  rows carry source, physical device/NIC, link/kind, evidence, and role. Network role text explicitly
+  marks a multi-role interface as `shared NIC`; USB role text distinguishes saved assignment from
+  observed heartbeat sysid. Starting a new USB/network search increments the revision and clears
+  stale selection/feedback without changing persisted configuration.
 - Each Pixhawk exposes both `GPS_RAW_INT` (GPS1) and `GPS2_RAW` (GPS2). The Pixhawk workspace
   shows all four receiver rows, including MSL/ellipsoid altitude, HDOP/VDOP, H/V accuracy, fix,
   satellites, and age. Its bottom P1/P2 antenna selectors independently choose the receiver used
@@ -715,40 +931,65 @@ python3 tools/check_portable_paths.py
   CAN1/CAN2-to-MAVLink path and guards MAVLink signing status lookup against null instance slots.
 - Measurement result evidence schema v2 adds `policy_id=field_measurement_v1`,
   `validity=VALID|ESTIMATED|INVALID`, `hard_block_reasons`, and `advisory_reasons`. The fixed
-  `measurements.jsonl` stream preserves the same decision and the compatibility
-  `measurement_valid` field remains true for both computed `VALID` and `ESTIMATED` results.
+  `measurements.jsonl` stream preserves successful representative `VALID`/`ESTIMATED` decisions and
+  the compatibility `measurement_valid` field remains true for both. Primary
+  `BLOCKED`/`FAILED`/`TIMEOUT`/`BACKPRESSURE_BLOCKED` outcomes are retained in
+  `method_evaluations.jsonl` rather than creating a representative measurement row. Successful
+  rows carry the method-evaluation pair/generation/snapshot IDs plus the primary outcome hash so
+  they can be joined to the later eight-method bundle without relying on positional row order.
+- `MeasurementDataStore` has explicit `OPEN → CLOSING → CLOSED` lifecycle evidence. Enqueue is
+  accepted only in `OPEN`; a `CLOSING`/`CLOSED` request is rejected, counted as dropped, and cannot
+  strand a new priority/bulk item after shutdown has begun. `Retry Storage` uses the same
+  active-operation fence and cannot move a retry record after close's empty-queue decision.
+- A pending native-frame completion keeps its immutable request-to-row owner even when a newer run
+  replaces the panel's current row collection. Completion updates only that original row when it is
+  still available and its append lease still matches. It also emits a best-effort `native.frames`
+  event under the original runtime generation; unavailable/retryable projection remains canonical
+  event evidence and never writes into a same-index row owned by the next run. Completion retry is
+  separate from primary-row retry, request fingerprints enforce first-terminal-wins, and exact
+  duplicates are no-ops. Persistent dual rejection uses bounded background retry, then exposes an
+  explicit terminal-drop counter/status and a bounded diagnostic payload cache so shutdown cannot
+  wait forever; this is not a durable-write claim when every storage boundary remains unavailable.
 
 - The canonical runtime root is `.local/workstation_data/` at the repository root, or the path in
-  `SASL_WORKSTATION_DATA_ROOT`. It owns `stereo_distance_settings.json`, `measurement_data/`,
-  `calibration/`, `models/`, historical `recordings/`, and runtime caches. Persistent asset and data
-  folder settings are normalized to data-root-relative POSIX paths.
-- New Measurement data uses the relative `measurement_data_root` setting, default
-  `measurement_data`. Hand-edited absolute or escaping values fall back to that safe default and
-  report `DEGRADED`; they do not reject Measurement.
-- Structured files have stable type ownership and append across application restarts:
+  `SASL_WORKSTATION_DATA_ROOT`. It owns `stereo_distance_settings.json`, portable imported
+  calibration profiles, `models/`, historical `recordings/`, and runtime caches. New Calibration
+  photos/results default to `apps/Workstation/calibration/`; persistent restart dependencies remain
+  content-addressed data-root-relative paths.
+- New Measurement data defaults to `<SASL_ROOT>/recordings`. The portable
+  `measurement_data_root` setting is blank for that default; an old saved value of
+  `measurement_data` is normalized to blank during load. With an explicit
+  `SASL_WORKSTATION_DATA_ROOT`, blank resolves to its `recordings/` child. A non-empty custom value
+  remains relative to the data root. Hand-edited absolute or escaping values fall back to the
+  resolved default and report `DEGRADED`; they do not reject Measurement.
+- Structured files have stable type ownership and timestamped names for each new data-writer file set.
+  Existing fixed names remain readable for compatibility:
 
-  | Stream | Fixed relative file |
+  | Stream | Timestamped relative file pattern |
   | --- | --- |
-  | run/capture events | `events.jsonl`, `capture_events.jsonl` |
-  | primary pair results | `measurements.jsonl` |
-  | eight-method bundles/outcomes | `method_evaluations.jsonl` |
-  | camera observations | `camera_left.jsonl`, `camera_right.jsonl` |
-  | rig and target PX4 | `px4_left.jsonl`, `px4_right.jsonl`, `px4_drone.jsonl` |
-  | Base GNSS | `gnss_base.jsonl` |
-  | analysis comparisons | `geometry_comparisons.jsonl` |
-  | Alignment changes | `alignment.jsonl` |
-  | binary inventory/logs | `artifacts.jsonl`, `native_frames.jsonl`, `application_log.jsonl` |
+  | run/capture events | `events_<timestamp>.jsonl`, `capture_events_<timestamp>.jsonl` |
+  | primary pair results | `measurements_<timestamp>.jsonl` |
+  | eight-method bundles/outcomes | `method_evaluations_<timestamp>.jsonl` |
+  | camera observations | `camera_left_<timestamp>.jsonl`, `camera_right_<timestamp>.jsonl` |
+  | rig and target PX4 | `px4_left_<timestamp>.jsonl`, `px4_right_<timestamp>.jsonl`, `px4_drone_<timestamp>.jsonl` |
+  | Base GNSS | `gnss_base_<timestamp>.jsonl` |
+  | GNSS baseline-center derived evidence | `gnss_baseline_center_<timestamp>.jsonl` |
+  | analysis comparisons | `geometry_comparisons_<timestamp>.jsonl` |
+  | Alignment changes | `alignment_<timestamp>.jsonl` |
+  | binary inventory/logs | `artifacts_<timestamp>.jsonl`, `native_frames_<timestamp>.jsonl`, `application_log_<timestamp>.jsonl` |
 
-- `<resolved data root>/latest_measurement.xlsx` is one app-owned, atomically replaced derived
+- `<resolved data root>/latest_measurement_<timestamp>.xlsx` is an app-owned, atomically published derived
   workbook. It contains `Summary`, Measurement events, materialized/latest and append/replace
-  result history, method bundles/outcomes/inputs, Camera/Pixhawk/Target/GNSS/geometry/native/file
+  result history, method bundles/outcomes/inputs, Camera/Pixhawk/Target/GNSS/GNSS-baseline-center/
+  geometry/native/file
   sheets, and `Issues`. Manual-record-only and unrelated application/capture/alignment streams are
   excluded. Original clock fields remain exact, UTC epoch fields gain KST ISO columns, and integers
   beyond Excel's 15-digit precision are stored as text.
 
 - The writer removes Session membership fields, adds host UTC and monotonic record timestamps, and
   preserves producer coordinate/source-clock fields. A torn final JSONL fragment is left as one bad
-  historical line; the next valid append begins on a new line. Files are not rotated automatically.
+  historical line; the next valid append begins on a new line. New writer instances use a new
+  timestamped file set; existing files are never replaced by that filename allocation.
 - Priority streams (`events`, results, method evaluations, captures, Alignment, artifacts, native
   frames) use a reserved bounded queue. Bulk camera/PX4/GNSS rows use a separate bounded queue whose
   oldest queued item may be dropped under overload. Each stream reports its own state/error/drop
@@ -766,10 +1007,11 @@ python3 tools/check_portable_paths.py
   `raw/gnss/{ntrip_transport_chunk,ntrip_rtcm_frame,base_rtcm_frame}.rtcm`, with a fixed sibling
   offset/hash JSONL index. RTCM evidence failure is diagnostic; injection/routing and Measurement
   admission remain independent.
-- Calibration continues to use its reusable calibration root and content-addressed profiles.
-  Calibration photo-set “sessions” are calibration-domain groupings only; they are not Measurement
-  Session gates. Alignment events append to the data root and the active in-memory pose spans runs
-  until Revert, Reset, or restart.
+- Calibration uses repository-relative `apps/Workstation/calibration/` as its default reusable root
+  and keeps content-addressed restart profiles under the Workstation data root. An explicit custom
+  relative root remains data-root-owned. Calibration photo-set “sessions” are calibration-domain
+  groupings only; they are not Measurement Session gates. Alignment events append to the data root
+  and the active in-memory pose spans runs until Revert, Reset, or restart.
 - Existing `recordings/<id>/` and `recordings/sessions/<id>/` trees are never scanned or recovered
   by the new workflow. `Data > Status > Open Legacy Recordings Folder` exposes them read-only through
   the file manager. Old manifests, Parquet, and `review.xlsx` remain untouched and no new legacy
@@ -803,9 +1045,16 @@ python3 tools/check_portable_paths.py
   unresolved legacy paths block calculation and are never replaced by an all-photo fallback.
 - Each capture metadata record identifies the exact source frame, source/native dimensions,
   preview dimensions, saved dimensions, crop/scale contract, overlay state, SHA-256, timing gate,
-  `stereo_pair_saved`, and `intrinsics_only_sides`. A live
+  `stereo_pair_saved`, and `intrinsics_only_sides`. New Live/Auto records also carry exact per-side
+  `left_app_receive_monotonic_ns`/`right_app_receive_monotonic_ns`, signed `pair_delta_ns`,
+  `pair_time_basis=app-receive-monotonic`, and `HOST_RECEIVE_PROXY`; host receive never sets
+  `precision_timing_qualified` or `actual_exposure_verified`. A live
   CameraPane capture fails closed when a fresh native frame cannot be matched. Preview fallback is
   disabled by default and exists only behind an explicit compatibility flag for lightweight tests.
+  Auto records the parser AU kind/NAL types, non-delta flag, exact AU and decoded PTS, and side
+  `frame_key`; these values must agree before the image is eligible.
+  The `이번 촬영` counters are UI lifecycle state rather than persisted photo-set totals, so Auto
+  Start resets them while the capture inventory remains derived from the existing files/metadata.
 - Calibration photo-time display reads `left_rtcp_frame_ntp_unix_s` and
   `right_rtcp_frame_ntp_unix_s` only when they are bound to a saved manual/native or Auto frame.
   It otherwise uses `capture_recorded_unix_ns`, then `capture_requested_unix_ns`, and finally the
@@ -817,7 +1066,8 @@ python3 tools/check_portable_paths.py
   explicit FTP pairing basis. It is classified as `HOST_DISPATCH_PROXY`: it may permit pair
   persistence but always has `precision_qualified=false` and
   `actual_exposure_verified=false`. It is not an exposure timestamp. RTCP-bound live-frame evidence
-  is `CAMERA_TIMESTAMP_VERIFIED`; only explicitly verified per-camera exposure fields can become
+  remains available as record-only wall-clock evidence. Ordinary Live/Auto pair admission is
+  `HOST_RECEIVE_PROXY`; only explicitly verified per-camera exposure fields can become
   `EXPOSURE_TIMESTAMP_VERIFIED`. If FTP is disabled or fails, the
   still remains camera-local until an exact HR file is imported.
 - Each button press appends one JSON object to `capture_events.jsonl`; downloaded/imported image
@@ -847,6 +1097,11 @@ python3 tools/check_portable_paths.py
 - `Devices > Telemetry` is the active drone-Pixhawk link for position reception and optional
   Base RTCM forwarding. The existing target-drone artifact stream remains a separate,
   receive-only path.
+- The Telemetry snapshot publishes additive `gnss_baseline_center_frd` evidence with frame
+  `gnss_baseline_center_local_level_frd`, ordered `[forward,right,down,range]` in metres, source
+  age/fix and three-source receive-time spread. During recording, primary Drone GPS reception
+  additionally produces `gnss.baseline.center` rows. This adds no setting, legacy Parquet or
+  canonical Measurement field.
 - Frozen optical-pose frames are persisted as native PNG evidence and remain bound to
   `(frame_id, image_sha256, native_width, native_height)`. Automatic points are returned in
   native OpenCV `(u, v)` pixels and are kept separate from manual annotation payloads until
@@ -907,19 +1162,77 @@ python3 tools/check_portable_paths.py
   GOOD/WARN/BAD tolerance. A stale row retains its last number with age/dashed-arrow evidence;
   use only current inputs for live adjustment.
 
+- Telemetry `Find Network` never changes NetworkManager, PX4 parameters/files, saved settings, or
+  active device ownership.
+- Only a decoded HEARTBEAT with `sysid=3` is selectable as Drone; P1/P2 identities remain visible
+  evidence but cannot be applied to the Drone field.
+- Apply/Save use the current form value as authoritative configuration input. Periodic status
+  refresh cannot overwrite a dirty edit with a stale connection endpoint.
+
+- Treat `GNSS BASELINE_CENTER F/R/D/Rg/Angle` as the camera-installation reference. The angle is the
+  acute horizontal angle between the P1→P2 baseline line and midpoint→Drone GNSS line; 90° means
+  the Drone is on the perpendicular through the P1/P2 midpoint. `90° error` is an absolute distance
+  from that target. Do not interpret `CURRENT` as measurement acceptance; use only current inputs for
+  live adjustment and keep STALE timing evidence visible.
+
+- Use `App receive (default)` unless the operator explicitly needs RTCP/NTP frame selection.
+  `RTCP/NTP preferred` requires VERIFIED/current/same-epoch frame evidence and automatically falls
+  back to exact app receipt on any timing fault. Do not treat fallback as exposure time. To change
+  an active run, Apply/Save the setting and start the next Measurement; the current run stays frozen.
+
+- Keep the Calibration root setting at `calibration` for the repository-owned
+  `apps/Workstation/calibration/` default. A root change applies to the next Calibration run and
+  does not move or merge existing photo sets. Generated profiles are copied and hash-verified into
+  the data-root import store before settings persistence; arbitrary external roots remain blocked.
+
+- Keep `Settings > Storage > Data folder` blank for repository-root `recordings/`. Changing it while
+  capture is active does not retarget open writers; the next capture uses the applied custom path.
+  Existing `.local/workstation_data/measurement_data/` bytes are historical and are never moved,
+  merged, deleted, or rewritten automatically.
+
+- Treat the timestamped latest Measurement XLSX as a disposable review projection. Only `READY` with an existing
+  published generation proves success; request acceptance or `GENERATING` does not. Do not use it
+  as a completeness verdict or edit it as the only copy of data. A new Measurement/Manual record or
+  shutdown cancels or defers export, while `Update Latest XLSX` retries after the system is idle.
+
+- Treat NIC role changes as explicit operations, not discovery side effects. Review the selected
+  NIC, exact before/after entries and active owners, then approve the OS authorization prompt.
+  Ordinary Camera/Pixhawk owners on affected NICs restart automatically; owners on other NICs do
+  not. Never apply during Measurement, recording, save or finalization. `APPLIED` requires
+  NetworkManager+kernel readback and, for a previously active role, a new Camera frame or expected
+  Pixhawk HB+ATT; a button click or socket open is not success.
+
 - Treat the three simple Calibration tabs as an ordered workflow, not as a quality bypass.
   `FAIL` continues to block Apply, `WARNING` still requires explicit review/confirmation in
-  `고급 캘리브레이션`, and a zoom or native-raster mismatch remains a hard failure. The
-  advanced area is presentation-only disclosure; collapsing it never disables its underlying
-  command state or changes the active calibration.
+  `고급 캘리브레이션`, and Calibration's capture/Apply zoom and native-raster checks retain their
+  existing behavior. After K,D is active, runtime Measurement readiness ignores live
+  zoom/serial/stabilization evidence but still blocks missing/invalid profile identity and
+  native-raster mismatch. The advanced area is presentation-only disclosure; collapsing it never
+  disables its underlying command state or changes the active calibration.
+- For local Alignment `Import Pair`, select the native Left and Right images; no zoom response is
+  required. Workstation still rejects a missing/invalid K,D identity or native-raster mismatch.
+  Camera, focus, and zoom provenance is operator-reviewed and does not gate readiness.
+- Before `K,D 계산`, verify that every selected Left image shares one width/height, every selected
+  Right image shares one width/height, and the configured inner columns/rows match the physical
+  board. The mathematical minimum is three geometrically distinct detections, but the configured
+  minimum and quality gate still apply. Low reprojection RMS alone is never Apply evidence.
+- Auto Stop→Start resets the legacy Auto valid-pair counter but does not delete files. The primary
+  `이번 촬영` inspection row is scoped to the current process and active capture root; it resets on
+  root change or restart. Use `현재 캡처 세트` and Compute selection to review/exclude all retained
+  files.
 
 - Camera Preview defaults to RTSP TCP with Auto decoder. Auto uses `nvh264dec` only when its
   factory can be created, `nvidia-smi` confirms a working driver, and CUDA `cuInit(0)` succeeds;
   otherwise it reports WARN and starts with mandatory `avdec_h264`. A direct NVDEC element/health
   failure, or a 30-second decoded first-frame/stall timeout while RTP input remains current, may
   authorize one software fallback.
-  RTSP/source/parser and MP4 mux/filesink failures retain their own error class and never trigger a
-  decoder change. Explicit `NVIDIA` has no software fallback.
+  RTSP/source/parser and decoded recorder/NVENC/output failures retain their own error class and
+  never trigger a decoder change. Explicit `NVIDIA` has no software decode fallback.
+- Decoder capability is checked before a Measurement replacement takes ownership of the live
+  panes. If that preflight rejects explicit `NVIDIA`, temporary automatic recording is released and
+  Measurement reports both camera/recording sources unavailable, but the existing Preview workers,
+  frames, and connection state are preserved. A failure after replacement begins retains the
+  bounded stop/cleanup path below.
 - Decoder fallback ownership is per side. Preview-only fallback restarts only the failed side and
   leaves the healthy side's decoder/worker running. During MP4 recording, the failed side finalizes
   and stops; its software override applies on the next side start because reopening the same MP4
@@ -930,19 +1243,26 @@ python3 tools/check_portable_paths.py
   `Diagnostics > Performance` shows GPU model/driver, NVDEC availability, requested/effective
   candidates, and per-side detail. `CUDA` shown for YOLO inference is a separate resource decision
   and does not prove that H.264 decode uses NVDEC.
-- A camera QThread/process launch is only a source-level `STARTING` request. Workstation sets a
-  side LIVE only
+- A camera QThread/process launch is only a source-level `STARTING` request. Workstation sets a side LIVE only
   after a decoded frame carrying that pane's current stream generation reaches the GUI boundary.
   The Measurement run is already `RUNNING`; after 35 seconds a side without an ACK is stopped and
   marked `UNAVAILABLE`. Zero, one, or two verified sides never roll back the observation interval.
 - MP4 readiness is independent from Measurement readiness. The recording projection reports
   `video=STARTING` until each allocated side-specific path exists and grows beyond its allocation
   size, then reports provisional `RUNNING`; one failed side is `PARTIAL`, and no growing side is
-  `FAILED`. A recovered side writes a new no-overwrite segment. Online post-run state is presence-only:
+  `FAILED`. The GStreamer camera pipeline supplies decoded NV12 to a bounded, oldest-drop queue;
+  an isolated FFmpeg `h264_nvenc` process writes lossless H.264 MP4 with no application bitrate,
+  file-size, or duration cap and no warning burn-in. Online post-run state is presence-only:
   `SAVED` means both sides produced a file, `PARTIAL` means only some files exist, and `FAILED`
   means none exist. These labels do not claim playback or integrity verification.
   Video failure never turns a frame-ready Measurement back from `RUNNING`, but Workstation does not
   claim video recording is active and preserves the per-side failure evidence.
+- `Settings > YOLO / RTSP > H.264 compressed queue` controls only the two compressed H.264 queue
+  boundaries and applies on the next camera Preview start. `Latest (drop old)` is the default
+  low-latency policy. `Reference-safe (preserve 8)` keeps up to eight compressed access units at
+  each boundary, which can reduce Workstation-induced reference loss but may increase latency or
+  backpressure. It never changes WIRIS `SEIR`, decoder choice, Measurement gates, or tolerant
+  decoded-frame admission.
 - Before a real soak, run the strict synthetic queue/evidence/cleanup gate from the SASL root:
 
   ```bash
@@ -1001,13 +1321,19 @@ python3 tools/check_portable_paths.py
   no older than 30 seconds, asks the operator to confirm the side/device/sysid, and revalidates it in
   the one-shot worker before sending reboot. Missing, stale, duplicate, or changed identity; active
   Measurement/recording/save/finalization; or another PX4 command fails closed. USB command send is
-  not success: Ethernet must enter `RECOVERING` and complete a fresh 10-minute qualification.
+  not success: Ethernet must enter `RECOVERING` and complete a fresh 1-minute qualification.
+- Treat the Pixhawk Discovery table as the result of the most recent accepted `Find USB` or
+  `Find network` command, not as accumulated history. A second click while another Pixhawk
+  Discovery worker is active is rejected without clearing the in-progress snapshot. Empty/error
+  completion remains empty/error and never restores older candidates.
 - USB Ethernet profile persistence and runtime stall recovery are separate operations. The verified
   recovery command writes no PX4 parameter/config/file and never flashes firmware. Automatic reboot
   is not supported.
-- Workstation does not start the automatic PX4 calibration-parameter readback at the first packet
-  or heartbeat. It waits until that side completes the continuous 10-minute qualification and
-  reaches `LIVE`; manual refresh remains available. During a parameter read, that side's normal
+- Workstation never starts PX4 calibration-parameter readback from startup, a packet, heartbeat,
+  status poll, reconnect, or the transition to `LIVE`. The operator explicitly uses `Refresh P1/P2
+  parameters` (or the existing Advanced MAG/attitude refresh); reset/apply/save operations retain
+  their required verification readback. Until then the calibration rows remain `PARAM readback
+  대기 중`. During an explicit parameter read, that side's normal
   ATTITUDE/GNSS receive loop is intentionally reserved. Its status
   shows `PARAM SYNC` with detail `PX4 파라미터 조회 중 (정상)` instead of falsely reporting
   `STALE` or `DISCONNECTED`. Nonmatching ATTITUDE/GPS messages consumed by the blocking PARAM or
@@ -1018,6 +1344,9 @@ python3 tools/check_portable_paths.py
 - Pixhawk connect and disconnect operations are mutually exclusive. Their P1/P2 buttons are
   disabled while either worker owns the subscriber; rapid repeated clicks cannot start an
   overlapping socket transition or publish a connected label for a closed transport.
+- P2 Ethernet uses the configured NIC, local address, route, peer endpoint, and expected-system
+  Heartbeat/ATTITUDE checks. It does not change PX4 settings automatically; board-side Ethernet
+  provisioning remains an explicit per-board ETH MAV/USB operation.
 - Base GNSS serial uses a one-second write timeout and a 64-item latest-preserving output queue.
   A blocked USB/radio writer emits `failed`, closes the port, and lets lifecycle shutdown continue
   instead of keeping the Base status falsely connected. PC-IP elevation through `pkexec` has a
@@ -1027,6 +1356,14 @@ python3 tools/check_portable_paths.py
   contention is reported as control-channel busy and retried up to five times; it is not labeled
   as a camera failure. TCP command responses are accumulated across fragments until terminator,
   EOF, bounded idle, or the request deadline.
+- Treat `GNSS BASELINE_CENTER F/R/D/Rg/Angle` as a GNSS antenna-midpoint local-level reference only.
+  Compute `v=Drone-(P1+P2)/2` in local NED, Right from horizontal P1→P2, Down from NED Down,
+  Forward as Right×Down, `Rg=√(F²+R²+D²)`, and `angle=atan2(|F|,|R|)`. Never write these values into camera
+  `baseline_center_frd`, left/right optical, Measurement, or recording fields. A zero/vertical-only
+  horizontal baseline waits; age over 2.0 s, future time, or three-source spread over 1000 ms is
+  STALE. Fix quality is shown but is not a gate. When recording is active, save all three states to
+  the dedicated bulk stream with exact selected-source clocks/provenance; never infer persistence
+  from the live UI. Writer/drop/error state in Data Status is authoritative.
 - Treat GPS1/GPS2 as independent receiver solutions. `RTK_FLOAT` alone does not prove vertical
   agreement. Before a measurement, inspect all four rows and choose the physically corresponding
   P1/P2 antennas at the bottom of the Pixhawk workspace. The baseline uses `GPS_RAW_INT.alt`
@@ -1039,13 +1376,19 @@ python3 tools/check_portable_paths.py
   reporting the stream check as successful. Changing encoder settings may pause RTSP temporarily.
 - `Capture Live Pair` selects the newest decoded native left/right frames from the live RTSP
   pipelines. It preserves RTP/RTCP timing metadata when available but does not capture raw RTP
-  packets. Camera-native `CPTR` stills remain separate `Capture HR Still`/`Capture OZ Still`
+  packets. Manual and Auto Live timing uses the decoded-frame app-receive monotonic timestamps;
+  missing receive evidence never falls back to RTCP/NTP. Camera-native `CPTR` stills remain
+  separate `Capture HR Still`/`Capture OZ Still`
   actions, with `(FTP)` appended only when the still is downloaded immediately. Manual, Auto,
   and FTP captures over `Max Live pair Δt` still save every side whose checkerboard validation
   succeeds, mark those files `INTRINSICS ONLY`, and exclude them from stereo `R,t`. Auto capture
   consumes each new frame identity once and counts only timing-eligible two-sided captures as
   valid stereo pairs. Calibration photo-set manifest `pair_count` uses the same R,t-eligibility
   rule; K,D-only files remain visible in the selected Photo set without inflating that count.
+- Auto capture is stricter than manual Live Pair: each candidate must be a parser-normalized AU
+  containing NAL type 1, excluding NAL5, with `DELTA_UNIT=false`, and its AU PTS must equal the
+  decoded-buffer PTS. Checkerboard detection and PNG persistence resolve that exact current-camera,
+  current-generation `FrameKey`; timestamp-near and generic-latest fallbacks are forbidden.
 - FTP calibration pairing never borrows the current RTSP preview clock. Both cameras must report
   the same capture ID, the synchronized-CPTR-dispatch contract, and per-camera dispatch timestamps;
   the absolute dispatch delta must satisfy the configured pair gate. These host timestamps prove
@@ -1062,27 +1405,33 @@ python3 tools/check_portable_paths.py
 - A run transitions `IDLE → STARTING → RUNNING → STOPPING → IDLE`. `측정 종료` releases live
   owners and requests writer flush without waiting for save, hash, probe, RTCM drain, package, or
   workbook completion. A new run can start immediately after the actual camera workers stop.
+- While the run is `RUNNING`, a primary `VALID`/`ESTIMATED` outcome is priority-enqueued before its
+  table, history, plot, and UI banner update and without a comparison barrier. Stop preserves an
+  already accepted queue record. A primary first received after Stop changes neither
+  `measurements.jsonl` nor the UI. A primary received while RUNNING whose enqueue was rejected keeps
+  background ownership; after Stop it may append only late evidence and cannot update the new run
+  UI. Enqueue is asynchronous and is not a completed write, flush, or `fsync` claim.
 - Structured data is recorded only while Measurement or Manual record is active. Explicit capture,
   import, and Alignment commands always append their own event even outside those intervals.
 - Storage is best-effort. A setup/open/write/serialization/fsync failure drops the affected record
   or pauses only that stream and is reported in `Data`; it never stops the recorder or raises through
   a Qt callback into Measurement admission. `Retry Storage` clears failed-stream state.
-- Treat `latest_measurement.xlsx` as a disposable review projection. Only `READY` with an existing
-  published generation proves success; request acceptance or `GENERATING` does not. Do not use it
-  as a completeness verdict or edit it as the only copy of data. A new Measurement/Manual record or
-  shutdown cancels or defers export, while `Update Latest XLSX` retries after the system is idle.
 - Native PNG completion is joined to its append-only recording row by the unique async request ID,
+  append-admission lease, and original row owner,
   independently of the 1024-pair lookup cache. A stale completion for an older request cannot
-  overwrite a newer pending request for the same pair. The disk-I/O barrier is acknowledged when
-  the writer finishes even if row projection must be deferred, so a later row-construction failure
-  cannot hold the next run open. Drone RTK Multi-view `BLOCKED` samples stay in audit evidence
+  overwrite a newer pending request for the same pair or a same-index row in the next run. The
+  original row owner remains bound until completion; sessionless completion also attempts a
+  best-effort `native.frames` event with that original runtime generation. The disk-I/O barrier is acknowledged
+  when the writer finishes even if row projection must be deferred, so a later row-construction
+  failure cannot hold the next run open. Drone RTK Multi-view `BLOCKED` samples stay in audit evidence
   but are not considered collected; only `READY` samples clear the target editor when the next
   Frozen burst arrives.
 - The Measurement view displays all eight frozen/live source values independently. Missing method
   instances remain visible as blocked catalog rows, while each pair persists one atomic bundle with
   method ID, instance ID, component sources, geometry hash, status, warnings, and worker timing for
-  every method. No authoritative workbook or Parquet materialization gates run stop; the
-  latest-only derived XLSX is built afterward and may be cancelled or retried independently.
+  every method. That later comparison bundle does not gate or rewrite a successful representative
+  row already priority-enqueued while the run was `RUNNING`. No automatic workbook or Parquet
+  materialization follows run stop.
 - Calibration quality and evidence preservation are separate. `WARNING` and `FAIL` calculation
   attempts are saved under `attempts/` without changing active aliases or settings. `WARNING`
   requires confirmation before Apply and `FAIL` cannot be applied. Any applied PASS/confirmed
@@ -1143,26 +1492,21 @@ python3 tools/check_portable_paths.py
   that single-owner reservation, verifies each incoming `frame_descriptor_sha256` against the pinned
   descriptor before writing either side, and fails the whole pair without nearest-frame substitution
   when any compact/component key or descriptor hash disagrees.
-  Frozen detection metadata retains every descriptor-hash input, including app-receive
-  `timestamp_s`, so a later audit can recompute the digest rather than only compare copied values.
+  Frozen detection metadata retains every descriptor-hash input, including exact integer
+  `app_receive_monotonic_ns` and compatibility `timestamp_s`, so a later audit can recompute the
+  digest rather than only compare copied values.
 - Raw camera frames update the latest calibration snapshot without broadcasting a duplicate
   calibration-preview signal. Hidden legacy/advanced preview widgets do not render those frames;
   checkerboard overlays remain available through the throttled overlay path or explicit Refresh.
-- The normal GStreamer H.264 path repeats SPS/PPS at every IDR (`h264parse config-interval=-1`)
-  and keeps compressed H.264 queues non-leaky and bounded to 250 ms so access units/IDRs are not
-  discarded before decode. The post-decoder queue is `leaky=downstream` with eight buffers, so a
-  stalled reader drops stale decoded frames without back-pressuring depay/decoder. The recording
-  tee branch is independently `leaky=downstream` with a five-second time bound, preventing disk
-  stalls from growing memory without limit. `decoded_hz` uses a five-second rolling window and
-  returns to zero after a genuine gap.
-- Each GStreamer side starts fail-closed and, after any RTP sequence omission, resumes only when
-  the normalized Annex-B access unit contains an H.264 IDR slice (NAL type 5) and the decoder
-  returns that exact PTS. A parser `non-delta` flag or a later dependent decoded frame is not a
-  recovery boundary. The encoded recording tee remains blocked until the parsed IDR; native
-  evidence, Preview, and YOLO remain blocked until that IDR's exact decoded PTS is observed. After
-  the 30-second integrity deadline, the side becomes explicitly unavailable and does not
-  auto-reconnect; the healthy peer remains live. Correct the sender so it emits IDRs, then reconnect
-  manually. Workstation does not change GOP/IDR or any other camera encoder setting automatically.
+- The normal GStreamer H.264 path repeats SPS/PPS at every IDR (`h264parse config-interval=-1`) and
+  uses latest-only leaky compressed queues plus an eight-buffer leaky decoded queue. A stalled
+  consumer drops stale work rather than back-pressuring depay/decoder. `decoded_hz` uses a
+  five-second rolling window and returns to zero after a genuine gap.
+- RTP sequence gaps and absent IDR remain latched as provenance but do not suppress the current
+  decoded frame. Preview, YOLO, native evidence, official Measurement, and the decoded-NV12
+  recording capture continue with `INPUT UNVERIFIED`. The true decoded-frame/source timeout remains
+  terminal per side; the healthy peer remains live. Workstation does not change GOP/IDR or any
+  other camera encoder setting automatically, and there is no strict/tolerant runtime switch.
 - Linux camera child processes arm a parent-death signal. A Workstation crash or Force Quit
   therefore terminates its decode children instead of leaving CPU-consuming orphan workers for
   the next launch; normal shutdown still uses the cooperative stop/drain path. Unexpected child
@@ -1221,30 +1565,46 @@ python3 tools/check_portable_paths.py
   evidence directly from `capture_metadata/capture_<id>.json`; selection sidecars continue to
   contain paths and inclusion/exclusion decisions only.
 - RTCP/NTP Unix time is never compared as if it were application monotonic time. Native-frame cache
-  lookup uses the frame's application-receive monotonic stamp; an absent clock-domain reference
-  remains `unknown`. An FTP pair with the same capture ID and command round, successful storage,
+  lookup and ordinary Live/Auto Calibration pairing use the frame's application-receive monotonic
+  stamp; missing receive evidence makes that capture K,D-only rather than falling back to NTP. An
+  absent clock-domain reference remains `unknown`. An FTP pair with the same capture ID and command round, successful storage,
   download, and decode on both sides may use the operator-approved
   `command_round_assumed_sync` basis for R,t; it records `pair_delta_s=null` and an explicit warning
   that simultaneous exposure was assumed, not measured. Other FTP/import evidence remains
   `SYNC_UNVERIFIED` rather than borrowing a live-preview timestamp.
+- Workstation live distance follows the frozen Measurement timing preference. App receive is the
+  default; healthy RTCP/NTP is selected only with VERIFIED/current same-epoch evidence. Any RTCP
+  timing fault falls back to exact decoded-frame app receipt, and that fallback alone does not
+  change normal VALID timing. New schema-v5 rows store requested/effective basis, fallback reason,
+  selected Right-minus-Left delta, and separate app/NTP deltas. Existing schema-v3/v4 rows retain
+  their original meaning.
 - A dual-camera `Set camera clock` operation sends Left STUS first and sends Right only after Left
   returns an exact `OK` ACK. Only STUS mutation responses may wait up to 15 seconds; generic SDK and
   HIWS retain their configured timeout. One action permits at most two rounds within 90 seconds and
-  uses fresh replacement-generation SR feedback for the second round. During recording the
-  operation is disabled and the controller also rejects direct requests. After RTSP reconnect and
-  fresh-SR warmup reaches `VERIFIED`, Workstation
-  continues a 1 Hz health check; it immediately changes to `FAILED` on a current-frame/SR loss or
-  regression, RTCP/NTP pair delta over 50 ms, SR-PC offset over 100 ms, SR age over the configured
-  target (7 s by default), or NTP/RTP clock-rate error over 0.5%. The limit stays configurable; an
-  older saved 10 s value is not silently changed, so Apply 7.0 s before the approved field
-  qualification and retain that effective value in its evidence. Stored per-frame SR age is advanced
-  using the current monotonic and wall-clock observations, so two frozen streams cannot remain green.
+  uses fresh replacement-generation SR feedback for the second round. RTCP observation runs in
+  parallel, but external clock mutation remains ordered for failure isolation. STUS is available
+  during Preview, Measurement, YOLO and recording and restarts neither CameraPane nor the YOLO/MP4
+  path; only the decoder-free RTCP observer starts a new observation generation.
+- Clock success is relative: the robust three-SR Left/Right mapping delta must be at or below the
+  configured 100 ms default. Per-camera signed/raw `SR-PC` remains visible and append-only evidence,
+  but its absolute magnitude never gates success, revokes `VERIFIED`, triggers Auto or blocks a
+  timing result. One isolated SR outlier is tolerated by the median/MAD window; span remains
+  diagnostic. Missing/stale/regressed SR, sustained relative delta failure, host-clock step and
+  clock-rate evidence retain their explicit Clock failure behavior. When RTCP/NTP is preferred,
+  these failures activate app-receive fallback rather than making Clock appear healthy. An
+  occasional unmatched/outlier frame may be dropped without revoking Clock.
+- Settings provides persistent `Manual`/`Auto` STUS mode and a 5–1440 minute interval (default
+  Manual/30 minutes). Auto requires one successful manual seed after each application start or new
+  camera connection. A scheduled action runs only at its deadline, including during active work.
+  Clock, Frame timing and Media status remain separate throughout the transition.
 - Calibration zoom A and operating zoom B are arbitrary supported zoom levels. The system
   does not prescribe 1×, 8×, or any particular A→B combination.
 - Cross-zoom application uses `K,D` from operating zoom B and `R,t` estimated at calibration
   zoom A.
-- Every measurement method requires the exact operating-zoom left/right `K,D` bundle and matching
-  hashes. Cross-zoom `R,t` remains allowed, but it cannot waive that intrinsics gate. Methods that
+- Every measurement method requires the selected left/right `K,D` bundle, matching hashes, and
+  matching native raster. Zoom readback, zoom agreement, camera serial, and stabilization do not
+  gate or warn after application. Cross-zoom `R,t` remains allowed, but it cannot waive the
+  profile-identity/native-raster intrinsics gate. Methods that
   consume GNSS use the latest valid sample independently for P1 and P2. A new side replaces only
   that side when it has finite position and `fix_type >= 3`; an invalid/sub-3D update leaves the
   previous valid value intact. Values may be reused across Measurements in the same app run and
@@ -1360,6 +1720,130 @@ source evidence. For offline reconstruction, join the existing `pixhawk_attitude
 (yaw/quaternion and app/PX4 timestamps) with `gps_rtk` rows (receiver role, WGS84 position, fix and
 timestamps) and apply the documented formula. No additional derived-angle field is persisted.
 
+- Passive discovery requires the Drone to be powered and already transmitting UDP MAVLink onto the
+  connected LAN. If no candidate appears, verify carrier/PX4 Ethernet configuration or use the
+  preserved manual URL/USB setup path.
+- A port already exclusively owned by another process cannot be scanned. Stop that owner or use a
+  different configured listen port; discovery reports failure rather than interrupting it.
+
+### GNSS BASELINE_CENTER is not the camera measurement frame
+
+The displayed F/R/D/Rg origin is the midpoint of the P1/P2 GNSS antennas, not the optical centers.
+Right is the horizontal P1→P2 direction and Down is local NED Down, so camera/body tilt,
+antenna-to-camera lever arms, and camera alignment are intentionally absent. Swapping P1/P2 reverses
+the signed horizontal axes. A moving platform can also move materially during the allowed 1000 ms
+three-source receive-time spread even while the row is `CURRENT`.
+
+Use this row for live GNSS relative-position reference and field diagnosis. Inspect its actual
+`Max age`, `Max Δt`, and fix labels, and prefer a stationary or slowly moving setup when signed
+components matter. Use the existing optical/Measurement result for camera-frame distance and pose;
+recorded derived rows remain asynchronous latest-sample evidence rather than simultaneous antenna
+exposure. At 5-10 Hz, allow approximately 72-144 MiB/hour of additional best-effort JSONL. Bulk
+queue pressure may drop rows; compare Data Status counters and retain the raw PX4 files for audit.
+
+### P2 Ethernet connection remains explicit
+
+Select the configured Ethernet transport, use `Find network` and `Assign` only when the NIC/route
+must change, then press `Connect` and verify the expected P2 Heartbeat/ATTITUDE. Workstation does
+not run a separate topology-provisioning flow or automatic failover. If the host link is up but P2
+does not answer, inspect the cable/switch path and PX4 `eth0` separately.
+
+### USB role identity requires a current heartbeat
+
+`Find USB` can enumerate a serial endpoint even when its air peer or Pixhawk is off, unpaired, busy,
+or silent. That one physical device remains visible as `identity unverified`; USB order, tty number,
+and descriptor never substitute for P1/P2/Drone identity. Power or repair the intended independent
+radio pair and run `Find USB` again. Assign only the row whose observed sysid matches the named role;
+Discovery itself does not assign or connect it.
+
+### GNSS baseline↔Drone installation angle is a latest-state aid
+
+The Telemetry view combines the latest selected P1/P2 GNSS positions with the latest Drone GNSS
+position at the 4 Hz UI poll. It exposes the midpoint-relative F/R/D/Rg values, the acute horizontal
+angle `atan2(|Forward|,|Right|)`, and absolute `90° error=|90°−angle|`. Drone ATTITUDE/yaw is not
+used, and the view does not interpolate the streams or claim one simultaneous exposure timestamp.
+
+Workaround: use the view while the rig is stationary or moving slowly and require CURRENT source
+evidence. A STALE row retains its finite values and exposes the actual age/spread reason. The angle
+is a live presentation value; no additional derived-angle field is persisted.
+
+### Stop can precede an asynchronous representative result
+
+The representative worker and storage writer are asynchronous. If a `VALID` or `ESTIMATED`
+`pixhawk_rtk_live` outcome arrives while the Measurement is still `RUNNING`, Workstation preserves
+the accepted priority-queue record even if the operator presses Stop immediately afterward. If Stop
+changes the run out of `RUNNING` before that primary outcome arrives, Workstation intentionally does
+not create a `measurements.jsonl` row and does not update the distance UI; the outcome remains only
+in method-evaluation evidence. Priority enqueue also does not prove that the bytes have already been
+written or `fsync`ed.
+
+Workaround: when a representative distance row is required, wait until the Pixhawk attitude +
+GNSS/RTK distance appears in the Measurement UI before pressing `측정 종료`, then confirm the
+`measurements` stream in `Data > Status` if durable storage timing matters. There is no need to wait
+for unused comparison methods or the completed nine-method bundle. If `Data > Status` reports the
+store as `CLOSING` or `CLOSED`, no new result can enter that store; start a normal new run with an
+`OPEN` store rather than treating a late enqueue rejection as a saved result.
+
+### Operating K,D does not protect against wrong zoom or camera identity
+
+After a K,D profile is active, Workstation intentionally does not reject or warn on missing,
+stale, future, or mismatched zoom readback, left/right zoom disagreement, physical-camera serial,
+or stabilization state. Those values remain evidence only. The operator must therefore select the
+intended calibration file; applying K,D from another zoom, physical camera, or image-warp state can
+bias rays, distances, and poses without a readiness error.
+
+`intrinsics_zoom_08_20260831.json` is structurally usable for the current native 1280x720 RTP path.
+It remains incompatible with 1920x1080 native images because resolution is still a hard gate. The
+file contains K,D only, so methods requiring stereo R,t also need a separately selected extrinsics
+profile. This statement is about interface/applicability, not calibration quality.
+
+### The bundled 2026-08-20 calibration photo set is not directly applicable
+
+Verification on 2026-08-29 found that
+`calibration/2026-08-20_18-21-24/AutoCapture/2026-08-20_18-49-57` contains mixed 1280x720 and
+1920x1080 inputs, while the photographed board has 10x8 inner corners and the inspected runtime
+setting was 13x8. Running the current selection unchanged therefore fails before K,D optimization.
+
+Selecting only the homogeneous 1280x720 images and using the photographed 10x8 pattern proved that
+the real `CheckerboardCalibrationWorker` completes: Left/Right each retained 10 representative
+poses, produced finite 3x3 K matrices and five D coefficients, and reported about 0.212/0.223 px
+reprojection RMS. The combined quality state was nevertheless `FAIL` because coverage, perspective
+diversity, effective-pose count, principal-point stability, and subset stability were insufficient.
+Do not Apply that result. Recapture at one raster/zoom with the measured square size, move the board
+through image center/edges, distance, roll, yaw and pitch, then require the quality panel to pass.
+
+### Calibration Auto capture depends on dual-camera NAL1 cadence
+
+NAL1/non-delta is an operational non-IDR intra category, not an IDR or source-integrity guarantee.
+Independent Left/Right encoder cadence may produce few candidates within `Max Live pair Δt`, so
+Auto can wait longer or retain timing-ineligible observations for K,D only. If AU provenance is
+missing, a FrameKey was overwritten, or a non-GStreamer compatibility source is active, Auto waits
+for a new candidate and never substitutes an adjacent frame. Use manual `Capture Live Pair` when
+automatic NAL1 provenance is unavailable; manual capture retains its existing freshness and timing
+gates.
+Resetting `이번 촬영` does not create a new AutoCapture directory. Stop→Start in the same Workstation
+process continues writing to the current capture set, so use the photo selector/exclusions or begin
+a separately owned calibration set when a physically isolated dataset is required.
+
+### Previous Measurement data is not migrated automatically
+
+Changing the default does not copy the existing `.local/workstation_data/measurement_data/`
+append streams into `recordings/`; blindly concatenating active JSONL files could duplicate
+operation indices or mix unrelated run histories. Treat the old folder as read-only history and
+start new collection in `recordings/`. If a later offline archive needs both, merge them with an
+explicit provenance-aware process. Each new writer file set is timestamped and remains append-only, so
+monitor free space on the repository volume. Runtime output under repository-root `recordings/`
+must not be added to source commits.
+
+### Dynamic Camera/Pixhawk NIC roles
+
+Role application requires a graphical PolicyKit authorization agent and NetworkManager `nmcli`.
+Headless/offscreen operation fails closed with a concrete manual command instead of silently
+changing the host. One-NIC Camera+P1+P2 operation is supported, but the earlier shared-L2 RTSP-load
+MAVLink stall means it remains outside long-duration field qualification. If rollback is incomplete,
+the UI reports the exact partial NIC state; inspect NetworkManager and use Find/Assign again rather
+than assuming the saved role is active.
+
 ### Dr/P1/P2 geometry is a latest-state GNSS aid
 
 The Pixhawk geometry group uses the latest selected P1/P2 rover positions, the latest Drone GNSS
@@ -1414,6 +1898,9 @@ The post-fault symptoms are intentionally explicit:
 - Camera `Auto` records `gst_parse_error: no element "nvh264dec"` per side and correctly falls back
   to `avdec_h264`. The observed UI showed both sides as `CPU fallback`, about `5.9 Hz`, with one side
   becoming `STALE` under the extra CPU load.
+- If the saved selection is explicit `NVIDIA`, pressing Measurement reports the unavailable decoder
+  without terminating an already-live software or prior-generation Preview. Choose `Auto` or
+  `Software` before retrying Measurement; explicit mode remains fail-closed.
 - App or Preview restart alone cannot recover this fatal driver state. The current Auto worker also
   keeps its proven CPU override for that generation instead of repeatedly probing a failed GPU.
 - This failure is independent of WIRIS GOP/RTP/IDR behavior; the camera streams merely kept active
@@ -1431,6 +1918,15 @@ nvidia-smi -q | rg 'Driver Version|GPU Recovery Action'
 GST_DEBUG_NO_COLOR=1 GST_DEBUG='nvcodec*:7,cuda*:7' gst-inspect-1.0 nvh264dec
 cat /sys/power/mem_sleep
 ```
+
+App-receive monotonic is the live-distance default and mandatory timing fallback, and remains the
+ordinary Live/Auto Calibration pairing source. Its provenance is decoded-frame receipt at the host,
+not physical camera exposure, and includes per-side network/decode latency. Selecting healthy
+RTCP/NTP can improve stereo frame selection, but PX4 attitude/GNSS association still uses host
+monotonic time; no camera-to-PX4 clock conversion is claimed. Calibration continues classifying app
+receipt as `HOST_RECEIVE_PROXY` and never precision-qualifies exposure from receipt alone. Keep the
+checkerboard stationary; true simultaneous exposure still requires verified exposure timestamps or
+qualified hardware triggering.
 
 The seven comparison processes deliberately run concurrently while Pixhawk/RTK has its own worker.
 On a CPU- or storage-constrained workstation, simultaneous OpenCV startup, native-PNG writes, and
@@ -1501,10 +1997,11 @@ They prove current-generation gating, error routing, per-side override, terminal
 and UI projection in software; they do not prove that a physical WIRIS/NVDEC failure will recover
 within the field timing limits. Keep that item open until dual-camera hardware qualification.
 
-Camera JSONL rows describe GUI-delivered frame observations, while MP4 may be encoded pass-through
-or decoded-frame recording. No exact 1:1 frame index is currently proven;
-`mp4_frame_index_contract=not_available` is the authoritative limitation. Use the exact native PNG
-bound to a terminal pair when pixel-level replay is required.
+Camera JSONL rows describe GUI-delivered frame observations, while MP4 contains the decoded NV12
+recording branch before Preview/YOLO overlays. A bounded overload drops the oldest recording frame;
+fixed-rate gap duplication preserves approximate elapsed duration, so no exact 1:1 source/MP4 frame
+index is claimed. Use the exact native PNG bound to a terminal pair when pixel-level replay is
+required.
 
 Nominal intrinsics fallback uses an ideal centered pinhole and the WIRIS 1280x720 zoom-index focal
 table scaled independently to the current native width and height. It does not model per-camera
@@ -1528,12 +2025,11 @@ the camera link, while TCP can expose camera-side RTSP service resets or startup
 changing transport alone is not an approved performance fix. Restart the Workstation after changing
 the decoder, transport, or pipeline code so existing child processes do not retain the prior setup.
 
-A sender that never emits H.264 IDR NAL units has no software-recoverable random-access boundary.
-Workstation can prevent its dependent or concealment frames from reaching Preview, YOLO, native
-evidence, and the encoded recording tee, but it cannot reconstruct missing reference pictures or
-turn a non-IDR intra picture into an independently decodable frame. Such a side remains unavailable
-after the bounded integrity wait; inspect the camera's encoder readback and correct it outside the
-automatic RTSP connection path.
+A sender that never emits H.264 IDR NAL units has no verifiable compressed-stream random-access
+boundary. Workstation now keeps usable decoded output flowing instead of waiting for that boundary,
+and labels it `INPUT UNVERIFIED`. It cannot reconstruct missing reference pictures or guarantee
+that a decoded frame is free of concealment artifacts; existing Measurement gates evaluate the
+delivered pixels, not the unavailable original compressed-media truth.
 
 On 2026-08-27, an operator-approved exact `GEIR VISIBLE=1` readback on both FW 2.18.72 cameras still
 produced zero type-5 NAL units in 15-second elementary captures: Left had 206 AUs with nine NAL1
@@ -1542,9 +2038,9 @@ intra AUs, Right had 112 AUs with three NAL1 intra AUs, and `ffprobe` marked eve
 Right rebooted with Ethernet mode off and profile `0/17/16/0`, then was restored to the approved
 `GETH=TRUE`, `0/1/30/1` state. On both models, fresh streams and an additional `SEIR VISIBLE 1`
 issued while RTSP was active still produced zero NAL5. That sender output remains unrecoverable by
-this software gate and now requires Workswell firmware/vendor correction. Zero IDR also blocks the current-generation frame evidence needed
-for STUS round two, so camera output, clock convergence and portable MP4 remain one shared CRITICAL
-hardware blocker.
+the camera/RTSP source and still requires Workswell firmware/vendor correction. It no longer blocks
+decoded Preview, YOLO, native evidence, official Measurement, or decoded-lossless MP4; all retain
+explicit unverified-source provenance. Clock success remains independent from Frame and Media.
 
 The type-owned append model deliberately provides no transactional “all evidence for one
 Measurement” package. A power loss or queue overload can leave some streams present and others
@@ -1575,8 +2071,9 @@ Ubuntu/ROS system-site `colcon-core` requires a version below 80.
 
 A clean checkout does not download model weights. Copy the approved `yolov8m.pt` into
 `.local/workstation_data/models/` (or the selected data root's `models/` directory) and require
-`run.sh --check` to pass before operation. Historical `apps/Workstation/calibration/` data is
-preserved and ignored by Git; migrate it only through an operator-approved copy-and-hash process.
+`run.sh --check` to pass before operation. `apps/Workstation/calibration/` is the active default
+Calibration owner and remains ignored by Git. The former `.local/workstation_data/calibration/`
+tree is preserved as historical input and is not copied, merged, or deleted automatically.
 
 `.local/workstation_data` remains Git-ignored even though its internal settings paths are portable.
 To continue on another PC, transfer that directory or an approved checksum inventory separately;
@@ -1596,13 +2093,14 @@ matching images K,D-only. Malformed capture metadata is not silently promoted an
 zoom/evidence gate blocks calculation until it is repaired.
 
 Workstation still does not generate legacy Session `review.xlsx` or typed Parquet automatically.
-It now generates one root-level `latest_measurement.xlsx` convenience view for the latest
-Measurement only; earlier Measurements and Manual-record-only intervals are not archived there.
+It now generates a timestamped root-level `latest_measurement_<timestamp>.xlsx` convenience view for
+the latest Measurement only; earlier Measurements and Manual-record-only intervals remain in their
+timestamped JSONL source files.
 Large exports are deliberately background/idle work: the representative current-data copy produced
 42,425 workbook rows in about 62 seconds (23.4 MB XLSX, about 28 MiB peak RSS), and a new recording
 may cancel or defer that work. Use `Update Latest XLSX` after the system is idle if the status is
 stale/failed/cancelled. A foreign unmarked file with the same name is preserved; rename or move it
-before retrying. Multi-run or authoritative analysis must still read fixed JSONL, interpret
+before retrying. Multi-run or authoritative analysis must still read timestamped/legacy JSONL, interpret
 append/replace operations by `_record_index`, retain signed nanosecond timestamps, and join only
 where the recorded identity/time contract supports it.
 
@@ -1691,8 +2189,9 @@ live-caster + three-Pixhawk operation still requires a field soak test before qu
 For this Ethernet MAVLink mitigation specifically, software tests are insufficient for a resolved
 claim. Required hardware evidence is three independent cold boots with at least 10 minutes each,
 one dual-P1/P2 60-minute full-load soak with RTCM and normal Workstation load, symmetric one-side
-isolation, and verified-USB recovery with another 10-minute post-reboot qualification. Until all
-of those pass, do not describe the field issue as resolved or update `Pixhawk.md` with a remedy.
+isolation, and verified-USB recovery followed by a 1-minute product requalification plus at least
+10 minutes of post-reboot observation. Until all of those pass, do not describe the field issue as
+resolved or update `Pixhawk.md` with a remedy.
 The two camera decoder child processes may still consume substantial CPU while Preview is active;
 this is expected producer-side work and is separate from GUI responsiveness. Stop Preview when
 video is not required. If a build predating 2026-08-23 was force-quit, terminate its orphaned
@@ -1760,8 +2259,12 @@ scales the resulting translation -- the fitted rotation and its normalized Samps
 provably invariant to the baseline's metric length. Correspondences are classified inlier/outlier
 by a normalized Sampson threshold after a soft-L1 seed solve, and the candidate is only
 `apply_eligible` when the final fit has full rotation rank, a bounded Jacobian condition number,
-and a sufficient inlier count/ratio; GNSS translation is only `apply_eligible` when both Left and
-Right report `RTK_FIXED`. Mountain never measures the Left absolute pose -- it remains the
+and a sufficient inlier count/ratio. GNSS translation is `apply_eligible` when the same frozen
+Capture contains finite Left/Right latitude, longitude, and altitude, both numeric
+`fix_type >= 3` (3D fix or better), and a finite non-zero P1-to-P2 NED baseline. `RTK_FIXED` is
+retained as quality evidence, not a Mountain translation blocker; a usable non-fixed baseline
+keeps explicit warnings and its `mountain_gnss` Measurement outcome is `ESTIMATED`. Mountain never
+measures the Left absolute pose -- it remains the
 prior/anchor -- so a candidate's `left_anchor_pose_sha256` input hash changes whenever the
 selected Left anchor changes, even for identical pixels and GNSS baseline; UI review must treat
 such a candidate as anchor-dependent, not as an independent absolute-pose measurement. The GNSS
@@ -1816,6 +2319,67 @@ frozen Mountain image.
   north-referenced top view. Missing/stale sides remain independent; no target/tolerance verdict,
   history, worker, setting, measurement change, or derived recording field was added.
 
+- 2026-09-02: Added Telemetry read-only Drone `Find Network`, sysid-3 candidate selection, and
+  protected the accepted MAVLink URL from stale Apply/Save/refresh rollback.
+
+- 2026-09-02: Relaxed only the NTRIP `SYSTEM_CENTER` GGA gate to accept selected P1/P2 GNSS
+  positions received within 10.0 seconds with an application-receive timestamp difference of at
+  most 3000 ms. Exact boundaries pass; older or more widely skewed samples still fail closed.
+  Measurement and baseline readiness thresholds are unchanged.
+
+- 2026-09-02: Fixed Measurement start to apply the currently selected
+  `Settings > YOLO / RTSP > Weights path` before invoking Detection. An unapplied selection no
+  longer falls back to an older persisted `yolov8n.pt`; a rejected handoff blocks start instead of
+  silently using stale weights. Stop remains available without requiring a new model selection,
+  while the explicit Save command and existing normal-shutdown settings save remain unchanged.
+
+- 2026-09-02: Fixed Measurement decoder-preflight rollback so an unavailable explicit `NVIDIA`
+  request no longer stops an already-live left/right Preview. The observation remains open with its
+  camera/recording sources unavailable, temporary automatic recording is released, and the
+  operator-visible recovery remains Stop → select `Auto`/`Software` → retry. Failures after worker
+  replacement starts retain the existing teardown, and explicit NVIDIA still has no implicit
+  fallback.
+
+- 2026-09-02: Added authoritative `gnss_baseline_center.jsonl` persistence for the GNSS-derived
+  Telemetry row. Measurement/Manual Record attempts one self-contained bulk row per primary Drone
+  GNSS callback, including CURRENT/STALE/WAITING, selected P1/P2/Drone positions and exact clocks,
+  fix/MAVLink provenance, NED intermediates and explicit frame/origin/axis contracts. Data Status
+  owns write/drop/error truth and Latest Measurement XLSX adds `GnssBaselineCenter`. Raw PX4 JSONL,
+  canonical Measurement fields, legacy Parquet, settings, workers and device behavior are unchanged.
+
+- 2026-09-02: Added a read-only `GNSS BASELINE_CENTER F/R/D/Rg` table to `Devices > Telemetry`.
+  Three live GNSS positions produce an antenna-midpoint local-level frame with horizontal P1→P2
+  Right, NED Down, Right×Down Forward and Euclidean Rg. CURRENT uses a 2.0 s age and operator-
+  selected 1000 ms three-source receive-spread limit; STALE retains finite evidence and WAITING
+  never fabricates zero. The existing ideal-disparity reference reuses the same Rg/readiness.
+  Camera `baseline_center_frd`, Measurement/recording schemas, settings, device behavior and worker
+  topology are unchanged.
+
+- 2026-09-03: Removed the one-time `Field topology setup` workflow. Existing per-board transport,
+  NIC discovery/assignment, P2 ETH MAV, Connect/Disconnect, and explicit board-side provisioning
+  controls remain unchanged.
+
+- 2026-09-01: Simplified the shared `EngineeringValue` presentation across Workstation. Normal
+  values no longer add a redundant visible `VALID` badge; age remains visible when present and
+  `Quality: valid` remains available in the tooltip. `INVALID` stays visible, and authoritative
+  status values such as Measurement `VALID` are unchanged.
+
+- 2026-09-01: Made Pixhawk `Find USB` and `Find network` replace the transient Discovery snapshot,
+  clear stale selection/feedback, and show only the new source. USB discovery now renders one row
+  per physical serial endpoint and enriches it with heartbeat identity instead of duplicating it as
+  USB plus MAVLink. Source-neutral columns distinguish shared Network NIC roles from independent
+  P1/P2/Drone Radio sysids; saved assignments, settings, connections, and explicit Assign/Connect
+  behavior are unchanged.
+
+- 2026-09-03: Corrected the camera-installation alignment contract to use the GNSS-only horizontal
+  angle between the P1→P2 baseline and midpoint-to-Drone GNSS vector. `Devices > Telemetry` now
+  exposes the angle and absolute 90° error beside GNSS F/R/D/Rg. Drone ATTITUDE/yaw is not used;
+  existing raw GNSS, measurement, recording and device contracts remain unchanged.
+
+- 2026-09-03: Added creation-time names to new structured JSONL writer files and derived Measurement
+  workbooks. Existing files are preserved; the exporter scans legacy fixed and timestamped streams,
+  while the Data Status action opens the exact newly published workbook path.
+
 - 2026-08-31: Added one derived `<data-root>/latest_measurement.xlsx` for the most recently stopped
   Measurement. A generation-exact checkpoint feeds Summary, result/history, eight-method, source,
   native/file and Issues sheets with Excel `#N/A`, exact large integers and KST display columns.
@@ -1823,6 +2387,74 @@ frozen Mountain image.
   coalesced cancellable worker keeps Measurement/Manual recording and shutdown authoritative.
   Temp validation/atomic replacement protects prior app-owned output, while foreign same-name
   files and all JSONL/legacy Session data remain untouched.
+
+- 2026-08-31: Hardened the primary-first Measurement persistence boundary. The primary worker now
+  starts and publishes before comparison workers, with an independent 20-pair queue; primary
+  terminal/one-second-timeout releases comparison startup, and comparison-only backlog produces
+  comparison `BACKPRESSURE_BLOCKED` without rejecting an available primary slot. The enqueue
+  attempt/result now precedes table/history/plot/banner projection. Method bundles commit only
+  after admitted append/replace, retain a lease-bound pending row for retry, and become `late` if
+  Stop wins. The data store rejects `CLOSING`/`CLOSED` enqueue and fences Retry Storage against
+  close. Retired owners fall back to direct evidence without overwriting reused indices. A rejected
+  primary remains independently retry-owned after bundle admission, becomes compact late evidence
+  after Stop, and reuses its already-built row so native capture is never scheduled twice. Cross-run
+  late results do not alter current counters/UI. Pending retries are count/byte bounded and
+  round-robin budgeted; native completion uses first-terminal fingerprints and bounded terminal-drop
+  diagnostics. Bundle fallback records its actual commit source.
+
+- 2026-08-31: Decoupled the successful representative Measurement result from the eight-method
+  comparison barrier. While a run is `RUNNING`, `pixhawk_rtk_live` `VALID`/`ESTIMATED` now enters
+  the asynchronous priority queue before its UI update; unused comparison methods cannot delay it.
+  Non-success primary outcomes remain method-evaluation-only. Stop preserves an already accepted
+  queue record, while a primary arriving after Stop creates no representative row or UI update.
+  "Immediate" denotes enqueue, not synchronous write or `fsync`.
+
+- 2026-08-31: Made P1/P2 `SCALED_IMU/2/3` delivery sample-backed instead of command-backed.
+  Missing/stale standard IMU streams now use bounded side-locked retries and stop immediately on a
+  real sample; all-RX stall remains fail-closed. Existing IMU rows now distinguish `WAITING`, fresh
+  `LIVE`, stale cached values, and fresh partial packets without changing layout or sensor axes.
+
+- 2026-08-31: Made Measurement timing follow its persisted Settings preference. App receive remains
+  the default. Healthy VERIFIED/current/same-epoch RTCP/NTP now selects pairs; missing, malformed,
+  stale, transitioning, epoch-mismatched or over-limit RTCP evidence falls back to exact app receive
+  without a timing-only validity downgrade. Active-run changes apply to the next Measurement. New
+  schema-v5 rows and measurement-pairs Parquet v4 preserve requested/effective/fallback and distinct
+  app/NTP deltas; legacy settings and rows remain readable.
+
+- 2026-08-31: Changed operating K,D readiness so zoom readback presence/age/value, left/right zoom
+  agreement, camera serial, and stabilization are saved evidence only and never blockers or
+  advisories. Missing/invalid K,D identity and unknown/mismatched native raster remain fail-closed.
+  Verified `intrinsics_zoom_08_20260831.json` loads as 1280x720 K,D for the current RTP path; no
+  calibration-quality claim or K,D/R,t/coordinate-math change is included.
+- 2026-08-31: Removed the obsolete local frozen-image Import zoom dialog. `Import Pair` now emits
+  only Left/Right paths, and Calibration/Alignment guidance states that native raster remains the
+  enforced applicability condition while camera/focus/zoom provenance is operator-managed.
+
+- 2026-08-30: Restored `apps/Workstation/calibration/` as the default owner for new Calibration
+  photos, FTP originals, metadata, attempts, and profiles while preserving both existing trees.
+  Explicit `app_root` tests remain isolated, custom relative roots remain data-root-owned, and an
+  approved K,D profile is content-addressed and hash-verified into the data root before its restart
+  path is persisted.
+
+- 2026-08-29: Added default Calibration capture feedback with shared Left/Right checkerboard
+  overlays, non-color board state/corner counts, current-process inspection outcomes, persisted
+  current-root candidate inventory, stale/unavailable handling, fixed-height/elided status, and an
+  additive public capture snapshot. Verified the real K,D worker against the bundled photo set:
+  the solver operates on a corrected homogeneous 10x8 subset, while the current mixed-raster/13x8
+  selection fails and the corrected subset remains quality `FAIL`, so it must not be applied.
+
+- 2026-08-29: Changed ordinary Calibration Live/Auto `Max Live pair Δt` admission from
+  RTCP/NTP frame time to signed decoded-frame `app_receive_monotonic_ns`. New capture evidence
+  records both side stamps, exact signed ns delta and `HOST_RECEIVE_PROXY`, which may admit an R,t
+  pair but never precision-qualifies or verifies exposure. NTP remains record-only, missing app
+  receipt fails closed to K,D-only, FTP CPTR dispatch and verified exposure paths are unchanged,
+  and historical Photo sets are not rewritten.
+
+- 2026-08-29: Changed the default Measurement output from
+  `.local/workstation_data/measurement_data/` to repository-root `recordings/`. A blank setting
+  selects the default, the former `measurement_data` value migrates logically without moving old
+  bytes, explicit data-root overrides resolve to their own `recordings/` child, and custom relative
+  folders retain the prior containment checks and non-blocking fallback behavior.
 
 - 2026-08-29: Removed Horizon detector quality from `Use suggestion` permission while retaining
   `GOOD`/`LOW_CONFIDENCE`, confidence, residual and reason text/evidence. Owner/UI validation now
@@ -1834,11 +2466,78 @@ frozen Mountain image.
   GStreamer CUDA-init failure, truthful CPU fallback symptoms, reboot-only recovery, and the
   current stop-Preview-before-suspend operational workaround.
 
+- 2026-08-29: Extended read-only NIC discovery with explicit, confirmed NetworkManager role
+  application for Camera/P1/P2. One or many NICs may hold composable roles. Target-first readback,
+  role-scoped source cleanup, app-owned-entry provenance, affected-owner automatic reconnect,
+  actual Camera/Pixhawk evidence, commit-last persistence and compensating rollback preserve
+  unrelated NICs/settings and existing Measurement mapping locks.
+
+- 2026-08-29: Separated Mountain automatic-suggestion quality from explicit copy permission.
+  `Use suggestion` now accepts a structurally valid `LOW_CONFIDENCE` proposal, revalidates current
+  frozen identities and paired native `(u,v)` geometry, applies exclusions symmetrically, and
+  persists filtered-input provenance. That slice did not change Horizon; direct/automatic Solve and
+  Apply behavior remain unchanged.
+
+- 2026-08-29: Reset Calibration's visible `이번 촬영` inspection/stereo/K,D-only/failure counters on
+  every successful Auto Start while preserving existing PNG/metadata files, capture IDs, and the
+  cumulative `촬영 세트`; a restart rejected by an active worker leaves the current counters intact.
+
+- 2026-08-29: Bound Calibration Auto capture to parser-observed NAL1/non-delta access units and
+  propagated that evidence by exact AU/decoded PTS into the native `FrameKey`. Removed Auto's
+  internal 1 ms timestamp-near lookup; evicted, stale, malformed, or old-generation keys now wait
+  for the next candidate without affecting Preview, YOLO, Measurement, recording, or manual capture.
+
 - 2026-08-29: Made Measurement observation-first. Start immediately opens a run with zero or more
   sources; camera, Pixhawk, Base GNSS/NTRIP, Target and recording join independently. Added manual
   camera rejoin with non-overwriting MP4 segments, bounded FIFO retry for essential structured
   evidence, presence-only `SAVED/PARTIAL/FAILED`, and removed artifact/integrity persistence from
   current- and next-run admission.
+
+- 2026-08-29: Made tolerant decoded-frame admission permanent for Preview, YOLO, native evidence,
+  and official Measurement. Added simultaneous `VALID` + `INPUT UNVERIFIED` provenance and replaced
+  the GStreamer direct-copy recording branch with an isolated bounded decoded-NV12 → FFmpeg
+  `h264_nvenc` lossless MP4 writer. Recording oldest-drops and failures do not stop YOLO/distance;
+  there is no CPU encoder fallback or application bitrate/size/time cap.
+
+- 2026-08-29: Added the persisted `H.264 compressed queue` setting with `Latest (drop old)` and
+  `Reference-safe (preserve 8)` modes. A 12-second left-camera TCP A/B showed nearly equal decode
+  rate (`16.72` vs `15.98` Hz mean) while the reference-safe run recorded zero observed RTP gaps
+  versus 16 gaps/183 missing packets in latest mode; the setting applies on the next Preview start.
+
+- 2026-08-29: Fixed the queue-setting handoff name from Settings to `YoloStreamWorker`. The initial
+  implementation passed `rtsp_encoded_queue_mode` to a constructor that accepted only
+  `encoded_queue_mode`, causing Preview to return immediately to STOPPED. A fresh real launch now
+  reaches Left LIVE, changes the action to `Stop preview`, and keeps the unavailable Right isolated.
+
+- 2026-08-28: Changed only the Mountain + GNSS translation gate from both-side `RTK_FIXED` to
+  both-side `fix_type >= 3` with finite positions and a finite non-zero frozen-capture baseline.
+  RTK Float/ordinary 3D Fix candidates can now supply all translation axes, while their explicit
+  warning keeps `mountain_gnss` outcomes `ESTIMATED`; sub-3D fixes still block those axes.
+
+- 2026-08-27: Reduced the operational P1/P2 HEARTBEAT+ATTITUDE qualification from ten minutes to
+  60 seconds. Initial connection, reconnect, confirmed reboot, stall recovery and explicit/manual
+  PARAM completion require a fresh minute; stale/stall fail-close is unchanged. Ten-minute and
+  60-minute runs remain separate long-duration evidence rather than routine measurement delays.
+
+- 2026-08-27: Removed the automatic post-`LIVE` PX4 calibration PARAM snapshot. P1/P2 and Advanced
+  manual refresh plus reset/apply/save verification readback remain unchanged; ordinary
+  qualification now sends no calibration PARAM requests and does not restart qualification for an
+  unrequested diagnostic snapshot.
+
+- 2026-08-27: Added a default-off, process-local WIRIS NAL1 intra field-qualification mode. It
+  requires SPS/PPS, parser non-delta, clean flags and exact decoded PTS, exposes explicit
+  experimental provenance, and never relaxes strict IDR/MP4 truth in normal launches.
+
+- 2026-08-27: Made exact decoded-frame `app_receive_monotonic_ns` the then-sole Workstation
+  live-distance pairing clock with a hard 100 ms bound and normal VALID semantics. This historical
+  fixed-basis contract was superseded by the Settings-preferred 2026-08-31 policy; its schema-v4
+  rows keep their original app-selected meaning.
+
+- 2026-08-27: Decoupled STUS clock truth from decoded video with a dedicated RTCP-only observer,
+  added Manual/Auto scheduling and logical clock epochs, and allowed ordered Left-then-Right STUS
+  during active Preview/Measurement/YOLO/recording without restarting video or MP4. Changed the
+  success contract to sustained Left/Right relative timing at or below 100 ms. Absolute SR-PC is
+  now diagnostic-only, while occasional unmatched/outlier frames are reported and may be dropped.
 
 - 2026-08-27: Reproduced the operator runtime in a separate official Ubuntu 22.04 KVM guest and
   made the external model provisioning step explicit. Added the missing system `python3-cairo`
@@ -1962,7 +2661,8 @@ frozen Mountain image.
 - 2026-08-26: Implemented the software side of P1/P2 Ethernet MAVLink stall mitigation without
   changing PX4 firmware, parameters, or SD-card configuration. Added explicit GCS `255/190` and
   bounded 1 Hz heartbeat, a consumer-backed Stock stream profile, per-side HB/ATT/ANY liveness,
-  10-minute qualification, truthful ATTITUDE-stale versus all-RX-stalled status, no false host
+  the then-current 10-minute qualification (superseded above by the approved 60-second operational
+  gate), truthful ATTITUDE-stale versus all-RX-stalled status, no false host
   reconnect, RTCM send-boundary fail-close with separate `blocked_stall` evidence, and
   operator-confirmed unique-sysid USB reboot with immediate worker revalidation. Hardware
   3-cycle/60-minute/isolation/recovery acceptance remains pending; `Pixhawk.md` is intentionally

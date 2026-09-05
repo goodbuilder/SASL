@@ -33,3 +33,11 @@ states come from existing source ages/status contracts, not from a new timeout/r
 
 No persistence or migration. Restart begins WAITING until existing live sources arrive. Shutdown
 adds no work and retains the existing lifecycle order.
+
+## 2026-09-03 corrected amendment
+
+The GNSS baseline-center geometry adds presentation-only `baseline_drone_angle_deg` and
+`baseline_drone_angle_error_deg` values. They are derived from existing midpoint `Forward/Right`
+components as `atan2(|Forward|,|Right|)` and `|90°−angle|`; NED Down is excluded from the horizontal
+angle. The values are returned by the existing Telemetry snapshot mapping and are not added to the
+recording row/schema. Drone ATTITUDE/yaw is not read by this feature.

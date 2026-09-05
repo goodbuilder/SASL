@@ -40,3 +40,11 @@ disconnect/reconnect recovery stays owned by existing Pixhawk/GNSS status logic.
 The live display combines latest-state samples rather than asserting simultaneous exposure. It is
 for stationary/slow physical alignment and must show source ages/pair delta. Hardware plot behavior
 and field readability remain manual evidence until tested on the rig.
+
+## 2026-09-03 corrected scope impact
+
+The Telemetry read model reuses the existing pure GNSS midpoint geometry and exposes two bounded
+derived values: horizontal `Baseline↔Drone` angle and absolute error from 90°. No attitude read,
+owner, worker, socket, queue, persistence, or measurement path changes. The existing fixed-height
+Telemetry table gains two numeric columns using its current native model, theme, and in-place refresh
+behavior. Missing/stale Drone GNSS cannot suppress P1/P2 source rows or F/R/D/Rg evidence.

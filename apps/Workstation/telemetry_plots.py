@@ -394,7 +394,7 @@ class BaselineYawAlignmentPlot(QtWidgets.QWidget):
         self.setStyleSheet(f"background: {CHART_BG}; border: 1px solid {PANEL_BORDER};")
         self.setToolTip(
             "Horizontal local NED: North=0 deg, clockwise positive.\n"
-            "Baseline-Pn = wrap180(azimuth(P1->P2) - Pn yaw).\n"
+            "Baseline-Pn = wrap180(azimuth(P1->P2) - Pn yaw), Pn=P1/P2.\n"
             "Positive is right/clockwise of that Pixhawk Forward direction."
         )
 
@@ -583,7 +583,7 @@ class BaselineYawAlignmentPlot(QtWidgets.QWidget):
             color=SERIES_LEFT,
             label="P1 Forward",
         )
-        self._draw_legend_item(
+        legend_x = self._draw_legend_item(
             painter,
             legend_x,
             legend_y,

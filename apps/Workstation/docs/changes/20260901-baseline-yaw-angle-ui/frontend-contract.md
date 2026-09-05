@@ -2,35 +2,39 @@
 
 ## Controls and inputs
 
-No controls. Inputs are the selected P1→P2 NED baseline and independently available P1/P2 PX4
-ATTITUDE yaw samples.
+No controls. Inputs are the selected P1/P2 GNSS positions and the primary Drone GNSS position.
+Drone PX4 ATTITUDE/yaw is not an input.
 
 ## Payloads and commands
 
-None. The workspace reads `EvidenceAdapter.baseline_yaw_alignment(now_s=...)`.
+None. The workspace reads `DroneTelemetryController.drone_telemetry_snapshot()` and its existing
+`gnss_baseline_center_frd` mapping.
 
 ## Visible states and transitions
 
-- `CURRENT`: fresh horizontal baseline plus fresh P1 and P2 yaw.
-- `PARTIAL`: current baseline and exactly one current yaw; the other row is STALE or WAITING.
-- `STALE`: finite last values exist but no complete current comparison remains.
-- `WAITING`: no finite non-zero horizontal baseline direction or no comparable yaw.
+- `CURRENT`: finite three-GNSS geometry, all source ages <=2.0 s, and timestamp spread <=1000 ms.
+- `STALE`: finite geometry remains visible but a source is old/future or timestamp spread exceeds
+  the existing bound.
+- `WAITING`: a GNSS position is missing/invalid, the horizontal baseline is undefined, or the
+  midpoint-to-Drone horizontal vector has no direction.
 
-Visible fields are baseline azimuth, P1 yaw/relative angle, P2 yaw/relative angle,
-P2-minus-P1 yaw, selected receiver sources/fix states, GNSS ages/pair delta, and ATTITUDE ages.
+Visible fields are F/R/D/Rg, `Baseline↔Drone angle`, `|90°−angle|`, selected receiver/fix states,
+three-source ages and timestamp spread.
 
 ## Errors and recovery actions
 
 Missing/non-finite/zero-horizontal inputs fail closed to `--`/WAITING with a factual reason.
-Stale arrows are dashed/muted. Recovery occurs automatically when fresh source evidence returns;
-no local retry is offered.
+Stale finite values remain visible with the existing STALE status and tooltip. Recovery occurs
+automatically when fresh GNSS source evidence returns; no local retry is offered.
 
 ## Keyboard, focus, accessibility, and layout
 
-Read-only values remain selectable/inspectable. Status meaning is available in text and tooltips;
-plot series use labels and line style as well as color. Fixed extents prevent live-layout motion.
+The read-only table is non-selectable as before; status meaning is available in text and tooltips.
+Fixed columns/table height prevent live-layout motion; the existing outer horizontal scroll is the
+recovery path for narrow widths.
 
 ## Cross-feature visible behavior and isolation
 
-Raw attitude and baseline groups remain unchanged. One missing Pixhawk affects only its own angle;
-camera, Base GNSS/NTRIP, Alignment R,t, Measurement, recording, and Diagnostics remain usable.
+Raw attitude and baseline groups remain unchanged. A missing/stale Drone GNSS source affects only
+the GNSS angle row; camera, Base GNSS/NTRIP, Alignment R,t, Measurement, recording, and Diagnostics
+remain usable.

@@ -4259,14 +4259,14 @@ def test_pixhawk_verified_usb_recovery_is_visible_and_stall_gated() -> None:
         for index in range(2, 15)
         if pixhawk_layout.itemAt(index).widget() is not None
     ] == [
+        "Board transport · explicit Connect only",
         "Connection",
         "Network candidates and assignments",
         "Attitude (R/P/Y)",
         "P1/P2 GNSS receivers",
-        "IMU magnetometer (MAVLink)",
+        "Magnetometer by CAL_MAG slot",
         "MAG Priority / active selection",
         "CAN magnetometer (dedicated MAVLink)",
-        "Pixhawk Parameters · calibration-owned groups",
         "P1→P2 baseline",
         "P1→P2 baseline / Pixhawk yaw",
         "Drone Pixhawk geometry · F/R/D/Rg",

@@ -31,3 +31,13 @@ requested implementation.
 
 The operator reconfirmed that the two relative degrees must be separately visible. Each row keeps
 its own ATTITUDE age/state so loss of one Pixhawk does not hide the other comparison.
+
+## 2026-09-03 — Supersede Drone ATTITUDE amendment with GNSS installation angle
+
+The operator clarified that Drone Pixhawk ATTITUDE/yaw is not used. The required observation is the
+acute horizontal angle between the P1→P2 GNSS baseline and the vector from the P1/P2 GNSS midpoint
+to the Drone GNSS position. Use the existing GNSS `Forward/Right` components:
+`angle=atan2(|Forward|,|Right|)`, with 90° as the camera-installation target and
+`|90°−angle|` as the displayed error. Move the feature to `Devices > Telemetry`; remove the
+Drone-yaw fields/arrow/read-model dependency. Preserve F/R/D/Rg, freshness, raw data, commands,
+settings, persistence, and measurement semantics.

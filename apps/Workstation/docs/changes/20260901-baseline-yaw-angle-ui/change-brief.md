@@ -2,32 +2,32 @@
 
 ## Operator outcome
 
-On `Devices > Pixhawk`, directly below the existing `P1→P2 baseline` group, the operator can
-read the live horizontal angle from each P1/P2 Pixhawk Forward direction to the selected
-P1→P2 GNSS baseline and verify the underlying source/freshness evidence.
+On `Devices > Telemetry`, directly below the existing `Live position` group, the operator can
+read the horizontal angle formed by the selected P1→P2 GNSS baseline and the Drone GNSS vector
+from the P1/P2 antenna midpoint, then adjust the camera installation until the angle reaches 90°.
 
 ## Motivation
 
-The current workspace shows P1/P2 yaw and NED/FRD baseline values in separate regions. The
-operator must calculate their horizontal relationship mentally, while the older owner-only panel
-contains a different unsigned 3D Forward-to-baseline aid that is not exposed in the Workstation.
+The current Telemetry workspace shows only the GNSS-derived midpoint-to-Drone `F/R/D/Rg` values.
+The operator must calculate the baseline-to-Drone horizontal angle mentally. The Drone Pixhawk
+ATTITUDE/yaw is not part of this installation-alignment contract.
 
 ## Included scope
 
-- Signed horizontal P1 and P2 baseline-relative angles, baseline azimuth, and P2-minus-P1 yaw.
-- Source-backed CURRENT/PARTIAL/STALE/WAITING presentation with ages and selected GNSS sources.
-- A compact fixed-height north-referenced top view using existing theme tokens.
-- Pure geometry tests, evidence/read-model tests, Qt integration tests, and operator documentation.
+- GNSS-only horizontal baseline-to-Drone angle and absolute error from the 90° target.
+- Source-backed CURRENT/STALE/WAITING presentation with the existing three-GNSS age/spread evidence.
+- Two additional read-only columns in the existing fixed-height `GNSS BASELINE_CENTER` table.
+- Pure geometry tests, controller/read-model tests, Qt integration tests, and operator documentation.
 
 ## Excluded scope and non-goals
 
-- No target angle, tolerance, GOOD/WARN/BAD alignment verdict, history, or stability statistic.
+- No Drone ATTITUDE/yaw input, target acceptance verdict, automatic camera movement, history, or stability statistic.
 - No command, worker, device/protocol, measurement algorithm, setting, or navigation change.
-- No new persisted derived-angle field or recording schema change.
+- No new persisted derived-angle field or recording schema change; existing F/R/D/Rg records remain unchanged.
 - No replacement of raw NED, P1 body FRD, camera RDF, or public measurement coordinates.
 
 ## Acceptance summary
 
-Fresh finite baseline and attitude inputs produce independently sourced P1/P2 signed angles at the
-next normal UI poll. Missing or stale sources remain explicit, rapid updates do not move controls
-or scroll, and existing raw telemetry/recording behavior is unchanged.
+Fresh finite P1/P2/Drone GNSS inputs produce the horizontal angle and 90° error at the next normal
+UI poll. Missing or stale sources remain explicit, rapid updates do not move controls or scroll,
+and existing raw telemetry/recording behavior is unchanged.

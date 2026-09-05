@@ -63,18 +63,48 @@ UNKNOWN means insufficient evidence. DEGRADED requires a defined rule/reason. ER
 ## 10. Camera Status
 
 Dimensions: connection, RTSP availability, requested decoder mode, actual per-side decoder,
-fallback reason, frame reception, frame age, FPS, and preview. Aggregate LIVE only if actual frames
-are confirmed. Requested NVIDIA/Auto is not GPU success evidence.
+fallback reason, frame reception, frame age, FPS, transport input metrics, and preview. Aggregate
+LIVE only if actual frames are confirmed. Requested NVIDIA/Auto is not GPU success evidence.
 
 - `GPU · nvh264dec`: actual worker reported NVDEC.
 - `CPU · avdec_h264 (selected)`: explicit Software mode, not degraded.
 - `CPU fallback · avdec_h264`: Auto failed NVIDIA and completed the bounded software restart; WARN.
 - `Decoder mismatch`: actual decoder contradicts requested mode without fallback evidence; ERROR.
 - `--`: no active decoder evidence.
+- `INPUT UNVERIFIED`: a current decoded frame is live but compressed-source RTP/IDR integrity is
+  not proven. Camera state remains LIVE with WARN. This provenance does not block Preview, YOLO,
+  native evidence, or Measurement and cannot be promoted to source-integrity green.
 
 Camera workspace owns the primary per-side value, compact CAM tooltip owns short actual/fallback
-detail, and Diagnostics Performance owns GPU model/driver/capability detail. GPU utilization is
-diagnostic only and cannot turn a source LIVE.
+detail, and Diagnostics Performance owns GPU model/driver/capability detail plus the worker's
+RTP/H.264 input metrics. RTP packet rate is packets per second; missing packets are estimated from
+forward RTP sequence gaps; loss percentage is missing/(received+missing); H.264 AU rate is parser
+access-unit output rate. These measurements are observational and do not change stream policy.
+GPU utilization is diagnostic only and cannot turn a source LIVE.
+
+## Pixhawk Radio transport status
+
+- P1, P2 and active Drone are independent status owners with expected sysids 1, 2 and 3.
+- Telemetry Drone network discovery has an independent transient state:
+  `IDLE/SEARCHING/FOUND/EMPTY/AMBIGUOUS/FAILED`. A `DRONE VERIFIED` row requires a decoded sysid-3
+  HEARTBEAT; it is candidate evidence only and never promotes connection state.
+- `RADIO QUALIFYING 00/10s` and `RADIO LIVE` describe transport evidence only; neither implies
+  `RTK READY` or Measurement admission.
+- Optional Radio demand is `CRITICAL`, `OPTIONAL_25`, `OPTIONAL_50` or `STOCK`. Recovery starts
+  after 30 healthy seconds and advances at 15-second intervals; a critical regression returns to
+  `CRITICAL` immediately.
+- `RADIO_STATUS` RSSI/noise/txbuf/error fields are diagnostics. Missing `RADIO_STATUS` is
+  `UNKNOWN`, not a transport failure. Freshness, RTCM queue/age/drop and I/O evidence own
+  degradation.
+- A 10-second expected-heartbeat timeout, sustained all-RX loss or Radio device removal retires
+  the connection generation and returns to `DISCONNECTED · PRESS CONNECT`.
+- Discovery status is revisioned command evidence: `SEARCHING USB`, `SEARCHING NETWORK`,
+  `FOUND n USB ENDPOINTS`, `FOUND n NETWORK CHOICES`, or `ERROR · reason`. Rows always belong to
+  that latest accepted command. Empty/error results do not retain stale candidates, while saved
+  assignments and connection state remain independent.
+- A USB row without heartbeat is `identity unverified`; observed sysid 1/2/3 maps to P1/P2/Drone.
+  A Network row with several roles is explicitly labelled `shared NIC` and never implies a shared
+  Telemetry Radio.
 
 ## 11. Pixhawk Status
 
@@ -87,21 +117,38 @@ The Pixhawk workspace separately projects network assignment evidence: `LEGACY A
 `ENDPOINT INVALID`, and `PORT IN USE`. These states describe the host-side prerequisite and never
 promote a side to CONNECTING/LIVE. Same-NIC topology is not a warning/status dimension.
 
+Explicit role application separately uses `REVIEW REQUIRED`, `AUTHORIZING`, `STOPPING AFFECTED`,
+`APPLYING`, `VERIFYING TARGET`, `CLEANING SOURCE`, `RECONNECTING`, `APPLIED`, `ROLLING BACK`,
+`ROLLED BACK`, `CANCELLED`, `AUTH DENIED`, `READBACK MISMATCH`, and `ROLLBACK PARTIAL`. `APPLIED`
+requires NetworkManager+kernel readback and, for a previously active role, a new Camera frame or
+expected-system Pixhawk HEARTBEAT+ATTITUDE. A partial state is never promoted to assignment success.
+
 - `DISCONNECTED`: local listener absent.
 - `CONNECTING`: listener open but expected P1/P2 system identity not observed.
-- `QUALIFYING`: expected identity plus fresh heartbeat/ATTITUDE, but less than 10 continuous minutes.
-- `LIVE`: 10 continuous minutes complete and current HB/ATT/ANY evidence remains fresh.
+- `QUALIFYING`: expected identity plus fresh heartbeat/ATTITUDE, but less than 60 continuous seconds.
+- `LIVE`: 60 continuous seconds complete and current HB/ATT/ANY evidence remains fresh.
 - `ATTITUDE STALE`: ATTITUDE older than 2 seconds while heartbeat/other traffic remains current.
 - `ETH MAVLINK RX STALLED`: all expected-system RX silent for 10 seconds; RTCM/commands blocked;
   detail may say PX4/NuttX UDP task deadlock suspected, never proven.
 - `RECOVERING`: expected packet returned after stall/reboot; qualification restarted at zero.
-- `PARAM SYNC`: bounded receive-path reservation; it suppresses false stall and requires fresh
-  post-command HB+ATT before qualification restarts.
+- `PARAM SYNC`: an explicit operator/reset/apply/save readback owns a bounded receive-path
+  reservation; it suppresses false stall and requires fresh post-command HB+ATT before
+  qualification restarts. It is never entered automatically because a side reaches `LIVE`.
 - `SHELL SYNC`: bounded Stable-PX4 `sensor_mag`/active-device Shell readback; it is not a
   parameter lookup and returns to the normal transport state after the readback.
 
-Display endpoint, observed/expected sysid, HB/ATT/ANY ages, qualification `mm:ss / 10:00`, and RTCM
+Display endpoint, observed/expected sysid, HB/ATT/ANY ages, qualification `mm:ss / 01:00`, and RTCM
 block evidence without resizing cards or moving controls. Only `LIVE` satisfies Pixhawk readiness.
+This device-connection state is separate from measurement-method readiness: the live
+`Pixhawk attitude + GNSS/RTK` method reuses the last valid process-local attitude and GPS sample per
+side, so it can stay ready while a side's connection card is no longer `LIVE`. The device card keeps
+reporting its own authoritative live state and is never rewritten by that reuse.
+Ten-minute comparison and 60-minute soak durations remain separate stability evidence.
+
+The P1/P2 `IMU stream 1/2/3` rows use actual `SCALED_IMU/2/3` app-receive timestamps. `WAITING`
+means no sample has arrived; `LIVE` requires age at or below one second; `STALE` retains the last
+values and reports their real age; `PARTIAL` is reserved for a fresh packet without all three
+xmag/ymag/zmag values. Command send alone never changes a row to `LIVE`.
 
 ## 12. GNSS / RTK
 
@@ -111,14 +158,20 @@ The separate `P1 body FRD projection` state is `WAITING` until P1 attitude is av
 when ready it is `[Forward, Right, Down]` in P1 PX4 body FRD and retains its attitude age.
 It must not overwrite raw NED, camera optical RDF, or public `baseline_center_frd` values.
 
-The horizontal baseline/yaw read model is independent from the raw baseline and from physical
-alignment acceptance. `CURRENT` requires a current selected P1/P2 GNSS baseline plus current P1
-and P2 ATTITUDE. `PARTIAL` requires a current baseline and exactly one current board attitude;
-that board's Baseline−Pn value remains visible. `STALE` retains finite last values and actual ages
-without presenting them as current. `WAITING` means no finite non-zero horizontal direction or no
-comparable attitude. The formulas are `Baseline−Pn=wrap180(azimuth(P1→P2)-Pn yaw)` and
-`P2−P1=wrap180(P2 yaw-P1 yaw)`. These states are source availability/freshness only; there is no
-GOOD/WARN/BAD angle verdict.
+The Telemetry `GNSS BASELINE_CENTER F/R/D/Rg/Angle` read model is a separate coordinate/status domain.
+`CURRENT` means three finite selected GNSS positions, application-receive age <=2.0 s per source,
+maximum receive-timestamp spread <=1000 ms, and a finite non-zero horizontal P1→P2 direction.
+`STALE` retains the last finite signed geometry when age is old/future or spread exceeds the bound;
+`WAITING` means missing/invalid geometry and uses `--`, never zero substitution. Fix labels are
+evidence and do not gate state. Its frame is `gnss_baseline_center_local_level_frd`, origin is the
+P1/P2 GNSS antenna midpoint, and it must not be promoted to camera/Measurement
+`baseline_center_frd`. Existing ideal disparity uses the same Rg/readiness.
+
+The same GNSS read model also exposes the acute horizontal installation angle
+`atan2(|Forward|,|Right|)` between the P1→P2 baseline line and the midpoint→Drone GNSS vector,
+plus `90° error=|90°−angle|`. `CURRENT`, `STALE`, and `WAITING` follow the existing three-GNSS
+age/timestamp-spread/finite-geometry state. Drone ATTITUDE/yaw is not an input, and the 90° error
+is an operator measurement rather than a GOOD/WARN/BAD acceptance verdict.
 
 The Pixhawk `Dr` geometry projection is a separate latest-state aid. It displays midpoint→Dr in
 `gnss_baseline_center_local_level_frd`, P1→Dr in P1 `px4_frd`, and P2→Dr in P2 `px4_frd`, each
@@ -154,16 +207,26 @@ Candidate states: UNAVAILABLE, WAITING, VALID, DEGRADED, REJECTED, STALE, ERROR.
 
 Rejection reasons must come from existing logic, not the UI.
 
+Measurement result validity and input-media provenance are independent dimensions. Existing gates
+may produce `VALID` while the same row/status also says `INPUT UNVERIFIED`; the UI must show both
+without relabelling the result DEGRADED or hiding the provenance.
+
+Operating K,D readiness is likewise separate from optical-state provenance. Missing K,D, invalid
+immutable profile identity, and unknown/mismatched native left/right frame resolution are blocking.
+Zoom readback presence/age/value, left/right zoom agreement, camera serial, and stabilization state
+remain saved evidence only; they never create a blocker/advisory or change method readiness.
+
 ## 15. Recording
 
 Manual recording: IDLE → STARTING → ACTIVE → STOPPING → IDLE, with DEGRADED/ERROR diagnostics.
-Measurement enters RUNNING immediately after its in-memory generation/time boundary is frozen.
+Measurement run enters RUNNING immediately after its in-memory generation/time boundary is frozen.
 Source states (`PENDING/WAITING_RESOURCE/LIVE/UNAVAILABLE/LEFT`) are independent and never own run
 admission.
 
-The compact post-run recording state is presence-only: `SAVED`, `PARTIAL`, or `FAILED`. Its detail
-explicitly says playback integrity is not verified. Recorder, artifact or storage failure never
-changes Measurement state or prevents the next run.
+Decoded-NV12 NVENC recording independently reports queue drops and writer details. The compact
+post-run state is presence-only: `SAVED`, `PARTIAL`, or `FAILED`; its detail explicitly says playback
+integrity is not verified. Recorder failure, missing files, artifact-write failure or oldest-drop
+never changes Detection or Measurement state.
 
 The Recording workspace also exposes an advisory protocol projection (not a new
 runtime status key). It evaluates camera LIVE, RTCP/NTP SYNCED, detection RUNNING,
@@ -187,6 +250,68 @@ publication success; only `READY` with an existing app-owned workbook is success
 Missing device/source rows are shown inside the workbook as zero rows/`#N/A`, not as a false export
 failure. A long path/error is compacted in the fixed-height label and retained in its tooltip, so
 status changes never move buttons, focus, selection, scroll, docks, or the window.
+
+The optional bulk stream `gnss.baseline.center` follows the existing store IDLE/PENDING/OK/
+DEGRADED/FAILED state and written/dropped/error counters. Live Telemetry CURRENT is not storage
+success. The stream may fail/drop independently without changing GNSS reception, Measurement or
+recording lifecycle. Latest XLSX Summary and `GnssBaselineCenter` expose only admitted rows from the
+selected Measurement generation.
+
+## 15.1 Camera Clock, Frame Timing, and Media
+
+These are independent status domains. `Clock VERIFIED` requires fresh decoder-independent RTCP
+Sender Reports and a robust Left/Right relative delta at or below the configured 100 ms default.
+Signed/raw per-camera SR-PC remains a diagnostic series and persisted evidence; its absolute value
+cannot create FAILED, revoke VERIFIED, trigger Auto, or block a result. A robust three-SR median/MAD
+window tolerates one isolated SR outlier.
+
+`Frame timing CURRENT` requires same-logical-clock-epoch frame mapping. Time-dependent pairing
+accepts pairs at or below 100 ms and may drop an occasional unmatched/outlier candidate; it does not
+promise one output pair per source frame. `Media` independently reports decoded/video/MP4 truth, so
+Clock may remain VERIFIED while Frame timing or Media is unavailable.
+
+Live distance timing reports separate requested and effective bases. The default request is
+`APP RECEIVE`; `RTCP/NTP preferred` becomes effective only with VERIFIED/current same-epoch frame
+evidence. Missing, malformed, stale, transitioning, epoch-mismatched or over-limit RTCP timing
+activates exact app-receive fallback. The selected delta is at most 100 ms, both app/NTP deltas stay
+visible, and fallback alone does not degrade an otherwise valid distance or turn Clock green.
+
+Calibration Live/Auto timing also uses decoded-frame app-receive monotonic for its configurable
+`Max Live pair Δt`, but it reports `HOST_RECEIVE_PROXY` rather than precision/exposure verification.
+Missing/invalid receive evidence or an over-limit delta yields `INTRINSICS ONLY`; RTCP/NTP remains
+separately recorded and never replaces the missing app clock. FTP keeps its `HOST_DISPATCH_PROXY`.
+
+Calibration Auto candidacy separately reports `waiting for NAL1 non-delta` and `exact native
+FrameKey expired`. These are recoverable waiting states, not Camera failures. Only a type-1,
+non-delta AU whose exact PTS reaches the decoded frame can proceed; an evicted/wrong-generation key
+is never replaced by a neighbor. This state does not change Preview, YOLO, Measurement, recording,
+or manual capture status.
+
+## 15.2 Automatic Optical-Pose Suggestion
+
+Automatic suggestion quality and permission are separate dimensions. Horizon and Mountain show the
+detector state (`GOOD`, `LOW_CONFIDENCE`, or `NO_DATA`) unchanged and separately project
+`COPY READY` only after structural validation. Horizon requires current identity/dimensions,
+exactly two finite in-frame endpoints per side and 25%-width separation. Mountain requires current
+identity, paired exclusions, equal counts, minimum four and unique/distributed in-frame points.
+Otherwise `COPY BLOCKED` shows the structural reason. Low-quality `AUTO_ACCEPTED` provenance
+retains its original quality state and warning; acceptance never relabels it `GOOD`.
+
+## 15.3 Calibration Capture Feedback
+
+Calibration capture status is an additive read model owned by the Calibration controller. It keeps
+three independent dimensions visible: latest per-side checkerboard detection, current-process
+capture inspection outcomes, and persisted current-root inventory. A capture command or Auto timer
+tick is not success. The run request count advances only after the existing checkerboard validation
+worker is admitted; stereo/K,D-only/failure counts advance from its result. Root change or restart
+resets only the run counters.
+
+The persisted inventory uses the same pair-usage evidence as calculation input. Missing roots are
+valid `EMPTY` evidence with zero counts; unreadable roots are `UNAVAILABLE` with `--`, never false
+zero. `Stereo 저장 후보` is explicitly before manual exclusion and solver pose filtering. Preview
+evidence older than the existing two-second Auto freshness limit is `STALE`; found state always
+includes text/corner count and never relies on color alone. No capture-feedback state may promote
+calibration quality or Apply readiness.
 
 ## 16. Aggregate Status
 
