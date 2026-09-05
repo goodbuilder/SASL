@@ -2481,6 +2481,7 @@ class EvidenceAdapter:
                     "port": str(row.get("port", "") or ""),
                     "status": str(row.get("status", "") or ""),
                     "interface": str(getattr(interface, "name", "") or ""),
+                    "mac": str(getattr(interface, "mac", "") or ""),
                     "host_ip": str(row.get("host_ip", "") or ""),
                 }
             )
@@ -2502,15 +2503,7 @@ class EvidenceAdapter:
                 for name in ("camera_network_discovery_thread", "camera_auto_detect_thread")
             ),
             "status": str(getattr(self.panel, "workstation_camera_discovery_status", "NOT RUN") or "NOT RUN"),
-            "network_role_status": dict(
-                getattr(self.panel, "network_role_status", {}) or {}
-            ),
-            "network_role_active": getattr(self.panel, "network_role_operation", None) is not None,
-            "network_roles": {
-                role: dict(value or {})
-                for role, value in raw_network_roles.items()
-                if isinstance(value, Mapping)
-            },
+            **self._network_role_projection(raw_network_roles),
             "contract": "Network/RTSP/control endpoint metadata; no image coordinates or camera-frame values",
         }
 
@@ -2596,6 +2589,16 @@ class EvidenceAdapter:
                 }
                 for side in ("left", "right")
             },
+            **self._network_role_projection(raw_network_roles),
+            "contract": "Host/serial/MAVLink endpoint metadata; no attitude, position, or baseline values",
+        }
+
+    def _network_role_projection(
+        self, raw_network_roles: Mapping[str, object]
+    ) -> dict[str, object]:
+        """Network-role state shared by the camera and Pixhawk candidate evidence."""
+
+        return {
             "network_role_status": dict(
                 getattr(self.panel, "network_role_status", {}) or {}
             ),
@@ -2605,7 +2608,6 @@ class EvidenceAdapter:
                 for role, value in raw_network_roles.items()
                 if isinstance(value, Mapping)
             },
-            "contract": "Host/serial/MAVLink endpoint metadata; no attitude, position, or baseline values",
         }
 
     def pixhawk_recovery(self, side: str, *, now_s: float | None = None) -> dict[str, object]:

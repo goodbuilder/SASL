@@ -26,11 +26,8 @@ from Workstation.workstation_core.optical_pose_auto_select import (
     validate_horizon_suggestion_points,
     validate_mountain_suggestion_points,
 )
-from Workstation.workstation_core.network import (
-    candidate_has_stable_identity,
-    candidate_matches_stable_id,
-)
-from Workstation.workstation_core.pixhawk_attitude import MAVLINK_MAG_STREAMS
+from Workstation.workstation_core.network import candidate_network_role_labels
+from Workstation.workstation_core.pixhawk_attitude import MAVLINK_EXPECTED_SYSTEM_IDS
 from Workstation.workstation_core.runtime_camera_status import (
     decoder_presentation,
     format_camera_input_metrics,
@@ -143,6 +140,48 @@ def _display_signed_number(value: object, *, digits: int = 3, suffix: str = "") 
     if not math.isfinite(number):
         return "--"
     return f"{number:+.{digits}f}{suffix}"
+
+
+# Side -> column label for Pixhawk role columns; the sysid map is derived so
+# the labels can never drift from the MAVLink identity contract.
+_PIXHAWK_SIDE_LABELS = (("left", "P1"), ("right", "P2"), ("drone", "Drone"))
+_PIXHAWK_SYSTEM_ID_LABELS = {
+    MAVLINK_EXPECTED_SYSTEM_IDS[side]: label for side, label in _PIXHAWK_SIDE_LABELS
+}
+
+
+def _network_role_column_text(labels: Sequence[str]) -> str:
+    """Render the saved roles one NIC row satisfies for a candidate table."""
+
+    if len(labels) > 1:
+        return f"{', '.join(labels)} (shared NIC)"
+    return labels[0] if labels else "--"
+
+
+def _apply_network_role_discovery_status(
+    status_widget: object,
+    connection: Mapping[str, object],
+    *,
+    default_status: str = "NOT RUN",
+) -> tuple[str, str]:
+    """Show discovery status, overridden while a network-role operation runs.
+
+    Returns the role state and its detail so callers can add their own feedback.
+    """
+
+    role_status = connection.get("network_role_status")
+    role_status = role_status if isinstance(role_status, Mapping) else {}
+    role_state = str(role_status.get("state") or "IDLE")
+    detail = str(role_status.get("detail") or "")
+    discovery_status = str(connection.get("status", default_status) or default_status)
+    if role_state != "IDLE":
+        discovery_status = f"NETWORK ROLE {role_state}"
+    status_widget.set_value(
+        discovery_status,
+        source=detail if role_state != "IDLE" else "",
+        valid=False if discovery_status.startswith("ERROR") else None,
+    )
+    return role_state, detail
 
 
 def _display_compass_deg(value: object) -> str:
@@ -1772,38 +1811,21 @@ class CameraWorkspace(QtWidgets.QWidget):
             if button is not None:
                 button.setEnabled(camera_recovery_allowed and not rtsp_operation_active)
         connection = evidence.camera_connection_candidates()
-        role_status = connection.get("network_role_status")
-        role_status = role_status if isinstance(role_status, Mapping) else {}
-        role_state = str(role_status.get("state") or "IDLE")
         self._network_role_locked = bool(connection.get("network_role_active", False))
-        if role_state != "IDLE":
-            self.candidate_feedback.setText(
-                f"Network role: {role_state} · {role_status.get('detail', '')}"
-            )
-        camera_discovery_status = str(connection.get("status", "NOT RUN") or "NOT RUN")
-        if role_state != "IDLE":
-            camera_discovery_status = f"NETWORK ROLE {role_state}"
-        self.discovery_status.set_value(
-            camera_discovery_status,
-            source=str(role_status.get("detail") or "") if role_state != "IDLE" else "",
-            valid=False if camera_discovery_status.startswith("ERROR") else None,
+        role_state, role_detail = _apply_network_role_discovery_status(
+            self.discovery_status, connection
         )
+        if role_state != "IDLE":
+            self.candidate_feedback.setText(f"Network role: {role_state} · {role_detail}")
         candidates = connection.get("candidates")
         candidates = tuple(row for row in candidates if isinstance(row, dict)) if isinstance(candidates, (tuple, list)) else ()
         network_roles = connection.get("network_roles")
         network_roles = network_roles if isinstance(network_roles, Mapping) else {}
 
         def assigned_roles(row: Mapping[str, object]) -> str:
-            interface_name = str(row.get("interface") or "")
-            if not interface_name:
+            if not str(row.get("interface") or ""):
                 return "--"
-            labels = [
-                label
-                for role, label in (("camera", "Camera"), ("p1", "P1"), ("p2", "P2"))
-                if isinstance(network_roles.get(role), Mapping)
-                and str(network_roles[role].get("interface") or "") == interface_name
-            ]
-            return ",".join(labels) or "--"
+            return _network_role_column_text(candidate_network_role_labels(row, network_roles))
         candidate_signature = tuple(
             (
                 *tuple(
@@ -5085,16 +5107,10 @@ class PixhawkWorkspace(QtWidgets.QWidget):
                 baud.setValue(baud_value)
                 baud.blockSignals(blocked)
         connection = evidence.pixhawk_connection_candidates()
-        pixhawk_discovery_status = str(connection.get("status", "NOT RUN") or "NOT RUN")
-        role_status = connection.get("network_role_status")
-        role_status = role_status if isinstance(role_status, Mapping) else {}
-        role_state = str(role_status.get("state") or "IDLE")
-        if role_state != "IDLE":
-            pixhawk_discovery_status = f"NETWORK ROLE {role_state}"
-        self.discovery_status.set_value(
-            pixhawk_discovery_status,
-            source=str(role_status.get("detail") or "") if role_state != "IDLE" else "",
-            valid=False if pixhawk_discovery_status.startswith("ERROR") else None,
+        network_role_active = bool(connection.get("network_role_active", False))
+        self._network_role_locked = network_role_active
+        role_state, role_detail = _apply_network_role_discovery_status(
+            self.discovery_status, connection
         )
         candidates = connection.get("candidates")
         candidates = tuple(row for row in candidates if isinstance(row, dict)) if isinstance(candidates, (tuple, list)) else ()
@@ -5109,9 +5125,7 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         network_roles = connection.get("network_roles")
         network_roles = network_roles if isinstance(network_roles, Mapping) else {}
         if role_state != "IDLE":
-            self.candidate_feedback.setText(
-                f"Network role: {role_state} · {role_status.get('detail', '')}"
-            )
+            self.candidate_feedback.setText(f"Network role: {role_state} · {role_detail}")
         for side, label in (("left", "P1"), ("right", "P2")):
             assignment = assignments.get(side)
             assignment = assignment if isinstance(assignment, Mapping) else {}
@@ -5140,6 +5154,15 @@ class PixhawkWorkspace(QtWidgets.QWidget):
             values["endpoint"].set_value(endpoint_text or "--", source=source)
             values["route"].set_value(detail or "--", source=source, valid=valid)
 
+        # Role labels resolve serial symlinks; compute each once per tick and
+        # reuse it for both the change check and the rebuild.
+        saved_serial_keys = self._saved_serial_endpoint_keys(panel)
+        role_labels = tuple(
+            self._candidate_role_label(
+                row, panel, network_roles, saved_serial_keys=saved_serial_keys
+            )
+            for row in candidates
+        )
         candidate_signature = tuple(
             (*tuple(
                 row.get(key, "")
@@ -5162,13 +5185,13 @@ class PixhawkWorkspace(QtWidgets.QWidget):
                     "p1_endpoint",
                     "p2_endpoint",
                 )
-            ), self._candidate_role_label(row, panel, network_roles))
-            for row in candidates
+            ), role_label)
+            for row, role_label in zip(candidates, role_labels)
         )
         if candidate_signature != self._candidate_signature:
             selected = None if discovery_replaced else self._selected_candidate_identity()
             self.candidate_model.removeRows(0, self.candidate_model.rowCount())
-            for row in candidates:
+            for row, role_label in zip(candidates, role_labels):
                 source = str(row.get("source") or "")
                 if source == "network":
                     values = (
@@ -5176,7 +5199,7 @@ class PixhawkWorkspace(QtWidgets.QWidget):
                         row.get("interface", "--"),
                         row.get("carrier", "UNKNOWN"),
                         row.get("local_cidr", "--") or "--",
-                        self._candidate_role_label(row, panel, network_roles),
+                        role_label,
                     )
                 else:
                     kind = str(row.get("kind") or "")
@@ -5185,7 +5208,7 @@ class PixhawkWorkspace(QtWidgets.QWidget):
                         row.get("value", "--"),
                         "MAVLink" if kind == "USB" and row.get("system_id") is not None else kind or "--",
                         row.get("status", "--"),
-                        self._candidate_role_label(row, panel, network_roles),
+                        role_label,
                     )
                 _append_table_row(
                     self.candidate_model,
@@ -5204,8 +5227,6 @@ class PixhawkWorkspace(QtWidgets.QWidget):
                         self.candidate_table.selectRow(row_index)
                         break
         discovery_active = bool(connection.get("discovery_active", False))
-        network_role_active = bool(connection.get("network_role_active", False))
-        self._network_role_locked = network_role_active
         recording = snapshot.get("recording")
         self._recording_locked = recording is not None and recording.state in {"ACTIVE", "FINALIZING"}
         source_connection_allowed = not self._recording_locked or bool(
@@ -5907,34 +5928,27 @@ class PixhawkWorkspace(QtWidgets.QWidget):
             return text
 
     @classmethod
+    def _saved_serial_endpoint_keys(cls, panel: object) -> tuple[tuple[str, str], ...]:
+        """Resolve each side's saved serial device once for a whole refresh."""
+
+        return tuple(
+            (label, cls._serial_endpoint_key(getattr(panel, f"{side}_pixhawk_radio_device", "")))
+            for side, label in _PIXHAWK_SIDE_LABELS
+        )
+
+    @classmethod
     def _candidate_role_label(
         cls,
         candidate: Mapping[str, object],
         panel: object,
         network_roles: Mapping[str, object],
+        *,
+        saved_serial_keys: Sequence[tuple[str, str]] | None = None,
     ) -> str:
         if str(candidate.get("source") or "") == "network":
-            interface_name = str(candidate.get("interface") or "")
-            labels: list[str] = []
-            # A kernel name is not a NIC identity: the same USB adapter comes back
-            # as a different ifname across replug and reboot.  Match on the saved
-            # MAC whenever both sides carry one, and fall back to the name only
-            # for rows or roles recorded before that identity existed.
-            row_identified = candidate_has_stable_identity(candidate)
-            for role, label in (("camera", "Camera"), ("p1", "P1"), ("p2", "P2")):
-                entry = network_roles.get(role)
-                if not isinstance(entry, Mapping):
-                    continue
-                stable_id = str(entry.get("stable_id") or "").strip()
-                if stable_id and row_identified:
-                    if candidate_matches_stable_id(candidate, stable_id):
-                        labels.append(label)
-                    continue
-                if str(entry.get("interface") or "") == interface_name:
-                    labels.append(label)
-            if len(labels) > 1:
-                return f"{', '.join(labels)} (shared NIC)"
-            return labels[0] if labels else "--"
+            return _network_role_column_text(
+                candidate_network_role_labels(candidate, network_roles)
+            )
 
         if str(candidate.get("kind") or "") != "USB":
             return "--"
@@ -5943,20 +5957,15 @@ class PixhawkWorkspace(QtWidgets.QWidget):
             cls._serial_endpoint_key(candidate.get("resolved_device")),
         }
         candidate_keys.discard("")
-        saved_roles = [
-            label
-            for side, label in (("left", "P1"), ("right", "P2"), ("drone", "Drone"))
-            if cls._serial_endpoint_key(
-                getattr(panel, f"{side}_pixhawk_radio_device", "")
-            )
-            in candidate_keys
-        ]
+        if saved_serial_keys is None:
+            saved_serial_keys = cls._saved_serial_endpoint_keys(panel)
+        saved_roles = [label for label, key in saved_serial_keys if key and key in candidate_keys]
         system_id = candidate.get("system_id")
         try:
             observed_system_id = int(system_id) if system_id is not None else None
         except (TypeError, ValueError):
             observed_system_id = None
-        observed_role = {1: "P1", 2: "P2", 3: "Drone"}.get(observed_system_id)
+        observed_role = _PIXHAWK_SYSTEM_ID_LABELS.get(observed_system_id)
         if observed_system_id is not None:
             observed_text = (
                 f"{observed_role} (sysid {observed_system_id})"

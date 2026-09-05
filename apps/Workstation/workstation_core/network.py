@@ -34,12 +34,20 @@ NETWORK_ROLE_CAMERA = "camera"
 NETWORK_ROLE_P1 = "p1"
 NETWORK_ROLE_P2 = "p2"
 NETWORK_ROLE_ORDER = (NETWORK_ROLE_CAMERA, NETWORK_ROLE_P1, NETWORK_ROLE_P2)
+NETWORK_ROLE_LABELS = {
+    NETWORK_ROLE_CAMERA: "Camera",
+    NETWORK_ROLE_P1: "P1",
+    NETWORK_ROLE_P2: "P2",
+}
 
 
 @dataclass(frozen=True)
 class InterfaceCandidate:
     name: str
     address: IPv4Interface
+    # Hardware address so a saved role can follow the adapter across a kernel
+    # rename; empty for rows recorded before this identity existed.
+    mac: str = ""
 
 
 @dataclass(frozen=True)
@@ -480,7 +488,13 @@ def local_ipv4_interfaces(*, include_wireless: bool = False) -> list[InterfaceCa
         if _skip_interface(name, include_wireless=include_wireless):
             continue
         try:
-            candidates.append(InterfaceCandidate(name=name, address=ip_interface(parts[3])))
+            candidates.append(
+                InterfaceCandidate(
+                    name=name,
+                    address=ip_interface(parts[3]),
+                    mac=_interface_mac(name),
+                )
+            )
         except ValueError:
             continue
     return candidates
@@ -1502,6 +1516,14 @@ def _run_ip_json(args: list[str]) -> list[dict[str, object]]:
     return [row for row in payload if isinstance(row, dict)]
 
 
+def _interface_mac(interface_name: str) -> str:
+    mac_path = Path("/sys/class/net") / interface_name / "address"
+    try:
+        return mac_path.read_text(encoding="ascii").strip().lower()
+    except (OSError, UnicodeError):
+        return ""
+
+
 def _interface_carrier(interface_name: str, link: dict[str, object]) -> str:
     carrier_path = Path("/sys/class/net") / interface_name / "carrier"
     try:
@@ -1623,6 +1645,35 @@ def candidate_has_stable_identity(candidate: Mapping[str, object]) -> bool:
     return any(
         normalize_stable_id(candidate.get(key)) for key in ("mac", "device_path")
     )
+
+
+def candidate_network_role_labels(
+    candidate: Mapping[str, object],
+    network_roles: Mapping[str, object],
+) -> tuple[str, ...]:
+    """Labels of the saved network roles that one discovered NIC row satisfies.
+
+    A kernel name is not a NIC identity: the same USB adapter comes back as a
+    different ifname across replug and reboot.  Match on the saved stable id
+    whenever both sides carry one, and fall back to the name only for rows or
+    roles recorded before that identity existed.  Labels keep NETWORK_ROLE_ORDER.
+    """
+
+    interface_name = str(candidate.get("interface") or "")
+    row_identified = candidate_has_stable_identity(candidate)
+    labels: list[str] = []
+    for role in NETWORK_ROLE_ORDER:
+        entry = network_roles.get(role)
+        if not isinstance(entry, Mapping):
+            continue
+        stable_id = str(entry.get("stable_id") or "").strip()
+        if stable_id and row_identified:
+            if candidate_matches_stable_id(candidate, stable_id):
+                labels.append(NETWORK_ROLE_LABELS[role])
+            continue
+        if interface_name and str(entry.get("interface") or "") == interface_name:
+            labels.append(NETWORK_ROLE_LABELS[role])
+    return tuple(labels)
 
 
 def _global_ipv4_inventory() -> dict[str, list[IPv4Interface]]:
@@ -1860,7 +1911,11 @@ def _unconfigured_host_interface_candidates(
     for name in wired_interface_names():
         if name in configured_names:
             continue
-        candidates.append(HostInterfaceCandidate(interface=InterfaceCandidate(name=name, address=address)))
+        candidates.append(
+            HostInterfaceCandidate(
+                interface=InterfaceCandidate(name=name, address=address, mac=_interface_mac(name))
+            )
+        )
     return candidates
 
 

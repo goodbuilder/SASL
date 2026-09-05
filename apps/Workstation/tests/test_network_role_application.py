@@ -713,6 +713,108 @@ def test_workspaces_show_composed_roles_without_fixed_nic_count() -> None:
     window.pixhawk.refresh(snapshot)
 
     assert window.camera.candidate_model.columnCount() == 7
-    assert window.camera.candidate_model.item(0, 6).text() == "Camera,P1"
+    assert window.camera.candidate_model.item(0, 6).text() == "Camera, P1 (shared NIC)"
     assert window.pixhawk.candidate_model.item(0, 4).text() == "P2"
+    window.close()
+
+
+def test_camera_and_pixhawk_candidate_evidence_share_network_role_projection() -> None:
+    from Workstation.evidence import EvidenceAdapter
+
+    panel = SimpleNamespace(
+        network_role_assignments={
+            "camera": {"interface": "enx-a", "stable_id": "mac-a"},
+            "p1": {"interface": "enx-a", "stable_id": "mac-a"},
+            "p2": "not-a-mapping",
+        },
+        network_role_status={"state": "APPLYING", "detail": "bringing up enx-a"},
+        network_role_operation=object(),
+        _camera_candidate_rows=[],
+        _pixhawk_candidate_rows_by_source={},
+    )
+    keys = ("network_role_status", "network_role_active", "network_roles")
+
+    camera = EvidenceAdapter(panel).camera_connection_candidates()
+    pixhawk = EvidenceAdapter(panel).pixhawk_connection_candidates()
+
+    assert {key: camera[key] for key in keys} == {key: pixhawk[key] for key in keys}
+    assert camera["network_role_active"] is True
+    assert camera["network_roles"] == {
+        "camera": {"interface": "enx-a", "stable_id": "mac-a"},
+        "p1": {"interface": "enx-a", "stable_id": "mac-a"},
+    }
+
+
+def test_camera_candidate_evidence_projects_interface_mac() -> None:
+    from ipaddress import ip_interface
+
+    from Workstation.evidence import EvidenceAdapter
+    from Workstation.workstation_core.network import InterfaceCandidate
+
+    legacy = InterfaceCandidate(name="enx-a", address=ip_interface("10.0.0.11/32"))
+    assert legacy.mac == ""
+    panel = SimpleNamespace(
+        network_role_assignments={},
+        _camera_candidate_rows=[
+            {"kind": "NIC", "interface": legacy},
+            {
+                "kind": "NIC",
+                "interface": SimpleNamespace(
+                    name="enx-b", address="10.0.0.12/24", mac="AA:BB:CC:DD:EE:02"
+                ),
+            },
+        ],
+    )
+
+    rows = EvidenceAdapter(panel).camera_connection_candidates()["candidates"]
+
+    assert [(row["interface"], row["mac"]) for row in rows] == [
+        ("enx-a", ""),
+        ("enx-b", "AA:BB:CC:DD:EE:02"),
+    ]
+
+
+def test_camera_workspace_role_column_follows_saved_mac_across_rename() -> None:
+    from PyQt5 import QtWidgets
+    from Workstation.main_window import WorkstationMainWindow
+    from Workstation.tests.workstation_test_support import _FakeBackend
+
+    _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    backend.panel._camera_candidate_rows = [
+        {
+            "kind": "NIC",
+            "address": "enx-new",
+            "port": "",
+            "status": "UP",
+            "interface": SimpleNamespace(
+                name="enx-new", address="10.0.0.11/32", mac="aa:bb:cc:dd:ee:01"
+            ),
+            "host_ip": "10.0.0.11",
+        },
+        {
+            "kind": "NIC",
+            "address": "enx-old",
+            "port": "",
+            "status": "UP",
+            "interface": SimpleNamespace(
+                name="enx-old", address="10.0.0.12/32", mac="de:ad:be:ef:00:01"
+            ),
+            "host_ip": "10.0.0.12",
+        },
+    ]
+    backend.panel.network_role_assignments = {
+        "camera": {"interface": "enx-old", "stable_id": "aa:bb:cc:dd:ee:01"},
+        "p1": {"interface": "", "stable_id": ""},
+        "p2": {"interface": "", "stable_id": ""},
+    }
+    window = WorkstationMainWindow(backend=backend)
+    snapshot = window.status_adapter.model.snapshot()
+
+    window.camera.refresh(snapshot)
+
+    # The adapter was renamed enx-old -> enx-new; the saved MAC keeps the role
+    # on the same hardware and off the NIC that recycled the old name.
+    assert window.camera.candidate_model.item(0, 6).text() == "Camera"
+    assert window.camera.candidate_model.item(1, 6).text() == "--"
     window.close()

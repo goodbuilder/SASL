@@ -1171,3 +1171,74 @@ def test_pixhawk_workspace_role_column_falls_back_to_name_without_stable_id() ->
     row = {"source": "network", "interface": "enx-legacy", "mac": "00:11:22:33:44:55"}
 
     assert PixhawkWorkspace._candidate_role_label(row, None, network_roles) == "P1"
+
+
+def test_candidate_network_role_labels_follow_stable_id_then_name() -> None:
+    from Workstation.workstation_core.network import candidate_network_role_labels
+
+    network_roles = {
+        "camera": {"interface": "enx-old", "stable_id": "aa:bb:cc:dd:ee:ff"},
+        "p1": {"interface": "enx-old", "stable_id": "00:11:22:33:44:55"},
+        "p2": {"interface": "enx-legacy", "stable_id": ""},
+    }
+    renamed = {"source": "network", "interface": "enx-new", "mac": "00:11:22:33:44:55"}
+    recycled_name = {"source": "network", "interface": "enx-old", "mac": "de:ad:be:ef:00:01"}
+    legacy = {"source": "network", "interface": "enx-legacy", "mac": "de:ad:be:ef:00:02"}
+    shared = {"source": "network", "interface": "enx-old", "mac": "aa:bb:cc:dd:ee:ff"}
+    unidentified = {"source": "network", "interface": "enx-old"}
+
+    assert candidate_network_role_labels(renamed, network_roles) == ("P1",)
+    assert candidate_network_role_labels(recycled_name, network_roles) == ()
+    assert candidate_network_role_labels(legacy, network_roles) == ("P2",)
+    assert candidate_network_role_labels(shared, network_roles) == ("Camera",)
+    # A row without any identity can only be matched by name, in role order.
+    assert candidate_network_role_labels(unidentified, network_roles) == ("Camera", "P1")
+    assert candidate_network_role_labels({"interface": ""}, network_roles) == ()
+
+
+def test_pixhawk_workspace_network_role_column_matches_camera_format() -> None:
+    from Workstation.workspaces import PixhawkWorkspace
+
+    network_roles = {
+        "camera": {"interface": "enx-a", "stable_id": ""},
+        "p1": {"interface": "enx-a", "stable_id": ""},
+        "p2": {"interface": "", "stable_id": ""},
+    }
+    shared = {"source": "network", "interface": "enx-a"}
+    assert PixhawkWorkspace._candidate_role_label(shared, None, network_roles) == (
+        "Camera, P1 (shared NIC)"
+    )
+    assert PixhawkWorkspace._candidate_role_label(
+        {"source": "network", "interface": "enx-z"}, None, network_roles
+    ) == "--"
+
+
+def test_usb_candidate_role_label_accepts_precomputed_saved_keys(tmp_path) -> None:
+    from Workstation.workspaces import PixhawkWorkspace
+
+    resolved = tmp_path / "ttyUSB1"
+    resolved.touch()
+    stable = tmp_path / "p2-radio-by-id"
+    stable.symlink_to(resolved)
+    candidate = {
+        "source": "mavlink",
+        "kind": "USB",
+        "value": str(stable),
+        "resolved_device": str(resolved),
+        "system_id": 2,
+    }
+    panel = SimpleNamespace(
+        left_pixhawk_radio_device=str(stable),
+        right_pixhawk_radio_device=str(resolved),
+        drone_pixhawk_radio_device="",
+    )
+
+    saved_keys = PixhawkWorkspace._saved_serial_endpoint_keys(panel)
+    assert [label for label, _key in saved_keys] == ["P1", "P2", "Drone"]
+    assert saved_keys[2][1] == ""
+    assert PixhawkWorkspace._candidate_role_label(
+        candidate, panel, {}, saved_serial_keys=saved_keys
+    ) == PixhawkWorkspace._candidate_role_label(candidate, panel, {})
+    assert PixhawkWorkspace._candidate_role_label(candidate, panel, {}) == (
+        "P1, P2 saved · P2 (sysid 2)"
+    )
