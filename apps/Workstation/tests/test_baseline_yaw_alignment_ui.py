@@ -44,6 +44,21 @@ def _gps(side: str, *, timestamp_s: float, longitude_deg: float) -> GpsPositionS
     )
 
 
+def _restamp_samples(backend: _FakeBackend) -> float:
+    """Re-date the GNSS/ATTITUDE samples so a slow window build cannot age them past CURRENT."""
+
+    now_s = time.monotonic()
+    backend.panel.latest_gps = {
+        "left": _gps("left", timestamp_s=now_s - 0.02, longitude_deg=127.0),
+        "right": _gps("right", timestamp_s=now_s - 0.01, longitude_deg=127.00001),
+    }
+    backend.panel.latest_extrinsics = {
+        "left": _attitude("left", yaw_deg=0.0, timestamp_s=now_s - 0.01),
+        "right": _attitude("right", yaw_deg=100.0, timestamp_s=now_s - 0.02),
+    }
+    return now_s
+
+
 def _backend_with_alignment() -> tuple[_FakeBackend, float]:
     now_s = time.monotonic()
     backend = _FakeBackend()
@@ -139,6 +154,7 @@ def test_pixhawk_workspace_shows_separate_baseline_p1_and_baseline_p2_degrees() 
     backend, _now_s = _backend_with_alignment()
     window = WorkstationMainWindow(backend=backend)
     try:
+        _restamp_samples(backend)
         window.pixhawk.refresh({})
 
         assert window.pixhawk.baseline_yaw_status_label.text().startswith("CURRENT")
@@ -157,9 +173,10 @@ def test_pixhawk_workspace_shows_separate_baseline_p1_and_baseline_p2_degrees() 
 
 
 def test_pixhawk_workspace_keeps_p1_visible_when_p2_is_missing_or_stale() -> None:
-    backend, now_s = _backend_with_alignment()
+    backend, _now_s = _backend_with_alignment()
     window = WorkstationMainWindow(backend=backend)
     try:
+        now_s = _restamp_samples(backend)
         backend.panel.latest_extrinsics.pop("right")
         window.pixhawk.refresh({})
 

@@ -1,0 +1,29 @@
+{
+  "schema": "workstation-pixhawk-endpoint-snapshot-v1",
+  "captured_at": "2026-08-30T14:57:59+09:00",
+  "source_settings": "/home/moontaehyung/바탕화면/SASL-20260821/.local/workstation_data/stereo_distance_settings.json",
+  "side": "P1",
+  "pixhawk_host_address": "10.0.0.10",
+  "pixhawk_eth_ip": "10.0.0.2",
+  "mavlink_url": "udpin:0.0.0.0:14550",
+  "mavlink_baud": 57600,
+  "mavlink_interface": "enx0023a40a2e39",
+  "mavlink_local_address": "10.0.0.10",
+  "mavlink_interface_stable_id": "00:23:a4:0a:2e:39",
+  "bootstrap_url": "/dev/serial/by-id/usb-Auterion_PX4_FMU_v6X.x_0-if00",
+  "bootstrap_baud": 57600,
+  "mavlink_configure_streams": true,
+  "mavlink_stream_rate": 2000000,
+  "pixhawk_ethernet_mode": "mavlink",
+  "owned_addresses": [
+    "10.0.0.10/24"
+  ],
+  "owned_routes": [
+    "10.0.0.2/32 src=10.0.0.10",
+    "10.0.0.3/32 src=10.0.0.10"
+  ],
+  "capture_usb_device": "/dev/ttyACM1",
+  "capture_usb_by_path": "/dev/serial/by-path/pci-0000:00:14.0-usb-0:3:1.0",
+  "usb_identity_warning": "Both connected V6X devices report USB serial ID 0; by-id is not side-stable."
+}
+

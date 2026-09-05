@@ -1,0 +1,111 @@
+{
+  "schema": "workstation-pixhawk-ethernet-params-v1",
+  "captured_at": "2026-08-30T15:09:33+09:00",
+  "side": "P2",
+  "physical_assignment": "new P2 board",
+  "identity": {
+    "observed_mavlink_system_id": 1,
+    "mavlink_component_id": 1,
+    "px4_guid": "0006000000003837393834335109002d004a"
+  },
+  "parameter_storage": {
+    "used": 1175,
+    "total": 1912,
+    "file": "/fs/mtd_params",
+    "backup_file": "/fs/microsd/parameters_backup.bson",
+    "storage_elements": 62,
+    "storage_bytes": 512,
+    "custom_default_elements": 27,
+    "custom_default_bytes": 256,
+    "auto_save": true,
+    "last_auto_save_seconds": 27.676
+  },
+  "readback_method": "MAVLink PARAM_REQUEST_READ plus PX4 param show",
+  "parameters": {
+    "MAV_SYS_ID": {
+      "value": 1,
+      "param_type": "MAV_PARAM_TYPE_INT32",
+      "used": true,
+      "saved_marker": false
+    },
+    "MAV_2_BROADCAST": {
+      "value": 1,
+      "param_type": "MAV_PARAM_TYPE_INT32",
+      "used": true,
+      "saved_marker": false
+    },
+    "MAV_2_CONFIG": {
+      "value": 1000,
+      "param_type": "MAV_PARAM_TYPE_INT32",
+      "used": true,
+      "saved_marker": false
+    },
+    "MAV_2_FLOW_CTRL": {
+      "value": 2,
+      "param_type": "MAV_PARAM_TYPE_INT32",
+      "used": true,
+      "saved_marker": false
+    },
+    "MAV_2_FORWARD": {
+      "value": 0,
+      "param_type": "MAV_PARAM_TYPE_INT32",
+      "used": true,
+      "saved_marker": false
+    },
+    "MAV_2_MODE": {
+      "value": 0,
+      "param_type": "MAV_PARAM_TYPE_INT32",
+      "used": true,
+      "saved_marker": false
+    },
+    "MAV_2_RADIO_CTL": {
+      "value": 0,
+      "param_type": "MAV_PARAM_TYPE_INT32",
+      "used": true,
+      "saved_marker": false
+    },
+    "MAV_2_RATE": {
+      "value": 100000,
+      "param_type": "MAV_PARAM_TYPE_INT32",
+      "used": true,
+      "saved_marker": false
+    },
+    "MAV_2_REMOTE_PRT": {
+      "value": 14550,
+      "param_type": "MAV_PARAM_TYPE_INT32",
+      "used": true,
+      "saved_marker": false
+    },
+    "MAV_2_UDP_PRT": {
+      "value": 14550,
+      "param_type": "MAV_PARAM_TYPE_INT32",
+      "used": true,
+      "saved_marker": false
+    }
+  },
+  "differences_from_intended_p2": {
+    "MAV_SYS_ID": {
+      "actual": 1,
+      "intended": 2
+    },
+    "MAV_2_RATE": {
+      "actual": 100000,
+      "intended": 2000000
+    },
+    "MAV_2_REMOTE_PRT": {
+      "actual": 14550,
+      "intended": 14551
+    },
+    "MAV_2_UDP_PRT": {
+      "actual": 14550,
+      "intended": 14551
+    }
+  },
+  "bson_observation": {
+    "entries": 62,
+    "MAV_SYS_ID_explicitly_stored": false,
+    "MAV_2_RATE_explicitly_stored": false,
+    "SYS_AUTOSTART": 4001
+  }
+}
+

@@ -1,0 +1,61 @@
+Capture time: 2026-08-30T14:57:59+09:00
+
+ifconfig eth0
+eth0    Link encap:Ethernet HWaddr 1e:1e:b3:a4:ff:b5 at UP
+        inet addr:10.0.0.2 DRaddr:10.0.0.10 Mask:255.255.255.0
+
+mavlink status
+
+instance #0:
+    mavlink chan: #0
+    type: RADIO Link
+    flow control: ON
+    tx: 1090.8 B/s
+    txerr: 0.0 B/s
+    rx: 42.0 B/s
+    rx loss: 0.0%
+    FTP enabled: YES, TX enabled: YES
+    mode: Normal
+    Forwarding: On
+    MAVLink version: 2
+    transport protocol: serial (/dev/ttyS6 @57600)
+
+instance #1:
+    mavlink chan: #1
+    type: GENERIC LINK OR RADIO
+    flow control: OFF
+    tx: 2144.6 B/s
+    txerr: 0.0 B/s
+    tx rate mult: 1.000
+    tx rate max: 2000000 B/s
+    rx: 4289.2 B/s
+    rx loss: 125.5%
+    FTP enabled: YES, TX enabled: YES
+    mode: Normal
+    Forwarding: Off
+    MAVLink version: 2
+    transport protocol: UDP (14550, remote port: 14550)
+    Broadcast enabled: YES
+    ping last: 2.22 ms
+    ping mean: 1.93 ms
+    ping max: 3.08 ms
+    ping min: 0.92 ms
+    ping dropped packets: 0
+
+instance #2:
+    GCS heartbeat valid
+    mavlink chan: #2
+    type: USB CDC
+    flow control: OFF
+    tx: 22075.6 B/s
+    txerr: 0.0 B/s
+    tx rate mult: 1.000
+    tx rate max: 100000 B/s
+    rx: 21.0 B/s
+    rx loss: 1.6%
+    FTP enabled: YES, TX enabled: YES
+    mode: Onboard
+    Forwarding: On
+    MAVLink version: 2
+    transport protocol: serial (/dev/ttyACM0 @2000000)
+

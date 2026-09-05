@@ -1,0 +1,179 @@
+{
+  "schema": "workstation-pixhawk-firmware-reinstall-v1",
+  "side": "P1",
+  "captured_at": "2026-08-31T10:13:17+09:00",
+  "operator_approval": "Reinstall P1 firmware and verify USB-free Ethernet MAVLink recovery",
+  "preflight": {
+    "hardware_arch": "PX4_FMU_V6X",
+    "board_id": 53,
+    "system_id": 1,
+    "component_id": 1,
+    "px4_guid": "000600000000363633383433510600210026",
+    "px4_git_hash": "d6f12ad1c4f70ad3230afd7d86e971421e02fef4",
+    "px4_version": "1.17.0",
+    "armed": false,
+    "failsafe": false
+  },
+  "backups": [
+    {
+      "path": "parameters-backup-pre-flash-20260831T1003KST.bson",
+      "bytes": 2393,
+      "sha256": "31b2dbebf46bd7392e077fc8a86d1871d22ce2cbd98f74424e6abfcf5e2027fb",
+      "source": "/fs/microsd/parameters_backup.bson"
+    },
+    {
+      "path": "extras-pre-flash-20260831T1003KST.txt",
+      "bytes": 58,
+      "sha256": "9eed6b399310602180d00e2f70d6e39a6df6ebe43bd1205fc7ef3dfa233809e3",
+      "source": "/fs/microsd/etc/extras.txt"
+    }
+  ],
+  "firmware": {
+    "path": "../../firmware/stock/px4_fmu-v6x_default.px4",
+    "asset_bytes": 1824460,
+    "image_size": 1959920,
+    "image_maxsize": 1966080,
+    "board_id": 53,
+    "git_identity": "v1.17.0",
+    "git_hash": "d6f12ad1c4f70ad3230afd7d86e971421e02fef4",
+    "sha256": "8f2c42787163b71e00758205ab0bed9df1669fd26d7a9f42d6f995cbabba0d7f"
+  },
+  "uploader": {
+    "source": "https://raw.githubusercontent.com/PX4/PX4-Autopilot/v1.17.0/Tools/px_uploader.py",
+    "sha256": "5cae28e8ebb0cdb1c25035034afdb44b2fc09f3893c32d54f2a31e96e0ac144c",
+    "force_board_override": false,
+    "force_erase": false
+  },
+  "flash_result": {
+    "status": "PASS",
+    "bootloader_protocol_revision": 5,
+    "detected_board_id": 53,
+    "detected_board_revision": 0,
+    "chip_family": "STM32H7[4|5]x",
+    "chip_revision": "V",
+    "erase": "PASS",
+    "program": "PASS",
+    "verify": "PASS",
+    "reboot": "PASS",
+    "elapsed_s": 26.914
+  },
+  "postflight": {
+    "px4_version": "1.17.0",
+    "px4_git_hash": "d6f12ad1c4f70ad3230afd7d86e971421e02fef4",
+    "build_datetime": "May 13 2026 18:36:37",
+    "system_id": 1,
+    "mav_2_config": 1000,
+    "mav_2_mode": 0,
+    "mav_2_broadcast": 1,
+    "mav_2_rate": 2000000,
+    "mav_2_remote_port": 14550,
+    "mav_2_udp_port": 14550,
+    "network_ip": "10.0.0.2/24",
+    "network_router": "10.0.0.10",
+    "extras_sha256": "9eed6b399310602180d00e2f70d6e39a6df6ebe43bd1205fc7ef3dfa233809e3",
+    "parameters_used": 1178,
+    "parameters_total": 1912
+  },
+  "ethernet_verification": {
+    "status": "FAIL",
+    "pcap": "/tmp/p1-post-reflash-eth.pcap",
+    "pcap_bytes": 3264471,
+    "pcap_sha256": "dc5a32e406747b4d51f94bc552109b81c39ee58fbe975122125cc323b9050bab",
+    "capture_duration_s": 142.275,
+    "pre_usb_stream_enable": {
+      "duration_s": 89.049,
+      "heartbeat": 87,
+      "attitude": 1299,
+      "scaled_imu": 0,
+      "scaled_imu2": 0,
+      "scaled_imu3": 0
+    },
+    "arp_p1_requests": 90,
+    "arp_p1_replies": 0,
+    "arp_p2_requests": 5,
+    "arp_p2_replies": 5,
+    "host_commands_to_p1": 0,
+    "command_ack_from_p1": 0,
+    "conclusion": "Reinstalling the exact official stock image did not restore P1 board-side Ethernet RX. USB runtime stream activation is still required.",
+    "additional_diagnostics": {
+      "p1_arp_lookup_pc": "no such ARP entry",
+      "p1_static_arp_insert": "ioctl failed: Out of memory",
+      "p1_originated_ping": "sendto failed at seqno 0: errno 114",
+      "host_replied_to_p1_arp": true,
+      "p1_learned_host_arp": false,
+      "heap_free_bytes": 498080,
+      "largest_free_block_bytes": 420608,
+      "dma_bytes_used": 1024,
+      "dma_bytes_total": 5120,
+      "official_v6x_iob_nbuffers": 24,
+      "ethernet_mavlink_rx_rate_bytes_s": 4313.2,
+      "ethernet_mavlink_rx_loss_percent_reported": 126.9,
+      "ethernet_received_source": "self sysid=1/component=1 only",
+      "boot_ifup_count_observed": 2,
+      "multiple_netinit_tasks_observed": true,
+      "physical_damage_proven": false,
+      "remaining_hypotheses": [
+        "P1 PHY or board-level receive failure",
+        "NuttX IOB/ARP/network resource exhaustion",
+        "duplicate Ethernet initialization from netman plus extras.txt"
+      ]
+    }
+  },
+  "restored_state": {
+    "pcap": "/tmp/p1-post-reflash-restored.pcap",
+    "pcap_bytes": 33554,
+    "pcap_sha256": "d2dddfb054fb9cbcac795d8c0ab7c94565fd72dfea985ffeb81ef41e32a02d10",
+    "scaled_imu": 62,
+    "scaled_imu2": 62,
+    "scaled_imu3": 62,
+    "attitude": 46,
+    "heartbeat": 3,
+    "capture_duration_s": 4,
+    "transport": "Ethernet telemetry after verified USB runtime stream activation"
+  },
+  "post_reflash_attitude_gnss_soak": {
+    "status": "TRANSPORT_PASS_GNSS_NO_FIX",
+    "pcap": "/tmp/p1-post-reflash-attitude-gnss-10m.pcap",
+    "pcap_bytes": 3186079,
+    "pcap_sha256": "980461f489c9b04b0673c6b5f11737d31274edcd08fc266b1cac5e1063a38fbc",
+    "capture_duration_s": 619.397,
+    "tcpdump_kernel_drops": 0,
+    "mavlink2_packets": 32034,
+    "raw_sequence_duplicates": 0,
+    "raw_sequence_missing": 0,
+    "raw_sequence_reordered": 0,
+    "heartbeat": {
+      "count": 619,
+      "rate_hz": 1.0,
+      "max_gap_s": 1.0037
+    },
+    "attitude": {
+      "count": 9292,
+      "rate_hz": 15.0,
+      "max_gap_s": 0.0715,
+      "ui_state": "LIVE"
+    },
+    "gps_raw_int": {
+      "count": 3097,
+      "rate_hz": 5.0,
+      "max_gap_s": 0.2044,
+      "fix_type": 0,
+      "satellites_visible": 0,
+      "latitude": 0,
+      "longitude": 0
+    },
+    "gps2_raw": {
+      "count": 620,
+      "rate_hz": 1.0,
+      "max_gap_s": 1.0029,
+      "fix_type": 0,
+      "satellites_visible": 0,
+      "latitude": 0,
+      "longitude": 0
+    },
+    "ui_checkpoints": 21,
+    "ui_checkpoint_failures": 0,
+    "all_rx_stalls": 0,
+    "interpretation": "P1 Ethernet outbound ATTITUDE and GNSS message transport is stable for ten minutes. GNSS solution content is not valid because both receivers report NO_FIX with zero satellites. P1 Ethernet inbound ARP/GCS/RTCM remains failed."
+  }
+}

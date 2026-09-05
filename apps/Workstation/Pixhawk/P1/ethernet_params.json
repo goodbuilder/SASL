@@ -1,0 +1,90 @@
+{
+  "schema": "workstation-pixhawk-ethernet-params-v1",
+  "captured_at": "2026-08-30T14:57:59+09:00",
+  "side": "P1",
+  "identity": {
+    "mavlink_system_id": 1,
+    "mavlink_component_id": 1,
+    "px4_guid": "000600000000363633383433510600210026"
+  },
+  "parameter_storage": {
+    "used": 1178,
+    "total": 1912,
+    "file": "/fs/mtd_params",
+    "backup_file": "/fs/microsd/parameters_backup.bson",
+    "storage_elements": 109,
+    "storage_bytes": 896,
+    "custom_default_elements": 27,
+    "custom_default_bytes": 256,
+    "auto_save": true,
+    "last_auto_save_seconds": 234.842
+  },
+  "symbol_legend": {
+    "used": "PX4 param show marker x",
+    "saved_marker": "PX4 param show marker +",
+    "unsaved_marker": "PX4 param show marker *"
+  },
+  "parameters": {
+    "MAV_SYS_ID": {
+      "value": 1,
+      "used": true,
+      "saved_marker": false,
+      "unsaved_marker": false
+    },
+    "MAV_2_BROADCAST": {
+      "value": 1,
+      "used": true,
+      "saved_marker": false,
+      "unsaved_marker": false
+    },
+    "MAV_2_CONFIG": {
+      "value": 1000,
+      "used": true,
+      "saved_marker": false,
+      "unsaved_marker": false
+    },
+    "MAV_2_FLOW_CTRL": {
+      "value": 2,
+      "used": true,
+      "saved_marker": false,
+      "unsaved_marker": false
+    },
+    "MAV_2_FORWARD": {
+      "value": 0,
+      "used": true,
+      "saved_marker": false,
+      "unsaved_marker": false
+    },
+    "MAV_2_MODE": {
+      "value": 0,
+      "used": true,
+      "saved_marker": false,
+      "unsaved_marker": false
+    },
+    "MAV_2_RADIO_CTL": {
+      "value": 0,
+      "used": true,
+      "saved_marker": false,
+      "unsaved_marker": false
+    },
+    "MAV_2_RATE": {
+      "value": 2000000,
+      "used": true,
+      "saved_marker": true,
+      "unsaved_marker": false
+    },
+    "MAV_2_REMOTE_PRT": {
+      "value": 14550,
+      "used": true,
+      "saved_marker": false,
+      "unsaved_marker": false
+    },
+    "MAV_2_UDP_PRT": {
+      "value": 14550,
+      "used": true,
+      "saved_marker": false,
+      "unsaved_marker": false
+    }
+  }
+}
+

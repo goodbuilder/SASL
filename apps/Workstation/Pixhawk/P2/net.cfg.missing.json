@@ -1,0 +1,12 @@
+{
+  "schema": "workstation-pixhawk-file-readback-v1",
+  "captured_at": "2026-08-30T15:06:13+09:00",
+  "side": "P2",
+  "remote_path": "/fs/microsd/net.cfg",
+  "status": "written-and-verified-before-reboot-missing-after-reboot",
+  "pre_reboot_bytes": 84,
+  "pre_reboot_sha256": "77c9c6dfbaf3af110ab51c69e22b5731f63111f7a2d2933b3df2de326b6bfffc",
+  "post_reboot_mavftp_error": "FileNotFound",
+  "generated_replacement": true,
+  "proposed_replacement": "proposed/net.cfg"
+}

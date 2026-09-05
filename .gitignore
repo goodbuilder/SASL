@@ -46,6 +46,7 @@ apps/Simulation/PX4-Autopilot/
 
 # Large generated experiment/runtime outputs
 workstation_data/
+recordings/
 StereoWIRIS/recordings/**
 !StereoWIRIS/recordings/
 !StereoWIRIS/recordings/README.md
@@ -86,6 +87,9 @@ perf.data
 *.onnx
 *.engine
 ref/yolo_models/
+apps/Workstation/models/
+*.pcap
+apps/Workstation/crash.log
 
 # Captured calibration/raw media. Keep derived JSON calibration files tracked.
 StereoDistance/calibration_captures/left/
