@@ -22,6 +22,7 @@ from .navigation import NavigationTree, canonical_context_id
 from .optical_pose_workers import OpticalPoseAutoSelectWorker
 from .settings_workspace import SettingsWorkspace
 from .status_model import BackendStatusAdapter, RuntimeStatus
+from Workstation.workstation_core.mavlink_liveness import MAVLINK_QUALIFICATION_S
 from Workstation.workstation_core.px4_calibration_groups import PX4_CALIBRATION_GROUPS
 from .workspaces import (
     AlignmentWorkspace,
@@ -268,14 +269,16 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             (
                 "pixhawk.recover_eth_mavlink.p1",
                 "Recover P1 via USB",
-                "For a confirmed P1 ETH RX stall, revalidate a unique USB heartbeat sysid=1, ask for confirmation, reboot only P1, then require 1-minute requalification.",
+                "For a confirmed P1 ETH RX stall, revalidate a unique USB heartbeat sysid=1, ask for confirmation, reboot only P1, "
+                f"then require {MAVLINK_QUALIFICATION_S:.0f}-second requalification.",
                 "device",
                 lambda: self._pixhawk_recover_eth_mavlink("left"),
             ),
             (
                 "pixhawk.recover_eth_mavlink.p2",
                 "Recover P2 via USB",
-                "For a confirmed P2 ETH RX stall, revalidate a unique USB heartbeat sysid=2, ask for confirmation, reboot only P2, then require 1-minute requalification.",
+                "For a confirmed P2 ETH RX stall, revalidate a unique USB heartbeat sysid=2, ask for confirmation, reboot only P2, "
+                f"then require {MAVLINK_QUALIFICATION_S:.0f}-second requalification.",
                 "device",
                 lambda: self._pixhawk_recover_eth_mavlink("right"),
             ),

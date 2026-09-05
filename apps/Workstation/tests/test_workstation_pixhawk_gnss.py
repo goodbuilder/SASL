@@ -4385,7 +4385,21 @@ def test_pixhawk_recovery_evidence_separates_usb_control_and_attitude() -> None:
     assert recovery["attitude_state"] == "OK"
     assert recovery["mavlink_endpoint"] == "udpin:0.0.0.0:14550"
     assert recovery["usb_system_id"] == 1
-    assert "1-minute qualification" in str(recovery["contract"])
+    assert "10-second qualification" in str(recovery["contract"])
+    assert recovery["qualification_required_s"] == 10.0
+
+    # The wording follows the health-owned duration, never a literal.
+    panel.mavlink_pixhawk.mavlink_health_snapshot = lambda _side, **_kwargs: SimpleNamespace(
+        state=SimpleNamespace(value="LIVE"),
+        listener_open=True,
+        heartbeat_rx_age_s=0.1,
+        attitude_rx_age_s=0.1,
+        qualification_elapsed_s=65.0,
+        qualification_required_s=65.0,
+    )
+    recovery = EvidenceAdapter(panel).pixhawk_recovery("left", now_s=100.0)
+    assert recovery["qualification_required_s"] == 65.0
+    assert "65-second qualification" in str(recovery["contract"])
 
     left_baud.deleteLater()
     panel.left_pixhawk_bootstrap_url_edit.deleteLater()

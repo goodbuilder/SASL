@@ -37,6 +37,7 @@ from Workstation.workstation_core.magnetometer_yaw import (
     calibrated_magnetometer_yaw_deg,
     project_magnetometer_yaw,
 )
+from Workstation.workstation_core.mavlink_liveness import MAVLINK_QUALIFICATION_S
 from Workstation.workstation_core.pixhawk_attitude import (
     MAVLINK_ATTITUDE_STALE_S,
     MAVLINK_IMU_STREAM_STALE_S,
@@ -2642,6 +2643,10 @@ class EvidenceAdapter:
             if health is not None
             else ""
         )
+        qualification_required_s = float(
+            getattr(health, "qualification_required_s", None) or MAVLINK_QUALIFICATION_S
+        )
+        qualification_text = f"{qualification_required_s:.0f}초"
         if not active and state == "COMMAND_SENT" and health_state == "RECOVERING":
             state = "QUALIFYING"
         elif not active and state in {"COMMAND_SENT", "QUALIFYING"} and health_state == "LIVE":
@@ -2685,8 +2690,8 @@ class EvidenceAdapter:
                 "IDLE": "대기",
                 "RUNNING": "USB identity 재검증 및 one-shot reboot 진행 중",
                 "COMMAND_SENT": "USB reboot command 전송; Ethernet packet 재개 대기",
-                "QUALIFYING": "Ethernet packet 재개; 1분 qualification 진행 중",
-                "RECOVERED": "1분 qualification 통과",
+                "QUALIFYING": f"Ethernet packet 재개; {qualification_text} qualification 진행 중",
+                "RECOVERED": f"{qualification_text} qualification 통과",
                 "CANCELLED": "operator 취소",
                 "ERROR": "결과 없음",
             }.get(state, "결과 없음")
@@ -2708,9 +2713,10 @@ class EvidenceAdapter:
             "mavlink_endpoint": str(provenance.get("mavlink_endpoint", "") or ""),
             "liveness_state": health_state,
             "qualification_elapsed_s": _number(getattr(health, "qualification_elapsed_s", None)),
+            "qualification_required_s": qualification_required_s,
             "contract": (
                 "unique current USB heartbeat sysid + operator confirmation + one-shot reboot; "
-                "success requires Ethernet HB/ATT 1-minute qualification"
+                f"success requires Ethernet HB/ATT {qualification_required_s:.0f}-second qualification"
             ),
         }
 

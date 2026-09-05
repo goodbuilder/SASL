@@ -1321,7 +1321,7 @@ Its candidate rows are transient and read-only. The selected URL keeps the exist
   no older than 30 seconds, asks the operator to confirm the side/device/sysid, and revalidates it in
   the one-shot worker before sending reboot. Missing, stale, duplicate, or changed identity; active
   Measurement/recording/save/finalization; or another PX4 command fails closed. USB command send is
-  not success: Ethernet must enter `RECOVERING` and complete a fresh 1-minute qualification.
+  not success: Ethernet must enter `RECOVERING` and complete a fresh 10-second qualification.
 - Treat the Pixhawk Discovery table as the result of the most recent accepted `Find USB` or
   `Find network` command, not as accumulated history. A second click while another Pixhawk
   Discovery worker is active is rejected without clearing the in-progress snapshot. Empty/error
@@ -2189,7 +2189,7 @@ live-caster + three-Pixhawk operation still requires a field soak test before qu
 For this Ethernet MAVLink mitigation specifically, software tests are insufficient for a resolved
 claim. Required hardware evidence is three independent cold boots with at least 10 minutes each,
 one dual-P1/P2 60-minute full-load soak with RTCM and normal Workstation load, symmetric one-side
-isolation, and verified-USB recovery followed by a 1-minute product requalification plus at least
+isolation, and verified-USB recovery followed by a 10-second product requalification plus at least
 10 minutes of post-reboot observation. Until all of those pass, do not describe the field issue as
 resolved or update `Pixhawk.md` with a remedy.
 The two camera decoder child processes may still consume substantial CPU while Preview is active;

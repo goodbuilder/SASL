@@ -51,6 +51,7 @@ from Workstation.workstation_core.network import (
     rtsp_host_port,
     validate_pixhawk_network_assignment,
 )
+from Workstation.workstation_core.mavlink_liveness import MAVLINK_QUALIFICATION_S
 from Workstation.workstation_core.pixhawk_attitude import (
     DualPixhawkMavlinkSubscriber,
     USB_MAVLINK_IDENTITY_MAX_AGE_S,
@@ -2531,7 +2532,8 @@ class DeviceRuntimeController:
                 f"USB: {device}\n"
                 f"MAVLink identity: sysid={expected_system_id}, compid={component_id}\n"
                 "이 USB identity를 worker가 즉시 다시 검증한 뒤 해당 Pixhawk에만 재부팅 명령을 보냅니다.\n"
-                "명령 전송은 복구 성공이 아니며 Ethernet heartbeat+ATTITUDE 10분 검증을 다시 시작합니다.\n\n"
+                "명령 전송은 복구 성공이 아니며 Ethernet heartbeat+ATTITUDE "
+                f"{MAVLINK_QUALIFICATION_S:.0f}초 검증을 다시 시작합니다.\n\n"
                 "계속할까요?"
             ),
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
@@ -2579,7 +2581,7 @@ class DeviceRuntimeController:
         label = self.panel._px4_mag_camera_label(camera)
         detail = (
             f"USB reboot command sent to sysid={data.get('system_id')} via {data.get('device')}; "
-            "Ethernet expected-sysid packet 재개 및 1분 qualification 대기"
+            f"Ethernet expected-sysid packet 재개 및 {MAVLINK_QUALIFICATION_S:.0f}초 qualification 대기"
         )
         self._set_pixhawk_usb_recovery_status(camera, "COMMAND_SENT", detail)
         self.panel._log(
