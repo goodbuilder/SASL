@@ -61,7 +61,9 @@ from Workstation.workstation_core.theme import (
 from Workstation.workstation_core.stereo import DetectionObservation
 from Workstation.workstation_core.settings import (
     DEFAULT_CALIBRATION_ROOT,
+    PIXHAWK_SERIAL_TRANSPORTS,
     normalize_pixhawk_gnss_source,
+    normalize_pixhawk_transport,
 )
 from Workstation.workstation_core.calibration_selection import (
     CALIBRATION_IMAGE_SUFFIXES,
@@ -4911,8 +4913,8 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         layout.addWidget(group)
 
     def _set_transport(self, side: str, combo: QtWidgets.QComboBox) -> None:
-        transport = str(combo.currentData() or "radio")
-        serial_selected = transport in {"radio", "usb"}
+        transport = normalize_pixhawk_transport(combo.currentData())
+        serial_selected = transport in PIXHAWK_SERIAL_TRANSPORTS
         self.radio_device_edits[side].setEnabled(serial_selected)
         self.radio_baud_spins[side].setEnabled(serial_selected)
         setter = getattr(self.backend, "set_pixhawk_transport", None)
@@ -5243,7 +5245,10 @@ class PixhawkWorkspace(QtWidgets.QWidget):
             self.role_disconnect_buttons[side].setEnabled(
                 source_connection_allowed and side_connected
             )
-            serial_selected = str(self.transport_combos[side].currentData()) in {"radio", "usb"}
+            serial_selected = (
+                normalize_pixhawk_transport(self.transport_combos[side].currentData())
+                in PIXHAWK_SERIAL_TRANSPORTS
+            )
             self.transport_combos[side].setEnabled(
                 not side_connected
             )
@@ -6261,11 +6266,13 @@ class TelemetryWorkspace(QtWidgets.QWidget):
         self.transport_combo.addItem("Drone Telemetry Radio", "radio")
         self.transport_combo.addItem("Ethernet", "ethernet")
         self.transport_combo.addItem("USB", "usb")
-        transport = str(defaults.get("drone_pixhawk_transport", "radio") or "radio").strip().lower()
+        transport = normalize_pixhawk_transport(defaults.get("drone_pixhawk_transport"))
         self.transport_combo.setCurrentIndex(max(0, self.transport_combo.findData(transport)))
-        self.transport_combo.currentIndexChanged.connect(
-            lambda _index: self._refresh_transport_fields()
-        )
+        # An operator's transport choice is only pushed to the backend on
+        # Configure/Connect/Save, so refresh() must not snap the combo back to
+        # the backend's last-applied transport in the meantime.
+        self._transport_dirty = False
+        self.transport_combo.currentIndexChanged.connect(self._on_transport_changed)
         self.serial_device_edit = QtWidgets.QLineEdit(
             str(
                 defaults.get(
@@ -6517,7 +6524,7 @@ class TelemetryWorkspace(QtWidgets.QWidget):
 
     def payload(self) -> dict[str, object]:
         return {
-            "drone_pixhawk_transport": str(self.transport_combo.currentData() or "radio"),
+            "drone_pixhawk_transport": normalize_pixhawk_transport(self.transport_combo.currentData()),
             "drone_telemetry_url": self.endpoint_edit.text().strip(),
             "drone_telemetry_baud": int(self.baud_spin.value()),
             "drone_pixhawk_serial_device": self.serial_device_edit.text().strip(),
@@ -6526,21 +6533,29 @@ class TelemetryWorkspace(QtWidgets.QWidget):
             "drone_telemetry_rtcm_forward": bool(self.forward_rtcm_checkbox.isChecked()),
         }
 
+    def _serial_transport_selected(self) -> bool:
+        return normalize_pixhawk_transport(self.transport_combo.currentData()) in PIXHAWK_SERIAL_TRANSPORTS
+
+    def _on_transport_changed(self, _index: int) -> None:
+        self._transport_dirty = True
+        self._refresh_transport_fields()
+
     def _refresh_transport_fields(self) -> None:
         """Show only the endpoint field the selected transport actually opens."""
 
-        transport = str(self.transport_combo.currentData() or "radio")
-        serial_selected = transport in {"radio", "usb"}
+        serial_selected = self._serial_transport_selected()
         self.endpoint_edit.setEnabled(not serial_selected)
         self.serial_device_edit.setEnabled(serial_selected)
 
     def accept_endpoint(self, result: object) -> None:
         data = dict(result) if isinstance(result, Mapping) else {}
-        serial_selected = str(self.transport_combo.currentData() or "radio") in {"radio", "usb"}
-        target_edit = self.serial_device_edit if serial_selected else self.endpoint_edit
+        target_edit = (
+            self.serial_device_edit if self._serial_transport_selected() else self.endpoint_edit
+        )
         endpoint = str(data.get("endpoint") or target_edit.text()).strip()
         target_edit.setText(endpoint)
         self._endpoint_dirty = False
+        self._transport_dirty = False
 
     def set_candidate_endpoint(self, result: object) -> None:
         data = dict(result) if isinstance(result, Mapping) else {}
@@ -6575,21 +6590,29 @@ class TelemetryWorkspace(QtWidgets.QWidget):
         if not data:
             data = self._settings_snapshot()
         endpoint = str(data.get("endpoint", data.get("drone_telemetry_url", "")) or "")
-        # A snapshot without a transport key predates the selector; the MAVLink
-        # URL field was the only endpoint then, so keep routing there.
-        transport = str(data.get("transport", data.get("drone_pixhawk_transport", "ethernet")) or "ethernet")
+        transport = normalize_pixhawk_transport(
+            data.get("transport", data.get("drone_pixhawk_transport"))
+        )
         transport_index = self.transport_combo.findData(transport)
-        if transport_index >= 0 and not self.transport_combo.hasFocus():
+        # Keyboard focus alone is not an edit: the combo is the first widget in
+        # tab order and holds focus right after the page is shown. Only an
+        # operator change (the dirty flag) keeps the backend value out.
+        if (
+            transport_index >= 0
+            and transport_index != self.transport_combo.currentIndex()
+            and not self._transport_dirty
+        ):
             blocked = self.transport_combo.blockSignals(True)
             self.transport_combo.setCurrentIndex(transport_index)
             self.transport_combo.blockSignals(blocked)
-        # The snapshot reports the endpoint of the active transport, so route it
-        # to whichever field that transport is edited in.
-        serial_selected = transport in {"radio", "usb"}
+        # The snapshot reports the endpoint of the backend's active transport;
+        # only route it into the field the operator is currently editing for.
+        serial_selected = self._serial_transport_selected()
         target_edit = self.serial_device_edit if serial_selected else self.endpoint_edit
         if (
             endpoint
             and not self._endpoint_dirty
+            and not self._transport_dirty
             and not target_edit.hasFocus()
             and target_edit.text() != endpoint
         ):
@@ -6616,15 +6639,7 @@ class TelemetryWorkspace(QtWidgets.QWidget):
         connection_active = state in {"CONNECTING", "CONNECTED", "LIVE"}
         usb_discovery_active = bool(data.get("usb_discovery_active"))
         network_discovery_active = bool(data.get("network_discovery_active"))
-        for widget in (
-            self.transport_combo,
-            self.baud_spin,
-            self.rtcm_source_combo,
-            self.forward_rtcm_checkbox,
-        ):
-            widget.setEnabled(True)
-        self.endpoint_edit.setEnabled(not serial_selected)
-        self.serial_device_edit.setEnabled(serial_selected)
+        self._refresh_transport_fields()
         self.operation_buttons["telemetry.connect"].setEnabled(
             self._invoke_command_available and not connection_active
         )

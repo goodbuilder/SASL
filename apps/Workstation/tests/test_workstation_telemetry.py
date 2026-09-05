@@ -328,6 +328,7 @@ def test_gnss_baseline_center_live_states_keep_geometry_focus_and_scroll_stable(
         "frame": "gnss_baseline_center_local_level_frd",
     }
     snapshot = {
+        "transport": "ethernet",
         "connection_state": "DISCONNECTED",
         "gnss_baseline_center_frd": geometry,
     }
@@ -401,6 +402,7 @@ def test_gnss_baseline_center_live_states_keep_geometry_focus_and_scroll_stable(
 def test_telemetry_refresh_preserves_dirty_url_until_apply_accepts_it() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     snapshot = {
+        "transport": "ethernet",
         "endpoint": "udpin:0.0.0.0:14552",
         "connection_state": "DISCONNECTED",
         "network_candidates": (),
@@ -465,3 +467,70 @@ def test_telemetry_network_candidate_requires_selection_and_fills_url_dirty() ->
     workspace.set_candidate_endpoint({"endpoint": "udpin:0.0.0.0:14551"})
     assert workspace.endpoint_edit.text() == "udpin:0.0.0.0:14551"
     assert workspace._endpoint_dirty
+
+
+def test_telemetry_refresh_keeps_operator_transport_until_backend_accepts_it() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    snapshot = {
+        "transport": "radio",
+        "endpoint": "/dev/serial/by-id/drone-radio",
+        "connection_state": "DISCONNECTED",
+        "network_candidates": (),
+    }
+
+    class Backend:
+        def drone_telemetry_snapshot(self):
+            return snapshot
+
+        def workstation_settings_snapshot(self):
+            return {}
+
+    workspace = TelemetryWorkspace(Backend(), lambda _command_id: True)
+    workspace.refresh({})
+    assert workspace.transport_combo.currentData() == "radio"
+    assert workspace.serial_device_edit.text() == "/dev/serial/by-id/drone-radio"
+
+    # The operator picks USB; the backend still reports radio until Configure/
+    # Connect/Save pushes the payload, so a refresh must not snap it back.
+    workspace.transport_combo.setCurrentIndex(workspace.transport_combo.findData("usb"))
+    app.processEvents()
+    workspace.serial_device_edit.setText("/dev/ttyACM2")
+    workspace.refresh({})
+    assert workspace.transport_combo.currentData() == "usb"
+    assert workspace.serial_device_edit.isEnabled()
+    assert not workspace.endpoint_edit.isEnabled()
+    assert workspace.serial_device_edit.text() == "/dev/ttyACM2"
+    assert workspace.payload()["drone_pixhawk_transport"] == "usb"
+
+    # Once the backend accepted the change, refresh follows the backend again.
+    snapshot["transport"] = "usb"
+    snapshot["endpoint"] = "/dev/ttyACM2"
+    workspace.accept_endpoint(snapshot)
+    snapshot["transport"] = "ethernet"
+    snapshot["endpoint"] = "udpin:0.0.0.0:14552"
+    workspace.refresh({})
+    assert workspace.transport_combo.currentData() == "ethernet"
+    assert workspace.endpoint_edit.isEnabled()
+    assert workspace.endpoint_edit.text() == "udpin:0.0.0.0:14552"
+
+
+def test_telemetry_refresh_without_transport_key_defaults_to_radio() -> None:
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    snapshot = {
+        "endpoint": "/dev/serial/by-id/drone-radio",
+        "connection_state": "DISCONNECTED",
+        "network_candidates": (),
+    }
+
+    class Backend:
+        def drone_telemetry_snapshot(self):
+            return snapshot
+
+        def workstation_settings_snapshot(self):
+            return {}
+
+    workspace = TelemetryWorkspace(Backend(), lambda _command_id: True)
+    workspace.refresh({})
+    assert workspace.transport_combo.currentData() == "radio"
+    assert workspace.serial_device_edit.isEnabled()
+    assert workspace.serial_device_edit.text() == "/dev/serial/by-id/drone-radio"
