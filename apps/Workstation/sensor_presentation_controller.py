@@ -167,7 +167,7 @@ class SensorPresentationController:
         raw_vel = getattr(raw, "vel", None) if raw is not None else None
         ground_speed_m_s = None if raw_vel in (None, 65535) else float(raw_vel) * 0.01
         raw_yaw = getattr(raw, "yaw", None) if raw is not None else None
-        gps_yaw_deg = None if raw_yaw in (None, 0, 65535) else float(raw_yaw) * 0.01
+        gps_yaw_deg = None if raw_yaw in (None, 65535) else float(raw_yaw) * 0.01
         raw_hdg_acc = getattr(raw, "hdg_acc", None) if raw is not None else None
         heading_accuracy_deg = (
             None if raw_hdg_acc in (None, 0, 65535) else float(raw_hdg_acc) * 1e-5

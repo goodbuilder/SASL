@@ -27,7 +27,9 @@ from typing import Any, Mapping
 
 from Workstation.workstation_core.strict_jsonl import (
     append_jsonl_record,
+    fsync_directory as _fsync_directory,
     prepare_jsonl_append,
+    sha256_file,
 )
 
 
@@ -77,17 +79,6 @@ def canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-
-
-def sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        while True:
-            chunk = handle.read(chunk_size)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -290,30 +281,37 @@ class RunEvidenceLedger:
                 "snapshot_policy": "reference_by_hash",
             }
         )
-        existing = self._existing_registered_artifact(
-            role=role_text,
-            relative_path=relative,
-            sha256=sha256,
-        )
-        if existing is not None:
-            return existing
-        record = ArtifactRecord(
-            artifact_id=str(uuid.uuid4()),
-            role=role_text,
-            relative_path=relative,
-            size_bytes=size,
-            sha256=sha256,
-            source_name=source.name,
-            media_type=str(media_type),
-            imported_utc_ns=time.time_ns(),
-            metadata=tuple(sorted(normalized_metadata.items())),
-        )
-        self._record_artifact(
-            record,
-            "artifact_registered",
-            source="RunEvidenceLedger.register_session_artifact",
-        )
-        return record
+        # The dedup check and the append it guards must be atomic under the
+        # same lock: otherwise two concurrent callers registering the same
+        # file can both miss each other's not-yet-written record and both
+        # append duplicate entries. ``_record_artifact`` (via
+        # ``_append_json_line``) reacquires ``_write_lock`` internally, which
+        # is safe because it is an ``RLock``.
+        with self._write_lock:
+            existing = self._existing_registered_artifact(
+                role=role_text,
+                relative_path=relative,
+                sha256=sha256,
+            )
+            if existing is not None:
+                return existing
+            record = ArtifactRecord(
+                artifact_id=str(uuid.uuid4()),
+                role=role_text,
+                relative_path=relative,
+                size_bytes=size,
+                sha256=sha256,
+                source_name=source.name,
+                media_type=str(media_type),
+                imported_utc_ns=time.time_ns(),
+                metadata=tuple(sorted(normalized_metadata.items())),
+            )
+            self._record_artifact(
+                record,
+                "artifact_registered",
+                source="RunEvidenceLedger.register_session_artifact",
+            )
+            return record
 
     def _existing_registered_artifact(
         self,
@@ -473,11 +471,7 @@ class RunEvidenceLedger:
 
     @staticmethod
     def _fsync_directory(path: Path) -> None:
-        descriptor = os.open(path, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        _fsync_directory(path)
 
 
 __all__ = [

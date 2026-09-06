@@ -30,6 +30,12 @@ from Workstation.workstation_core.mp4_integrity import (
     H264_MP4_INTEGRITY_SCHEMA,
     validate_h264_copy_mp4_integrity,
 )
+from Workstation.workstation_core.package_provenance import (
+    _artifact_id,
+    _BEARER_CREDENTIAL,
+    _QUERY_CREDENTIAL,
+    _URI_CREDENTIALS,
+)
 
 
 PRODUCER = "workstation.media_evidence"
@@ -354,8 +360,8 @@ def verify_video_evidence(
         try:
             finalization_path_matches = bool(
                 finalization_path
-                and Path(finalization_path).expanduser().absolute()
-                == source_path.absolute()
+                and Path(finalization_path).expanduser().resolve()
+                == source_path.resolve()
             )
         except (OSError, ValueError):
             finalization_path_matches = False
@@ -870,8 +876,18 @@ def _required_text(value: Any, name: str) -> str:
     return text
 
 
+def _redact_credentials(value: str) -> str:
+    """Strip embedded credentials (e.g. rtsp://user:pass@host/...) before
+    a value is persisted into the permanent evidence audit trail."""
+
+    result = _URI_CREDENTIALS.sub(lambda match: f"{match.group('scheme')}<redacted>@", value)
+    result = _BEARER_CREDENTIAL.sub(lambda match: f"{match.group(1)} <redacted>", result)
+    result = _QUERY_CREDENTIAL.sub(lambda match: f"{match.group(1)}<redacted>", result)
+    return result
+
+
 def _portable_text(value: str) -> str:
-    stripped = str(value)
+    stripped = _redact_credentials(str(value))
     if PurePosixPath(stripped).is_absolute():
         name = PurePosixPath(stripped).name
         return f"<absolute-path>/{name}" if name else "<absolute-path>"
@@ -920,20 +936,6 @@ def _portable_json_value(value: Any) -> Any:
 def _media_type(path: Path) -> str:
     guessed, _encoding = mimetypes.guess_type(path.name)
     return guessed or "application/octet-stream"
-
-
-def _artifact_id(*, role: str, relative_path: str, status: str, sha256: str | None) -> str:
-    identity = json.dumps(
-        {
-            "relative_path": relative_path,
-            "role": role,
-            "sha256": sha256,
-            "status": status,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return f"artifact-{hashlib.sha256(identity).hexdigest()[:24]}"
 
 
 def _descriptor(

@@ -13,13 +13,17 @@ from typing import Any, Mapping, Sequence
 
 from PyQt5 import QtCore, QtGui
 
-from Workstation.workstation_core.measurement_data_store import creation_timestamp_text
+from Workstation.workstation_core.measurement_data_store import (
+    _safe_token,
+    creation_timestamp_text,
+)
 from Workstation.workstation_core.native_frame_ring import (
     FrameKey,
     NativeFrameLease,
     SharedNativeFrameRing,
 )
 from Workstation.workstation_core.native_frame_store import NativeFrameStore
+from Workstation.workstation_core.qimage_convert import qimage_from_bgr as _qimage_from_bgr
 
 
 EVIDENCE_FRAME_UNAVAILABLE = "EVIDENCE_FRAME_UNAVAILABLE"
@@ -141,33 +145,6 @@ def reserve_ring_pair(
         return None
     return RingPairReservation(pinned)
 
-
-def _safe_token(value: object, fallback: str) -> str:
-    text = "".join(
-        character if character.isalnum() or character in ".+-_" else "_"
-        for character in str(value or "")
-    )
-    return text.strip("._") or fallback
-
-
-def _qimage_from_bgr(data: bytes, *, width: int, height: int) -> QtGui.QImage:
-    bytes_per_line = int(width) * 3
-    bgr_format = getattr(QtGui.QImage, "Format_BGR888", None)
-    if bgr_format is not None:
-        return QtGui.QImage(
-            data,
-            int(width),
-            int(height),
-            bytes_per_line,
-            bgr_format,
-        ).copy()
-    return QtGui.QImage(
-        data,
-        int(width),
-        int(height),
-        bytes_per_line,
-        QtGui.QImage.Format_RGB888,
-    ).rgbSwapped()
 
 
 class AsyncNativeEvidenceWriter(QtCore.QObject):

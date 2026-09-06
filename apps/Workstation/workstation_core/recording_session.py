@@ -31,6 +31,10 @@ from Workstation.workstation_core.measurement_data_store import (
     RowWriteAdmission,
 )
 from Workstation.workstation_core.runtime_camera_status import is_sr_pc_diagnostic_reason
+from Workstation.workstation_core.strict_jsonl import (
+    fsync_directory as _fsync_directory_path,
+    sha256_file as _sha256_path,
+)
 
 
 # Finalized structured records are canonical JSONL.  Typed Parquet tables and
@@ -588,6 +592,7 @@ class SpoolRows(Sequence[dict[str, object]]):
         self._write_error: str | None = None
         self._volatile_appends: list[dict[str, object]] = []
         self._volatile_updates: dict[int, dict[str, object]] = {}
+        self._volatile_deletes: list[int] = []
         self._owner_epoch = 0
 
     @property
@@ -641,6 +646,7 @@ class SpoolRows(Sequence[dict[str, object]]):
             self._write_error = None
             self._volatile_appends.clear()
             self._volatile_updates.clear()
+            self._volatile_deletes.clear()
 
     def open_existing(self, path: Path) -> None:
         with self._lock:
@@ -654,6 +660,7 @@ class SpoolRows(Sequence[dict[str, object]]):
             self._write_error = None
             self._volatile_appends.clear()
             self._volatile_updates.clear()
+            self._volatile_deletes.clear()
             if path.exists():
                 self._repair_unterminated_tail(path)
                 for row in self._materialized_rows() if self.supports_updates else self._plain_rows():
@@ -883,10 +890,40 @@ class SpoolRows(Sequence[dict[str, object]]):
             )
 
     def pop(self, index: int = -1) -> dict[str, object]:
+        """Remove and return one row without rewriting the whole spool file.
+
+        Mirrors ``replace()``: instead of materializing every row and
+        rewriting the entire on-disk file (O(n) per call, O(n**2) for a run
+        of pops), this appends a single tombstone record marking the row as
+        deleted.  ``_materialized_rows()`` replays tombstones in order to
+        reconstruct the current logical sequence.
+        """
+
+        if not self.supports_updates:
+            raise TypeError("this spool does not support row removal")
         with self._lock:
-            rows = list(self)
-            removed = rows.pop(index)
-            self._rewrite(rows)
+            resolved = index if index >= 0 else self._count + index
+            if resolved < 0 or resolved >= self._count:
+                raise IndexError(index)
+            removed = self[resolved]
+            record = {"__spool_delete_index": resolved}
+            if self._handle is not None:
+                try:
+                    self._handle.write(
+                        json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+                    )
+                except OSError as exc:
+                    self._record_write_error(exc)
+                    self._volatile_deletes.append(resolved)
+            elif self._path is not None:
+                self._volatile_deletes.append(resolved)
+            # A pending (not-yet-persisted) replacement for this exact row is
+            # moot now that the row itself is gone.
+            self._volatile_updates.pop(resolved, None)
+            preview_start = self._count - len(self._preview)
+            if resolved >= preview_start:
+                del self._preview[resolved - preview_start]
+            self._count -= 1
             return removed
 
     def close(self) -> bool:
@@ -931,6 +968,7 @@ class SpoolRows(Sequence[dict[str, object]]):
             self._count = 0
             self._volatile_appends.clear()
             self._volatile_updates.clear()
+            self._volatile_deletes.clear()
             self._write_error = None
 
     def discard_spool(self) -> bool:
@@ -1018,49 +1056,48 @@ class SpoolRows(Sequence[dict[str, object]]):
                         raise OSError(
                             f"invalid spool update record: path={path}, line={line_number}"
                         ) from exc
+                elif "__spool_delete_index" in record:
+                    try:
+                        delete_index = int(record["__spool_delete_index"])
+                        del rows[delete_index]
+                    except (IndexError, KeyError, TypeError, ValueError) as exc:
+                        raise OSError(
+                            f"invalid spool delete record: path={path}, line={line_number}"
+                        ) from exc
                 else:
                     rows.append(record)
         for index, row in self._volatile_updates.items():
             if 0 <= index < len(rows):
                 rows[index] = row
         rows.extend(self._volatile_appends)
+        for index in self._volatile_deletes:
+            if 0 <= index < len(rows):
+                del rows[index]
         return rows
 
-    def _rewrite(self, rows: list[dict[str, object]]) -> None:
-        path = self._path
-        self.close()
-        self._owner_epoch += 1
-        self._preview.clear()
-        self._count = 0
-        self._volatile_appends.clear()
-        self._volatile_updates.clear()
-        self._write_error = None
-        if path is None:
-            for row in rows:
-                self._preview.append(row)
-                self._count += 1
-            return
-        path.unlink(missing_ok=True)
-        self._handle = path.open("a", encoding="utf-8", buffering=1)
-        for row in rows:
-            self.append(row)
-
     def __iter__(self) -> Iterator[dict[str, object]]:
+        # The disk read must happen under the same lock acquisition as the
+        # path/count snapshot: releasing the lock in between lets a
+        # concurrent append/bind/close/discard_spool truncate or rebind the
+        # file out from under us, producing a spurious row-count mismatch or
+        # FileNotFoundError.  Every other method on this class that touches
+        # disk (open_existing, _repair_unterminated_tail, replace, ...) holds
+        # ``self._lock`` for the full duration of its I/O; do the same here.
         with self._lock:
             self.flush()
             path = self._path
             preview = list(self._preview)
             count = self._count
-        if path is None or not path.exists():
-            yield from preview
-            return
-        yielded = 0
-        source = self._materialized_rows() if self.supports_updates else self._plain_rows()
-        for row in source:
-            yielded += 1
-            yield row
-        if yielded != count:
-            raise OSError(f"spool row count mismatch: expected={count}, read={yielded}, path={path}")
+            if path is None or not path.exists():
+                yield from preview
+                return
+            yielded = 0
+            source = self._materialized_rows() if self.supports_updates else self._plain_rows()
+            for row in source:
+                yielded += 1
+                yield row
+            if yielded != count:
+                raise OSError(f"spool row count mismatch: expected={count}, read={yielded}, path={path}")
 
     def __getitem__(self, index):
         if isinstance(index, slice):
@@ -2865,14 +2902,6 @@ def _v2_publish_root(output_dir: Path) -> Path:
     return output_dir / ".workstation" / "publish"
 
 
-def _fsync_directory_path(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 def _ensure_v2_data_link(output_dir: Path) -> None:
     """Expose one data link and one generation-bound measurement manifest."""
 
@@ -3235,14 +3264,6 @@ def _review_capture_rows(metadata: Mapping[str, object]) -> list[dict[str, objec
                     }
                 )
     return rows
-
-
-def _sha256_path(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _measurement_review_mapping(
@@ -3992,6 +4013,12 @@ def save_session_files(
         output_dir, metadata
     )
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Mirror the legacy path's start-of-save orphan sweep: a prior failed save
+    # attempt can leave a ``.preparing`` staging directory (or any other
+    # non-current generation) behind under ``.workstation/publish/generations``.
+    # Without this, repeated failures leak disk space indefinitely because the
+    # success-only cleanup at the end of this function never runs for them.
+    _cleanup_v2_generations(output_dir)
     pair_full_rows = _normalized_pair_rows(pair_rows)
     camera_sources = camera_rows or {}
     px4_sources = px4_rows or {}

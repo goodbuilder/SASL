@@ -24,6 +24,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from Workstation.workstation_core.strict_jsonl import (
+    fsync_directory as _fsync_directory,
+    sha256_file,
+)
+
 
 PACKAGE_SCHEMA = "workstation-measurement-package-v1"
 PACKAGE_SCHEMA_VERSION = 1
@@ -96,17 +101,6 @@ def canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-
-
-def sha256_file(path: Path | str, *, chunk_size: int = 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        while True:
-            chunk = handle.read(chunk_size)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _required_text(value: object, field: str) -> str:
@@ -217,14 +211,6 @@ def _load_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{path.name} must contain a JSON object")
     return _json_safe(value)
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def _atomic_write_bytes(path: Path, data: bytes, *, replace: bool = True) -> None:

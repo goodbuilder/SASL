@@ -233,13 +233,20 @@ def test_invalid_csv_header_is_not_replaced_and_jsonl_remains_authoritative(
 def test_csv_retry_reserve_is_bounded_without_rejecting_jsonl_enqueue(
     tmp_path: Path,
 ) -> None:
-    bad_csv_path = tmp_path / "events.csv"
-    bad_csv_path.mkdir()
+    # A transient CSV failure (not one of the permanent-error markers) still
+    # occupies the shared retry reserve, which stays bounded by
+    # retry_reserve_capacity and evicts the newest entry once full.
     store = MeasurementDataStore(
         tmp_path,
         fsync_interval_s=10.0,
         retry_reserve_capacity=2,
     )
+
+    def _always_fail_transiently(stream: str):
+        raise OSError("simulated transient csv failure")
+
+    store._csv_handle = _always_fail_transiently  # type: ignore[method-assign]
+
     assert store.enqueue("events", {"sequence": 1})
     _wait_for(
         lambda: store.snapshot()["streams"]["events"]["csv"]["state"] == "FAILED"
@@ -254,6 +261,49 @@ def test_csv_retry_reserve_is_bounded_without_rejecting_jsonl_enqueue(
     assert snapshot["streams"]["events"]["written_records"] == 3
     assert snapshot["streams"]["events"]["csv"]["dropped_records"] == 1
     assert snapshot["csv_dropped_records"] == 1
+    assert store.close(timeout_s=2.0)
+
+
+def test_permanently_failed_csv_stream_does_not_starve_other_streams_retry_reserve(
+    tmp_path: Path,
+) -> None:
+    bad_csv_path = tmp_path / "events.csv"
+    bad_csv_path.mkdir()
+    store = MeasurementDataStore(
+        tmp_path,
+        fsync_interval_s=10.0,
+        retry_reserve_capacity=2,
+    )
+    # The record whose write attempt first discovers the permanent failure
+    # is still reserved once -- it is the token a later retry_failed() call
+    # replays once the underlying problem (here, the directory) is fixed.
+    assert store.enqueue("events", {"sequence": 1})
+    _wait_for(
+        lambda: store.snapshot()["streams"]["events"]["csv"]["state"] == "FAILED"
+    )
+    assert store.snapshot()["streams"]["events"]["csv"]["retry_pending"] == 1
+
+    # Every subsequent record for the stream -- now known to be permanently
+    # broken -- must be dropped outright instead of piling into the shared
+    # reserve, no matter how many arrive.
+    for sequence in range(2, 6):
+        assert store.enqueue("events", {"sequence": sequence})
+    _wait_for(
+        lambda: store.snapshot()["streams"]["events"]["csv"]["dropped_records"] == 4
+    )
+    assert store.snapshot()["streams"]["events"]["csv"]["retry_pending"] == 1
+
+    # A different, transiently-failing stream must still get its fair share
+    # of the shared reserve instead of being starved out by the permanently
+    # broken one filling every slot.
+    def _always_fail_transiently(stream: str):
+        raise OSError("simulated transient csv failure")
+
+    store._csv_handle = _always_fail_transiently  # type: ignore[method-assign]
+    assert store.enqueue("measurements", {"sequence": 1})
+    _wait_for(
+        lambda: store.snapshot()["streams"]["measurements"]["csv"]["retry_pending"] == 1
+    )
     assert store.close(timeout_s=2.0)
 
 

@@ -139,6 +139,19 @@ _YAW_DOF = PoseDofMask(roll_deg=False, pitch_deg=False, yaw_deg=True)
 # so the joint least-squares path below optimizes all three rotation DOF.
 _DRONE_ROTATION_DOF = PoseDofMask(roll_deg=True, pitch_deg=True, yaw_deg=True)
 _TRANSLATION_DOF = PoseDofMask(roll_deg=False, pitch_deg=False, yaw_deg=False, north_m=True, east_m=True, down_m=True)
+# ``register_workstation_optical_pose_reference_candidate`` packages these two
+# methods from evidence that never touches the operating K,D profile
+# (stereoCalibrate's own stored extrinsics; a live RTK GNSS baseline), unlike
+# every PnP/Horizon/Mountain/Drone-yaw candidate, which calls
+# ``_require_frozen_intrinsics``/embeds ``operating_intrinsics_profile_sha256``
+# because their pose *is* derived through K,D. Apply's "K,D changed since this
+# candidate was created" staleness check is therefore meaningless for these
+# two methods and is skipped for them (the separate "K,D is currently
+# applicable at all" gate still applies to every candidate, since Apply always
+# needs a valid live K,D to build the resulting active stereo geometry).
+_KD_INDEPENDENT_CANDIDATE_METHODS = frozenset(
+    {"reference/checkerboard", "reference/pixhawk-rtk-translation"}
+)
 
 
 @dataclass(frozen=True)
@@ -546,6 +559,19 @@ class OpticalPoseController:
         self._frozen_intrinsics_profile: OperatingIntrinsicsProfile | None = None
         self._frozen_prior_poses: tuple[CameraPoseNed, CameraPoseNed] | None = None
         self._frozen_capture_monotonic_s: float | None = None
+        # ``_clone_for_auto_select`` shares the live, mutable ``panel`` object
+        # with its background-job clone rather than copying it (copying the
+        # whole panel would be far more invasive than the handful of fields a
+        # frozen-mode read actually needs). These fields hold that
+        # clone-creation-time snapshot; they stay None/False on every
+        # non-clone controller, so frozen-mode reads on the live controller
+        # are unaffected and keep reading ``self.panel`` directly. See
+        # ``_frozen_or_live_extrinsics_profile``/``_frozen_or_live_nominal_poses``/
+        # ``_frozen_or_live_active_intrinsics``.
+        self._is_frozen_auto_select_clone = False
+        self._frozen_extrinsics_profile: Any = None
+        self._frozen_nominal_poses: Any = None
+        self._frozen_active_intrinsics: Any = None
         self._terrain_metadata: TerrainMetadata | None = None
         self._terrain_snapshot: dict[str, Any] | None = None
         # Automatic selections are reviewable evidence, not annotations.  The
@@ -885,19 +911,20 @@ class OpticalPoseController:
                 "exact operating K,D is not applicable: "
                 + ", ".join(applicability["applicability"]["reasons"])
             )
-        expected_profile_hash = dict(candidate.input_hashes).get(
-            "operating_intrinsics_profile_sha256",
-            "",
-        )
-        active_profile_hash = str(applicability["applicability"]["profile_sha256"])
-        if not expected_profile_hash:
-            raise RuntimeError(
-                "candidate operating K,D profile SHA-256 is missing; capture/solve again"
+        if candidate.method not in _KD_INDEPENDENT_CANDIDATE_METHODS:
+            expected_profile_hash = dict(candidate.input_hashes).get(
+                "operating_intrinsics_profile_sha256",
+                "",
             )
-        if expected_profile_hash != active_profile_hash:
-            raise RuntimeError(
-                "operating K,D changed after candidate creation; capture/solve again"
-            )
+            active_profile_hash = str(applicability["applicability"]["profile_sha256"])
+            if not expected_profile_hash:
+                raise RuntimeError(
+                    "candidate operating K,D profile SHA-256 is missing; capture/solve again"
+                )
+            if expected_profile_hash != active_profile_hash:
+                raise RuntimeError(
+                    "operating K,D changed after candidate creation; capture/solve again"
+                )
         current_intrinsics, operating_profile = self._active_intrinsics_for_apply(
             applicability
         )
@@ -1392,8 +1419,16 @@ class OpticalPoseController:
                 raise RuntimeError(f"{side} native frame is null")
             metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
             metadata.setdefault("timestamp_s", float(timestamp_s))
-            metadata.setdefault("native_width", image.width())
-            metadata.setdefault("native_height", image.height())
+            # native_width/native_height must come from the frame producer
+            # (e.g. the shared native-frame-ring descriptor). Backfilling them
+            # from `image` here would make NativeFrameStore.persist()'s
+            # dimension-mismatch check tautological -- it would compare the
+            # image against itself and could never fail.
+            if metadata.get("native_width") is None or metadata.get("native_height") is None:
+                raise RuntimeError(
+                    f"{side} native frame source did not report native_width/"
+                    "native_height; refusing to backfill from the captured image"
+                )
             metadata.setdefault("overlay_applied", False)
             zoom = self._zoom_mapping(side)
             metadata["capture_zoom_index"] = zoom.get("index")
@@ -2129,6 +2164,20 @@ class OpticalPoseController:
         clone._frozen_prior_poses = self._frozen_prior_poses
         clone._active_poses = self._active_poses
         clone._frozen_capture_monotonic_s = self._frozen_capture_monotonic_s
+        # Freeze the few live-``panel`` fields that ``_intrinsics_snapshot``'s
+        # and ``_resolve_prior_poses``'s frozen-mode fallback chains still
+        # need, so the background job this clone runs on never observes a
+        # panel value the operator changed after the burst was frozen (a
+        # different extrinsics/intrinsics profile applied, a new nominal
+        # pose declared, etc).
+        clone._is_frozen_auto_select_clone = True
+        clone._frozen_extrinsics_profile = getattr(
+            self.panel,
+            "active_extrinsics_profile",
+            getattr(self.panel, "selected_extrinsics_profile", None),
+        )
+        clone._frozen_nominal_poses = getattr(self.panel, "optical_pose_nominal_poses", None)
+        clone._frozen_active_intrinsics = getattr(self.panel, "active_intrinsics", None)
         clone._drone_rtk_observations = copy.deepcopy(self._drone_rtk_observations)
         clone._drone_rtk_multiview_samples = copy.deepcopy(
             self._drone_rtk_multiview_samples
@@ -4484,6 +4533,35 @@ class OpticalPoseController:
             yaw_deg=parsed_rpy[2],
         )
 
+    def _frozen_or_live_extrinsics_profile(self, *, prefer_frozen: bool) -> Any:
+        """Resolve the active/selected extrinsics profile.
+
+        A background auto-select clone (see ``_clone_for_auto_select``) shares
+        the live, mutable ``panel`` object with its owner controller, so a
+        frozen-mode read must use the profile captured at clone-creation time
+        instead of re-reading ``self.panel`` -- which may have moved on (a
+        new profile applied, a different zoom selected) by the time the
+        background job actually runs.
+        """
+
+        if prefer_frozen and self._is_frozen_auto_select_clone:
+            return self._frozen_extrinsics_profile
+        return getattr(
+            self.panel,
+            "active_extrinsics_profile",
+            getattr(self.panel, "selected_extrinsics_profile", None),
+        )
+
+    def _frozen_or_live_nominal_poses(self, *, prefer_frozen: bool) -> Any:
+        if prefer_frozen and self._is_frozen_auto_select_clone:
+            return self._frozen_nominal_poses
+        return getattr(self.panel, "optical_pose_nominal_poses", None)
+
+    def _frozen_or_live_active_intrinsics(self, *, prefer_frozen: bool) -> Any:
+        if prefer_frozen and self._is_frozen_auto_select_clone:
+            return self._frozen_active_intrinsics
+        return getattr(self.panel, "active_intrinsics", None)
+
     def _resolve_prior_poses(
         self,
         payload: Mapping[str, Any],
@@ -4504,21 +4582,17 @@ class OpticalPoseController:
             return self._frozen_prior_poses
         if self._active_poses is not None:
             return self._active_poses
-        declared = getattr(self.panel, "optical_pose_nominal_poses", None)
+        declared = self._frozen_or_live_nominal_poses(prefer_frozen=prefer_frozen)
         if (
             isinstance(declared, tuple)
             and len(declared) == 2
             and all(isinstance(pose, CameraPoseNed) for pose in declared)
         ):
             return declared
-        profile = getattr(
-            self.panel,
-            "active_extrinsics_profile",
-            getattr(self.panel, "selected_extrinsics_profile", None),
-        )
+        profile = self._frozen_or_live_extrinsics_profile(prefer_frozen=prefer_frozen)
         extrinsics = getattr(profile, "extrinsics", None)
         if extrinsics is None:
-            active = getattr(self.panel, "active_intrinsics", None)
+            active = self._frozen_or_live_active_intrinsics(prefer_frozen=prefer_frozen)
             extrinsics = getattr(active, "extrinsics", None)
         if extrinsics is None:
             raise RuntimeError(
@@ -4707,11 +4781,7 @@ class OpticalPoseController:
             if use_frozen and self._frozen_capture_monotonic_s is not None
             else time.monotonic()
         )
-        extrinsics = getattr(
-            self.panel,
-            "active_extrinsics_profile",
-            getattr(self.panel, "selected_extrinsics_profile", None),
-        )
+        extrinsics = self._frozen_or_live_extrinsics_profile(prefer_frozen=use_frozen)
         result = evaluate_intrinsics_applicability(
             profile,
             left,

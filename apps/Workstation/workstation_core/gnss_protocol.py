@@ -538,10 +538,16 @@ class UbxStreamParser:
             if len(self._buffer) < frame_len:
                 break
             frame = bytes(self._buffer[:frame_len])
-            del self._buffer[:frame_len]
             ck_a, ck_b = _ubx_checksum(frame[2:-2])
             if ck_a != frame[-2] or ck_b != frame[-1]:
+                # A corrupt length field can make this candidate encompass a
+                # complete valid frame that follows the false sync byte.  Drop
+                # only that sync byte so the next pass can rescan every
+                # remaining byte for 0xB5 0x62; deleting ``frame_len`` bytes
+                # here would silently discard the enclosed valid message.
+                del self._buffer[0]
                 continue
+            del self._buffer[:frame_len]
             messages.append((frame[2], frame[3], frame[6:-2]))
         return messages
 

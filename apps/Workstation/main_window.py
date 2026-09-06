@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import time
 from collections.abc import Mapping
 
@@ -39,6 +40,41 @@ from .workspaces import (
     TelemetryWorkspace,
     TimeWorkspace,
 )
+
+
+def _call_pnp_capture_method(capture_method: object, purpose: str) -> object:
+    """Call a PnP HR/OZ capture method, tolerating a legacy zero-arg facade.
+
+    ``capture_method`` is normally ``capture_pnp_hr_photos``/``capture_pnp_oz_photos``,
+    which accept a single ``purpose`` argument. A few test/legacy facades
+    expose a zero-argument version instead. We inspect the callable's
+    signature to decide *before* calling it which form applies, rather than
+    calling with ``purpose`` and blindly retrying on any ``TypeError`` --
+    the latter would also swallow a ``TypeError`` raised by a real bug
+    inside the capture implementation itself and silently retry the
+    capture, which for HR risks an unintended second physical capture
+    (camera reboot).
+    """
+
+    try:
+        signature = inspect.signature(capture_method)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is not None:
+        try:
+            signature.bind(purpose)
+        except TypeError:
+            try:
+                signature.bind()
+            except TypeError:
+                # Neither call form matches the declared signature (e.g. an
+                # unusual facade); fall back to the documented call shape so
+                # any resulting error surfaces as a real failure instead of
+                # being swallowed.
+                pass
+            else:
+                return capture_method()
+    return capture_method(purpose)
 
 
 class WorkstationMainWindow(QtWidgets.QMainWindow):
@@ -1026,12 +1062,9 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                     if command_id == "recording.hr.capture"
                     else self.backend.capture_pnp_oz_photos
                 )
-                try:
-                    result = capture_method(str(values.get("purpose") or "unspecified"))
-                except TypeError:
-                    # Compatibility for test/legacy facades while the real
-                    # Workstation owner records the typed purpose.
-                    result = capture_method()
+                result = _call_pnp_capture_method(
+                    capture_method, str(values.get("purpose") or "unspecified")
+                )
             elif command_id == "recording.hr.import":
                 source_path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
                     self,
@@ -1442,9 +1475,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 self._ui_settings.value("sessions_tab", "current") or "current"
             )
             self.sessions.select_tab(
-                "current" if canonical_context_id(context) == "tasks.data" else (
-                    "review" if context in review_contexts else saved_tab
-                )
+                "review" if context in review_contexts else saved_tab
             )
 
     def _save_ui_state(self) -> None:

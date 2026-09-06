@@ -148,8 +148,17 @@ _FSYNC = os.fsync
 _SESSION_MEMBERSHIP_FIELDS = frozenset(
     {"session_id", "parent_session_id", "measurement_package_id"}
 )
-_SAFE_TOKEN = re.compile(r"[^A-Za-z0-9._-]+")
 _KOREA_TIMEZONE = timezone(timedelta(hours=9), name="KST")
+_PERMANENT_CSV_ERROR_MARKERS = (
+    "header is invalid or foreign",
+    "must not be a symlink",
+    "is not a regular file",
+)
+
+
+def _is_permanent_csv_error(error: str) -> bool:
+    text = str(error)
+    return any(marker in text for marker in _PERMANENT_CSV_ERROR_MARKERS)
 
 
 def _json_safe(value: Any) -> Any:
@@ -184,8 +193,21 @@ def creation_timestamp_text(utc_ns: int | None = None) -> str:
 
 
 def _safe_token(value: object, fallback: str) -> str:
-    text = _SAFE_TOKEN.sub("_", str(value or "")).strip("._")
-    return text or fallback
+    """Sanitize *value* into a filename-safe token.
+
+    Canonical, consolidated implementation shared with
+    ``native_frame_store.py``/``native_evidence_writer.py`` (this module is
+    the home for it, not those, since they already import
+    ``creation_timestamp_text`` from here -- importing the other way would
+    be circular). Character-by-character replacement (`+` preserved, runs of
+    invalid characters replaced individually rather than collapsed).
+    """
+
+    text = "".join(
+        character if character.isalnum() or character in ".+-_" else "_"
+        for character in str(value or "")
+    )
+    return text.strip("._") or fallback
 
 
 def allocate_timestamped_path(
@@ -928,6 +950,13 @@ class MeasurementDataStore:
             stream_pending = any(
                 pending.stream == item.stream for pending in self._csv_retry_reserve
             )
+            if csv_state.state == "FAILED" and _is_permanent_csv_error(csv_state.last_error):
+                # A permanently-failed stream will never self-heal (see
+                # _mark_csv_failed); reserving for it anyway would let it
+                # monopolize the shared retry reserve and starve out other,
+                # genuinely transient streams' retry records.
+                csv_state.dropped_records += 1
+                return
             if csv_state.state == "FAILED" or stream_pending:
                 self._reserve_csv_retry_unlocked(item)
                 return
@@ -940,6 +969,12 @@ class MeasurementDataStore:
         except (OSError, TypeError, ValueError, csv.Error) as exc:
             self._mark_csv_failed(item.stream, str(exc))
             with self._state_lock:
+                # The record whose write attempt just failed is always
+                # reserved once, regardless of permanence: it is the token
+                # that lets a later retry_failed() call replay it once the
+                # underlying problem is fixed. Later records for a stream
+                # already known to be permanently broken are handled by the
+                # early-return check above instead, so they don't pile up.
                 self._reserve_csv_retry_unlocked(item)
             return
         with self._state_lock:
@@ -1015,7 +1050,15 @@ class MeasurementDataStore:
             state.state = "FAILED"
             state.last_error = str(error)
             self._close_csv_handle(stream)
-            if self._csv_next_retry_monotonic_s[stream] is None:
+            # A structurally permanent condition (foreign/incompatible header,
+            # symlink, non-regular file) cannot self-heal by retrying; only an
+            # explicit retry_failed() call re-attempts it. Otherwise this would
+            # flap FAILED/IDLE and re-log the same error every backoff cycle
+            # forever, and keep consuming the shared CSV retry reserve that
+            # other, genuinely transient streams need.
+            if not _is_permanent_csv_error(error) and (
+                self._csv_next_retry_monotonic_s[stream] is None
+            ):
                 self._csv_next_retry_monotonic_s[stream] = (
                     time.monotonic() + self._csv_retry_backoff_s[stream]
                 )

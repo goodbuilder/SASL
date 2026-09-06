@@ -140,7 +140,7 @@ def quaternion_to_euler_deg(q: Iterable[float]) -> RelativeAttitude:
 def relative_attitude(left_q: Iterable[float], right_q: Iterable[float]) -> RelativeAttitude:
     left = normalize_quaternion(left_q)
     right = normalize_quaternion(right_q)
-    relative_q = quaternion_multiply(right, quaternion_conjugate(left))
+    relative_q = quaternion_multiply(quaternion_conjugate(left), right)
     return quaternion_to_euler_deg(relative_q)
 
 

@@ -795,6 +795,7 @@ class CalibrationWorkflowController:
             return [
                 (f"ordered-{index:06d}", left, right)
                 for index, (left, right) in enumerate(zip(left_paths, right_paths, strict=False))
+                if self._calibration_pair_stereo_eligible(root, left, right)
             ]
         return []
 
@@ -1101,36 +1102,45 @@ class CalibrationWorkflowController:
         except (AttributeError, TypeError, ValueError):
             return 0
 
+    @staticmethod
+    def _evenly_sampled_calibration_items(candidates: list, limit: int) -> list:
+        """Evenly sample a deterministic, bounded subset of ``candidates``.
+
+        A deterministic spread keeps early/late items (capture pairs or
+        single-camera files) represented instead of silently taking the first
+        N, while a non-positive or oversized limit returns everything. Shared
+        by ``_select_calibration_pairs`` and ``_select_calibration_image_paths``,
+        which differ only in the element type being sampled.
+        """
+
+        items = list(candidates)
+        if limit <= 0 or limit >= len(items):
+            return items
+        limit = max(3, limit)
+        if limit >= len(items):
+            return items
+        indices = sorted(
+            {
+                round(index * (len(items) - 1) / (limit - 1))
+                for index in range(limit)
+            }
+        )
+        return [items[index] for index in indices]
+
     def _select_calibration_pairs(
         self,
         pairs: list[tuple[str, Path, Path]],
         *,
         pair_limit: int | None = None,
     ) -> list[tuple[str, Path, Path]]:
-        """Select evenly distributed capture pairs for calibration input.
+        """Select evenly distributed capture pairs for calibration input."""
 
-        A deterministic spread keeps early/late board poses represented instead
-        of silently taking the first N captures, while zero means all pairs.
-        """
-
-        candidates = list(pairs)
         limit = (
             self._calibration_calculation_pair_limit()
             if pair_limit is None
             else max(0, int(pair_limit))
         )
-        if limit <= 0 or limit >= len(candidates):
-            return candidates
-        limit = max(3, limit)
-        if limit >= len(candidates):
-            return candidates
-        indices = sorted(
-            {
-                round(index * (len(candidates) - 1) / (limit - 1))
-                for index in range(limit)
-            }
-        )
-        return [candidates[index] for index in indices]
+        return self._evenly_sampled_calibration_items(pairs, limit)
 
     @staticmethod
     def _select_calibration_image_paths(
@@ -1139,19 +1149,7 @@ class CalibrationWorkflowController:
     ) -> list[Path]:
         """Evenly sample one camera's files when no stereo IDs are available."""
 
-        candidates = list(paths)
-        if limit <= 0 or limit >= len(candidates):
-            return candidates
-        limit = max(3, limit)
-        if limit >= len(candidates):
-            return candidates
-        indices = sorted(
-            {
-                round(index * (len(candidates) - 1) / (limit - 1))
-                for index in range(limit)
-            }
-        )
-        return [candidates[index] for index in indices]
+        return CalibrationWorkflowController._evenly_sampled_calibration_items(paths, limit)
 
     def _checkerboard_intrinsic_delta_px(self, result: StereoIntrinsicsResult, reference: StereoIntrinsicsResult) -> tuple[float, float]:
         left_delta = max(
@@ -2198,6 +2196,20 @@ class CalibrationWorkflowController:
         ).expanduser().resolve(strict=False)
 
     def _calibration_dirs(self) -> tuple[Path, Path, Path]:
+        """Resolve the current left/right calibration directories.
+
+        Read-only: this is called from status/polling paths (for example
+        ``workstation_calibration_capture_snapshot``) as well as from actual
+        capture/compute paths, so it must not mutate session bookkeeping.
+        When the configured root has diverged from the session-owned default
+        (custom root, hierarchy disabled) this simply returns the configured
+        root without touching ``_calibration_session_root``/
+        ``_calibration_session_roots`` -- ``_ensure_calibration_session_root``
+        independently re-validates and evicts stale entries from that dict
+        the next time it actually needs to hand out a session root, so no
+        proactive reset is needed here.
+        """
+
         configured_root = self._configured_calibration_root()
         session_root = getattr(self.panel, "_calibration_session_root", None)
         default_root = self._default_calibration_root()
@@ -2207,9 +2219,6 @@ class CalibrationWorkflowController:
         ):
             root = Path(session_root)
         else:
-            if session_root is not None:
-                self.panel._calibration_session_root = None
-                self.panel._calibration_session_roots = {}
             root = configured_root
         left_dir = root / "left"
         right_dir = root / "right"
@@ -3967,17 +3976,10 @@ class CalibrationWorkflowController:
                 (f"selected-{index:04d}", left, right)
                 for index, (left, right) in enumerate(zip(left_paths, right_paths, strict=False))
             ]
-        right_by_key: dict[str, list[Path]] = {}
-        for path in right_paths:
-            key = path.stem.removeprefix("right_")
-            right_by_key.setdefault(key, []).append(path)
-        pairs: list[tuple[str, Path, Path]] = []
-        for left in left_paths:
-            key = left.stem.removeprefix("left_")
-            candidates = right_by_key.get(key) or []
-            if candidates:
-                pairs.append((key, left, candidates.pop(0)))
-        return pairs
+        # No shared capture keys and unequal list lengths: the key-matching
+        # pass above (which produced the empty ``common_pairs``) is the only
+        # matching strategy available here, so there is nothing left to pair.
+        return common_pairs
 
     def _effective_calibration_inputs(
         self,
@@ -4011,17 +4013,16 @@ class CalibrationWorkflowController:
             for pair in scanned_pairs
             if pair[1] in left_members and pair[2] in right_members
         ]
+        # ``scanned_pairs`` is already stereo-eligibility filtered by
+        # ``_calibration_stereo_pair_paths_for_root`` (both its common-key and
+        # ordered-fallback branches apply ``_calibration_pair_stereo_eligible``),
+        # so ``pair_candidates`` -- a subset of it -- needs no second pass here.
         selected_pairs = self._choose_calibration_pairs(
             pair_candidates,
             selection=selection,
             root=root,
             pair_limit=pair_limit,
         )
-        selected_pairs = [
-            pair
-            for pair in selected_pairs
-            if self._calibration_pair_stereo_eligible(root, pair[1], pair[2])
-        ]
         return left_paths, right_paths, selected_pairs, explicit_selection
 
     def _random_validation_inputs(
@@ -4154,12 +4155,22 @@ class CalibrationWorkflowController:
         excluded_left = set(excluded_left_paths)
         excluded_right = set(excluded_right_paths)
         excluded_keys = {str(key) for key in selection.get("excluded_pair_keys") or ()}
+        # ``candidates`` from the manual-explicit-paths branch above is
+        # rebuilt straight from the operator's raw left/right selection via
+        # ``_selected_calibration_pairs`` -- it never consults ``pairs``
+        # (already stereo-eligibility filtered by
+        # ``_calibration_stereo_pair_paths_for_root``), so an
+        # intrinsics-only/timing-rejected capture the operator explicitly
+        # kept for K,D purposes could otherwise slip back into the stereo
+        # pair set here. Re-checking eligibility is a no-op for pairs that
+        # came from the already-filtered ``pairs`` list.
         eligible = [
             pair
             for pair in candidates
             if pair[0] not in excluded_keys
             and pair[1] not in excluded_left
             and pair[2] not in excluded_right
+            and self._calibration_pair_stereo_eligible(root, pair[1], pair[2])
         ]
         # ``calibration_calculation_pair_count`` is a stereo-pair limit. Apply
         # it once, after exclusions and side membership have established the

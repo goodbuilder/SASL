@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import errno as errno_module
+import logging
 import queue
 import socket
 import threading
 import time
 
 from PyQt5 import QtCore
+
+_LOGGER = logging.getLogger(__name__)
 
 from Workstation.workstation_core.gnss_network import NtripClient
 from Workstation.workstation_core.gnss_operation import HeightType, NetworkConfig
@@ -808,6 +811,7 @@ class RtcmDataPlaneWorker(QtCore.QObject):
 class GnssBaseSerialWorker(QtCore.QObject):
     WRITE_TIMEOUT_S = 1.0
     MAX_WRITE_QUEUE = 64
+    MAX_NMEA_BUFFER_BYTES = 4096
 
     connected = QtCore.pyqtSignal(str, int)
     stats_changed = QtCore.pyqtSignal(int, float, float)
@@ -890,6 +894,17 @@ class GnssBaseSerialWorker(QtCore.QObject):
                             if gga is not None:
                                 satellites, fix_quality = gga
                                 self.satellite_count_changed.emit(satellites, f"NMEA-GGA fix={fix_quality}")
+                    elif len(nmea_buffer) > self.MAX_NMEA_BUFFER_BYTES:
+                        # A stream with no newline bytes for a long stretch
+                        # (e.g. UBX/RTCM-only traffic) would otherwise grow
+                        # this buffer unbounded. Discard and resync on the
+                        # next newline.
+                        _LOGGER.warning(
+                            "GnssBaseSerialWorker: discarding %d-byte NMEA buffer with no newline (port=%s)",
+                            len(nmea_buffer),
+                            self.port,
+                        )
+                        nmea_buffer = ""
                     for message_class, message_id, payload in ubx_parser.feed(chunk):
                         self.ubx_message_received.emit(message_class, message_id, payload)
                         if message_class == 0x01 and message_id == 0x3B:

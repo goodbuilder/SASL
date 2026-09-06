@@ -63,6 +63,7 @@ from Workstation.workstation_core.hr_evidence import (
     CapturePurpose,
     create_hr_capture_event,
     import_hr_image_file,
+    verify_capture_ftp_metadata,
 )
 from Workstation.workstation_core.native_frame_store import AsyncNativeFrameStore
 from Workstation.workstation_core.native_evidence_writer import (
@@ -3036,9 +3037,38 @@ class RecordingController:
             json.dumps(normalized, ensure_ascii=False, sort_keys=True)
         )
 
+    @staticmethod
+    def _verify_ftp_capture_cameras(cameras: object) -> None:
+        """Re-verify each FTP-downloaded capture's bytes against its reported
+        metadata, downgrading that camera's state to "failed" on mismatch.
+
+        wiris_runtime_workers.py already verifies the bytes once immediately
+        after the FTP transfer completes; this catches corruption or an
+        unexpected file swap in the window between that download and this
+        completion-event handling running, before the capture is recorded as
+        trusted evidence.
+        """
+
+        if not isinstance(cameras, dict):
+            return
+        for item in cameras.values():
+            if not isinstance(item, dict):
+                continue
+            local_path = item.get("ftp_local_path")
+            if not item.get("ftp_downloaded") or not local_path:
+                continue
+            try:
+                item["capture_metadata_verified"] = verify_capture_ftp_metadata(
+                    Path(local_path), item
+                )
+            except (OSError, ValueError) as exc:
+                item["state"] = "failed"
+                item["error"] = f"capture metadata verification failed: {exc}"
+
     def _handle_pnp_photo_capture_completed(self, result: object) -> None:
         record = dict(result or {}) if isinstance(result, dict) else {"state": "failed"}
         cameras = record.get("cameras")
+        self._verify_ftp_capture_cameras(cameras)
         camera_states = (
             [str(item.get("state", "failed")) for item in cameras.values()]
             if isinstance(cameras, dict)
@@ -3088,6 +3118,7 @@ class RecordingController:
     def _handle_oz_photo_capture_completed(self, result: object) -> None:
         record = dict(result or {}) if isinstance(result, dict) else {"state": "failed"}
         cameras = record.get("cameras")
+        self._verify_ftp_capture_cameras(cameras)
         camera_states = (
             [str(item.get("state", "failed")) for item in cameras.values()]
             if isinstance(cameras, dict)
@@ -6345,7 +6376,15 @@ class RecordingController:
             self._track_pending_native_row(row_index, row, row_lease=admission.lease)
             self.panel._append_recording_table_row(row)
         else:
-            current = owner[row_index]
+            try:
+                current = owner[row_index]
+            except (IndexError, KeyError, TypeError):
+                # The owner may have been cleared between the retryable append
+                # and this bundle fallback.  Let replace_with_admission classify
+                # the stale index/lease atomically so the canonical row can be
+                # rerouted to direct persistence instead of escaping as an
+                # indexing exception.
+                current = {}
             sample_index = current.get("sample_index", row_index)
             pair_sequence = current.get("pair_sequence", row_index)
             current.update(row)
@@ -6740,6 +6779,43 @@ class RecordingController:
             "measurement_yaw_reverse": bool(measurement_attempt.measurement_yaw_reverse),
             "measurement_yaw_consensus": measurement_attempt.measurement_yaw_consensus,
             "measurement_yaw_low_margin": bool(measurement_attempt.measurement_yaw_low_margin),
+            "measurement_yaw_candidate_minus90_deg": self.panel._fmt_record_float(
+                measurement_attempt.measurement_yaw_candidate_minus90_deg, 6
+            ),
+            "measurement_yaw_candidate_plus90_deg": self.panel._fmt_record_float(
+                measurement_attempt.measurement_yaw_candidate_plus90_deg, 6
+            ),
+            "measurement_yaw_alternate_deg": self.panel._fmt_record_float(
+                measurement_attempt.measurement_yaw_alternate_deg, 6
+            ),
+            "measurement_yaw_p1_error_minus90_deg": self.panel._fmt_record_float(
+                measurement_attempt.measurement_yaw_p1_error_minus90_deg, 6
+            ),
+            "measurement_yaw_p1_error_plus90_deg": self.panel._fmt_record_float(
+                measurement_attempt.measurement_yaw_p1_error_plus90_deg, 6
+            ),
+            "measurement_yaw_p2_error_minus90_deg": self.panel._fmt_record_float(
+                measurement_attempt.measurement_yaw_p2_error_minus90_deg, 6
+            ),
+            "measurement_yaw_p2_error_plus90_deg": self.panel._fmt_record_float(
+                measurement_attempt.measurement_yaw_p2_error_plus90_deg, 6
+            ),
+            "geometry_left_quaternion_wxyz_alternate": (
+                None
+                if measurement_attempt.geometry_left_quaternion_wxyz_alternate is None
+                else json.dumps(
+                    list(measurement_attempt.geometry_left_quaternion_wxyz_alternate),
+                    separators=(",", ":"),
+                )
+            ),
+            "geometry_right_quaternion_wxyz_alternate": (
+                None
+                if measurement_attempt.geometry_right_quaternion_wxyz_alternate is None
+                else json.dumps(
+                    list(measurement_attempt.geometry_right_quaternion_wxyz_alternate),
+                    separators=(",", ":"),
+                )
+            ),
             "quality": estimate.sync_quality,
             "disparity_px": f"{estimate.disparity_px:.6f}",
             "raw_disparity_px": f"{estimate.disparity_px:.6f}",
@@ -6827,6 +6903,23 @@ class RecordingController:
                     "reverse": measurement_attempt.measurement_yaw_reverse,
                     "consensus": measurement_attempt.measurement_yaw_consensus,
                     "low_margin": measurement_attempt.measurement_yaw_low_margin,
+                    "candidate_minus90_deg": measurement_attempt.measurement_yaw_candidate_minus90_deg,
+                    "candidate_plus90_deg": measurement_attempt.measurement_yaw_candidate_plus90_deg,
+                    "alternate_yaw_deg": measurement_attempt.measurement_yaw_alternate_deg,
+                    "p1_error_minus90_deg": measurement_attempt.measurement_yaw_p1_error_minus90_deg,
+                    "p1_error_plus90_deg": measurement_attempt.measurement_yaw_p1_error_plus90_deg,
+                    "p2_error_minus90_deg": measurement_attempt.measurement_yaw_p2_error_minus90_deg,
+                    "p2_error_plus90_deg": measurement_attempt.measurement_yaw_p2_error_plus90_deg,
+                    "geometry_left_quaternion_wxyz_alternate": (
+                        None
+                        if measurement_attempt.geometry_left_quaternion_wxyz_alternate is None
+                        else list(measurement_attempt.geometry_left_quaternion_wxyz_alternate)
+                    ),
+                    "geometry_right_quaternion_wxyz_alternate": (
+                        None
+                        if measurement_attempt.geometry_right_quaternion_wxyz_alternate is None
+                        else list(measurement_attempt.geometry_right_quaternion_wxyz_alternate)
+                    ),
                 },
                 vector_frd_range_m=(
                     point.forward_m,
@@ -6842,12 +6935,18 @@ class RecordingController:
         row["measurement_attempt_instance_sha256"] = measurement_attempt_instance_sha256
         row_commit = self.panel._upsert_pair_recording_row(measurement_attempt, row)
         if row_metadata is not None:
-            if row_commit.enqueue_admitted:
-                self._pending_primary_record_rows.pop(key, None)
-                self._primary_retry_required_keys.discard(key)
-            else:
-                self._primary_retry_required_keys.add(key)
-                self._remember_pending_primary_row(key, row)
+            # Every other mutator of this retry-tracking state
+            # (_persist_compact_primary_measurement, _release_primary_retry_ownership,
+            # _commit_primary_distance_outcome) holds _primary_persistence_lock
+            # before touching _primary_retry_required_keys /
+            # _pending_primary_record_rows; do the same here.
+            with self._primary_persistence_lock:
+                if row_commit.enqueue_admitted:
+                    self._pending_primary_record_rows.pop(key, None)
+                    self._primary_retry_required_keys.discard(key)
+                else:
+                    self._primary_retry_required_keys.add(key)
+                    self._remember_pending_primary_row(key, row)
         if publish_history:
             self.panel._last_distance_history_key = key
             self.panel.distance_history.append(point)
@@ -7838,12 +7937,12 @@ class RecordingController:
             and "right" in self.panel.recording_reference_attitudes
         ):
             initial_relative_q = quaternion_multiply(
-                self.panel.recording_reference_attitudes["right"].quaternion_wxyz,
                 quaternion_conjugate(self.panel.recording_reference_attitudes["left"].quaternion_wxyz),
+                self.panel.recording_reference_attitudes["right"].quaternion_wxyz,
             )
             current_relative_q = quaternion_multiply(
-                attitudes["right"].quaternion_wxyz,
                 quaternion_conjugate(attitudes["left"].quaternion_wxyz),
+                attitudes["right"].quaternion_wxyz,
             )
             row["left_right_relative_reference_q_wxyz"] = json.dumps(
                 list(initial_relative_q), separators=(",", ":")

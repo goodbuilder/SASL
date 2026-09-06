@@ -390,7 +390,20 @@ class NtripClient:
                     raise RuntimeError("NTRIP client was closed before response header completed")
                 if time.monotonic() > deadline:
                     raise NtripProtocolError("NTRIP response header timeout")
-                chunk = self._socket.recv(4096)
+                try:
+                    chunk = self._socket.recv(4096)
+                except socket.timeout:
+                    # The caster is sending the header in fragments with a
+                    # pause longer than read_timeout_s. Keep retrying until
+                    # the overall connect_timeout_s deadline above elapses.
+                    continue
+                except AttributeError:
+                    # self._socket was concurrently reset to None by close().
+                    if self._closed:
+                        raise RuntimeError(
+                            "NTRIP client was closed before response header completed"
+                        ) from None
+                    raise
                 if not chunk:
                     break
                 response.extend(chunk)
@@ -458,7 +471,11 @@ class NtripClient:
                 chunk = self._socket.recv(4096)
             except socket.timeout:
                 continue
-            except OSError:
+            except (OSError, AttributeError):
+                # AttributeError covers self._socket being concurrently
+                # reset to None by close() between the loop guard above and
+                # this recv() call -- treat it the same as any other
+                # shutdown-triggered socket error.
                 if self._closed or stop_event.is_set():
                     return
                 raise

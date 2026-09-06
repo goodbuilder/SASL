@@ -612,7 +612,8 @@ def run_qualification(
                 if writer_close_ok:
                     writer._thread.join(timeout=writer_shutdown_timeout_s)
             writer_thread_stopped = not writer._thread.is_alive()
-            pairer_close_ok = bool(pairer.close())
+            if not pairer_close_ok:
+                pairer_close_ok = bool(pairer.close())
             for side, state in cameras.items():
                 if state["process"].is_alive():
                     state["stop"].set()

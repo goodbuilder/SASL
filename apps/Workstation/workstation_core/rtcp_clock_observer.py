@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from collections import deque
 from collections.abc import Callable, Mapping
 from typing import Protocol
 
@@ -124,6 +125,11 @@ class RtcpClockObserverWorker(QtCore.QObject):
     failed = QtCore.pyqtSignal(str)
     finished = QtCore.pyqtSignal()
 
+    # `ntp_raw` changes on almost every RTCP Sender Report, so the dedup set
+    # of (side, ssrc, ntp_raw) identities would otherwise grow unbounded over
+    # a long-running session. Cap it and evict the oldest entries FIFO.
+    MAX_EMITTED_IDENTITIES = 4096
+
     def __init__(
         self,
         targets: Mapping[str, Mapping[str, object]],
@@ -154,6 +160,7 @@ class RtcpClockObserverWorker(QtCore.QObject):
     def run(self) -> None:
         probes: dict[str, ClockProbe] = {}
         emitted_identities: set[tuple[str, int, int]] = set()
+        emitted_identities_order: deque[tuple[str, int, int]] = deque()
         try:
             if set(self.targets) != {"left", "right"}:
                 raise ValueError("RTCP clock observer requires exact Left and Right targets")
@@ -187,6 +194,10 @@ class RtcpClockObserverWorker(QtCore.QObject):
                         if identity in emitted_identities:
                             continue
                         emitted_identities.add(identity)
+                        emitted_identities_order.append(identity)
+                        while len(emitted_identities_order) > self.MAX_EMITTED_IDENTITIES:
+                            evicted = emitted_identities_order.popleft()
+                            emitted_identities.discard(evicted)
                         payload = {
                             "schema": "workstation-rtcp-clock-observation-v1",
                             "side": side,

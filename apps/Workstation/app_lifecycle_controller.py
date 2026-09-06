@@ -19,6 +19,13 @@ from Workstation.workstation_core.camera_pane import (
 # valid slow NVENC/MP4 finalization into a forced kill.
 SHUTDOWN_DEADLINE_S = CAMERA_STOP_TERMINATE_AFTER_S
 SHUTDOWN_FORCE_WAIT_S = 1.0
+# One last cooperative chance for a non-camera worker thread to react to
+# quit()/requestInterruption() before we resort to QThread.terminate().
+# terminate() can hang or corrupt the interpreter if it lands mid blocking
+# I/O or while the thread holds a Python-level lock/the GIL, so this short
+# grace period is cheap insurance against that -- kept small so it does not
+# meaningfully delay a shutdown that genuinely needs the force path.
+SHUTDOWN_POLITE_WAIT_S = 0.25
 SHUTDOWN_RESOURCE_REPORT_SCHEMA = "workstation-shutdown-resources-v1"
 
 APP_LIFECYCLE_METHODS = [
@@ -664,6 +671,7 @@ class AppLifecycleController:
                 pass
 
         running: list[object] = []
+        terminate_candidates: list[object] = []
         for thread in threads:
             try:
                 if not thread.isRunning():
@@ -675,8 +683,43 @@ class AppLifecycleController:
                 if id(thread) in protected_camera_threads:
                     running.append(thread)
                     continue
+                terminate_candidates.append(thread)
+            except (AttributeError, RuntimeError, TypeError):
+                continue
+
+        # Give the polite quit()/requestInterruption() above one short,
+        # bounded chance to actually stop each thread before we escalate to
+        # terminate(). This is not a substitute for the force-wait pass
+        # below (which still applies to whatever remains running) -- it
+        # just avoids reaching for the unsafe API when a cooperative stop
+        # would have worked anyway.
+        polite_deadline_s = time.monotonic() + SHUTDOWN_POLITE_WAIT_S
+        for thread in terminate_candidates:
+            remaining_ms = max(0, int((polite_deadline_s - time.monotonic()) * 1000.0))
+            if remaining_ms <= 0:
+                break
+            waiter = getattr(thread, "wait", None)
+            if callable(waiter):
+                try:
+                    waiter(min(50, remaining_ms))
+                except (AttributeError, RuntimeError, TypeError):
+                    pass
+
+        for thread in terminate_candidates:
+            try:
+                if not thread.isRunning():
+                    continue
                 terminator = getattr(thread, "terminate", None)
                 if callable(terminator):
+                    if callable(logger):
+                        try:
+                            logger(
+                                "[종료] worker thread "
+                                f"{thread!r} 가 정상 quit()에 응답하지 않아 "
+                                "terminate()로 강제 종료합니다. (조사 필요)"
+                            )
+                        except Exception:
+                            pass
                     terminator()
                 running.append(thread)
             except (AttributeError, RuntimeError, TypeError):

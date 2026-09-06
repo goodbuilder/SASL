@@ -2420,12 +2420,19 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             self._attitude_stream_request_attempts.pop(camera, None)
             self._attitude_stream_last_request_s.pop(camera, None)
             self._attitude_stream_outage_reported.discard(camera)
+            roll_rad = _optional_float(message, "roll")
+            pitch_rad = _optional_float(message, "pitch")
+            yaw_rad = _optional_float(message, "yaw")
+            if roll_rad is None or pitch_rad is None or yaw_rad is None:
+                # Non-finite (NaN/Inf) attitude values: drop this malformed
+                # message rather than propagate a corrupt extrinsic.
+                return
             extrinsic = camera_extrinsic_from_euler_rad(
                 camera=camera,
                 namespace=namespace,
-                roll_rad=float(getattr(message, "roll")),
-                pitch_rad=float(getattr(message, "pitch")),
-                yaw_rad=float(getattr(message, "yaw")),
+                roll_rad=roll_rad,
+                pitch_rad=pitch_rad,
+                yaw_rad=yaw_rad,
                 timestamp_s=now_s,
             )
             time_boot_ms = getattr(message, "time_boot_ms", None)

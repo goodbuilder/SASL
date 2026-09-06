@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
 from Workstation.workstation_core.measurement_methods import MEASUREMENT_METHOD_IDS
+from Workstation.workstation_core.strict_jsonl import sha256_file
 
 
 ROLE_SOURCES = {
@@ -156,14 +156,6 @@ def _resolve_inside(root: Path, relative_path: object) -> Path:
     return resolved
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _read_verified_jsonl(
     path: Path,
     descriptor: Mapping[str, object],
@@ -172,7 +164,7 @@ def _read_verified_jsonl(
     if expected_size is None or int(expected_size) != path.stat().st_size:
         raise OSError("authoritative JSONL size does not match measurement manifest")
     expected_sha = str(descriptor.get("sha256") or "")
-    if len(expected_sha) != 64 or _sha256(path) != expected_sha:
+    if len(expected_sha) != 64 or sha256_file(path) != expected_sha:
         raise OSError("authoritative JSONL SHA-256 does not match measurement manifest")
     payload = path.read_bytes()
     if payload and not payload.endswith(b"\n"):
@@ -319,7 +311,7 @@ def read_measurement_stream(
             "media_type": "application/vnd.apache.parquet",
             "relative_path": path.relative_to(root).as_posix(),
             "size_bytes": path.stat().st_size,
-            "sha256": _sha256(path),
+            "sha256": sha256_file(path),
             "authoritative": True,
             "legacy_compatibility": "parquet_only",
         },

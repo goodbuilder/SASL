@@ -51,7 +51,9 @@ from Workstation.workstation_core.mavlink_sources import (
 )
 from Workstation.workstation_core.strict_jsonl import (
     append_jsonl_record,
+    fsync_directory,
     prepare_jsonl_append,
+    sha256_file,
 )
 from Workstation.workstation_core.measurement_data_store import creation_timestamp_text
 
@@ -864,13 +866,7 @@ class ULogController:
 
     @staticmethod
     def _sha256_file(path: Path) -> str:
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            while True:
-                chunk = handle.read(1024 * 1024)
-                if not chunk:
-                    return digest.hexdigest()
-                digest.update(chunk)
+        return sha256_file(path)
 
     @staticmethod
     def _append_json_line(path: Path, value: Mapping[str, Any]) -> None:
@@ -904,11 +900,7 @@ class ULogController:
 
     @staticmethod
     def _fsync_directory(path: Path) -> None:
-        descriptor = os.open(path, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        fsync_directory(path)
 
 
 __all__ = [

@@ -17,6 +17,7 @@ from Workstation.workstation_core.native_frame_ring import (
     FrameKey,
     SharedNativeFrameRing,
 )
+from Workstation.workstation_core.qimage_convert import qimage_from_bgr
 from Workstation.workstation_core.yolo_stream import (
     DEFAULT_PREVIEW_DISPLAY_RATE_HZ,
     YoloStreamWorker,
@@ -112,6 +113,16 @@ class _CameraStreamSignalAdapter(QtCore.QObject):
             pane._emit_native_measurement_frame_if_current(
                 self._generation,
                 metadata,
+                image,
+            )
+
+    @QtCore.pyqtSlot(float, QtGui.QImage)
+    def measurement_frame(self, timestamp_s: float, image: QtGui.QImage) -> None:
+        pane = self._pane_ref()
+        if pane is not None:
+            pane._store_measurement_frame_if_current(
+                self._generation,
+                timestamp_s,
                 image,
             )
 
@@ -266,6 +277,16 @@ class CameraPane(QtWidgets.QGroupBox):
         # only lightweight descriptors through preview/detection metadata.
         self.worker.detection_ready.connect(
             adapter.detection,
+        )
+        # Feeds the measurement_frame_images fallback cache used by
+        # native_measurement_frame()/calibration_native_frame_near() when the
+        # native_frame_ring has no close-enough descriptor. Only emitted by
+        # the worker when its "emit_measurement_frames" config is enabled.
+        self.worker.measurement_frame_ready.connect(
+            adapter.measurement_frame,
+        )
+        self.worker.native_measurement_frame_ready.connect(
+            adapter.native_frame,
         )
         self.worker.stats_ready.connect(
             adapter.stats,
@@ -619,23 +640,7 @@ class CameraPane(QtWidgets.QGroupBox):
         width: int,
         height: int,
     ) -> QtGui.QImage:
-        bytes_per_line = int(width) * 3
-        bgr_format = getattr(QtGui.QImage, "Format_BGR888", None)
-        if bgr_format is not None:
-            return QtGui.QImage(
-                data,
-                int(width),
-                int(height),
-                bytes_per_line,
-                bgr_format,
-            ).copy()
-        return QtGui.QImage(
-            data,
-            int(width),
-            int(height),
-            bytes_per_line,
-            QtGui.QImage.Format_RGB888,
-        ).rgbSwapped()
+        return qimage_from_bgr(data, width=width, height=height)
 
     def native_frame_for_key(
         self,

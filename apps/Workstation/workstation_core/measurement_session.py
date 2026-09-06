@@ -32,6 +32,7 @@ from Workstation.workstation_core.measurement_package import (
     sha256_file,
     verify_package,
 )
+from Workstation.workstation_core.strict_jsonl import fsync_directory as _fsync_directory
 
 
 SESSION_SCHEMA = "workstation-measurement-session-v1"
@@ -166,14 +167,6 @@ def _load_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{path.name} must contain a JSON object")
     return dict(_json_safe(value))
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def _atomic_write_bytes(path: Path, payload: bytes, *, replace: bool = True) -> None:

@@ -15,11 +15,12 @@ assumed to be ellipsoidal unless its vertical datum is explicitly declared.
 
 from __future__ import annotations
 
-import hashlib
 import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from Workstation.workstation_core.strict_jsonl import sha256_file
 
 
 class TerrainDependencyError(RuntimeError):
@@ -35,14 +36,6 @@ def _terrain_dependencies() -> tuple[Any, Any]:
             "GeoTIFF pose requires rasterio>=1.3 and pyproj>=3.5; raw recording remains available"
         ) from exc
     return rasterio, Transformer
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -112,7 +105,7 @@ def inspect_geotiff(path: Path | str, *, vertical_datum: str) -> TerrainMetadata
             datum = ""
         return TerrainMetadata(
             path=str(source),
-            sha256=_sha256(source),
+            sha256=sha256_file(source),
             width=int(dataset.width),
             height=int(dataset.height),
             band_count=int(dataset.count),

@@ -425,61 +425,6 @@ def test_package_bytes_cannot_override_live_terminal_integrity_failure(
     assert descriptor["metadata"]["recording_finalization_boundary_valid"] is False
 
 
-def test_gstreamer_eos_reports_success_only_after_integrity_pass() -> None:
-    from Workstation.workstation_core import yolo_stream
-
-    messages: list[object] = []
-
-    class Gst:
-        class Event:
-            @staticmethod
-            def new_eos() -> str:
-                return "EOS"
-
-        class MessageType:
-            ERROR = 1
-            EOS = 2
-
-    pipeline = SimpleNamespace(send_event=lambda event: event == "EOS")
-    bus = SimpleNamespace(
-        timed_pop_filtered=lambda *_args: SimpleNamespace(type=Gst.MessageType.EOS)
-    )
-    queue = SimpleNamespace(put=messages.append)
-    validation = {
-        "integrity_schema": H264_MP4_INTEGRITY_SCHEMA,
-        "integrity_validation_status": "PASS",
-        "integrity_failure_reasons": [],
-        "recording_usable": True,
-        "recording_integrity_verified": True,
-        "sample_count": 3,
-        "decoded_frame_count": 3,
-        "h264_usable_idr_present": True,
-        "sample_timing_valid": True,
-    }
-
-    assert yolo_stream._finalize_gst_recording(
-        Gst,
-        pipeline,
-        bus,
-        queue,
-        "/tmp/validator-injected.mp4",
-        config={
-            "_recording_integrity_validator": lambda *_args, **_kwargs: validation,
-        },
-    ) is True
-
-    event = next(
-        payload
-        for kind, payload in messages
-        if kind == "recording_finalized"
-    )
-    assert event["container_finalization_success"] is True
-    assert event["success"] is True
-    assert event["recording_integrity_verified"] is True
-    assert event["recording_usable"] is True
-    assert event["integrity_validation_status"] == "PASS"
-
-
 def test_video_finalized_persistence_preserves_validated_pass(tmp_path: Path) -> None:
     from Workstation.camera_stream_controller import CameraStreamLifecycleController
 
@@ -523,53 +468,45 @@ def test_video_finalized_persistence_preserves_validated_pass(tmp_path: Path) ->
     assert artifacts[0]["recording_integrity_verified"] is True
 
 
-def test_measurement_worker_requires_copy_integrity_for_gstreamer(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    from Workstation.measurement_package_controller import (
-        _VideoEvidenceVerificationWorker,
+def test_gstreamer_worker_wires_h264_copy_integrity_validator(tmp_path: Path) -> None:
+    """The GStreamer EOS handler in yolo_stream.py finalizes a raw H.264 copy
+    recording by calling ``finalization_config["_recording_integrity_validator"]``
+    (see the comment above the corresponding EOS handling code). This used to
+    be populated by the now-deleted measurement_package_controller.py's
+    "package worker" as a later, separate pass -- which never actually ran in
+    production since nothing wired it up (see workstation_core/yolo_stream.py's
+    stale comment referencing it). It is now wired directly into
+    YoloStreamWorker.config so real H.264 copy integrity validation actually
+    happens live instead of leaving every such recording stuck at PENDING.
+    """
+    from Workstation.workstation_core.yolo_stream import YoloStreamWorker
+
+    worker = YoloStreamWorker(
+        url="rtsp://camera.invalid/visible",
+        weights_path="weights.pt",
+        device="cpu",
+        input_size=640,
+        conf_threshold=0.5,
+        iou_threshold=0.45,
+        max_rate_hz=0.0,
+        enable_detection=False,
+        stream_backend="gstreamer",
     )
-    from Workstation.workstation_core import media_evidence
 
-    video_dir = tmp_path / "video"
-    video_dir.mkdir()
-    for side in ("left", "right"):
-        _write_mp4_with_stts(video_dir / f"raw_{side}.mp4", (1000, 1000, 1000))
-    calls: list[str] = []
+    assert worker.config["_recording_integrity_validator"] is validate_h264_copy_mp4_integrity
 
-    def fail_integrity(path: Path, **_kwargs: Any) -> dict[str, Any]:
-        calls.append(Path(path).name)
-        return {
-            "integrity_schema": H264_MP4_INTEGRITY_SCHEMA,
-            "integrity_validation_status": "FAIL",
-            "integrity_failure_reasons": ["integrity_h264_usable_idr_missing"],
-            "recording_usable": False,
-            "recording_integrity_verified": False,
-        }
-
-    monkeypatch.setattr(
-        media_evidence,
-        "validate_h264_copy_mp4_integrity",
-        fail_integrity,
-    )
-    result_box: dict[str, object] = {}
-    worker = _VideoEvidenceVerificationWorker(
-        root=tmp_path,
-        backend="gstreamer",
-        decoder="nvh264dec",
-        full_decode=False,
+    # A finalized MP4 with no usable H.264 access units must be reported as a
+    # real integrity failure through the exact same helper the live EOS
+    # handler calls -- not silently left as a "package worker will check this
+    # later" placeholder.
+    video_path = tmp_path / "raw_left.mp4"
+    _write_mp4_with_stts(video_path, (1000, 1000, 1000))
+    result = worker.config["_recording_integrity_validator"](
+        video_path,
         probe_runner=_standard_probe_runner,
-        result_box=result_box,
     )
 
-    worker.run()
-
-    assert calls == ["raw_left.mp4", "raw_right.mp4"]
-    descriptors = result_box["descriptors"]
-    assert isinstance(descriptors, list)
-    assert [item["status"] for item in descriptors] == ["failed", "failed"]
-    assert all(
-        item["metadata"]["recording_usable"] is False
-        for item in descriptors
-    )
+    assert result["integrity_schema"] == H264_MP4_INTEGRITY_SCHEMA
+    assert result["integrity_validation_status"] == "FAIL"
+    assert result["recording_usable"] is False
+    assert result["recording_integrity_verified"] is False

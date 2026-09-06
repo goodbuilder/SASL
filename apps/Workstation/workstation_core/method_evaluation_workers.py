@@ -700,8 +700,9 @@ class MethodEvaluationCoordinator:
         *,
         planned_methods: Mapping[str, str] | None = None,
     ) -> MethodEvaluationSubmission:
-        if self._close_requested:
-            raise RuntimeError("method evaluation coordinator is closed")
+        if self._close_requested or self._closed_event.is_set():
+            reason = self._actor_error or "method evaluation coordinator is closed"
+            raise RuntimeError(reason)
         frozen = validate_submission(requests)
         first = frozen[0]
         key = (first.pair_id, first.request_generation)

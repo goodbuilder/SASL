@@ -43,11 +43,16 @@ def _sha256_bytes(payload: bytes) -> str:
 
 
 def _sha256_path(path: Path) -> str:
+    # Deliberately NOT shared with workstation_core.strict_jsonl.sha256_file:
+    # this verifier is stdlib-only by design (see module docstring) so it
+    # never trusts the implementation it is independently auditing.
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
 
 
 def _iter_jsonl(path: Path) -> Iterator[tuple[int, str, dict[str, Any]]]:
@@ -294,7 +299,18 @@ def _runtime_stream_path(root: Path, stem: str, runtime: str) -> Path:
                     return path
         except (OSError, UnicodeError):
             continue
-    return fixed if fixed.exists() else candidates[-1]
+    # Apply the same symlink distrust as the search loop above: a symlinked
+    # candidate must not be preferred just because nothing matched the
+    # runtime marker, or tampering could swap in a symlink to attacker
+    # controlled content and still have it silently accepted here.
+    regular_candidates = [
+        path for path in candidates if path.is_file() and not path.is_symlink()
+    ]
+    if fixed.is_file() and not fixed.is_symlink():
+        return fixed
+    if regular_candidates:
+        return regular_candidates[-1]
+    return candidates[-1]
 
 
 def audit_native_evidence(

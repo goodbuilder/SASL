@@ -4883,7 +4883,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
         self._build_single_pixhawk_sensor_tab(pixhawk_1_layout, "left", "Pixhawk 1")
         self._build_single_pixhawk_sensor_tab(pixhawk_2_layout, "right", "Pixhawk 2")
-        self._build_px4_mag_manager_panel(yaw_layout)
+        self._build_px4_mag_manager_panel(yaw_layout, panel_key="sensor_tab")
         yaw_layout.addStretch(1)
 
     def _build_alignment_signal_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
@@ -6907,34 +6907,90 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.alignment_profile_status_label.setText(f"Alignment Profile 불러옴: {path}")
         self._refresh_alignment_validation()
 
-    def _build_px4_mag_manager_panel(self, layout: QtWidgets.QVBoxLayout, *, collapsible: bool = True) -> None:
+    @staticmethod
+    def _px4_mag_registry_key_camera(key: object) -> object:
+        """Return the camera-side component of a PX4 MAG widget-registry key.
+
+        Registry keys are ``(camera, panel_key)`` tuples so that multiple
+        simultaneously-visible panels (e.g. the Alignment tab manager panel
+        and the Pixhawk sensor tab manager panel) can each keep their own
+        widgets without one panel's build silently overwriting another
+        panel's entries for the same camera side.
+        """
+        return key[0] if isinstance(key, tuple) else key
+
+    def _px4_mag_registry_values(self, registry: dict, camera: str) -> list:
+        """Return every widget registered for *camera* across all PX4 MAG panels."""
+        return [
+            value
+            for key, value in registry.items()
+            if self._px4_mag_registry_key_camera(key) == camera
+        ]
+
+    def _px4_mag_registry_get(self, registry: dict, camera: str, panel_key: str | None):
+        """Return the widget for (*camera*, *panel_key*), falling back to any panel's entry."""
+        if panel_key is not None:
+            value = registry.get((camera, panel_key))
+            if value is not None:
+                return value
+        values = self._px4_mag_registry_values(registry, camera)
+        return values[0] if values else None
+
+    def _ensure_px4_mag_widget_registries(self) -> None:
+        if not hasattr(self, "px4_mag_tables"):
+            self.px4_mag_tables: dict[tuple[str, str], QtWidgets.QTableWidget] = {}
+        if not hasattr(self, "px4_mag_status_labels"):
+            self.px4_mag_status_labels: dict[tuple[str, str], QtWidgets.QLabel] = {}
+        if not hasattr(self, "px4_mag_refresh_buttons"):
+            self.px4_mag_refresh_buttons: dict[tuple[str, str], QtWidgets.QPushButton] = {}
+        if not hasattr(self, "px4_mag_apply_manual_buttons"):
+            self.px4_mag_apply_manual_buttons: dict[tuple[str, str], QtWidgets.QPushButton] = {}
+        if not hasattr(self, "px4_mag_save_buttons"):
+            self.px4_mag_save_buttons: dict[tuple[str, str], QtWidgets.QPushButton] = {}
+        if not hasattr(self, "px4_mag_reboot_buttons"):
+            self.px4_mag_reboot_buttons: dict[tuple[str, str], QtWidgets.QPushButton] = {}
+        if not hasattr(self, "px4_mag_priority_spins"):
+            # Kept under the historical ``*_spins`` attribute name for backend
+            # compatibility; the controls now expose PX4's semantic priority enum.
+            self.px4_mag_priority_spins: dict[tuple[str, str], dict[str, QtWidgets.QComboBox]] = {}
+
+    def _build_px4_mag_manager_panel(
+        self,
+        layout: QtWidgets.QVBoxLayout,
+        *,
+        collapsible: bool = True,
+        panel_key: str = "manager",
+    ) -> None:
         group = QtWidgets.QGroupBox("PX4 Magnetometer 역할 / Priority 관리")
         group.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
         group_layout = QtWidgets.QVBoxLayout(group)
 
-        self.px4_mag_tables: dict[str, QtWidgets.QTableWidget] = {}
-        self.px4_mag_status_labels: dict[str, QtWidgets.QLabel] = {}
-        self.px4_mag_refresh_buttons: dict[str, QtWidgets.QPushButton] = {}
-        self.px4_mag_apply_manual_buttons: dict[str, QtWidgets.QPushButton] = {}
-        self.px4_mag_save_buttons: dict[str, QtWidgets.QPushButton] = {}
-        self.px4_mag_reboot_buttons: dict[str, QtWidgets.QPushButton] = {}
-        # Kept under the historical ``*_spins`` attribute name for backend
-        # compatibility; the controls now expose PX4's semantic priority enum.
-        self.px4_mag_priority_spins: dict[str, dict[str, QtWidgets.QComboBox]] = {}
+        # NOTE: these registries persist across repeated calls (they are only
+        # created if missing) and are keyed by (camera, panel_key) so that a
+        # second call for a different panel (e.g. a Pixhawk sensor tab
+        # instance of this same manager panel) does not silently replace the
+        # widgets registered by an earlier call for a different panel.
+        self._ensure_px4_mag_widget_registries()
 
-        self.px4_mag_tab_widget = QtWidgets.QTabWidget()
+        tab_widget = QtWidgets.QTabWidget()
         for camera, title in (("left", "Pixhawk 1"), ("right", "Pixhawk 2")):
             tab = QtWidgets.QWidget()
             tab_layout = QtWidgets.QVBoxLayout(tab)
-            self._build_single_px4_mag_manager_tab(tab_layout, camera)
-            self.px4_mag_tab_widget.addTab(tab, title)
-        group_layout.addWidget(self.px4_mag_tab_widget)
+            self._build_single_px4_mag_manager_tab(tab_layout, camera, panel_key)
+            tab_widget.addTab(tab, title)
+        # Stored per panel_key (not a single shared ``px4_mag_tab_widget``
+        # attribute) so a second panel instance does not overwrite the first
+        # panel's tab-widget reference.
+        setattr(self, f"px4_mag_tab_widget_{panel_key}", tab_widget)
+        group_layout.addWidget(tab_widget)
         layout.addWidget(group)
         if collapsible:
             self._configure_collapsible_group(group, checked=False)
         self.refresh_px4_mag_manager()
 
-    def _build_single_px4_mag_manager_tab(self, layout: QtWidgets.QVBoxLayout, camera: str) -> None:
+    def _build_single_px4_mag_manager_tab(
+        self, layout: QtWidgets.QVBoxLayout, camera: str, panel_key: str = "manager"
+    ) -> None:
         control_row = QtWidgets.QHBoxLayout()
         refresh_button = QtWidgets.QPushButton("새로고침")
         apply_manual_button = QtWidgets.QPushButton("수동 Priority 적용")
@@ -6960,7 +7016,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         manual_layout = QtWidgets.QGridLayout(manual_group)
         manual_layout.setColumnStretch(1, 1)
         default_priorities = {key: 0 for key in MAG_PRIORITY_KEYS}
-        self.px4_mag_priority_spins[camera] = {}
+        registry_key = (camera, panel_key)
+        self.px4_mag_priority_spins[registry_key] = {}
         for row, slot_key in enumerate(MAG_PRIORITY_KEYS):
             spin = _build_px4_priority_combo(default_priorities[slot_key])
             spin.setToolTip(
@@ -6969,7 +7026,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             )
             manual_layout.addWidget(QtWidgets.QLabel(slot_key), row, 0)
             manual_layout.addWidget(spin, row, 1)
-            self.px4_mag_priority_spins[camera][slot_key] = spin
+            self.px4_mag_priority_spins[registry_key][slot_key] = spin
         manual_note = QtWidgets.QLabel(
             "PX4 값: Uninitialized=-1, Disabled=0, Min=1, Low=25, Medium=50, High=75, Max=100. "
             "기존의 비표준 값은 Custom으로 보존합니다. MAVLink heartbeat + PARAM readback 상태에서만 적용됩니다."
@@ -6979,16 +7036,18 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         manual_layout.addWidget(manual_note, len(default_priorities), 0, 1, 2)
         layout.addWidget(manual_group)
 
-        self.px4_mag_refresh_buttons[camera] = refresh_button
-        self.px4_mag_apply_manual_buttons[camera] = apply_manual_button
-        self.px4_mag_save_buttons[camera] = save_button
-        self.px4_mag_reboot_buttons[camera] = reboot_button
-        self.px4_mag_status_labels[camera] = status_label
+        self.px4_mag_refresh_buttons[registry_key] = refresh_button
+        self.px4_mag_apply_manual_buttons[registry_key] = apply_manual_button
+        self.px4_mag_save_buttons[registry_key] = save_button
+        self.px4_mag_reboot_buttons[registry_key] = reboot_button
+        self.px4_mag_status_labels[registry_key] = status_label
 
         refresh_button.clicked.connect(
             lambda _checked=False, side=camera: self.refresh_px4_mag_manager(side, read_params=True)
         )
-        apply_manual_button.clicked.connect(lambda _checked=False, side=camera: self.apply_manual_mag_priorities_from_panel(side))
+        apply_manual_button.clicked.connect(
+            lambda _checked=False, side=camera, pk=panel_key: self.apply_manual_mag_priorities_from_panel(side, panel_key=pk)
+        )
         save_button.clicked.connect(lambda _checked=False, side=camera: self.save_px4_mag_params_from_panel(side))
         reboot_button.clicked.connect(lambda _checked=False, side=camera: self.reboot_px4_from_panel(side))
 
@@ -7041,7 +7100,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             lambda _checked=False, side=camera: self.refresh_px4_attitude_cal_status(side, read_params=True)
         )
 
-    def _build_px4_mag_detail_panel(self, layout: QtWidgets.QVBoxLayout) -> None:
+    def _build_px4_mag_detail_panel(self, layout: QtWidgets.QVBoxLayout, *, panel_key: str = "detail") -> None:
         group = QtWidgets.QGroupBox("PX4 MAG 고급 상세: CAL_MAG 슬롯 / Priority")
         group_layout = QtWidgets.QVBoxLayout(group)
         note = QtWidgets.QLabel(
@@ -7052,7 +7111,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         note.setWordWrap(True)
         group_layout.addWidget(note)
 
-        self.px4_mag_tab_widget = QtWidgets.QTabWidget()
+        self._ensure_px4_mag_widget_registries()
+        tab_widget = QtWidgets.QTabWidget()
         for camera, title in (("left", "Pixhawk 1"), ("right", "Pixhawk 2")):
             tab = QtWidgets.QWidget()
             tab_layout = QtWidgets.QVBoxLayout(tab)
@@ -7080,9 +7140,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             table.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
             table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
             tab_layout.addWidget(table)
-            self.px4_mag_tables[camera] = table
-            self.px4_mag_tab_widget.addTab(tab, title)
-        group_layout.addWidget(self.px4_mag_tab_widget)
+            self.px4_mag_tables[(camera, panel_key)] = table
+            tab_widget.addTab(tab, title)
+        setattr(self, f"px4_mag_tab_widget_{panel_key}", tab_widget)
+        group_layout.addWidget(tab_widget)
         layout.addWidget(group)
         self.refresh_px4_mag_manager()
 
@@ -8507,6 +8568,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.left_url_edit.setText(self._swap_line_edit_text(self.left_url_edit, self.right_url_edit))
         self.left_rtsp_ip_edit.setText(self._swap_line_edit_text(self.left_rtsp_ip_edit, self.right_rtsp_ip_edit))
         self.left_zoom_host_edit.setText(self._swap_line_edit_text(self.left_zoom_host_edit, self.right_zoom_host_edit))
+        self.left_stip_ip_edit.setText(self._swap_line_edit_text(self.left_stip_ip_edit, self.right_stip_ip_edit))
+        left_control_port = self._control_port_for_camera("left")
+        right_control_port = self._control_port_for_camera("right")
+        self._set_control_port_for_camera("left", right_control_port)
+        self._set_control_port_for_camera("right", left_control_port)
         self._log("[카메라] Left/Right 카메라 매핑을 교체했습니다.")
         if cameras_running:
             self._start_camera_streams(enable_detection=detection_was_enabled, switch_to_depth=False)
@@ -11966,28 +12032,27 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         actions_enabled: bool,
         tooltip: str = "",
     ) -> None:
-        refresh_button = self.px4_mag_refresh_buttons.get(camera)
-        if refresh_button is not None:
+        for refresh_button in self._px4_mag_registry_values(self.px4_mag_refresh_buttons, camera):
             refresh_button.setEnabled(refresh_enabled)
             refresh_button.setToolTip("" if refresh_enabled else tooltip)
-        for button in (
-            self.px4_mag_apply_manual_buttons.get(camera),
-            self.px4_mag_save_buttons.get(camera),
-            self.px4_mag_reboot_buttons.get(camera),
+        for registry in (
+            self.px4_mag_apply_manual_buttons,
+            self.px4_mag_save_buttons,
+            self.px4_mag_reboot_buttons,
         ):
-            if button is None:
-                continue
-            button.setEnabled(actions_enabled)
-            button.setToolTip("" if actions_enabled else tooltip)
+            for button in self._px4_mag_registry_values(registry, camera):
+                button.setEnabled(actions_enabled)
+                button.setToolTip("" if actions_enabled else tooltip)
 
     def _clear_px4_mag_manager_ui(self, camera: str) -> None:
         if not hasattr(self, "px4_mag_tables"):
             return
-        table = self.px4_mag_tables.get(camera)
-        status_label = self.px4_mag_status_labels.get(camera)
-        if table is not None:
+        # Update every panel instance registered for this camera (e.g. the
+        # manager panel's status label and the detail panel's table), not
+        # just whichever panel happened to be built most recently.
+        for table in self._px4_mag_registry_values(self.px4_mag_tables, camera):
             table.setRowCount(0)
-        if status_label is not None:
+        for status_label in self._px4_mag_registry_values(self.px4_mag_status_labels, camera):
             status_label.setText(
                 f"{self._px4_mag_camera_label(camera)} | 픽스호크 MAG 관리: MAVLink 수신 대기 중\n"
                 "MAVLink에서 실제 MAG device_id를 수신하면 관리 내용이 표시됩니다."
@@ -12022,8 +12087,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._clear_px4_mag_manager_ui(side)
 
     def _render_px4_mag_mavlink_pending_status(self, camera: str) -> None:
-        status_label = self.px4_mag_status_labels.get(camera) if hasattr(self, "px4_mag_status_labels") else None
-        if status_label is not None:
+        status_labels = (
+            self._px4_mag_registry_values(self.px4_mag_status_labels, camera)
+            if hasattr(self, "px4_mag_status_labels")
+            else []
+        )
+        for status_label in status_labels:
             actual = self.latest_vehicle_mag_device_ids.get(camera)
             status_label.setText(
                 f"{self._px4_mag_camera_label(camera)} | Actual selected MAG: "
@@ -12202,7 +12271,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 return int(getattr(candidate, "slot"))
         return None
 
-    def apply_manual_mag_priorities_from_panel(self, camera: str = "left") -> None:
+    def apply_manual_mag_priorities_from_panel(self, camera: str = "left", *, panel_key: str | None = None) -> None:
         manager = self.px4_mag_managers[camera]
         label = self._px4_mag_camera_label(camera)
         if not self._px4_mag_manager_has_data_source(camera):
@@ -12221,7 +12290,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             )
             self.refresh_px4_mag_manager(camera, read_params=True)
             return
-        spins = self.px4_mag_priority_spins.get(camera, {})
+        # Read from the specific panel instance whose button triggered this
+        # (falling back to any registered panel for this camera) so a manual
+        # priority edit made in one panel isn't silently discarded in favor
+        # of another simultaneously-visible panel's values.
+        spins = self._px4_mag_registry_get(self.px4_mag_priority_spins, camera, panel_key) or {}
         desired = {slot_key: _px4_priority_combo_value(spin) for slot_key, spin in spins.items()}
         if using_mavlink_params:
             if self._start_pixhawk_parameter_worker(
@@ -12317,17 +12390,20 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._px4_mag_status_cache[camera] = status
         if not hasattr(self, "px4_mag_tables"):
             return
-        priority_controls = self.px4_mag_priority_spins.get(camera, {})
-        for slot in status.slots:
-            slot_key = mag_priority_slot_key(slot.slot)
-            if slot_key not in priority_controls or slot.priority is None:
-                continue
-            _set_px4_priority_combo_value(priority_controls[slot_key], slot.priority)
-        table = self.px4_mag_tables.get(camera)
-        status_label = self.px4_mag_status_labels.get(camera)
-        if status_label is None:
+        # Update every panel instance registered for this camera (manager
+        # panel(s) and the detail panel) rather than only whichever panel
+        # happened to be built most recently.
+        for priority_controls in self._px4_mag_registry_values(self.px4_mag_priority_spins, camera):
+            for slot in status.slots:
+                slot_key = mag_priority_slot_key(slot.slot)
+                if slot_key not in priority_controls or slot.priority is None:
+                    continue
+                _set_px4_priority_combo_value(priority_controls[slot_key], slot.priority)
+        tables = self._px4_mag_registry_values(self.px4_mag_tables, camera)
+        status_labels = self._px4_mag_registry_values(self.px4_mag_status_labels, camera)
+        if not status_labels:
             return
-        if table is not None:
+        for table in tables:
             table.setRowCount(len(status.slots))
             for row, slot in enumerate(status.slots):
                 values = [
@@ -12364,7 +12440,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "Save/Reboot: QGC 또는 PX4 shell에서 `param save` 후 reboot 필요\n"
             f"{warning}"
         )
-        status_label.setText(text)
+        for status_label in status_labels:
+            status_label.setText(text)
         disable_actions = bool(status.armed)
         self._set_px4_mag_manager_button_state(
             camera,

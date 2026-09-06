@@ -23,6 +23,7 @@ from Workstation.runtime_paths import WORKSTATION_MODELS_ROOT
 from Workstation.workstation_core.error_throttle import should_emit_throttled_error
 from Workstation.workstation_core.mp4_integrity import (
     H264_MP4_INTEGRITY_SCHEMA,
+    validate_h264_copy_mp4_integrity,
 )
 from Workstation.workstation_core.native_frame_ring import (
     DEFAULT_NATIVE_MAX_HEIGHT,
@@ -80,9 +81,6 @@ RTSP_RECONNECT_MANUAL = "manual"
 RTSP_RECONNECT_AUTOMATIC = "automatic"
 NVIDIA_H264_DECODER = "nvh264dec"
 SOFTWARE_H264_DECODER = "avdec_h264"
-RED_BGR = (0, 0, 255)
-NEUTRAL_BGR = (128, 128, 128)
-WHITE_BGR = (255, 255, 255)
 RTP_CLOCK_RATE_HZ = 90_000
 NTP_UNIX_EPOCH_OFFSET_S = 2_208_988_800
 UINT32_MODULUS = 2**32
@@ -271,53 +269,6 @@ def detections_from_ultralytics_result(result, *, names: object | None = None) -
     return detections
 
 
-def _draw_label(cv2, image, text: str, origin: tuple[int, int], color: tuple[int, int, int]) -> None:
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = 0.55
-    thickness = 1
-    (text_width, text_height), baseline = cv2.getTextSize(text, font, scale, thickness)
-    x, y = origin
-    y = max(text_height + baseline + 2, y)
-    cv2.rectangle(
-        image,
-        (x, y - text_height - baseline - 4),
-        (x + text_width + 6, y + baseline + 2),
-        color,
-        -1,
-    )
-    cv2.putText(image, text, (x + 3, y - 3), font, scale, WHITE_BGR, thickness, cv2.LINE_AA)
-
-
-def _draw_detections(cv2, frame, detections: list[DetectionBox], best_detection: DetectionBox | None):
-    annotated = frame.copy()
-    for detection in detections:
-        is_best = detection is best_detection
-        color = RED_BGR if is_best else NEUTRAL_BGR
-        thickness = 3 if is_best else 2
-        x1 = int(round(detection.x1))
-        y1 = int(round(detection.y1))
-        x2 = int(round(detection.x2))
-        y2 = int(round(detection.y2))
-        center_x, center_y = detection.center
-        center = (int(round(center_x)), int(round(center_y)))
-
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness)
-        class_label = detection.class_name or f"class {detection.class_id}"
-        label = f"{class_label} {detection.confidence:.2f}"
-        if is_best:
-            label = f"BEST {label} c=({center[0]},{center[1]})"
-            cv2.drawMarker(
-                annotated,
-                center,
-                RED_BGR,
-                markerType=cv2.MARKER_CROSS,
-                markerSize=22,
-                thickness=2,
-            )
-        _draw_label(cv2, annotated, label, (x1, max(0, y1 - 8)), color)
-    return annotated
-
-
 def _emit_status(output_queue, text: str) -> None:
     output_queue.put(("status", text))
 
@@ -418,11 +369,25 @@ class AsyncVideoWriter:
         self.dropped_frames = 0
         self.written_frames = 0
         self._last_drop_status_s = 0.0
+        self._writer_thread_dead_reported = False
         self.thread = threading.Thread(target=self._run, name="stereo-video-writer", daemon=True)
         self.thread.start()
 
     def enqueue(self, frame) -> None:
         if self.stop_event.is_set():
+            return
+        if not self.thread.is_alive():
+            # The writer thread exited on its own (e.g. cv2.VideoWriter
+            # failed to open) without stop_event being set. Stop pushing
+            # into a queue nobody will ever drain, and report the failure
+            # exactly once instead of spamming the same warning forever.
+            self.stop_event.set()
+            if not self._writer_thread_dead_reported:
+                self._writer_thread_dead_reported = True
+                _emit_status(
+                    self.output_queue,
+                    f"영상 녹화 writer 스레드가 예기치 않게 종료되어 프레임을 버립니다: {self.path}",
+                )
             return
         try:
             self.frames.put_nowait(frame)
@@ -1159,18 +1124,6 @@ def recording_integrity_contract(backend: str | None) -> dict[str, str | bool]:
         "recording_encoding_mode": RECORDING_ENCODING_DECODED_REENCODE_UNVERIFIED,
         "recording_integrity_verified": False,
         "recording_integrity_scope": "decoded-frames-only",
-    }
-
-
-def h264_copy_recording_integrity_contract() -> dict[str, str | bool]:
-    """Historical direct-copy contract retained for old finalization evidence."""
-
-    return {
-        "recording_encoding_mode": RECORDING_ENCODING_H264_COPY_GATED,
-        "recording_integrity_verified": False,
-        "recording_integrity_scope": (
-            "finalized-mp4:h264-idr+frame-num+decode-count+sample-timing"
-        ),
     }
 
 
@@ -2828,200 +2781,6 @@ def _launch_gst_pipeline(
     raise RuntimeError(last_error or "no usable decoder")
 
 
-def _finalize_gst_recording(
-    Gst,
-    pipeline,
-    bus,
-    output_queue,
-    record_video_path: str,
-    *,
-    config: dict[str, Any] | None = None,
-) -> bool:
-    if not record_video_path:
-        return True
-    finalization_config = config or {}
-    live_integrity_terminal_failure = bool(
-        finalization_config.get("_integrity_manual_reconnect_required", False)
-    )
-
-    def finish(
-        success: bool,
-        detail: str,
-        *,
-        container_success: bool = False,
-        validation: dict[str, Any] | None = None,
-    ) -> bool:
-        integrity = dict(validation or {})
-        if not integrity:
-            integrity = {
-                "integrity_validation_status": "NOT_RUN",
-                "integrity_failure_reasons": ["container_finalization_failed"],
-                "recording_usable": False,
-                "recording_integrity_verified": False,
-            }
-        _emit_recording_finalized(
-            output_queue,
-            path=record_video_path,
-            backend=STREAM_BACKEND_GSTREAMER,
-            success=success,
-            detail=detail,
-            contract=h264_copy_recording_integrity_contract(),
-            metrics={
-                "container_finalization_success": bool(container_success),
-                "integrity_terminal_failure": (
-                    "H264_IDR_RANDOM_ACCESS_UNAVAILABLE"
-                    if live_integrity_terminal_failure
-                    else ""
-                ),
-                "integrity_gap_events": int(
-                    finalization_config.get("_integrity_gap_events", 0) or 0
-                ),
-                "integrity_missing_packets": int(
-                    finalization_config.get("_integrity_missing_packets", 0) or 0
-                ),
-                "integrity_suppressed_decoded_frames": int(
-                    finalization_config.get("_integrity_suppressed_decoded_frames", 0)
-                    or 0
-                ),
-                **integrity,
-            },
-        )
-        return success
-
-    try:
-        if not pipeline.send_event(Gst.Event.new_eos()):
-            _emit_status(output_queue, f"GStreamer 녹화 EOS 전송 실패: {record_video_path}")
-            return finish(False, "EOS send failed")
-        deadline_s = time.monotonic() + GST_RECORDING_EOS_TIMEOUT_S
-        while time.monotonic() < deadline_s:
-            message = bus.timed_pop_filtered(
-                200_000_000,
-                Gst.MessageType.EOS | Gst.MessageType.ERROR,
-            )
-            if message is None:
-                continue
-            if message.type == Gst.MessageType.ERROR:
-                error, debug = message.parse_error()
-                detail = error.message if debug is None else f"{error.message} ({debug})"
-                _emit_status(output_queue, f"GStreamer 녹화 종료 오류: {detail}")
-                return finish(False, f"EOS bus error: {detail}")
-            if message.type == Gst.MessageType.EOS:
-                _emit_status(
-                    output_queue,
-                    f"GStreamer H264 원본 녹화 mux 저장 완료; "
-                    f"최종 MP4 무결성 검증 중: {record_video_path}",
-                )
-                validator = finalization_config.get("_recording_integrity_validator")
-                if callable(validator):
-                    try:
-                        validation = dict(validator(record_video_path))
-                    except Exception as exc:
-                        validation = {
-                            "integrity_validation_status": "FAIL",
-                            "integrity_failure_reasons": [
-                                f"integrity_validator_exception:{type(exc).__name__}"
-                            ],
-                            "recording_usable": False,
-                            "recording_integrity_verified": False,
-                        }
-                else:
-                    # Full decode/header/timing validation is intentionally not
-                    # run inside the camera child. EOS already consumes up to
-                    # nine seconds of its twelve-second cooperative stop budget;
-                    # the package worker validates the immutable bytes later.
-                    validation = {
-                        "integrity_schema": H264_MP4_INTEGRITY_SCHEMA,
-                        "integrity_validation_status": "PENDING",
-                        "integrity_failure_reasons": [
-                            "finalized_mp4_package_validation_pending"
-                        ],
-                        "recording_usable": False,
-                        "recording_integrity_verified": False,
-                    }
-
-                live_failures: list[str] = []
-                if live_integrity_terminal_failure:
-                    live_failures.append("live_h264_idr_random_access_unavailable")
-                if int(finalization_config.get("_integrity_gap_events", 0) or 0) > 0:
-                    live_failures.append("live_rtp_sequence_gap_detected")
-                if int(finalization_config.get("_integrity_missing_packets", 0) or 0) > 0:
-                    live_failures.append("live_rtp_missing_packet_detected")
-                if int(
-                    finalization_config.get("_integrity_suppressed_decoded_frames", 0)
-                    or 0
-                ) > 0:
-                    live_failures.append("live_decoder_frame_suppression_detected")
-                if live_failures:
-                    validation["integrity_failure_reasons"] = list(
-                        dict.fromkeys(
-                            [
-                                *tuple(validation.get("integrity_failure_reasons", ()) or ()),
-                                *live_failures,
-                            ]
-                        )
-                    )
-                    validation.update(
-                        integrity_validation_status="FAIL",
-                        recording_usable=False,
-                        recording_integrity_verified=False,
-                    )
-
-                usable = bool(
-                    validation.get("integrity_schema") == H264_MP4_INTEGRITY_SCHEMA
-                    and validation.get("integrity_validation_status") == "PASS"
-                    and validation.get("recording_usable") is True
-                    and validation.get("recording_integrity_verified") is True
-                )
-                if not usable:
-                    validation_failures = list(
-                        validation.get("integrity_failure_reasons", ()) or ()
-                    )
-                    if validation.get("integrity_schema") != H264_MP4_INTEGRITY_SCHEMA:
-                        validation_failures.append("integrity_validation_schema_invalid")
-                    if not validation_failures:
-                        validation_failures.append("integrity_validation_incomplete")
-                    validation.update(
-                        integrity_validation_status="FAIL",
-                        integrity_failure_reasons=list(
-                            dict.fromkeys(validation_failures)
-                        ),
-                        recording_usable=False,
-                        recording_integrity_verified=False,
-                    )
-                if usable:
-                    detail = "EOS received; mp4mux finalized; MP4 integrity PASS"
-                    _emit_status(
-                        output_queue,
-                        f"GStreamer H264 원본 녹화 무결성 PASS: {record_video_path}",
-                    )
-                else:
-                    reasons = ",".join(
-                        str(item)
-                        for item in tuple(
-                            validation.get("integrity_failure_reasons", ()) or ()
-                        )
-                    ) or "integrity_validation_incomplete"
-                    detail = (
-                        "EOS received; mp4mux finalized; MP4 integrity FAIL: "
-                        f"{reasons}"
-                    )
-                    _emit_status(
-                        output_queue,
-                        f"GStreamer H264 원본 녹화 무결성 FAIL: {reasons}",
-                    )
-                return finish(
-                    usable,
-                    detail,
-                    container_success=True,
-                    validation=validation,
-                )
-        _emit_status(output_queue, f"GStreamer 녹화 EOS 대기 시간 초과: {record_video_path}")
-        return finish(False, "EOS timeout")
-    except Exception as exc:
-        _emit_status(output_queue, f"GStreamer 녹화 종료 실패: {exc}")
-        return finish(False, f"{type(exc).__name__}: {exc}")
-
-
 def _load_yolo_model(config: dict[str, Any], output_queue, enable_detection: bool):
     if not enable_detection:
         return None
@@ -3049,11 +2808,9 @@ def _process_frame_for_output(
     output_queue,
     now_s: float,
     enable_detection: bool,
-    draw_preview_overlay: bool = False,
     timestamp_metadata: dict[str, Any] | None = None,
 ):
     height, width = frame.shape[:2]
-    annotated = frame
     best_detection = None
     inferred = False
     if enable_detection:
@@ -3109,8 +2866,6 @@ def _process_frame_for_output(
                 target=config.get("class_gate", ""),
             )
             best_detection = highest_confidence_detection(detections)
-            if draw_preview_overlay and best_detection is not None:
-                annotated = _draw_detections(cv2, frame, [best_detection], best_detection)
             inferred = True
             output_queue.put(
                 (
@@ -3126,7 +2881,7 @@ def _process_frame_for_output(
         except Exception as exc:
             _emit_status(output_queue, f"검출 결과 처리 오류: {exc}")
             return frame, None, False
-    return annotated, best_detection, inferred
+    return frame, best_detection, inferred
 
 
 def _publish_native_frame_to_ring(
@@ -3294,6 +3049,19 @@ def _yolo_device_stats(config: dict[str, Any]) -> tuple[str, str, bool]:
     active_device = str(config.get("_active_yolo_device") or "").strip()
     cpu_fallback = bool(config.get("_yolo_cpu_fallback_active", False))
     return requested_device, active_device, cpu_fallback
+
+
+def _resolve_frame_timeout_s(config: dict[str, Any]) -> float:
+    """Return the configured stall-detection timeout, matching the GStreamer path."""
+    try:
+        frame_timeout_s = float(
+            config.get("rtsp_frame_timeout_s", DEFAULT_RTSP_FRAME_TIMEOUT_S)
+        )
+    except (TypeError, ValueError):
+        frame_timeout_s = DEFAULT_RTSP_FRAME_TIMEOUT_S
+    if not math.isfinite(frame_timeout_s) or frame_timeout_s <= 0.0:
+        frame_timeout_s = DEFAULT_RTSP_FRAME_TIMEOUT_S
+    return frame_timeout_s
 
 
 def _run_gstreamer_stream_once(
@@ -3600,6 +3368,15 @@ def _run_gstreamer_stream_once(
                         if unverified_tolerant_frame
                         else f"GStreamer decoder frame verified: {active_decoder}"
                     ),
+                )
+            if config.get("emit_measurement_frames", False):
+                _emit_measurement_frame(
+                    cv2,
+                    frame,
+                    config,
+                    output_queue,
+                    timestamp_s=receive_s,
+                    timestamp_metadata=rtp_timing_metadata,
                 )
             with latest_lock:
                 latest_sequence += 1
@@ -3959,7 +3736,7 @@ def _run_gstreamer_stream_once(
                 if detection_timestamp_metadata.get("source_timestamp_s") is not None
                 else "app-receive",
             )
-            annotated, best_detection, inferred = _process_frame_for_output(
+            processed_frame, best_detection, inferred = _process_frame_for_output(
                 cv2,
                 frame,
                 model=model,
@@ -3967,10 +3744,9 @@ def _run_gstreamer_stream_once(
                 output_queue=output_queue,
                 now_s=float(frame_record["timestamp_s"]),
                 enable_detection=enable_detection,
-                draw_preview_overlay=True,
                 timestamp_metadata=detection_timestamp_metadata,
             )
-            if annotated is None:
+            if processed_frame is None:
                 time.sleep(0.2)
                 continue
             if config.get("_yolo_cpu_fallback_active"):
@@ -4199,9 +3975,12 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
     decoded_rate = RollingFrameRateEstimator()
     reader_stop = threading.Event()
     record_writer_state = None
+    stream_started_s = time.monotonic()
+    frame_timeout_s = _resolve_frame_timeout_s(config)
+    last_frame_received_s: float | None = None
 
     def reader_loop() -> None:
-        nonlocal displayed_frames, height, latest_frame, latest_sequence, record_writer_state, width
+        nonlocal displayed_frames, height, last_frame_received_s, latest_frame, latest_sequence, record_writer_state, width
         while not stop_event.is_set() and not reader_stop.is_set():
             ok, frame = cap.read()
             receive_monotonic_ns, receive_s = app_receive_monotonic_sample()
@@ -4210,6 +3989,7 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
                 continue
             with latest_lock:
                 decoded_rate.add(receive_s)
+                last_frame_received_s = time.monotonic()
             frame_height, frame_width = frame.shape[:2]
             if _record_video_path(config):
                 if record_writer_state is None:
@@ -4237,6 +4017,15 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
                 timestamp_source=f"{backend}-read",
                 extra_metadata=native_metadata,
             )
+            if config.get("emit_measurement_frames", False):
+                _emit_measurement_frame(
+                    cv2,
+                    frame,
+                    config,
+                    output_queue,
+                    timestamp_s=receive_s,
+                    timestamp_metadata=native_metadata,
+                )
             with latest_lock:
                 latest_sequence += 1
                 displayed_frames += int(preview_emitted)
@@ -4290,6 +4079,20 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
                 last_stats_s = now_s
             with latest_lock:
                 frame_record = None if latest_frame is None else dict(latest_frame)
+                last_receive_s = last_frame_received_s
+            frame_age_s = now_s - (stream_started_s if last_receive_s is None else last_receive_s)
+            if frame_age_s >= frame_timeout_s:
+                # cap.isOpened() can stay true even when the underlying
+                # source has stopped delivering fresh frames (e.g. a dead
+                # RTSP session). Bail out so the worker process exits and
+                # the supervising controller reconnects, matching the
+                # GStreamer backend's stall watchdog.
+                phase = "첫 프레임" if last_receive_s is None else "새 프레임"
+                _emit_status(
+                    output_queue,
+                    f"{backend_name} 프레임 타임아웃: {phase}이 {frame_age_s:.1f}s 동안 없습니다.",
+                )
+                break
             if frame_record is None:
                 if now_s - last_status_s > 1.0:
                     _emit_status(output_queue, f"{backend_name} 프레임 수신 대기 중")
@@ -4317,7 +4120,7 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
             detection_timestamp_metadata.update(
                 dict(frame_record.get("native_metadata") or {})
             )
-            annotated, best_detection, inferred = _process_frame_for_output(
+            processed_frame, best_detection, inferred = _process_frame_for_output(
                 cv2,
                 frame,
                 model=model,
@@ -4325,10 +4128,9 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
                 output_queue=output_queue,
                 now_s=float(frame_record["timestamp_s"]),
                 enable_detection=enable_detection,
-                draw_preview_overlay=True,
                 timestamp_metadata=detection_timestamp_metadata,
             )
-            if annotated is None:
+            if processed_frame is None:
                 time.sleep(0.2)
                 continue
             if config.get("_yolo_cpu_fallback_active"):
@@ -4387,9 +4189,12 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
     decoded_rate = RollingFrameRateEstimator()
     reader_stop = threading.Event()
     record_writer_state = None
+    stream_started_s = time.monotonic()
+    frame_timeout_s = _resolve_frame_timeout_s(config)
+    last_frame_received_s: float | None = None
 
     def reader_loop() -> None:
-        nonlocal displayed_frames, height, latest_frame, latest_sequence, record_writer_state, width
+        nonlocal displayed_frames, height, last_frame_received_s, latest_frame, latest_sequence, record_writer_state, width
         try:
             for packet in container.demux(video_stream):
                 if stop_event.is_set() or reader_stop.is_set():
@@ -4400,6 +4205,7 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
                     receive_monotonic_ns, receive_s = app_receive_monotonic_sample()
                     with latest_lock:
                         decoded_rate.add(receive_s)
+                        last_frame_received_s = time.monotonic()
                     frame = av_frame.to_ndarray(format="bgr24")
                     frame_height, frame_width = frame.shape[:2]
                     if _record_video_path(config):
@@ -4442,6 +4248,15 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
                         timestamp_source=timestamp_source,
                         extra_metadata=native_metadata,
                     )
+                    if config.get("emit_measurement_frames", False):
+                        _emit_measurement_frame(
+                            cv2,
+                            frame,
+                            config,
+                            output_queue,
+                            timestamp_s=receive_s,
+                            timestamp_metadata=native_metadata,
+                        )
                     with latest_lock:
                         latest_sequence += 1
                         displayed_frames += int(preview_emitted)
@@ -4501,6 +4316,20 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
                 last_stats_s = now_s
             with latest_lock:
                 frame_record = None if latest_frame is None else dict(latest_frame)
+                last_receive_s = last_frame_received_s
+            frame_age_s = now_s - (stream_started_s if last_receive_s is None else last_receive_s)
+            if frame_age_s >= frame_timeout_s:
+                # The demux/decode loop can keep the container "open" while
+                # silently stalling (e.g. a dead RTSP session). Bail out so
+                # the worker process exits and the supervising controller
+                # reconnects, matching the GStreamer backend's stall
+                # watchdog.
+                phase = "첫 프레임" if last_receive_s is None else "새 프레임"
+                _emit_status(
+                    output_queue,
+                    f"PyAV 프레임 타임아웃: {phase}이 {frame_age_s:.1f}s 동안 없습니다.",
+                )
+                break
             if frame_record is None:
                 if now_s - last_status_s > 1.0:
                     _emit_status(output_queue, "PyAV 프레임 수신 대기 중")
@@ -4528,7 +4357,7 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
             detection_timestamp_metadata.update(
                 dict(frame_record.get("native_metadata") or {})
             )
-            annotated, best_detection, inferred = _process_frame_for_output(
+            processed_frame, best_detection, inferred = _process_frame_for_output(
                 cv2,
                 frame,
                 model=model,
@@ -4536,10 +4365,9 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
                 output_queue=output_queue,
                 now_s=float(frame_record["timestamp_s"]),
                 enable_detection=enable_detection,
-                draw_preview_overlay=True,
                 timestamp_metadata=detection_timestamp_metadata,
             )
-            if annotated is None:
+            if processed_frame is None:
                 time.sleep(0.2)
                 continue
             if config.get("_yolo_cpu_fallback_active"):
@@ -4851,6 +4679,14 @@ class YoloStreamWorker(QtCore.QObject):
             "frame_queue_size": max(1, int(frame_queue_size)),
         }
         self.config.update(recording_integrity_contract(self.config["stream_backend"]))
+        # Ported from the now-deleted measurement_package_controller.py's
+        # "package worker" (see the EOS handler around
+        # _run_gstreamer_stream_once): full finalized-file H.264 copy
+        # integrity validation was previously only performed by that
+        # sessionless-migration-orphaned controller, so it never actually ran
+        # in production. Wiring it in here closes that gap without waiting
+        # for a separate post-hoc verification pass.
+        self.config["_recording_integrity_validator"] = validate_h264_copy_mp4_integrity
         self._mp_context = mp_context or multiprocessing.get_context("spawn")
         set_executable = getattr(self._mp_context, "set_executable", None)
         if callable(set_executable):
@@ -4984,33 +4820,12 @@ class YoloStreamWorker(QtCore.QObject):
                 self._emit_finished_once()
 
     def stop(self) -> None:
+        # _stop_child_process() already implements the full cooperative
+        # join -> terminate -> join -> kill -> join escalation (using the
+        # same YOLO_COOPERATIVE_STOP_TIMEOUT_S/YOLO_KILL_AFTER_STOP_S/
+        # YOLO_KILL_JOIN_TIMEOUT_S budgets) plus queue/process-handle
+        # cleanup, so there is nothing left for stop() to duplicate here.
         self.request_stop()
-        process = self._process
-        if process is None:
-            return
-        if not process.is_alive():
-            if self._stop_child_process():
-                self._emit_finished_once()
-            return
-        # Give the child a chance to release its video writer and queues after
-        # observing the stop event.  Escalate only if cooperative shutdown
-        # does not complete.
-        stop_requested_s = self._stop_requested_monotonic_s or time.monotonic()
-        cooperative_remaining_s = max(
-            0.0,
-            stop_requested_s + YOLO_COOPERATIVE_STOP_TIMEOUT_S - time.monotonic(),
-        )
-        process.join(timeout=cooperative_remaining_s)
-        if process.is_alive():
-            process.terminate()
-            terminate_remaining_s = max(
-                0.0,
-                stop_requested_s + YOLO_KILL_AFTER_STOP_S - time.monotonic(),
-            )
-            process.join(timeout=terminate_remaining_s)
-        if process.is_alive():
-            process.kill()
-            process.join(timeout=YOLO_KILL_JOIN_TIMEOUT_S)
         if self._stop_child_process():
             self._emit_finished_once()
 

@@ -456,11 +456,14 @@ def _trace_h264_headers(
                 text=True,
                 errors="replace",
             )
-            parsed_box: dict[str, dict[str, Any]] = {}
+            parsed_box: dict[str, Any] = {}
 
             def drain_trace() -> None:
                 assert process.stderr is not None
-                parsed_box["value"] = _parse_h264_trace_lines(process.stderr)
+                try:
+                    parsed_box["value"] = _parse_h264_trace_lines(process.stderr)
+                except Exception as exc:  # noqa: BLE001 - fail-closed at the call site.
+                    parsed_box["error"] = exc
 
             drain_thread = threading.Thread(
                 target=drain_trace,
@@ -482,7 +485,19 @@ def _trace_h264_headers(
                 reason = "integrity_h264_trace_drain_failed"
                 record["reason"] = reason
                 return None, record, reason
-            parsed = parsed_box.get("value", {})
+            if "value" not in parsed_box:
+                # The drain thread exited (join above proved it is no longer
+                # alive) without ever recording a parsed value -- it must
+                # have raised inside drain_trace(). Fail closed instead of
+                # falling through with an empty `parsed` dict, which would
+                # raise an uncaught KeyError below.
+                reason = "integrity_h264_trace_drain_exception"
+                record["reason"] = reason
+                drain_error = parsed_box.get("error")
+                if drain_error is not None:
+                    record["drain_error"] = f"{type(drain_error).__name__}: {drain_error}"
+                return None, record, reason
+            parsed = parsed_box["value"]
         else:
             result = runner(
                 command,

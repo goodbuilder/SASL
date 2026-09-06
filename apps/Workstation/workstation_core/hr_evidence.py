@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import mimetypes
 import os
@@ -39,6 +40,8 @@ from .optical_pose import (
     transfer_stereo_pose_through_bridges,
 )
 
+
+_LOGGER = logging.getLogger(__name__)
 
 HR_CAPTURE_EVENT_SCHEMA = "workstation-hr-capture-event-v1"
 HR_OZ_BRIDGE_PROFILE_SCHEMA = "workstation-hr-oz-bridge-profile-v1"
@@ -238,8 +241,20 @@ class HrImportedImage:
                     str(target.parent),
                     os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
                 )
-            except OSError:
+            except OSError as exc:
                 directory_descriptor = None
+                # Best-effort durability: the hardlink itself already
+                # succeeded, so we do not fail the import, but silently
+                # skipping the directory fsync hid a durability gap from
+                # operators entirely. Surface it at warning level.
+                _LOGGER.warning(
+                    "HrImportedImage.write_exact: could not open directory %s "
+                    "to fsync after linking %s (durability of the directory "
+                    "entry is not guaranteed): %s",
+                    target.parent,
+                    target,
+                    exc,
+                )
             if directory_descriptor is not None:
                 try:
                     os.fsync(directory_descriptor)
@@ -317,6 +332,44 @@ def import_hr_image_bytes(
         or "application/octet-stream",
         imported_utc_ns=time.time_ns() if imported_utc_ns is None else int(imported_utc_ns),
     )
+
+
+def verify_capture_ftp_metadata(path: Path, detail: Mapping[str, Any]) -> dict[str, Any]:
+    """Cross-check a WIRIS FTP-downloaded capture file against its reported metadata.
+
+    ``WirisPnPPhotoCaptureWorker``/``WirisOZPhotoCaptureWorker`` already verify
+    the downloaded bytes once, immediately after the FTP transfer completes
+    (see ``_download_latest_ftp_file`` in ``wiris_runtime_workers.py``). This
+    is a second, independent check performed later -- when the completion
+    event for the capture is actually recorded -- so that corruption or an
+    unexpected file swap occurring in the window between download and
+    completion-event handling is still caught before the capture is trusted
+    as evidence. Ported from the sessionless-migration-orphaned
+    ``measurement_package_controller._validated_capture_metadata``.
+    """
+
+    payload = Path(path).read_bytes()
+    digest = _sha256_bytes(payload)
+    expected_sha = str(detail.get("sha256") or detail.get("ftp_sha256") or "")
+    expected_size = detail.get("size_bytes", detail.get("ftp_size_bytes", detail.get("byte_size")))
+    if expected_sha and expected_sha != digest:
+        raise ValueError("downloaded capture bytes do not match reported SHA-256")
+    if expected_size not in (None, "") and int(expected_size) != len(payload):
+        raise ValueError("downloaded capture size does not match reported metadata")
+    width, height = _decode_image_resolution(payload)
+    expected_width = detail.get("width_px", detail.get("width"))
+    expected_height = detail.get("height_px", detail.get("height"))
+    if expected_width not in (None, "") and int(expected_width) != width:
+        raise ValueError("downloaded capture width does not match reported metadata")
+    if expected_height not in (None, "") and int(expected_height) != height:
+        raise ValueError("downloaded capture height does not match reported metadata")
+    return {
+        "sha256": digest,
+        "size_bytes": len(payload),
+        "width_px": width,
+        "height_px": height,
+        "decode_verified": True,
+    }
 
 
 @dataclass(frozen=True)
@@ -1067,4 +1120,5 @@ __all__ = [
     "solve_full_se3_hr_to_oz_bridge",
     "solve_rotation_only_hr_to_oz_bridge",
     "transfer_hr_stereo_pose_to_oz",
+    "verify_capture_ftp_metadata",
 ]

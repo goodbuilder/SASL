@@ -708,7 +708,14 @@ class PixhawkUsbFlashWorker(QtCore.QObject):
                 if self._cancelled.is_set():
                     self._process.terminate()
                     break
-            return_code = self._process.wait(timeout=5.0)
+            try:
+                return_code = self._process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                # terminate() did not stop the child within the grace period
+                # (e.g. it ignored SIGTERM). Force-kill and reap it so we
+                # never leave an orphan process behind.
+                self._process.kill()
+                return_code = self._process.wait()
             output = "".join(output_lines)
             if self._cancelled.is_set():
                 raise RuntimeError("USB flash cancelled")

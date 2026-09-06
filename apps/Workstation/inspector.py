@@ -560,11 +560,13 @@ class InspectorWidget(QtWidgets.QWidget):
         self.geometry_apply_candidate_button.setEnabled(apply_ready)
         active = bool(self._optical_pose_snapshot.get("active_selection_id"))
         self.geometry_revert_button.setEnabled(active)
-        calibration_state = str(
-            getattr(self.backend, "evidence", None).calibration().get("state", "NO DATA")
-            if isinstance(getattr(self.backend, "evidence", None), EvidenceAdapter)
-            else "NO DATA"
-        )
+        evidence = getattr(self.backend, "evidence", None)
+        calibration_state = "NO DATA"
+        if isinstance(evidence, EvidenceAdapter):
+            try:
+                calibration_state = str(evidence.calibration().get("state", "NO DATA") or "NO DATA")
+            except Exception:
+                calibration_state = "NO DATA"
         has_bundle = calibration_state in {"ACTIVE", "AVAILABLE"}
         self.geometry_apply_bundle_button.setEnabled(has_bundle)
 
@@ -914,7 +916,10 @@ class InspectorWidget(QtWidgets.QWidget):
             )
             source = "Workstation advanced facade"
         elif context_id == "tasks.calibration":
-            calibration = evidence.calibration()
+            try:
+                calibration = evidence.calibration()
+            except Exception:
+                calibration = {}
             left = calibration.get("left", {})
             values.update(
                 primary=f"{calibration.get('state', 'NO DATA')} zoom={calibration.get('zoom', '--')}",

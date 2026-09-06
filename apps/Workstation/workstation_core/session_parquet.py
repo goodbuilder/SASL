@@ -31,6 +31,11 @@ from typing import Callable
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from Workstation.workstation_core.strict_jsonl import (
+    fsync_directory as _fsync_directory,
+    sha256_file,
+)
+
 
 ROW_JSON_CONTRACT = "workstation-canonical-json-object-v1"
 PARQUET_FORMAT_VERSION = 1
@@ -715,23 +720,7 @@ def _schema_sha256(schema: Mapping[str, object]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _fsync_file(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
@@ -820,7 +809,7 @@ def _verify_table(
         role=spec.role,
         row_count=row_count,
         size_bytes=path.stat().st_size,
-        sha256=_file_sha256(path),
+        sha256=sha256_file(path),
         schema=schema,
         schema_sha256=_schema_sha256(schema),
     )

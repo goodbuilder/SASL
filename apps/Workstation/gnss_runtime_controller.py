@@ -2278,13 +2278,22 @@ class GnssRuntimeController:
         )
         self.panel.gnss_base_serial_thread = thread
         self.panel.gnss_base_serial_worker = worker
-        pipeline = self._ensure_rtcm_pipeline()
-        self._wire_rtcm_base_source(worker, pipeline)
-        self._wire_rtcm_pipeline_base_worker(worker)
-        if self._rtcm_route_config().base_targets:
-            self._ensure_pixhawk_rtcm_worker()
-        self._sync_rtcm_pipeline_config(reset=True)
-        self._sync_rtcm_evidence_context()
+        try:
+            pipeline = self._ensure_rtcm_pipeline()
+            self._wire_rtcm_base_source(worker, pipeline)
+            self._wire_rtcm_pipeline_base_worker(worker)
+            if self._rtcm_route_config().base_targets:
+                self._ensure_pixhawk_rtcm_worker()
+            self._sync_rtcm_pipeline_config(reset=True)
+            self._sync_rtcm_evidence_context()
+        except Exception:
+            # The thread was never started, so it will never emit `finished`
+            # to self-clear via `_clear_gnss_base_serial_worker`. Reset these
+            # back to None so a future connect attempt is not permanently
+            # blocked by the `gnss_base_serial_thread is not None` guard above.
+            self.panel.gnss_base_serial_thread = None
+            self.panel.gnss_base_serial_worker = None
+            raise
         thread.start()
 
     def disconnect_gnss_base_serial(self) -> None:
@@ -2928,7 +2937,8 @@ class GnssRuntimeController:
         ui_due = self._rtcm_ui_update_due()
         self.panel._record_gnss_base_rtcm_frame(payload)
         if (
-            self.panel.gnss_operation_manager.state == GnssOperationState.BASE_RECONFIGURING
+            source == DRONE_RTCM_SOURCE_BASE
+            and self.panel.gnss_operation_manager.state == GnssOperationState.BASE_RECONFIGURING
             and parse_rtcm3_message_type(payload) in {1005, 1006}
         ):
             self.panel.gnss_fixed_base_reconfigure_rtcm = True

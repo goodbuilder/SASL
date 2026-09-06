@@ -83,7 +83,11 @@ def test_session_prepared_failure_stops_artifact_write(
     assert calls == ["session_prepared"]
 
 
-def test_session_switch_keeps_old_ledger_when_flush_fails(tmp_path: Path) -> None:
+def test_session_switch_rebinds_despite_old_ledger_flush_failure(tmp_path: Path) -> None:
+    """A stale session's ledger flush failure must not block binding to the
+    new session -- otherwise a one-time disk hiccup on session A would wedge
+    evidence recording for every session that comes after it (B, C, ...)."""
+
     panel = _panel(tmp_path, "A")
     controller = RunEvidenceController(panel)
     controller.ensure_workstation_run_evidence("started")
@@ -98,7 +102,10 @@ def test_session_switch_keeps_old_ledger_when_flush_fails(tmp_path: Path) -> Non
 
     result = controller.ensure_workstation_run_evidence("started")
 
-    assert result["status"] == "failed"
-    assert result["kind"] == "run_event_setup"
-    assert controller.ledger is old_ledger
-    assert controller.ledger.root == (tmp_path / "A").resolve()
+    assert result["session_id"] == "B"
+    assert controller.ledger is not old_ledger
+    assert controller.ledger.root == (tmp_path / "B").resolve()
+    # The old ledger's flush failure is still surfaced as a recoverable
+    # notice rather than silently swallowed.
+    assert panel._session_save_retry_required is True
+    assert "flush-sentinel" in panel._session_save_last_error

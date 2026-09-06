@@ -566,8 +566,12 @@ def load_settings(
         yolo_iou_threshold=float(payload.get("yolo_iou_threshold", AppSettings.yolo_iou_threshold)),
         yolo_gate_class_enabled=bool(payload.get("yolo_gate_class_enabled", AppSettings.yolo_gate_class_enabled)),
         yolo_gate_class_text=str(payload.get("yolo_gate_class_text", AppSettings.yolo_gate_class_text)),
-        yolo_gate_matching_enabled=True,
-        yolo_gate_time_delta_enabled=True,
+        yolo_gate_matching_enabled=bool(
+            payload.get("yolo_gate_matching_enabled", AppSettings.yolo_gate_matching_enabled)
+        ),
+        yolo_gate_time_delta_enabled=bool(
+            payload.get("yolo_gate_time_delta_enabled", AppSettings.yolo_gate_time_delta_enabled)
+        ),
         yolo_gate_vertical_delta_enabled=bool(
             payload.get("yolo_gate_vertical_delta_enabled", AppSettings.yolo_gate_vertical_delta_enabled)
         ),

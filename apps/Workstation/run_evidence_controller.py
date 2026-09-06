@@ -84,10 +84,19 @@ class RunEvidenceController:
         ledger = self._ledger
         if ledger is None or ledger.root != root:
             if ledger is not None:
-                # Do not abandon the old dirty ledger when its durability
-                # barrier fails.  The public wrapper records the failure and
-                # leaves this binding intact so the same session can retry.
-                ledger.flush()
+                # A flush failure on the OLD session's ledger must not block
+                # binding to the NEW session: leaving the stale binding in
+                # place would make every future call keep retrying the same
+                # dead session's flush, wedging evidence recording for every
+                # session that comes after it. Report the failure but always
+                # proceed to rebind.
+                try:
+                    ledger.flush()
+                except OSError as exc:
+                    report_recoverable_persistence_failure(
+                        self.panel,
+                        f"failed to flush previous session evidence ledger: {exc}",
+                    )
             ledger = RunEvidenceLedger(root)
             self._ledger = ledger
         return ledger

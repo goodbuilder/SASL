@@ -21,6 +21,8 @@ import re
 import tempfile
 from typing import Any
 import zipfile
+
+from Workstation.workstation_core.strict_jsonl import fsync_directory as _fsync_directory
 from xml.etree import ElementTree
 
 import xlsxwriter
@@ -978,18 +980,6 @@ def _validate_workbook(path: Path) -> None:
             raise ValueError(
                 "generated review workbook is missing sheets: " + ", ".join(sorted(missing))
             )
-
-
-def _fsync_directory(path: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError:
-        return
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 __all__ = [

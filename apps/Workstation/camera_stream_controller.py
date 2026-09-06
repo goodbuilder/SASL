@@ -2055,6 +2055,23 @@ class CameraStreamLifecycleController:
             "pixhawk_host_ip_discovery_thread",
             "rtsp_check_thread",
             "rtsp_enable_thread",
+            # Kept in sync with _camera_busy_reason()'s busy_threads tuple so a
+            # capture/command worker running at shutdown is always told to
+            # quit instead of being abandoned (QThread destroyed while
+            # running).
+            "pnp_photo_capture_thread",
+            "oz_photo_capture_thread",
+            "optical_pose_wiris_ftp_thread",
+            "optical_pose_wiris_ftp_oz_thread",
+            "calibration_wiris_ftp_thread",
+            "calibration_wiris_ftp_oz_thread",
+            "calibration_wiris_oz_capture_thread",
+            "calibration_wiris_oz_sync_thread",
+            "calibration_wiris_oz_delete_thread",
+            "calibration_wiris_oz_format_thread",
+            "calibration_wiris_oz_gilc_thread",
+            "wiris_image_format_thread",
+            "wiris_lrf_thread",
         ):
             thread = getattr(self.panel, attr, None)
             if thread is None:

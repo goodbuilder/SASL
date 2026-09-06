@@ -7,6 +7,8 @@ admission: failures surface only as diagnostics and workbook events.
 
 from __future__ import annotations
 
+import os
+import threading
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -109,15 +111,38 @@ class DataStorageController:
                 or getattr(self.panel, "video_recording_enabled", False)
             )
             if not active:
-                self._store.close(timeout_s=2.0)
+                # This property is read from the GUI thread's status-poll
+                # timer (see StatusModel._refresh_recording ->
+                # data_storage_snapshot -> store). Closing the old store
+                # synchronously can block for up to close()'s own timeout,
+                # which would freeze the UI whenever
+                # measurement_data_root changes while idle. Swap in the new
+                # store immediately and let the superseded store finish
+                # closing on a background thread instead.
+                old_store = self._store
                 self._root = root
                 self._store = self._new_store(root)
+                self._close_store_in_background(old_store)
         return self._store
 
     def _new_store(self, root: Path) -> MeasurementDataStore:
         store = MeasurementDataStore(root, timestamped_filenames=True)
         store.add_enqueue_observer(self._registry.observe_store_record)
         return store
+
+    @staticmethod
+    def _close_store_in_background(store: MeasurementDataStore) -> None:
+        def _do_close() -> None:
+            try:
+                store.close(timeout_s=2.0)
+            except Exception:
+                pass
+
+        threading.Thread(
+            target=_do_close,
+            name="workstation-data-store-close",
+            daemon=True,
+        ).start()
 
     def measurement_registry(self) -> MeasurementRegistry:
         if self._workbook_writer is None:
@@ -204,12 +229,28 @@ class DataStorageController:
         root = self._configured_root()
         root.mkdir(parents=True, exist_ok=True)
         stem = f"{record.file_prefix}_{safe_label}"
-        candidate = root / f"{stem}{suffix_text}"
         sequence = 1
-        while candidate.exists() or candidate.is_symlink():
-            sequence += 1
-            candidate = root / f"{stem}-{sequence:02d}{suffix_text}"
-        return candidate
+        candidate = root / f"{stem}{suffix_text}"
+        while True:
+            # Reserve the slot atomically (O_CREAT|O_EXCL) instead of
+            # checking exists()/is_symlink() and returning the path for the
+            # caller to open later -- the check-then-return form lets two
+            # concurrent callers observe the same "free" candidate and both
+            # end up writing to it. The reservation leaves an empty file in
+            # place, which the eventual writer (video/ffmpeg/etc.) opens and
+            # truncates as normal.
+            try:
+                fd = os.open(
+                    str(candidate),
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o644,
+                )
+            except FileExistsError:
+                sequence += 1
+                candidate = root / f"{stem}-{sequence:02d}{suffix_text}"
+                continue
+            os.close(fd)
+            return candidate
 
     def latest_measurement_workbook_path(self) -> Path | None:
         root = self._configured_root()

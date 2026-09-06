@@ -420,7 +420,7 @@ def test_worker_keeps_intrinsic_inputs_independent_and_stereo_uses_only_pairs(
             calibration_flags=0,
         )
 
-    def stereo(left, right, _config, _left_intrinsics, _right_intrinsics):
+    def stereo(left, right, _config, _left_intrinsics, _right_intrinsics, **_kwargs):
         calls.append(("stereo", tuple(left), tuple(right)))
         return extrinsics
 

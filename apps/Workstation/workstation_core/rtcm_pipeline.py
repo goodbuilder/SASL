@@ -22,6 +22,7 @@ from Workstation.workstation_core.gnss_protocol import (
     Rtcm3StreamParser,
     parse_rtcm3_message_type,
 )
+from Workstation.workstation_core.strict_jsonl import fsync_directory as _fsync_directory
 
 
 RTCM_EVIDENCE_ACTIVE_STATES = frozenset(
@@ -745,15 +746,6 @@ def _rollback_evidence_pair(
             errors.append(f"{label}: {exc}")
     if errors:
         raise OSError("RTCM evidence rollback failed: " + "; ".join(errors))
-
-
-def _fsync_directory(path: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    descriptor = os.open(path, flags)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def append_rtcm_evidence(

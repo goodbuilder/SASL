@@ -530,6 +530,7 @@ def analyze_calibration_image(
     intrinsics: CameraIntrinsics,
     *,
     side: str,
+    observation: CheckerboardObservation | None = None,
 ) -> CalibrationImageDiagnostic:
     """Calculate an independent per-image checkerboard residual.
 
@@ -537,6 +538,13 @@ def analyze_calibration_image(
     pass solves the board pose for each image using the calculated K,D and
     reports per-view RMS, board coverage, and detection state without changing
     the camera model.
+
+    ``observation`` lets a caller that already ran checkerboard detection for
+    this exact image (e.g. ``CameraCalibrationSolve.observations`` from the
+    intrinsics solve) pass the cached corners through, so the image is not
+    re-detected from scratch for this independent diagnostic pass. It is only
+    used when its ``view_id`` matches ``path``; otherwise detection runs as
+    before.
     """
 
     import cv2
@@ -544,29 +552,41 @@ def analyze_calibration_image(
 
     image_path = Path(path)
     capture_key = _calibration_capture_key(image_path, side)
+    cached = observation if observation is not None and observation.view_id == str(image_path) else None
     try:
-        image = _load_grayscale(image_path)
-        height, width = int(image.shape[0]), int(image.shape[1])
-        found, corners = cv2.findChessboardCorners(image, config.pattern_size, None)
-        if not found or corners is None:
-            return CalibrationImageDiagnostic(
-                side=str(side),
-                path=str(image_path),
-                capture_key=capture_key,
-                found=False,
-                corner_count=0 if corners is None else int(len(corners)),
-                reprojection_error_px=None,
-                width=width,
-                height=height,
-                board_center_x_px=None,
-                board_center_y_px=None,
-                board_coverage_fraction=None,
-                error="checkerboard not found",
-            )
+        if cached is not None:
+            width, height = int(cached.image_size[0]), int(cached.image_size[1])
+            corner_count = len(cached.image_points_px)
+            points = np.asarray(cached.image_points_px, dtype=np.float64).reshape(-1, 2)
+            solve_points = np.asarray(cached.image_points_px, dtype=np.float32).reshape(-1, 1, 2)
+            object_points = np.asarray(cached.object_points_m, dtype=np.float32).reshape(-1, 3)
+        else:
+            image = _load_grayscale(image_path)
+            height, width = int(image.shape[0]), int(image.shape[1])
+            found, corners = cv2.findChessboardCorners(image, config.pattern_size, None)
+            if not found or corners is None:
+                return CalibrationImageDiagnostic(
+                    side=str(side),
+                    path=str(image_path),
+                    capture_key=capture_key,
+                    found=False,
+                    corner_count=0 if corners is None else int(len(corners)),
+                    reprojection_error_px=None,
+                    width=width,
+                    height=height,
+                    board_center_x_px=None,
+                    board_center_y_px=None,
+                    board_coverage_fraction=None,
+                    error="checkerboard not found",
+                )
 
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-        refined = cv2.cornerSubPix(image, corners, (11, 11), (-1, -1), criteria)
-        points = np.asarray(refined, dtype=np.float64).reshape(-1, 2)
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+            refined = cv2.cornerSubPix(image, corners, (11, 11), (-1, -1), criteria)
+            corner_count = int(len(corners))
+            points = np.asarray(refined, dtype=np.float64).reshape(-1, 2)
+            solve_points = refined
+            object_points = _object_points(config)
+
         board_center = points.mean(axis=0)
         min_xy = points.min(axis=0)
         max_xy = points.max(axis=0)
@@ -578,8 +598,8 @@ def analyze_calibration_image(
         camera_matrix = np.asarray(intrinsics.camera_matrix, dtype=np.float64)
         distortion = np.asarray(intrinsics.distortion_coefficients, dtype=np.float64)
         ok, rvec, tvec = cv2.solvePnP(
-            _object_points(config),
-            refined,
+            object_points,
+            solve_points,
             camera_matrix,
             distortion,
             flags=cv2.SOLVEPNP_ITERATIVE,
@@ -590,7 +610,7 @@ def analyze_calibration_image(
                 path=str(image_path),
                 capture_key=capture_key,
                 found=True,
-                corner_count=int(len(corners)),
+                corner_count=corner_count,
                 reprojection_error_px=None,
                 width=width,
                 height=height,
@@ -600,7 +620,7 @@ def analyze_calibration_image(
                 error="solvePnP failed",
             )
         projected, _ = cv2.projectPoints(
-            _object_points(config),
+            object_points,
             rvec,
             tvec,
             camera_matrix,
@@ -614,7 +634,7 @@ def analyze_calibration_image(
             path=str(image_path),
             capture_key=capture_key,
             found=True,
-            corner_count=int(len(corners)),
+            corner_count=corner_count,
             reprojection_error_px=rms,
             width=width,
             height=height,
@@ -645,9 +665,30 @@ def analyze_calibration_images(
     intrinsics: CameraIntrinsics,
     *,
     side: str,
+    observations: Sequence[CheckerboardObservation] | None = None,
 ) -> tuple[dict[str, Any], ...]:
+    """Run the independent per-image diagnostic, reusing cached detections.
+
+    ``observations`` is typically ``CameraCalibrationSolve.observations`` from
+    the intrinsics solve for this side; images already detected there are not
+    re-detected here (see :func:`analyze_calibration_image`).
+    """
+
+    observation_by_view_id = (
+        {observation.view_id: observation for observation in observations}
+        if observations is not None
+        else {}
+    )
     return tuple(
-        asdict(analyze_calibration_image(path, config, intrinsics, side=side))
+        asdict(
+            analyze_calibration_image(
+                path,
+                config,
+                intrinsics,
+                side=side,
+                observation=observation_by_view_id.get(str(Path(path))),
+            )
+        )
         for path in paths
     )
 
@@ -1124,21 +1165,42 @@ def calibrate_stereo_extrinsics_from_image_pairs(
     right_intrinsics: CameraIntrinsics,
     *,
     progress_callback: CalibrationProgressCallback | None = None,
+    left_observations: Sequence[CheckerboardObservation] | None = None,
+    right_observations: Sequence[CheckerboardObservation] | None = None,
 ) -> StereoExtrinsics:
+    """Solve stereo R/T from matched checkerboard pairs.
+
+    ``left_observations``/``right_observations`` are typically the
+    ``CameraCalibrationSolve.observations`` already produced by the intrinsics
+    solve for each side. When a pair's images both have a cached observation
+    (matched by ``view_id`` against the resolved path), the cached corners are
+    reused instead of re-running checkerboard detection on the image.
+    """
+
     import cv2
     import numpy as np
 
-    def paths_by_stem(paths: list[str | Path]) -> dict[str, Path]:
+    left_observation_by_view_id = (
+        {observation.view_id: observation for observation in left_observations}
+        if left_observations is not None
+        else {}
+    )
+    right_observation_by_view_id = (
+        {observation.view_id: observation for observation in right_observations}
+        if right_observations is not None
+        else {}
+    )
+
+    def paths_by_stem(paths: list[str | Path], *, side: str) -> dict[str, Path]:
         result = {}
         for raw_path in paths:
             path = Path(raw_path)
-            stem = path.stem
-            key = stem.split("_")[-1]
+            key = _calibration_capture_key(path, side)
             result[key] = path
         return result
 
-    left_by_stem = paths_by_stem(left_paths)
-    right_by_stem = paths_by_stem(right_paths)
+    left_by_stem = paths_by_stem(left_paths, side="left")
+    right_by_stem = paths_by_stem(right_paths, side="right")
     pair_keys = sorted(set(left_by_stem) & set(right_by_stem))
     if not pair_keys and len(left_paths) == len(right_paths):
         # Explicit Compute selections are ordered left/right lists. Raw WIRIS
@@ -1166,27 +1228,52 @@ def calibrate_stereo_extrinsics_from_image_pairs(
 
     total_pairs = len(pair_keys)
     for index, key in enumerate(pair_keys, start=1):
-        left_image = _load_grayscale(left_by_stem[key])
-        right_image = _load_grayscale(right_by_stem[key])
-        current_size = (int(left_image.shape[1]), int(left_image.shape[0]))
-        right_size = (int(right_image.shape[1]), int(right_image.shape[0]))
-        if current_size != right_size:
-            raise ValueError(
-                f"image size mismatch for pair {key}: left={current_size}, right={right_size}"
+        left_path = left_by_stem[key]
+        right_path = right_by_stem[key]
+        left_observation = left_observation_by_view_id.get(str(left_path))
+        right_observation = right_observation_by_view_id.get(str(right_path))
+        if left_observation is not None and right_observation is not None:
+            current_size = (int(left_observation.image_size[0]), int(left_observation.image_size[1]))
+            right_size = (int(right_observation.image_size[0]), int(right_observation.image_size[1]))
+            if current_size != right_size:
+                raise ValueError(
+                    f"image size mismatch for pair {key}: left={current_size}, right={right_size}"
+                )
+            if image_size is None:
+                image_size = current_size
+            elif image_size != current_size:
+                raise ValueError(f"image size mismatch for pair {key}: {current_size}, expected {image_size}")
+            object_points.append(
+                np.asarray(left_observation.object_points_m, dtype=np.float32).reshape(-1, 3)
             )
-        if image_size is None:
-            image_size = current_size
-        elif image_size != current_size:
-            raise ValueError(f"image size mismatch for pair {key}: {current_size}, expected {image_size}")
+            left_image_points.append(
+                np.asarray(left_observation.image_points_px, dtype=np.float32).reshape(-1, 1, 2)
+            )
+            right_image_points.append(
+                np.asarray(right_observation.image_points_px, dtype=np.float32).reshape(-1, 1, 2)
+            )
+        else:
+            left_image = _load_grayscale(left_path)
+            right_image = _load_grayscale(right_path)
+            current_size = (int(left_image.shape[1]), int(left_image.shape[0]))
+            right_size = (int(right_image.shape[1]), int(right_image.shape[0]))
+            if current_size != right_size:
+                raise ValueError(
+                    f"image size mismatch for pair {key}: left={current_size}, right={right_size}"
+                )
+            if image_size is None:
+                image_size = current_size
+            elif image_size != current_size:
+                raise ValueError(f"image size mismatch for pair {key}: {current_size}, expected {image_size}")
 
-        left_found, left_corners = cv2.findChessboardCorners(left_image, config.pattern_size, None)
-        right_found, right_corners = cv2.findChessboardCorners(right_image, config.pattern_size, None)
-        if left_found and right_found and left_corners is not None and right_corners is not None:
-            left_refined = cv2.cornerSubPix(left_image, left_corners, (11, 11), (-1, -1), criteria)
-            right_refined = cv2.cornerSubPix(right_image, right_corners, (11, 11), (-1, -1), criteria)
-            object_points.append(objp)
-            left_image_points.append(left_refined)
-            right_image_points.append(right_refined)
+            left_found, left_corners = cv2.findChessboardCorners(left_image, config.pattern_size, None)
+            right_found, right_corners = cv2.findChessboardCorners(right_image, config.pattern_size, None)
+            if left_found and right_found and left_corners is not None and right_corners is not None:
+                left_refined = cv2.cornerSubPix(left_image, left_corners, (11, 11), (-1, -1), criteria)
+                right_refined = cv2.cornerSubPix(right_image, right_corners, (11, 11), (-1, -1), criteria)
+                object_points.append(objp)
+                left_image_points.append(left_refined)
+                right_image_points.append(right_refined)
         if progress_callback is not None:
             progress_callback(index, total_pairs, "detect")
 

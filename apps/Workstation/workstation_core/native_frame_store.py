@@ -19,7 +19,10 @@ from Workstation.workstation_core.strict_jsonl import (
     append_jsonl_record,
     prepare_jsonl_append,
 )
-from Workstation.workstation_core.measurement_data_store import creation_timestamp_text
+from Workstation.workstation_core.measurement_data_store import (
+    _safe_token,
+    creation_timestamp_text,
+)
 
 
 @dataclass(frozen=True)
@@ -43,11 +46,6 @@ class NativeFrameArtifact:
             **self.__dict__,
             "pixel_contract": "decoded native RGB pixels; lossless PNG; no overlay; no resize",
         }
-
-
-def _safe_token(value: object, fallback: str) -> str:
-    text = "".join(character if character.isalnum() or character in ".+-_" else "_" for character in str(value or ""))
-    return text.strip("._") or fallback
 
 
 class NativeFrameStore:
@@ -84,8 +82,21 @@ class NativeFrameStore:
             raise ValueError("native image is null")
         if metadata.get("overlay_applied") not in (False, None):
             raise ValueError("annotated frames cannot be persisted as native evidence")
-        expected_width = int(metadata.get("native_width", image.width()))
-        expected_height = int(metadata.get("native_height", image.height()))
+        # These must come from the producer's own recorded frame size, not be
+        # backfilled from the QImage being validated here -- defaulting to
+        # image.width()/height() would make this check tautological (it can
+        # never fail, since it would always compare the image against
+        # itself). A caller with no genuine producer-side dimensions must
+        # fail loudly instead of silently skipping the check.
+        raw_width = metadata.get("native_width")
+        raw_height = metadata.get("native_height")
+        if raw_width is None or raw_height is None:
+            raise ValueError(
+                "metadata must include native_width/native_height from the frame "
+                "producer; dimensions cannot be inferred from the image itself"
+            )
+        expected_width = int(raw_width)
+        expected_height = int(raw_height)
         if (image.width(), image.height()) != (expected_width, expected_height):
             raise ValueError("native frame dimensions do not match producer metadata")
         identifier = _safe_token(frame_id or uuid.uuid4(), "frame")

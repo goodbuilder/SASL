@@ -565,6 +565,8 @@ class CheckerboardCalibrationWorker(QtCore.QObject):
                     left,
                     right,
                     progress_callback=self._callback("stereo_extrinsic", "stereo pair 검출"),
+                    left_observations=left_solve.observations,
+                    right_observations=right_solve.observations,
                 )
                 self._emit_progress(
                     "stereo_extrinsic",
@@ -584,12 +586,14 @@ class CheckerboardCalibrationWorker(QtCore.QObject):
                     self.config,
                     left,
                     side="left",
+                    observations=left_solve.observations,
                 ),
                 *analyze_calibration_images(
                     list(self.right_intrinsic_paths),
                     self.config,
                     right,
                     side="right",
+                    observations=right_solve.observations,
                 ),
             )
             self._emit_progress(

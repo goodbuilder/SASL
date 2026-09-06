@@ -207,6 +207,11 @@ class TelemetryHistoryPlot(QtWidgets.QWidget):
         self.title = title
         self.y_unit = y_unit
         self.points: deque[TelemetryHistoryPoint] = deque(maxlen=600)
+        # Per-series subsequence of ``self.points``, kept incrementally in
+        # sync (append/evict) so paintEvent -- which runs on every incoming
+        # sample at 10+ Hz -- never has to rescan the whole deque to derive
+        # series names or per-series point lists.
+        self._series_cache: dict[str, deque[TelemetryHistoryPoint]] = {}
         self.series_labels: dict[str, str] = {
             "Δnorm": "Delta Norm",
             "angle": "Angle",
@@ -221,7 +226,17 @@ class TelemetryHistoryPlot(QtWidgets.QWidget):
         self.setStyleSheet(f"background: {CHART_BG}; border: 1px solid {PANEL_BORDER};")
 
     def add_point(self, point: TelemetryHistoryPoint) -> None:
+        evicted = None
+        if self.points.maxlen is not None and len(self.points) >= self.points.maxlen:
+            evicted = self.points[0]
         self.points.append(point)
+        if evicted is not None:
+            bucket = self._series_cache.get(evicted.series)
+            if bucket and bucket[0] is evicted:
+                bucket.popleft()
+        self._series_cache.setdefault(
+            point.series, deque(maxlen=self.points.maxlen)
+        ).append(point)
         self.update()
 
     def set_series_labels(self, labels: dict[str, str]) -> None:
@@ -230,13 +245,15 @@ class TelemetryHistoryPlot(QtWidgets.QWidget):
 
     def remove_series(self, series: str) -> None:
         self.points = deque((point for point in self.points if point.series != series), maxlen=self.points.maxlen)
+        self._series_cache.pop(series, None)
         self.update()
 
     def _plot_rect(self) -> QtCore.QRect:
         return self.rect().adjusted(54, 24, -18, -34)
 
     def _series_names(self) -> list[str]:
-        return sorted({point.series for point in self.points}, key=lambda name: (self.series_order.get(name, 1000), name))
+        names = [name for name, bucket in self._series_cache.items() if bucket]
+        return sorted(names, key=lambda name: (self.series_order.get(name, 1000), name))
 
     def _series_color_map(self) -> dict[str, str]:
         colors = [SERIES_LEFT, SERIES_RIGHT, SERIES_Z, SERIES_DISTANCE]
@@ -359,7 +376,7 @@ class TelemetryHistoryPlot(QtWidgets.QWidget):
 
         series_colors = self._series_color_map()
         for series_name in self._series_names():
-            series_points = [point for point in self.points if point.series == series_name]
+            series_points = list(self._series_cache.get(series_name, ()))
             if len(series_points) < 2:
                 continue
             painter.setPen(QtGui.QPen(QtGui.QColor(series_colors[series_name]), 2))

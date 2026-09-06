@@ -191,13 +191,12 @@ print(json.dumps({
     }
 
     from Workstation import runtime_paths
-    from Workstation.measurement_package_controller import MeasurementPackageController
 
     monkeypatch.setattr(runtime_paths, "WORKSTATION_DATA_ROOT", data_root)
     model = data_root / "models" / "custom.pt"
     model.parent.mkdir(parents=True)
     model.write_bytes(b"model-sentinel")
-    assert MeasurementPackageController._first_existing_path("models/custom.pt") == model
+    assert runtime_paths.first_existing_path("models/custom.pt") == model
 
 
 def test_settings_preserve_custom_paths_and_read_known_legacy_defaults(

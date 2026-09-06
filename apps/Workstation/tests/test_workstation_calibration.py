@@ -1621,7 +1621,7 @@ def test_checkerboard_calibration_worker_preserves_optical_rdf_stereo_contract(m
     monkeypatch.setattr(
         calibration_workers,
         "calibrate_stereo_extrinsics_from_image_pairs",
-        lambda left, right, _config, _left, _right: calls.append(
+        lambda left, right, _config, _left, _right, **_kwargs: calls.append(
             ("stereo", (*tuple(left), *tuple(right)))
         )
         or extrinsics,
@@ -1734,7 +1734,7 @@ def test_workstation_calibration_and_validation_run_off_ui_thread(monkeypatch, t
             image_count=len(paths),
         )
 
-    def fake_extrinsics(left_paths, _right_paths, _config, _left, _right):
+    def fake_extrinsics(left_paths, _right_paths, _config, _left, _right, **_kwargs):
         return StereoExtrinsics(
             rotation_left_to_right=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             translation_left_to_right_m=[-0.3, 0.0, 0.0],
@@ -1765,7 +1765,13 @@ def test_workstation_calibration_and_validation_run_off_ui_thread(monkeypatch, t
             extrinsic_standard_deviations=(),
             per_view_errors_px=(),
             effective_view_ids=tuple(str(path) for path in paths),
-            observations=tuple(paths),
+            # Not real ``CheckerboardObservation`` instances: this fake solve
+            # never actually detects anything, so there is nothing to cache.
+            # ``analyze_calibration_images``/``calibrate_stereo_extrinsics_from_image_pairs``
+            # correctly treat an empty/missing cache as "detect from the image
+            # instead", which is what this test exercises against the fixture
+            # files below.
+            observations=(),
             subset_estimates=(),
             subset_membership=(),
             subset_failures=(),

@@ -8,18 +8,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from Workstation.workstation_core.strict_jsonl import sha256_file as _sha256_file
+
 
 CALIBRATION_INPUT_SNAPSHOT_SCHEMA = "workstation-calibration-input-snapshot-v1"
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                return digest.hexdigest()
-            digest.update(chunk)
 
 
 def _canonical_bytes(payload: Mapping[str, object]) -> bytes:

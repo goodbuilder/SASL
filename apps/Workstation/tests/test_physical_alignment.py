@@ -4,6 +4,10 @@ from math import cos, radians, sin
 
 import pytest
 
+from Workstation.workstation_core.attitude_geometry import (
+    quaternion_multiply,
+    relative_attitude,
+)
 from Workstation.workstation_core.physical_alignment import (
     PhysicalAlignmentSample,
     angle_error_deg,
@@ -15,6 +19,34 @@ from Workstation.workstation_core.physical_alignment import (
 def _yaw(degrees: float) -> tuple[float, float, float, float]:
     half = radians(degrees) / 2.0
     return cos(half), 0.0, 0.0, sin(half)
+
+
+def _axis_angle(axis: tuple[float, float, float], degrees: float) -> tuple[float, float, float, float]:
+    half = radians(degrees) / 2.0
+    ax, ay, az = axis
+    return cos(half), ax * sin(half), ay * sin(half), az * sin(half)
+
+
+def test_relative_attitude_is_invariant_under_a_common_rotation() -> None:
+    """relative_attitude(left, right) must depend only on the mechanical
+    offset between left and right, not on the vehicle's overall attitude --
+    rotating both operands by the same common rotation must not change the
+    result. A regression here previously let the rig's own attitude leak
+    into physical-alignment and live-telemetry relative-attitude readings.
+    """
+
+    left_q = _axis_angle((0.0, 0.0, 1.0), 30.0)
+    right_q = _axis_angle((1.0, 0.0, 0.0), 12.0)
+    baseline = relative_attitude(left_q, right_q)
+
+    common_rotation = _axis_angle((0.0, 1.0, 0.0), 47.0)
+    rotated_left = quaternion_multiply(common_rotation, left_q)
+    rotated_right = quaternion_multiply(common_rotation, right_q)
+    rotated = relative_attitude(rotated_left, rotated_right)
+
+    assert rotated.roll_deg == pytest.approx(baseline.roll_deg, abs=1e-6)
+    assert rotated.pitch_deg == pytest.approx(baseline.pitch_deg, abs=1e-6)
+    assert rotated.yaw_deg == pytest.approx(baseline.yaw_deg, abs=1e-6)
 
 
 def test_sample_keeps_ned_and_projects_to_p1_body_frd() -> None:

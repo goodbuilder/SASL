@@ -9,7 +9,6 @@ import pytest
 from PyQt5 import QtWidgets
 
 from Workstation.recording_controller import RecordingController
-from Workstation.measurement_package_controller import MeasurementPackageController
 from Workstation.wiris_runtime_workers import (
     WirisOZPhotoCaptureWorker,
     WirisPnPPhotoCaptureWorker,
@@ -125,18 +124,44 @@ def test_pnp_worker_rejects_unsafe_capture_id(capture_id: str) -> None:
         WirisPnPPhotoCaptureWorker((), capture_id=capture_id)
 
 
-def test_package_capture_validation_honors_worker_ftp_hash(tmp_path: Path) -> None:
+def test_capture_ftp_metadata_verification_honors_worker_ftp_hash(tmp_path: Path) -> None:
+    from Workstation.workstation_core.hr_evidence import verify_capture_ftp_metadata
+
     path = tmp_path / "capture.jpg"
     path.write_bytes(b"exact-camera-bytes")
 
     with pytest.raises(ValueError, match="SHA-256"):
-        MeasurementPackageController._validated_capture_metadata(
+        verify_capture_ftp_metadata(
             path,
             {
                 "ftp_sha256": "0" * 64,
                 "ftp_size_bytes": path.stat().st_size,
             },
         )
+
+
+def test_pnp_completion_downgrades_camera_on_ftp_metadata_mismatch(tmp_path: Path) -> None:
+    """RecordingController re-verifies each FTP-downloaded capture against its
+    reported metadata when the completion event is handled -- this is a
+    second, independent check beyond the worker's own download-time
+    verification (see _verify_ftp_capture_cameras)."""
+
+    path = tmp_path / "capture.jpg"
+    path.write_bytes(b"exact-camera-bytes")
+    cameras = {
+        "left": {
+            "state": "completed",
+            "ftp_downloaded": True,
+            "ftp_local_path": str(path),
+            "ftp_sha256": "0" * 64,
+            "ftp_size_bytes": path.stat().st_size,
+        }
+    }
+
+    RecordingController._verify_ftp_capture_cameras(cameras)
+
+    assert cameras["left"]["state"] == "failed"
+    assert "capture metadata verification failed" in cameras["left"]["error"]
 
 
 def test_pnp_worker_enables_hr_and_captures_both_cameras(monkeypatch) -> None:

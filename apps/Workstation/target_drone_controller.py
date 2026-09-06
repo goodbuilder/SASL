@@ -17,7 +17,6 @@ never calibration-time truth and never an OpenCV optical-RDF pose.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
@@ -31,6 +30,7 @@ from typing import Any, Callable, Mapping
 import uuid
 
 from Workstation.workstation_core.mavlink_sources import MavlinkSourceConfig
+from Workstation.workstation_core.strict_jsonl import fsync_directory, sha256_file
 from Workstation.workstation_core.target_drone_stream import (
     TARGET_DRONE_SCHEMA_VERSION,
     TargetDroneMode,
@@ -469,14 +469,6 @@ class TargetDroneControllerSnapshot:
         }
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _jsonl_row_count_and_validate(
     path: Path,
     *,
@@ -552,7 +544,7 @@ def _verify_sealed_artifact(artifact: TargetDroneSpoolArtifact) -> None:
     stat_result = path.stat()
     if stat_result.st_size != artifact.size_bytes:
         raise TargetDroneArtifactIntegrityError("sealed spool byte size changed")
-    if _sha256(path) != artifact.sha256:
+    if sha256_file(path) != artifact.sha256:
         raise TargetDroneArtifactIntegrityError("sealed spool hash changed")
     rows = _jsonl_row_count_and_validate(
         path,
@@ -709,9 +701,20 @@ class TargetDroneController:
         max_messages: int = 4096,
         max_duration_s: float = 0.250,
     ) -> int:
-        self._assert_session_unchanged()
+        # As with stop(), a session mismatch must not stop the receiver's
+        # internal buffer from being drained -- otherwise it grows without
+        # bound for as long as the mismatch persists.
+        if self._request is None:
+            raise TargetDroneControllerError("target-drone stream is not configured")
+        session_mismatch: TargetDroneControllerError | None = None
+        try:
+            self._assert_session_unchanged()
+        except TargetDroneControllerError as exc:
+            session_mismatch = exc
         assert self._request is not None and self._receiver is not None
         if self._request.mode == TargetDroneMode.UAM:
+            if session_mismatch is not None:
+                raise session_mismatch
             return 0
         if self._artifact is not None:
             raise TargetDroneControllerError("sealed target-drone spool cannot be drained")
@@ -725,17 +728,34 @@ class TargetDroneController:
             self._publish_measurement_source(
                 "LIVE", "verified Target telemetry message received"
             )
+        if session_mismatch is not None:
+            raise session_mismatch
         return drained
 
     def stop(self, *, timeout_s: float | None = None) -> TargetDroneControllerSnapshot:
-        self._assert_session_unchanged()
+        # A session-mismatch is reported to the caller, but it must never
+        # prevent the receiver/worker from actually being torn down here --
+        # skipping cleanup on a stale session would leak the live MAVLink
+        # connection, its worker thread, and the open spool file.
+        if self._request is None:
+            raise TargetDroneControllerError("target-drone stream is not configured")
+        session_mismatch: TargetDroneControllerError | None = None
+        try:
+            self._assert_session_unchanged()
+        except TargetDroneControllerError as exc:
+            session_mismatch = exc
         assert self._request is not None and self._receiver is not None
         if self._artifact is not None:
-            return self.snapshot()
+            result = self.snapshot()
+            if session_mismatch is not None:
+                raise session_mismatch
+            return result
         if self._request.mode == TargetDroneMode.UAM:
             self._receiver.stop(drain=False)
             self._phase = TargetDroneControllerPhase.DEFERRED
             self._publish_measurement_source("LEFT", "Target telemetry stopped")
+            if session_mismatch is not None:
+                raise session_mismatch
             return self.snapshot()
         try:
             if self._worker is None:
@@ -768,7 +788,10 @@ class TargetDroneController:
             self._artifact = self._seal_spool(stream_snapshot)
             if self._phase != TargetDroneControllerPhase.FAILED:
                 self._phase = TargetDroneControllerPhase.SEALED
-        return self.snapshot()
+        result = self.snapshot()
+        if session_mismatch is not None:
+            raise session_mismatch
+        return result
 
     def _seal_spool(self, stream: TargetDroneStreamSnapshot) -> TargetDroneSpoolArtifact:
         assert self._request is not None
@@ -787,7 +810,7 @@ class TargetDroneController:
                 f"target-drone spool row mismatch: receiver={stream.spool_row_count}, disk={rows}"
             )
         initial_size = source.stat().st_size
-        initial_sha256 = _sha256(source)
+        initial_sha256 = sha256_file(source)
         final_dir = self._session_root / "raw" / "target_drone"
         final_dir.mkdir(parents=True, exist_ok=True)
         final_path = final_dir / f"{self._runtime_id}.{initial_sha256[:16]}.jsonl"
@@ -798,11 +821,7 @@ class TargetDroneController:
             final_path,
             stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH,
         )
-        directory_fd = os.open(final_dir, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        fsync_directory(final_dir)
         artifact = TargetDroneSpoolArtifact(
             artifact_id=f"target-drone-spool-{uuid.uuid4().hex}",
             absolute_path=str(final_path),

@@ -156,12 +156,15 @@ def send_tcp_line(command: WirisZoomCommand) -> str:
     # WIRIS exposes one SDK control service per camera.  Keep all Workstation
     # workers from opening overlapping command sessions against that service.
     timeout_s = max(0.01, float(command.timeout_s))
-    deadline_s = time.monotonic() + timeout_s
     lock = _control_lock(command.host, command.port)
     if not lock.acquire(timeout=timeout_s):
         raise WirisControlBusyError(
             f"WIRIS control busy: {command.host}:{command.port}"
         )
+    # Start the socket-operation deadline only after the lock is held, so
+    # time spent waiting for another worker's command session does not eat
+    # into this command's own timeout budget.
+    deadline_s = time.monotonic() + timeout_s
     try:
         remaining_s = max(0.01, deadline_s - time.monotonic())
         with socket.create_connection((command.host, command.port), timeout=remaining_s) as sock:

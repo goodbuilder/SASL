@@ -176,6 +176,7 @@ class DetectionPairCoordinator:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._input_replaced = 0
+        self._input_lost = 0
         self._result_replaced = 0
         self._submitted = 0
         self._paired = 0
@@ -216,21 +217,39 @@ class DetectionPairCoordinator:
             reservation_source,
             time.monotonic(),
         )
-        try:
-            self._input.put_nowait(message)
-        except queue.Full:
-            try:
-                self._input.get_nowait()
-                with self._lock:
-                    self._input_replaced += 1
-            except queue.Empty:
-                pass
+        # The full-queue fallback (evict oldest, then insert) must be atomic
+        # as a unit. Without the lock, two concurrent producers (left/right
+        # camera threads) can each observe a full queue, each successfully
+        # evict a slot, and then race for the freed slots: the loser's final
+        # put_nowait() fails even though it already evicted something, so its
+        # own submission is dropped entirely -- neither queued nor recorded
+        # as displacing anything. Serializing the whole sequence under
+        # ``self._lock`` removes that race, and the two outcomes below are
+        # now tracked as genuinely distinct: ``_input_replaced`` only counts
+        # a submission that made it in after displacing an older one, while
+        # ``_input_lost`` counts a submission that ended up neither queued
+        # nor recorded as a replacement (true data loss).
+        with self._lock:
+            evicted = False
+            enqueued = False
             try:
                 self._input.put_nowait(message)
+                enqueued = True
             except queue.Full:
-                with self._lock:
-                    self._input_replaced += 1
-        with self._lock:
+                try:
+                    self._input.get_nowait()
+                    evicted = True
+                except queue.Empty:
+                    pass
+                try:
+                    self._input.put_nowait(message)
+                    enqueued = True
+                except queue.Full:
+                    enqueued = False
+            if enqueued and evicted:
+                self._input_replaced += 1
+            elif not enqueued:
+                self._input_lost += 1
             self._submitted += 1
 
     def _timestamp_for_policy(
@@ -789,6 +808,7 @@ class DetectionPairCoordinator:
                 "stale_policy_inputs": self._stale_policy_inputs,
                 "reservation_failed": self._reservation_failed,
                 "input_replaced": self._input_replaced,
+                "input_lost": self._input_lost,
                 "result_replaced": self._result_replaced,
                 "left_buffered": len(self._buffers["left"]),
                 "right_buffered": len(self._buffers["right"]),

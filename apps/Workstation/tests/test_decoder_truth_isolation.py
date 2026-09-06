@@ -296,7 +296,6 @@ def test_bus_error_routing_only_marks_decoder_health_for_fallback(
             yolo_stream.NVIDIA_H264_DECODER,
         ),
     )
-    monkeypatch.setattr(yolo_stream, "_finalize_gst_recording", lambda *_a, **_k: True)
     config = {
         "url": "rtsp://camera.invalid/visible",
         "decoder": "auto",

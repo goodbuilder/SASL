@@ -116,8 +116,11 @@ def test_legacy_live_time_basis_migrates_to_rtcp_preferred_with_app_fallback(
 
     settings = load_settings(path)
 
-    assert settings.yolo_gate_matching_enabled is True
-    assert settings.yolo_gate_time_delta_enabled is True
+    # yolo_gate_matching_enabled/yolo_gate_time_delta_enabled are independent
+    # persisted preferences, unrelated to the legacy time-basis migration
+    # below -- the stored `false` values must round-trip unchanged.
+    assert settings.yolo_gate_matching_enabled is False
+    assert settings.yolo_gate_time_delta_enabled is False
     assert settings.yolo_gate_max_time_delta_s == pytest.approx(0.100)
     assert settings.yolo_gate_time_basis == "camera_rtcp"
 

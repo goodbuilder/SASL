@@ -63,6 +63,7 @@ from Workstation.workstation_core.px4_mag_manager import (
 )
 from Workstation.workstation_core.rtk_geometry import GpsPositionState
 from Workstation.workstation_core.settings import normalize_live_distance_time_basis
+from Workstation.workstation_core.strict_jsonl import sha256_file
 
 from Workstation.workstation_core.coordinate_contract import (
     BASELINE_TRANSLATION_FRAME,
@@ -72,17 +73,6 @@ from Workstation.workstation_core.coordinate_contract import (
     MEASUREMENT_FRAME,
     WORLD_FRAME,
 )
-
-
-def _sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while True:
-            chunk = handle.read(chunk_size)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _widget_text(widget: object | None, default: str = "") -> str:
@@ -3524,7 +3514,7 @@ class EvidenceAdapter:
                     "error": f"artifact SHA-256 is missing or invalid in package manifest: {normalized_artifact}",
                 }
             try:
-                actual_sha256 = _sha256_file(candidate)
+                actual_sha256 = sha256_file(candidate)
             except OSError as exc:
                 return {"columns": (), "rows": (), "error": str(exc)}
             if actual_sha256 != expected_sha256:

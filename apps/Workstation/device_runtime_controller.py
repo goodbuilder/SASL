@@ -81,6 +81,22 @@ def _connect_gui_signal(signal, callback) -> None:
     signal.connect(callback, QtCore.Qt.QueuedConnection)
 
 
+def _wire_worker_thread_cleanup(worker: QtCore.QObject, thread: QtCore.QThread) -> None:
+    """Wire the fixed worker/thread lifecycle cleanup skeleton.
+
+    ``worker.moveToThread(thread)``, ``thread.started.connect(worker.run)``,
+    domain-specific signal connections, and any extra ``thread.finished``
+    cleanup hook remain the caller's responsibility -- only the fixed,
+    always-identical tail (``finished`` -> ``quit``/``deleteLater`` ->
+    ``deleteLater``) is consolidated here, so no call site risks losing a
+    connection that differs from this shared part.
+    """
+
+    worker.finished.connect(thread.quit)
+    worker.finished.connect(worker.deleteLater)
+    thread.finished.connect(thread.deleteLater)
+
+
 DEVICE_RUNTIME_CONTROLLER_METHODS = [
     "toggle_mavlink_connection",
     "set_pixhawk_transport",
@@ -412,9 +428,7 @@ class DeviceRuntimeController:
             worker.failed,
             lambda error, camera=camera: self.panel._pixhawk_mavftp_failed(camera, error),
         )
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        _wire_worker_thread_cleanup(worker, thread)
         _connect_gui_signal(
             thread.finished,
             lambda camera=camera: self.panel._clear_pixhawk_mavftp_worker(camera),
@@ -464,7 +478,14 @@ class DeviceRuntimeController:
         camera = str(data.get("camera") or "")
         current = dict(self.panel.pixhawk_transfer_status.get(camera) or {})
         current.update(data)
-        current["state"] = "UPLOADING"
+        # The progress payload's own "direction" field (set by
+        # PixhawkMavFtpTransferWorker) is the source of truth for which way
+        # the transfer is going; fall back to whatever direction was seeded
+        # at transfer start if a given progress event omits it, rather than
+        # always hardcoding "UPLOADING" regardless of actual direction.
+        direction = str(data.get("direction") or current.get("direction") or "").strip().lower()
+        if direction in {"upload", "download"}:
+            current["state"] = direction.upper() + "ING"
         self.panel.pixhawk_transfer_status[camera] = current
 
     def _apply_pixhawk_mavftp_result(self, result: object, *, category: str) -> None:
@@ -535,9 +556,7 @@ class DeviceRuntimeController:
             worker.failed,
             lambda error, camera=camera: self.panel._pixhawk_usb_flash_failed(camera, error),
         )
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        _wire_worker_thread_cleanup(worker, thread)
         _connect_gui_signal(thread.finished, self.panel._clear_pixhawk_usb_flash_worker)
         self.panel.pixhawk_usb_flash_thread = thread
         self.panel.pixhawk_usb_flash_worker = worker
@@ -880,9 +899,7 @@ class DeviceRuntimeController:
         thread.started.connect(worker.run)
         _connect_gui_signal(worker.discovered, self.panel._apply_pixhawk_network_discovery)
         _connect_gui_signal(worker.failed, self.panel._pixhawk_network_discovery_failed)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        _wire_worker_thread_cleanup(worker, thread)
         _connect_gui_signal(thread.finished, self.panel._clear_pixhawk_network_discovery)
         self.panel.pixhawk_network_discovery_thread = thread
         self.panel.pixhawk_network_discovery_worker = worker
@@ -1354,9 +1371,7 @@ class DeviceRuntimeController:
         thread.started.connect(worker.run)
         _connect_gui_signal(worker.completed, self.panel._apply_network_role_result)
         _connect_gui_signal(worker.failed, self.panel._network_role_apply_failed)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        _wire_worker_thread_cleanup(worker, thread)
         _connect_gui_signal(thread.finished, self.panel._clear_network_role_apply_worker)
         self.panel.network_role_apply_thread = thread
         self.panel.network_role_apply_worker = worker
@@ -2273,9 +2288,7 @@ class DeviceRuntimeController:
             )
         )
         worker.failed.connect(lambda error: self.panel._log(f"[픽스호크] MAVLink stream 설정 실패: {error}"))
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        _wire_worker_thread_cleanup(worker, thread)
         thread.finished.connect(self.panel._clear_pixhawk_stream_setup_worker)
         self.panel.pixhawk_stream_setup_thread = thread
         self.panel.pixhawk_stream_setup_worker = worker
@@ -2351,9 +2364,7 @@ class DeviceRuntimeController:
         worker.failed.connect(
             lambda error, camera=camera, label=label: self._pixhawk_usb_bootstrap_failed(camera, label, error)
         )
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        _wire_worker_thread_cleanup(worker, thread)
         thread.finished.connect(self.panel._clear_pixhawk_usb_bootstrap_worker)
         self.panel.pixhawk_usb_bootstrap_thread = thread
         self.panel.pixhawk_usb_bootstrap_worker = worker
@@ -2555,9 +2566,7 @@ class DeviceRuntimeController:
         worker.failed.connect(
             lambda failure, camera=camera: self.panel._pixhawk_usb_recovery_failed(camera, failure)
         )
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        _wire_worker_thread_cleanup(worker, thread)
         thread.finished.connect(self.panel._clear_pixhawk_usb_recovery_worker)
         self.panel.pixhawk_usb_recovery_thread = thread
         self.panel.pixhawk_usb_recovery_worker = worker
@@ -2723,9 +2732,7 @@ class DeviceRuntimeController:
                 camera, target_sides, error
             ),
         )
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        _wire_worker_thread_cleanup(worker, thread)
         _connect_gui_signal(
             thread.finished,
             self.panel._clear_pixhawk_connection_worker,
@@ -2948,9 +2955,7 @@ class DeviceRuntimeController:
             self._finish_pixhawk_disconnect(camera, target_sides, error=error),
             QtCore.Qt.QueuedConnection,
         )
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        _wire_worker_thread_cleanup(worker, thread)
         thread.finished.connect(
             self._clear_pixhawk_disconnection_worker,
             QtCore.Qt.QueuedConnection,
@@ -3163,9 +3168,7 @@ class DeviceRuntimeController:
                 "PX4 shell과 MAVLink FTP가 모두 막히면 앱만으로 저장할 수 없습니다."
             )
         )
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        _wire_worker_thread_cleanup(worker, thread)
         thread.finished.connect(self.panel._clear_pixhawk_persistent_config_worker)
         self.panel.pixhawk_persistent_config_thread = thread
         self.panel.pixhawk_persistent_config_worker = worker
@@ -3465,9 +3468,7 @@ class DeviceRuntimeController:
                 camera, error, operation
             )
         )
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        _wire_worker_thread_cleanup(worker, thread)
         thread.finished.connect(lambda camera=camera, thread=thread: self.panel._clear_pixhawk_shell_worker(camera, thread))
         self.panel.pixhawk_shell_threads[camera] = thread
         self.panel.pixhawk_shell_workers[camera] = worker
@@ -3628,9 +3629,7 @@ class DeviceRuntimeController:
                 camera, operation, error
             )
         )
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        _wire_worker_thread_cleanup(worker, thread)
         thread.finished.connect(
             lambda camera=camera, thread=thread: self.panel._clear_pixhawk_parameter_worker(camera, thread)
         )

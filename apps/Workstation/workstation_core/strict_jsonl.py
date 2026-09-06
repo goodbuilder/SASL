@@ -36,12 +36,40 @@ def _decode_object(raw: bytes, *, path: Path, line_number: int) -> dict[str, Any
     return value
 
 
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
+def fsync_directory(path: Path) -> None:
+    """Fsync one directory so a prior rename/write into it is durable.
+
+    Canonical, consolidated implementation (see workstation_core/qimage_convert.py's
+    sibling consolidation note for `sha256_file`/`safe_token`/`artifact_id`):
+    always passes ``O_DIRECTORY`` (fails fast/clearly if *path* is not
+    actually a directory) and always lets any ``OSError`` propagate -- no
+    best-effort/"swallow the failure" mode. Call sites that previously
+    tolerated a missing/unopenable directory must now handle that
+    ``OSError`` explicitly themselves rather than relying on a silent no-op.
+    """
+
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def sha256_file(path: Path | str, *, chunk_size: int = 1024 * 1024) -> str:
+    """Return the streaming SHA-256 hex digest of a file's bytes.
+
+    Canonical, consolidated implementation -- see `fsync_directory`'s
+    docstring for the sibling consolidation note.
+    """
+
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _atomic_replace(path: Path, payload: bytes) -> None:
@@ -57,7 +85,7 @@ def _atomic_replace(path: Path, payload: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        _fsync_directory(path.parent)
+        fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -162,7 +190,13 @@ def append_jsonl_record(
         if fsync:
             os.fsync(handle.fileno())
     if not existed and fsync:
-        _fsync_directory(output.parent)
+        fsync_directory(output.parent)
 
 
-__all__ = ["JsonlRecovery", "append_jsonl_record", "prepare_jsonl_append"]
+__all__ = [
+    "JsonlRecovery",
+    "append_jsonl_record",
+    "fsync_directory",
+    "prepare_jsonl_append",
+    "sha256_file",
+]

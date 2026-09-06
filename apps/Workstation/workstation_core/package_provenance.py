@@ -35,6 +35,11 @@ from enum import Enum
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Mapping, Sequence
 
+from Workstation.workstation_core.strict_jsonl import (
+    fsync_directory as _fsync_directory,
+    sha256_file,
+)
+
 
 PRODUCER = "workstation.package_provenance"
 REDACTED = "[REDACTED]"
@@ -246,25 +251,6 @@ def canonical_json_bytes(value: Any) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-
-
-def sha256_file(path: Path | str, *, chunk_size: int = 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        while True:
-            chunk = handle.read(chunk_size)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def _session_destination(session_root: Path | str, relative_path: str | Path) -> tuple[Path, Path]:

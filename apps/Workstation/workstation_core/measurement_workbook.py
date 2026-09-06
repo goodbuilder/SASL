@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from Workstation.workstation_core.strict_jsonl import fsync_directory as _fsync_directory
+
 import xlsxwriter
 
 from Workstation.workstation_core.measurement_methods import (
@@ -718,19 +720,6 @@ def _provenance_rows(snapshot: MeasurementSnapshot, *, write_utc_ns: int) -> lis
     for name, value in sorted(snapshot.storage.items()):
         rows.append({"key": f"storage.{name}", "value": value})
     return rows
-
-
-def _fsync_directory(path: Path) -> None:
-    try:
-        fd = os.open(str(path), os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
 
 
 def write_measurement_workbook(snapshot: MeasurementSnapshot, path: Path, *, write_utc_ns: int | None = None) -> Path:

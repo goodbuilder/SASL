@@ -14,6 +14,8 @@ import tempfile
 from collections.abc import Iterable
 from pathlib import Path, PureWindowsPath
 
+from Workstation.workstation_core.strict_jsonl import sha256_file
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKSTATION_SOURCE_ROOT = Path(__file__).resolve().parent
@@ -58,6 +60,27 @@ def resolve_workstation_data_path(value: str | os.PathLike[str]) -> Path:
 
     path = Path(value).expanduser()
     return path if path.is_absolute() else (WORKSTATION_DATA_ROOT / path).resolve(strict=False)
+
+
+def first_existing_path(*values: object) -> Path | None:
+    """Return the first of *values* that resolves to an existing file.
+
+    Each candidate is resolved against the canonical Workstation data root
+    (not CWD) when it isn't already absolute. Ported from the
+    sessionless-migration-orphaned
+    ``measurement_package_controller.MeasurementPackageController._first_existing_path``.
+    """
+
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        candidate = Path(text).expanduser()
+        if not candidate.is_absolute():
+            candidate = resolve_workstation_data_path(candidate)
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def portable_workstation_data_path_text(
@@ -126,14 +149,6 @@ def workstation_settings_portability_errors(
     return errors
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def import_workstation_asset_file(
     source: str | os.PathLike[str],
     *,
@@ -160,13 +175,13 @@ def import_workstation_asset_file(
     if not category_text or Path(category_text).is_absolute() or ".." in Path(category_text).parts:
         raise ValueError(f"invalid portable asset category: {category!r}")
 
-    digest = _sha256_file(source_path)
+    digest = sha256_file(source_path)
     target_dir = root / category_text / "imported" / digest
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / source_path.name
     if target.exists():
         if target.is_file() and target.stat().st_size == source_path.stat().st_size:
-            if _sha256_file(target) == digest:
+            if sha256_file(target) == digest:
                 return target
         raise ValueError(f"portable asset target conflicts with verified source: {target}")
 
@@ -187,7 +202,7 @@ def import_workstation_asset_file(
         if copied_digest.hexdigest() != digest or temp_path.stat().st_size != source_path.stat().st_size:
             raise OSError(f"portable asset copy verification failed: {source_path}")
         os.replace(temp_path, target)
-        if _sha256_file(target) != digest:
+        if sha256_file(target) != digest:
             raise OSError(f"portable asset published hash mismatch: {target}")
         return target
     finally:
@@ -207,4 +222,5 @@ __all__ = [
     "workstation_settings_portability_errors",
     "import_workstation_asset_file",
     "resolve_workstation_data_path",
+    "first_existing_path",
 ]

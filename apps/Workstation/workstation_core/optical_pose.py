@@ -22,6 +22,11 @@ from math import acos, asin, atan2, cos, degrees, hypot, isfinite, radians, sin,
 from typing import Any, Iterable, Sequence
 
 
+from Workstation.workstation_core.triangulation import (
+    CAMERA_TO_BODY_ROTATION as OPTICAL_RDF_TO_VIRTUAL_FRD,
+    BODY_TO_CAMERA_ROTATION as VIRTUAL_FRD_TO_OPTICAL_RDF,
+)
+
 Vector3 = tuple[float, float, float]
 Matrix3 = tuple[Vector3, Vector3, Vector3]
 
@@ -29,16 +34,11 @@ ROTATION_VALIDATION_TOLERANCE = 1.0e-6
 DEFAULT_EARTH_RADIUS_M = 6_371_008.8
 
 # ``v_virtual_frd = OPTICAL_RDF_TO_VIRTUAL_FRD * v_optical_rdf``.
-OPTICAL_RDF_TO_VIRTUAL_FRD: Matrix3 = (
-    (0.0, 0.0, 1.0),
-    (1.0, 0.0, 0.0),
-    (0.0, 1.0, 0.0),
-)
-VIRTUAL_FRD_TO_OPTICAL_RDF: Matrix3 = (
-    (0.0, 1.0, 0.0),
-    (0.0, 0.0, 1.0),
-    (1.0, 0.0, 0.0),
-)
+# Single source of truth: this matrix (and its inverse) is defined once in
+# ``triangulation.py`` as ``CAMERA_TO_BODY_ROTATION``/``BODY_TO_CAMERA_ROTATION``
+# and re-exported here under the optical-pose module's own names, since the
+# two modules describe the same physical rotation (optical RDF <-> body/virtual
+# FRD) between the camera's optical frame and its FRD-convention counterpart.
 
 POSE_DOF_NAMES = (
     "roll_deg",
