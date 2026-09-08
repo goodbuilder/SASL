@@ -26,7 +26,7 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, BinaryIO, Mapping, Protocol, Sequence
+from typing import Any, BinaryIO, Callable, Mapping, Protocol, Sequence
 
 from Workstation.workstation_core.mavlink_sources import (
     LoggerCommandReceipt,
@@ -322,6 +322,7 @@ class _AutomaticState:
     inventory_before: tuple[ULogInventoryEntry, ...] = ()
     last_decision: LoggerControlDecision | None = None
     last_error: str | None = None
+    storage_context: dict[str, Any] = field(default_factory=dict)
 
 
 class ULogController:
@@ -338,15 +339,19 @@ class ULogController:
         ]
         | None = None,
         timestamp_filenames: bool = False,
+        storage_context_provider: Callable[[], Mapping[str, Any]] | None = None,
+        artifact_sink: Callable[[Mapping[str, Any]], bool] | None = None,
     ) -> None:
         self.session_root = Path(session_root).expanduser().resolve()
         self.session_root.mkdir(parents=True, exist_ok=True)
         self.session_id = _required_text(session_id, "session_id")
         self.timestamp_filenames = bool(timestamp_filenames)
+        self._storage_context_provider = storage_context_provider
+        self._artifact_sink = artifact_sink
         self._states: dict[MavlinkSourceId, _AutomaticState] = {}
         self._artifacts: list[SessionULogArtifact] = []
         self._manifest_path = self.session_root / "ulog_artifacts.jsonl"
-        self._manifest_recovery = prepare_jsonl_append(self._manifest_path)
+        self._manifest_recovery = None if storage_context_provider else prepare_jsonl_append(self._manifest_path)
         self._lock = threading.RLock()
         for source, value in (automatic_sources or {}).items():
             binding = (
@@ -384,6 +389,7 @@ class ULogController:
             ):
                 raise RuntimeError("Workstation already owns this source logger")
             try:
+                state.storage_context = dict(self._storage_context_provider() or {}) if self._storage_context_provider else {}
                 adapter = state.binding.adapter
                 identity = self._current_identity(state)
                 preflight = self._query_status(state, "preflight")
@@ -744,9 +750,16 @@ class ULogController:
         copy: Any,
         ownership_token_sha256: str | None,
     ) -> SessionULogArtifact:
-        source_dir = self.session_root / "ulog" / entry.source_id.value
+        state = self._states.get(entry.source_id)
+        context = (
+            dict(state.storage_context) if acquisition == ULogAcquisitionKind.AUTOMATIC and state is not None
+            else dict(self._storage_context_provider() or {}) if self._storage_context_provider else {}
+        )
+        artifact_root = Path(str(context.get("root") or self.session_root))
+        stamp = str(context.get("measurement_file_stamp") or "")
+        source_dir = artifact_root / "ulog" / entry.source_id.value
         source_dir.mkdir(parents=True, exist_ok=True)
-        part = source_dir / f".{uuid.uuid4().hex}.ulg.part"
+        part = source_dir / f".{stamp}_{uuid.uuid4().hex}.ulg.part"
         try:
             with part.open("xb") as writer:
                 copy(writer)
@@ -768,7 +781,7 @@ class ULogController:
             imported_utc_ns = time.time_ns()
             if self.timestamp_filenames:
                 timestamp_stem = (
-                    f"{creation_timestamp_text(imported_utc_ns)}_"
+                    f"{stamp or creation_timestamp_text(imported_utc_ns)}_"
                     f"{Path(safe_name).stem}"
                 )
                 sequence = 0
@@ -838,7 +851,18 @@ class ULogController:
             metadata = artifact.to_mapping()
             metadata["validation"] = _validation_mapping(validation)
             self._atomic_write_json(metadata_path, metadata)
-            self._append_json_line(self._manifest_path, metadata)
+            if context.get("measurement_id") and self._artifact_sink:
+                if not self._artifact_sink({
+                    **metadata, "measurement_id": context["measurement_id"],
+                    "event_type": "ulog_saved",
+                    "relative_path": final.relative_to(artifact_root).as_posix(),
+                    "metadata_relative_path": metadata_path.relative_to(artifact_root).as_posix(),
+                }):
+                    raise OSError("ULog saved but artifact record enqueue failed")
+            else:
+                if self._manifest_recovery is None:
+                    self._manifest_recovery = prepare_jsonl_append(self._manifest_path)
+                self._append_json_line(self._manifest_path, metadata)
             return artifact
         except Exception:
             try:

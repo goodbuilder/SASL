@@ -9,9 +9,12 @@ recorded result.
 from __future__ import annotations
 
 import math
+import json
 from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Any
+from Workstation.workstation_core.target_coordinates import TARGET_COORDINATE_FIELDS
+from Workstation.workstation_core.target_level_coordinates import LEVEL_COORDINATE_FIELDS, LEVEL_METADATA_FIELDS
 
 from Workstation.workstation_core.canonical_transform import (
     flatten_rotation,
@@ -210,6 +213,12 @@ def derive_method_result(outcome_record: Mapping[str, Any]) -> dict[str, Any]:
         derived["ray_angle_deg"] = _finite(triangulated.get("ray_angle_deg"))
         derived["left_depth_m"] = _finite(triangulated.get("left_depth_m"))
         derived["right_depth_m"] = _finite(triangulated.get("right_depth_m"))
+    derived.update({name: _finite(result.get(name)) for name in (*TARGET_COORDINATE_FIELDS, *LEVEL_COORDINATE_FIELDS)})
+    derived.update({name: result.get(name) for name in LEVEL_METADATA_FIELDS})
+    level_evidence = result.get("target_level_evidence")
+    derived["target_level_evidence"] = dict(level_evidence) if isinstance(level_evidence, Mapping) else {}
+    evidence = result.get("target_coordinate_evidence")
+    derived["target_coordinate_evidence"] = dict(evidence) if isinstance(evidence, Mapping) else {}
     return derived
 
 
@@ -275,6 +284,10 @@ def _flatten_rows(
 
 
 def _component_names(key: str, length: int) -> tuple[str, ...]:
+    if key == "virtual_frd_rpy_deg" and length == 3:
+        return ("roll", "pitch", "yaw")
+    if key == "p1_roll_pitch_deg" and length == 2:
+        return ("roll", "pitch")
     if "quaternion" in key and length == 4:
         return ("w", "x", "y", "z")
     if "ned" in key and length == 3:
@@ -320,6 +333,12 @@ def source_evidence_rows(
     attempt = attempt if isinstance(attempt, Mapping) else {}
     rows: list[tuple[str, object, str, str]] = []
     component_sources: dict[str, str] = {}
+    target = (outcome_record.get("result") or {}).get("target_coordinate_evidence")
+    if isinstance(target, Mapping):
+        rows.extend(_flatten_rows("target.", target, source="frozen target geolocation"))
+    pose_json = attempt.get("measurement_pose_evidence_json")
+    if pose_json:
+        rows.extend(_flatten_rows("optical_pose.", json.loads(pose_json), source="frozen optical pose evidence"))
     for item in attempt.get("measurement_component_sources", ()) or ():
         if isinstance(item, (list, tuple)) and len(item) == 2:
             component_sources[str(item[0])] = str(item[1])

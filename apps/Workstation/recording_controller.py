@@ -53,6 +53,7 @@ from Workstation.workstation_core.coordinate_contract import (
     WORLD_FRAME,
 )
 from Workstation.workstation_core.measurement_widgets import DistanceHistoryPoint
+from Workstation.workstation_core.target_coordinates import TARGET_COORDINATE_FIELDS, target_coordinates_from_attempt
 from Workstation.workstation_core.gnss_baseline_center import (
     DEFAULT_MAXIMUM_GNSS_AGE_S,
     DEFAULT_MAXIMUM_GNSS_TIMESTAMP_SPREAD_S,
@@ -1573,6 +1574,7 @@ class RecordingController:
         self.panel.method_evaluation_bundle_rows = allocate_rows(
             "method_evaluations", priority=True
         )
+        self.panel.method_result_rows = allocate_rows("method_results", priority=True)
         self.panel._gnss_baseline_center_recording_sequence = 0
         self.panel._recording_pair_row_index = {}
         self.panel._recording_pending_native_request_rows = {}
@@ -1767,8 +1769,17 @@ class RecordingController:
             getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
         ):
             normalized = re.sub(r"[^a-z0-9]+", "", str(prefix).lower()) or "capture"
+            reader = getattr(self.panel, "measurement_storage_context", None)
+            context = reader() if callable(reader) else {}
+            if context.get("measurement_file_stamp"):
+                return f"{normalized}-{context['measurement_file_stamp']}-{uuid.uuid4().hex[:8]}"
             return f"{normalized}-{creation_timestamp_text()}"
         return self._next_capture_id(records, prefix)
+
+    def _measurement_artifact_stamp(self, utc_ns: int | None = None) -> str:
+        reader = getattr(self.panel, "measurement_storage_context", None)
+        context = reader() if callable(reader) else {}
+        return str(context.get("measurement_file_stamp") or creation_timestamp_text(utc_ns))
 
     def _recover_retryable_recording_session(self) -> bool:
         try:
@@ -2463,6 +2474,8 @@ class RecordingController:
                 root,
                 session_id,
                 timestamp_filenames=sessionless,
+                storage_context_provider=getattr(self.panel, "measurement_storage_context", None),
+                artifact_sink=lambda payload: bool(self.panel.append_workstation_data("artifacts", payload, priority=True)),
                 automatic_sources=(
                     automatic_sources if isinstance(automatic_sources, dict) else None
                 ),
@@ -3326,7 +3339,7 @@ class RecordingController:
                     Path(image.source_name).stem,
                 ).strip("._") or "image"
                 stem = (
-                    f"{creation_timestamp_text(imported_utc_ns)}_"
+                    f"{self._measurement_artifact_stamp(imported_utc_ns)}_"
                     f"{side_name}_{source_stem}"
                 )
                 destination = destination_root / f"{stem}{suffix}"
@@ -4532,7 +4545,12 @@ class RecordingController:
             "session_id": session_id,
             "record_key": list(record_key) if record_key is not None else None,
             "writer_kind": "ring" if exact_ring_mode else "legacy",
+            "native_root": str(root),
+            "native_events_path": str(self._native_events_path(root)),
         }
+        context_reader = getattr(self.panel, "measurement_storage_context", None)
+        if callable(context_reader):
+            context.update(context_reader(session_id))
         if exact_ring_mode:
             writer = self._native_evidence_writer_for_session(session_id, root)
             if reservation is not None:
@@ -4610,6 +4628,7 @@ class RecordingController:
                 getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
             ),
             events_path=self._native_events_path(root),
+            event_sink=self._persist_native_artifact_record,
             parent=parent,
         )
         callback = getattr(self.panel, "_handle_async_native_frame_result", None)
@@ -4649,6 +4668,7 @@ class RecordingController:
                 getattr(self.panel, "_measurement_session_hierarchy_enabled", True)
             ),
             events_path=self._native_events_path(root),
+            event_sink=self._persist_native_artifact_record,
             parent=parent,
         )
         callback = getattr(self.panel, "_handle_async_native_frame_result", None)
@@ -4662,9 +4682,20 @@ class RecordingController:
         writers[writer_key] = writer
         return writer
 
+    def _persist_native_artifact_record(self, payload: Mapping[str, Any], context: Mapping[str, Any]) -> bool:
+        writer = getattr(self.panel, "append_workstation_data", None)
+        if not callable(writer):
+            return False
+        return bool(writer("native.frames", {
+            **dict(payload), "measurement_id": str(context.get("measurement_id") or ""),
+            "event_type": "native_frame_saved",
+        }, priority=True))
+
     def _native_events_path(self, root: Path) -> Path:
         """Use the timestamped native ledger selected by the data store when co-located."""
 
+        if re.fullmatch(r"\d{8}_\d{6}_\d{9}\+0900(?:-\d+)?", root.name):
+            return root / "raw" / f"{root.name}_native_frames.jsonl"
         candidate: Path | None = None
         owner_factory = getattr(self.panel, "_data_storage_controller", None)
         if callable(owner_factory):
@@ -5666,6 +5697,7 @@ class RecordingController:
         hard_block_reasons: tuple[str, ...] = (),
         advisory_reasons: tuple[str, ...] = (),
         measurement_yaw: Mapping[str, object] | None = None,
+        target_coordinates: Mapping[str, object] | None = None,
     ) -> dict[str, str]:
         warning_values = (
             [str(value) for value in warnings]
@@ -5693,6 +5725,8 @@ class RecordingController:
             "vector_frd_range_m": list(vector_frd_range_m),
             "measurement_yaw": None if measurement_yaw is None else dict(measurement_yaw),
         }
+        if target_coordinates is not None:
+            payload.update(target_coordinates)
         encoded = json.dumps(
             payload,
             ensure_ascii=False,
@@ -6532,8 +6566,11 @@ class RecordingController:
             "native_pair_projection": "authoritative_native.frames_event",
             **{str(name): value for name, value in outcome_metadata.items()},
         }
+        target_coordinates = target_coordinates_from_attempt(measurement_attempt.canonical_payload(), raw_point_left_m)
+        row.update(target_coordinates)
         row.update(
             self._measurement_result_evidence(
+                target_coordinates=target_coordinates,
                 attempt_sha256=measurement_attempt.canonical_sha256(),
                 status="measured",
                 valid=True,
@@ -6685,6 +6722,9 @@ class RecordingController:
             if self.panel.distance_recording_started_monotonic_s is None:
                 self.panel.distance_recording_started_monotonic_s = time.monotonic()
             recording_elapsed_s = max(0.0, time.monotonic() - self.panel.distance_recording_started_monotonic_s)
+        target_coordinates = target_coordinates_from_attempt(
+            measurement_attempt.canonical_payload(), raw_point_left_m
+        )
         point = DistanceHistoryPoint(
             timestamp_s=timestamp_s,
             distance_m=distance_m,
@@ -6696,6 +6736,7 @@ class RecordingController:
             class_name=class_name,
             sample_key=tuple(measurement_attempt.detection_pair_key),
             recording_elapsed_s=recording_elapsed_s,
+            **{name: target_coordinates[name] for name in TARGET_COORDINATE_FIELDS},
         )
         if not self.panel.distance_recording_enabled:
             if publish_history:
@@ -6877,8 +6918,10 @@ class RecordingController:
         row.update(self.panel._record_frame_timestamp_parameters(measurement_attempt))
         row.update(self.panel._record_live_telemetry_snapshot_parameters(measurement_attempt))
         row.update(self.panel._record_external_parameters(estimate=estimate, measurement_attempt=measurement_attempt))
+        row.update(target_coordinates)
         row.update(
             self._measurement_result_evidence(
+                target_coordinates=target_coordinates,
                 attempt_sha256=measurement_attempt.canonical_sha256(),
                 status="measured",
                 valid=True,
@@ -6974,6 +7017,12 @@ class RecordingController:
         if not self.panel.distance_recording_enabled:
             return
         for comparison_row in getattr(self.panel, "geometry_comparison_rows", ()) or ():
+            status = str(comparison_row.get("status", ""))
+            # A method with no inputs yields nothing worth a row: the same
+            # "waiting for inputs" placeholder repeated per pair only bloats
+            # the stream. Its absence is the signal that nothing was compared.
+            if status.startswith("waiting for inputs"):
+                continue
             record = {
                 "pair_sequence": pair_sequence,
                 "timestamp_s": self.panel._fmt_record_float(timestamp_s, 6),
@@ -7022,8 +7071,20 @@ class RecordingController:
             return f"{left_class_name}/{right_class_name}"
         return left_class_name or right_class_name or None
 
-    def _fmt_record_float(self, value: float | None, precision: int = 6) -> str:
-        return "" if value is None else f"{float(value):.{precision}f}"
+    def _fmt_record_float(self, value: float | None, precision: int = 6) -> float | None:
+        """Round a recorded number to ``precision`` decimals, keeping it numeric.
+
+        Rows used to carry every number as a fixed-precision string, which
+        made JSONL/CSV consumers parse text and turned workbook cells into
+        text. ``None`` stays ``None`` (JSON ``null``, empty CSV cell).
+        """
+
+        if value is None:
+            return None
+        number = float(value)
+        if number != number or number in (float("inf"), float("-inf")):
+            return None
+        return round(number, int(precision))
 
     def _fmt_record_bool(self, value: bool | None) -> str:
         return "" if value is None else ("true" if value else "false")

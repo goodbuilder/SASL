@@ -9,7 +9,7 @@ import queue
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from PyQt5 import QtCore, QtGui
 
@@ -161,12 +161,14 @@ class AsyncNativeEvidenceWriter(QtCore.QObject):
         max_pending: int = DEFAULT_MAX_PENDING,
         timestamp_filenames: bool = False,
         events_path: Path | str | None = None,
+        event_sink: Callable[[Mapping[str, Any], Mapping[str, Any]], bool] | None = None,
         parent: QtCore.QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self.root = Path(session_root).expanduser().resolve()
         self.max_pending = max(1, int(max_pending))
         self.timestamp_filenames = bool(timestamp_filenames)
+        self.event_sink = event_sink
         self.events_path = (
             None
             if events_path is None
@@ -318,8 +320,9 @@ class AsyncNativeEvidenceWriter(QtCore.QObject):
                 }
             stored_pair_id = str(pair_id)
             if self.timestamp_filenames:
+                stamp = (context or {}).get("measurement_file_stamp") or creation_timestamp_text()
                 stored_pair_id = (
-                    f"{creation_timestamp_text()}_"
+                    f"{stamp}_"
                     f"{_safe_token(pair_id, 'frame')}"
                 )
             job = RingPairJob(
@@ -404,10 +407,13 @@ class AsyncNativeEvidenceWriter(QtCore.QObject):
             raise ValueError("pinned native frame descriptor changed after reservation")
 
     def _persist(self, job: RingPairJob) -> dict[str, object]:
-        if self._store is None:
+        root = Path(str(job.context.get("native_root") or self.root)).resolve()
+        if self._store is None or self._store.root != root:
+            sink = self.event_sink if job.context.get("measurement_id") else None
             self._store = NativeFrameStore(
-                self.root,
-                events_path=self.events_path,
+                root,
+                events_path=job.context.get("native_events_path") or self.events_path,
+                event_sink=(lambda payload: sink(payload, job.context)) if sink else None,
             )
         fields: dict[str, object] = {
             "native_pair_status": "complete",

@@ -554,18 +554,29 @@ def test_measurement_decoder_preflight_rejection_preserves_live_preview() -> Non
     assert "Preview 유지" in panel.camera_connection_label.text
 
 
-def test_measurement_start_is_blocked_when_live_pixhawk_mag_is_unverified() -> None:
+def test_measurement_start_is_not_blocked_when_live_pixhawk_mag_is_unverified() -> None:
     from Workstation.camera_stream_controller import CameraStreamLifecycleController
 
     events: list[str] = []
+    reservations: list[str] = []
     panel = SimpleNamespace(
         _shutdown_in_progress=False,
         measurement_mag_start_gate=lambda: False,
         _log=lambda message: events.append(str(message)),
     )
+    controller = CameraStreamLifecycleController(panel)
 
-    assert CameraStreamLifecycleController(panel).start_yolo() is False
-    assert any("MAG active-selection verification" in message for message in events)
+    def _reserve() -> bool:
+        reservations.append("reserve")
+        return False
+
+    controller._reserve_package_detection = _reserve  # type: ignore[method-assign]
+
+    assert controller.start_yolo() is False
+    # The unverified MAG selection is logged as a warning and start proceeds
+    # to the package reservation step instead of being rejected up front.
+    assert any("MAG active-selection" in message and "차단하지 않음" in message for message in events)
+    assert reservations == ["reserve"]
 
 
 def test_camera_stream_preflight_rejection_does_not_cancel_current_owner() -> None:

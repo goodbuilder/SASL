@@ -63,6 +63,7 @@ DISTANCE_MEASUREMENT_COLUMNS = (
     "baseline_center_forward_m",
     "baseline_center_right_m",
     "baseline_center_down_m",
+    "target_latitude_deg", "target_longitude_deg", "target_altitude_ellipsoid_m", "target_altitude_msl_m",
     "baseline_m",
     "pairing_time_basis_requested",
     "pairing_time_basis",
@@ -1713,6 +1714,9 @@ def _compact_distance_measurement_row(
         "baseline_center_forward_m": _optional_float(row.get("baseline_center_forward_m")),
         "baseline_center_right_m": _optional_float(row.get("baseline_center_right_m")),
         "baseline_center_down_m": _optional_float(row.get("baseline_center_down_m")),
+        **{name: _optional_float(row.get(name)) for name in (
+            "target_latitude_deg", "target_longitude_deg", "target_altitude_ellipsoid_m", "target_altitude_msl_m",
+        )},
         "baseline_m": _optional_float(_first_present(row, "baseline_m", "baseline_length_m")),
         "pairing_time_basis_requested": str(
             row.get("pairing_time_basis_requested")
@@ -3184,6 +3188,9 @@ def _review_result_row(row: Mapping[str, object]) -> dict[str, object]:
         "forward_m": row.get("baseline_center_forward_m"),
         "right_m": row.get("baseline_center_right_m"),
         "down_m": row.get("baseline_center_down_m"),
+        **{name: row.get(name) for name in (
+            "target_latitude_deg", "target_longitude_deg", "target_altitude_ellipsoid_m", "target_altitude_msl_m",
+        )},
         "measurement_method_id": _review_measurement_method_id(row),
         "measurement_method_instance_id": row.get("measurement_method_instance_id"),
         "measurement_geometry_kind": row.get("measurement_geometry_kind"),

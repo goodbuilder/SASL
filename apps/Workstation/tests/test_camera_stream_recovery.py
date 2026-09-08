@@ -1659,3 +1659,22 @@ def test_new_workstation_settings_prefer_reliable_tcp_rtsp_transport() -> None:
     assert AppSettings().rtsp_transport == "tcp"
     assert not hasattr(AppSettings(), "rtsp_pipeline_profile")
     assert AppSettings().rtsp_reconnect_policy == "manual"
+
+
+def test_nvenc_recorder_overwrites_only_the_empty_slot_reservation(tmp_path) -> None:
+    """Field log 2026-09-07: every measurement MP4 stayed at 0 bytes because the
+    artifact allocator reserves the path with O_CREAT|O_EXCL and FFmpeg -n then
+    refused the placeholder ("File ... already exists. Exiting.")."""
+
+    from Workstation.workstation_core.yolo_stream import ffmpeg_overwrite_flag
+
+    missing = tmp_path / "missing.mp4"
+    assert ffmpeg_overwrite_flag(missing) == "-n"
+
+    reserved = tmp_path / "reserved.mp4"
+    reserved.touch()
+    assert ffmpeg_overwrite_flag(reserved) == "-y"
+
+    evidence = tmp_path / "evidence.mp4"
+    evidence.write_bytes(b"ftyp")
+    assert ffmpeg_overwrite_flag(evidence) == "-n"

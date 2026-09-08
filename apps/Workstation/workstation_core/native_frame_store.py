@@ -11,7 +11,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 import threading
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from PyQt5 import QtCore, QtGui
 
@@ -56,6 +56,7 @@ class NativeFrameStore:
         session_root: Path | str,
         *,
         events_path: Path | str | None = None,
+        event_sink: Callable[[Mapping[str, Any]], bool] | None = None,
     ) -> None:
         self.root = Path(session_root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
@@ -64,7 +65,8 @@ class NativeFrameStore:
             if events_path is None
             else Path(events_path).expanduser().resolve()
         )
-        self.ledger_recovery = prepare_jsonl_append(self.events_path)
+        self.event_sink = event_sink
+        self.ledger_recovery = None if event_sink else prepare_jsonl_append(self.events_path)
 
     def persist(
         self,
@@ -170,11 +172,11 @@ class NativeFrameStore:
             timestamp_reference=timestamp_reference,
             source_native_frame_id=str(metadata.get("source_native_frame_id") or ""),
         )
-        append_jsonl_record(
-            self.events_path,
-            record.to_mapping(),
-            prepared=True,
-        )
+        if self.event_sink is not None:
+            if not self.event_sink(record.to_mapping()):
+                raise OSError("native image saved but artifact record enqueue failed")
+        else:
+            append_jsonl_record(self.events_path, record.to_mapping(), prepared=True)
         return record
 
 
@@ -191,12 +193,14 @@ class AsyncNativeFrameStore(QtCore.QObject):
         max_pending: int = DEFAULT_MAX_PENDING,
         timestamp_filenames: bool = False,
         events_path: Path | str | None = None,
+        event_sink: Callable[[Mapping[str, Any], Mapping[str, Any]], bool] | None = None,
         parent: QtCore.QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self.root = Path(session_root).expanduser().resolve()
         self.max_pending = max(1, int(max_pending))
         self.timestamp_filenames = bool(timestamp_filenames)
+        self.event_sink = event_sink
         self.events_path = (
             None
             if events_path is None
@@ -243,8 +247,9 @@ class AsyncNativeFrameStore(QtCore.QObject):
             )
             stored_pair_id = str(pair_id)
             if self.timestamp_filenames:
+                stamp = (context or {}).get("measurement_file_stamp") or creation_timestamp_text()
                 stored_pair_id = (
-                    f"{creation_timestamp_text()}_"
+                    f"{stamp}_"
                     f"{_safe_token(pair_id, 'frame')}"
                 )
             task = (
@@ -318,10 +323,13 @@ class AsyncNativeFrameStore(QtCore.QObject):
         missing_sides: tuple[str, ...],
         context: dict[str, object],
     ) -> dict[str, object]:
-        if self._store is None:
+        root = Path(str(context.get("native_root") or self.root)).resolve()
+        if self._store is None or self._store.root != root:
+            sink = self.event_sink if context.get("measurement_id") else None
             self._store = NativeFrameStore(
-                self.root,
-                events_path=self.events_path,
+                root,
+                events_path=context.get("native_events_path") or self.events_path,
+                event_sink=(lambda payload: sink(payload, context)) if sink else None,
             )
         fields: dict[str, object] = {
             "native_pair_status": "complete",

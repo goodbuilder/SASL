@@ -142,9 +142,10 @@ def test_synthetic_stereo_features_are_distributed_and_unique() -> None:
     )
 
     assert result.inlier_count >= 4
-    assert len(result.left.points) >= 4
+    assert len(result.left.points) == result.inlier_count
     assert len(result.left.points) == len(result.right.points)
     assert result.left.spatial_rank >= 2
+    assert result.metadata["relative_rotation"]["fit_point_count"] == result.inlier_count
     assert len(set(result.left.points)) == len(result.left.points)
     assert result.left.eligible is True
     assert result.residual_px is not None

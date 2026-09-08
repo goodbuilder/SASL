@@ -272,34 +272,7 @@ def test_telemetry_workspace_renders_position_rtcm_and_ideal_disparity() -> None
     assert workspace.rtcm_values["frames"].text() == "4"
     assert workspace.rtcm_values["route"].text() == "enabled · Network NTRIP RTCM → Drone Pixhawk"
     assert workspace.disparity_values["disparity"].text() == "90.000 px"
-    assert workspace.gnss_baseline_center_group.title() == (
-        "GNSS BASELINE_CENTER F/R/D/Rg/Angle"
-    )
-    assert workspace.gnss_baseline_center_model.rowCount() == 1
-    assert workspace.gnss_baseline_center_model.horizontalHeaderItem(5).text() == (
-        "Baseline↔Drone angle°"
-    )
-    assert workspace.gnss_baseline_center_model.horizontalHeaderItem(6).text() == (
-        "90° error°"
-    )
-    assert workspace.gnss_baseline_center_model.horizontalHeaderItem(9).text() == (
-        "Fix P1/P2/Drone"
-    )
-    assert workspace.gnss_baseline_center_model.item(0, 0).text() == "CURRENT"
-    assert workspace.gnss_baseline_center_model.item(0, 1).text() == "+10.000"
-    assert workspace.gnss_baseline_center_model.item(0, 2).text() == "-2.000"
-    assert workspace.gnss_baseline_center_model.item(0, 3).text() == "+4.000"
-    assert workspace.gnss_baseline_center_model.item(0, 4).text() == "10.954"
-    assert workspace.gnss_baseline_center_model.item(0, 5).text() == "78.69"
-    assert workspace.gnss_baseline_center_model.item(0, 6).text() == "11.31"
-    assert workspace.gnss_baseline_center_model.item(0, 8).text() == "1000.0"
-    assert workspace.gnss_baseline_center_model.item(0, 9).text() == (
-        "RTK_FIXED / RTK_FIXED / RTK_FLOAT"
-    )
-    assert "angle=78.69°" in workspace.gnss_baseline_center_status.toolTip()
-    assert "not camera baseline_center_frd" in workspace.gnss_baseline_center_contract.text()
-    assert workspace.gnss_baseline_center_group.height() > 0
-    assert workspace.gnss_baseline_center_group.y() < workspace.rtcm_group.y()
+    assert not hasattr(workspace, "gnss_baseline_center_group")
     assert "P1/P2 baseline midpoint" in workspace.disparity_values["target"].text()
     assert not hasattr(workspace, "target_distance_spin")
     assert workspace.rtcm_source_combo.currentData() == "ntrip"
@@ -311,89 +284,42 @@ def test_telemetry_workspace_renders_position_rtcm_and_ideal_disparity() -> None
     app.processEvents()
 
 
-def test_gnss_baseline_center_live_states_keep_geometry_focus_and_scroll_stable() -> None:
+def test_moved_midpoint_table_keeps_geometry_focus_and_scroll_stable() -> None:
+    from Workstation.baseline_yaw90_pane import BaselineYaw90Pane
+
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    geometry = {
-        "state": "CURRENT",
-        "reason": "Three GNSS positions are current",
-        "forward_m": 9.999,
-        "right_m": -0.001,
-        "down_m": 0.0,
-        "range_m": 9.999,
-        "baseline_drone_angle_deg": math.degrees(math.atan2(9.999, 0.001)),
-        "baseline_drone_angle_error_deg": abs(90.0 - math.degrees(math.atan2(9.999, 0.001))),
-        "maximum_age_s": 0.1,
-        "timestamp_spread_ms": 999.9,
-        "fix_labels": {"p1": "3D_FIX", "p2": "RTK_FLOAT", "drone": "RTK_FIXED"},
-        "frame": "gnss_baseline_center_local_level_frd",
-    }
-    snapshot = {
-        "transport": "ethernet",
-        "connection_state": "DISCONNECTED",
-        "gnss_baseline_center_frd": geometry,
-    }
-
+    geometry = {"state": "CURRENT", "forward_m": 9.999, "right_m": -0.001,
+                "down_m": 0.0, "range_m": 9.999, "baseline_drone_angle_deg": 89.99,
+                "baseline_drone_angle_error_deg": 0.01, "timestamp_spread_ms": 999.9}
     class Backend:
-        def drone_telemetry_snapshot(self):
-            return snapshot
-
-        def workstation_settings_snapshot(self):
-            return {}
-
+        def baseline_yaw90_snapshot(self):
+            return {"midpoint": geometry, "reverse_editable": True}
     scroll = QtWidgets.QScrollArea()
     scroll.setWidgetResizable(True)
-    workspace = TelemetryWorkspace(Backend(), lambda _command_id: True)
+    workspace = BaselineYaw90Pane(Backend())
     scroll.setWidget(workspace)
     scroll.resize(1000, 600)
+    workspace.reference_toggle.setChecked(True)
     scroll.show()
     app.processEvents()
-    workspace.refresh({})
+    workspace.refresh()
+    workspace.reverse_checkbox.setFocus()
+    workspace.reference_table.selectRow(2)
+    scroll.verticalScrollBar().setValue(60)
+    before = (workspace.reference_table.height(), scroll.verticalScrollBar().value())
+    geometry.update(state="STALE", forward_m=-12345.678, reason="old GNSS " * 100)
+    workspace.refresh()
     app.processEvents()
-    workspace.endpoint_edit.setFocus()
-    scroll.verticalScrollBar().setValue(min(80, scroll.verticalScrollBar().maximum()))
-    app.processEvents()
-    before = {
-        "group_height": workspace.gnss_baseline_center_group.height(),
-        "table_height": workspace.gnss_baseline_center_table.height(),
-        "rtcm_y": workspace.rtcm_group.y(),
-        "scroll": scroll.verticalScrollBar().value(),
-    }
-
-    geometry.update(
-        state="STALE",
-        reason="three-GNSS timestamp spread 1.001s exceeds 1.000s " * 8,
-        forward_m=-12345.678,
-        right_m=23456.789,
-        down_m=-34567.891,
-        range_m=99999.999,
-        baseline_drone_angle_deg=math.degrees(math.atan2(12345.678, 23456.789)),
-        baseline_drone_angle_error_deg=abs(90.0 - math.degrees(math.atan2(12345.678, 23456.789))),
-        maximum_age_s=2.01,
-        timestamp_spread_ms=1000.1,
-    )
-    workspace.refresh({})
-    app.processEvents()
-    assert workspace.gnss_baseline_center_model.item(0, 0).text() == "STALE"
-    assert workspace.gnss_baseline_center_model.item(0, 1).text() == "-12345.678"
-    assert workspace.gnss_baseline_center_status.toolTip().startswith("STALE")
-    assert workspace.gnss_baseline_center_group.height() == before["group_height"]
-    assert workspace.gnss_baseline_center_table.height() == before["table_height"]
-    assert workspace.rtcm_group.y() == before["rtcm_y"]
-    assert scroll.verticalScrollBar().value() == before["scroll"]
-    assert app.focusWidget() is workspace.endpoint_edit
-
-    snapshot["gnss_baseline_center_frd"] = {
-        "state": "WAITING",
-        "reason": "Drone GNSS position waiting",
-    }
-    workspace.refresh({})
-    app.processEvents()
-    assert workspace.gnss_baseline_center_model.item(0, 1).text() == "--"
-    assert workspace.gnss_baseline_center_model.item(0, 4).text() == "--"
-    assert workspace.gnss_baseline_center_group.height() == before["group_height"]
-    assert workspace.rtcm_group.y() == before["rtcm_y"]
-    assert scroll.verticalScrollBar().value() == before["scroll"]
-
+    assert workspace.reference_table.item(0, 1).text() == "-12345.678"
+    assert workspace.reference_table.item(0, 2).text() == "STALE"
+    assert workspace.reference_table.currentRow() == 2
+    assert before == (workspace.reference_table.height(), scroll.verticalScrollBar().value())
+    assert app.focusWidget() is workspace.reverse_checkbox
+    geometry.clear()
+    geometry["state"] = "WAITING"
+    workspace.refresh()
+    assert workspace.reference_table.item(0, 1).text() == "--"
+    assert before == (workspace.reference_table.height(), scroll.verticalScrollBar().value())
     scroll.close()
     scroll.deleteLater()
     app.processEvents()
@@ -534,3 +460,60 @@ def test_telemetry_refresh_without_transport_key_defaults_to_radio() -> None:
     assert workspace.transport_combo.currentData() == "radio"
     assert workspace.serial_device_edit.isEnabled()
     assert workspace.serial_device_edit.text() == "/dev/serial/by-id/drone-radio"
+
+
+def test_drone_telemetry_position_rows_show_frozen_gnss_state() -> None:
+    from Workstation.drone_telemetry_controller import gnss_frozen_state_text
+
+    panel = SimpleNamespace(
+        mavlink_pixhawk=None,
+        latest_gps={
+            "left": _gps("left", longitude_deg=127.0),
+            "right": _gps("right", longitude_deg=127.00001),
+            "drone": _gps("drone", longitude_deg=127.00010),
+        },
+        _gnss_position_frozen={
+            "drone": {
+                "packets": 131,
+                "utc_frozen": False,
+                "fix_type": 4,
+                "satellites": 31,
+                "ground_speed_m_s": 0.0,
+            }
+        },
+        actual_visible_zoom={"left": {"index": 8}, "right": {"index": 8}},
+        drone_telemetry_url="udpin:0.0.0.0:14552",
+        drone_telemetry_baud=57_600,
+        drone_telemetry_rtcm_forward=True,
+        drone_telemetry_rtcm_source="ntrip",
+        drone_telemetry_connection_state="CONNECTED",
+        drone_telemetry_last_error="",
+        gnss_base_rtcm_stats={},
+    )
+
+    snapshot = DroneTelemetryController(panel).drone_telemetry_snapshot()
+
+    assert snapshot["position"]["state"] == "FROZEN ×131 (수신기 정지 · fix=4 sats=31 v=0.00m/s)"
+    assert snapshot["position"]["frozen"]["packets"] == 131
+    assert snapshot["left_position"]["state"] == "LIVE"
+    assert snapshot["left_position"]["frozen"] is None
+    assert gnss_frozen_state_text({"packets": 3, "utc_frozen": True}) == "FROZEN ×3 (AP 재전송)"
+    assert gnss_frozen_state_text(None) is None
+    assert gnss_frozen_state_text({"packets": 0}) is None
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    class Backend:
+        def drone_telemetry_snapshot(self):
+            return snapshot
+
+        def workstation_settings_snapshot(self):
+            return {}
+
+    workspace = TelemetryWorkspace(Backend(), lambda _command_id: True)
+    workspace.refresh({})
+    assert workspace.position_model.item(2, 0).text() == "Drone Pixhawk"
+    assert workspace.position_model.item(2, 1).text() == "FROZEN ×131 (수신기 정지 · fix=4 sats=31 v=0.00m/s)"
+    assert workspace.position_model.item(0, 1).text() == "LIVE"
+    workspace.deleteLater()
+    app.processEvents()

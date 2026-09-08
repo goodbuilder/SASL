@@ -269,6 +269,10 @@ class GnssRuntimeController:
                     root = Path(resolver("measurement-data"))
                 except (OSError, TypeError, ValueError):
                     root = None
+            context_reader = getattr(self.panel, "measurement_storage_context", None)
+            measurement = context_reader() if callable(context_reader) else {}
+            if measurement.get("root"):
+                root = Path(str(measurement["root"]))
             return RtcmEvidenceContext(
                 # RtcmEvidenceContext retains its legacy state vocabulary as
                 # an internal writer contract only; there is no persisted
@@ -278,8 +282,9 @@ class GnssRuntimeController:
                 session_id="measurement-data" if active and root is not None else "",
                 session_root=root if active else None,
                 context_token=(
-                    "measurement-data-live" if active and root is not None else ""
+                    str(measurement.get("measurement_id") or "measurement-data-live") if active and root is not None else ""
                 ),
+                file_stamp=str(measurement.get("measurement_file_stamp") or ""),
             )
         state = str(getattr(self.panel, "_measurement_package_state", "IDLE") or "IDLE")
         session_id = str(getattr(self.panel, "recording_session_id", "") or "")
@@ -625,6 +630,13 @@ class GnssRuntimeController:
 
     def _handle_rtcm_pipeline_integrity_failed(self, payload: object) -> None:
         values = dict(payload) if isinstance(payload, dict) else {"error": str(payload)}
+        if values.get("format") == "CSV":
+            self.panel._log(f"[저장] RTCM CSV 저장 실패: {values.get('error', '')}")
+            append = getattr(self.panel, "append_workstation_data", None)
+            if callable(append):
+                append("events", {"event_type": "rtcm_csv_failed", "measurement_id": values.get("context_token"),
+                                  "detail": values.get("error", ""), "payload": values}, priority=True)
+            return
         error = (
             "RTCM integrity failure: "
             f"sequence={int(values.get('sequence') or 0)}, {values.get('error') or 'unknown error'}"
@@ -2977,7 +2989,17 @@ class GnssRuntimeController:
                 self.panel._refresh_gnss_base_rtcm_stats()
                 self.panel._refresh_gnss_operation_readiness()
             return
-        worker.request.emit(tuple(target_sides), payload)
+        # Carry the receive time so the worker drops a frame that waited
+        # longer than MAX_INJECTION_AGE_S instead of pushing stale corrections
+        # into the receiver in a late burst.
+        worker.request_envelope.emit(
+            {
+                "targets": tuple(target_sides),
+                "payload": payload,
+                "source": str(source),
+                "receive_monotonic_ns": time.monotonic_ns(),
+            }
+        )
         if ui_due:
             self.panel._set_health_label(
                 self.panel.gnss_base_status_labels["rtcm_injection"],
@@ -3031,6 +3053,7 @@ class GnssRuntimeController:
         worker = PixhawkRtcmInjectionWorker(subscriber)
         worker.moveToThread(thread)
         worker.request.connect(worker.enqueue, QtCore.Qt.QueuedConnection)
+        worker.request_envelope.connect(worker.enqueue_envelope, QtCore.Qt.QueuedConnection)
         thread.finished.connect(thread.deleteLater)
         _connect_gui_signal(
             thread.finished,
@@ -3085,6 +3108,19 @@ class GnssRuntimeController:
             return True
         return False
 
+    def _note_rtcm_frame_drop(self, dropped: int) -> None:
+        """Log dropped RTCM frames at most every 5 s, carrying the pending count."""
+
+        now_s = time.monotonic()
+        pending = int(getattr(self.panel, "_rtcm_drop_pending_count", 0) or 0) + int(dropped)
+        last_s = getattr(self.panel, "_rtcm_drop_last_log_s", None)
+        if last_s is not None and now_s - float(last_s) < 5.0:
+            self.panel._rtcm_drop_pending_count = pending
+            return
+        self.panel._rtcm_drop_pending_count = 0
+        self.panel._rtcm_drop_last_log_s = now_s
+        self.panel._log(f"[GNSS] RTCM 오래된 대기 프레임 {pending}개를 폐기했습니다.")
+
     def _apply_pixhawk_rtcm_result(self, result: object) -> None:
         data = dict(result or {})
         payload_bytes = int(data.get("payload_bytes") or 0)
@@ -3123,7 +3159,21 @@ class GnssRuntimeController:
                 f"{self.panel._px4_mag_camera_label(side)}:{item.get('reason') or 'liveness blocked'}"
             )
         if dropped:
-            self.panel._log(f"[GNSS] RTCM 오래된 대기 프레임 {dropped}개를 폐기했습니다.")
+            self._note_rtcm_frame_drop(dropped)
+        if failed_labels or blocked_labels:
+            # The health label below is the operator surface; run.log needs the
+            # same reason so a side that silently stops receiving corrections
+            # can be diagnosed after the fact.
+            now_s = time.monotonic()
+            last_s = getattr(self.panel, "_rtcm_problem_last_log_s", None)
+            if last_s is None or now_s - float(last_s) >= 5.0:
+                self.panel._rtcm_problem_last_log_s = now_s
+                parts = []
+                if failed_labels:
+                    parts.append("실패 " + ", ".join(failed_labels))
+                if blocked_labels:
+                    parts.append("차단 " + ", ".join(blocked_labels))
+                self.panel._log(f"[GNSS] RTCM 주입 제한 ({payload_bytes} bytes): " + " | ".join(parts))
         # Receive/pending updates and completed injection updates use separate
         # clocks.  Otherwise every high-rate receive event consumes the one
         # slot that should publish delivery stats and advance readiness.

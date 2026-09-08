@@ -99,6 +99,12 @@ def test_overview_shows_all_read_only_method_states_and_navigates_to_details() -
             "primary_blocker": "missing frozen input" if index else "",
             "additional_blocker_count": 2 if index == 1 else 0,
             "result_counters": {"VALID": index, "BLOCKED": 1, "FAILED": 0},
+            "runtime_reasons": (
+                ["missing frozen input", "stale attitude", "no baseline"]
+                if index == 1
+                else ([] if index == 0 else ["missing frozen input"])
+            ),
+            "required_inputs": ["exact operating K,D", "usable P1→P2 GNSS NED baseline"],
         }
         for index, method_id in enumerate(MEASUREMENT_METHOD_IDS)
     ]
@@ -120,6 +126,14 @@ def test_overview_shows_all_read_only_method_states_and_navigates_to_details() -
     assert "PRIMARY" in workspace.measurement_method_cards[MEASUREMENT_METHOD_IDS[0]].text()
     assert "REUSED" in workspace.measurement_method_cards[MEASUREMENT_METHOD_IDS[0]].text()
     assert "+2 more" in workspace.measurement_method_cards[MEASUREMENT_METHOD_IDS[1]].text()
+    blocked_tooltip = workspace.measurement_method_cards[MEASUREMENT_METHOD_IDS[1]].toolTip()
+    for reason in ("missing frozen input", "stale attitude", "no baseline"):
+        assert f"- {reason}" in blocked_tooltip
+    assert "Required inputs:" in blocked_tooltip
+    assert "- usable P1→P2 GNSS NED baseline" in blocked_tooltip
+    ready_tooltip = workspace.measurement_method_cards[MEASUREMENT_METHOD_IDS[0]].toolTip()
+    assert "Reasons: none (ready)" in ready_tooltip
+    assert "REUSED" in ready_tooltip
     workspace.measurement_method_cards[MEASUREMENT_METHOD_IDS[3]].click()
     assert opened == ["processing.measurement"]
 
@@ -903,6 +917,11 @@ def test_sessionless_data_workspace_exposes_stable_measurement_workbook_actions(
     assert len(workspace.measurement_workbook_status_label.text()) < len(long_error)
     assert long_error in workspace.measurement_workbook_status_label.toolTip()
 
+    backend._measurement_workbook_snapshot.update(state="READY", error="", rebuild_error="saved-input rebuild failed")
+    workspace._refresh_measurement_workbook()
+    assert "REBUILD FAILED" in workspace.measurement_workbook_status_label.text()
+    assert workspace.measurement_workbook_status_label.height() == initial_height
+
     workspace.deleteLater()
     app.processEvents()
 
@@ -1126,4 +1145,47 @@ def test_data_workspace_leaves_legacy_session_files_for_file_manager_only(tmp_pa
     window.close()
     app.processEvents()
     window.deleteLater()
+    app.processEvents()
+
+
+def test_command_failure_is_written_to_the_diagnostics_log(caplog) -> None:
+    """Field report: 측정 시작 did nothing visible. The registry swallowed the
+    handler exception into a 5-second status-bar message, so nothing reached
+    the log. Failures must be logged with the exception type."""
+
+    import logging
+
+    from Workstation.command_registry import CommandSpec
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    logs: list[str] = []
+    backend.panel._log = logs.append
+    window = WorkstationMainWindow(backend=backend)
+    window.show()
+    app.processEvents()
+
+    def broken_handler() -> object:
+        raise RuntimeError("YOLO model is not selected")
+
+    window.commands.register(
+        CommandSpec("test.broken", "깨진 명령", "raises", "detection", broken_handler)
+    )
+    logger = logging.getLogger(type(window.commands).__module__)
+    logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.ERROR, logger=logger.name):
+            assert window.commands.invoke("test.broken") is False
+    finally:
+        logger.removeHandler(caplog.handler)
+    assert logs[-1] == "[명령] 깨진 명령 실패: RuntimeError: YOLO model is not selected"
+    assert any(record.exc_info and "Traceback" in logging.Formatter().format(record) for record in caplog.records)
+
+    window.commands.register(
+        CommandSpec("test.rejected", "거부 명령", "returns False", "detection", lambda: False)
+    )
+    assert window.commands.invoke("test.rejected") is False
+    assert logs[-1] == "[명령] 거부 명령 실패: handler rejected command"
+
+    window.close()
     app.processEvents()

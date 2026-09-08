@@ -971,6 +971,7 @@ class OpticalPoseCandidate:
     uncertainty_metrics: tuple[tuple[str, float], ...] = ()
     warnings: tuple[str, ...] = ()
     created_utc_ns: int | None = None
+    reference_evidence_json: str = ""
     observability_by_side: tuple[
         tuple[str, tuple[tuple[str, bool], ...]], ...
     ] = ()
@@ -980,6 +981,12 @@ class OpticalPoseCandidate:
         method = str(self.method).strip()
         if not candidate_id or not method:
             raise ValueError("candidate_id and method must be non-empty")
+        if self.reference_evidence_json:
+            import json
+            from .optical_yaw90_reference import canonical_evidence, reference_poses
+            reference = json.loads(self.reference_evidence_json)
+            reference_poses(reference)
+            object.__setattr__(self, "reference_evidence_json", canonical_evidence(reference))
         if not isinstance(self.left_pose_ned, CameraPoseNed) or not isinstance(
             self.right_pose_ned, CameraPoseNed
         ):

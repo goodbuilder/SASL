@@ -674,6 +674,43 @@ def test_mountain_rotation_ill_conditioned_geometry_is_not_apply_eligible() -> N
     assert result.apply_eligible is False
     assert any("condition" in reason for reason in result.ineligibility_reasons)
 
+    advisory = solve_mountain_relative_rotation_robust(
+        left_bearings_rdf=left,
+        right_bearings_rdf=right,
+        baseline_direction_left_rdf=baseline_direction,
+        prior_rotation_right_from_left_rdf=np.eye(3).tolist(),
+        config=MountainRotationConfig(quality_advisory=True),
+    )
+    assert advisory.apply_eligible
+    assert not advisory.ineligibility_reasons
+    assert any("condition" in reason for reason in advisory.quality_warnings)
+    np.testing.assert_allclose(advisory.rotation_right_from_left_rdf, result.rotation_right_from_left_rdf)
+
+
+def test_mountain_advisory_policy_still_blocks_rank_deficiency() -> None:
+    result = solve_mountain_relative_rotation_robust(
+        left_bearings_rdf=[(0, 0, 1)] * 4,
+        right_bearings_rdf=[(0, 0, 1)] * 4,
+        baseline_direction_left_rdf=(0, 1, 0),
+        prior_rotation_right_from_left_rdf=np.eye(3).tolist(),
+        config=MountainRotationConfig(quality_advisory=True),
+    )
+    assert not result.apply_eligible
+    assert any("rank" in reason for reason in result.ineligibility_reasons)
+
+
+def test_mountain_advisory_policy_retains_fit_below_inlier_quality_target() -> None:
+    _, baseline, left, right = _synthetic_mountain_correspondences(seed=3, spread=6.0)
+    result = solve_mountain_relative_rotation_robust(
+        left_bearings_rdf=left, right_bearings_rdf=right,
+        baseline_direction_left_rdf=baseline,
+        prior_rotation_right_from_left_rdf=np.eye(3).tolist(),
+        config=MountainRotationConfig(min_inliers=len(left) + 1, quality_advisory=True),
+    )
+    assert result.apply_eligible
+    assert any("inlier_count" in reason for reason in result.quality_warnings)
+    assert np.isfinite(result.rotation_right_from_left_rdf).all()
+
 
 def test_mountain_rotation_requires_minimum_correspondences() -> None:
     with pytest.raises(ValueError, match="at least 4"):

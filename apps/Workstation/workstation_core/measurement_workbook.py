@@ -1,7 +1,9 @@
 """Per-Measurement XLSX workbook: sheet layout, atomic publish, background writer.
 
 The workbook is the operator-facing, standalone record of one Measurement.
-Every value is a literal (no formulas); missing values are the text ``N/A``;
+Every data value is a literal; reader sheets show missing values as ``—``
+and compatibility evidence tables retain ``N/A``. R,t appears both in the
+dedicated comparison sheet and expanded beside every Method result;
 nanosecond/microsecond integers are written as text so Excel cannot round
 them. A complete temporary workbook is written, closed, fsynced and then
 atomically renamed over the previous version, so a crash always leaves the
@@ -9,6 +11,8 @@ last good workbook in place.
 """
 
 from __future__ import annotations
+
+from Workstation.workstation_core.target_level_coordinates import LEVEL_OUTPUT_FIELDS
 
 import json
 import math
@@ -18,6 +22,8 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
+from dataclasses import replace
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,8 +50,12 @@ from Workstation.workstation_core.method_result_evidence import (
     flat_transform_cells,
     source_evidence_rows,
 )
+from Workstation.workstation_core.measurement_report import (
+    FRONT_SHEETS, append_trend_chart, rt_id, rt_sources, write_front_sheets,
+)
+from Workstation.workstation_core.measurement_artifacts import KST
 
-WORKBOOK_SCHEMA = "workstation-measurement-workbook-v1"
+WORKBOOK_SCHEMA = "workstation-measurement-workbook-v2"
 NA = "N/A"
 MAX_SHEET_ROWS = 1_048_575
 _EXACT_INT_LIMIT = 2**53
@@ -59,18 +69,12 @@ SECTION_D = "[D] R,t source evidence"
 SECTION_E = "[E] Geometry diagnostics"
 
 SECTION_A_COLUMNS: tuple[str, ...] = (
-    "measurement_id",
-    "pair_id",
-    "pair_sequence",
-    "time_local",
-    "time_utc_ns",
-    "Attempted",
+    "pair_sequence", "elapsed_s", "Range", "Forward", "Right", "Down", "Status", "Reason",
+    "target_latitude_deg", "target_longitude_deg", "target_altitude_ellipsoid_m", "target_altitude_msl_m", *LEVEL_OUTPUT_FIELDS,
     "R11", "R12", "R13", "R21", "R22", "R23", "R31", "R32", "R33",
     "T_R", "T_D", "T_F",
-    "Forward", "Right", "Down", "Range",
-    "Status",
-    "Reason",
-    "time_delta_s",
+    "rt_id", "R_source", "T_source",
+    "measurement_id", "pair_id", "time_local", "time_utc_ns", "Attempted", "time_delta_s",
     "method_instance_id",
     "worker_started_monotonic_ns",
     "completed_monotonic_ns",
@@ -103,6 +107,7 @@ FLAT_COLUMNS: tuple[str, ...] = (
     "R11", "R12", "R13", "R21", "R22", "R23", "R31", "R32", "R33",
     "T_R", "T_D", "T_F",
     "Forward", "Right", "Down", "Range",
+    "target_latitude_deg", "target_longitude_deg", "target_altitude_ellipsoid_m", "target_altitude_msl_m", *LEVEL_OUTPUT_FIELDS,
     "ray_gap_m", "ray_angle_deg", "left_depth_m", "right_depth_m",
     "time_delta_s", "Reason",
 )
@@ -125,6 +130,21 @@ ALIGNMENT_COLUMNS: tuple[str, ...] = (
     "T_R", "T_D", "T_F", "source_sha256", "detail",
 )
 EVENT_COLUMNS: tuple[str, ...] = ("measurement_id", "event_type", "utc_ns", "utc_local", "monotonic_ns", "detail", "payload")
+METHOD_COMPARE_FRONT_COLUMNS: tuple[str, ...] = (
+    "measurement_id", "pair_id", "pair_sequence", "time_local", "time_utc_ns",
+    "disparity_px", "time_delta_s",
+)
+METHOD_COMPARE_FIELDS: tuple[str, ...] = ("status", "range_m", "forward_m", "right_m", "down_m", "ray_angle_deg",
+    "target_latitude_deg", "target_longitude_deg", "target_altitude_ellipsoid_m", "target_altitude_msl_m", *LEVEL_OUTPUT_FIELDS)
+OPTICAL_POSE_COLUMNS: tuple[str, ...] = (
+    "measurement_id", "record_source", "event_type", "utc_ns", "utc_local",
+    "mode", "suggestion_id", "state", "eligible", "inlier_count", "match_count",
+    "residual_px", "confidence",
+    "relative_yaw_right_minus_left_deg", "relative_pitch_right_minus_left_deg",
+    "relative_roll_right_minus_left_deg", "relative_fit_inlier_count", "relative_fit_residual_px",
+    "far_field_du_median_px", "far_field_dv_median_px",
+    "gnss_baseline_m", "gnss_baseline_fix_quality", "left_image_sha256", "right_image_sha256",
+)
 EXACT_COLUMNS: tuple[str, ...] = ("measurement_id", "pair_id", "method_id", "field", "value", "value_repr", "value_hex")
 TELEMETRY_FRONT_COLUMNS: tuple[str, ...] = (
     "measurement_id", "side", "sample_type", "sequence",
@@ -168,7 +188,8 @@ def _kst_or_local_iso(utc_ns: int | None) -> str:
     if utc_ns is None:
         return NA
     try:
-        return datetime.fromtimestamp(int(utc_ns) / 1e9, tz=timezone.utc).astimezone().isoformat(timespec="milliseconds")
+        seconds, nanos = divmod(int(utc_ns), 1_000_000_000)
+        return datetime.fromtimestamp(seconds, tz=KST).replace(microsecond=nanos // 1000).isoformat(timespec="milliseconds")
     except (OverflowError, OSError, ValueError):
         return NA
 
@@ -185,11 +206,48 @@ class _SheetWriter:
     """Explicit-type cell writer with column formats and width tracking."""
 
     def __init__(self, workbook: xlsxwriter.Workbook, name: str, formats: Mapping[str, Any]) -> None:
+        self._workbook = workbook
+        self._base_name = name
+        self._part = 0
         self.worksheet = workbook.add_worksheet(name)
+        self.sheets = [self.worksheet]
+        self.table_headers: dict[Any, int] = {}
+        self.end_rows: dict[Any, int] = {}
         self.name = name
         self.formats = formats
         self.row = 0
         self.widths: dict[int, int] = {}
+        self.rt_links: Mapping[str, tuple[str, int]] = {}
+        self.display_na = "—" if name in FRONT_SHEETS else NA
+        self._row_heights: dict[int, float] = {}
+
+    @property
+    def max_row(self) -> int:
+        return MAX_SHEET_ROWS
+
+    def _continue(self) -> None:
+        self.end_rows[self.worksheet] = self.row - 1
+        self.finish()
+        self._part += 1
+        self.name = f"{self._base_name[:26]}_{self._part:03d}"
+        self.worksheet = self._workbook.add_worksheet(self.name)
+        self.sheets.append(self.worksheet)
+        self.row = 0
+        self.widths = {}
+        self._row_heights = {}
+
+    def ensure_room(self, rows: int = 1) -> None:
+        if self.row + rows - 1 > self.max_row:
+            self._continue()
+
+    def data_row(self, columns: Sequence[str]) -> None:
+        if self.row > self.max_row:
+            previous = self.worksheet
+            header = self.table_headers.get(previous, 0)
+            previous.autofilter(header, 0, self.max_row, len(columns) - 1)
+            previous.freeze_panes(header + 1, 2)
+            self._continue()
+            self.header(columns)
 
     def _note_width(self, column: int, text: str) -> None:
         width = min(60, max(4, len(text) + 1))
@@ -199,10 +257,10 @@ class _SheetWriter:
     def cell(self, row: int, column: int, value: object, *, header: str = "") -> None:
         worksheet = self.worksheet
         if value is None:
-            worksheet.write_string(row, column, NA, self.formats["na"])
+            worksheet.write_string(row, column, self.display_na, self.formats["na"])
             return
         if isinstance(value, bool):
-            worksheet.write_string(row, column, "YES" if value else "NO")
+            worksheet.write_string(row, column, "YES" if value else "NO", self.formats["body"])
             self._note_width(column, "YES")
             return
         if isinstance(value, int):
@@ -211,7 +269,7 @@ class _SheetWriter:
                 worksheet.write_string(row, column, text, self.formats["text_int"])
                 self._note_width(column, text)
             else:
-                worksheet.write_number(row, column, value)
+                worksheet.write_number(row, column, value, self.formats["integer"])
                 self._note_width(column, str(value))
             return
         if isinstance(value, float):
@@ -223,32 +281,49 @@ class _SheetWriter:
                 worksheet.write_string(row, column, text, self.formats["text_int"])
                 self._note_width(column, text)
                 return
-            worksheet.write_number(row, column, value, self._number_format(header))
+            worksheet.write_number(row, column, value, self._number_format(header) or self.formats["number"])
             self._note_width(column, f"{value:.6f}")
             return
         if isinstance(value, (list, tuple, dict)):
             text = _compact_json(value)
         else:
             text = str(value)
-        worksheet.write_string(row, column, text)
+        if header in {"rt_id", "R,t 번호", "Method"} and text in self.rt_links:
+            name, target_row = self.rt_links[text]
+            worksheet.write_url(row, column, f"internal:'{name}'!A{target_row + 1}", self.formats["link"], string=text)
+        else:
+            wrap_width = {"Reason": 37, "사유": 36, "경고": 40, "R_source": 48, "T_source": 48, "R 출처": 31, "t 출처": 31, "term": 37, "definition": 78}.get(header)
+            worksheet.write_string(row, column, text, self.formats["wrap"] if wrap_width else self.formats["body"])
+            if wrap_width:
+                lines = sum(max(1, math.ceil(sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in line) / wrap_width)) for line in text.splitlines() or [""])
+                height = max(self._row_heights.get(row, 18), min(409, 18 * lines))
+                if height > 18:
+                    worksheet.set_row(row, height)
+                    self._row_heights[row] = height
         self._note_width(column, text)
 
     def _number_format(self, header: str) -> Any:
+        if header.endswith(("target_latitude_deg", "target_longitude_deg")):
+            return self.formats["matrix"]
         if header.startswith("R") and len(header) == 3 and header[1:].isdigit():
             return self.formats["matrix"]
         if header.endswith(("_ray_R", "_ray_D", "_ray_F")):
             return self.formats["matrix"]
-        if header in {"Forward", "Right", "Down", "Range", "T_R", "T_D", "T_F"} or header.endswith("_m"):
+        if header in {"Forward", "Right", "Down", "Range", "T_R", "T_D", "T_F"} or header.endswith(("_m", "(m)")):
             return self.formats["metre"]
-        if header.endswith("_deg"):
+        if header.endswith(("_deg", "(deg)")):
             return self.formats["degree"]
+        if header.endswith(("_s", "(s)")):
+            return self.formats["elapsed"]
         return None
 
     def header(self, columns: Sequence[str]) -> int:
+        self.ensure_room(2)
         for index, name in enumerate(columns):
             self.worksheet.write_string(self.row, index, str(name), self.formats["header"])
             self._note_width(index, str(name))
         header_row = self.row
+        self.table_headers[self.worksheet] = header_row
         self.row += 1
         return header_row
 
@@ -262,20 +337,29 @@ class _SheetWriter:
     ) -> int:
         header_row = self.header(columns)
         count = 0
+        part_count = 0
         for row in rows:
-            if self.row > MAX_SHEET_ROWS:
-                break
+            if self.row > self.max_row:
+                if autofilter and part_count:
+                    self.worksheet.autofilter(header_row, 0, self.row - 1, max(0, len(columns) - 1))
+                if freeze:
+                    self.worksheet.freeze_panes(header_row + 1, 2)
+                self._continue()
+                header_row = self.header(columns)
+                part_count = 0
             for index, name in enumerate(columns):
                 self.cell(self.row, index, row.get(name), header=name)
             self.row += 1
             count += 1
+            part_count += 1
         if freeze:
             self.worksheet.freeze_panes(header_row + 1, 0)
         if autofilter and count:
-            self.worksheet.autofilter(header_row, 0, header_row + count, max(0, len(columns) - 1))
+            self.worksheet.autofilter(header_row, 0, header_row + part_count, max(0, len(columns) - 1))
         return count
 
     def marker(self, text: str) -> None:
+        self.ensure_room()
         self.worksheet.write_string(self.row, 0, text, self.formats["section"])
         self.row += 1
 
@@ -284,6 +368,7 @@ class _SheetWriter:
 
     def key_values(self, items: Iterable[tuple[str, object]]) -> None:
         for key, value in items:
+            self.ensure_room()
             self.worksheet.write_string(self.row, 0, str(key), self.formats["key"])
             self._note_width(0, str(key))
             self.cell(self.row, 1, value, header=str(key))
@@ -292,19 +377,25 @@ class _SheetWriter:
     def finish(self) -> None:
         for column, width in self.widths.items():
             self.worksheet.set_column(column, column, width)
+        self.worksheet.set_default_row(18)
+        self.worksheet.hide_gridlines(2)
 
 
 def _formats(workbook: xlsxwriter.Workbook) -> dict[str, Any]:
-    return {
-        "header": workbook.add_format({"bold": True, "bg_color": "#E6E6E6", "border": 1}),
-        "section": workbook.add_format({"bold": True, "font_color": "#333333", "font_size": 12}),
-        "key": workbook.add_format({"bold": True}),
-        "na": workbook.add_format({"font_color": "#808080", "italic": True}),
-        "text_int": workbook.add_format({"num_format": "@"}),
-        "metre": workbook.add_format({"num_format": "0.000000"}),
-        "degree": workbook.add_format({"num_format": "0.000"}),
-        "matrix": workbook.add_format({"num_format": "0.000000000"}),
+    base = {"font_name": "Noto Sans CJK KR", "font_size": 11, "font_color": "#202020"}
+    styles = {
+        "body": {"align": "left", "indent": 1}, "number": {"align": "right"},
+        "integer": {"num_format": "0", "align": "right"},
+        "wrap": {"text_wrap": True, "valign": "top", "indent": 1},
+        "header": {"bold": True, "align": "center", "bg_color": "#EAEAEA", "bottom": 1, "bottom_color": "#C8C8C8", "text_wrap": True},
+        "section": {"bold": True, "font_size": 12}, "key": {"bold": True},
+        "na": {"font_color": "#737373", "align": "center"}, "text_int": {"num_format": "@"},
+        "metre": {"num_format": "0.000"}, "degree": {"num_format": "0.00"},
+        "matrix": {"num_format": "0.000000000"}, "elapsed": {"num_format": "0.000"},
+        "estimated_metre": {"num_format": '0.000" †"', "font_color": "#A02828"},
+        "band": {"bg_color": "#F7F7F7"}, "link": {"font_color": "#5D2020", "underline": 1},
     }
+    return {name: workbook.add_format(style if name == "band" else {**base, **style}) for name, style in styles.items()}
 
 
 def _pair_snapshot_detection_cells(prefix: str, detection: Mapping[str, Any], detection_id: str) -> dict[str, object]:
@@ -332,6 +423,9 @@ def _section_a_row(snapshot: MeasurementSnapshot, pair_by_id: Mapping[str, Any],
         "measurement_id": snapshot.measurement_id,
         "pair_id": row.pair_id,
         "pair_sequence": row.pair_sequence,
+        "elapsed_s": None if pair is None else (pair.created_monotonic_ns - snapshot.started_monotonic_ns) / 1e9,
+        "rt_id": rt_id(row) or None,
+        "R_source": rt_sources(row)[0], "T_source": rt_sources(row)[1],
         "time_local": _kst_or_local_iso(None if pair is None else pair.created_unix_ns),
         "time_utc_ns": None if pair is None else pair.created_unix_ns,
         "Attempted": bool(row.attempted),
@@ -345,6 +439,9 @@ def _section_a_row(snapshot: MeasurementSnapshot, pair_by_id: Mapping[str, Any],
         "Right": derived.get("right_m"),
         "Down": derived.get("down_m"),
         "Range": derived.get("range_m"),
+        **{name: derived.get(name) for name in (
+            "target_latitude_deg", "target_longitude_deg", "target_altitude_ellipsoid_m", "target_altitude_msl_m", *LEVEL_OUTPUT_FIELDS,
+        )},
     }
     cells.update(flat_transform_cells(derived))
     return cells
@@ -387,8 +484,9 @@ def _section_e_row(row: MethodResultRow) -> dict[str, object]:
     }
 
 
-def _write_method_sheet(workbook: xlsxwriter.Workbook, formats: Mapping[str, Any], snapshot: MeasurementSnapshot, method_id: str) -> None:
+def _write_method_sheet(workbook: xlsxwriter.Workbook, formats: Mapping[str, Any], snapshot: MeasurementSnapshot, method_id: str, *, rt_links=None) -> None:
     sheet = _SheetWriter(workbook, METHOD_SHEET_NAMES[method_id], formats)
+    sheet.rt_links = rt_links or {}
     rows = _method_rows(snapshot, method_id)
     pair_by_id = {pair.pair_id: pair for pair in snapshot.pairs}
     sheet.key_values(
@@ -400,7 +498,9 @@ def _write_method_sheet(workbook: xlsxwriter.Workbook, formats: Mapping[str, Any
     )
     sheet.blank()
     sheet.marker(SECTION_A)
-    sheet.table(SECTION_A_COLUMNS, (_section_a_row(snapshot, pair_by_id, row) for row in rows), autofilter=False)
+    header_row = sheet.row
+    sheet.table(SECTION_A_COLUMNS, (_section_a_row(snapshot, pair_by_id, row) for row in rows))
+    sheet.worksheet.freeze_panes(header_row + 1, 2)
     sheet.blank()
     sheet.marker(SECTION_B)
     sheet.table(SECTION_B_COLUMNS, (_section_b_row(pair_by_id, row) for row in rows), freeze=False, autofilter=False)
@@ -426,6 +526,15 @@ def _write_method_sheet(workbook: xlsxwriter.Workbook, formats: Mapping[str, Any
     sheet.marker(SECTION_E)
     sheet.table(SECTION_E_COLUMNS, (_section_e_row(row) for row in rows), freeze=False, autofilter=False)
     sheet.finish()
+    for column in range(8, 20):
+        sheet.worksheet.set_column(column, column, 16, None, {"hidden": False, "level": 0})
+    sheet.worksheet.set_column(0, 1, 16)
+    sheet.worksheet.set_column(2, 5, 15)
+    sheet.worksheet.set_column(6, 6, 22)
+    sheet.worksheet.set_column(7, 7, 40)
+    if not any(row.attempted for row in rows):
+        for worksheet in sheet.sheets:
+            worksheet.hide()
 
 
 def _calibration_rows(snapshot: MeasurementSnapshot) -> list[dict[str, object]]:
@@ -519,14 +628,49 @@ def _write_telemetry_sheet(workbook: xlsxwriter.Workbook, formats: Mapping[str, 
         sheet = _SheetWriter(workbook, sheet_name, formats)
         sheet.table(columns, rows[start : start + MAX_SHEET_ROWS])
         sheet.finish()
+        if not rows:
+            sheet.worksheet.hide()
+
+
+_RT_CELL_NAMES: tuple[str, ...] = (
+    "R11", "R12", "R13", "R21", "R22", "R23", "R31", "R32", "R33",
+    "T_R", "T_D", "T_F",
+)
+
+
+def _finite_transform_cells(derived: Mapping[str, Any]) -> dict[str, float] | None:
+    """Return the R,t cells of one method row only when all twelve are finite."""
+
+    cells = flat_transform_cells(derived)
+    values: dict[str, float] = {}
+    for name in _RT_CELL_NAMES:
+        value = cells.get(name)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)):
+            return None
+        values[name] = float(value)
+    return values
+
+
+def _rotation_angle_deg(a: Mapping[str, float], b: Mapping[str, float]) -> float:
+    """Geodesic angle between two rotation matrices given as R11..R33 cells."""
+
+    trace = sum(a[f"R{i}{j}"] * b[f"R{i}{j}"] for i in (1, 2, 3) for j in (1, 2, 3))
+    return math.degrees(math.acos(max(-1.0, min(1.0, (trace - 1.0) / 2.0))))
+
+
+def _translation_distance_m(a: Mapping[str, float], b: Mapping[str, float]) -> float:
+    return math.sqrt(sum((a[name] - b[name]) ** 2 for name in ("T_R", "T_D", "T_F")))
 
 
 def _summary_method_rows(snapshot: MeasurementSnapshot) -> list[dict[str, object]]:
+    """Legacy v1 projection; v2 reports use measurement_report instead."""
     rows: list[dict[str, object]] = []
     for method_id in MEASUREMENT_METHOD_IDS:
         results = _method_rows(snapshot, method_id)
         counts = {status: 0 for status in (*_STATUS_ORDER, STATUS_PENDING, STATUS_NOT_ATTEMPTED)}
         extents: dict[str, list[float]] = {"Forward": [], "Right": [], "Down": [], "Range": []}
+        # R,t of every VALID row, in pair order, for the latest value and its spread.
+        valid_transforms: list[tuple[int, dict[str, float]]] = []
         for row in results:
             counts[row.status] = counts.get(row.status, 0) + 1
             derived = row.derived or {}
@@ -534,6 +678,10 @@ def _summary_method_rows(snapshot: MeasurementSnapshot) -> list[dict[str, object
                 value = derived.get(key)
                 if isinstance(value, (int, float)) and math.isfinite(float(value)):
                     extents[column].append(float(value))
+            if row.status == _STATUS_ORDER[0]:  # "VALID"
+                transform = _finite_transform_cells(derived)
+                if transform is not None:
+                    valid_transforms.append((int(row.pair_sequence), transform))
         row: dict[str, object] = {
             "Method": method_id,
             "Sheet": METHOD_SHEET_NAMES[method_id],
@@ -543,6 +691,27 @@ def _summary_method_rows(snapshot: MeasurementSnapshot) -> list[dict[str, object
         for column, values in extents.items():
             row[f"{column} min"] = min(values) if values else None
             row[f"{column} max"] = max(values) if values else None
+        if valid_transforms:
+            valid_transforms.sort(key=lambda item: item[0])
+            latest_sequence, latest = valid_transforms[-1]
+            row["R,t pair"] = latest_sequence
+            row["R,t rows"] = len(valid_transforms)
+            row.update(latest)
+            row["R spread deg"] = max(
+                (_rotation_angle_deg(latest, other) for _seq, other in valid_transforms),
+                default=0.0,
+            )
+            row["T spread m"] = max(
+                (_translation_distance_m(latest, other) for _seq, other in valid_transforms),
+                default=0.0,
+            )
+        else:
+            row["R,t pair"] = None
+            row["R,t rows"] = 0
+            for name in _RT_CELL_NAMES:
+                row[name] = None
+            row["R spread deg"] = None
+            row["T spread m"] = None
         rows.append(row)
     return rows
 
@@ -551,6 +720,9 @@ SUMMARY_METHOD_COLUMNS: tuple[str, ...] = (
     "Method", "Sheet", "Attempted count",
     *(f"{status} count" for status in (*_STATUS_ORDER, STATUS_PENDING, STATUS_NOT_ATTEMPTED)),
     "Forward min", "Forward max", "Right min", "Right max", "Down min", "Down max", "Range min", "Range max",
+    # Latest VALID R_right_from_left / T (right-camera RDF metres) per method, plus how far
+    # the other VALID rows of this Measurement deviate from it.
+    "R,t pair", "R,t rows", *_RT_CELL_NAMES, "R spread deg", "T spread m",
 )
 
 
@@ -582,7 +754,10 @@ def _write_summary(workbook: xlsxwriter.Workbook, formats: Mapping[str, Any], sn
         )
     )
     sheet.blank()
-    sheet.marker("Method summary (min/max over rows with numeric results only)")
+    sheet.marker(
+        "Method summary (min/max over rows with numeric results only; R,t = latest VALID row's "
+        "R_right_from_left and T in right-camera RDF metres, spread = max deviation of other VALID rows)"
+    )
     header_row = sheet.header(SUMMARY_METHOD_COLUMNS)
     for index, row in enumerate(_summary_method_rows(snapshot)):
         target_row = header_row + 1 + index
@@ -653,10 +828,165 @@ def _exact_rows(snapshot: MeasurementSnapshot) -> Iterable[dict[str, object]]:
                 ("right_depth_m", derived.get("right_depth_m")),
             )
         )
+        from Workstation.workstation_core.target_coordinates import TARGET_COORDINATE_FIELDS
+        fields.extend((name, derived.get(name)) for name in (*TARGET_COORDINATE_FIELDS, *LEVEL_OUTPUT_FIELDS))
+        level_evidence = derived.get("target_level_evidence") or {}
+        fields.append(("target_level_evidence", json.dumps(level_evidence, ensure_ascii=False, sort_keys=True)))
+        evidence = derived.get("target_coordinate_evidence") or {}
+        for key in ("origin_wgs84", "target_from_left_ned_m", "source_point_left_rdf_m", "body_to_ned_quaternion_wxyz"):
+            fields.extend((f"target.{key}.{i}", value) for i, value in enumerate(evidence.get(key, ())))
+        for i, row in enumerate(evidence.get("rotation_ned_from_left_optical", ())):
+            fields.extend((f"target.rotation.{i}.{j}", value) for j, value in enumerate(row))
         for field, value in fields:
             item = emit(result.pair_id, result.method_id, field, value)
             if item is not None:
                 yield item
+
+
+def _method_compare_label(method_id: str) -> str:
+    name = METHOD_SHEET_NAMES.get(method_id, method_id)
+    head, _, tail = str(name).partition("_")
+    return tail if head.isdigit() and tail else str(name)
+
+
+def _method_compare_table(snapshot: MeasurementSnapshot) -> tuple[tuple[str, ...], list[dict[str, object]]]:
+    """One row per pair with every attempted method's F/R/D/Range side by side.
+
+    The per-method sheets (``10_``..``19_``) already hold the full evidence;
+    this sheet exists so two methods can be compared without a VLOOKUP.
+    """
+
+    attempted_methods = [
+        method_id
+        for method_id in MEASUREMENT_METHOD_IDS
+        if any(row.method_id == method_id and row.attempted for row in snapshot.method_results)
+    ]
+    labels = {method_id: _method_compare_label(method_id) for method_id in attempted_methods}
+    columns: list[str] = list(METHOD_COMPARE_FRONT_COLUMNS)
+    for method_id in attempted_methods:
+        columns.extend(f"{labels[method_id]}_{field}" for field in METHOD_COMPARE_FIELDS)
+    if "pixhawk_rtk_live" in labels and "pixhawk_rp_gps_baseline_yaw" in labels:
+        columns.append("yaw90_over_rtk_range_ratio")
+    pair_by_id = {pair.pair_id: pair for pair in snapshot.pairs}
+    by_pair: dict[str, dict[str, object]] = {}
+    order: list[str] = []
+    for row in snapshot.method_results:
+        if row.method_id not in labels:
+            continue
+        cells = by_pair.get(row.pair_id)
+        if cells is None:
+            pair = pair_by_id.get(row.pair_id)
+            cells = {
+                "measurement_id": snapshot.measurement_id,
+                "pair_id": row.pair_id,
+                "pair_sequence": row.pair_sequence,
+                "time_local": _kst_or_local_iso(None if pair is None else pair.created_unix_ns),
+                "time_utc_ns": None if pair is None else pair.created_unix_ns,
+                "time_delta_s": None if pair is None else pair.time_delta_s,
+            }
+            by_pair[row.pair_id] = cells
+            order.append(row.pair_id)
+        derived = row.derived or {}
+        label = labels[row.method_id]
+        cells[f"{label}_status"] = row.status
+        for field in METHOD_COMPARE_FIELDS[1:]:
+            cells[f"{label}_{field}"] = derived.get(field)
+        outcome = row.outcome or {}
+        result = outcome.get("result") if isinstance(outcome, Mapping) else None
+        match = result.get("match") if isinstance(result, Mapping) else None
+        if isinstance(match, Mapping) and cells.get("disparity_px") is None:
+            cells["disparity_px"] = match.get("disparity_px")
+    rows: list[dict[str, object]] = []
+    for pair_id in order:
+        cells = by_pair[pair_id]
+        rtk = cells.get(f"{labels.get('pixhawk_rtk_live', '')}_range_m")
+        yaw90 = cells.get(f"{labels.get('pixhawk_rp_gps_baseline_yaw', '')}_range_m")
+        if "yaw90_over_rtk_range_ratio" in columns:
+            try:
+                cells["yaw90_over_rtk_range_ratio"] = (
+                    None if not rtk or yaw90 is None else float(yaw90) / float(rtk)
+                )
+            except (TypeError, ValueError, ZeroDivisionError):
+                cells["yaw90_over_rtk_range_ratio"] = None
+        rows.append(cells)
+    return tuple(columns), rows
+
+
+def _optical_pose_rows(snapshot: MeasurementSnapshot) -> list[dict[str, object]]:
+    """Accepted/created optical-pose suggestions and their relative rotation."""
+
+    rows: list[dict[str, object]] = []
+
+    def _from_suggestion(suggestion: Mapping[str, Any]) -> dict[str, object]:
+        rotation = suggestion.get("relative_rotation")
+        rotation = rotation if isinstance(rotation, Mapping) else {}
+        frames = suggestion.get("source_frames")
+        frames = frames if isinstance(frames, Mapping) else {}
+        baseline = suggestion.get("gnss_baseline")
+        baseline = baseline if isinstance(baseline, Mapping) else {}
+
+        def _sha(side: str) -> object:
+            value = frames.get(side)
+            return value.get("image_sha256") if isinstance(value, Mapping) else None
+
+        return {
+            "mode": suggestion.get("mode"),
+            "suggestion_id": suggestion.get("suggestion_id"),
+            "state": suggestion.get("state"),
+            "eligible": suggestion.get("eligible"),
+            "inlier_count": suggestion.get("inlier_count"),
+            "match_count": suggestion.get("match_count"),
+            "residual_px": suggestion.get("residual_px"),
+            "confidence": suggestion.get("confidence"),
+            "relative_yaw_right_minus_left_deg": rotation.get("yaw_right_minus_left_deg"),
+            "relative_pitch_right_minus_left_deg": rotation.get("pitch_right_minus_left_deg"),
+            "relative_roll_right_minus_left_deg": rotation.get("roll_right_minus_left_deg"),
+            "relative_fit_inlier_count": rotation.get("fit_inlier_count"),
+            "relative_fit_residual_px": rotation.get("fit_residual_px"),
+            "far_field_du_median_px": rotation.get("far_field_du_median_px"),
+            "far_field_dv_median_px": rotation.get("far_field_dv_median_px"),
+            "gnss_baseline_m": baseline.get("baseline_m"),
+            "gnss_baseline_fix_quality": baseline.get("fix_quality"),
+            "left_image_sha256": _sha("left"),
+            "right_image_sha256": _sha("right"),
+        }
+
+    for raw in snapshot.alignment_rows:
+        event_type = str(raw.get("event_type") or "")
+        if not event_type.startswith("optical_pose_auto_suggestion"):
+            continue
+        utc_ns = raw.get("updated_utc_ns") or raw.get("recorded_utc_ns")
+        row: dict[str, object] = {
+            "measurement_id": snapshot.measurement_id,
+            "record_source": "alignment",
+            "event_type": event_type,
+            "utc_ns": utc_ns,
+            "utc_local": _kst_or_local_iso(utc_ns if isinstance(utc_ns, int) else None),
+            "suggestion_id": raw.get("source"),
+        }
+        row.update({name: raw.get(name) for name in OPTICAL_POSE_COLUMNS if name in raw and name not in row})
+        rows.append(row)
+    for event in snapshot.events:
+        if not str(event.event_type).startswith("optical_pose_auto_suggestion"):
+            continue
+        payload = event.payload if isinstance(event.payload, Mapping) else {}
+        suggestion = payload.get("suggestion")
+        source = suggestion if isinstance(suggestion, Mapping) else payload
+        row = {
+            "measurement_id": snapshot.measurement_id,
+            "record_source": "event",
+            "event_type": event.event_type,
+            "utc_ns": event.utc_ns,
+            "utc_local": _kst_or_local_iso(event.utc_ns),
+        }
+        row.update(_from_suggestion(source))
+        if not row.get("mode"):
+            row["mode"] = payload.get("mode")
+        if not row.get("suggestion_id"):
+            row["suggestion_id"] = payload.get("suggestion_id")
+        rows.append(row)
+    rows.sort(key=lambda item: (item.get("utc_ns") or 0))
+    return rows
 
 
 def _flat_rows(snapshot: MeasurementSnapshot) -> Iterable[dict[str, object]]:
@@ -736,7 +1066,9 @@ def write_measurement_workbook(snapshot: MeasurementSnapshot, path: Path, *, wri
         )
         workbook.set_properties({"title": f"Measurement {snapshot.file_prefix}", "subject": WORKBOOK_SCHEMA, "comments": snapshot.measurement_id})
         formats = _formats(workbook)
-        _write_summary(workbook, formats, snapshot, write_utc_ns=write_utc_ns)
+        report_info = write_front_sheets(workbook, formats, snapshot, _SheetWriter)
+        for method_id in MEASUREMENT_METHOD_IDS:
+            _write_method_sheet(workbook, formats, snapshot, method_id, rt_links=report_info["rt_locations"])
         for camera, name in (("left", "01_Left_Detections"), ("right", "02_Right_Detections")):
             sheet = _SheetWriter(workbook, name, formats)
             sheet.table(
@@ -771,8 +1103,9 @@ def write_measurement_workbook(snapshot: MeasurementSnapshot, path: Path, *, wri
         sheet = _SheetWriter(workbook, "04_Alignment", formats)
         sheet.table(ALIGNMENT_COLUMNS, _alignment_rows(snapshot))
         sheet.finish()
-        for method_id in MEASUREMENT_METHOD_IDS:
-            _write_method_sheet(workbook, formats, snapshot, method_id)
+        sheet = _SheetWriter(workbook, "06_Optical_Pose", formats)
+        sheet.table(OPTICAL_POSE_COLUMNS, _optical_pose_rows(snapshot))
+        sheet.finish()
         telemetry_names = sorted(set(ALWAYS_PRESENT_TELEMETRY_SHEETS) | set(snapshot.telemetry))
         for name in telemetry_names:
             _write_telemetry_sheet(workbook, formats, name, snapshot.telemetry.get(name, ()))
@@ -796,15 +1129,24 @@ def write_measurement_workbook(snapshot: MeasurementSnapshot, path: Path, *, wri
         sheet = _SheetWriter(workbook, "90_Flat", formats)
         sheet.table(FLAT_COLUMNS, _flat_rows(snapshot))
         sheet.finish()
+        for worksheet in sheet.sheets:
+            worksheet.hide()
         sheet = _SheetWriter(workbook, "91_Exact", formats)
         sheet.table(EXACT_COLUMNS, _exact_rows(snapshot))
         sheet.finish()
+        for worksheet in sheet.sheets:
+            worksheet.hide()
         sheet = _SheetWriter(workbook, "98_Provenance", formats)
         sheet.table(("key", "value"), _provenance_rows(snapshot, write_utc_ns=write_utc_ns), autofilter=False)
+        append_trend_chart(workbook, sheet, snapshot, report_info)
         sheet.finish()
+        for worksheet in sheet.sheets:
+            worksheet.hide()
         sheet = _SheetWriter(workbook, "99_Definitions", formats)
         sheet.table(("term", "definition"), ({"term": term, "definition": text} for term, text in DEFINITIONS), autofilter=False)
         sheet.finish()
+        sheet.worksheet.set_column(0, 0, 40)
+        sheet.worksheet.set_column(1, 1, 85)
         workbook.close()
         with open(temporary, "rb") as handle:
             os.fsync(handle.fileno())
@@ -829,9 +1171,10 @@ class MeasurementWorkbookWriter:
     is left untouched.
     """
 
-    def __init__(self, *, checkpoint_interval_s: float = 30.0, writer=write_measurement_workbook) -> None:
+    def __init__(self, *, checkpoint_interval_s: float = 30.0, writer=write_measurement_workbook, source_storage_reader=None) -> None:
         self._checkpoint_interval_s = max(0.0, float(checkpoint_interval_s))
         self._write = writer
+        self._source_storage_reader = source_storage_reader
         self._condition = threading.Condition()
         self._pending: dict[str, tuple[MeasurementRecord, str]] = {}
         self._tracked: dict[str, MeasurementRecord] = {}
@@ -944,6 +1287,12 @@ class MeasurementWorkbookWriter:
                 self._failure_count += 1
             return False
         snapshot = record.snapshot()
+        if self._source_storage_reader is not None:
+            try:
+                raw = self._source_storage_reader(record.measurement_id)
+            except Exception as exc:
+                raw = {"state": "UNAVAILABLE", "last_error": str(exc)}
+            snapshot = replace(snapshot, storage={**snapshot.storage, "raw": raw})
         write_utc_ns = time.time_ns()
         try:
             self._write(snapshot, path, write_utc_ns=write_utc_ns)

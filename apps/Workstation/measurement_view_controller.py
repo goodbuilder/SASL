@@ -7,6 +7,8 @@ baseline-center FRD. Conversions remain explicit in workstation_core helpers.
 
 from __future__ import annotations
 
+from Workstation.workstation_core.target_level_coordinates import LEVEL_OUTPUT_FIELDS
+
 import hashlib
 import html as html_lib
 import json
@@ -33,6 +35,7 @@ from Workstation.workstation_core.calibration import (
 )
 from Workstation.workstation_core.measurement_methods import (
     CHECKERBOARD_STEREO,
+    CLOUD_GNSS,
     COMBINED_HYBRID,
     DEFAULT_MEASUREMENT_METHOD_FALLBACK_ORDER,
     DRONE_RTK_MULTIVIEW,
@@ -91,6 +94,7 @@ from Workstation.workstation_core.measurement_attempt import (
     live_pair_timing_evidence,
 )
 from Workstation.workstation_core.baseline_yaw import (
+    BASELINE_YAW_MINUS_90_DEG,
     BaselineYawSelection,
     quaternion_from_roll_pitch_yaw_deg,
     select_baseline_yaw,
@@ -658,6 +662,17 @@ class MeasurementViewController:
             snapshot = owner.workstation_optical_pose_snapshot(include_frames=False)
         except Exception:  # noqa: BLE001 - alignment view is optional evidence.
             snapshot = None
+        try:
+            accepted = getattr(owner, "_last_accepted_auto_suggestion", None)
+        except Exception:  # noqa: BLE001 - optional evidence.
+            accepted = None
+        if isinstance(accepted, Mapping):
+            from Workstation.optical_pose_controller import accepted_suggestion_alignment_row
+
+            accepted_row = accepted_suggestion_alignment_row(accepted)
+            accepted_row["event_type"] = "optical_pose_auto_suggestion_at_start"
+            accepted_row["recorded_utc_ns"] = now_ns
+            rows.append(accepted_row)
         if isinstance(snapshot, Mapping) and snapshot.get("active_selection"):
             active = snapshot.get("active_selection")
             method = None
@@ -1567,6 +1582,10 @@ class MeasurementViewController:
                 for side in ("left", "right"):
                     if "yaw_deg" not in observed_by_side[side]:
                         reasons.append(f"{side} Drone RTK rotation not observable")
+            elif method_id == CLOUD_GNSS:
+                for side in ("left", "right"):
+                    if not {"roll_deg", "pitch_deg", "yaw_deg"} <= set(observed_by_side[side]):
+                        reasons.append(f"{side} Cloud far-field rotation not observable")
             elif method_id in {
                 MOUNTAIN_GNSS,
                 DRONE_RTK_MULTIVIEW,
@@ -1580,7 +1599,7 @@ class MeasurementViewController:
                             f"{side} full 6-DOF incomplete: {','.join(sorted(missing))}"
                         )
 
-            fillable_method = method_id in {HORIZON_HYBRID, DRONE_RTK_ROTATION_HYBRID}
+            fillable_method = method_id in {HORIZON_HYBRID, DRONE_RTK_ROTATION_HYBRID, CLOUD_GNSS}
             fill_sources: dict[str, str] = {}
             for side in MEASUREMENT_POSE_SIDES:
                 for dof in MEASUREMENT_POSE_DOFS:
@@ -1746,6 +1765,8 @@ class MeasurementViewController:
                         and dof in {"roll_deg", "pitch_deg"}
                         or status.method_id == DRONE_RTK_ROTATION_HYBRID
                         and dof == "yaw_deg"
+                        or status.method_id == CLOUD_GNSS
+                        and dof in {"roll_deg", "pitch_deg", "yaw_deg"}
                         or status.method_id
                         in {MOUNTAIN_GNSS, DRONE_RTK_MULTIVIEW, TERRAIN_PNP, COMBINED_HYBRID}
                     )
@@ -2162,6 +2183,11 @@ class MeasurementViewController:
             row["frozen_for_measurement"] = frozen_measurement
             row["primary_blocker"] = runtime_reasons[0] if runtime_reasons else ""
             row["additional_blocker_count"] = max(0, len(runtime_reasons) - 1)
+            row["runtime_reasons"] = list(runtime_reasons)
+            row.setdefault(
+                "required_inputs",
+                list(MEASUREMENT_METHOD_REQUIRED_INPUTS[method_id]),
+            )
             row["result_counters"] = dict(
                 counters.get(
                     method_id,
@@ -2221,6 +2247,7 @@ class MeasurementViewController:
         right_attitude: AttitudeSnapshot | None = None,
         left_gps: GpsSnapshot | None = None,
         right_gps: GpsSnapshot | None = None,
+        pose_evidence_out: dict[str, object] | None = None,
     ) -> StereoIntrinsicsResult | None:
         owner = self.panel._optical_pose_controller()
         if bool(
@@ -2324,6 +2351,16 @@ class MeasurementViewController:
                         attitude.yaw_deg,
                         *live_centers[side],
                     )
+                elif status.method_id == CLOUD_GNSS:
+                    observed = set(self._candidate_observed_dofs(candidate, side))
+                    if not {"roll_deg", "pitch_deg", "yaw_deg"} <= observed:
+                        return None
+                    final_values = PoseParametersNed(
+                        candidate_values.roll_deg,
+                        candidate_values.pitch_deg,
+                        candidate_values.yaw_deg,
+                        *live_centers[side],
+                    )
                 elif status.method_id == DRONE_RTK_ROTATION_HYBRID:
                     observed = set(self._candidate_observed_dofs(candidate, side))
                     if {"roll_deg", "pitch_deg", "yaw_deg"} <= observed:
@@ -2355,6 +2392,19 @@ class MeasurementViewController:
                     return None
                 poses.append(final_values.to_camera_pose_ned())
         stereo = stereo_pose_from_absolute(poses[0], poses[1])
+        if pose_evidence_out is not None:
+            from Workstation.optical_pose_controller import _pose_mapping
+            pose_evidence_out.update({
+                "schema": "measurement-optical-pose-evidence-v1",
+                "candidate_id": candidate.candidate_id,
+                "yaw90_reference": json.loads(candidate.reference_evidence_json) if candidate.reference_evidence_json else None,
+                "target_origin_model": "P1_GNSS_as_left_optical_center",
+                "left_role": "assumed_reference", "right_role": "derived_from_reference_and_images",
+                "left_pose": _pose_mapping(poses[0]), "right_pose": _pose_mapping(poses[1]),
+                "translation_source": "pair_gnss" if status.method_id == CLOUD_GNSS else "capture_gnss",
+                "R_right_from_left_rdf": [list(row) for row in stereo.rotation_right_from_left_rdf],
+                "t_right_from_left_rdf_m": list(stereo.translation_right_from_left_rdf_m),
+            })
         candidate_quality = dict(candidate.quality_metrics)
         stereo_extrinsics = StereoExtrinsics(
             rotation_left_to_right=[list(row) for row in stereo.rotation_right_from_left_rdf],
@@ -3987,6 +4037,9 @@ class MeasurementViewController:
         yaw_p2_age_s: float | None = None
         geometry_left_quaternion = None
         geometry_right_quaternion = None
+        geometry_left_quaternion_alternate = None
+        geometry_right_quaternion_alternate = None
+        alternate_yaw_deg: float | None = None
         if baseline_yaw_method:
             yaw_selection, yaw_p1_age_s, yaw_p2_age_s = self._baseline_yaw_selection_preview(
                 left_gps=left_gps,
@@ -4011,6 +4064,21 @@ class MeasurementViewController:
                 right_attitude.pitch_deg,
                 yaw_selection.selected_yaw_deg,
             )
+            alternate_yaw_deg = (
+                yaw_selection.candidate_plus90_deg
+                if yaw_selection.selected_offset_deg == BASELINE_YAW_MINUS_90_DEG
+                else yaw_selection.candidate_minus90_deg
+            )
+            geometry_left_quaternion_alternate = quaternion_from_roll_pitch_yaw_deg(
+                left_attitude.roll_deg,
+                left_attitude.pitch_deg,
+                alternate_yaw_deg,
+            )
+            geometry_right_quaternion_alternate = quaternion_from_roll_pitch_yaw_deg(
+                right_attitude.roll_deg,
+                right_attitude.pitch_deg,
+                alternate_yaw_deg,
+            )
         relative = (
             None
             if geometry_left_quaternion is None or geometry_right_quaternion is None
@@ -4018,12 +4086,14 @@ class MeasurementViewController:
         )
         attitude_for_geometry_left = left_attitude
         attitude_for_geometry_right = right_attitude
+        pose_evidence: dict[str, object] = {}
         measurement_result = self._measurement_intrinsics_result_for_method(
             method_status,
             left_attitude=attitude_for_geometry_left,
             right_attitude=attitude_for_geometry_right,
             left_gps=left_gps,
             right_gps=right_gps,
+            pose_evidence_out=pose_evidence,
         )
         intrinsics = None
         if measurement_result is not None:
@@ -4230,6 +4300,10 @@ class MeasurementViewController:
                 getattr(self.panel, "_measurement_selection_reason", "selected")
             ),
             measurement_component_sources=method_status.component_sources,
+            measurement_pose_evidence_json=(
+                json.dumps(pose_evidence, sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+                if pose_evidence else ""
+            ),
             measurement_started_monotonic_s=measurement_start,
             requested_timestamp_basis=str(
                 frozen.get("requested_timestamp_basis") or timestamp_basis
@@ -4277,6 +4351,27 @@ class MeasurementViewController:
             measurement_yaw_low_margin=(
                 False if yaw_selection is None else yaw_selection.low_margin
             ),
+            measurement_yaw_candidate_minus90_deg=(
+                None if yaw_selection is None else yaw_selection.candidate_minus90_deg
+            ),
+            measurement_yaw_candidate_plus90_deg=(
+                None if yaw_selection is None else yaw_selection.candidate_plus90_deg
+            ),
+            measurement_yaw_alternate_deg=alternate_yaw_deg,
+            measurement_yaw_p1_error_minus90_deg=(
+                None if yaw_selection is None else yaw_selection.p1_error_minus90_deg
+            ),
+            measurement_yaw_p1_error_plus90_deg=(
+                None if yaw_selection is None else yaw_selection.p1_error_plus90_deg
+            ),
+            measurement_yaw_p2_error_minus90_deg=(
+                None if yaw_selection is None else yaw_selection.p2_error_minus90_deg
+            ),
+            measurement_yaw_p2_error_plus90_deg=(
+                None if yaw_selection is None else yaw_selection.p2_error_plus90_deg
+            ),
+            geometry_left_quaternion_wxyz_alternate=geometry_left_quaternion_alternate,
+            geometry_right_quaternion_wxyz_alternate=geometry_right_quaternion_alternate,
         )
         if cached_attempt is not None:
             previous_missing = set(cached_attempt.missing_geometry_inputs)
@@ -4422,10 +4517,23 @@ class MeasurementViewController:
         source is officially selected for the recorded measurement.
         """
 
+        optical_owner = self.panel._optical_pose_controller()
         intrinsics = self.panel.active_intrinsics
+        # Use the same current operating K,D selection as Measurement. A
+        # nominal profile can be active without any loaded calibration, or
+        # while a calibration for another zoom remains in active_intrinsics.
+        profile_reader = getattr(optical_owner, "operating_intrinsics_profile_for_geometry", None)
+        operating_profile = profile_reader() if callable(profile_reader) else None
+        nominal = bool(
+            operating_profile is not None
+            and operating_profile.provenance.get("quality") == NOMINAL_INTRINSICS_QUALITY
+        )
+        if nominal:
+            intrinsics = nominal_profile_to_stereo_result(operating_profile)
+        elif callable(profile_reader) and operating_profile is None:
+            return ()
         if intrinsics is None:
             return ()
-        optical_owner = self.panel._optical_pose_controller()
         try:
             intrinsics_snapshot = optical_owner._intrinsics_snapshot(use_frozen=False)
             active_intrinsics_hash = str(
@@ -4445,7 +4553,11 @@ class MeasurementViewController:
             unavailable_status: str = "waiting for inputs",
             metadata: Mapping[str, object] | None = None,
         ) -> None:
-            suffix = f" · {provenance_note}" if provenance_note else ""
+            notes = tuple(filter(None, (
+                "NOMINAL K,D (uncalibrated)" if nominal else "",
+                provenance_note,
+            )))
+            suffix = " · " + " · ".join(notes) if notes else ""
             base = {
                 "schema_version": GEOMETRY_COMPARISON_ANALYSIS_SCHEMA,
                 "evidence_namespace": GEOMETRY_COMPARISON_ANALYSIS_NAMESPACE,
@@ -5459,6 +5571,259 @@ class MeasurementViewController:
         ):
             self._stop_method_evaluation_timer()
 
+    # -- readable projections of the per-pair method bundle -----------------
+
+    _METHOD_ROW_PREFIXES = {
+        PIXHAWK_RTK_LIVE: "rtk",
+        PIXHAWK_RP_GPS_BASELINE_YAW: "yaw90",
+    }
+
+    @staticmethod
+    def _row_scalar(value: Any) -> Any:
+        """JSON-friendly scalar for a flattened row cell (numbers stay numeric)."""
+
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            number = float(value)
+            if number != number or number in (float("inf"), float("-inf")):
+                return None
+            return round(number, 6)
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)):
+            return json.dumps([MeasurementViewController._row_scalar(item) for item in value])
+        return str(value)
+
+    @classmethod
+    def _method_row_prefix(cls, method_id: str) -> str:
+        return cls._METHOD_ROW_PREFIXES.get(str(method_id), str(method_id))
+
+    def _optical_relative_rotation_fields(
+        self,
+        attempt_payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Latest accepted optical-pose suggestion's relative rotation, flattened.
+
+        Lets one measurement row show the SIFT far-field relative yaw next to
+        the Pixhawk relative yaw it competes with, plus how old that optical
+        evidence is at the time of the pair.
+        """
+
+        fields: dict[str, Any] = {
+            "optical_relative_source": "",
+            "optical_relative_mode": "",
+            "optical_relative_suggestion_id": "",
+            "optical_relative_accepted_utc_ns": None,
+            "optical_relative_age_s": None,
+            "optical_relative_yaw_deg": None,
+            "optical_relative_pitch_deg": None,
+            "optical_relative_roll_deg": None,
+            "optical_relative_fit_inlier_count": None,
+            "optical_relative_fit_residual_px": None,
+            "optical_far_field_du_median_px": None,
+            "pixhawk_relative_yaw_deg": None,
+            "optical_minus_pixhawk_relative_yaw_deg": None,
+        }
+        payload = attempt_payload if isinstance(attempt_payload, Mapping) else {}
+        pixhawk_relative = None
+        try:
+            left = payload.get("left_attitude") or {}
+            right = payload.get("right_attitude") or {}
+            if isinstance(left, Mapping) and isinstance(right, Mapping):
+                left_yaw = left.get("yaw_deg")
+                right_yaw = right.get("yaw_deg")
+                if left_yaw is not None and right_yaw is not None:
+                    delta = float(right_yaw) - float(left_yaw)
+                    pixhawk_relative = (delta + 180.0) % 360.0 - 180.0
+        except (TypeError, ValueError):
+            pixhawk_relative = None
+        fields["pixhawk_relative_yaw_deg"] = self._row_scalar(pixhawk_relative)
+        try:
+            owner = self.panel._optical_pose_controller()
+            accepted = getattr(owner, "_last_accepted_auto_suggestion", None)
+        except Exception:  # noqa: BLE001 - optical evidence is optional.
+            accepted = None
+        if not isinstance(accepted, Mapping):
+            return fields
+        rotation = accepted.get("relative_rotation")
+        rotation = rotation if isinstance(rotation, Mapping) else {}
+        accepted_ns = accepted.get("accepted_utc_ns")
+        fields.update(
+            {
+                "optical_relative_source": "optical_pose_auto_suggestion_accepted",
+                "optical_relative_mode": str(accepted.get("mode") or ""),
+                "optical_relative_suggestion_id": str(accepted.get("suggestion_id") or ""),
+                "optical_relative_accepted_utc_ns": None if accepted_ns is None else int(accepted_ns),
+                "optical_relative_age_s": (
+                    None
+                    if accepted_ns is None
+                    else self._row_scalar((time.time_ns() - int(accepted_ns)) / 1e9)
+                ),
+            }
+        )
+        if not rotation.get("available"):
+            return fields
+        optical_yaw = rotation.get("yaw_right_minus_left_deg")
+        fields.update(
+            {
+                "optical_relative_yaw_deg": self._row_scalar(optical_yaw),
+                "optical_relative_pitch_deg": self._row_scalar(rotation.get("pitch_right_minus_left_deg")),
+                "optical_relative_roll_deg": self._row_scalar(rotation.get("roll_right_minus_left_deg")),
+                "optical_relative_fit_inlier_count": rotation.get("fit_inlier_count"),
+                "optical_relative_fit_residual_px": self._row_scalar(rotation.get("fit_residual_px")),
+                "optical_far_field_du_median_px": self._row_scalar(rotation.get("far_field_du_median_px")),
+            }
+        )
+        if optical_yaw is not None and pixhawk_relative is not None:
+            try:
+                delta = float(optical_yaw) - float(pixhawk_relative)
+                fields["optical_minus_pixhawk_relative_yaw_deg"] = self._row_scalar(
+                    (delta + 180.0) % 360.0 - 180.0
+                )
+            except (TypeError, ValueError):
+                pass
+        return fields
+
+    def _method_result_row(self, bundle: MethodEvaluationBundle, outcome: MethodEvaluationOutcome) -> dict[str, Any]:
+        """One thin ``method_results`` row: status, F/R/D/Range, diagnostics."""
+
+        from Workstation.workstation_core.method_result_evidence import derive_method_result
+
+        record = outcome.to_record()
+        derived = derive_method_result(record)
+        result = record.get("result")
+        result = result if isinstance(result, Mapping) else {}
+        match = result.get("match")
+        match = match if isinstance(match, Mapping) else {}
+        return {
+            "schema": "workstation-method-result-row-v1",
+            "measurement_id": outcome.measurement_id,
+            "pair_id": outcome.pair_id,
+            "pair_sequence": outcome.pair_sequence,
+            "request_generation": outcome.request_generation,
+            "method_id": outcome.method_id,
+            "method_instance_id": outcome.method_instance_id,
+            "status": outcome.status,
+            "reasons": "; ".join(str(item) for item in outcome.reasons),
+            "warning_count": len(outcome.warnings),
+            "forward_m": self._row_scalar(derived.get("forward_m")),
+            "right_m": self._row_scalar(derived.get("right_m")),
+            "down_m": self._row_scalar(derived.get("down_m")),
+            "range_m": self._row_scalar(derived.get("range_m")),
+            "target_level_evidence": derived.get("target_level_evidence", {}),
+            **{name: derived.get(name) for name in (
+                "target_latitude_deg", "target_longitude_deg",
+                "target_altitude_ellipsoid_m", "target_altitude_msl_m", *LEVEL_OUTPUT_FIELDS,
+            )},
+            "ray_gap_m": self._row_scalar(derived.get("ray_gap_m")),
+            "ray_angle_deg": self._row_scalar(derived.get("ray_angle_deg")),
+            "left_depth_m": self._row_scalar(derived.get("left_depth_m")),
+            "right_depth_m": self._row_scalar(derived.get("right_depth_m")),
+            "disparity_px": self._row_scalar(match.get("disparity_px")),
+            "vertical_delta_px": self._row_scalar(match.get("vertical_delta_px")),
+            "time_delta_s": self._row_scalar(match.get("time_delta_s")),
+            "class_name": str(match.get("class_name") or ""),
+            "queue_wait_ms": self._row_scalar(outcome.queue_wait_ms),
+            "evaluation_duration_ms": self._row_scalar(outcome.evaluation_duration_ms),
+            "attempt_sha256": outcome.attempt_sha256,
+            "method_evaluation_bundle_sha256": bundle.to_record().get("method_evaluation_bundle_sha256", ""),
+        }
+
+    def _persist_method_result_rows(self, bundle: MethodEvaluationBundle) -> int:
+        """Append one thin row per outcome to the ``method_results`` stream."""
+
+        owner = getattr(self.panel, "method_result_rows", None)
+        appender = getattr(owner, "append", None)
+        if not callable(appender):
+            return 0
+        written = 0
+        for outcome in bundle.outcomes:
+            try:
+                if appender(self._method_result_row(bundle, outcome)):
+                    written += 1
+            except (OSError, RuntimeError, TypeError, ValueError):
+                continue
+        return written
+
+    def _bundle_flat_fields(self, bundle: MethodEvaluationBundle) -> dict[str, Any]:
+        """Per-method columns (``m_<prefix>_*``) plus baseline-yaw selection fields."""
+
+        from Workstation.workstation_core.method_result_evidence import derive_method_result
+
+        fields: dict[str, Any] = {}
+        ranges: dict[str, float | None] = {}
+        for outcome in bundle.outcomes:
+            prefix = f"m_{self._method_row_prefix(outcome.method_id)}"
+            derived = derive_method_result(outcome.to_record())
+            range_value = derived.get("range_m")
+            ranges[outcome.method_id] = None if range_value is None else float(range_value)
+            fields.update(
+                {
+                    f"{prefix}_status": outcome.status,
+                    f"{prefix}_reason": "; ".join(str(item) for item in outcome.reasons),
+                    f"{prefix}_forward_m": self._row_scalar(derived.get("forward_m")),
+                    f"{prefix}_right_m": self._row_scalar(derived.get("right_m")),
+                    f"{prefix}_down_m": self._row_scalar(derived.get("down_m")),
+                    **{f"{prefix}_{name}": derived.get(name) for name in (
+                        "target_latitude_deg", "target_longitude_deg",
+                        "target_altitude_ellipsoid_m", "target_altitude_msl_m", *LEVEL_OUTPUT_FIELDS,
+                    )},
+                    f"{prefix}_range_m": self._row_scalar(derived.get("range_m")),
+                    f"{prefix}_ray_gap_m": self._row_scalar(derived.get("ray_gap_m")),
+                    f"{prefix}_ray_angle_deg": self._row_scalar(derived.get("ray_angle_deg")),
+                }
+            )
+        rtk_range = ranges.get(PIXHAWK_RTK_LIVE)
+        yaw90_range = ranges.get(PIXHAWK_RP_GPS_BASELINE_YAW)
+        fields["m_yaw90_over_rtk_range_ratio"] = (
+            None
+            if not rtk_range or yaw90_range is None
+            else self._row_scalar(yaw90_range / rtk_range)
+        )
+        fields["m_method_ids"] = ",".join(outcome.method_id for outcome in bundle.outcomes)
+        # Baseline-yaw selection diagnostics live only in that method's attempt;
+        # surface them on the row whichever method is primary.
+        yaw_outcome = bundle.outcome_for(PIXHAWK_RP_GPS_BASELINE_YAW)
+        payload = yaw_outcome.attempt_payload if yaw_outcome is not None else None
+        if isinstance(payload, Mapping):
+            for key, value in payload.items():
+                if str(key).startswith("measurement_yaw_"):
+                    fields[str(key)] = self._row_scalar(value)
+            fields["measurement_yaw_fields_source"] = PIXHAWK_RP_GPS_BASELINE_YAW
+        return fields
+
+    def _flatten_bundle_into_measurement_row(self, bundle: MethodEvaluationBundle) -> bool:
+        """Merge every method's result into the pair's ``measurements`` row.
+
+        The row is created by the primary commit; this re-writes it (a
+        ``replace`` record) once the whole bundle is known so one row carries
+        RTK, baseline-yaw, the yaw selection evidence and the optical relative
+        yaw side by side. Pairs without a primary row are left to
+        ``method_results``.
+        """
+
+        if not bundle.outcomes:
+            return False
+        index_map = getattr(self.panel, "_recording_pair_row_index", None)
+        upsert = getattr(self.panel, "_upsert_pair_recording_row", None)
+        if not isinstance(index_map, Mapping) or not callable(upsert):
+            return False
+        source = bundle.primary if bundle.primary is not None else bundle.outcomes[0]
+        try:
+            attempt = MeasurementAttempt.from_canonical_payload(source.attempt_payload)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+        if tuple(attempt.detection_pair_key) not in index_map:
+            return False
+        values = self._bundle_flat_fields(bundle)
+        values.update(self._optical_relative_rotation_fields(source.attempt_payload))
+        try:
+            commit = upsert(attempt, values)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
+        return bool(getattr(commit, "enqueue_admitted", False))
+
     def _commit_method_evaluation_bundle(
         self,
         bundle: MethodEvaluationBundle,
@@ -5493,6 +5858,8 @@ class MeasurementViewController:
 
         if not self._persist_method_evaluation_bundle(bundle):
             return
+        self._persist_method_result_rows(bundle)
+        self._flatten_bundle_into_measurement_row(bundle)
         current_after_write, _generation_after_write = (
             self._method_bundle_is_current(bundle)
         )

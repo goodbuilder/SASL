@@ -421,13 +421,26 @@ class CameraStreamLifecycleController:
         if bool(getattr(self.panel, "_shutdown_in_progress", False)):
             self.panel._log("[YOLO] application shutdown is in progress; Measurement start rejected")
             return False
+        if self._measurement_run_state() not in {"RUNNING", "STARTING", "STOPPING"} and getattr(self.panel, "_measurement_start_click_clocks", None) is None:
+            before = time.monotonic_ns()
+            utc_ns = time.time_ns()
+            self.panel._measurement_start_click_clocks = (utc_ns, (before + time.monotonic_ns()) // 2)
+        # The MAG active-selection check is advisory only. It still refreshes
+        # the per-side verification snapshot that begin_measurement_run
+        # records as provenance, but an unverified side no longer blocks the
+        # operator from starting a Measurement.
         mag_gate = getattr(self.panel, "measurement_mag_start_gate", None)
-        if callable(mag_gate) and not bool(mag_gate()):
+        try:
+            mag_verified = not callable(mag_gate) or bool(mag_gate())
+        except Exception:
+            self.panel._measurement_start_click_clocks = None
+            raise
+        if not mag_verified:
             self.panel._log(
-                "[YOLO] 측정 시작 차단: live Pixhawk MAG active-selection verification is incomplete"
+                "[YOLO] 측정 시작: live Pixhawk MAG active-selection이 미검증 상태입니다 (경고만, 차단하지 않음)"
             )
-            return False
         if not self._reserve_package_detection():
+            self.panel._measurement_start_click_clocks = None
             self.panel._log("[YOLO] 측정 시작 준비가 거부되었습니다: live run state를 확인하세요.")
             return False
         if not self._detection_inputs_valid():

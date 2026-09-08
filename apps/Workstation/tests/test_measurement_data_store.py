@@ -141,6 +141,7 @@ def test_csv_stream_paths_are_same_stem_for_every_fixed_stream() -> None:
             "events",
             "measurements",
             "method_evaluations",
+            "method_results",
             "camera.left",
             "camera.right",
             "px4.left",
@@ -154,6 +155,7 @@ def test_csv_stream_paths_are_same_stem_for_every_fixed_stream() -> None:
             "artifacts",
             "application.log",
             "native.frames",
+            "measurement.journal",
         }
     )
     assert all(path.suffix == ".csv" for path in CSV_STREAM_PATHS.values())

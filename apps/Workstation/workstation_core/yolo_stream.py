@@ -473,6 +473,26 @@ class AsyncVideoWriter:
             )
 
 
+def ffmpeg_overwrite_flag(path: str | Path) -> str:
+    """Return ``-y`` only for the app's own empty slot reservation.
+
+    ``allocate_workstation_data_artifact`` reserves an output path with
+    ``O_CREAT|O_EXCL`` and leaves a zero-byte file behind for the writer to
+    fill. FFmpeg's ``-n`` treats that placeholder as existing evidence and
+    exits ("File ... already exists"), which left every decoded NVENC MP4 at
+    0 bytes. A non-empty file is real evidence and must still never be
+    overwritten.
+    """
+
+    try:
+        target = Path(path).expanduser()
+        if target.is_file() and target.stat().st_size == 0:
+            return "-y"
+    except OSError:
+        pass
+    return "-n"
+
+
 class DecodedNv12Recorder:
     """Own one isolated bounded raw-NV12 -> FFmpeg NVENC MP4 writer."""
 
@@ -519,7 +539,7 @@ class DecodedNv12Recorder:
             "-hide_banner",
             "-loglevel",
             "error",
-            "-n",
+            ffmpeg_overwrite_flag(output_path),
             "-f",
             "rawvideo",
             "-pixel_format",

@@ -158,7 +158,7 @@ The separate `P1 body FRD projection` state is `WAITING` until P1 attitude is av
 when ready it is `[Forward, Right, Down]` in P1 PX4 body FRD and retains its attitude age.
 It must not overwrite raw NED, camera optical RDF, or public `baseline_center_frd` values.
 
-The Telemetry `GNSS BASELINE_CENTER F/R/D/Rg/Angle` read model is a separate coordinate/status domain.
+The GNSS midpoint read model (now displayed in Baseline Yaw90 reference information) is a separate coordinate/status domain.
 `CURRENT` means three finite selected GNSS positions, application-receive age <=2.0 s per source,
 maximum receive-timestamp spread <=1000 ms, and a finite non-zero horizontal P1→P2 direction.
 `STALE` retains the last finite signed geometry when age is old/future or spread exceeds the bound;
@@ -189,15 +189,35 @@ The IMU table contains the three standard `SCALED_IMU/2/3` rows and the dedicate
 Gauss unit.
 On Stable PX4, the same RM3100 rows may instead be populated by the bounded Shell
 `listener sensor_mag` path and retain a `px4-shell/sensor_mag/<instance>` topic/source.
-`PX4 yaw°` and `Δyaw°` remain backend diagnostic fields and are not operator-table columns. `WAITING`,
-`STALE`, `PARAM 대기`, `PARAM 불완전`, and `전류 보정 대기` remain visible as corrected-yaw
-states. The Pixhawk MAG control adds side-specific `PARAM APPLYING`,
+`PX4 yaw°` is visible in the operator table when the row's device identity exactly matches the
+active `vehicle_magnetometer` and ATTITUDE is fresh; it is the firmware estimator yaw with the
+configured `EKF2_MAG_DECL` declination handling. Hidden `Δyaw°` remains the backend diagnostic
+difference `PX4−RAW`. `WAITING`, `STALE`, `PARAM 대기`, `PARAM 불완전`, and `전류 보정 대기`
+remain visible as corrected-yaw states. The Pixhawk MAG control adds side-specific `PARAM APPLYING`,
 `PARAM VERIFIED`, `VERIFYING`, `ACTIVE VERIFIED`, `STALE`, `TIMEOUT`, and `ERROR` evidence; it
 does not create a global status key. Live-Pixhawk Measurement admission consumes the public
 side-specific verification snapshot and records its selection provenance; no stream request,
 firmware change, or persistent parameter schema is added.
 
 ## 13. Detection
+
+Baseline Yaw90 keeps each live row independent. The azimuth uses the selected P1/P2 GNSS now,
+not the optional Drone/attitude aggregate; its source freshness follows the existing baseline
+read model. P1/P2 Roll/Pitch retain raw body-FRD attitude and real ages. Vertex angles retain
+the three-GNSS timing contract. Producer frozen-position evidence is displayed as FROZEN without
+adding a new detector or changing measurement admission. Installation snapshots never select or
+apply a Measurement method. Reverse is writable while idle (or inactive ERROR), and locked during
+queued/start/running/stop or a pending camera/Detection start; this is separate from DOF fill.
+Inspector details selected from Baseline Yaw90 carry a selection-owner tag. Leaving that Method
+clears only those details and restores normal context projection; it never keeps a stopped
+installation snapshot labelled CURRENT and never polls the hidden setup pane to fake freshness.
+Display query exceptions and malformed snapshot containers use local `QUERY_ERROR` (shown as
+`조회 오류`). Values come from an immutable last-successful display snapshot, with elapsed
+monotonic time added to the recorded ages. The table and Inspector resolve the same display rows,
+including explicit missing rows. Successful reads restore the source's CURRENT/STALE/WAITING
+state; no prior values are fabricated when there has been no observation. Query failure is not a
+Pixhawk disconnect or a Measurement readiness decision. Last-valid Measurement attitude/GNSS caches
+are never mutated by this fallback; current calculation inputs cannot be inferred from old UI data.
 
 Separate configured/model-loaded/runtime-running/target-present/output-fresh states where applicable.
 
@@ -238,18 +258,18 @@ The Data Status stream projection exposes the authoritative JSONL path/state and
 same-stem CSV path/state. CSV `FAILED`/`RETRYING`/`DROPPED` is diagnostic evidence only; JSONL and
 Measurement remain available and `Retry Storage` is the recovery action.
 
-### 15.1 Latest Measurement XLSX
+### 15.1 Measurement XLSX
 
-The Data workspace owns a local derived-artifact read model, not a new global runtime status key:
-`NOT_CREATED`, `WAITING`, `GENERATING`, `READY`, `STALE`, `FAILED`, or `CANCELLED`. It includes the
-target and published generation, output path, generation time, per-sheet row counts, issue count,
-checkpoint settled/pending evidence, completion basis, and error. Request acceptance is not
-publication success; only `READY` with an existing app-owned workbook is success.
+Data shows `IDLE/WRITING/READY/FAILED` from the workbook writer, plus `REBUILDING` and its
+separate error during saved-input reconstruction. A valid existing latest path is READY after
+restart. Pending Method jobs and per-record state remain visible. Raw JSONL/CSV health is
+independent of workbook publication and appears in the report diagnostics.
 
-`STALE` means a newer target or late matching row exists while the prior workbook remains usable.
-Missing device/source rows are shown inside the workbook as zero rows/`#N/A`, not as a false export
-failure. A long path/error is compacted in the fixed-height label and retained in its tooltip, so
-status changes never move buttons, focus, selection, scroll, docks, or the window.
+The report has five front tabs, including a dedicated R,t tab; Method tables also show expanded
+R,t. Missing source rows remain absent and reader cells use `—` (core evidence uses `N/A`).
+Long paths/errors stay in fixed-height labels/tooltips, preserving control geometry and focus.
+CSV retry can restore unmirrored rows from JSONL; RTCM mirror failures are storage diagnostics,
+not evidence that correction injection itself failed. Source failures never disable Measurement.
 
 The optional bulk stream `gnss.baseline.center` follows the existing store IDLE/PENDING/OK/
 DEGRADED/FAILED state and written/dropped/error counters. Live Telemetry CURRENT is not storage

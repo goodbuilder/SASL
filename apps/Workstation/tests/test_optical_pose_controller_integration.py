@@ -183,6 +183,7 @@ def _panel(tmp_path: Path):
         _active_intrinsics_profile_path="calibration/zoom-08.json",
         distance_recording_rows=[{"pair_sequence": 0}, {"pair_sequence": 1}],
         events=events,
+        latest_extrinsics={"left": SimpleNamespace(roll_deg=0., pitch_deg=0., yaw_deg=0., timestamp_s=now)},
     )
     panel.operating_intrinsics_profile = OperatingIntrinsicsProfile.from_stereo_result(
         active,
@@ -807,8 +808,58 @@ def test_drone_yaw_requires_explicit_los_and_preserves_other_dof(tmp_path: Path)
     assert retained["expected_los_ned"] == pytest.approx((0.0, 1.0, 0.0))
 
 
-def test_gnss_mountain_uses_mountain_rotation_and_gnss_metric_baseline(tmp_path: Path) -> None:
+def _yaw90_panel(tmp_path):
     panel = _panel(tmp_path)
+    panel.latest_gps = {
+        "left": _gps_state("left", timestamp_s=time.monotonic(), latitude_deg=0., longitude_deg=0., altitude_m=50., fix_type=3),
+        "right": _gps_state("right", timestamp_s=time.monotonic(), latitude_deg=0., longitude_deg=math.degrees(2. / 6378137.), altitude_m=49.75, fix_type=4),
+    }
+    return panel
+
+
+@pytest.mark.parametrize("method", ["solve_workstation_optical_pose_gnss_mountain", "solve_workstation_optical_pose_cloud_rotation"])
+def test_yaw90_solve_without_base_rt_freezes_inputs_and_saves_both_poses(tmp_path, method):
+    from dataclasses import replace
+    panel = _yaw90_panel(tmp_path)
+    panel.active_intrinsics = replace(panel.active_intrinsics, extrinsics=None)
+    panel.selected_extrinsics_profile = None
+    controller = OpticalPoseController(panel)
+    frozen = controller.capture_workstation_optical_pose_burst({})
+    reference = frozen["yaw90_reference"]
+    panel.latest_extrinsics["left"].roll_deg = 45.
+    panel.latest_gps = {}
+    panel.settings = SimpleNamespace(measurement_baseline_yaw_reverse=True)
+    candidate = getattr(controller, method)({"annotations": _mountain_annotations(frozen)})["candidates"][-1]
+    assert candidate["yaw90_reference"] == reference
+    assert candidate["left_pose"]["virtual_frd_rpy_deg"] == pytest.approx([0., 0., 0.])
+    assert candidate["right_pose"]["center_ned_m"] == pytest.approx([0., 2., .25])
+    assert candidate["pose_roles"]["left"] == "assumed_reference"
+    persisted = [row for event, row in panel.events if event == "pose_candidate_created"][-1]
+    assert persisted["left_pose"] == candidate["left_pose"]
+    assert persisted["right_pose"] == candidate["right_pose"]
+    assert persisted["yaw90_reference"]["sha256"] == reference["sha256"]
+    detail = OpticalPosePane._candidate_detail_text(persisted)
+    assert "GNSS Yaw90" in detail
+    assert "기준 자세 (가정)" in detail
+    assert "영상 상대 R로 유도한 자세" in detail
+    # Worker uses exactly the effective poses that are exported, including Cloud pair t.
+    panel._optical_pose_controller = lambda: controller
+    status = SimpleNamespace(method_id="cloud_gnss" if "cloud" in method else "mountain_gnss",
+                             candidate_id=candidate["candidate_id"], profile_id="", instance_id="test",
+                             component_sources=())
+    measure = MeasurementViewController(panel)
+    measure._measurement_candidate = lambda _id: controller._candidates[candidate["candidate_id"]]
+    evidence = {}
+    gps_l = _gps_state("left", timestamp_s=200., latitude_deg=0., longitude_deg=0., altitude_m=50.)
+    gps_r = _gps_state("right", timestamp_s=200., latitude_deg=0., longitude_deg=math.degrees(4./6378137.), altitude_m=49.5)
+    result = measure._measurement_intrinsics_result_for_method(status, left_gps=gps_l, right_gps=gps_r, pose_evidence_out=evidence)
+    assert evidence["right_pose"]["center_ned_m"] == pytest.approx([0, 4, .5] if "cloud" in method else [0, 2, .25])
+    assert result.extrinsics.translation_left_to_right_m == evidence["t_right_from_left_rdf_m"]
+    assert evidence["yaw90_reference"] == reference
+
+
+def test_gnss_mountain_uses_mountain_rotation_and_gnss_metric_baseline(tmp_path: Path) -> None:
+    panel = _yaw90_panel(tmp_path)
     controller = OpticalPoseController(panel)
     frozen = controller.capture_workstation_optical_pose_burst({})
     annotations = _annotations(frozen, horizon=False)
@@ -1112,6 +1163,28 @@ def test_import_burst_does_not_attach_current_gnss_as_capture_time_gnss(tmp_path
 
     assert snapshot["frozen_frame_artifacts"]["left"]["frame_id"]
     assert snapshot["drone_rtk_capture_observations"] == []
+    assert snapshot["yaw90_reference"] is None
+
+
+def test_ftp_completion_retains_request_reference_and_import_clears_it(tmp_path):
+    panel = _yaw90_panel(tmp_path)
+    controller = OpticalPoseController(panel)
+    reference = controller._capture_yaw90_reference()
+    paths = {}
+    for side in ("left", "right"):
+        path = tmp_path / f"{side}.png"
+        _image().save(str(path), "PNG")
+        paths[side] = {"path": str(path)}
+    panel.latest_gps = {}
+    panel.latest_extrinsics = {}
+    imported = controller.import_workstation_optical_pose_burst({
+        "sources": paths, "_capture_yaw90_reference": reference,
+    })
+    assert imported["yaw90_reference"] == reference
+    reference["reverse"] = True
+    assert controller._frozen_yaw90_reference["reverse"] is False
+    imported = controller.import_workstation_optical_pose_burst({"sources": paths})
+    assert imported["yaw90_reference"] is None
 
 
 def test_ftp_import_with_unknown_capture_time_never_claims_app_receive_sync(
@@ -1489,7 +1562,7 @@ def test_gnss_mountain_capture_translation_accepts_3d_fix_or_better(tmp_path: Pa
     assert candidate["quality_metrics"]["gnss_left_fix_type"] == pytest.approx(3.0)
     assert candidate["quality_metrics"]["gnss_right_fix_type"] == pytest.approx(5.0)
     warning_text = " ".join(candidate["warnings"])
-    assert "accepted with 3D fix or better" in warning_text
+    assert "accepted from finite capture positions" in warning_text
     assert "remains ESTIMATED" in warning_text
 
     panel.settings = SimpleNamespace(
@@ -1530,7 +1603,7 @@ def test_gnss_mountain_capture_translation_accepts_3d_fix_or_better(tmp_path: Pa
     assert "remains ESTIMATED" in " ".join(mountain_status.warnings)
 
 
-def test_gnss_mountain_capture_translation_rejects_sub_3d_fix(tmp_path: Path) -> None:
+def test_gnss_mountain_capture_translation_warns_on_sub_3d_fix(tmp_path: Path) -> None:
     panel = _panel(tmp_path)
     panel.latest_gps = {
         "left": _gps_state(
@@ -1558,12 +1631,12 @@ def test_gnss_mountain_capture_translation_rejects_sub_3d_fix(tmp_path: Path) ->
     )
 
     candidate = snapshot["candidates"][-1]
-    assert candidate["observable_dof"]["north_m"] is False
-    assert candidate["observable_dof"]["east_m"] is False
-    assert candidate["observable_dof"]["down_m"] is False
+    assert candidate["observable_dof"]["north_m"] is True
+    assert candidate["observable_dof"]["east_m"] is True
+    assert candidate["observable_dof"]["down_m"] is True
     warning_text = " ".join(candidate["warnings"])
-    assert "fix_type >= 3" in warning_text
-    assert "left_fix_type=2" in warning_text
+    assert "left capture GNSS fix_type=2" in warning_text
+    assert "gate_policy=mountain-cloud-availability-v1" in warning_text
 
 
 def test_gnss_mountain_capture_rejects_nonfinite_position(tmp_path: Path) -> None:
@@ -1618,14 +1691,14 @@ def test_gnss_mountain_fails_closed_without_capture_baseline_or_override(tmp_pat
     controller = OpticalPoseController(panel)
     frozen = controller.capture_workstation_optical_pose_burst({})
 
-    with pytest.raises(RuntimeError, match="no capture-associated GNSS baseline evidence"):
+    with pytest.raises(RuntimeError, match="Yaw90 capture reference unavailable"):
         controller.solve_workstation_optical_pose_gnss_mountain(
             {"annotations": _mountain_annotations(frozen)}
         )
 
 
-def test_gnss_mountain_left_anchor_change_changes_provenance_hash(tmp_path: Path) -> None:
-    panel = _panel(tmp_path)
+def test_gnss_mountain_ignores_external_prior_after_capture(tmp_path: Path) -> None:
+    panel = _yaw90_panel(tmp_path)
     controller = OpticalPoseController(panel)
     frozen = controller.capture_workstation_optical_pose_burst({})
     annotations = _mountain_annotations(frozen)
@@ -1657,13 +1730,13 @@ def test_gnss_mountain_left_anchor_change_changes_provenance_hash(tmp_path: Path
     second = controller.solve_workstation_optical_pose_gnss_mountain(payload_rotated)
     second_hash = second["candidates"][-1]["input_hashes"]["left_anchor_pose_sha256"]
 
-    assert first_hash != second_hash
+    assert first_hash == second_hash
 
 
 def test_gnss_mountain_lever_arm_defaults_unmodeled_and_applies_explicit_correction(
     tmp_path: Path,
 ) -> None:
-    panel = _panel(tmp_path)
+    panel = _yaw90_panel(tmp_path)
     controller = OpticalPoseController(panel)
     frozen = controller.capture_workstation_optical_pose_burst({})
     annotations = _mountain_annotations(frozen)
@@ -1750,3 +1823,143 @@ def test_horizon_short_endpoint_baseline_has_higher_sensitivity_than_long_one(
     medium_metrics = medium_solved["candidates"][-1]["quality_metrics"]
 
     assert medium_metrics["left_pitch_sensitivity_1px_deg"] > long_metrics["left_pitch_sensitivity_1px_deg"]
+
+
+def _cloud_solve_payload(frozen: dict[str, object]) -> dict[str, object]:
+    annotations = _annotations(frozen, horizon=False)
+    annotations["left"]["ridge_polyline"] = [
+        {"u_px": 80.0, "v_px": 180.0},
+        {"u_px": 200.0, "v_px": 210.0},
+        {"u_px": 350.0, "v_px": 160.0},
+        {"u_px": 520.0, "v_px": 230.0},
+    ]
+    annotations["right"]["ridge_polyline"] = [
+        {"u_px": 90.0, "v_px": 175.0},
+        {"u_px": 210.0, "v_px": 205.0},
+        {"u_px": 360.0, "v_px": 155.0},
+        {"u_px": 530.0, "v_px": 225.0},
+    ]
+    return {
+        "annotations": annotations,
+        "gnss_baseline_ned_m": [0.0, 2.0, 0.25],
+        "gnss_fix_quality": "RTK_FIXED",
+        "gnss_left_fix_type": 6,
+        "gnss_right_fix_type": 6,
+        "gnss_left_rtk_label": "RTK_FIXED",
+        "gnss_right_rtk_label": "RTK_FIXED",
+    }
+
+
+def test_cloud_rotation_solve_never_observes_translation(tmp_path: Path) -> None:
+    panel = _yaw90_panel(tmp_path)
+    panel.left_pane = _TimedCameraPane("left", timestamp_s=100.000, timestamp_reference="app-receive")
+    panel.right_pane = _TimedCameraPane("right", timestamp_s=100.004, timestamp_reference="app-receive")
+    controller = OpticalPoseController(panel)
+    frozen = controller.capture_workstation_optical_pose_burst({})
+
+    snapshot = controller.solve_workstation_optical_pose_cloud_rotation(_cloud_solve_payload(frozen))
+
+    candidate = snapshot["candidates"][-1]
+    assert candidate["method"] == "cloud-far-field-rotation"
+    assert candidate["candidate_id"].startswith("cloud-rotation-")
+    # Translation is never observable even with RTK_FIXED on both sides.
+    for dof in ("north_m", "east_m", "down_m"):
+        assert candidate["observable_dof"][dof] is False
+        assert candidate["optimized_dof"][dof] is False
+    for dof in ("roll_deg", "pitch_deg", "yaw_deg"):
+        assert candidate["optimized_dof"][dof] is True
+    assert candidate["input_hashes"]["frame_pair_simultaneity"] == "VERIFIED"
+    assert candidate["input_hashes"]["pose_component_sources.relative_rotation"] == "cloud_far_field_correspondences"
+    assert candidate["input_hashes"]["pose_component_sources.relative_translation"] == "not_applied_rotation_only"
+    assert candidate["quality_metrics"]["frame_pair_delta_s"] == pytest.approx(0.004, abs=1e-9)
+    warnings = " ".join(candidate["warnings"])
+    assert "rotation-only" in warnings
+    assert "simultaneity VERIFIED" in warnings
+    assert "GNSS is authoritative" not in warnings
+    assert "relative_pose_rdf" in candidate
+
+
+def test_cloud_rotation_solve_rejects_non_simultaneous_pair(tmp_path: Path) -> None:
+    panel = _yaw90_panel(tmp_path)
+    panel.left_pane = _TimedCameraPane("left", timestamp_s=100.000, timestamp_reference="app-receive")
+    panel.right_pane = _TimedCameraPane("right", timestamp_s=101.000, timestamp_reference="app-receive")
+    controller = OpticalPoseController(panel)
+    frozen = controller.capture_workstation_optical_pose_burst({})
+
+    snapshot = controller.solve_workstation_optical_pose_cloud_rotation(_cloud_solve_payload(frozen))
+
+    candidate = snapshot["candidates"][-1]
+    assert candidate["input_hashes"]["frame_pair_simultaneity"] == "EXCEEDED"
+    for dof in ("roll_deg", "pitch_deg", "yaw_deg", "north_m", "east_m", "down_m"):
+        assert candidate["observable_dof"][dof] is False
+    assert "simultaneity EXCEEDED" in " ".join(candidate["warnings"])
+    # The Mountain solve on the same inputs is unaffected by the pair delta.
+    mountain = controller.solve_workstation_optical_pose_gnss_mountain(_cloud_solve_payload(frozen))
+    assert mountain["candidates"][-1]["method"] == "gnss-constrained-mountain-uv"
+    assert "frame_pair_simultaneity" not in mountain["candidates"][-1]["input_hashes"]
+
+
+def test_cloud_auto_suggestion_is_far_field_only_and_commits_as_cloud_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = OpticalPoseController(_panel(tmp_path))
+    controller.capture_workstation_optical_pose_burst({})
+    left_points = ((10.0, 20.0), (120.0, 210.0), (260.0, 55.0), (430.0, 300.0))
+    right_points = tuple((u + 5.0, v - 2.0) for u, v in left_points)
+    side_results = tuple(
+        AutoSelectionResult(
+            mode="mountain",
+            state="GOOD",
+            detection_method="fixture",
+            points=points,
+            inlier_count=4,
+            confidence=0.8,
+            spatial_rank=2,
+            eligible=True,
+            metadata={"filter_tier": "cloud_far_field"},
+        )
+        for points in (left_points, right_points)
+    )
+    result = MountainAutoSelection(
+        left=side_results[0],
+        right=side_results[1],
+        state="GOOD",
+        detection_method="fixture",
+        match_count=4,
+        inlier_count=4,
+        confidence=0.8,
+        eligible=True,
+        metadata={"filter_tier": "cloud_far_field"},
+    )
+    captured: dict[str, object] = {}
+
+    def _fake_select(*_args, **kwargs):
+        captured.update(kwargs)
+        return result
+
+    monkeypatch.setattr(optical_pose_module, "auto_select_mountain", _fake_select)
+
+    job = controller.prepare_workstation_optical_pose_auto_selection("cloud", {})
+    assert job.mode == "cloud"
+    suggestion = job.controller._compute_auto_selection(job.mode, job.payload)
+
+    assert captured["far_field_only"] is True
+    assert suggestion["mode"] == "cloud"
+    assert suggestion["suggestion_id"].startswith("auto-cloud-")
+    committed = controller.commit_workstation_optical_pose_auto_selection(suggestion)
+
+    def _ids(snapshot: dict[str, object]) -> set[str]:
+        rows = snapshot["auto_suggestions"]
+        if isinstance(rows, dict):
+            return set(rows)
+        return {str(row["suggestion_id"]) for row in rows}
+
+    assert suggestion["suggestion_id"] in _ids(committed)
+    # Mountain auto-select must not be forced into far-field mode.
+    captured.clear()
+    controller._compute_auto_select_mountain({})
+    assert captured["far_field_only"] is False
+    # Clearing Mountain suggestions also drops Cloud ones (shared ridge annotation).
+    cleared = controller.clear_workstation_optical_pose_auto_suggestions({"mode": "mountain"})
+    assert suggestion["suggestion_id"] not in _ids(cleared)

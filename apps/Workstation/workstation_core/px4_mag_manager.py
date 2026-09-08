@@ -124,6 +124,37 @@ MAG_PRIORITY_PARAM_NAMES = (
 )
 
 
+def missing_mag_status_params(params: Mapping[str, object] | None) -> tuple[str, ...]:
+    """Return the CAL_MAG PARAM names a slot table/corrected yaw still needs.
+
+    A radio PARAM readback is a sequence of single-shot requests, so one lost
+    reply leaves ``None`` in the middle of an otherwise valid status.  Every
+    slot needs its ``_ID``/``_PRIO`` to be placed in the table at all; a slot
+    that names a device also needs its rotation and correction coefficients
+    before a CAL_MAG-corrected yaw can be shown for that row.
+    """
+
+    values = params if isinstance(params, Mapping) else {}
+    missing: list[str] = []
+    for slot in MAG_SLOTS:
+        for suffix in ("ID", "PRIO"):
+            name = f"CAL_MAG{slot}_{suffix}"
+            if values.get(name) is None:
+                missing.append(name)
+        device_id = values.get(f"CAL_MAG{slot}_ID")
+        try:
+            configured = device_id is not None and int(device_id) != 0
+        except (TypeError, ValueError):
+            configured = False
+        if not configured:
+            continue
+        for suffix in ("ROT", *MAG_CAL_CORRECTION_SUFFIXES):
+            name = f"CAL_MAG{slot}_{suffix}"
+            if values.get(name) is None:
+                missing.append(name)
+    return tuple(missing)
+
+
 class ParameterStore(Protocol):
     def get_param(self, name: str) -> int | float | None:
         ...

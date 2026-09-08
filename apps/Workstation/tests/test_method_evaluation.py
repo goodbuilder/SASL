@@ -342,6 +342,61 @@ def test_px4_attitude_distance_uses_frozen_healthy_rtcp_pair() -> None:
     assert outcome.result["triangulated"]["range_m"] == pytest.approx(9.0, rel=1e-3)
 
 
+def test_baseline_yaw_attempt_keeps_both_branches_and_alternate_geometry() -> None:
+    base = _pixhawk_fallback_attempt()
+    north_m, east_m = base.baseline.ned_right_from_left_m[:2]
+    selection = select_baseline_yaw(
+        north_m=north_m, east_m=east_m, p1_yaw_deg=0.0, p2_yaw_deg=0.0
+    )
+    assert selection.ready
+    alternate_yaw = (
+        selection.candidate_plus90_deg
+        if selection.selected_offset_deg == -90.0
+        else selection.candidate_minus90_deg
+    )
+    assert {selection.selected_yaw_deg, alternate_yaw} == {
+        selection.candidate_minus90_deg,
+        selection.candidate_plus90_deg,
+    }
+    left_alt = quaternion_from_roll_pitch_yaw_deg(
+        base.left_attitude.roll_deg, base.left_attitude.pitch_deg, alternate_yaw
+    )
+    right_alt = quaternion_from_roll_pitch_yaw_deg(
+        base.right_attitude.roll_deg, base.right_attitude.pitch_deg, alternate_yaw
+    )
+    attempt = replace(
+        base,
+        measurement_yaw_candidate_minus90_deg=selection.candidate_minus90_deg,
+        measurement_yaw_candidate_plus90_deg=selection.candidate_plus90_deg,
+        measurement_yaw_alternate_deg=alternate_yaw,
+        measurement_yaw_p1_error_minus90_deg=selection.p1_error_minus90_deg,
+        measurement_yaw_p1_error_plus90_deg=selection.p1_error_plus90_deg,
+        measurement_yaw_p2_error_minus90_deg=selection.p2_error_minus90_deg,
+        measurement_yaw_p2_error_plus90_deg=selection.p2_error_plus90_deg,
+        geometry_left_quaternion_wxyz_alternate=left_alt,
+        geometry_right_quaternion_wxyz_alternate=right_alt,
+    )
+
+    payload = attempt.canonical_payload()
+    assert payload["measurement_yaw_alternate_deg"] == pytest.approx(alternate_yaw)
+    assert tuple(payload["geometry_left_quaternion_wxyz_alternate"]) == pytest.approx(left_alt)
+    rebuilt = MeasurementAttempt.from_canonical_payload(payload)
+    assert rebuilt.geometry_right_quaternion_wxyz_alternate == pytest.approx(right_alt)
+    assert rebuilt.measurement_yaw_p1_error_plus90_deg == pytest.approx(
+        selection.p1_error_plus90_deg
+    )
+    assert rebuilt.canonical_sha256() == attempt.canonical_sha256()
+
+    # Legacy attempts without branch fields keep their canonical hash.
+    legacy_payload = base.canonical_payload()
+    assert "measurement_yaw_alternate_deg" not in legacy_payload
+    assert "geometry_left_quaternion_wxyz_alternate" not in legacy_payload
+    assert (
+        MeasurementAttempt.from_canonical_payload(legacy_payload).canonical_sha256()
+        == base.canonical_sha256()
+    )
+
+
 def test_baseline_yaw_method_uses_effective_rp_and_selected_gps_yaw() -> None:
     base = _pixhawk_fallback_attempt()
     selection = select_baseline_yaw(
@@ -754,6 +809,77 @@ def test_nonfixed_3d_mountain_warning_persists_as_estimated_outcome() -> None:
     assert record["method_id"] == MOUNTAIN_GNSS
     assert record["status"] == "ESTIMATED"
     assert record["warnings"] == [warning]
+    assert record["usable"] is True
+    assert record["quality_warnings"] == [warning]
+    assert record["blocking_reasons"] == []
+    assert record["gate_policy"] == "legacy_or_unspecified"
+
+
+@pytest.mark.parametrize("method_id", ["mountain_gnss", "cloud_gnss"])
+def test_advisory_method_policy_survives_result_serialization(method_id) -> None:
+    warnings = ("jacobian condition exceeds quality threshold",
+                "gate_policy=mountain-cloud-availability-v1; quality thresholds are advisory")
+    attempt = replace(_attempt(), measurement_method_id=method_id, warnings=warnings)
+    outcome = evaluate_method_request(
+        _request(method_id, attempt_payload=attempt.canonical_payload()),
+        worker_started_monotonic_ns=2_000,
+    )
+    record = json.loads(json.dumps(outcome.to_record(), allow_nan=False))
+    assert record["usable"] is True
+    assert record["status"] == "ESTIMATED"
+    assert record["gate_policy"] == "mountain-cloud-availability-v1"
+    assert record["quality_warnings"] == list(warnings)
+    assert record["result"]
+    assert MethodEvaluationOutcome.from_mapping(record).canonical_sha256() == outcome.canonical_sha256()
+
+
+@pytest.mark.parametrize("method_id", ["mountain_gnss", "cloud_gnss"])
+def test_yaw90_pose_evidence_survives_outcome_csv_and_source_rows(tmp_path, method_id):
+    from Workstation.workstation_core.optical_yaw90_reference import build_reference, canonical_evidence
+    from Workstation.workstation_core.method_result_evidence import source_evidence_rows
+    from Workstation.workstation_core.measurement_data_store import MeasurementDataStore
+    reference = build_reference(
+        gps={"left": dict(latitude_deg=0., longitude_deg=0., altitude_m=10., fix_type=6, timestamp_s=1.),
+             "right": dict(latitude_deg=0., longitude_deg=.00001, altitude_m=10., fix_type=6, timestamp_s=1.)},
+        attitudes={"left": dict(roll_deg=2., pitch_deg=3., yaw_deg=0., timestamp_s=1.)},
+        reverse=False, requested_monotonic_s=1., requested_utc_ns=1000000000,
+        sources={"left": "GPS1", "right": "GPS2"},
+    )
+    evidence = dict(schema="measurement-optical-pose-evidence-v1", yaw90_reference=reference,
+                    left_pose={"virtual_frd_rpy_deg": [2., 3., 0.]},
+                    right_pose={"virtual_frd_rpy_deg": [4., 5., 6.]})
+    attempt = replace(_attempt(), measurement_method_id=method_id,
+                      measurement_pose_evidence_json=canonical_evidence(evidence))
+    outcome = evaluate_method_request(_request(method_id, attempt_payload=attempt.canonical_payload()),
+                                      worker_started_monotonic_ns=2000)
+    path = tmp_path / "outcome.jsonl"
+    path.write_text(json.dumps(outcome.to_record(), allow_nan=False) + "\n")
+    envelope = MeasurementDataStore._csv_row_from_payload(path.read_bytes())
+    restored = MethodEvaluationOutcome.from_mapping(json.loads(envelope["record_json"]))
+    assert restored.canonical_sha256() == outcome.canonical_sha256()
+    payload = restored.attempt_payload
+    assert json.loads(payload["measurement_pose_evidence_json"]) == evidence
+    rows = source_evidence_rows(restored.to_record())
+    assert any(field.startswith("optical_pose.left_pose.virtual_frd_rpy_deg") and value == 2. for field, value, _, _ in rows)
+    assert any(field.startswith("optical_pose.right_pose.virtual_frd_rpy_deg") and value == 6. for field, value, _, _ in rows)
+    assert "measurement_pose_evidence_json" not in _attempt().canonical_payload()
+    # Verify the actual workbook's method evidence cells, not just the flatten helper.
+    from dataclasses import replace as replace_record
+    from Workstation.tests.test_measurement_workbook import _populated_record
+    from Workstation.workstation_core.measurement_record import MethodResultRow, METHOD_SHEET_NAMES
+    from Workstation.workstation_core.measurement_workbook import write_measurement_workbook, SECTION_D
+    from Workstation.workstation_core.measurement_xlsx_read import read_workbook, find_marker_row, table_rows
+    _, record = _populated_record(tmp_path)
+    snapshot = record.snapshot()
+    row = MethodResultRow(outcome.pair_id, outcome.pair_sequence, method_id, True,
+                          outcome.status, "", outcome=outcome.to_record())
+    snapshot = replace_record(snapshot, method_results=(row,))
+    workbook = write_measurement_workbook(snapshot, tmp_path / f"{method_id}.xlsx")
+    grid = read_workbook(workbook)[METHOD_SHEET_NAMES[method_id]]
+    saved = table_rows(grid, find_marker_row(grid, SECTION_D) + 1)
+    cells = {r["field"]: r["value"] for r in saved}
+    assert cells["optical_pose.left_pose.virtual_frd_rpy_deg.roll"] == 2.
+    assert cells["optical_pose.right_pose.virtual_frd_rpy_deg.yaw"] == 6.
 
 
 def test_missing_frozen_input_produces_an_explicit_blocked_outcome() -> None:
@@ -765,6 +891,13 @@ def test_missing_frozen_input_produces_an_explicit_blocked_outcome() -> None:
     assert outcome.status == "BLOCKED"
     assert outcome.reasons == ("frozen comparison input missing",)
     assert outcome.queue_wait_ms == pytest.approx(0.001)
+
+
+def test_other_method_pose_evidence_does_not_require_yaw90():
+    evidence = {"schema": "measurement-optical-pose-evidence-v1", "yaw90_reference": None}
+    attempt = replace(_attempt(), measurement_pose_evidence_json=json.dumps(evidence))
+    restored = MeasurementAttempt.from_canonical_payload(attempt.canonical_payload())
+    assert restored.canonical_sha256() == attempt.canonical_sha256()
 
 
 def test_bundle_accepts_canonical_subsets_and_verifies_hashes() -> None:

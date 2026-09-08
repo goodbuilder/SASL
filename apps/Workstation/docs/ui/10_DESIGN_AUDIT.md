@@ -26,14 +26,21 @@ explicit mutation confirmation, exact readback, commit-last persistence, guided 
 lifecycle cancellation. `COMPLETE` must never be used as evidence of Connect or field
 qualification; physical radio removal, cable insertion, and power cycling stay operator-owned.
 
-2026-09-02 GNSS baseline-center audit amendment: verify that the Telemetry result is named
+2026-09-07 Baseline Yaw90 relocation audit: verify the appended Method tab retains optical
+frames/annotations/candidates and restores scroll. Live azimuth is independent of Drone/attitude;
+vertex angles and R/P have separate state/age rows. Center line never enters source/capture pixels.
+Reverse changes only its original setting and is rejected during active Measurement. The former
+Telemetry midpoint table is now collapsed reference data; its backend and recorded schema remain.
+Calibration loses only Center line. Verify 1366x768 and 1920x1080 views and no new stream/worker.
+
+2026-09-02 GNSS baseline-center audit amendment: verify that the GNSS midpoint result is named
 `gnss_baseline_center_local_level_frd`, uses the P1/P2 GNSS antenna midpoint and local-level axes,
 and cannot alias optical `baseline_center_frd`. Audit exact signed sentinel math, 2.0 s/1000 ms
 timing boundaries, stale-value retention, missing-data non-zero fabrication, fix-as-evidence,
 shared Rg/readiness with ideal disparity, absence of persistence/workers/device I/O, and fixed
 one-row table geometry/focus/scroll across live states and target screen sizes.
 
-2026-09-03 GNSS installation-angle audit amendment: verify that the Telemetry table derives the
+2026-09-03 GNSS installation-angle audit amendment: verify that the relocated midpoint reference derives the
 acute horizontal angle from existing GNSS midpoint `Forward/Right` components as
 `atan2(|Forward|,|Right|)`, shows absolute `|90°−angle|` error, keeps Drone ATTITUDE/yaw out of the
 contract, preserves CURRENT/STALE/WAITING source timing semantics, and remains fixed-height and

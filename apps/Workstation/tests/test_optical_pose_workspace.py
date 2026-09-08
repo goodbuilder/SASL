@@ -131,7 +131,6 @@ def test_annotation_modes_do_not_expose_candidate_apply_dof_controls() -> None:
         "Terrain PnP",
         "Drone Rotation",
         "Drone Multi-view",
-        "References",
         "Combine",
     ]
     assert "alignment.pose.initialize_telemetry" not in pane.solver_buttons
@@ -144,7 +143,6 @@ def test_annotation_modes_do_not_expose_candidate_apply_dof_controls() -> None:
         "Terrain PnP",
         "Drone Rotation",
         "Drone Multi-view",
-        "References",
         "Combine",
     }
     assert candidates_group.parentWidget() is pane.candidate_review_widget
@@ -225,35 +223,18 @@ def test_mountain_auto_point_exclusion_is_paired_and_sent_for_acceptance() -> No
     app.processEvents()
 
 
-def test_existing_calibration_is_reference_and_combine_requires_explicit_sources() -> None:
+def test_live_rt_replaces_reference_registration_and_combine_requires_explicit_sources() -> None:
     app = _app()
     pane = OpticalPosePane()
 
-    existing_text = pane.method_tabs.widget(5).findChildren(QtWidgets.QLabel)[0].text()
-    assert "Register Checkerboard" in existing_text
-
-    # The tab's own text promises "use this reference as the base pose for
-    # optical-pose candidates" -- there must actually be a button that does
-    # that, not just descriptive text.
-    reference_buttons = {
+    assert "References" not in [pane.method_tabs.tabText(i) for i in range(pane.method_tabs.count())]
+    assert not any("Register" in button.text() for button in pane.findChildren(QtWidgets.QPushButton))
+    assert pane.live_rt_table.rowCount() == 2
+    combine_buttons = {
         button.text(): button
         for button in pane.method_tabs.widget(5).findChildren(QtWidgets.QPushButton)
     }
-    assert "Register Checkerboard as candidate" in reference_buttons
-    assert "Register Pixhawk + RTK (live) as candidate" in reference_buttons
-    combine_buttons = {
-        button.text(): button
-        for button in pane.method_tabs.widget(6).findChildren(QtWidgets.QPushButton)
-    }
     assert "Build combined candidate" in combine_buttons
-    captured: list[tuple[str, object]] = []
-    pane.command_requested.connect(lambda command_id, payload: captured.append((command_id, payload)))
-    reference_buttons["Register Checkerboard as candidate"].click()
-    reference_buttons["Register Pixhawk + RTK (live) as candidate"].click()
-    assert captured == [
-        ("alignment.pose.register_reference", {"source": "checkerboard"}),
-        ("alignment.pose.register_reference", {"source": "pixhawk_rtk"}),
-    ]
 
     combine_button = pane.solver_buttons["alignment.pose.solve_combined"]
     assert combine_button.isEnabled() is False
@@ -540,12 +521,12 @@ def test_alignment_isolates_optical_pose_page_and_preserves_physical_index() -> 
         workspace.operation_tabs.tabText(index)
         for index in range(workspace.operation_tabs.count())
     ] == [
-        "Horizon",
         "Mountain + GNSS",
+        "Baseline Yaw90",
+        "Horizon",
         "Terrain PnP",
         "Drone Rotation",
         "Drone Multi-view",
-        "References",
         "Combine",
     ]
     assert workspace.operation_tabs is workspace.optical_pose_pane.method_tabs
@@ -560,6 +541,10 @@ def test_alignment_isolates_optical_pose_page_and_preserves_physical_index() -> 
     )
     workspace.select_tab_for_context("processing.alignment")
     assert workspace.operation_tabs.currentIndex() == 0
+    assert workspace.operation_tabs.tabText(0) == "Mountain + GNSS"
+    workspace.open_baseline_yaw90()
+    assert workspace.operation_tabs.currentIndex() == 1
+    assert workspace.operation_tabs.currentWidget() is workspace.baseline_yaw90_pane
 
     workspace.deleteLater()
     app.processEvents()

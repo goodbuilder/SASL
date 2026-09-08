@@ -98,6 +98,58 @@ def _pair() -> SimpleNamespace:
     )
 
 
+@pytest.mark.parametrize("loaded_calibration", [False, True])
+def test_nominal_operating_intrinsics_refresh_comparison(loaded_calibration: bool) -> None:
+    from Workstation.workstation_core.operating_intrinsics import (
+        build_nominal_operating_intrinsics_profile,
+    )
+
+    profile = build_nominal_operating_intrinsics_profile(
+        zoom_index=1, left_width_px=640, left_height_px=480,
+        right_width_px=640, right_height_px=480,
+    )
+    panel = _panel("a" * 64, "a" * 64)
+    if not loaded_calibration:
+        panel.active_intrinsics = None
+    owner = panel._optical_pose_controller()
+    owner.operating_intrinsics_profile_for_geometry = lambda: profile
+    controller = MeasurementViewController(panel)
+    pair = _pair()
+    submitted = []
+    panel._rtsp_urls_are_same_stream = lambda: False
+    panel._matched_detection_pair = lambda: pair
+    panel._geometry_comparison_rows = controller._geometry_comparison_rows
+    panel._measurement_display_mode = lambda: "detection"
+    panel._show_measurement_pair = lambda *_args: None
+    controller._multi_method_measurement_active = lambda: True
+    controller._select_measurement_method_for_attempt = lambda: None
+    controller._submit_method_evaluations = lambda value: submitted.append(value)
+    controller._refresh_distance()
+    first = panel.geometry_comparison_rows
+    pair.right.center = (320.0, 240.0)
+    controller._refresh_distance()
+    second = panel.geometry_comparison_rows
+    assert len(submitted) == 2
+
+    # Parallel cameras, one metre baseline: depth = focal_px / disparity_px.
+    focal = float(profile.left.camera_matrix[0][0])
+    assert first[-1]["forward_m"] == pytest.approx(focal / 60.0)
+    assert second[-1]["forward_m"] == pytest.approx(focal / 30.0)
+    cx = float(profile.left.camera_matrix[0][2])
+    cy = float(profile.left.camera_matrix[1][2])
+    fy = float(profile.left.camera_matrix[1][1])
+    assert first[-1]["right_m"] == pytest.approx((350.0 - cx) / 60.0 - 0.5)
+    assert first[-1]["down_m"] == pytest.approx((240.0 - cy) * focal / (60.0 * fy))
+    assert first[-1]["not_measurement_result"] is True
+    assert "NOMINAL" in first[-1]["status"]
+
+
+def test_comparison_does_not_reuse_loaded_calibration_when_operating_kd_blocked() -> None:
+    panel = _panel("a" * 64, "a" * 64)
+    panel._optical_pose_controller().operating_intrinsics_profile_for_geometry = lambda: None
+    assert MeasurementViewController(panel)._geometry_comparison_rows(_pair()) == ()
+
+
 def test_matching_unapplied_candidate_is_analysis_only_with_complete_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

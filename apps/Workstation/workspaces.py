@@ -594,10 +594,29 @@ class OverviewWorkspace(QtWidgets.QWidget):
                 f"F{int(counters.get('FAILED', 0) or 0)}"
                 + (f"\n{_compact_text(blocker_text, limit=72)}" if blocker_text else "")
             )
-            card.setToolTip(
-                blocker_text
-                or "Click to open read-only Measurement details."
+            reasons = row.get("runtime_reasons")
+            reasons = (
+                [str(reason) for reason in reasons if str(reason)]
+                if isinstance(reasons, (list, tuple))
+                else ([blocker] if blocker else [])
             )
+            required_inputs = row.get("required_inputs")
+            required_inputs = (
+                [str(item) for item in required_inputs if str(item)]
+                if isinstance(required_inputs, (list, tuple))
+                else []
+            )
+            tooltip_lines = [f"{MEASUREMENT_METHOD_LABELS[method_id]} · {state}"]
+            if reasons:
+                tooltip_lines.append("Reasons:")
+                tooltip_lines.extend(f"  - {reason}" for reason in reasons)
+            else:
+                tooltip_lines.append("Reasons: none (ready)")
+            if required_inputs:
+                tooltip_lines.append("Required inputs:")
+                tooltip_lines.extend(f"  - {item}" for item in required_inputs)
+            tooltip_lines.append("Click to open read-only Measurement details.")
+            card.setToolTip("\n".join(tooltip_lines))
 
 
 class ExperimentWorkspace(QtWidgets.QWidget):
@@ -932,6 +951,10 @@ class _ElidedStatusLabel(QtWidgets.QLabel):
 
 class CameraPreview(QtWidgets.QFrame):
     IMAGE_ASPECT_RATIO = 16.0 / 9.0
+    # Same wheel-zoom contract as AnnotationImageView on the Alignment page.
+    MIN_ZOOM_FACTOR = 1.0
+    MAX_ZOOM_FACTOR = 8.0
+    WHEEL_ZOOM_STEP = 1.2
 
     def __init__(
         self,
@@ -944,10 +967,16 @@ class CameraPreview(QtWidgets.QFrame):
         active_label: str = "LIVE",
         empty_image_text: str = "NO VIDEO",
         maximum_image_height: int | None = None,
+        wheel_zoom: bool = False,
     ) -> None:
         super().__init__(parent)
         self.side = side
         self.crop_to_fill = bool(crop_to_fill)
+        # Plain-wheel zoom is opt-in: previews embedded in scrolling pages
+        # must keep forwarding wheel input to the enclosing QScrollArea unless
+        # the page explicitly makes the camera surface the wheel target.
+        # Zoom is only implemented for the fit (non-crop) render path.
+        self.wheel_zoom = bool(wheel_zoom) and not self.crop_to_fill
         self.lock_chrome_height = bool(lock_chrome_height)
         self.lock_image_aspect = bool(lock_image_aspect)
         self.active_label = str(active_label)
@@ -999,6 +1028,134 @@ class CameraPreview(QtWidgets.QFrame):
         self._image: QtGui.QImage | None = None
         self._detection: DetectionObservation | None = None
         self._metadata: object = {}
+        self._center_line_visible = False
+        self._zoom_factor = self.MIN_ZOOM_FACTOR
+        # Native (u, v) pixel center kept at the viewport center while zoomed.
+        self._view_center_source: tuple[float, float] | None = None
+        if self.wheel_zoom:
+            self.image.setToolTip(
+                "Mouse wheel over the image zooms 1×–8× around the pointer."
+            )
+
+    def set_center_line_visible(self, visible: bool) -> None:
+        """Toggle a 1 px red vertical guide at the transformed source midpoint.
+
+        The guide is display-only chrome painted on the rendered copy; the
+        source frame handed to capture/evidence paths is never modified.
+        """
+
+        visible = bool(visible)
+        if visible == self._center_line_visible:
+            return
+        self._center_line_visible = visible
+        if self.isVisible():
+            self._render()
+
+    def center_line_visible(self) -> bool:
+        return self._center_line_visible
+
+    def zoom_factor(self) -> float:
+        return self._zoom_factor
+
+    def reset_zoom(self) -> None:
+        """Return to the fully zoomed-out, centered fit view."""
+
+        changed = (
+            self._zoom_factor != self.MIN_ZOOM_FACTOR
+            or self._view_center_source is not None
+        )
+        self._zoom_factor = self.MIN_ZOOM_FACTOR
+        self._view_center_source = None
+        if changed and self.isVisible():
+            self._render()
+
+    def _fit_display_geometry(
+        self,
+    ) -> tuple[float, float, float, float, float] | None:
+        """Fit-path transform as ``(scale, offset_x, offset_y, draw_w, draw_h)``.
+
+        ``display = source * scale + offset`` in image-label coordinates.
+        Only valid when ``crop_to_fill`` is False.
+        """
+
+        if self._image is None or self._image.isNull():
+            return None
+        source_width = self._image.width()
+        source_height = self._image.height()
+        target = self.image.size()
+        if (
+            source_width <= 0
+            or source_height <= 0
+            or target.width() <= 0
+            or target.height() <= 0
+        ):
+            return None
+        fit_scale = min(
+            target.width() / source_width, target.height() / source_height
+        )
+        scale = fit_scale * self._zoom_factor
+        draw_width = source_width * scale
+        draw_height = source_height * scale
+        if self._zoom_factor <= self.MIN_ZOOM_FACTOR or self._view_center_source is None:
+            offset_x = (target.width() - draw_width) / 2.0
+            offset_y = (target.height() - draw_height) / 2.0
+        else:
+            center_u = min(max(self._view_center_source[0], 0.0), float(source_width - 1))
+            center_v = min(max(self._view_center_source[1], 0.0), float(source_height - 1))
+            offset_x = target.width() / 2.0 - (center_u + 0.5) * scale
+            offset_y = target.height() / 2.0 - (center_v + 0.5) * scale
+        return scale, offset_x, offset_y, draw_width, draw_height
+
+    def wheelEvent(self, event: QtGui.QWheelEvent) -> None:  # noqa: N802 - Qt API.
+        """Zoom around the pointer while keeping the pointed native pixel fixed."""
+
+        if not self.wheel_zoom:
+            super().wheelEvent(event)
+            return
+        geometry = self._fit_display_geometry()
+        if geometry is None:
+            super().wheelEvent(event)
+            return
+        scale, offset_x, offset_y, draw_width, draw_height = geometry
+        cursor = QtCore.QPointF(event.pos()) - QtCore.QPointF(self.image.pos())
+        image_rect = QtCore.QRectF(0.0, 0.0, float(self.image.width()), float(self.image.height()))
+        display_rect = QtCore.QRectF(offset_x, offset_y, draw_width, draw_height)
+        if not image_rect.contains(cursor) or not display_rect.contains(cursor):
+            super().wheelEvent(event)
+            return
+        delta_y = float(event.angleDelta().y())
+        if delta_y == 0.0:
+            delta_y = float(event.pixelDelta().y())
+        if delta_y == 0.0:
+            super().wheelEvent(event)
+            return
+        steps = delta_y / 120.0
+        next_zoom = min(
+            self.MAX_ZOOM_FACTOR,
+            max(self.MIN_ZOOM_FACTOR, self._zoom_factor * self.WHEEL_ZOOM_STEP**steps),
+        )
+        if math.isclose(next_zoom, self._zoom_factor, rel_tol=0.0, abs_tol=1.0e-12):
+            event.accept()
+            return
+        source_width = self._image.width()
+        source_height = self._image.height()
+        source_u = min(max((cursor.x() - offset_x) / scale - 0.5, 0.0), float(source_width - 1))
+        source_v = min(max((cursor.y() - offset_y) / scale - 0.5, 0.0), float(source_height - 1))
+        if next_zoom <= self.MIN_ZOOM_FACTOR:
+            # Fully zoomed out must be the centered fit view, otherwise
+            # repeated in/out wheel steps drift the image sideways.
+            self._view_center_source = None
+        else:
+            next_scale = (scale / self._zoom_factor) * next_zoom
+            viewport_cx = self.image.width() / 2.0
+            viewport_cy = self.image.height() / 2.0
+            self._view_center_source = (
+                min(max(source_u - (cursor.x() - viewport_cx) / next_scale, 0.0), float(source_width - 1)),
+                min(max(source_v - (cursor.y() - viewport_cy) / next_scale, 0.0), float(source_height - 1)),
+            )
+        self._zoom_factor = next_zoom
+        self._render()
+        event.accept()
 
     def hasHeightForWidth(self) -> bool:  # noqa: N802 - Qt override.
         return True
@@ -1100,7 +1257,7 @@ class CameraPreview(QtWidgets.QFrame):
             crop_x = max(0, (scaled.width() - target_size.width()) // 2)
             crop_y = max(0, (scaled.height() - target_size.height()) // 2)
             pixmap = scaled.copy(crop_x, crop_y, target_size.width(), target_size.height())
-        else:
+        elif self._zoom_factor <= self.MIN_ZOOM_FACTOR:
             scaled = source_pixmap.scaled(
                 target_size, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
             )
@@ -1114,6 +1271,29 @@ class CameraPreview(QtWidgets.QFrame):
             # _draw_detection_overlay uses display = source * scale - crop.
             crop_x = -offset_x
             crop_y = -offset_y
+        else:
+            # Zoomed fit view: paint the transformed source directly so the
+            # off-screen part is clipped instead of materialised as a huge
+            # scaled pixmap at 8x.
+            geometry = self._fit_display_geometry()
+            if geometry is None:
+                self.image.setText(self.empty_image_text)
+                self.image.setPixmap(QtGui.QPixmap())
+                return
+            scale, offset_x, offset_y, draw_width, draw_height = geometry
+            pixmap = QtGui.QPixmap(target_size)
+            pixmap.fill(QtCore.Qt.black)
+            painter = QtGui.QPainter(pixmap)
+            painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
+            painter.drawPixmap(
+                QtCore.QRectF(offset_x, offset_y, draw_width, draw_height),
+                source_pixmap,
+                QtCore.QRectF(source_pixmap.rect()),
+            )
+            painter.end()
+            scaled = QtCore.QSizeF(draw_width, draw_height)
+            crop_x = -offset_x
+            crop_y = -offset_y
         if self._detection is not None:
             pixmap = self._draw_detection_overlay(
                 pixmap,
@@ -1122,6 +1302,13 @@ class CameraPreview(QtWidgets.QFrame):
                 scale_y=scaled.height() / source_pixmap.height(),
                 crop_x=crop_x,
                 crop_y=crop_y,
+            )
+        if self._center_line_visible:
+            pixmap = self._draw_center_line(
+                pixmap,
+                center_x=scaled.width() / 2.0 - crop_x,
+                top=max(0, int(math.floor(-crop_y))),
+                bottom=min(pixmap.height(), int(math.ceil(scaled.height() - crop_y))),
             )
         self.image.setPixmap(pixmap)
 
@@ -1135,6 +1322,33 @@ class CameraPreview(QtWidgets.QFrame):
             desired_height = min(desired_height, self.maximum_image_height)
         if desired_height > 0 and self.image.height() != desired_height:
             self.image.setFixedHeight(desired_height)
+
+    @staticmethod
+    def _draw_center_line(
+        pixmap: QtGui.QPixmap,
+        *,
+        center_x: float,
+        top: int,
+        bottom: int,
+    ) -> QtGui.QPixmap:
+        """Paint the transformed native image center when it is in view."""
+
+        if pixmap.isNull() or bottom <= top or not 0.0 <= center_x < pixmap.width():
+            return pixmap
+        # Cursor-centered zoom can move the source center outside the viewport.
+        # Clamping it to an edge would show an incorrect installation guide.
+        column = int(center_x)
+        painter = QtGui.QPainter(pixmap)
+        try:
+            painter.setRenderHint(QtGui.QPainter.Antialiasing, False)
+            pen = QtGui.QPen(QtGui.QColor(255, 0, 0))
+            pen.setWidth(1)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.drawLine(column, int(top), column, int(bottom) - 1)
+        finally:
+            painter.end()
+        return pixmap
 
     @staticmethod
     def _draw_detection_overlay(
@@ -2748,7 +2962,14 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         method_layout.setColumnStretch(1, 1)
         details_layout.addWidget(method_group)
 
+        from Workstation.measurement_comparison import MeasurementComparisonPane
+        result_reader = getattr(self.backend, "measurement_results_snapshot", None)
+        self.method_results_pane = MeasurementComparisonPane(
+            result_reader if callable(result_reader) else lambda *_args: {
+                "rows": [], "reason": "기록 결과 없음 · results snapshot unavailable"}, self)
+        details_layout.addWidget(self.method_results_pane)
         quality_group = QtWidgets.QGroupBox("Quality")
+        quality_group.hide()  # Legacy adapters retained; visible results use pair records.
         quality_layout = QtWidgets.QGridLayout(quality_group)
         quality_layout.setContentsMargins(6, 6, 6, 6)
         quality_layout.setHorizontalSpacing(8)
@@ -2786,6 +3007,7 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         details_layout.addWidget(quality_group)
 
         values_group = QtWidgets.QGroupBox("Result")
+        values_group.hide()
         values_layout = QtWidgets.QGridLayout(values_group)
         self.values = {
             "range": EngineeringValue("Range"),
@@ -2798,12 +3020,33 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             values_layout.addWidget(self.values[key], index // 2, index % 2)
         details_layout.addWidget(values_group)
 
-        comparison_group = QtWidgets.QGroupBox("Extrinsics 비교 (F/R/D/Rg)")
+        self.target_coordinates_group = QtWidgets.QGroupBox("Target 위치 · WGS84")
+        self.target_coordinates_group.hide()
+        target_layout = QtWidgets.QGridLayout(self.target_coordinates_group)
+        self.target_coordinate_values: dict[str, EngineeringValue] = {}
+        for index, (key, label) in enumerate((
+            ("target_latitude_deg", "Target 위도"),
+            ("target_longitude_deg", "Target 경도"),
+            ("target_altitude_ellipsoid_m", "Target 타원체고"),
+            ("target_altitude_msl_m", "Target MSL"),
+        )):
+            value = EngineeringValue(label)
+            value.setObjectName(key)
+            value.activated.connect(lambda key=key: self._inspect_result(key))
+            self.target_coordinate_values[key] = value
+            target_layout.addWidget(value, index // 2, index % 2)
+        self.target_coordinate_status = QtWidgets.QLabel("측정 결과 대기 중")
+        self.target_coordinate_status.setObjectName("statusStrip")
+        self.target_coordinate_status.setWordWrap(True)
+        target_layout.addWidget(self.target_coordinate_status, 2, 0, 1, 2)
+        details_layout.addWidget(self.target_coordinates_group)
+
+        comparison_group = QtWidgets.QGroupBox("Extrinsics 분석 미리보기 (F/R/D/Rg)")
         comparison_layout = QtWidgets.QVBoxLayout(comparison_group)
         comparison_layout.setContentsMargins(6, 6, 6, 6)
         comparison_note = QtWidgets.QLabel(
             "동일 좌/우 검출 픽셀에 대해 각 외부 파라미터 소스로 계산한 결과 미리보기 · "
-            "실제 기록되는 값은 Result에 표시된 방식(Distance Mode)만 사용합니다."
+            "이 표는 분석 미리보기입니다. 위 Method 비교 표는 실제 pair별 계산 기록을 표시합니다."
         )
         comparison_note.setObjectName("statusStrip")
         comparison_note.setWordWrap(True)
@@ -2906,16 +3149,6 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             geometry_form.addWidget(QtWidgets.QLabel(label), row, column)
             geometry_form.addWidget(widget, row, column + 1)
         settings_layout.addLayout(geometry_form)
-        reverse_yaw = toggle(
-            "measurement_baseline_yaw_reverse",
-            "Reverse baseline yaw branch (persistent)",
-        )
-        reverse_yaw.setToolTip(
-            "새 baseline-yaw Measurement에서 Auto 선택 branch를 반대로 사용합니다. "
-            "현재 Measurement는 시작 시 고정된 branch를 유지합니다."
-        )
-        settings_layout.addWidget(reverse_yaw)
-
         gate_group = QtWidgets.QGroupBox("Pair gates")
         gate_form = QtWidgets.QGridLayout(gate_group)
         gate_form.setHorizontalSpacing(8)
@@ -3125,6 +3358,16 @@ class MeasurementWorkspace(QtWidgets.QWidget):
 
     def _result_inspection(self, key: str) -> dict[str, object]:
         status = self.status_model.record("measurement")
+        if key in self.target_coordinate_values:
+            value = self.target_coordinate_values[key]
+            return {
+                "selection": value.label.text(),
+                "value": f"{value.value.text()} {value.unit.text()}".strip(),
+                "freshness": self.target_coordinate_status.text(),
+                "contract": "WGS84 latitude/longitude degrees; ellipsoid/MSL altitude metres as labelled",
+                "verdict": "계산된 표적 위치" if value.value.text() != "--" else "좌표를 계산할 입력 없음",
+                "source": "same accepted DistanceHistoryPoint as Range/F/R/D",
+            }
         value = self.values[key]
         return {
             "selection": f"Measurement {value.label.text()}",
@@ -3333,6 +3576,10 @@ class MeasurementWorkspace(QtWidgets.QWidget):
                 rank_text = "--" if rank is None else str(rank)
                 self.measurement_method_combo.addItem(f"#{rank_text} · {label}", method_id)
                 self.measurement_method_combo.setItemData(index, row, QtCore.Qt.UserRole + 1)
+                self.measurement_method_combo.setItemData(
+                    index, "\n".join(str(w) for w in row.get("warnings", ()) or ()),
+                    QtCore.Qt.ToolTipRole,
+                )
                 if method_id == selected_method:
                     selected_index = index
             self.measurement_method_combo.setEnabled(True)
@@ -3923,6 +4170,7 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         else:
             for value in self.values.values():
                 value.set_value(None, unit="m", frame=MEASUREMENT_FRAME, source="no accepted measurement")
+        self._refresh_target_coordinates(point)
         rows = []
         try:
             rows = list(history or [])[-100:]
@@ -3952,6 +4200,39 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             for row in (getattr(panel, "geometry_comparison_rows", ()) or ())
         )
         _sync_table_rows(self.geometry_comparison_model, comparison_rows)
+
+    def _refresh_target_coordinates(self, point: object | None) -> None:
+        """Render the latest accepted result beside Range without live GNSS reads."""
+        timestamp = getattr(point, "timestamp_s", None)
+        age_s = (
+            max(0.0, time.monotonic() - float(timestamp))
+            if isinstance(timestamp, (int, float)) and math.isfinite(timestamp)
+            else None
+        )
+        for key, value in self.target_coordinate_values.items():
+            raw = getattr(point, key, None)
+            number = (
+                float(raw) if isinstance(raw, (int, float))
+                and not isinstance(raw, bool) and math.isfinite(raw) else None
+            )
+            is_angle = key.endswith("_deg")
+            value.set_value(
+                None if number is None else f"{number:.9f}" if is_angle else f"{number:.3f}",
+                unit="deg" if is_angle else "m",
+                frame="WGS84" if is_angle else "WGS84 ellipsoid height" if "ellipsoid" in key else "MSL height",
+                source="same measurement as Range/F/R/D",
+            )
+        if point is None:
+            text = "측정 결과 대기 중"
+        else:
+            text = "마지막 측정 결과"
+            if age_s is not None:
+                text += f" · {age_s:.1f}s 전"
+            if self.target_coordinate_values["target_latitude_deg"].value.text() == "--":
+                text += " · 월드 좌표 계산 입력 없음"
+            elif self.target_coordinate_values["target_altitude_msl_m"].value.text() == "--":
+                text += " · MSL 기준 없음"
+        self.target_coordinate_status.setText(text)
 
     def _refresh_distance_timing_contract(self, panel: object) -> None:
         requested_reader = getattr(panel, "_yolo_time_basis", None)
@@ -3988,6 +4269,10 @@ class MeasurementWorkspace(QtWidgets.QWidget):
 
 
 class PixhawkWorkspace(QtWidgets.QWidget):
+    # Automatic CAL_MAG PARAM readback: retry cadence and cap per connect.
+    MAG_STATUS_AUTO_REFRESH_RETRY_S = 10.0
+    MAG_STATUS_AUTO_REFRESH_MAX_ATTEMPTS = 3
+
     """P1/P2 MAVLink attitude and GNSS-baseline evidence."""
 
     inspection_requested = QtCore.pyqtSignal(object)
@@ -4314,7 +4599,8 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         magnetometer_layout = QtWidgets.QVBoxLayout(magnetometer_group)
         magnetometer_hint = QtWidgets.QLabel(
             "CAL_MAG0..3 순서 · Device ID로 실제 센서 sample 연결 · "
-            "RAW yaw=atan2(-y,x) · Corrected yaw=CAL_MAG 보정값"
+            "RAW yaw=atan2(-y,x) · Corrected yaw=CAL_MAG 보정값 · "
+            "PX4 yaw=편각 보정 ATTITUDE 추정값"
         )
         magnetometer_hint.setObjectName("statusStrip")
         magnetometer_hint.setWordWrap(True)
@@ -4333,6 +4619,7 @@ class PixhawkWorkspace(QtWidgets.QWidget):
                 "Norm",
                 "RAW yaw°",
                 "Corrected yaw°",
+                "PX4 yaw°",
                 "Δyaw°",
                 "Priority",
                 "Unit",
@@ -4354,11 +4641,12 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         magnetometer_header.setStretchLastSection(False)
         magnetometer_header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
         for column, width in enumerate(
-            (72, 76, 190, 100, 72, 72, 72, 72, 72, 88, 96, 88, 88, 52, 72, 190)
+            (72, 76, 190, 100, 72, 72, 72, 72, 72, 88, 96, 88, 88, 88, 52, 72, 190)
         ):
             magnetometer_header.resizeSection(column, width)
         magnetometer_header.setSectionHidden(10, False)
-        magnetometer_header.setSectionHidden(11, True)
+        magnetometer_header.setSectionHidden(11, False)
+        magnetometer_header.setSectionHidden(12, True)
         self.magnetometer_table.clicked.connect(self._inspect_magnetometer_row)
         magnetometer_layout.addWidget(self.magnetometer_table)
         layout.addWidget(magnetometer_group)
@@ -4369,7 +4657,8 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         can_magnetometer_layout = QtWidgets.QVBoxLayout(can_magnetometer_group)
         can_magnetometer_hint = QtWidgets.QLabel(
             "CAN1/CAN2 값은 PX4 DEBUG_VECT CAN_MAG 호환 메시지가 수신될 때만 표시 · "
-            "RAW yaw=센서축 진단값 · Corrected yaw=CAL_MAG 보정값"
+            "RAW yaw=센서축 진단값 · Corrected yaw=CAL_MAG 보정값 · "
+            "PX4 yaw=편각 보정 ATTITUDE 추정값"
         )
         can_magnetometer_hint.setObjectName("statusStrip")
         can_magnetometer_hint.setWordWrap(True)
@@ -4388,6 +4677,7 @@ class PixhawkWorkspace(QtWidgets.QWidget):
                 "Norm",
                 "RAW yaw°",
                 "Corrected yaw°",
+                "PX4 yaw°",
                 "Δyaw°",
                 "Unit",
                 "Age",
@@ -4404,10 +4694,11 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         can_magnetometer_header = self.can_magnetometer_table.horizontalHeader()
         can_magnetometer_header.setStretchLastSection(False)
         can_magnetometer_header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
-        for column, width in enumerate((72, 72, 72, 112, 72, 72, 72, 72, 72, 88, 96, 88, 52, 72, 220)):
+        for column, width in enumerate((72, 72, 72, 112, 72, 72, 72, 72, 72, 88, 96, 88, 88, 52, 72, 220)):
             can_magnetometer_header.resizeSection(column, width)
         can_magnetometer_header.setSectionHidden(10, False)
-        can_magnetometer_header.setSectionHidden(11, True)
+        can_magnetometer_header.setSectionHidden(11, False)
+        can_magnetometer_header.setSectionHidden(12, True)
         self.can_magnetometer_table.clicked.connect(self._inspect_can_magnetometer_row)
         can_magnetometer_layout.addWidget(self.can_magnetometer_table)
         layout.addWidget(can_magnetometer_group)
@@ -4615,7 +4906,9 @@ class PixhawkWorkspace(QtWidgets.QWidget):
     def _build_mag_priority_group(self, layout: QtWidgets.QVBoxLayout) -> None:
         group = QtWidgets.QGroupBox("MAG Priority / active selection")
         group_layout = QtWidgets.QVBoxLayout(group)
-        self._mag_status_auto_refresh_requested: set[str] = set()
+        # side -> (attempt count, monotonic time of the last automatic request).
+        self._mag_status_auto_refresh_attempts: dict[str, tuple[int, float]] = {}
+        self._board_rotation_auto_refresh_attempts: dict[str, tuple[int, float]] = {}
         hint = QtWidgets.QLabel(
             "P1/P2는 독립적으로 적용됩니다. CAL_MAGn_PRIO를 직접 수정하며, "
             "Apply 후 PARAM readback, 실제 active device ID, fresh ATTITUDE가 모두 확인되어야 "
@@ -4758,29 +5051,110 @@ class PixhawkWorkspace(QtWidgets.QWidget):
             f"Actual PX4: {actual_text}"
         )
 
+    @staticmethod
+    def _board_rotation_known(side: str, attitude_cache: object, rotation_cache: object) -> bool:
+        """True when SENS_BOARD_ROT is available from either readback path."""
+
+        for cache in (attitude_cache, rotation_cache):
+            if not isinstance(cache, Mapping):
+                continue
+            entry = cache.get(side)
+            params = getattr(entry, "params", entry)
+            if not isinstance(params, Mapping):
+                continue
+            value = params.get("SENS_BOARD_ROT")
+            try:
+                if value is not None and math.isfinite(float(value)):
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
     def _refresh_mag_priority_group(self, snapshot: dict[str, RuntimeStatus]) -> None:
         panel = getattr(self.backend, "panel", self.backend)
         status_cache = getattr(panel, "_px4_mag_status_cache", {})
         open_sides = getattr(panel, "_mavlink_open_sides", None)
         connected = set(open_sides()) if callable(open_sides) else set()
+        # The automatic readback waits for a verified heartbeat. The PARAM
+        # worker shares the serial link with the sensor_mag shell poller, and
+        # a request fired during the CONNECTING window is exactly what failed
+        # in the field ("device reports readiness to read but returned no
+        # data"), leaving the CAL_MAG-slot table empty for the whole session.
+        verified_reader = getattr(panel, "_mavlink_connected_sides", None)
+        verified = set(verified_reader()) if callable(verified_reader) else set(connected)
+        parameter_threads = getattr(panel, "pixhawk_parameter_threads", {})
+        incomplete_cache = getattr(panel, "_px4_mag_status_incomplete", {})
+        attitude_cache = getattr(panel, "_px4_attitude_cal_status_cache", {})
+        rotation_cache = getattr(panel, "_px4_board_rotation_params", {})
+        now_s = time.monotonic()
+        max_attempts = self.MAG_STATUS_AUTO_REFRESH_MAX_ATTEMPTS
         for side, label, code in (("left", "P1", "p1"), ("right", "P2", "p2")):
             status = status_cache.get(side) if isinstance(status_cache, Mapping) else None
+            missing_params = (
+                tuple(incomplete_cache.get(side) or ())
+                if isinstance(incomplete_cache, Mapping) and status is not None
+                else ()
+            )
             controls = self.mag_priority_combos.get(side, {})
             if side not in connected:
-                self._mag_status_auto_refresh_requested.discard(side)
+                self._mag_status_auto_refresh_attempts.pop(side, None)
+                self._board_rotation_auto_refresh_attempts.pop(side, None)
             elif (
-                status is None
+                (status is None or missing_params)
                 and self._invoke_command_available
-                and side not in getattr(panel, "pixhawk_parameter_threads", {})
-                and side not in self._mag_status_auto_refresh_requested
+                and side in verified
+                and side not in parameter_threads
             ):
                 # The CAL_MAG-slot table and priority combos need a live
                 # CAL_MAGn_ID/_PRIO param readback to know which physical
-                # sensor sits in which slot. Request it automatically once
-                # per connect so the table doesn't sit empty until the
-                # operator manually presses "Refresh MAG".
-                self._mag_status_auto_refresh_requested.add(side)
-                self._invoke_command(f"pixhawk.mag.refresh.{code}")
+                # sensor sits in which slot. Request it automatically so the
+                # table doesn't sit empty until the operator presses
+                # "Refresh MAG", and retry a bounded number of times when a
+                # readback fails (no status lands and the worker is gone).
+                attempts, last_request_s = self._mag_status_auto_refresh_attempts.get(
+                    side, (0, float("-inf"))
+                )
+                if (
+                    attempts < max_attempts
+                    and now_s - last_request_s >= self.MAG_STATUS_AUTO_REFRESH_RETRY_S
+                ):
+                    self._mag_status_auto_refresh_attempts[side] = (attempts + 1, now_s)
+                    self._invoke_command(f"pixhawk.mag.refresh.{code}")
+                    logger = getattr(panel, "_log", None)
+                    if callable(logger):
+                        reason = (
+                            f"; {len(missing_params)}개 PARAM 미수신" if missing_params else ""
+                        )
+                        logger(
+                            f"[PX4 MAG] {label} CAL_MAG PARAM 자동 readback 요청 "
+                            f"({attempts + 1}/{max_attempts}{reason})"
+                        )
+            elif (
+                status is not None
+                and self._invoke_command_available
+                and side in verified
+                and side not in parameter_threads
+                and not self._board_rotation_known(side, attitude_cache, rotation_cache)
+            ):
+                # Internal (board/GPS) MAG rows cannot show a CAL_MAG-corrected
+                # yaw until SENS_BOARD_ROT is known. The full attitude-cal
+                # readback is operator-driven, so request the single PARAM here
+                # with the same bounded cadence as the CAL_MAG readback.
+                attempts, last_request_s = self._board_rotation_auto_refresh_attempts.get(
+                    side, (0, float("-inf"))
+                )
+                if (
+                    attempts < max_attempts
+                    and now_s - last_request_s >= self.MAG_STATUS_AUTO_REFRESH_RETRY_S
+                ):
+                    self._board_rotation_auto_refresh_attempts[side] = (attempts + 1, now_s)
+                    self._invoke_command(f"pixhawk.board_rotation.refresh.{code}")
+                    logger = getattr(panel, "_log", None)
+                    if callable(logger):
+                        logger(
+                            f"[PX4 MAG] {label} SENS_BOARD_ROT 자동 readback 요청 "
+                            f"({attempts + 1}/{max_attempts})"
+                        )
             if status is not None:
                 slots_data = getattr(status, "slots", ()) or ()
                 if slots_data:
@@ -4819,7 +5193,28 @@ class PixhawkWorkspace(QtWidgets.QWidget):
                     f"{verification.get('reason', '')}"
                 )
             elif status is None:
-                status_text = f"{label}: PARAM readback 대기 중"
+                attempts, _last_request_s = self._mag_status_auto_refresh_attempts.get(side, (0, 0.0))
+                if attempts >= max_attempts:
+                    status_text = (
+                        f"{label}: PARAM readback 자동 시도 {attempts}회 실패 · "
+                        "Refresh MAG를 눌러 CAL_MAG PARAM을 다시 읽으세요"
+                    )
+                elif attempts:
+                    status_text = f"{label}: PARAM readback 대기 중 (자동 시도 {attempts}/{max_attempts})"
+                else:
+                    status_text = f"{label}: PARAM readback 대기 중"
+            elif missing_params:
+                attempts, _last_request_s = self._mag_status_auto_refresh_attempts.get(side, (0, 0.0))
+                if attempts >= max_attempts:
+                    status_text = (
+                        f"{label}: PARAM readback 불완전 ({len(missing_params)}개 미수신) · "
+                        f"자동 시도 {attempts}회 소진 · Refresh MAG를 눌러 다시 읽으세요"
+                    )
+                else:
+                    status_text = (
+                        f"{label}: PARAM readback 불완전 ({len(missing_params)}개 미수신) · "
+                        f"자동 재시도 대기 ({attempts}/{max_attempts})"
+                    )
             else:
                 active = getattr(panel, "latest_vehicle_mag_device_ids", {}).get(side)
                 status_text = (
@@ -5397,6 +5792,7 @@ class PixhawkWorkspace(QtWidgets.QWidget):
                         _display_number(row.get("norm")),
                         _display_signed_deg(row.get("raw_yaw_deg")),
                         _display_magnetometer_corrected_yaw(row),
+                        _display_magnetometer_px4_yaw(row),
                         _display_signed_deg(row.get("delta_yaw_deg")),
                         mag_priority_display(row.get("priority")),
                         row.get("unit", "--"),
@@ -5412,7 +5808,8 @@ class PixhawkWorkspace(QtWidgets.QWidget):
                 str(row[9]),
                 str(row[10]),
                 str(row[11]),
-                str(row[15]),
+                str(row[12]),
+                str(row[16]),
             )
             for row in magnetometer_rows
         )
@@ -5428,8 +5825,8 @@ class PixhawkWorkspace(QtWidgets.QWidget):
                     logger(
                         "[픽스호크 UI] P1/P2 5-MAG yaw cells populated: "
                         + "; ".join(
-                            f"{pixhawk}/{mag} RAW={raw} CORR={px4} Δ={delta} topic={topic}"
-                            for pixhawk, mag, raw, px4, delta, topic in ui_yaw_signature
+                            f"{pixhawk}/{mag} RAW={raw} CORR={corrected} PX4={px4} Δ={delta} topic={topic}"
+                            for pixhawk, mag, raw, corrected, px4, delta, topic in ui_yaw_signature
                         )
                     )
         can_magnetometer_rows: list[tuple[object, ...]] = []
@@ -5448,6 +5845,7 @@ class PixhawkWorkspace(QtWidgets.QWidget):
                         _display_number(row.get("norm")),
                         _display_signed_deg(row.get("raw_yaw_deg")),
                         _display_magnetometer_corrected_yaw(row),
+                        _display_magnetometer_px4_yaw(row),
                         _display_signed_deg(row.get("delta_yaw_deg")),
                         row.get("unit", "--"),
                         _display_number(row.get("age_s"), digits=2, suffix="s"),
@@ -6390,70 +6788,6 @@ class TelemetryWorkspace(QtWidgets.QWidget):
         position_layout.addWidget(position_hint)
         layout.addWidget(position_group)
 
-        gnss_center_group = QtWidgets.QGroupBox("GNSS BASELINE_CENTER F/R/D/Rg/Angle")
-        gnss_center_layout = QtWidgets.QVBoxLayout(gnss_center_group)
-        gnss_center_layout.setContentsMargins(6, 6, 6, 6)
-        gnss_center_layout.setSpacing(4)
-        self.gnss_baseline_center_model = _table_model(
-            self,
-            (
-                "State",
-                "Forward m",
-                "Right m",
-                "Down m",
-                "Range Rg m",
-                "Baseline↔Drone angle°",
-                "90° error°",
-                "Max age s",
-                "Max Δt ms",
-                "Fix P1/P2/Drone",
-            ),
-        )
-        self.gnss_baseline_center_table = QtWidgets.QTableView()
-        self.gnss_baseline_center_table.setModel(self.gnss_baseline_center_model)
-        self.gnss_baseline_center_table.setEditTriggers(
-            QtWidgets.QAbstractItemView.NoEditTriggers
-        )
-        self.gnss_baseline_center_table.setSelectionMode(
-            QtWidgets.QAbstractItemView.NoSelection
-        )
-        self.gnss_baseline_center_table.verticalHeader().setVisible(False)
-        self.gnss_baseline_center_table.verticalHeader().setDefaultSectionSize(26)
-        self.gnss_baseline_center_table.setHorizontalScrollMode(
-            QtWidgets.QAbstractItemView.ScrollPerPixel
-        )
-        self.gnss_baseline_center_table.setFixedHeight(68)
-        gnss_center_header = self.gnss_baseline_center_table.horizontalHeader()
-        gnss_center_header.setStretchLastSection(True)
-        gnss_center_header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
-        for column, width in enumerate((90, 105, 105, 105, 110, 145, 105, 90, 95, 230)):
-            gnss_center_header.resizeSection(column, width)
-        gnss_center_layout.addWidget(self.gnss_baseline_center_table)
-        self.gnss_baseline_center_status = QtWidgets.QLabel(
-            "WAITING · P1/P2/Drone GNSS position waiting"
-        )
-        self.gnss_baseline_center_status.setObjectName("statusStrip")
-        self.gnss_baseline_center_status.setFixedHeight(24)
-        self.gnss_baseline_center_status.setTextInteractionFlags(
-            QtCore.Qt.TextSelectableByMouse
-        )
-        gnss_center_layout.addWidget(self.gnss_baseline_center_status)
-        self.gnss_baseline_center_contract = QtWidgets.QLabel(
-            "GNSS-derived · origin=P1/P2 antenna midpoint · R=horizontal P1→P2 · "
-            "D=NED Down · F=R×D · angle=atan2(|F|,|R|) · target=90° · "
-            "not camera baseline_center_frd"
-        )
-        self.gnss_baseline_center_contract.setObjectName("compactContract")
-        self.gnss_baseline_center_contract.setWordWrap(True)
-        self.gnss_baseline_center_contract.setMaximumHeight(96)
-        self.gnss_baseline_center_contract.setToolTip(
-            "This is a GNSS antenna-midpoint local-level reference. It does not include "
-            "camera optical centers, camera/body attitude, or antenna-to-camera lever arms."
-        )
-        gnss_center_layout.addWidget(self.gnss_baseline_center_contract)
-        self.gnss_baseline_center_group = gnss_center_group
-        layout.addWidget(gnss_center_group)
-
         rtcm_group = QtWidgets.QGroupBox("RTCM delivery")
         rtcm_form = QtWidgets.QGridLayout(rtcm_group)
         self.rtcm_values: dict[str, QtWidgets.QLabel] = {}
@@ -6668,7 +7002,6 @@ class TelemetryWorkspace(QtWidgets.QWidget):
             )
         self._refresh_network_candidates(data)
         self._refresh_position_table(data)
-        self._refresh_gnss_baseline_center(data)
         self._refresh_rtcm(data)
         self._refresh_disparity(data)
 
@@ -6731,82 +7064,6 @@ class TelemetryWorkspace(QtWidgets.QWidget):
                 )
             )
         _sync_table_rows(self.position_model, tuple(rows))
-
-    @staticmethod
-    def _gnss_center_unsigned_text(value: object, *, digits: int) -> str:
-        if value in (None, ""):
-            return "--"
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            return "--"
-        return f"{number:.{digits}f}" if math.isfinite(number) else "--"
-
-    def _refresh_gnss_baseline_center(self, data: Mapping[str, object]) -> None:
-        geometry = data.get("gnss_baseline_center_frd")
-        geometry = geometry if isinstance(geometry, Mapping) else {}
-        state = str(geometry.get("state") or "WAITING").upper()
-        reason = str(
-            geometry.get("reason") or "P1/P2/Drone GNSS baseline-center evidence waiting"
-        )
-        fix_labels = geometry.get("fix_labels")
-        fix_labels = fix_labels if isinstance(fix_labels, Mapping) else {}
-        fix_text = " / ".join(
-            (
-                str(fix_labels.get("p1") or "--"),
-                str(fix_labels.get("p2") or "--"),
-                str(fix_labels.get("drone") or "--"),
-            )
-        )
-        row = (
-            state,
-            _display_signed_number(geometry.get("forward_m"), digits=3),
-            _display_signed_number(geometry.get("right_m"), digits=3),
-            _display_signed_number(geometry.get("down_m"), digits=3),
-            self._gnss_center_unsigned_text(geometry.get("range_m"), digits=3),
-            self._gnss_center_unsigned_text(
-                geometry.get("baseline_drone_angle_deg"),
-                digits=2,
-            ),
-            self._gnss_center_unsigned_text(
-                geometry.get("baseline_drone_angle_error_deg"),
-                digits=2,
-            ),
-            self._gnss_center_unsigned_text(geometry.get("maximum_age_s"), digits=2),
-            self._gnss_center_unsigned_text(
-                geometry.get("timestamp_spread_ms"),
-                digits=1,
-            ),
-            fix_text,
-        )
-        _sync_table_rows(self.gnss_baseline_center_model, (row,))
-        frame = str(
-            geometry.get("frame") or "gnss_baseline_center_local_level_frd"
-        )
-        tooltip = f"{state}: {reason}\nFrame: {frame}"
-        for column in range(self.gnss_baseline_center_model.columnCount()):
-            item = self.gnss_baseline_center_model.item(0, column)
-            if item is None:
-                continue
-            item.setToolTip(tooltip)
-            if 1 <= column <= 8:
-                item.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        angle_text = self._gnss_center_unsigned_text(
-            geometry.get("baseline_drone_angle_deg"),
-            digits=2,
-        )
-        angle_error_text = self._gnss_center_unsigned_text(
-            geometry.get("baseline_drone_angle_error_deg"),
-            digits=2,
-        )
-        angle_detail = (
-            ""
-            if angle_text == "--"
-            else f" · angle={angle_text}° · 90° error={angle_error_text}°"
-        )
-        full_status = f"{state} · {reason}{angle_detail}"
-        self.gnss_baseline_center_status.setText(_compact_text(full_status, limit=180))
-        self.gnss_baseline_center_status.setToolTip(full_status)
 
     def _refresh_rtcm(self, data: Mapping[str, object]) -> None:
         rtcm = data.get("rtcm")
@@ -7833,6 +8090,7 @@ class OpticalPosePane(QtWidgets.QWidget):
                 ("mountain_uv", "Mountain u,v"),
                 ("terrain", "Terrain GeoTIFF"),
                 ("target_reference", "Target reference"),
+                ("yaw90_reference", "Mountain/Cloud 기준"),
             )
         ):
             value = EngineeringValue(label)
@@ -8114,13 +8372,21 @@ class OpticalPosePane(QtWidgets.QWidget):
             (
                 ("alignment.pose.auto_select_horizon", "Auto-select Horizon"),
                 ("alignment.pose.auto_select_mountain", "Auto-select Mountain"),
+                ("alignment.pose.auto_select_cloud", "Auto-select Cloud"),
             )
         ):
             button = make_solver_button(command_id, label)
-            button.setToolTip(
-                "Analyze the frozen native left/right frames and draw a separate suggestion overlay. "
-                "No Horizon/Mountain solver runs until the suggestion is explicitly accepted."
-            )
+            if command_id.endswith("cloud"):
+                button.setToolTip(
+                    "Match far-field sky/cloud texture on the frozen native left/right frames with no "
+                    "ridge bias. The points feed the rotation-only Cloud solve; translation always "
+                    "comes from live GNSS. Both frames must be simultaneous."
+                )
+            else:
+                button.setToolTip(
+                    "Analyze the frozen native left/right frames and draw a separate suggestion overlay. "
+                    "No Horizon/Mountain solver runs until the suggestion is explicitly accepted."
+                )
             self.auto_select_buttons[command_id] = button
             auto_layout.addWidget(button, 0, column)
         self.use_suggestion_button = make_solver_button(
@@ -8134,11 +8400,11 @@ class OpticalPosePane(QtWidgets.QWidget):
             "remain structurally usable. Horizon requires two separated endpoints per side; "
             "Mountain requires paired distributed points after exclusions."
         )
-        auto_layout.addWidget(self.use_suggestion_button, 0, 2)
+        auto_layout.addWidget(self.use_suggestion_button, 0, 3)
         self.auto_suggestion_status_label = QtWidgets.QLabel("No automatic suggestion")
         self.auto_suggestion_status_label.setObjectName("statusStrip")
         self.auto_suggestion_status_label.setWordWrap(True)
-        auto_layout.addWidget(self.auto_suggestion_status_label, 1, 0, 1, 3)
+        auto_layout.addWidget(self.auto_suggestion_status_label, 1, 0, 1, 4)
         self.auto_suggestion_metrics_label = QtWidgets.QLabel(
             "Confidence / inliers / residual / detector: --"
         )
@@ -8171,7 +8437,6 @@ class OpticalPosePane(QtWidgets.QWidget):
             "Terrain PnP": "Observed: full 6-DOF · requires GeoTIFF vertical datum and matched 2D/3D points",
             "Drone Rotation": "1 target: Yaw · 2+ targets: Roll/Pitch/Yaw · Measurement t: pair-frozen GNSS",
             "Drone Multi-view": "Observed: full 6-DOF R,t · requires at least four READY accumulated Frozen target pairs",
-            "References": "Register existing Checkerboard R,t or live Pixhawk+RTK Translation as reusable reference evidence",
             "Combine": "Compose only non-overlapping axes observable on both camera sides with shared prior/K,D",
         }
         method_details = {
@@ -8180,7 +8445,6 @@ class OpticalPosePane(QtWidgets.QWidget):
             "Terrain PnP": "Evidence: GeoTIFF/vertical datum, 2D↔3D counts, reprojection error, depth ratio, rank/condition",
             "Drone Rotation": "Evidence: target count, Yaw/full-R mode, Drone/P1/P2 RTK state, sync delta, angular residual",
             "Drone Multi-view": "Evidence: JSON hash, per-side observation count, timestamp verification, 3D spread, full-rank status",
-            "References": "Evidence: active K,D compatibility, profile hash, source zoom, baseline and reference state",
             "Combine": "Evidence: selected candidates, per-side observability, DOF ownership, overlap and shared-prior checks",
         }
 
@@ -8252,6 +8516,7 @@ class OpticalPosePane(QtWidgets.QWidget):
             "Click corresponding Mountain features in the same order on both frames. Uses paired u,v and the numeric GNSS baseline; no GeoTIFF or terrain height.",
             (
                 make_solver_button("alignment.pose.solve_gnss_mountain", "Solve GNSS + Mountain R,t"),
+                make_solver_button("alignment.pose.solve_cloud_rotation", "Solve Cloud rotation"),
             ),
             content=build_mountain_content,
         )
@@ -8291,33 +8556,6 @@ class OpticalPosePane(QtWidgets.QWidget):
             "full six-DOF camera pose without a separate JSON file. Translation is solved from the "
             "observations instead of inherited from live GNSS.",
             (multiview_button,),
-        )
-        def register_reference_candidate(source: str) -> None:
-            self.command_requested.emit(
-                "alignment.pose.register_reference",
-                {"source": source},
-            )
-
-        register_checkerboard_button = QtWidgets.QPushButton("Register Checkerboard as candidate")
-        register_checkerboard_button.setObjectName("opticalPoseRegisterCheckerboardReference")
-        register_checkerboard_button.setToolTip(
-            "Package the stored Checkerboard stereoCalibrate R,t (all 6 DOF) as an immutable "
-            "candidate, anchored to the current prior's left pose, so Combine candidates can mix "
-            "specific axes from it -- e.g. take only its translation alongside a rotation-only "
-            "Horizon/Drone-yaw solve. This does not recalculate or overwrite the stored profile."
-        )
-        register_checkerboard_button.clicked.connect(
-            lambda _checked=False: register_reference_candidate("checkerboard")
-        )
-        register_pixhawk_button = QtWidgets.QPushButton("Register Pixhawk + RTK (live) as candidate")
-        register_pixhawk_button.setObjectName("opticalPoseRegisterPixhawkReference")
-        register_pixhawk_button.setToolTip(
-            "Package the current live RTK GNSS baseline as a translation-only candidate (rotation "
-            "is not packaged here -- the attitude quaternion is body-FRD, not camera-RDF) so "
-            "Combine candidates can mix its N/E/D with a separately solved rotation."
-        )
-        register_pixhawk_button.clicked.connect(
-            lambda _checked=False: register_reference_candidate("pixhawk_rtk")
         )
         combine_button = make_solver_button(
             "alignment.pose.solve_combined",
@@ -8387,11 +8625,6 @@ class OpticalPosePane(QtWidgets.QWidget):
             page_layout.addWidget(self.combine_candidate_status)
 
         add_method_tab(
-            "References",
-            "Register Checkerboard or live Pixhawk+RTK reference evidence for later method composition.",
-            (register_checkerboard_button, register_pixhawk_button),
-        )
-        add_method_tab(
             "Combine",
             "Compose explicitly selected non-overlapping candidate axes into one immutable candidate.",
             (combine_button,),
@@ -8406,6 +8639,12 @@ class OpticalPosePane(QtWidgets.QWidget):
             "on frozen left/right frames and the numeric left/right GNSS baseline. "
             "No GeoTIFF or terrain height is used. Fix quality is recorded as evidence, "
             "not used as a hard gate. Assumes camera optical center equals GNSS antenna."
+        )
+        self.solver_buttons["alignment.pose.solve_cloud_rotation"].setToolTip(
+            "Rotation-only solve from the same paired Ridge points treated as far-field "
+            "sky/cloud correspondences (Auto-select Cloud). Translation is never applied by "
+            "this candidate; the Cloud measurement method fills N/E/D from live GNSS. Both "
+            "frozen frames must be simultaneous within the burst pairing tolerance."
         )
 
         candidate_group = QtWidgets.QGroupBox("R,t candidates · compare")
@@ -8504,6 +8743,32 @@ class OpticalPosePane(QtWidgets.QWidget):
         lower_splitter.setStretchFactor(1, 2)
         lower_splitter.setSizes([720, 480])
         self.method_review_splitter = lower_splitter
+        self.live_rt_group = QtWidgets.QGroupBox("R,t · 실시간")
+        live_layout = QtWidgets.QVBoxLayout(self.live_rt_group)
+        note = QtWidgets.QLabel("자동 갱신 · R,t: X_right = R × X_left + t · OpenCV RDF (Right, Down, Forward), t 단위 m")
+        note.setObjectName("compactContract")
+        note.setWordWrap(True)
+        live_layout.addWidget(note)
+        self.live_rt_table = QtWidgets.QTableWidget(2, 5)
+        self.live_rt_table.setObjectName("alignmentLiveRtTable")
+        self.live_rt_table.setHorizontalHeaderLabels(("Method", "R · 3×3", "t · RDF (m)", "State", "Age (s)"))
+        self.live_rt_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.live_rt_table.setWordWrap(False)
+        self.live_rt_table.setTextElideMode(QtCore.Qt.ElideNone)
+        self.live_rt_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.live_rt_table.verticalHeader().hide()
+        self.live_rt_table.horizontalHeader().setStretchLastSection(True)
+        for col, width in enumerate((165, 315, 175, 100, 85)):
+            self.live_rt_table.setColumnWidth(col, width)
+        for row in range(2):
+            self.live_rt_table.setRowHeight(row, 72)
+            for column in range(5):
+                self.live_rt_table.setItem(row, column, QtWidgets.QTableWidgetItem("--"))
+        self.live_rt_table.setFixedHeight(196)
+        live_layout.addWidget(self.live_rt_table)
+        self._live_rt_rows: dict[str, dict[str, object]] = {}
+        self.set_live_rt_snapshot({"rows": []})
+        layout.addWidget(self.live_rt_group)
         layout.addWidget(lower_splitter)
 
         self.method_tabs.currentChanged.connect(self._handle_method_tab_changed)
@@ -8511,6 +8776,39 @@ class OpticalPosePane(QtWidgets.QWidget):
 
     def _handle_method_tab_changed(self, index: int) -> None:
         label = self.method_tabs.tabText(index) if index >= 0 else ""
+        setup = label == "Baseline Yaw90"
+        was_setup = bool(getattr(self, "_baseline_setup_visible", False))
+        if setup and not was_setup:
+            self._baseline_saved_splitter_sizes = self.method_review_splitter.sizes()
+            parent = self.parentWidget()
+            while parent is not None and not isinstance(parent, QtWidgets.QScrollArea):
+                parent = parent.parentWidget()
+            self._baseline_saved_scroll = parent.verticalScrollBar().value() if parent is not None else 0
+        self._baseline_setup_visible = setup
+        # Keep the installation tables in their existing first viewport. The
+        # live transform readout follows the setup page, and precedes solver
+        # review on the other tabs.
+        root_layout = self.layout()
+        root_layout.removeWidget(self.live_rt_group)
+        if setup:
+            root_layout.addWidget(self.live_rt_group)
+        else:
+            root_layout.insertWidget(root_layout.indexOf(self.method_review_splitter), self.live_rt_group)
+        self.readiness_group.setVisible(not setup)
+        self.preview_group.setVisible(not setup)
+        self.candidate_review_widget.setVisible(not setup)
+        if setup:
+            self.auto_group.hide()
+            return
+        if was_setup:
+            self.method_review_splitter.setSizes(self._baseline_saved_splitter_sizes)
+            parent = self.parentWidget()
+            while parent is not None and not isinstance(parent, QtWidgets.QScrollArea):
+                parent = parent.parentWidget()
+            if parent is not None:
+                scrollbar = parent.verticalScrollBar()
+                value = getattr(self, "_baseline_saved_scroll", 0)
+                QtCore.QTimer.singleShot(0, lambda: scrollbar.setValue(value))
         annotation_modes = {
             "Horizon": AnnotationMode.HORIZON.value,
             "Mountain + GNSS": AnnotationMode.RIDGE.value,
@@ -8534,16 +8832,21 @@ class OpticalPosePane(QtWidgets.QWidget):
         self.auto_group.setVisible(show_horizon_auto or show_mountain_auto)
         horizon_button = self.auto_select_buttons.get("alignment.pose.auto_select_horizon")
         mountain_button = self.auto_select_buttons.get("alignment.pose.auto_select_mountain")
+        cloud_button = self.auto_select_buttons.get("alignment.pose.auto_select_cloud")
         if horizon_button is not None:
             horizon_button.setVisible(show_horizon_auto)
         if mountain_button is not None:
             mountain_button.setVisible(show_mountain_auto)
+        if cloud_button is not None:
+            cloud_button.setVisible(show_mountain_auto)
         self.observations_group.setVisible(
             label in {"Drone Rotation", "Drone Multi-view"}
         )
         self._refresh_method_information()
 
     def _update_optical_pose_layout_mode(self) -> None:
+        if getattr(self, "_baseline_setup_visible", False):
+            return
         width_hint = self._optical_pose_layout_width_hint or self.width()
         preview_width = min(
             self.preview_group.contentsRect().width(),
@@ -8618,7 +8921,6 @@ class OpticalPosePane(QtWidgets.QWidget):
         left = annotation_counts["left"]
         right = annotation_counts["right"]
         terrain_state = self.readiness_values["terrain"].value.text()
-        base_state = self.readiness_values["base_extrinsics"].value.text()
         observation_count = len(self._drone_rtk_observation_order)
         multiview_sample_count = len(self._drone_rtk_multiview_samples)
         multiview_ready_count = sum(
@@ -8635,7 +8937,7 @@ class OpticalPosePane(QtWidgets.QWidget):
             "Mountain + GNSS": (
                 f"Solve readiness · paired ridge points L/R={left['ridge']}/{right['ridge']} "
                 f"(≥4, equal order) · candidate={candidate_state_by_method.get('Mountain + GNSS', '--')} · "
-                "frozen GNSS baseline and lever-arm provenance required"
+                "GNSS Yaw90 + P1 R/P at capture request; existing Base R,t is not required"
             ),
             "Terrain PnP": (
                 f"Solve readiness · ridge points L/R={left['ridge']}/{right['ridge']} · "
@@ -8649,10 +8951,6 @@ class OpticalPosePane(QtWidgets.QWidget):
                 f"Solve readiness · accumulated READY/total={multiview_ready_count}/{multiview_sample_count} "
                 f"(≥4 READY required) · captured evidence={observation_count} · "
                 f"candidate={candidate_state_by_method.get('Drone Multi-view', '--')}"
-            ),
-            "References": (
-                f"Reference readiness · base R,t={base_state or '--'} · candidates={candidate_count} · "
-                "register a reusable source candidate"
             ),
             "Combine": (
                 f"Combine readiness · candidates={candidate_count} · "
@@ -8705,10 +9003,6 @@ class OpticalPosePane(QtWidgets.QWidget):
                 f"{candidate_metric('Drone Multi-view', 'right_angular_rms_chord')} · "
                 f"collection={candidate_input('Drone Multi-view', 'drone_rtk_multiview_collection_sha256')} · "
                 f"JSON fallback={candidate_input('Drone Multi-view', 'drone_rtk_multiview_json_sha256')}"
-            ),
-            "References": (
-                f"checkerboard profile={base_state or '--'} · "
-                f"reference candidates={candidate_count} · source zoom/status are shown in Candidate review"
             ),
             "Combine": (
                 f"sources={len(candidate_by_method.get('Combine', {}).get('source_observation_ids', ())) or '--'} · "
@@ -8830,12 +9124,9 @@ class OpticalPosePane(QtWidgets.QWidget):
         if command_id in {
             "alignment.pose.auto_select_horizon",
             "alignment.pose.auto_select_mountain",
+            "alignment.pose.auto_select_cloud",
         }:
-            payload["auto_mode"] = (
-                "horizon"
-                if command_id.endswith("horizon")
-                else "mountain"
-            )
+            payload["auto_mode"] = command_id.rsplit("_", 1)[-1]
             payload["frozen_frames_required"] = True
         if command_id == "alignment.pose.use_suggestion":
             payload["suggestion_id"] = self._active_auto_suggestion_id
@@ -9011,7 +9302,7 @@ class OpticalPosePane(QtWidgets.QWidget):
         visible_index: int,
     ) -> None:
         suggestion = self._auto_suggestions.get(self._active_auto_suggestion_id)
-        if not isinstance(suggestion, Mapping) or str(suggestion.get("mode") or "") != "mountain":
+        if not isinstance(suggestion, Mapping) or str(suggestion.get("mode") or "") not in {"mountain", "cloud"}:
             return
         if str(mode) != AnnotationMode.RIDGE.value:
             return
@@ -9147,7 +9438,7 @@ class OpticalPosePane(QtWidgets.QWidget):
             button.setEnabled(not busy)
         if not busy:
             return
-        mode_label = "Horizon" if str(mode).lower() == "horizon" else "Mountain"
+        mode_label = {"horizon": "Horizon", "cloud": "Cloud"}.get(str(mode).lower(), "Mountain")
         self._auto_suggestion_error_active = False
         self.auto_suggestion_status_label.setStyleSheet("")
         self.auto_suggestion_status_label.setText(
@@ -9217,7 +9508,7 @@ class OpticalPosePane(QtWidgets.QWidget):
             AnnotationMode.HORIZON
             if mode == "horizon"
             else AnnotationMode.RIDGE
-            if mode == "mountain"
+            if mode in {"mountain", "cloud"}
             else None
         )
         sides = suggestion.get("sides")
@@ -9260,7 +9551,7 @@ class OpticalPosePane(QtWidgets.QWidget):
         excluded_count = len(
             self._auto_suggestion_excluded_indices.get(suggestion_id, set())
         )
-        excluded_text = f" · excluded pairs {excluded_count}" if mode == "mountain" else ""
+        excluded_text = f" · excluded pairs {excluded_count}" if mode in {"mountain", "cloud"} else ""
         self.auto_suggestion_metrics_label.setText(
             f"Confidence {confidence_text} · inliers {inliers} · residual {residual_text} "
             f"· detector {detector}{excluded_text}"
@@ -9269,7 +9560,7 @@ class OpticalPosePane(QtWidgets.QWidget):
         suffix = f" · {reason}" if reason else ""
         copy_eligible = False
         copy_status = ""
-        if mode == "mountain":
+        if mode in {"mountain", "cloud"}:
             copy_eligible, copy_reason = self._mountain_suggestion_copy_status(
                 suggestion_id, sides
             )
@@ -9277,7 +9568,7 @@ class OpticalPosePane(QtWidgets.QWidget):
             copy_eligible, copy_reason = self._horizon_suggestion_copy_status(sides)
         else:
             copy_reason = "unsupported automatic suggestion mode"
-        if mode in {"horizon", "mountain"}:
+        if mode in {"horizon", "mountain", "cloud"}:
             copy_status = (
                 " · COPY READY"
                 if copy_eligible
@@ -9302,7 +9593,11 @@ class OpticalPosePane(QtWidgets.QWidget):
             return
         mode = str(suggestion.get("mode") or "").lower()
         annotation_mode = (
-            AnnotationMode.HORIZON if mode == "horizon" else AnnotationMode.RIDGE if mode == "mountain" else None
+            AnnotationMode.HORIZON
+            if mode == "horizon"
+            else AnnotationMode.RIDGE
+            if mode in {"mountain", "cloud"}
+            else None
         )
         sides = suggestion.get("sides")
         sides = sides if isinstance(sides, Mapping) else {}
@@ -9753,6 +10048,55 @@ class OpticalPosePane(QtWidgets.QWidget):
         )
         values["sync_reason"].set_value(sync.get("reason") or "--")
 
+    def set_live_rt_snapshot(self, snapshot: Mapping[str, object], *, error: str = "") -> None:
+        """Update fixed live rows in-place, keeping solved candidate selection intact."""
+        from Workstation.alignment_rt_controller import LIVE_RT_METHODS
+        now = time.monotonic()
+        if not error:
+            rows = snapshot.get("rows")
+            if not isinstance(rows, (tuple, list)):
+                raise ValueError("live R,t snapshot rows missing")
+            checked = {}
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    raise ValueError("invalid live R,t row")
+                rotation = row.get("rotation_right_from_left_rdf")
+                translation = row.get("translation_right_from_left_rdf_m")
+                if rotation is not None and (not isinstance(rotation, (tuple, list)) or len(rotation) != 3
+                        or any(not isinstance(line, (tuple, list)) or len(line) != 3
+                            or any(not math.isfinite(float(v)) for v in line) for line in rotation)):
+                    raise ValueError("invalid live R matrix")
+                if translation is not None and (not isinstance(translation, (tuple, list)) or len(translation) != 3
+                        or any(not math.isfinite(float(v)) for v in translation)):
+                    raise ValueError("invalid live translation")
+                timestamp = row.get("oldest_sample_s")
+                if timestamp is not None and not math.isfinite(float(timestamp)):
+                    raise ValueError("invalid live sample timestamp")
+                checked[str(row.get("method_id"))] = dict(row)
+            self._live_rt_rows = checked
+        for index, (method, label) in enumerate(LIVE_RT_METHODS):
+            row = self._live_rt_rows.get(method, {})
+            rotation = row.get("rotation_right_from_left_rdf")
+            translation = row.get("translation_right_from_left_rdf_m")
+            r_text = "--" if rotation is None else "\n".join(
+                "[" + ", ".join(f"{float(v):+.5f}" for v in line) + "]" for line in rotation)
+            t_text = "--" if translation is None else "\n".join(
+                f"{axis} {float(v):+.6f}" for axis, v in zip(("R", "D", "F"), translation))
+            timestamp = row.get("oldest_sample_s")
+            age = max(0., now-float(timestamp)) if isinstance(timestamp, (float, int)) else None
+            state = "ERROR" if error else str(row.get("state", "WAITING"))
+            tooltip = str(error or row.get("reason") or "")
+            tooltip += f"\nR:\n{r_text}\nt [R,D,F] m:\n{t_text}"
+            tooltip += f"\nP1/P2 attitude, GNSS ages: {row.get('input_ages_s', '--')} s"
+            if row.get("yaw_selection"):
+                yaw = row["yaw_selection"]
+                tooltip += f"\nYaw={yaw.get('selected_yaw_deg')} deg; Reverse={yaw.get('reverse')}"
+            for column, text in enumerate((label, r_text, t_text, state, "--" if age is None else f"{age:.2f}")):
+                item = self.live_rt_table.item(index, column)
+                if item.text() != text:
+                    item.setText(text)
+                item.setToolTip(tooltip)
+
     def apply_snapshot(self, snapshot: Mapping[str, object]) -> None:
         readiness = snapshot.get("readiness")
         if isinstance(readiness, Mapping):
@@ -9817,7 +10161,7 @@ class OpticalPosePane(QtWidgets.QWidget):
     def _candidate_relative_pose_text(candidate: Mapping[str, object]) -> str:
         """Render the owner-projected Mountain relative OpenCV R/t readout."""
 
-        if str(candidate.get("method", "") or "") != "gnss-constrained-mountain-uv":
+        if str(candidate.get("method", "") or "") not in {"gnss-constrained-mountain-uv", "cloud-far-field-rotation"}:
             return ""
         relative = candidate.get("relative_pose_rdf")
         if not isinstance(relative, Mapping):
@@ -9882,6 +10226,14 @@ class OpticalPosePane(QtWidgets.QWidget):
         """
 
         lines: list[str] = []
+        reference = candidate.get("yaw90_reference")
+        if isinstance(reference, Mapping):
+            lines.append("기준: GNSS Yaw90 · 촬영 요청 시 고정 · P1 R/P 정렬 가정")
+            lines.append(f"요청 UTC ns={reference.get('requested_utc_ns')} · Reverse={reference.get('reverse')}")
+            for side, role in (("left", "기준 자세 (가정)"), ("right", "영상 상대 R로 유도한 자세")):
+                pose = candidate.get(f"{side}_pose", {})
+                lines.append(f"{side} {role}: R/P/Y={pose.get('virtual_frd_rpy_deg')} deg; C_NED={pose.get('center_ned_m')} m")
+            lines.append("")
         relative_pose_text = cls._candidate_relative_pose_text(candidate)
         if relative_pose_text:
             lines.extend(relative_pose_text.splitlines())
@@ -10311,6 +10663,8 @@ class AlignmentWorkspace(QtWidgets.QWidget):
 
     inspection_requested = QtCore.pyqtSignal(object)
     optical_pose_command_requested = QtCore.pyqtSignal(str, object)
+    open_measurement_requested = QtCore.pyqtSignal()
+    inspection_clear_requested = QtCore.pyqtSignal(str)
 
     def __init__(
         self,
@@ -10358,6 +10712,17 @@ class AlignmentWorkspace(QtWidgets.QWidget):
         self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
         self.optical_pose_pane = OpticalPosePane()
         operation_tabs = self.optical_pose_pane.method_tabs
+        operation_tabs.tabBar().moveTab(1, 0)  # Mountain + GNSS first in Alignment.
+        from Workstation.baseline_yaw90_pane import BaselineYaw90Pane
+
+        self.baseline_yaw90_pane = BaselineYaw90Pane(self.backend, _invoke_command)
+        self.baseline_yaw90_pane.inspection_requested.connect(self.inspection_requested.emit)
+        self.baseline_yaw90_pane.open_measurement.connect(self.open_measurement_requested.emit)
+        self.baseline_yaw90_index = operation_tabs.insertTab(1, self.baseline_yaw90_pane, "Baseline Yaw90")
+        operation_tabs.setCurrentIndex(0)
+        self._last_setup_tab = False
+        self._optical_scroll_position = 0
+        operation_tabs.currentChanged.connect(self._setup_tab_changed)
         self.optical_pose_pane.command_requested.connect(
             self.optical_pose_command_requested.emit
         )
@@ -10373,6 +10738,38 @@ class AlignmentWorkspace(QtWidgets.QWidget):
         )
         self.optical_pose_scroll = None
         return operation_tabs
+
+    def _setup_tab_changed(self, index: int) -> None:
+        setup = index == self.baseline_yaw90_index
+        if self._last_setup_tab and not setup:
+            self.inspection_clear_requested.emit("baseline_yaw90")
+        parent = self.parentWidget()
+        while parent is not None and not isinstance(parent, QtWidgets.QScrollArea):
+            parent = parent.parentWidget()
+        if parent is not None:
+            scrollbar = parent.verticalScrollBar()
+            if setup and not self._last_setup_tab:
+                scrollbar.setValue(0)
+        self._last_setup_tab = setup
+        if setup:
+            self.baseline_yaw90_pane.refresh(self.status_model.snapshot())
+
+    def open_baseline_yaw90(self) -> None:
+        self.operation_tabs.setCurrentIndex(self.baseline_yaw90_index)
+
+    def refresh(self, snapshot: dict[str, RuntimeStatus]) -> None:
+        if self.operation_tabs.currentIndex() == self.baseline_yaw90_index:
+            self.baseline_yaw90_pane.refresh(snapshot)
+        try:
+            reader = getattr(self.backend, "alignment_live_rt_snapshot", None)
+            if callable(reader):
+                live = reader()
+            else:
+                from Workstation.alignment_rt_controller import alignment_live_rt_snapshot
+                live = alignment_live_rt_snapshot(getattr(self.backend, "panel", self.backend))
+            self.optical_pose_pane.set_live_rt_snapshot(live)
+        except (AttributeError, TypeError, ValueError, RuntimeError) as exc:
+            self.optical_pose_pane.set_live_rt_snapshot({}, error=str(exc))
 
     def select_tab_for_context(self, _context_id: str) -> None:
         """Alignment has one promoted method surface; preserve its local tab."""
@@ -10521,6 +10918,7 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                 crop_to_fill=False,
                 lock_chrome_height=True,
                 lock_image_aspect=True,
+                wheel_zoom=True,
             )
             for side in ("left", "right")
         }
@@ -10545,6 +10943,7 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                 lock_image_aspect=True,
                 active_label="FTP STILL",
                 empty_image_text="NO FTP IMAGE",
+                wheel_zoom=True,
             )
             for side in ("left", "right")
         }
@@ -15416,6 +15815,11 @@ class RecordingWorkspace(QtWidgets.QWidget):
             data_actions.addWidget(self.open_legacy_recordings_button, 0, 1)
             data_actions.addWidget(self.retry_storage_button, 0, 2)
             data_actions.addWidget(self.open_measurement_workbook_button, 1, 0)
+            self.rebuild_measurement_workbook_button = QtWidgets.QPushButton("Rebuild Latest XLSX")
+            self.rebuild_measurement_workbook_button.setObjectName("dataWorkspaceRebuildMeasurementWorkbook")
+            self.rebuild_measurement_workbook_button.setToolTip("Rebuild the latest Measurement workbook from its saved JSONL/CSV inputs.")
+            self.rebuild_measurement_workbook_button.clicked.connect(self._rebuild_measurement_workbook)
+            data_actions.addWidget(self.rebuild_measurement_workbook_button, 1, 1)
             data_actions.setColumnStretch(3, 1)
             data_layout.addLayout(data_actions)
             self.measurement_workbook_status_label = QtWidgets.QLabel(
@@ -15605,11 +16009,14 @@ class RecordingWorkspace(QtWidgets.QWidget):
         if not self._sessionless or not hasattr(self, "measurement_workbook_status_label"):
             return
         snapshot = self._measurement_workbook_snapshot()
-        state = str(snapshot.get("state") or "IDLE").replace("_", " ")
+        state = (
+            "REBUILDING" if snapshot.get("rebuilding") else "REBUILD FAILED"
+            if snapshot.get("rebuild_error") else str(snapshot.get("state") or "IDLE").replace("_", " ")
+        )
         latest = str(snapshot.get("latest_path") or "")
         latest_name = Path(latest).name if latest else "--"
         pending = int(snapshot.get("pending_method_jobs") or 0)
-        error = str(snapshot.get("error") or "")
+        error = str(snapshot.get("rebuild_error") or snapshot.get("error") or "")
         detail = (
             _compact_text(error, limit=88)
             if error
@@ -15645,6 +16052,18 @@ class RecordingWorkspace(QtWidgets.QWidget):
         self.open_measurement_workbook_button.setEnabled(
             bool(latest and Path(latest).is_file())
         )
+        self.rebuild_measurement_workbook_button.setEnabled(
+            not snapshot.get("recording_active") and not snapshot.get("rebuilding") and not pending and state != "WRITING"
+        )
+
+    def _rebuild_measurement_workbook(self) -> None:
+        panel = getattr(self.backend, "panel", self.backend)
+        action = getattr(self.backend, "rebuild_latest_measurement_workbook", None)
+        if not callable(action):
+            action = getattr(panel, "rebuild_latest_measurement_workbook", None)
+        if callable(action):
+            action()
+        self._refresh_measurement_workbook()
 
     def _open_measurement_workbook(self) -> None:
         snapshot = self._measurement_workbook_snapshot()

@@ -36,3 +36,21 @@ preflight threshold, and `EKF2_GPS_CTRL=2`, which disables latitude/longitude
 and 3D velocity fusion. P2 is therefore not yet qualified for all-Ethernet
 operation or long-duration P1/P2 telemetry verification. No persistent
 parameter/file write or reboot was performed during this diagnosis.
+
+## 2026-09-06 parameter backup after yaw-delta tuning
+
+- `parameters-full-20260906T0939KST.params`: complete onboard parameter table
+  (1183 params) read over USB with `PARAM_REQUEST_LIST`, QGC overlay format.
+  Read-only capture, board disarmed. `EKF2_GPS_CTRL` was `7` at capture time
+  (the `2` noted in the 2026-09-04 diagnosis had been corrected); it was later
+  set to `0` on both boards because `EKF2_HEAD_NOISE=0.02` also acts as the
+  mag-heading consistency gate and GPS NE aiding made heading fusion drop out
+  after the rig was moved — see `../../Pixhawk.md` section 12. The
+  `yaw-tune-*.params` overlay carries the current value (`0`).
+- `yaw-tune-20260906T0939KST.params`: only the parameters changed or pinned on
+  2026-09-06. The `CAL_MAG2_YAW=-5.48` trim used earlier that day was removed by
+  operator decision (it was pose-dependent); the overlay now carries
+  `CAL_MAG2_YAW=0`, `CAL_MAG2_ROT=0`, and the raw P2-P1 ΔYaw is about -7.3°.
+  Common values match P1's overlay. Apply with PARAM_SET,
+  then PARAM_SAVE and reboot. Never set an unused `CAL_MAGn_PRIO` to 0 — see
+  `../../Pixhawk.md` section 12.

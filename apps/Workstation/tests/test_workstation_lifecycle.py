@@ -410,12 +410,12 @@ def test_workstation_shell_navigation_and_close() -> None:
         window.alignment.operation_tabs.tabText(index)
         for index in range(window.alignment.operation_tabs.count())
     ] == [
-        "Horizon",
         "Mountain + GNSS",
+        "Baseline Yaw90",
+        "Horizon",
         "Terrain PnP",
         "Drone Rotation",
         "Drone Multi-view",
-        "References",
         "Combine",
     ]
     alignment_layout = window.alignment.layout()

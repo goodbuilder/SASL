@@ -19,7 +19,7 @@ from typing import Any
 from Workstation.workstation_core.canonical_transform import (
     kernel_inputs_from_right_from_left,
 )
-from Workstation.workstation_core.measurement_xlsx_read import read_workbook, table_rows
+from Workstation.workstation_core.measurement_xlsx_read import read_workbook, table_rows, table_rows_with_parts
 from Workstation.workstation_core.triangulation import (
     triangulate_pixels_with_relative_pose_attempt,
 )
@@ -129,7 +129,7 @@ def reproduce_workbook(path: Path | str) -> list[ReproducedResult]:
     sheets = read_workbook(path)
     calibration = _calibration_from_sheet(table_rows(sheets["03_Calibration"]))
     results: list[ReproducedResult] = []
-    for row in table_rows(sheets["90_Flat"]):
+    for row in table_rows_with_parts(sheets, "90_Flat"):
         if str(row.get("Attempted")) != "YES":
             continue
         stored = (
@@ -188,7 +188,7 @@ def reproduce_workbook_exact(path: Path | str) -> list[ReproducedResult]:
 
     sheets = read_workbook(path)
     exact: dict[tuple[str, str], dict[str, float]] = {}
-    for row in table_rows(sheets["91_Exact"]):
+    for row in table_rows_with_parts(sheets, "91_Exact"):
         key = (str(row.get("pair_id") or ""), str(row.get("method_id") or ""))
         text = row.get("value_hex")
         if not isinstance(text, str):
@@ -235,7 +235,65 @@ def reproduce_workbook_exact(path: Path | str) -> list[ReproducedResult]:
     return results
 
 
+def reproduce_target_coordinates_exact(path: Path | str) -> list[dict[str, Any]]:
+    """Recompute target geolocation from exact K,D,R,T,u,v and world anchor.
+
+    Old workbooks without target fields yield no entries. Existing FRD replay
+    APIs retain their original return contract.
+    """
+    import json
+    from Workstation.workstation_core.target_coordinates import TARGET_COORDINATE_FIELDS, target_wgs84_from_attempt
+
+    sheets = read_workbook(path)
+    groups: dict[tuple[str, str], dict[str, float]] = {}
+    for row in table_rows_with_parts(sheets, "91_Exact"):
+        try:
+            value = float.fromhex(str(row.get("value_hex")))
+        except ValueError:
+            continue
+        groups.setdefault((str(row.get("pair_id") or ""), str(row.get("method_id") or "")), {})[str(row.get("field"))] = value
+    results = []
+    for (pair_id, method_id), v in groups.items():
+        if not any(name in v for name in TARGET_COORDINATE_FIELDS):
+            continue
+        stored = {name: v.get(name) for name in TARGET_COORDINATE_FIELDS}
+        try:
+            origin = [v[f"target.origin_wgs84.{i}"] for i in range(3)]
+            cameras = {}
+            for side in ("left", "right"):
+                matrix = [[v[f"{side}.K{r+1}{c+1}"] for c in range(3)] for r in range(3)]
+                names = sorted((key for key in v if key.startswith(f"{side}.D")), key=lambda name: int(name.split('.D')[1]))
+                cameras[side] = _intrinsics(matrix, [v[name] for name in names], 0, 0)
+            rotation, center = kernel_inputs_from_right_from_left(
+                [[v[f"R{r+1}{c+1}"] for c in range(3)] for r in range(3)],
+                [v[axis] for axis in ("T_R", "T_D", "T_F")],
+            )
+            geometry = triangulate_pixels_with_relative_pose_attempt(
+                left_pixel=(v["left.u"], v["left.v"]), right_pixel=(v["right.u"], v["right.v"]),
+                left_intrinsics=cameras["left"], right_intrinsics=cameras["right"],
+                rotation_right_to_left=rotation, translation_right_in_left_m=center,
+            )
+            attempt = {"left_gps": {"latitude_deg": origin[0], "longitude_deg": origin[1],
+                       "altitude_ellipsoid_m": origin[2], "fix_type": 3}}
+            if "target.body_to_ned_quaternion_wxyz.0" in v:
+                attempt.update(triangulation_source="pixhawk", geometry_left_quaternion_wxyz=[v[f"target.body_to_ned_quaternion_wxyz.{i}"] for i in range(4)])
+            else:
+                attempt.update(triangulation_source="checkerboard", measurement_pose_evidence_json=json.dumps({
+                    "target_origin_model": "P1_GNSS_as_left_optical_center",
+                    "left_pose": {"rotation_ned_from_camera_rdf": [[v[f"target.rotation.{r}.{c}"] for c in range(3)] for r in range(3)]},
+                }))
+            result = target_wgs84_from_attempt(attempt, None if geometry.result is None else geometry.result.source_point_left_rdf_m)
+            reason = result["target_coordinate_evidence"]["reason"]
+        except (KeyError, TypeError, ValueError) as exc:
+            result, reason = {}, f"missing_or_invalid_input: {exc}"
+        reproduced = {name: result.get(name) for name in TARGET_COORDINATE_FIELDS}
+        results.append({"pair_id": pair_id, "method_id": method_id, "stored": stored,
+                        "reproduced": reproduced, "reason": reason})
+    return results
+
+
 __all__ = [
+    "reproduce_target_coordinates_exact",
     "ReproducedResult",
     "reproduce_pair_geometry",
     "reproduce_workbook",

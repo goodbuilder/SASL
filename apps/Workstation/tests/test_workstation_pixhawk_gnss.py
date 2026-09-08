@@ -4555,3 +4555,219 @@ def test_parse_rtcm3_reference_station_arp_ignores_other_message_types() -> None
     other = frame[:3] + bytes(payload) + frame[-3:]
 
     assert parse_rtcm3_reference_station_arp(other) is None
+
+
+def test_pixhawk_shell_read_stops_at_prompt_and_on_idle(monkeypatch) -> None:
+    """NSH replies end at the prompt or after an idle gap, not the full timeout."""
+
+    from Workstation.workstation_core import pixhawk_attitude
+
+    clock = {"value": 100.0}
+    monkeypatch.setattr(pixhawk_attitude.time, "monotonic", lambda: clock["value"])
+
+    def serial(text: str) -> SimpleNamespace:
+        data = list(text.encode("utf-8"))
+        return SimpleNamespace(get_type=lambda: "SERIAL_CONTROL", count=len(data), data=data)
+
+    class Connection:
+        def __init__(self, script: list[object]) -> None:
+            self.script = list(script)
+
+        def recv_match(self, **kwargs):
+            clock["value"] += float(kwargs["timeout"])
+            return self.script.pop(0) if self.script else None
+
+    # Prompt ends the read at once even though seconds of timeout remain.
+    connection = Connection(
+        [
+            serial("listener sensor_mag -i 0 -n 1\r\n"),
+            serial("TOPIC: sensor_mag instance 0\r\n x: 1.0\r\n"),
+            serial("nsh> \x1b[K"),
+        ]
+    )
+    start = clock["value"]
+    output = pixhawk_attitude._read_mavlink_shell_output(connection, timeout_s=4.0)
+    assert "TOPIC: sensor_mag instance 0" in output
+    assert output.endswith("nsh> \x1b[K")
+    assert clock["value"] - start < 0.5
+
+    # Output that never shows a prompt ends after the idle gap.
+    connection = Connection([serial("partial output")])
+    start = clock["value"]
+    assert pixhawk_attitude._read_mavlink_shell_output(connection, timeout_s=4.0) == "partial output"
+    assert pixhawk_attitude.MAVLINK_SHELL_OUTPUT_IDLE_S <= clock["value"] - start < 1.0
+
+    # No output at all still waits the whole timeout (unchanged contract).
+    start = clock["value"]
+    assert pixhawk_attitude._read_mavlink_shell_output(Connection([]), timeout_s=1.0) == ""
+    assert clock["value"] - start >= 1.0
+
+    # A multi-line payload returns one prompt per line; stop_at_prompt=False keeps reading.
+    connection = Connection([serial("nsh> "), serial("second\r\n"), serial("nsh> ")])
+    output = pixhawk_attitude._read_mavlink_shell_output(
+        connection, timeout_s=4.0, stop_at_prompt=False
+    )
+    assert output == "nsh> second\r\nnsh> "
+
+
+def test_pixhawk_shell_worker_awaits_replies_without_holding_send_lock() -> None:
+    from Workstation import standalone_gui
+
+    seen: list[dict[str, object]] = []
+
+    class FakeSubscriber:
+        @contextmanager
+        def exclusive_command(self, camera: str, **kwargs):
+            seen.append(dict(kwargs))
+            yield
+
+        def send_shell_command_with_result(self, camera: str, command: str, *, timeout_s: float):
+            return MavlinkShellCommandResult(command, "nsh> OK", "respond")
+
+        def reboot_autopilot(self, camera: str) -> None:
+            return None
+
+    subscriber = FakeSubscriber()
+    poll_worker = standalone_gui.PixhawkShellCommandWorker(
+        subscriber,
+        camera="left",
+        command=("listener sensor_mag -i 0 -n 1", "listener vehicle_magnetometer -n 1"),
+        operation="sensor_mag_shell_poll",
+    )
+    poll_worker.run()
+    assert seen[-1]["hold_send_lock"] is False
+    assert seen[-1]["preserve_qualification"] is True
+
+    manual_worker = standalone_gui.PixhawkShellCommandWorker(
+        subscriber, camera="left", command="param show CAL_MAG0_ID"
+    )
+    manual_worker.run()
+    assert seen[-1]["hold_send_lock"] is False
+
+    reboot_worker = standalone_gui.PixhawkShellCommandWorker(
+        subscriber, camera="left", command="reboot", operation="reboot"
+    )
+    reboot_worker.run()
+    assert seen[-1]["hold_send_lock"] is True
+
+
+def _run_worker_in_thread_until_finished(worker, *, timeout_s: float = 3.0) -> QtCore.QThread:
+    """Start ``worker.run`` on its own QThread and pump events until ``finished``."""
+
+    import time as _time
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    thread = QtCore.QThread()
+    worker.moveToThread(thread)
+    done: list[bool] = []
+    worker.finished.connect(lambda: done.append(True))
+    thread.started.connect(worker.run)
+    thread.start()
+    deadline = _time.monotonic() + timeout_s
+    while not done and _time.monotonic() < deadline:
+        app.processEvents()
+        _time.sleep(0.005)
+    thread.quit()
+    assert thread.wait(1000)
+    assert done, "worker did not finish in time"
+    return thread
+
+
+def test_pixhawk_parameter_worker_stops_when_its_thread_is_interrupted() -> None:
+    """Shutdown must not wait out a 75-parameter radio readback.
+
+    ``QThread.quit()`` cannot stop a running slot, so the worker checks
+    ``isInterruptionRequested()`` before every radio round trip.
+    """
+
+    from Workstation import standalone_gui
+
+    reads: list[str] = []
+    holder: dict[str, QtCore.QThread] = {}
+
+    class FakeSubscriber:
+        def read_param(self, camera: str, name: str, *, timeout_s: float):
+            reads.append(name)
+            # Simulate the close sequence arriving mid-readback.
+            QtCore.QThread.currentThread().requestInterruption()
+            return None
+
+    worker = standalone_gui.PixhawkParameterWorker(
+        FakeSubscriber(), camera="left", operation="mag_refresh"
+    )
+    failures: list[str] = []
+    completions: list[object] = []
+    worker.failed.connect(failures.append)
+    worker.completed.connect(completions.append)
+    holder["thread"] = _run_worker_in_thread_until_finished(worker)
+
+    assert completions == []
+    assert len(failures) == 1
+    assert "interrupted by shutdown" in failures[0]
+    # One read happened; the retry of that same parameter was refused.
+    assert len(reads) == 1
+
+
+def test_pixhawk_shell_worker_stops_between_commands_when_interrupted() -> None:
+    from Workstation import standalone_gui
+    from Workstation.workstation_core.pixhawk_attitude import MavlinkShellCommandResult
+
+    calls: list[str] = []
+
+    class FakeSubscriber:
+        @contextmanager
+        def exclusive_command(self, camera: str, **kwargs):
+            yield
+
+        def send_shell_command_with_result(self, camera: str, command: str, *, timeout_s: float):
+            calls.append(command)
+            QtCore.QThread.currentThread().requestInterruption()
+            return MavlinkShellCommandResult(command, "nsh> ", "respond")
+
+    worker = standalone_gui.PixhawkShellCommandWorker(
+        FakeSubscriber(),
+        camera="right",
+        command=tuple(f"listener sensor_mag -i {i} -n 1" for i in range(5)),
+        operation="sensor_mag_shell_poll",
+    )
+    failures: list[str] = []
+    worker.failed.connect(failures.append)
+    _run_worker_in_thread_until_finished(worker)
+
+    assert calls == ["listener sensor_mag -i 0 -n 1"]
+    assert len(failures) == 1
+    assert "interrupted by shutdown" in failures[0]
+
+
+def test_stop_pixhawk_operation_workers_requests_interruption_before_quit() -> None:
+    from Workstation.device_runtime_controller import DeviceRuntimeController
+
+    class FakeThread:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        def requestInterruption(self) -> None:  # noqa: N802 - Qt API shape.
+            self.events.append("interrupt")
+
+        def quit(self) -> None:
+            self.events.append("quit")
+
+        def isRunning(self) -> bool:  # noqa: N802 - Qt API shape.
+            return True
+
+    shell_thread = FakeThread()
+    parameter_thread = FakeThread()
+    panel = SimpleNamespace(
+        pixhawk_shell_threads={"left": shell_thread},
+        pixhawk_shell_workers={"left": object()},
+        pixhawk_parameter_threads={"right": parameter_thread},
+        pixhawk_parameter_workers={"right": object()},
+    )
+    controller = DeviceRuntimeController(panel)
+
+    assert controller._stop_pixhawk_operation_workers(wait=False) is False
+    assert shell_thread.events == ["interrupt", "quit"]
+    assert parameter_thread.events == ["interrupt", "quit"]
+    # Still running: the registry keeps them so the retrying close loop sees them.
+    assert "left" in panel.pixhawk_shell_threads
+    assert "right" in panel.pixhawk_parameter_threads

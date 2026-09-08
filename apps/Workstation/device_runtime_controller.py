@@ -60,6 +60,7 @@ from Workstation.workstation_core.pixhawk_attitude import (
 from Workstation.workstation_core.px4_attitude_cal_manager import (
     LEVEL_HORIZON_RESET_PARAM_NAMES,
 )
+from Workstation.workstation_core.px4_mag_manager import missing_mag_status_params
 from Workstation.workstation_core.px4_calibration_groups import px4_calibration_group
 
 # Legacy fallback for test doubles/older subscriber adapters that do not yet
@@ -722,6 +723,12 @@ class DeviceRuntimeController:
         for workers in (self.panel.pixhawk_shell_threads, self.panel.pixhawk_parameter_threads):
             for camera, thread in list(workers.items()):
                 try:
+                    # The worker checks this flag between radio round trips;
+                    # quit() alone would wait out the whole PARAM/shell
+                    # sequence (minutes on a lossy radio) before returning.
+                    interrupter = getattr(thread, "requestInterruption", None)
+                    if callable(interrupter):
+                        interrupter()
                     thread.quit()
                     if thread.isRunning():
                         if not wait or not thread.wait(1000):
@@ -3684,6 +3691,10 @@ class DeviceRuntimeController:
             if attitude_status is not None:
                 self.panel._render_px4_attitude_cal_status(camera, attitude_status, using_real_params=True)
             return
+        if kind == "board_rotation_refresh":
+            if camera:
+                self._apply_px4_board_rotation_readback(camera, data.get("params"))
+            return
         if not camera or status is None:
             return
         if kind in {"mag_refresh", "mag_apply"}:
@@ -3693,6 +3704,26 @@ class DeviceRuntimeController:
                 manager.actual_selected_device_id = getattr(status, "actual_selected_device_id", None)
                 manager.armed = bool(getattr(status, "armed", False))
             self.panel._render_px4_mag_status(camera, status)
+            if kind == "mag_refresh":
+                # Success used to be silent, so a missing failure line could not
+                # be told apart from a readback that never ran.
+                slot_summary = ", ".join(
+                    f"CAL_MAG{getattr(slot, 'slot', '?')}="
+                    f"{getattr(slot, 'device_id', None)}/prio={getattr(slot, 'priority', None)}"
+                    for slot in (getattr(status, "slots", ()) or ())
+                ) or "slots N/A"
+                missing = self._record_px4_mag_readback_completeness(camera, status)
+                if missing:
+                    preview = ", ".join(missing[:6]) + (" …" if len(missing) > 6 else "")
+                    self.panel._log(
+                        f"[PX4 MAG] {self.panel._px4_mag_camera_label(camera)} CAL_MAG PARAM readback "
+                        f"불완전 ({len(missing)}개 미수신: {preview}): {slot_summary}"
+                    )
+                else:
+                    self.panel._log(
+                        f"[PX4 MAG] {self.panel._px4_mag_camera_label(camera)} CAL_MAG PARAM readback 완료: "
+                        f"{slot_summary}"
+                    )
             applied = tuple(str(item) for item in data.get("applied") or ())
             missing = tuple(str(item) for item in data.get("missing") or ())
             if kind == "mag_apply":
@@ -3721,6 +3752,45 @@ class DeviceRuntimeController:
         elif kind == "attitude_refresh":
             self.panel._px4_calibration_parameter_error.pop(camera, None)
             self.panel._render_px4_attitude_cal_status(camera, status, using_real_params=True)
+
+    def _record_px4_mag_readback_completeness(self, camera: str, status: object) -> tuple[str, ...]:
+        """Remember which CAL_MAG PARAMs a rendered status is still missing.
+
+        The slot table renders whatever arrived, but the automatic readback
+        keeps retrying (bounded) while identity, priority, or correction
+        coefficients are absent -- a partially read status must not be
+        mistaken for a finished one.
+        """
+
+        store = getattr(self.panel, "_px4_mag_status_incomplete", None)
+        if not isinstance(store, dict):
+            store = {}
+            setattr(self.panel, "_px4_mag_status_incomplete", store)
+        missing = missing_mag_status_params(getattr(status, "params", None))
+        if missing:
+            store[camera] = missing
+        else:
+            store.pop(camera, None)
+        return missing
+
+    def _apply_px4_board_rotation_readback(self, camera: str, params: object) -> None:
+        values = dict(params) if isinstance(params, Mapping) else {}
+        rotation = values.get("SENS_BOARD_ROT")
+        label = self.panel._px4_mag_camera_label(camera)
+        if rotation is None:
+            self.panel._log(f"[PX4 MAG] {label} SENS_BOARD_ROT readback 실패: 응답 없음")
+            return
+        store = getattr(self.panel, "_px4_board_rotation_params", None)
+        if not isinstance(store, dict):
+            store = {}
+            setattr(self.panel, "_px4_board_rotation_params", store)
+        previous = store.get(camera, {}).get("SENS_BOARD_ROT") if isinstance(store.get(camera), Mapping) else None
+        store[camera] = {"SENS_BOARD_ROT": rotation}
+        if previous != rotation:
+            self.panel._log(
+                f"[PX4 MAG] {label} SENS_BOARD_ROT readback 완료: {int(rotation)} "
+                "(internal/GPS MAG corrected yaw 보드 회전 기준)"
+            )
 
     def _pixhawk_parameter_worker_failed(self, camera: str, operation: str, error: str) -> None:
         if operation == "calibration_refresh":

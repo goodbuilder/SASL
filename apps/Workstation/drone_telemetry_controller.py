@@ -107,7 +107,33 @@ def _set_drone_usb_endpoint(panel: object, device: str, baud: int) -> None:
         setattr(panel, "drone_pixhawk_bootstrap_baud", baud)
 
 
-def _gps_mapping(gps: object, *, now_s: float) -> dict[str, object]:
+def gnss_frozen_state_text(frozen: object) -> str | None:
+    """Operator-facing label for a GNSS producer repeating one position."""
+
+    if not isinstance(frozen, Mapping):
+        return None
+    try:
+        packets = int(frozen.get("packets") or 0)
+    except (TypeError, ValueError):
+        return None
+    if packets <= 0:
+        return None
+    cause = "AP 재전송" if frozen.get("utc_frozen") else "수신기 정지"
+    details: list[str] = []
+    fix_type = frozen.get("fix_type")
+    if fix_type is not None:
+        details.append(f"fix={fix_type}")
+    satellites = frozen.get("satellites")
+    if satellites is not None:
+        details.append(f"sats={satellites}")
+    speed = frozen.get("ground_speed_m_s")
+    if isinstance(speed, (int, float)) and math.isfinite(float(speed)):
+        details.append(f"v={float(speed):.2f}m/s")
+    detail_text = f" · {' '.join(details)}" if details else ""
+    return f"FROZEN ×{packets} ({cause}{detail_text})"
+
+
+def _gps_mapping(gps: object, *, now_s: float, frozen: object = None) -> dict[str, object]:
     if gps is None:
         return {
             "state": "NO DATA",
@@ -130,8 +156,10 @@ def _gps_mapping(gps: object, *, now_s: float) -> dict[str, object]:
         except (TypeError, ValueError):
             age_s = None
     position_valid = bool(getattr(gps, "has_position", False))
+    frozen_text = gnss_frozen_state_text(frozen) if position_valid else None
     return {
-        "state": "LIVE" if position_valid else "NO POSITION",
+        "state": frozen_text or ("LIVE" if position_valid else "NO POSITION"),
+        "frozen": dict(frozen) if isinstance(frozen, Mapping) and frozen_text else None,
         "rtk_label": str(getattr(gps, "rtk_label", "UNKNOWN")),
         "age_s": age_s,
         "latitude_deg": getattr(gps, "latitude_deg", None),
@@ -455,6 +483,8 @@ class DroneTelemetryController:
             connection_state = str(getattr(self.panel, "drone_telemetry_connection_state", "DISCONNECTED"))
         gps_states = getattr(self.panel, "latest_gps", {}) or {}
         drone_gps = gps_states.get("drone") if isinstance(gps_states, Mapping) else None
+        frozen_positions = getattr(self.panel, "_gnss_position_frozen", {}) or {}
+        frozen_positions = frozen_positions if isinstance(frozen_positions, Mapping) else {}
         selected_reader = getattr(self.panel, "_selected_rover_gps_state", None)
         left_gps = (
             selected_reader("left")
@@ -539,9 +569,9 @@ class DroneTelemetryController:
             "rtcm_source": rtcm_source,
             "rtcm_source_label": drone_rtcm_source_label(rtcm_source),
             "last_error": str(getattr(self.panel, "drone_telemetry_last_error", "") or ""),
-            "position": _gps_mapping(drone_gps, now_s=now_s),
-            "left_position": _gps_mapping(left_gps, now_s=now_s),
-            "right_position": _gps_mapping(right_gps, now_s=now_s),
+            "position": _gps_mapping(drone_gps, now_s=now_s, frozen=frozen_positions.get("drone")),
+            "left_position": _gps_mapping(left_gps, now_s=now_s, frozen=frozen_positions.get("left")),
+            "right_position": _gps_mapping(right_gps, now_s=now_s, frozen=frozen_positions.get("right")),
             "rtcm": injection,
             "focal_length_px": focal_length_px,
             "focal_source": focal_source,

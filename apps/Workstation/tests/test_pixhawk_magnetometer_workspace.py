@@ -540,9 +540,11 @@ def test_pixhawk_workspace_renders_p1_p2_imu_magnetometer_table() -> None:
     assert workspace.magnetometer_model.horizontalHeaderItem(7).text() == "zmag"
     assert workspace.magnetometer_model.horizontalHeaderItem(9).text() == "RAW yaw°"
     assert workspace.magnetometer_model.horizontalHeaderItem(10).text() == "Corrected yaw°"
-    assert workspace.magnetometer_model.horizontalHeaderItem(11).text() == "Δyaw°"
+    assert workspace.magnetometer_model.horizontalHeaderItem(11).text() == "PX4 yaw°"
+    assert workspace.magnetometer_model.horizontalHeaderItem(12).text() == "Δyaw°"
     assert not workspace.magnetometer_table.horizontalHeader().isSectionHidden(8)
-    assert workspace.magnetometer_table.horizontalHeader().isSectionHidden(11)
+    assert not workspace.magnetometer_table.horizontalHeader().isSectionHidden(11)
+    assert workspace.magnetometer_table.horizontalHeader().isSectionHidden(12)
     assert workspace.magnetometer_model.rowCount() == 8
     assert [workspace.magnetometer_model.item(row, 0).text() for row in range(4)] == ["P1"] * 4
     assert [workspace.magnetometer_model.item(row, 0).text() for row in range(4, 8)] == ["P2"] * 4
@@ -555,8 +557,9 @@ def test_pixhawk_workspace_renders_p1_p2_imu_magnetometer_table() -> None:
     assert workspace.magnetometer_model.item(2, 5).text() == "0.012"
     assert workspace.magnetometer_model.item(2, 9).text() == "-014.04"
     assert workspace.magnetometer_model.item(2, 10).text() == "-014.04"
-    assert workspace.magnetometer_model.item(2, 11).text() == "+044.04"
-    assert workspace.magnetometer_model.item(2, 15).text() == "px4-shell/sensor_mag/0"
+    assert workspace.magnetometer_model.item(2, 11).text() == "+030.00"
+    assert workspace.magnetometer_model.item(2, 12).text() == "+044.04"
+    assert workspace.magnetometer_model.item(2, 16).text() == "px4-shell/sensor_mag/0"
     assert workspace.magnetometer_model.item(5, 1).text() == "CAL_MAG1"
     assert workspace.magnetometer_model.item(5, 2).text().startswith("GPS1")
     assert workspace.magnetometer_model.item(5, 5).text() == "-4.000"
@@ -568,20 +571,24 @@ def test_pixhawk_workspace_renders_p1_p2_imu_magnetometer_table() -> None:
     assert "RAW=-014.04°" in str(inspection_payloads[-1]["value"])
     assert workspace.magnetometer_model.item(0, 9).text() == "--"
     assert workspace.magnetometer_model.item(0, 10).text() == "대기"
-    assert workspace.magnetometer_model.item(0, 11).text() == "--"
+    assert workspace.magnetometer_model.item(0, 11).text() == "대기"
+    assert workspace.magnetometer_model.item(0, 12).text() == "--"
     assert workspace.can_magnetometer_model.horizontalHeaderItem(1).text() == "CAN port"
     assert workspace.can_magnetometer_model.horizontalHeaderItem(9).text() == "RAW yaw°"
     assert workspace.can_magnetometer_model.horizontalHeaderItem(10).text() == "Corrected yaw°"
-    assert workspace.can_magnetometer_model.horizontalHeaderItem(11).text() == "Δyaw°"
+    assert workspace.can_magnetometer_model.horizontalHeaderItem(11).text() == "PX4 yaw°"
+    assert workspace.can_magnetometer_model.horizontalHeaderItem(12).text() == "Δyaw°"
     assert not workspace.can_magnetometer_table.horizontalHeader().isSectionHidden(10)
-    assert workspace.can_magnetometer_table.horizontalHeader().isSectionHidden(11)
+    assert not workspace.can_magnetometer_table.horizontalHeader().isSectionHidden(11)
+    assert workspace.can_magnetometer_table.horizontalHeader().isSectionHidden(12)
     assert workspace.can_magnetometer_model.rowCount() == 4
     assert workspace.can_magnetometer_model.item(0, 1).text() == "CAN1"
     assert workspace.can_magnetometer_model.item(0, 4).text() == "LIVE"
     assert workspace.can_magnetometer_model.item(0, 5).text() == "0.012"
     assert workspace.can_magnetometer_model.item(0, 9).text() == "-014.04"
     assert workspace.can_magnetometer_model.item(0, 10).text() == "-014.04"
-    assert workspace.can_magnetometer_model.item(0, 11).text() == "+044.04"
+    assert workspace.can_magnetometer_model.item(0, 11).text() == "+030.00"
+    assert workspace.can_magnetometer_model.item(0, 12).text() == "+044.04"
     inspection = workspace._can_magnetometer_inspection("left", 0)
     assert "RAW=-014.04°" in str(inspection["value"])
     assert "Corrected=-014.04" in str(inspection["value"])
@@ -1130,3 +1137,348 @@ def test_debug_vect_decoder_maps_stable_can_mag_name_to_rm3100_identity() -> Non
     assert state.node_id == 0x7D
     assert state.topic == "mavlink/DEBUG_VECT"
     assert state.px4_timestamp_s == 2.0
+
+
+def test_pixhawk_workspace_retries_automatic_cal_mag_readback_after_failure(monkeypatch) -> None:
+    """A failed CAL_MAG PARAM readback must not leave the slot table empty.
+
+    Field log: the one-shot automatic ``mag_refresh`` fired while P2 was still
+    CONNECTING, died with a serial read error, and was never retried, so every
+    P2 row stayed WAITING until the operator noticed. The request now waits
+    for a verified heartbeat and retries a bounded number of times.
+    """
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    commands: list[str] = []
+    open_sides: set[str] = {"left"}
+    verified_sides: set[str] = set()
+    panel = SimpleNamespace(
+        _px4_mag_status_cache={},
+        pixhawk_parameter_threads={},
+        _mavlink_open_sides=lambda: set(open_sides),
+        _mavlink_connected_sides=lambda: set(verified_sides),
+        latest_vehicle_mag_device_ids={},
+        latest_sensor_mag_instances={},
+        px4_mag_managers={},
+    )
+    backend = SimpleNamespace(panel=panel)
+    clock = [1000.0]
+    monkeypatch.setattr("Workstation.workspaces.time.monotonic", lambda: clock[0])
+    workspace = PixhawkWorkspace(
+        backend, StatusModel(), lambda command_id: commands.append(command_id) or True
+    )
+
+    def mag_commands() -> list[str]:
+        # Other automatic readbacks (e.g. SENS_BOARD_ROT) share the invoker;
+        # this test only follows the CAL_MAG request budget.
+        return [command for command in commands if command == "pixhawk.mag.refresh.p1"]
+    retry_s = PixhawkWorkspace.MAG_STATUS_AUTO_REFRESH_RETRY_S
+    max_attempts = PixhawkWorkspace.MAG_STATUS_AUTO_REFRESH_MAX_ATTEMPTS
+
+    # Link is open but no verified heartbeat yet: do not touch the serial link.
+    workspace._refresh_mag_priority_group({})
+    assert mag_commands() == []
+    assert workspace.mag_priority_status_labels["left"].text() == "P1: PARAM readback 대기 중"
+
+    # Heartbeat verified: request once and mark the attempt.
+    verified_sides.add("left")
+    workspace._refresh_mag_priority_group({})
+    assert mag_commands() == ["pixhawk.mag.refresh.p1"]
+    assert f"(자동 시도 1/{max_attempts})" in workspace.mag_priority_status_labels["left"].text()
+
+    # Worker still running: no duplicate request.
+    panel.pixhawk_parameter_threads["left"] = object()
+    workspace._refresh_mag_priority_group({})
+    assert mag_commands() == ["pixhawk.mag.refresh.p1"]
+
+    # Worker failed (thread cleared, no status). Retry only after the cadence.
+    panel.pixhawk_parameter_threads.clear()
+    clock[0] += retry_s / 2
+    workspace._refresh_mag_priority_group({})
+    assert mag_commands() == ["pixhawk.mag.refresh.p1"]
+    clock[0] += retry_s / 2
+    workspace._refresh_mag_priority_group({})
+    assert mag_commands() == ["pixhawk.mag.refresh.p1"] * 2
+    clock[0] += retry_s
+    workspace._refresh_mag_priority_group({})
+    assert mag_commands() == ["pixhawk.mag.refresh.p1"] * 3
+
+    # Cap reached: stop retrying and tell the operator to press Refresh MAG.
+    clock[0] += retry_s
+    workspace._refresh_mag_priority_group({})
+    assert mag_commands() == ["pixhawk.mag.refresh.p1"] * max_attempts
+    assert "자동 시도 3회 실패" in workspace.mag_priority_status_labels["left"].text()
+    assert "Refresh MAG" in workspace.mag_priority_status_labels["left"].text()
+    # The manual button stays available on an open link.
+    assert workspace.mag_priority_refresh_buttons["left"].isEnabled()
+
+    # A successful readback ends the automatic requests.
+    panel._px4_mag_status_cache["left"] = SimpleNamespace(params={}, slots=())
+    clock[0] += retry_s
+    workspace._refresh_mag_priority_group({})
+    assert mag_commands() == ["pixhawk.mag.refresh.p1"] * max_attempts
+    assert workspace.mag_priority_status_labels["left"].text().startswith("P1: PARAM VERIFIED")
+
+    # Disconnect resets the budget; a reconnect gets a fresh automatic request.
+    open_sides.clear()
+    verified_sides.clear()
+    panel._px4_mag_status_cache.clear()
+    workspace._refresh_mag_priority_group({})
+    open_sides.add("left")
+    verified_sides.add("left")
+    clock[0] += 1.0
+    workspace._refresh_mag_priority_group({})
+    assert mag_commands() == ["pixhawk.mag.refresh.p1"] * (max_attempts + 1)
+
+    # The right side is independent and untouched while disconnected.
+    assert workspace.mag_priority_status_labels["right"].text() == "P2: PARAM readback 대기 중"
+
+    workspace.deleteLater()
+    app.processEvents()
+
+
+def test_missing_mag_status_params_reports_identity_and_correction_gaps() -> None:
+    from Workstation.workstation_core.px4_mag_manager import missing_mag_status_params
+
+    # Field log (P1 over Radio): CAL_MAG0/3 identity lost, CAL_MAG1/2 priority
+    # lost, no correction coefficients at all.
+    params = {
+        "CAL_MAG0_ID": None,
+        "CAL_MAG0_PRIO": None,
+        "CAL_MAG1_ID": 396809,
+        "CAL_MAG1_PRIO": None,
+        "CAL_MAG2_ID": 8944899,
+        "CAL_MAG2_PRIO": None,
+        "CAL_MAG3_ID": None,
+        "CAL_MAG3_PRIO": 1,
+    }
+    missing = missing_mag_status_params(params)
+    assert "CAL_MAG0_ID" in missing
+    assert "CAL_MAG3_ID" in missing
+    assert "CAL_MAG1_PRIO" in missing
+    # Unconfigured slots do not demand correction coefficients.
+    assert "CAL_MAG0_XOFF" not in missing
+    # Configured slots do.
+    assert "CAL_MAG1_XOFF" in missing
+    assert "CAL_MAG2_ROT" in missing
+    assert "CAL_MAG2_ZCOMP" in missing
+
+    complete = {f"CAL_MAG{slot}_ID": 0 for slot in MAG_SLOTS}
+    complete.update({f"CAL_MAG{slot}_PRIO": 0 for slot in MAG_SLOTS})
+    complete.update({name: 0.0 for name in MAG_CAL_PARAM_NAMES if name.startswith("CAL_MAG2_")})
+    complete.update({"CAL_MAG2_ID": 8944387, "CAL_MAG2_PRIO": 100, "CAL_MAG2_ROT": 0})
+    assert missing_mag_status_params(complete) == ()
+    assert missing_mag_status_params(None) == tuple(
+        name for slot in MAG_SLOTS for name in (f"CAL_MAG{slot}_ID", f"CAL_MAG{slot}_PRIO")
+    )
+
+
+def test_pixhawk_workspace_retries_incomplete_cal_mag_readback(monkeypatch) -> None:
+    """A rendered-but-partial readback keeps the bounded automatic retry alive.
+
+    Field log: P1's Radio readback returned CAL_MAG0_ID=None/CAL_MAG3_ID=None.
+    The status was cached, the auto-refresh saw "status present" and stopped,
+    and the slot table stayed half empty for the whole session.
+    """
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    commands: list[str] = []
+    panel = SimpleNamespace(
+        _px4_mag_status_cache={"left": SimpleNamespace(params={"CAL_MAG1_ID": 396809}, slots=())},
+        _px4_mag_status_incomplete={"left": ("CAL_MAG0_ID", "CAL_MAG3_ID")},
+        _px4_board_rotation_params={"left": {"SENS_BOARD_ROT": 0}},
+        pixhawk_parameter_threads={},
+        _mavlink_open_sides=lambda: {"left"},
+        _mavlink_connected_sides=lambda: {"left"},
+        latest_vehicle_mag_device_ids={},
+        latest_sensor_mag_instances={},
+        px4_mag_managers={},
+    )
+    backend = SimpleNamespace(panel=panel)
+    clock = [2000.0]
+    monkeypatch.setattr("Workstation.workspaces.time.monotonic", lambda: clock[0])
+    workspace = PixhawkWorkspace(
+        backend, StatusModel(), lambda command_id: commands.append(command_id) or True
+    )
+    retry_s = PixhawkWorkspace.MAG_STATUS_AUTO_REFRESH_RETRY_S
+    max_attempts = PixhawkWorkspace.MAG_STATUS_AUTO_REFRESH_MAX_ATTEMPTS
+
+    workspace._refresh_mag_priority_group({})
+    assert commands == ["pixhawk.mag.refresh.p1"]
+    label = workspace.mag_priority_status_labels["left"].text()
+    assert "불완전" in label and "2개 미수신" in label
+
+    for _ in range(max_attempts + 1):
+        clock[0] += retry_s
+        workspace._refresh_mag_priority_group({})
+    assert commands == ["pixhawk.mag.refresh.p1"] * max_attempts
+    assert "Refresh MAG" in workspace.mag_priority_status_labels["left"].text()
+
+    # Once the readback is complete the label flips to VERIFIED and the
+    # automatic requests stop; the known board rotation is not re-read.
+    panel._px4_mag_status_incomplete.clear()
+    clock[0] += retry_s
+    workspace._refresh_mag_priority_group({})
+    assert commands == ["pixhawk.mag.refresh.p1"] * max_attempts
+    assert workspace.mag_priority_status_labels["left"].text().startswith("P1: PARAM VERIFIED")
+
+    workspace.deleteLater()
+    app.processEvents()
+
+
+def test_parameter_worker_retries_lost_param_reply_and_reads_board_rotation() -> None:
+    from Workstation.device_runtime_workers import PixhawkParameterWorker
+
+    class FakeSubscriber:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self.dropped = {"CAL_MAG0_ID": 1, "SENS_BOARD_ROT": 1}
+            self.params = {"CAL_MAG0_ID": 4395041, "CAL_MAG0_PRIO": 100, "SENS_BOARD_ROT": 4}
+
+        def read_param(self, camera: str, name: str, *, timeout_s: float):
+            assert camera == "left"
+            self.calls.append(name)
+            remaining = self.dropped.get(name, 0)
+            if remaining:
+                self.dropped[name] = remaining - 1
+                return None
+            return self.params.get(name)
+
+    subscriber = FakeSubscriber()
+    results: list[object] = []
+    worker = PixhawkParameterWorker(subscriber, camera="left", operation="mag_refresh")
+    worker.completed.connect(results.append)
+    worker.run()
+    status = results[0]["status"]
+    # The lost first reply was retried exactly once and the value recovered.
+    assert subscriber.calls.count("CAL_MAG0_ID") == 2
+    assert status.params["CAL_MAG0_ID"] == 4395041
+    # Names PX4 never answered are retried once, then reported as None.
+    assert subscriber.calls.count("CAL_MAG1_ID") == 2
+    assert status.params["CAL_MAG1_ID"] is None
+
+    subscriber.calls.clear()
+    rotation_results: list[object] = []
+    rotation_worker = PixhawkParameterWorker(
+        subscriber, camera="left", operation="board_rotation_refresh"
+    )
+    rotation_worker.completed.connect(rotation_results.append)
+    rotation_worker.run()
+    assert rotation_results[0]["kind"] == "board_rotation_refresh"
+    assert rotation_results[0]["camera"] == "left"
+    assert rotation_results[0]["params"] == {"SENS_BOARD_ROT": 4}
+    # Only the single parameter the corrected-yaw gate needs is read.
+    assert set(subscriber.calls) == {"SENS_BOARD_ROT"}
+
+
+def test_controller_records_incomplete_readback_and_board_rotation() -> None:
+    from Workstation.device_runtime_controller import DeviceRuntimeController
+
+    logs: list[str] = []
+    rendered: list[object] = []
+    panel = SimpleNamespace(
+        latest_vehicle_mag_device_ids={"left": None, "right": None},
+        pixhawk_parameter_threads={},
+        pixhawk_parameter_workers={},
+        px4_mag_managers={},
+        _px4_calibration_parameter_error={},
+        _px4_mag_status_cache={},
+        _px4_mag_status_incomplete={},
+        _px4_board_rotation_params={},
+        _render_px4_mag_status=lambda camera, status: rendered.append((camera, status)),
+        _px4_mag_camera_label=lambda camera: "Pixhawk 1" if camera == "left" else "Pixhawk 2",
+        _log=logs.append,
+    )
+    controller = DeviceRuntimeController(panel)
+
+    partial = build_mag_status({"CAL_MAG1_ID": 396809, "CAL_MAG1_PRIO": 50})
+    controller._apply_pixhawk_parameter_worker_result(
+        {"kind": "mag_refresh", "camera": "left", "status": partial}
+    )
+    assert rendered and rendered[-1][0] == "left"
+    assert "CAL_MAG0_ID" in panel._px4_mag_status_incomplete["left"]
+    assert "CAL_MAG1_XOFF" in panel._px4_mag_status_incomplete["left"]
+    assert any("readback 불완전" in line for line in logs)
+
+    complete_params = {name: 0 for name in MAG_PARAM_NAMES}
+    complete_params["CAL_MAG2_ID"] = 8944387
+    complete_params["CAL_MAG2_PRIO"] = 100
+    complete = build_mag_status(complete_params)
+    controller._apply_pixhawk_parameter_worker_result(
+        {"kind": "mag_refresh", "camera": "left", "status": complete}
+    )
+    assert "left" not in panel._px4_mag_status_incomplete
+    assert any("readback 완료" in line for line in logs)
+
+    controller._apply_pixhawk_parameter_worker_result(
+        {"kind": "board_rotation_refresh", "camera": "left", "params": {"SENS_BOARD_ROT": None}}
+    )
+    assert "left" not in panel._px4_board_rotation_params
+    assert any("SENS_BOARD_ROT readback 실패" in line for line in logs)
+    controller._apply_pixhawk_parameter_worker_result(
+        {"kind": "board_rotation_refresh", "camera": "left", "params": {"SENS_BOARD_ROT": 4}}
+    )
+    assert panel._px4_board_rotation_params["left"] == {"SENS_BOARD_ROT": 4}
+    assert any("SENS_BOARD_ROT readback 완료: 4" in line for line in logs)
+
+
+def test_internal_magnetometer_corrected_yaw_uses_board_rotation_readback() -> None:
+    """Board/GPS MAG rows show a corrected yaw as soon as SENS_BOARD_ROT is
+    known from the lightweight readback, without the full attitude-cal
+    status the operator has to request by hand."""
+
+    now = 300.0
+    cal_params = {name: 0.0 for name in MAG_CAL_PARAM_NAMES}
+    cal_params.update({f"CAL_MAG{slot}_ID": 0 for slot in MAG_SLOTS})
+    cal_params.update({f"CAL_MAG{slot}_PRIO": 0 for slot in MAG_SLOTS})
+    cal_params.update(
+        {
+            "CAL_MAG0_ID": 4395041,
+            "CAL_MAG0_PRIO": 100,
+            "CAL_MAG0_ROT": 0,
+            "CAL_MAG0_XSCALE": 1.0,
+            "CAL_MAG0_YSCALE": 1.0,
+            "CAL_MAG0_ZSCALE": 1.0,
+        }
+    )
+    panel = SimpleNamespace(
+        latest_mag_sensors={
+            "right": {
+                "CAN1": _mag_state(
+                    slot="CAN1",
+                    topic="px4-shell/sensor_mag/0",
+                    timestamp_s=now - 0.1,
+                    x=0.2,
+                    y=0.0,
+                    z=0.4,
+                    device_id=4395041,
+                )
+            }
+        },
+        latest_can_mag_sensors={},
+        latest_vehicle_mag_device_ids={"left": None, "right": 4395041},
+        latest_sensor_mag_instances={},
+        latest_attitude={},
+        _px4_mag_status_cache={"right": SimpleNamespace(params=cal_params, slots=())},
+        _px4_attitude_cal_status_cache={},
+        _px4_board_rotation_params={},
+    )
+    evidence = EvidenceAdapter(panel)
+
+    rows = evidence.magnetometers_for_cal_mag_view("right", now_s=now)
+    row = rows[0]
+    assert row["device_id"] == 4395041
+    assert row["raw_yaw_deg"] == pytest.approx(0.0)
+    assert row["corrected_yaw_state"] == "BOARD ROTATION WAITING"
+
+    # ROTATION_YAW_180 (4): the corrected body-frame yaw flips by 180 degrees.
+    panel._px4_board_rotation_params["right"] = {"SENS_BOARD_ROT": 4}
+    row = evidence.magnetometers_for_cal_mag_view("right", now_s=now)[0]
+    assert row["corrected_yaw_state"] == "CALIBRATED"
+    assert abs(row["corrected_yaw_deg"]) == pytest.approx(180.0)
+
+    # The full attitude-calibration readback, when present, still wins.
+    panel._px4_attitude_cal_status_cache["right"] = SimpleNamespace(params={"SENS_BOARD_ROT": 0})
+    row = evidence.magnetometers_for_cal_mag_view("right", now_s=now)[0]
+    assert row["corrected_yaw_state"] == "CALIBRATED"
+    assert row["corrected_yaw_deg"] == pytest.approx(0.0)

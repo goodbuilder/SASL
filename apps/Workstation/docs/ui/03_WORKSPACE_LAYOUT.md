@@ -124,6 +124,24 @@ degraded. Actual camera contention appears as QUEUED and resumes automatically. 
 method tables remain evidence projections and preserve PX4, GNSS NED, candidate virtual-FRD/NED,
 and OpenCV RDF contracts.
 
+Baseline Yaw90 installation alignment is accessed in `Alignment > Baseline Yaw90`.
+The Measurement method group has no installation-alignment shortcut button.
+
+The Measurement Method comparison replaces the visible shared Quality/Result/WGS84
+blocks. It uses a stable participant-row table with original FRD, existing per-method
+midpoint/P1 horizontal FRD, and WGS84 modes. Row selection populates same-pair
+Quality/Result/R,t details without changing calculation selection. Updates are coalesced
+at 4 Hz while visible; a pair stays until terminal or one second, then moves to the
+latest pair. Missing/partial coordinate outputs never erase successful relative results.
+Legacy adapters remain internal; the former standalone WGS84 projection displays latitude/longitude in
+degrees (nine decimals) and ellipsoid/MSL heights in metres (three decimals), using
+the same latest accepted `DistanceHistoryPoint` as Range/Forward/Right/Down. The
+two-column group uses the existing EngineeringValue component and follows the page
+scroll. It shows time since that result, retains it with increasing age when no new
+result arrives, replaces unavailable coordinates with `--` on a new result, and clears
+when history is empty. Inspector clicks identify WGS84 and each height datum; neither
+the screen nor Inspector interprets these coordinates as camera FRD.
+
 ## 16. Calibration Workspace
 
 The primary surface keeps the local `촬영`, `계산·적용`, and `프로파일` tabs. `촬영` places
@@ -136,6 +154,24 @@ file selection, setup, diagnostics, raw K,D/R,t evidence and detailed command re
 collapsed `고급 캘리브레이션`; the hidden owner UI is not a fallback.
 
 ## 17. Pixhawk / GNSS / Detection / Recording / Analysis
+
+Mountain + GNSS is the first and default Method tab in Alignment; Baseline Yaw90 is second. Its primary surface has an
+existing-owner Preview control, two uncropped Live views with optional Center line, read-only
+Attitude (P1/P2, Roll, Pitch, State, Age) and GNSS (azimuth, two vertex angles, State, Age) tables,
+yaw candidates/Reverse Apply/Save, and collapsed midpoint reference. No level target is displayed.
+Wheel up/down over either live image independently zooms its display 1×–8× around the cursor;
+returning to 1× restores the centered full image. New frames retain the current display zoom.
+The Center line follows the native image midpoint, stays one display pixel wide and disappears
+when that midpoint is outside the zoomed view. Camera optical zoom and source pixels are unchanged.
+Entering it hides the common frozen/reference/candidate regions without rebuilding their state;
+leaving restores those regions. The tab receives existing frames and visible-only 4 Hz evidence.
+The former Telemetry installation group, Calibration Center line and Measurement Reverse controls
+are moved here; the Pixhawk common tables and all original measurement/recording semantics remain.
+The live pair observes its outer viewport's Resize events through a coalesced, view-owned timer.
+Height-only window changes and Diagnostics visibility/size changes therefore refit the videos even
+when the scrollable content keeps its previous minimum height. Hidden tabs stop pending fit work.
+On Yaw90 exit, only its owner-tagged Inspector detail is cleared; table/annotation/candidate
+selections and unrelated Inspector selections remain intact.
 
 Pixhawk, Base GNSS, and Alignment have separate Workstation pages. Pixhawk presents P1/P2
 attitude, rover fix numbers, and NED/FRD baseline evidence. Directly below Connection it keeps a
@@ -155,11 +191,13 @@ The IMU magnetometer table shows the three `SCALED_IMU/2/3` rows plus the existi
 RM3100 `DEBUG_VECT` `CAN1_MAG`/`CAN2_MAG` rows, preserving each row's original topic and unit.
 Stable PX4 Shell `sensor_mag` readback may populate those same RM3100 rows with a
 `px4-shell/sensor_mag/<instance>` topic and Gauss unit; the source remains visible.
-The IMU and dedicated CAN magnetometer tables additionally show fixed `RAW yaw°` and
-`Corrected yaw°` columns. RAW is an explicitly labelled producer-axis `atan2(-y,x)` diagnostic;
+The IMU and dedicated CAN magnetometer tables additionally show fixed `RAW yaw°`, `Corrected yaw°`,
+and `PX4 yaw°` columns. RAW is an explicitly labelled producer-axis `atan2(-y,x)` diagnostic;
 Corrected yaw applies the read-back `CAL_MAG` offset/scale/misalignment/rotation when the user
-has manually refreshed parameters. Before readback, the cell remains `PARAM 대기`. PX4 yaw/Δ
-remain backend diagnostic evidence rather than operator-table columns. Missing, stale, and
+has manually refreshed parameters. `PX4 yaw°` is the fresh, declination-corrected firmware
+`ATTITUDE.yaw` reference, shown only when the row's device ID matches the active
+`vehicle_magnetometer`; `Δyaw°` remains the backend diagnostic difference `PX4−RAW` and stays
+hidden. Before readback, the corrected cell remains `PARAM 대기`. Missing, stale, and
 uncalibrated values use bounded text and do not resize the table, move selection, or alter
 priority/calibration ownership.
 Base GNSS presents the Base receiver, Survey-in/NTRIP, discovered receiver candidates, and
@@ -167,23 +205,34 @@ RTCM delivery; Alignment presents physical sampling and iteration evidence. Dete
 with Cameras, writer/capture status is Data, and Manual record/video files are Advanced.
 The Alignment page places compact readiness and shared frozen native left/right annotation views
 below the page header. The previews are side by side when each can retain at least 560 px width and
-stack vertically otherwise. Below them, promoted `Horizon`, `Mountain + GNSS`, `Terrain PnP`,
-`Drone Rotation`, `Drone Multi-view`, `References`, and `Combine` tabs replace the former nested
+stack vertically otherwise. Below them, promoted `Mountain + GNSS`, `Baseline Yaw90`, `Horizon`, `Terrain PnP`,
+`Drone Rotation`, `Drone Multi-view`, and `Combine` tabs replace the former nested
 `R,t methods` structure. Candidate residuals/side-specific observability and immutable Apply/Revert
 remain in one common review area: right of the tabs at widths of at least 1200 px and below them on
-narrower screens. Overview shows eight read-only method cards and Measurement shows all frozen/live
-method details; Pixhawk/RTK remains the fixed representative. Alignment Apply/Revert/Reset is
+narrower screens. Overview shows one read-only card per catalog method (ten, in fallback order);
+each card shows the runtime state, VALID/BLOCKED/FAILED counters, and the first blocker with a
+`+N more` count, and its tooltip lists every current reason plus the method's required inputs.
+Measurement shows all frozen/live method details; Pixhawk/RTK remains the fixed representative. Alignment Apply/Revert/Reset is
 app-lifetime state and is not a second calibration owner.
+
+`R,t · 실시간` is a full-width two-row readout for `Attitude + GNSS` and `GNSS Yaw90`.
+It refreshes through the existing visible-workspace status polling without registration or
+Capture. The References tab/manual registration buttons are removed. Each fixed-height row
+shows R (3×3), t [Right,Down,Forward] metres, LIVE/WARNING/STALE/WAITING/ERROR, and oldest
+input age. The contract is `X_right = R * X_left + t`; selected P1/P2 GPS and Reverse feed
+the same canonical geometry helpers as Measurement. Old finite data remains labelled STALE,
+missing data clears the transform, and query errors retain the last confirmed transform as
+ERROR with increasing age. Updates replace cell text in-place and never rebuild candidate
+rows, move their selection, change Combine checks, or generate a candidate/Apply event.
+The live group precedes method review, except in Baseline Yaw90 setup where it follows the
+installation page to preserve the first-viewport attitude/angle tables.
 The Alignment evidence keeps raw RTK NED `[N,E,D]` and the separate P1 body-FRD
 `[F,R,D]` projection in adjacent groups so the operator can use the intuitive P1
 orientation without confusing it with camera optical RDF or public measurement output.
 The Pixhawk page keeps the raw P1/P2 ATTITUDE diagnostic separate from GNSS installation alignment.
-The Telemetry page places one fixed `GNSS BASELINE_CENTER F/R/D/Rg/Angle` group immediately below its
-three-row `Live position` table and before RTCM delivery. A non-selectable one-row table keeps
-State, signed Forward/Right/Down metres, Rg, the acute horizontal baseline↔Drone angle, absolute
-90° error, maximum age, maximum three-GNSS receive delta, and P1/P2/Drone fix labels in stable
-columns. Live updates replace values in place and never
-resize the group, move controls, change focus/selection, or jump the outer scroll position.
+Telemetry keeps Live position, RTCM delivery and disparity. Its installation reference has moved
+to Baseline Yaw90; signed midpoint F/R/D/Rg, line angle and 90° deviation remain available in
+collapsed reference rows with complete age, fix and timestamp-spread evidence in their tooltips.
 Immediately below this baseline/yaw group, Pixhawk adds one compact read-only `Drone Pixhawk
 geometry · F/R/D/Rg` table with `Dr from Baseline Center`, `Dr from P1`, and `Dr from P2` rows.
 The midpoint row is GNSS baseline-center local-level FRD; the P1/P2 rows are their respective

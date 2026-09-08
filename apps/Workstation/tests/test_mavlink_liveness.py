@@ -435,6 +435,44 @@ def test_subscriber_transition_formats_health_owned_qualification_duration() -> 
     assert statuses[-1].endswith("qualification=00:05/01:05")
 
 
+def _live_subscriber(now_s: float):
+    from Workstation.workstation_core.pixhawk_attitude import DualPixhawkMavlinkSubscriber
+
+    subscriber = DualPixhawkMavlinkSubscriber(left_url="", right_url="")
+    subscriber.connections["left"] = object()
+    model = subscriber._ensure_liveness_listener("left")
+    generation = model.connection_generation
+    for second in range(0, int(now_s) + 1):
+        _observe_pair(model, generation, float(second))
+    statuses: list[str] = []
+    subscriber.status_changed.connect(statuses.append)
+    subscriber._emit_liveness_transition("left", now_s=now_s)
+    assert statuses[-1].endswith("MAVLink liveness: LIVE")
+    return subscriber, model, generation, statuses
+
+
+def test_subscriber_transition_skips_qualification_preserving_command_blip() -> None:
+    subscriber, model, generation, statuses = _live_subscriber(20.0)
+
+    model.begin_command("sensor_mag shell poll", now_s=20.5, preserve_qualification=True)
+    subscriber._emit_liveness_transition("left", now_s=20.6)
+    model.end_command(now_s=21.0)
+    _observe_pair(model, generation, 21.1)
+    subscriber._emit_liveness_transition("left", now_s=21.2)
+
+    assert len(statuses) == 1
+    assert model.snapshot(now_s=21.2).state is MavlinkLivenessState.LIVE
+
+
+def test_subscriber_transition_still_logs_qualification_resetting_command() -> None:
+    subscriber, model, generation, statuses = _live_subscriber(20.0)
+
+    model.begin_command("PARAM SYNC", now_s=20.5)
+    subscriber._emit_liveness_transition("left", now_s=20.6)
+
+    assert statuses[-1].endswith("MAVLink liveness: QUALIFYING; qualification=00:00/00:10")
+
+
 class _TransportMessage:
     def __init__(
         self,
@@ -733,7 +771,8 @@ def test_long_param_reservation_keeps_one_hz_gcs_heartbeat_from_command_owner(
             self.param_requests: list[tuple[object, ...]] = []
 
         def heartbeat_send(self, *args: object) -> None:
-            assert send_lock.depth == 2
+            # Only the heartbeat's own per-write acquisition is held.
+            assert send_lock.depth == 1
             self.heartbeat_times.append(clock["value"])
             super().heartbeat_send(*args)
 
@@ -747,7 +786,8 @@ def test_long_param_reservation_keeps_one_hz_gcs_heartbeat_from_command_owner(
             self.polls = 0
 
         def recv_match(self, **kwargs):
-            assert send_lock.depth == 1
+            # Waiting for PARAM_VALUE leaves the send lock free for RTCM.
+            assert send_lock.depth == 0
             clock["value"] += float(kwargs["timeout"])
             self.polls += 1
             if clock["value"] < 28.0:
@@ -772,7 +812,7 @@ def test_long_param_reservation_keeps_one_hz_gcs_heartbeat_from_command_owner(
     assert result == pytest.approx(3.5)
     assert mav.param_requests == [(1, 1, b"TEST", -1)]
     assert send_lock.depth == 0
-    assert send_lock.max_depth == 2
+    assert send_lock.max_depth == 1
     assert clock["value"] >= 28.0
     assert len(mav.heartbeat_times) >= 27
     assert mav.heartbeat_times[0] == 0.0
@@ -806,7 +846,9 @@ def test_shell_reservation_services_same_owner_heartbeat_and_releases_shell(
             super().heartbeat_send(*args)
 
         def serial_control_send(self, *args: object) -> None:
-            assert send_lock.depth == 1
+            # exclusive_command holds the lock (1) and every shell write takes
+            # it again (2); the blocking reads below run at depth 1.
+            assert send_lock.depth == 2
             self.serial_calls.append(args)
 
     class Connection(_TransportConnection):
@@ -1127,3 +1169,108 @@ def test_deferred_first_heartbeat_requests_runtime_profile_without_persistent_se
 
     assert setup_sides == []
     assert len(connection.mav.commands) == len(pixhawk_attitude.MAVLINK_STOCK_STREAM_REQUESTS)
+
+
+def test_shell_command_without_held_send_lock_only_locks_each_write(monkeypatch) -> None:
+    """The shell poll worker must not hold the send lock while awaiting NSH output.
+
+    Field regression: six ``listener`` commands per sensor_mag poll cycle held
+    the per-side send lock for ~27 s, so RTCM injection on the same radio
+    only got through in the 2 s gap between cycles and the rovers never left
+    3D FIX. With ``hold_send_lock=False`` the lock is taken only per write.
+    """
+
+    from Workstation.workstation_core import pixhawk_attitude
+
+    clock = {"value": 0.0}
+    monkeypatch.setattr(pixhawk_attitude.time, "monotonic", lambda: clock["value"])
+    send_lock = _TrackedReentrantLock()
+
+    class Mav(_TransportMav):
+        def __init__(self) -> None:
+            super().__init__()
+            self.serial_calls: list[tuple[object, ...]] = []
+
+        def heartbeat_send(self, *args: object) -> None:
+            assert send_lock.depth == 1
+            super().heartbeat_send(*args)
+
+        def serial_control_send(self, *args: object) -> None:
+            assert send_lock.depth == 1
+            self.serial_calls.append(args)
+
+    class Connection(_TransportConnection):
+        def recv_match(self, **kwargs):
+            # The wait itself leaves the lock free for RTCM/heartbeat writers.
+            assert send_lock.depth == 0
+            clock["value"] += float(kwargs["timeout"])
+            return None
+
+    mav = Mav()
+    connection = Connection(mav)
+    subscriber = pixhawk_attitude.DualPixhawkMavlinkSubscriber(
+        left_url="udp:fake",
+        right_url="",
+    )
+    subscriber.connections["left"] = connection
+    subscriber._mavlink_send_locks["left"] = send_lock
+
+    with subscriber.exclusive_command("left", hold_send_lock=False):
+        result = subscriber.send_shell_command_with_result(
+            "left",
+            "listener sensor_mag -i 0 -n 1",
+            timeout_s=2.2,
+        )
+
+    assert result.flag_label == "respond"
+    assert send_lock.depth == 0
+    assert send_lock.max_depth == 1
+    assert len(mav.heartbeats) >= 2
+    assert mav.serial_calls[-1][1] == 0
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_minimal_radio_commands_remain_bounded_and_retry_after_failure(side, monkeypatch):
+    from Workstation.workstation_core import pixhawk_attitude as module
+    subscriber = module.DualPixhawkMavlinkSubscriber(left_url="left", right_url="right")
+    subscriber.transports[side] = "radio"
+    connection = _TransportConnection()
+    subscriber.connections[side] = connection
+    monkeypatch.setattr(subscriber, "mavlink_health_snapshot", lambda *a, **k: type("Health", (), {"state": MavlinkLivenessState.LIVE})())
+    subscriber._request_mavlink_sensor_streams(side)
+    commands = connection.mav.commands
+    positive = {c[4]: c[5] for c in commands if c[5] > 0}
+    assert positive == {30: 200000, 24: 200000, 124: 200000, 1: 1000000, 147: 1000000}
+    disabled = {c[4] for c in commands if c[5] == -1}
+    assert {4, 8, 26, 29, 31, 32, 36, 74, 83, 85, 116, 127, 128, 129, 141, 230, 241, 242, 245, 380, 436, 441, 12901, 12904} <= disabled
+    assert not disabled.intersection({0, 1, 24, 30, 124, 147})
+    assert all(c[2] == 511 for c in commands)
+    count = len(commands)
+    for now in (0, 30, 60, 600, 3600):
+        subscriber._advance_radio_stream_policy(side, now_s=now)
+        subscriber._request_missing_mavlink_imu_streams(side)
+        subscriber._request_mavlink_sensor_streams(side)
+    assert len(commands) == count
+    subscriber._attitude_stream_last_request_s.clear()
+    subscriber._request_stale_attitude_stream(side)
+    assert commands[-1][4:6] == (30, 200000)
+    # Connection/reboot rearm and partial send failure must allow full retry.
+    subscriber._mavlink_stream_requests_sent.discard(side)
+    original = connection.mav.command_long_send
+    monkeypatch.setattr(connection.mav, "command_long_send", lambda *a: (_ for _ in ()).throw(OSError("unplugged")))
+    subscriber._request_mavlink_sensor_streams(side)
+    assert side not in subscriber._mavlink_stream_requests_sent
+    monkeypatch.setattr(connection.mav, "command_long_send", original)
+    start = len(commands)
+    subscriber._request_mavlink_sensor_streams(side)
+    assert commands[start:] == commands[:count]
+
+
+def test_minimal_radio_does_not_change_drone_or_direct_transport():
+    from Workstation.workstation_core.pixhawk_attitude import DualPixhawkMavlinkSubscriber, MAVLINK_STOCK_STREAM_REQUESTS
+    subscriber = DualPixhawkMavlinkSubscriber(left_url="left", right_url="right", drone_url="drone")
+    for transport in ("ethernet", "usb"):
+        subscriber.transports["left"] = transport
+        assert subscriber._active_stream_requests("left") == MAVLINK_STOCK_STREAM_REQUESTS
+    subscriber.transports["drone"] = "radio"
+    assert "GPS_RTK" in dict(subscriber._active_stream_requests("drone"))

@@ -21,6 +21,7 @@ DRONE_RTK_ROTATION_HYBRID = "drone_rtk_rotation_hybrid"
 DRONE_RTK_MULTIVIEW = "drone_rtk_multiview"
 TERRAIN_PNP = "terrain_pnp"
 COMBINED_HYBRID = "combined_hybrid"
+CLOUD_GNSS = "cloud_gnss"
 
 MEASUREMENT_METHOD_IDS: tuple[str, ...] = (
     PIXHAWK_RTK_LIVE,
@@ -32,6 +33,7 @@ MEASUREMENT_METHOD_IDS: tuple[str, ...] = (
     DRONE_RTK_MULTIVIEW,
     TERRAIN_PNP,
     COMBINED_HYBRID,
+    CLOUD_GNSS,
 )
 
 DEFAULT_MEASUREMENT_METHOD_FALLBACK_ORDER = MEASUREMENT_METHOD_IDS
@@ -57,6 +59,7 @@ MEASUREMENT_METHOD_LABELS: Mapping[str, str] = {
     DRONE_RTK_MULTIVIEW: "Drone RTK Multi-view R,t",
     TERRAIN_PNP: "Terrain PnP",
     COMBINED_HYBRID: "Combined candidate",
+    CLOUD_GNSS: "Cloud far-field rotation + live GNSS",
 }
 
 MEASUREMENT_METHOD_REQUIRED_INPUTS: Mapping[str, tuple[str, ...]] = {
@@ -100,6 +103,11 @@ MEASUREMENT_METHOD_REQUIRED_INPUTS: Mapping[str, tuple[str, ...]] = {
         "compatible non-overlapping candidate set",
         "combined full 6-DOF candidate",
     ),
+    CLOUD_GNSS: (
+        "exact operating K,D",
+        "Cloud far-field rotation candidate",
+        "configured GNSS translation fill",
+    ),
 }
 
 MEASUREMENT_METHOD_MISSING_INSTANCE_REASONS: Mapping[str, str] = {
@@ -112,6 +120,7 @@ MEASUREMENT_METHOD_MISSING_INSTANCE_REASONS: Mapping[str, str] = {
     DRONE_RTK_MULTIVIEW: "no Drone RTK Multi-view candidate or compatible loaded profile",
     TERRAIN_PNP: "no Terrain PnP candidate or compatible loaded profile",
     COMBINED_HYBRID: "no Combined candidate or compatible loaded profile",
+    CLOUD_GNSS: "no Cloud far-field rotation candidate or compatible loaded profile",
 }
 
 _LEGACY_METHOD_IDS: Mapping[str, str] = {
@@ -128,6 +137,7 @@ _CANDIDATE_METHOD_CATEGORIES: tuple[tuple[str, str], ...] = (
     ("drone-rtk-multiview-r-t", DRONE_RTK_MULTIVIEW),
     ("terrain-pnp-ensemble", TERRAIN_PNP),
     ("combined-independent-axis-evidence", COMBINED_HYBRID),
+    ("cloud-far-field-rotation", CLOUD_GNSS),
 )
 
 
@@ -342,6 +352,7 @@ def choose_ready_measurement_method(
 
 __all__ = [
     "CHECKERBOARD_STEREO",
+    "CLOUD_GNSS",
     "COMBINED_HYBRID",
     "DEFAULT_MEASUREMENT_METHOD_FALLBACK_ORDER",
     "DRONE_RTK_MULTIVIEW",

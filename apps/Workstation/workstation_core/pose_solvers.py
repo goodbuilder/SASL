@@ -1075,6 +1075,7 @@ class MountainRotationConfig:
     max_jacobian_condition: float = 1.0e6
     robust_loss: str = "soft_l1"
     robust_f_scale: float = 0.02
+    quality_advisory: bool = False
 
     def __post_init__(self) -> None:
         if int(self.min_correspondences) < 4:
@@ -1115,6 +1116,7 @@ class MountainRotationResult:
     iterations: int
     apply_eligible: bool
     ineligibility_reasons: tuple[str, ...]
+    quality_warnings: tuple[str, ...] = ()
 
 
 def solve_mountain_relative_rotation_robust(
@@ -1277,6 +1279,14 @@ def solve_mountain_relative_rotation_robust(
     if not (isfinite(rms) and isfinite(p95)):
         reasons.append("Sampson residual metrics are non-finite")
 
+    quality_warnings: tuple[str, ...] = ()
+    if config.quality_advisory:
+        quality_warnings = tuple(reason for reason in reasons if not reason.startswith("jacobian rank"))
+        reasons = []
+        if rank != 3:
+            reasons.append(f"jacobian rank {rank} != 3")
+        if not np.all(np.isfinite(final_rotation)) or not all(isfinite(v) for v in final_sampson):
+            reasons.append("rotation or correspondence residuals are non-finite")
     apply_eligible = not reasons
 
     return MountainRotationResult(
@@ -1292,6 +1302,7 @@ def solve_mountain_relative_rotation_robust(
         iterations=int(getattr(seed, "nfev", 0)) + refit_nfev,
         apply_eligible=apply_eligible,
         ineligibility_reasons=tuple(reasons),
+        quality_warnings=quality_warnings,
     )
 
 

@@ -553,9 +553,43 @@ def _estimate_ground_mask(gray: Any, cv2: Any, np: Any) -> Any | None:
     estimate, only on a successful one.
     """
 
+    mask, _metrics = _estimate_ground_mask_with_metrics(gray, cv2, np)
+    return mask
+
+
+# Ground must be markedly more textured than sky and, unless overwhelmingly
+# so, darker. Calibrated on all-sky synthetic frames (texture ratio 1.05-1.11,
+# brightness gap <= 0.17) versus real ridge photos (ratio 3.4-9.5, gap >= 0.30).
+_GROUND_MIN_TEXTURE_RATIO = 2.0
+_GROUND_OVERWHELMING_TEXTURE_RATIO = 6.0
+_GROUND_MIN_BRIGHTNESS_GAP = 0.12
+
+
+def _estimate_ground_mask_with_metrics(
+    gray: Any, cv2: Any, np: Any
+) -> tuple[Any | None, dict[str, Any]]:
+    """Return the ground mask plus absolute sky/ground separability metrics.
+
+    The percentile split in :func:`_estimate_ground_mask` always labels a
+    share of the frame as ground, even when the whole frame is sky. The
+    metrics measure whether the two classes actually differ in absolute
+    terms: ``texture_ratio`` is median local std of the ground class over the
+    sky class and ``brightness_gap`` is the class mean difference in units of
+    full scale. ``ground_detectable`` is False for frames with no separable
+    terrain (all sky/cloud), in which case the mask is returned as ``None``
+    so the caller does not restrict matches on a meaningless estimate.
+    """
+
     height, width = gray.shape[:2]
+    metrics: dict[str, Any] = {
+        "ground_detectable": False,
+        "texture_ratio": None,
+        "brightness_gap": None,
+        "reason": "",
+    }
     if width < 32 or height < 24:
-        return None
+        metrics["reason"] = "frame_too_small"
+        return None, metrics
     ksize = max(9, (min(height, width) // 40) | 1)
     smoothed = gray.astype(np.float32)
     mean = cv2.boxFilter(smoothed, -1, (ksize, ksize))
@@ -564,7 +598,25 @@ def _estimate_ground_mask(gray: Any, cv2: Any, np: Any) -> Any | None:
     texture_threshold = float(np.percentile(local_std, 65.0))
     brightness_threshold = float(np.percentile(mean, 45.0))
     sky_like = (local_std <= texture_threshold) & (mean >= brightness_threshold)
-    return ~sky_like
+    ground = ~sky_like
+    if not bool(sky_like.any()) or not bool(ground.any()):
+        metrics["reason"] = "single_class_frame"
+        return None, metrics
+    sky_texture = float(np.median(local_std[sky_like]))
+    ground_texture = float(np.median(local_std[ground]))
+    texture_ratio = ground_texture / max(sky_texture, 1.0e-6)
+    brightness_gap = (float(np.mean(mean[sky_like])) - float(np.mean(mean[ground]))) / 255.0
+    metrics["texture_ratio"] = texture_ratio
+    metrics["brightness_gap"] = brightness_gap
+    detectable = texture_ratio >= _GROUND_MIN_TEXTURE_RATIO and (
+        brightness_gap >= _GROUND_MIN_BRIGHTNESS_GAP
+        or texture_ratio >= _GROUND_OVERWHELMING_TEXTURE_RATIO
+    )
+    metrics["ground_detectable"] = detectable
+    if not detectable:
+        metrics["reason"] = "no_separable_ground_class"
+        return None, metrics
+    return ground, metrics
 
 
 def _estimate_ridge_boundary(mask: Any, np: Any) -> Any:
@@ -800,6 +852,149 @@ def _spatial_rank(points: Sequence[Point2], np: Any) -> tuple[int, float, float]
     return rank, ratio, area
 
 
+def _pixel_focal(left_matrix: Any, right_matrix: Any) -> float:
+    """Geometric-mean focal length in pixels, or 1.0 when no intrinsics."""
+
+    values = []
+    for matrix in (left_matrix, right_matrix):
+        if matrix is None:
+            continue
+        values.append(max(1.0, float(matrix[0, 0])))
+        values.append(max(1.0, float(matrix[1, 1])))
+    if not values:
+        return 1.0
+    product = 1.0
+    for value in values:
+        product *= value
+    return product ** (1.0 / len(values))
+
+
+# Optical RDF -> virtual FRD axis permutation: Forward=+Z, Right=+X, Down=+Y.
+_FRD_FROM_RDF = ((0.0, 0.0, 1.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+
+
+def _rpy_deg_from_rotation_frd(rotation: Any, np: Any) -> tuple[float, float, float]:
+    """PX4-style 3-2-1 roll/pitch/yaw (deg) of ``R_parent_from_child`` in FRD."""
+
+    matrix = np.asarray(rotation, dtype=np.float64)
+    sine_pitch = max(-1.0, min(1.0, -float(matrix[2, 0])))
+    pitch = math.asin(sine_pitch)
+    if abs(math.cos(pitch)) <= 1.0e-9:
+        raise ValueError("virtual FRD roll/yaw are singular at pitch +/-90 degrees")
+    roll = math.atan2(float(matrix[2, 1]), float(matrix[2, 2]))
+    yaw = math.atan2(float(matrix[1, 0]), float(matrix[0, 0]))
+    return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
+
+
+def _fit_far_field_relative_rotation(
+    left_norm: Any,
+    right_norm: Any,
+    left_px: Any,
+    right_px: Any,
+    *,
+    focal_px: float,
+    np: Any,
+) -> dict[str, Any]:
+    """Rotation-only fit of the right camera orientation relative to the left.
+
+    Far-field correspondences (mountains, clouds) carry no usable parallax,
+    so the essential matrix is degenerate there; the correct model is the
+    homography at infinity, which for normalized ideal coordinates is the
+    rotation itself. The fit is Kabsch (SVD) on unit bearing vectors with one
+    trimming pass on angular residuals. Returned angles describe the right
+    camera in the left camera's virtual FRD frame (3-2-1 roll/pitch/yaw):
+    negative yaw means the right camera is turned towards the left camera
+    (toe-in), which shows up as far features shifted to +u in the right
+    image (``far_field_du_median_px`` > 0).
+    """
+
+    result: dict[str, Any] = {
+        "model": "far_field_rotation_only_kabsch",
+        "frame_contract": (
+            "rotation_right_from_left_rdf maps left optical RDF bearings onto right optical RDF bearings; "
+            "rpy = right camera orientation in left camera virtual FRD (3-2-1 roll/pitch/yaw, deg)"
+        ),
+        "assumption": (
+            "correspondences at infinity; residual parallax of nearer features biases yaw by ~atan(B/D) "
+            "and inflates fit_residual_px (it is not an epipolar residual; see residual_px for that)"
+        ),
+        "available": False,
+        "reason": "",
+        "fit_point_count": 0,
+        "fit_inlier_count": 0,
+    }
+    try:
+        left = np.asarray(left_norm, dtype=np.float64).reshape(-1, 2)
+        right = np.asarray(right_norm, dtype=np.float64).reshape(-1, 2)
+        count = int(min(left.shape[0], right.shape[0]))
+        result["fit_point_count"] = count
+        lpx = np.asarray(left_px, dtype=np.float64).reshape(-1, 2)[:count]
+        rpx = np.asarray(right_px, dtype=np.float64).reshape(-1, 2)[:count]
+        if count:
+            result["far_field_du_median_px"] = float(np.median(rpx[:, 0] - lpx[:, 0]))
+            result["far_field_dv_median_px"] = float(np.median(rpx[:, 1] - lpx[:, 1]))
+        if count < 3:
+            result["reason"] = "fewer than three inlier correspondences"
+            return result
+
+        def _bearings(points: Any) -> Any:
+            homogeneous = np.concatenate([points, np.ones((points.shape[0], 1))], axis=1)
+            return homogeneous / np.linalg.norm(homogeneous, axis=1, keepdims=True)
+
+        bl = _bearings(left[:count])
+        br = _bearings(right[:count])
+
+        def _kabsch(a: Any, b: Any) -> Any:
+            # R = argmin sum |b_i - R a_i|^2
+            h = a.T @ b
+            u, _, vt = np.linalg.svd(h)
+            d = np.sign(np.linalg.det(vt.T @ u.T))
+            if d == 0:
+                d = 1.0
+            fix = np.diag([1.0, 1.0, d])
+            return vt.T @ fix @ u.T
+
+        active = np.arange(count)
+        rotation = _kabsch(bl, br)
+        for _ in range(2):
+            rotated = (rotation @ bl[active].T).T
+            cosines = np.clip(np.einsum("ij,ij->i", rotated, br[active]), -1.0, 1.0)
+            angular = np.arccos(cosines)
+            if active.size <= 4:
+                break
+            threshold = max(3.0 * float(np.median(angular)), 0.5 / max(1.0, focal_px))
+            keep = active[angular <= threshold]
+            if keep.size < 3 or keep.size == active.size:
+                break
+            active = keep
+            rotation = _kabsch(bl[active], br[active])
+        rotated = (rotation @ bl[active].T).T
+        cosines = np.clip(np.einsum("ij,ij->i", rotated, br[active]), -1.0, 1.0)
+        angular = np.arccos(cosines)
+        residual_px = float(np.sqrt(np.mean(angular ** 2)) * focal_px)
+
+        frd = np.asarray(_FRD_FROM_RDF, dtype=np.float64)
+        # rotation maps left->right; the right camera's axes in the left frame are its transpose.
+        left_from_right_frd = frd @ rotation.T @ frd.T
+        roll, pitch, yaw = _rpy_deg_from_rotation_frd(left_from_right_frd, np)
+        result.update(
+            {
+                "available": True,
+                "fit_inlier_count": int(active.size),
+                "rotation_right_from_left_rdf": [[float(v) for v in row] for row in rotation],
+                "roll_right_minus_left_deg": roll,
+                "pitch_right_minus_left_deg": pitch,
+                "yaw_right_minus_left_deg": yaw,
+                "fit_residual_px": residual_px,
+                "fit_residual_deg": math.degrees(float(np.sqrt(np.mean(angular ** 2)))),
+            }
+        )
+        return result
+    except Exception as exc:  # pragma: no cover - defensive; never break the suggestion
+        result["reason"] = f"rotation fit failed: {exc}"
+        return result
+
+
 def _select_spread_matches(
     left: Any,
     right: Any,
@@ -839,17 +1034,17 @@ def _select_spread_matches(
     # Fill remaining slots by descriptor quality when the image occupies only
     # a few grid cells.  This keeps the four-point minimum usable for a small
     # but textured crop while still preferring coverage.
+    budget = min(max_points, len(order))
     for index in order:
-        if any(
+        if len(selected) >= budget:
+            break
+        if index in selected or any(
             float(np.linalg.norm(np.asarray(left[index]) - np.asarray(left[chosen]))) < 3.0
             or float(np.linalg.norm(np.asarray(right[index]) - np.asarray(right[chosen]))) < 3.0
             for chosen in selected
         ):
             continue
-        if index not in selected:
-            selected.append(index)
-        if len(selected) >= min(max_points, len(order)):
-            break
+        selected.append(index)
     return (
         [(float(left[index][0]), float(left[index][1])) for index in selected],
         [(float(right[index][0]), float(right[index][1])) for index in selected],
@@ -857,14 +1052,20 @@ def _select_spread_matches(
     )
 
 
-def _empty_mountain(reason: str, method: str = "sift/ratio-mutual-ransac") -> MountainAutoSelection:
-    empty = _failure("mountain", method, reason)
+def _empty_mountain(
+    reason: str,
+    method: str = "sift/ratio-mutual-ransac",
+    *,
+    metadata: Mapping[str, Any] | None = None,
+) -> MountainAutoSelection:
+    empty = _failure("mountain", method, reason, metadata=metadata)
     return MountainAutoSelection(
         left=empty,
         right=empty,
         state="NO_DATA",
         detection_method=method,
         failure_reason=reason,
+        metadata=dict(metadata or {}),
     )
 
 
@@ -971,9 +1172,14 @@ def detect_mountain(
     baseline_ned_m: Sequence[float] | None = None,
     prior_rotation_right_from_left_rdf: Sequence[Sequence[float]] | None = None,
     ridge_margin_fraction: float = 0.06,
-    max_points: int = 12,
+    max_points: int | None = 0,
+    far_field_only: bool = False,
 ) -> MountainAutoSelection:
     """Suggest distributed left/right ridge correspondences without 3-D data.
+
+    ``far_field_only=True`` is the Cloud mode: the sky/ground ridge bias is
+    skipped entirely and every mutual match is treated as a far-field
+    correspondence (rotation-only evidence).
 
     ``ridge_margin_fraction`` is the half-width of the boundary-curve match
     band, as a fraction of image height (default 0.06 = 6%). Wider tolerates
@@ -981,13 +1187,26 @@ def detect_mountain(
     off-ridge matches back in; narrower rejects more aggressively but can
     drop legitimate points on a very jagged silhouette.
 
-    ``max_points`` caps how many spatially-spread correspondences are kept
-    for the final suggestion (default 12); it never discards inliers beyond
-    what is needed to build that spread selection.
+    ``max_points`` optionally caps how many spatially-spread correspondences
+    are kept for the final suggestion. ``0``/``None`` (the default) keeps
+    every RANSAC inlier so the stored suggestion is the complete evidence
+    set; a positive value keeps at most that many spread points (minimum 4).
+
+    Every result also carries ``metadata["relative_rotation"]``: a
+    rotation-only (far-field) fit of the right camera orientation relative
+    to the left camera over all RANSAC inliers, expressed both as
+    ``rotation_right_from_left_rdf`` and as virtual-FRD roll/pitch/yaw of the
+    right camera in the left camera's FRD frame. It assumes the matched
+    features are effectively at infinity; residual parallax of nearer
+    features biases yaw by roughly ``atan(B / D)``.
     """
 
     method = "sift/ratio-mutual-ransac"
-    max_points = max(4, int(max_points))
+    if max_points is None or int(max_points) <= 0:
+        max_points = None
+    else:
+        max_points = max(4, int(max_points))
+    fallback_points = max_points if max_points is not None else 12
     try:
         cv2, np = _require_cv_numpy()
         left_gray = _undistort_gray(
@@ -1026,7 +1245,7 @@ def detect_mountain(
                 right_camera_matrix=right_camera_matrix,
                 left_distortion_coefficients=left_distortion_coefficients,
                 right_distortion_coefficients=right_distortion_coefficients,
-                max_points=max_points,
+                max_points=fallback_points,
             )
         matcher = cv2.BFMatcher(norm, crossCheck=False)
         forward = matcher.knnMatch(descriptor_left, descriptor_right, k=2)
@@ -1059,8 +1278,29 @@ def detect_mountain(
         # fall back to plain "not sky" and then to the unfiltered set as each
         # estimate becomes unavailable or leaves too few points, matching
         # this module's rule that a possibly-off-ridge suggestion beats none.
-        left_ground_mask = _estimate_ground_mask(left_gray, cv2, np)
-        right_ground_mask = _estimate_ground_mask(right_gray, cv2, np)
+        left_ground_mask, left_separability = _estimate_ground_mask_with_metrics(left_gray, cv2, np)
+        right_ground_mask, right_separability = _estimate_ground_mask_with_metrics(right_gray, cv2, np)
+        separability_metadata = {
+            "sky_ground_separability": {
+                "left": dict(left_separability),
+                "right": dict(right_separability),
+            }
+        }
+        # An all-sky/cloud pair has no ridge to bias toward. Cloud texture is
+        # still a valid far-field correspondence set for the rotation-only
+        # Mountain solve when both frames are simultaneous, so proceed
+        # unfiltered and flag it instead of failing closed.
+        all_sky = (
+            left_separability.get("reason") == "no_separable_ground_class"
+            and right_separability.get("reason") == "no_separable_ground_class"
+        )
+        if far_field_only:
+            # Cloud mode: never bias toward a ridge; every match is treated as
+            # a far-field correspondence.
+            filter_tier = "cloud_far_field"
+            left_ground_mask = right_ground_mask = None
+        else:
+            filter_tier = "unfiltered_all_sky" if all_sky else "unfiltered"
         if left_ground_mask is not None or right_ground_mask is not None:
             left_boundary = None if left_ground_mask is None else _estimate_ridge_boundary(left_ground_mask, np)
             right_boundary = None if right_ground_mask is None else _estimate_ridge_boundary(right_ground_mask, np)
@@ -1104,6 +1344,7 @@ def detect_mountain(
             ]
             if len(boundary_matches) >= 4:
                 matches = boundary_matches
+                filter_tier = "ridge_boundary"
             else:
                 ridge_matches = [
                     match
@@ -1113,6 +1354,7 @@ def detect_mountain(
                 ]
                 if len(ridge_matches) >= 4:
                     matches = ridge_matches
+                    filter_tier = "ground_only"
         if len(matches) < 4:
             return _skyline_mountain_fallback(
                 left_image,
@@ -1121,8 +1363,24 @@ def detect_mountain(
                 right_camera_matrix=right_camera_matrix,
                 left_distortion_coefficients=left_distortion_coefficients,
                 right_distortion_coefficients=right_distortion_coefficients,
-                max_points=max_points,
+                max_points=fallback_points,
             )
+        # SIFT emits several keypoints per location (one per dominant
+        # orientation), so mutual matches can repeat the same (u, v) pair.
+        # Keep one match per 1 px cell on both sides (best descriptor first)
+        # so inlier counts, stored points, and the rotation fit all count
+        # unique correspondences.
+        unique_matches = []
+        seen_cells: set[tuple[int, int, int, int]] = set()
+        for match in sorted(matches, key=lambda item: float(item.distance)):
+            lu, lv = key_left[match.queryIdx].pt
+            ru, rv = key_right[match.trainIdx].pt
+            cell = (int(round(lu)), int(round(lv)), int(round(ru)), int(round(rv)))
+            if cell in seen_cells:
+                continue
+            seen_cells.add(cell)
+            unique_matches.append(match)
+        matches = unique_matches
         left_points = np.asarray(
             [key_left[match.queryIdx].pt for match in matches], dtype=np.float64
         )
@@ -1180,7 +1438,7 @@ def detect_mountain(
                 right_camera_matrix=right_camera_matrix,
                 left_distortion_coefficients=left_distortion_coefficients,
                 right_distortion_coefficients=right_distortion_coefficients,
-                max_points=max_points,
+                max_points=fallback_points,
             )
 
         inlier_left = left_points[inlier_indices]
@@ -1188,14 +1446,30 @@ def detect_mountain(
         inlier_distances = np.asarray(
             [float(matches[index].distance) for index in inlier_indices], dtype=np.float64
         )
-        selected_left, selected_right, selected_distances = _select_spread_matches(
+        if max_points is None:
+            # Keep the complete inlier set, ordered by descriptor quality so
+            # the overlay/annotation order stays meaningful.
+            order = sorted(range(len(inlier_indices)), key=lambda index: float(inlier_distances[index]))
+            selected_left = [(float(inlier_left[index][0]), float(inlier_left[index][1])) for index in order]
+            selected_right = [(float(inlier_right[index][0]), float(inlier_right[index][1])) for index in order]
+            selected_distances = [float(inlier_distances[index]) for index in order]
+        else:
+            selected_left, selected_right, selected_distances = _select_spread_matches(
+                inlier_left,
+                inlier_right,
+                inlier_distances,
+                width=width,
+                height=height,
+                np=np,
+                max_points=max_points,
+            )
+        relative_rotation = _fit_far_field_relative_rotation(
+            left_norm[inlier_indices],
+            right_norm[inlier_indices],
             inlier_left,
             inlier_right,
-            inlier_distances,
-            width=width,
-            height=height,
+            focal_px=_pixel_focal(left_matrix, right_matrix),
             np=np,
-            max_points=max_points,
         )
         # Lower SIFT/ORB descriptor distance means a stronger appearance
         # match. Normalize against the whole geometrically-consistent inlier
@@ -1257,6 +1531,16 @@ def detect_mountain(
             warnings.append("GNSS baseline was not supplied to auto-selection; solver still requires current GNSS baseline")
         if prior_rotation_right_from_left_rdf is None:
             warnings.append("relative prior rotation was not supplied; RANSAC used image epipolar geometry only")
+        if far_field_only:
+            warnings.append(
+                "Cloud far-field mode: correspondences are sky/cloud texture with no ridge bias; "
+                "rotation-only evidence, valid only when both frames are simultaneous"
+            )
+        elif all_sky:
+            warnings.append(
+                "no separable ground/ridge in either frame; correspondences are far-field sky/cloud "
+                "texture, valid for rotation only when both frames are simultaneous"
+            )
         side_kwargs = {
             "detection_method": f"{detector_name}/{method.split('/', 1)[1]}",
             "candidate_count": len(matches),
@@ -1277,6 +1561,9 @@ def detect_mountain(
                 "descriptor": detector_name,
                 "baseline_supplied": baseline_ned_m is not None,
                 "prior_rotation_supplied": prior_rotation_right_from_left_rdf is not None,
+                "filter_tier": filter_tier,
+                "relative_rotation": relative_rotation,
+                **separability_metadata,
             },
         }
         left_result = AutoSelectionResult(
@@ -1300,8 +1587,11 @@ def detect_mountain(
             metadata={
                 "descriptor": detector_name,
                 "essential_matrix_found": essential is not None,
+                "relative_rotation": relative_rotation,
                 "baseline_ned_m": None if baseline_ned_m is None else list(baseline_ned_m),
                 "prior_rotation_supplied": prior_rotation_right_from_left_rdf is not None,
+                "filter_tier": filter_tier,
+                **separability_metadata,
             },
         )
     except Exception as exc:

@@ -126,3 +126,37 @@ def test_evidence_marks_all_geometry_stale_without_discarding_finite_values() ->
     assert all(row["state"] == "STALE" for row in snapshot["angles"])
     assert all(row["forward_m"] is not None for row in snapshot["vectors"])
     assert snapshot["angles"][0]["angle_deg"] == pytest.approx(90.0, abs=1e-5)
+
+
+def test_frozen_drone_gnss_marks_geometry_and_receiver_row() -> None:
+    """A drone whose GNSS repeats one position must not present as CURRENT.
+
+    Field log 2026-09-07: 165 consecutive identical drone fixes with UTC
+    advancing; age kept resetting so the triangle looked live. The operator
+    must see this in the table, not only in the log.
+    """
+
+    panel = _panel()
+    panel._gnss_position_frozen = {"drone": {"packets": 165, "utc_frozen": False, "since_s": 50.0}}
+    evidence = EvidenceAdapter(panel)
+
+    snapshot = evidence.drone_pixhawk_geometry(now_s=100.0)
+    assert snapshot["state"] == "FROZEN"
+    assert snapshot["drone_position_frozen"] is True
+    assert snapshot["reason"].startswith("Drone GNSS 위치 고정 ×165 (수신기 위치 출력 정지)")
+    # The numbers are still shown; only the state says they are untrustworthy.
+    angles = {row["key"]: row for row in snapshot["angles"]}
+    assert angles["dr_p1_p2"]["angle_deg"] == pytest.approx(90.0, abs=1e-5)
+
+    row = evidence.gps("drone", now_s=100.0)
+    assert row["position_frozen"] is True
+    assert row["position_frozen_packets"] == 165
+    assert "receiver position output frozen" in row["position_frozen_cause"]
+
+    panel._gnss_position_frozen = {"drone": {"packets": 12, "utc_frozen": True}}
+    snapshot = evidence.drone_pixhawk_geometry(now_s=100.0)
+    assert "autopilot이 같은 fix 재전송" in snapshot["reason"]
+
+    panel._gnss_position_frozen = {}
+    assert evidence.drone_pixhawk_geometry(now_s=100.0)["state"] == "CURRENT"
+    assert evidence.gps("drone", now_s=100.0)["position_frozen"] is False

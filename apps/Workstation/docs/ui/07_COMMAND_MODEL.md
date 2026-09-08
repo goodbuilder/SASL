@@ -28,18 +28,16 @@ Session Save/Finalize command.
 
 Operate on selected object/workspace: camera connect/preview/capture, calibration capture/calculate/save, etc.
 
-`Data > Status` adds two local derived-artifact commands:
+`Data > Status` exposes `Open Latest Measurement XLSX`, `Rebuild Latest XLSX`, and `Retry Storage`.
+Open resolves the latest start-stamped workbook across run directories and legacy paths.
+Rebuild uses saved journal/raw input, never current settings, and runs in the background. It is
+rejected during Measurement, Manual recording, pending Method calculations or another workbook
+write/rebuild. Retry asks the raw writer to recover JSONL/CSV streams and checks stopped-run RTCM
+CSV mirrors in a separate bounded maintenance operation. Failures are visible and remain local.
 
-- `Update Latest XLSX` submits/coalesces a request for the newest saved Measurement only. It is
-  disabled while Measurement/Manual recording or XLSX generation is active. Acceptance means
-  `WAITING/GENERATING`, not success; status readback owns the result.
-- `Open Latest XLSX` is enabled only when the published path exists and an app-owned generation is
-  reported. It delegates to the system spreadsheet application and does not edit source data.
-
-Automatic Measurement-stop submission uses the same backend request after the run is already
-`IDLE`. Duplicate requests coalesce; a newer completed generation supersedes an older pending one.
-Cancellation, checkpoint timeout, malformed input, publication failure, and manual retry remain
-local to Data and cannot reject Measurement.
+Automatic workbook checkpoints, Stop and late results update their original run file atomically.
+Start captures its clocks before optional readiness work; queued camera startup and retries retain
+that identity. Normal shutdown records an end boundary; interrupted histories stay read-only.
 
 `Find network` is a read-only contextual command that inventories physical NIC identity,
 address/carrier and route evidence. `Assign Camera NIC/P1/P2` is a separate explicit mutation:

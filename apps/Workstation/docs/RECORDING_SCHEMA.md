@@ -1,6 +1,62 @@
 # Workstation Measurement Data Schema
 
+## Target geographic result fields (2026-09-08)
+
+| Field | Meaning | Type |
+| --- | --- | --- |
+| `target_latitude_deg` | WGS84 geodetic latitude | nullable float64, degrees |
+| `target_longitude_deg` | WGS84 geodetic longitude | nullable float64, degrees |
+| `target_altitude_ellipsoid_m` | WGS84 ellipsoid height | nullable float64, metres |
+| `target_altitude_msl_m` | Mean-sea-level height; null without a target geoid model | nullable float64, metres |
+
+The fields appear in worker result payloads, `recorded_geometry`, primary measurement
+rows (including retry), method results, compact measurement projections and Parquet,
+and workbook `02_좌표결과`, method [A], `90_Flat`, `91_Exact` and method comparison output.
+Envelope CSV mirrors retain the same JSON payload. Geographic degrees display nine
+decimal places in XLSX; numeric values are not rounded before persistence.
+
+`target_coordinate_evidence` (`target-geolocation-v1`) retains the P1 GNSS geodetic
+origin, the method's frozen world rotation, source point in left optical RDF [R,D,F],
+and derived local NED [N,E,D]. Pixhawk's selected geometry quaternion takes precedence
+over raw attitude (including baseline-yaw90). Candidate methods retain their resolved
+left optical-to-NED matrix in `measurement_pose_evidence_json` with
+`target_origin_model=P1_GNSS_as_left_optical_center`. Their local pose translation is
+rebased to the pair's P1 GNSS proxy, not added a second time. Relative profiles lacking
+this world anchor remain null. The Pixhawk/optical-center offset is assumed zero;
+GNSS antenna offset is still the existing unmodeled proxy, and body/optical mounting
+rotation is applied. No new geolocation quality gate blocks existing FRD results.
+
+Conversion uses left optical RDF → world NED → ECEF → WGS84. Ellipsoid height is
+required; MSL is never silently substituted. No constant-geoid approximation is used.
+The height/Cartesian distinction follows the
+[GeographicLib local Cartesian definition](https://geographiclib.sourceforge.io/2009-03/classGeographicLib_1_1LocalCartesian.html).
+
+New fields are additive. Old results remain readable with missing target fields,
+without backfilling from live state. Existing canonical attempt payloads stay unchanged
+unless new pose evidence was actually captured. The outcome's nested target evidence
+has its own version. Journal rebuild copies `recorded_geometry` without recalculation;
+explicit `reproduce_target_coordinates_exact(path)` reconstructs rays from workbook
+K,D,R,T,u,v and uses the stored world anchor to check geolocation independently of
+the saved target point. No hardware changes or original recording migration is needed.
+
 ## Purpose
+
+### Mountain/Cloud Yaw90 reference
+
+`yaw90_reference` (`optical-yaw90-reference-v1`) records selected GPS1/GPS2 positions,
+P1 Roll/Pitch, P1/P2 branch yaw references, request UTC/monotonic timestamps, sample ages,
+Reverse, baseline/selection, assumptions, state/reasons/warnings and SHA-256. The capture
+event binds this snapshot to both frame identities. Request time is not exposure time.
+Candidate `left_pose` is assumed; `right_pose` is image-derived relative to that reference.
+Each contains optical RDF→NED rotation, virtual-FRD RPY degrees and local NED center metres.
+OpenCV translation remains `t=-Q_R^T*(C_R-C_L)`.
+
+Optional `measurement_pose_evidence_json` in MeasurementAttempt embeds the reference and
+actual pair-used left/right poses and R,t, covered by the canonical checksum. Cloud keeps
+capture rotations and pair GNSS positions; Mountain keeps capture positions. Empty legacy
+evidence is omitted to preserve old hashes. CSV `record_json` retains all fields; XLSX
+method section D expands `optical_pose.*` with units. Raw telemetry attitude fields remain
+unchanged. Existing records are not migrated or reclassified.
 
 This document defines the sessionless recording contract for `apps/Workstation`. It covers real
 WIRIS, Pixhawk, GNSS/RTK, RTCM, ULog, Target Drone, native-frame, capture, Alignment, and
@@ -9,118 +65,114 @@ Measurement admission condition.
 
 ## Ownership and identity
 
-There is no persisted Measurement Session, parent/child package, revision, completeness, seal, or
-restart-recovery identity for new data.
+A Measurement is an observation interval. Its persisted start context locates evidence and
+supports read-only reconstruction; it never restores active device commands after restart.
+`measurement_id`/`runtime_generation` identify the run. One accepted Start request freezes
+`measurement_started_utc_ns`, `measurement_started_monotonic_ns` and `measurement_file_stamp`.
+Each record also retains its own UTC, monotonic and source timestamps.
 
-- `runtime_generation` identifies one transient Measurement or Manual-record interval when a
-  producer needs correlation. It is not a directory or durability owner.
-- `measurement_attempt_sha256`, method instance IDs, capture IDs, frame IDs, and source packet IDs
-  keep their existing domain meanings.
-- Every stored record receives `recorded_utc_ns` and `recorded_monotonic_ns` unless the producer
-  already supplied them.
-- `session_id`, `parent_session_id`, and `measurement_package_id` are removed recursively before a
-  record is written. `measurement_id` may remain as a transient compatibility correlation field.
+For new Measurement-owned records, nested source identity fields are preserved. Legacy
+membership fields at the top level are retained as `source_session_membership`, rather than
+creating an operational Session. Outside-run legacy streams retain their previous filtering.
 
 ## Physical layout
 
-An empty `measurement_data_root` selects `<SASL_ROOT>/recordings` for a normal launch. When
-`SASL_WORKSTATION_DATA_ROOT` is explicitly configured, the empty default selects its `recordings/`
-child. A non-empty value is a POSIX-style path relative to `SASL_WORKSTATION_DATA_ROOT`. The former
-default spelling `measurement_data` is normalized to the empty default when settings load; existing
-bytes in that historical directory are not moved or rewritten.
+An empty `measurement_data_root` selects `<SASL_ROOT>/recordings`, or the `recordings/` child
+of an explicit `SASL_WORKSTATION_DATA_ROOT`. A custom value is relative to that data root.
+The KST start stamp is `YYYYMMDD_HHMMSS_nnnnnnnnn+0900`; a whole-run collision adds `-01`, etc.
+All files owned by the run contain exactly that stamp, regardless of when they finish writing.
 
 ```text
-<resolved Measurement data root>/
-├── latest_measurement.xlsx
-├── events.jsonl
-├── events.csv
-├── measurements.jsonl
-├── measurements.csv
-├── method_evaluations.jsonl
-├── method_evaluations.csv
-├── camera_left.jsonl
-├── camera_left.csv
-├── camera_right.jsonl
-├── camera_right.csv
-├── px4_left.jsonl
-├── px4_left.csv
-├── px4_right.jsonl
-├── px4_right.csv
-├── px4_drone.jsonl
-├── px4_drone.csv
-├── gnss_base.jsonl
-├── gnss_base.csv
-├── gnss_baseline_center.jsonl
-├── gnss_baseline_center.csv
-├── geometry_comparisons.jsonl
-├── geometry_comparisons.csv
-├── capture_events.jsonl
-├── capture_events.csv
-├── alignment.jsonl
-├── alignment.csv
-├── artifacts.jsonl
-├── artifacts.csv
-├── application_log.jsonl
-├── application_log.csv
-├── native_frames.jsonl
-├── native_frames.csv
-├── videos/
-├── images/
-├── frames/
-├── ulog/
-└── raw/gnss/
-    ├── ntrip_transport_chunk.rtcm
-    ├── ntrip_transport_chunk.rtcm.jsonl
-    ├── ntrip_rtcm_frame.rtcm
-    ├── ntrip_rtcm_frame.rtcm.jsonl
-    ├── base_rtcm_frame.rtcm
-    └── base_rtcm_frame.rtcm.jsonl
+<resolved data root>/<stamp>/
+  <stamp>_measurement.xlsx
+  raw/<stamp>_<stream>.jsonl
+  raw/<stamp>_<stream>.csv
+  raw/<stamp>_measurement_journal.jsonl
+  raw/<stamp>_measurement_journal.csv
+  raw/gnss/<stamp>_<source>_<kind>.rtcm
+  raw/gnss/<stamp>_<source>_<kind>.rtcm.jsonl
+  raw/gnss/<stamp>_<source>_<kind>.rtcm.csv
+  media/<stamp>_left.mp4
+  media/<stamp>_right.mp4
+  frames/<purpose>/<stamp>_<pair>-<side>.png
+  images/hr_imported/<stamp>_<side>_<original-stem>.<extension>
+  ulog/<source>/<stamp>_<original-stem>.ulg
+  ulog/<source>/<stamp>_<original-stem>.ulg.<artifact-id>.json
 ```
 
-Structured files append across runs and are not rotated automatically. No new Measurement folder,
-Parquet generation, legacy `review.xlsx`, package manifest, or publication pointer is produced.
-`latest_measurement.xlsx` is one replaceable derived view of the most recently completed
-Measurement; it is not a Session, archive, completeness verdict, or authoritative store.
+Video reconnect segments and repeated captures receive unique suffixes. PNG/ULog artifact
+metadata goes through the dual-format raw store; RTCM's existing binary/index owner also
+mirrors its index to CSV. Native binary contents are not converted to JSON. Reusable app
+settings/assets and operations outside Measurement retain their existing ownership rules.
+No new-run folder is moved at shutdown, and existing histories are never renamed or backfilled
+as a migration. An explicit CSV repair may replace only the derived mirror of its existing JSONL.
 
-Each fixed JSONL stream has a same-stem UTF-8 CSV mirror (`.jsonl` → `.csv`) for newly persisted
-records. The CSV header is `workstation-measurement-csv-v1` and contains the recorded clocks,
-common identity/status fields, and the complete canonical JSON object in `record_json`. JSONL is
-written first and remains authoritative; a CSV mirror may be temporarily `RETRYING`, `FAILED`, or
-`DROPPED` without rejecting Measurement. Existing JSONL files are not backfilled automatically.
+## Measurement journal and CSV
 
-## Latest Measurement XLSX
+Each logical stream has UTF-8 JSONL and a same-stem UTF-8 CSV using
+`workstation-measurement-csv-v1`: common clock/identity/status columns plus the complete canonical
+object in `record_json`. Payloads, nested values, large integers and long strings are retained.
+The existing thin numeric projections keep their producer formatting; full-precision frozen
+inputs/outcomes and `recorded_geometry` are independently retained in the journal.
 
-After a Measurement stops, Workstation requests a background rebuild of
-`latest_measurement.xlsx`. `Data > Status` exposes `Update Latest XLSX`, `Open Latest XLSX`, and
-the factual `NOT_CREATED/WAITING/GENERATING/READY/STALE/FAILED/CANCELLED` state. The request occurs
-after the run has returned to `IDLE`; delay, cancellation, failure, or a locked/foreign destination
-never blocks the next Measurement.
+`measurement.journal` records start metadata/calibration, detection candidates, pair decisions,
+method outcomes with frozen geometry, calibration/alignment updates, events, pending-job failures
+and Stop. `journal_sequence` provides ordering, gap detection and idempotent replay. Rebuild uses
+these deltas plus same-run telemetry/artifacts; it does not consult current settings or sensors.
+A missing JSONL can be read from its CSV mirror. Torn/corrupt input remains untouched and is
+reported as incomplete. An interrupted run is never silently presented as a live run.
 
-The workbook selects exactly one `runtime_generation`, using `runtime_generation` or the
-sessionless compatibility `measurement_id` stored on each source row. It contains Summary,
-Measurement events, materialized and append/replace result history, nine-method bundles/outcomes/
-inputs, camera, P1/P2/Target, Base GNSS, GNSS baseline-center, geometry, native-frame,
-file-inventory, and issue sheets.
-Manual-record-only and unrelated application/capture/alignment streams are excluded. Differently
-sampled sources are not time-joined.
+## Measurement XLSX v2
 
-Original clock values remain exact; integers beyond Excel's 15-digit precision are text and UTC
-epoch fields gain adjacent nanosecond-precision KST ISO display columns. Missing cells are Excel
-`#N/A`; absent samples are never invented. Row, column, and cell limits produce deterministic
-shards/continuation columns inside the same workbook.
+`<stamp>_measurement.xlsx` is updated atomically by the background writer at Start/checkpoints,
+Stop and late completion. Its name never changes on rebuild. `Open Latest Measurement XLSX`
+selects start time plus collision sequence, not the modification time of a late older export.
+`Rebuild Latest XLSX` reads saved inputs in a background thread after recording/calculations stop.
 
-The writer takes a background-only durable byte-cutoff checkpoint, builds and validates a hidden
-temporary XLSX, and atomically publishes it. A prior Workstation-schema workbook may be replaced;
-an unmarked same-name file is treated as user-owned and preserved. Malformed/torn source records
-are excluded with `Issues` evidence. JSONL remains authoritative in every success and failure path.
+The first six sheets are `00_요약`, `01_거리비교`, `02_좌표결과`, `03_진단`, `04_Rt`, `05_그래프`.
+Existing Method sheets, detections, calibration, alignment, optical-pose, sensors, events,
+`90_Flat`, `91_Exact`, `98_Provenance` and `99_Definitions` remain available (40 base sheets).
+Internal analysis and unused Method/telemetry sheets are normally hidden. Every displayed
+Method table shows results first and all nine R plus three t components expanded, with a
+stable `rt_id` linking to the same pair/method in `04_Rt`. R and t sources and their fixed/changed
+summaries are separate. Available transforms from ESTIMATED/BLOCKED/FAILED results are retained.
 
-## Fixed stream contract
+Coordinates remain `baseline_center_frd`; the canonical transform is
+`X_right = R_right_from_left * X_left + T_right_from_left`, with both camera coordinates in
+optical RDF and T in right-camera RDF metres. T is not the camera-center vector `C=-R^T T`.
+R/t/coordinate values stay numeric and unrounded; only display formats change. Nanosecond and
+large exact integer values remain text. Reader missing markers are `—`, while reproduction
+sheets retain `N/A`. Tables use numbered continuation sheets at Excel's row limit, and exact
+reproduction reads all parts. Compact report widths, 11pt font, filters and frozen identifiers
+support reading; wide R,t/Method tables permit horizontal scrolling.
+
+`05_그래프` contains twelve native XY charts in two columns, with four charts per printed
+landscape A4 page. Their Y fields are, in order:
+
+1. `forward_m`, `right_m`, `down_m`, `range_m`: existing camera midpoint FRD, metres.
+2. `target_level_forward_m`, `target_level_right_m`, `target_level_down_m`,
+   `target_level_range_m`: existing Method midpoint / pair-frozen P1 horizontal FRD, metres.
+3. `target_latitude_deg`, `target_longitude_deg`, `target_altitude_ellipsoid_m`,
+   `target_altitude_msl_m`: geodetic degrees and separate ellipsoid/MSL heights in metres.
+
+X is `(pair.created_monotonic_ns - started_monotonic_ns) / 1e9`, in seconds. Each Method's
+style is stable across fields. Only finite values from `VALID`/`ESTIMATED` rows are drawn;
+missing coordinates and other statuses remain blank gaps. Single results use a marker;
+fields with no finite result keep a `데이터 없음` chart without numeric axes. The summary
+links to this sheet. Native series reference hidden provenance ranges, with hidden-data
+display enabled. Only chart backing ranges may sample up to 2,000 points per Method per
+field, retaining bucket minima/maxima and gap markers. Full result tables, exact numbers
+and journal reconstruction are unchanged; historical missing fields are not calculated
+during export or rebuild.
+
+## Logical stream contract
 
 | Stream key | File | Priority | Meaning |
 | --- | --- | --- | --- |
 | `events` | `events.jsonl` | yes | transient run, command, and producer events |
 | `measurements` | `measurements.jsonl` | yes | representative `pixhawk_rtk_live` `VALID`/`ESTIMATED` terminal results accepted while the run is `RUNNING` |
 | `method_evaluations` | `method_evaluations.jsonl` | yes | atomic nine-method inputs/outcomes and late-result markers |
+| `method_results` | `method_results.jsonl` | yes | one thin row per method outcome (status, reasons, F/R/D/Range, ray diagnostics, disparity, timing) — the readable projection of `method_evaluations` |
 | `camera.left/right` | `camera_left/right.jsonl` | no | GUI-delivered camera observations |
 | `px4.left/right/drone` | `px4_left/right/drone.jsonl` | no | P1, P2, and Target telemetry records |
 | `gnss.base` | `gnss_base.jsonl` | no | Base GNSS observations |
@@ -131,6 +183,9 @@ are excluded with `Issues` evidence. JSONL remains authoritative in every succes
 | `artifacts` | `artifacts.jsonl` | yes | binary allocation/close/import inventory |
 | `application.log` | `application_log.jsonl` | no | redacted recording-time application log |
 | `native.frames` | `native_frames.jsonl` | yes | async native-frame completion/path evidence |
+| `measurement.journal` | `measurement_journal.jsonl` | yes | complete per-run reconstruction deltas and frozen Method geometry |
+
+Table filenames above are logical/legacy stems. New run files use `raw/<stamp>_<stem>.jsonl` and `.csv`.
 
 JSONL is UTF-8, one JSON object per line, `allow_nan=False`. Unsupported/non-finite values reject
 only that record. A malformed final historical fragment is retained as one bad line; the writer
@@ -140,6 +195,40 @@ quoting and copies coordinate/frame and clock fields without conversion.
 `LiveDataRows.replace(index, row)` does not edit the file. It appends a new record carrying
 `_record_operation="replace"` and the same `_record_index`. Readers that want the current-run view
 apply later replace records over earlier append records. Readers that need audit history retain both.
+`_record_index` is allocated monotonically in the payload's actual destination file. Each logical
+row retains its allocation for replacements/retries. A late result delivered through a newer row
+collection allocates in the original run, preventing cross-run index collisions.
+
+Numeric row fields are written as JSON numbers (rounded to six decimals; `null` when absent), not
+fixed-precision strings; boolean flags stay `"true"`/`"false"` text. `application_log` rows carry an
+inferred `level` (`INFO`/`WARNING`/`ERROR`) classified from the message text.
+
+### Readable projections on the `measurements` row
+
+Once a pair's method bundle has been evaluated, the pair's `measurements` row is re-written
+(`_record_operation="replace"`) with:
+
+- `m_<method>_status/reason/forward_m/right_m/down_m/range_m/ray_gap_m/ray_angle_deg` for every
+  evaluated method (`m_rtk_*` for `pixhawk_rtk_live`, `m_yaw90_*` for
+  `pixhawk_rp_gps_baseline_yaw`, otherwise the method id), `m_method_ids`, and
+  `m_yaw90_over_rtk_range_ratio`.
+- every `measurement_yaw_*` selection field taken from the baseline-yaw attempt, whichever method is
+  primary (`measurement_yaw_fields_source` names the source method).
+- `optical_relative_*`: the latest accepted optical-pose suggestion's far-field relative
+  yaw/pitch/roll, fit inlier count/residual, its age at the pair, `pixhawk_relative_yaw_deg`
+  (P2 minus P1 Pixhawk yaw) and `optical_minus_pixhawk_relative_yaw_deg`.
+
+`geometry_comparisons` no longer records placeholder rows whose status starts with
+`waiting for inputs`; a method with no inputs simply has no row for that pair.
+
+### Session archive on shutdown
+
+The final lifecycle step (`archive-session-recordings`) runs after the data writer is closed. It
+moves that session's token-stamped stream files, the `frames/` and `raw/` trees, and run artifacts
+whose `YYYYMMDD_HHMMSS` prefix is not earlier than the session token into
+`<root>/<YYYYMMDD_HHMMSS>/` (run artifacts under `runs/<prefix>/`). Native-frame index rows keep
+resolving because their `relative_path` is relative to that folder. Earlier sessions' files and
+`latest_measurement_*.xlsx` are left in place.
 
 ### GNSS baseline-center derived rows
 
@@ -231,7 +320,9 @@ finite; complete storage unavailability can still prevent durable recording of t
 
 ## Queue and failure contract
 
-One daemon writer owns the fixed JSONL files and their same-stem CSV mirrors.
+One bounded daemon writer owns logical JSONL/CSV streams across run-specific destinations.
+Closed-run handles are flushed and released; immutable routes can reopen for late appends.
+The RTCM binary/index owner remains separate and serializes CSV repair with its file writes.
 
 - Store lifecycle is `OPEN → CLOSING → CLOSED`. Only `OPEN` accepts enqueue. A request observed
   during `CLOSING` or `CLOSED` is rejected, increments lifecycle/stream drop evidence, and never
@@ -246,6 +337,8 @@ One daemon writer owns the fixed JSONL files and their same-stem CSV mirrors.
   retry/drop behavior. A CSV failure retains the successful JSONL row, places the canonical row in
   a separate FIFO CSV retry reserve capped at 256 records and 8 MiB, and uses 1–30 second automatic
   backoff plus immediate `Retry Storage`; CSV overflow increments only the CSV drop count.
+  CSV retry rebuilds from the durable JSONL, including rows that overflowed its retry reserve.
+  `Retry Storage` also checks stopped-run RTCM mirrors off the GUI thread.
   Measurement and unrelated streams remain usable.
 - Serialization failure drops only the malformed record; a later valid record continues normally.
 - `Data > Status` exposes root, writer liveness, pending counts, per-stream JSONL/CSV paths and
@@ -407,3 +500,51 @@ Existing `recordings/<id>/` and `recordings/sessions/<id>/` hierarchies remain u
 Session/package/manifests/Parquet/workbook contracts apply only to those historical trees. New code
 does not scan, recover, seal, convert, or append to them; the Data workspace exposes only a file
 manager link.
+# Mountain/Cloud availability policy (2026-09-08)
+
+Newly solved candidates carry `gate_policy=mountain-cloud-availability-v1` in provenance
+and warnings. Mountain translation uses capture-associated GNSS NED (right minus left);
+Cloud measurement translation uses the existing live/retained GNSS provider. Relative
+rotation remains OpenCV optical RDF right-from-left; no coordinate transform changes.
+
+Method outcome records add `usable` (VALID/ESTIMATED), `blocking_reasons` (alias of reasons),
+`quality_warnings` (alias of warnings, including provenance warnings), and `gate_policy`.
+These are derived projections outside the existing canonical checksum; authoritative reasons,
+warnings, result and attempt remain checksummed. Absent policy markers serialize as
+`legacy_or_unspecified`, never as retroactive approval. Existing CSV/XLSX status and warning
+columns retain ESTIMATED results. Historical records are not overwritten or reclassified.
+
+### Additive method-midpoint horizontal target coordinates
+
+New Measurement outcomes, representative results and per-method result rows add
+`target_level_forward_m`, `target_level_right_m`, `target_level_down_m`, and
+`target_level_range_m` (metres). `target_level_frame=baseline_center_local_level_frd`.
+Existing optical `baseline_center_frd` and WGS84 fields retain their meanings;
+no ECEF output is added. JSONL and its CSV mirror preserve the new values, and
+XLSX coordinate, Method, comparison and flat tables expose them beside existing
+results. Older records remain unknown rather than being recalculated on read.
+
+The origin is **each method's existing midpoint**, not a replacement shared GNSS
+midpoint. For relative-pose methods the right optical origin is `-R.T @ T` from
+the exact left-to-right optical RDF transform used in triangulation. Other
+methods use their frozen `translation_right_in_left_rdf_m`. Subtract half that
+origin from `source_point_left_rdf_m`, convert RDF to body FRD, then use the raw
+pair-frozen P1 attitude quaternion to rotate into NED. Forward is P1 body forward
+projected onto the NED horizontal plane; Right is horizontal right, Down is NED
+Down. All methods in a pair use that common attitude, never a method-specific
+geometry quaternion for levelling. Camera and Pixhawk mounting rotation offsets
+are assumed zero. Range is the norm from the preserved midpoint and agrees with
+the existing unsmoothed geometric Range up to floating-point roundoff.
+
+`target_level_status` is `AVAILABLE` or `UNAVAILABLE`; `target_level_reason`
+explains unavailable values. Missing/nonfinite geometry, missing/invalid attitude,
+a zero baseline, or a forward projection below 1e-8 produces null extra numeric
+fields without blocking the original measurement. Availability is a mathematical
+calculation status, not an attitude accuracy/freshness certification.
+`target_level_evidence` in canonical outcomes, representative records and journal
+contains the source left RDF point, midpoint in left RDF, normalized quaternion,
+attitude receive timestamp/age, detection midpoint time, axis definitions, mount
+assumption and baseline source. The existing attitude reuse/quality warnings
+remain authoritative. Absolute GNSS position is not required for this addition.
+The separate GNSS antenna-midpoint-to-Drone stream retains its own coordinate
+contract and is not substituted for these camera-derived target results.

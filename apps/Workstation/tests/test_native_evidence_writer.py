@@ -349,6 +349,7 @@ def test_pending_writer_stop_and_stream_reconnect_keep_old_reserved_pair_valid(
 
 def test_recording_controller_schedules_exact_ring_pair_without_gui_qimage(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     left = _ring("left")
     right = _ring("right")
@@ -384,7 +385,12 @@ def test_recording_controller_schedules_exact_ring_pair_without_gui_qimage(
             _recording_pending_native_request_rows={},
             _log=lambda _message: None,
         )
-        result = RecordingController(panel)._persist_native_detection_pair(
+        controller = RecordingController(panel)
+        delivered = []
+        # This test inspects the producer result before the controller consumes
+        # and acknowledges it. The normal callback removes acknowledged results.
+        monkeypatch.setattr(controller, "_handle_async_native_frame_result", delivered.append)
+        result = controller._persist_native_detection_pair(
             left_detection=SimpleNamespace(
                 timestamp_metadata=left_descriptor.to_mapping(),
                 app_receive_monotonic_s=4.0,
@@ -412,6 +418,7 @@ def test_recording_controller_schedules_exact_ring_pair_without_gui_qimage(
 
 def test_recording_controller_consumes_pre_gui_reserved_pair_after_ring_depth_delay(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     left = _ring("left")
     right = _ring("right")
@@ -460,7 +467,10 @@ def test_recording_controller_consumes_pre_gui_reserved_pair_after_ring_depth_de
             _recording_pending_native_request_rows={},
             _log=lambda _message: None,
         )
-        result = RecordingController(panel)._persist_native_detection_pair(
+        controller = RecordingController(panel)
+        delivered = []
+        monkeypatch.setattr(controller, "_handle_async_native_frame_result", delivered.append)
+        result = controller._persist_native_detection_pair(
             left_detection=SimpleNamespace(
                 timestamp_metadata=left_descriptor.to_mapping(),
                 app_receive_monotonic_s=5.0,

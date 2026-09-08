@@ -83,6 +83,7 @@ class RtcmEvidenceContext:
     session_id: str = ""
     session_root: Path | None = None
     context_token: str = ""
+    file_stamp: str = ""
 
     def __post_init__(self) -> None:
         state = str(self.state or "IDLE").strip().upper()
@@ -119,6 +120,7 @@ class RtcmEvidenceContext:
                 else Path(str(values["session_root"]))
             ),
             context_token=str(values.get("context_token") or ""),
+            file_stamp=str(values.get("file_stamp") or ""),
         )
 
     def as_dict(self) -> dict[str, object]:
@@ -127,6 +129,7 @@ class RtcmEvidenceContext:
             "session_id": self.session_id,
             "session_root": None if self.session_root is None else str(self.session_root),
             "context_token": self.context_token,
+            "file_stamp": self.file_stamp,
             "active": self.active,
         }
 
@@ -752,6 +755,16 @@ def append_rtcm_evidence(
     context: RtcmEvidenceContext,
     record: RtcmEvidenceRecord,
 ) -> dict[str, object] | None:
+    from Workstation.workstation_core.measurement_csv_mirror import owned_ledger_lock
+    if not context.active or context.session_root is None:
+        return None
+    prefix = f"{context.file_stamp}_" if context.file_stamp else ""
+    index = context.session_root / "raw" / "gnss" / f"{prefix}{_safe_component(record.source, 'unknown')}_{_safe_component(record.record_kind, 'bytes')}.rtcm.jsonl"
+    with owned_ledger_lock(index):
+        return _append_rtcm_evidence_locked(context, record)
+
+
+def _append_rtcm_evidence_locked(context: RtcmEvidenceContext, record: RtcmEvidenceRecord) -> dict[str, object] | None:
     """Append one exact payload and index row, returning its durable identity.
 
     The caller must serialize calls for a given context.  Runtime ownership is
@@ -763,7 +776,10 @@ def append_rtcm_evidence(
     safe_source = _safe_component(record.source, "unknown")
     safe_kind = _safe_component(record.record_kind, "bytes")
     root = context.session_root / "raw" / "gnss"
-    binary_path = root / f"{safe_source}_{safe_kind}.rtcm"
+    prefix = f"{context.file_stamp}_" if context.file_stamp else ""
+    if prefix and any(c in prefix for c in "/\\\x00"):
+        raise ValueError("invalid Measurement file stamp")
+    binary_path = root / f"{prefix}{safe_source}_{safe_kind}.rtcm"
     index_path = binary_path.with_suffix(binary_path.suffix + ".jsonl")
     root.mkdir(parents=True, exist_ok=True)
     binary_existed = binary_path.exists()
@@ -807,6 +823,9 @@ def append_rtcm_evidence(
         }
         if context.session_id == "measurement-data":
             row["data_owner"] = "measurement_data_root"
+            if context.file_stamp:
+                row["measurement_id"] = context.context_token
+                row["measurement_file_stamp"] = context.file_stamp
         else:
             row["session_id"] = context.session_id
         encoded = (
@@ -862,8 +881,16 @@ def append_rtcm_evidence(
     finally:
         os.close(index_descriptor)
         os.close(binary_descriptor)
+    mirror = {}
+    if context.file_stamp:
+        from Workstation.workstation_core.measurement_csv_mirror import mirror_owned_jsonl_record
+        try:
+            mirror["csv_path"] = str(mirror_owned_jsonl_record(index_path, encoded))
+        except (OSError, ValueError) as exc:
+            mirror["csv_error"] = str(exc)
     return {
         **row,
+        **mirror,
         "binary_path": str(binary_path),
         "index_path": str(index_path),
     }

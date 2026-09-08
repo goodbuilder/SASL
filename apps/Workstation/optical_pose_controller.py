@@ -105,6 +105,8 @@ OPTICAL_POSE_CONTROLLER_METHODS = (
     "commit_workstation_optical_pose_auto_selection",
     "auto_select_workstation_optical_pose_horizon",
     "auto_select_workstation_optical_pose_mountain",
+    "auto_select_workstation_optical_pose_cloud",
+    "solve_workstation_optical_pose_cloud_rotation",
     "accept_workstation_optical_pose_suggestion",
     "record_workstation_optical_pose_annotation",
     "workstation_optical_pose_candidate_poses",
@@ -133,6 +135,10 @@ _HORIZON_DOF = PoseDofMask(roll_deg=True, pitch_deg=True, yaw_deg=False)
 DRONE_RTK_FRAME_PAIR_MAX_DELTA_S = 0.350
 DRONE_RTK_FRAME_GNSS_MAX_ABS_DELTA_S = 0.350
 _YAW_DOF = PoseDofMask(roll_deg=False, pitch_deg=False, yaw_deg=True)
+_ROTATION_DOF = PoseDofMask(roll_deg=True, pitch_deg=True, yaw_deg=True)
+# Cloud far-field correspondences are only meaningful when both frozen frames
+# were captured together; reuse the Drone RTK frame-pair bound.
+CLOUD_FRAME_PAIR_MAX_DELTA_S = DRONE_RTK_FRAME_PAIR_MAX_DELTA_S
 # A single RTK target/ray pair only constrains yaw (see estimate_drone_yaw_deg's
 # closed form, which fixes roll/pitch). Two or more non-degenerate target/ray
 # pairs over-determine the full rotation with the optical center still fixed,
@@ -515,7 +521,7 @@ def _candidate_mapping(candidate: OpticalPoseCandidate) -> dict[str, Any]:
         "uncertainty_metrics": dict(candidate.uncertainty_metrics),
         "created_utc_ns": candidate.created_utc_ns,
     }
-    if candidate.method == "gnss-constrained-mountain-uv":
+    if candidate.method in {"gnss-constrained-mountain-uv", "cloud-far-field-rotation"}:
         relative_pose = candidate.stereo_pose_rdf
         mapping["relative_pose_rdf"] = {
             "rotation_right_from_left_rdf": [
@@ -531,6 +537,9 @@ def _candidate_mapping(candidate: OpticalPoseCandidate) -> dict[str, Any]:
             ),
             "unit": "m",
         }
+    if candidate.reference_evidence_json:
+        mapping["yaw90_reference"] = json.loads(candidate.reference_evidence_json)
+        mapping["pose_roles"] = {"left": "assumed_reference", "right": "derived_from_reference_and_images"}
     return mapping
 
 
@@ -540,9 +549,11 @@ class OpticalPoseController:
     _MOUNTAIN_RIDGE_MARGIN_DEFAULT = 0.06
     _MOUNTAIN_RIDGE_MARGIN_MIN = 0.02
     _MOUNTAIN_RIDGE_MARGIN_MAX = 0.15
-    _MOUNTAIN_MAX_POINTS_DEFAULT = 12
+    # 0 = keep every RANSAC inlier (no display/storage sampling); a positive
+    # value caps the spread selection at that many points (minimum 4).
+    _MOUNTAIN_MAX_POINTS_DEFAULT = 0
     _MOUNTAIN_MAX_POINTS_MIN = 4
-    _MOUNTAIN_MAX_POINTS_MAX = 40
+    _MOUNTAIN_MAX_POINTS_MAX = 500
 
     def __init__(self, panel: object) -> None:
         self.panel = panel
@@ -558,6 +569,7 @@ class OpticalPoseController:
         self._frozen_frames: dict[str, dict[str, Any]] = {}
         self._frozen_intrinsics_profile: OperatingIntrinsicsProfile | None = None
         self._frozen_prior_poses: tuple[CameraPoseNed, CameraPoseNed] | None = None
+        self._frozen_yaw90_reference: dict[str, Any] | None = None
         self._frozen_capture_monotonic_s: float | None = None
         # ``_clone_for_auto_select`` shares the live, mutable ``panel`` object
         # with its background-job clone rather than copying it (copying the
@@ -667,6 +679,7 @@ class OpticalPoseController:
         self._frozen_frames.clear()
         self._frozen_intrinsics_profile = None
         self._frozen_prior_poses = None
+        self._frozen_yaw90_reference = None
         self._frozen_capture_monotonic_s = None
         self._terrain_metadata = None
         self._terrain_snapshot = None
@@ -1371,6 +1384,33 @@ class OpticalPoseController:
             },
         }
 
+    def _capture_yaw90_reference(self) -> dict[str, Any]:
+        from Workstation.workstation_core.optical_yaw90_reference import build_reference
+
+        now, utc = time.monotonic(), time.time_ns()
+        selector = getattr(self.panel, "_selected_baseline_gps_states", None)
+        raw = getattr(self.panel, "latest_gps", {}) or {}
+        positions = selector() if callable(selector) else (raw.get("left"), raw.get("right"))
+        gps = {side: _gps_state_observation_mapping(value, role=side)
+               for side, value in zip(("left", "right"), positions)}
+        live = getattr(self.panel, "latest_extrinsics", {}) or {}
+        attitudes = {}
+        for side in ("left", "right"):
+            sample = live.get(side)
+            row = {}
+            for key in ("roll_deg", "pitch_deg", "yaw_deg", "timestamp_s"):
+                value = getattr(sample, key, None)
+                row[key] = float(value) if isinstance(value, (int, float)) and math.isfinite(value) else None
+            row["source"] = str(getattr(sample, "topic", "ATTITUDE"))
+            attitudes[side] = row
+        settings = getattr(self.panel, "settings", None)
+        reader = getattr(self.panel, "_workstation_setting", lambda _key, default=None: default)
+        reverse = bool(reader("measurement_baseline_yaw_reverse", getattr(settings, "measurement_baseline_yaw_reverse", False)))
+        source_reader = getattr(self.panel, "_pixhawk_gnss_source", lambda _side: "GPS1")
+        return build_reference(gps=gps, attitudes=attitudes, reverse=reverse,
+                               requested_monotonic_s=now, requested_utc_ns=utc,
+                               sources={side: source_reader(side) for side in ("left", "right")})
+
     def capture_workstation_optical_pose_burst(
         self,
         payload: Mapping[str, Any] | None = None,
@@ -1397,6 +1437,7 @@ class OpticalPoseController:
                 raise OSError(f"optical-pose evidence setup failed: {evidence_error}")
 
         captured_monotonic_s = time.monotonic()
+        yaw90_reference = self._capture_yaw90_reference()
         profile = self.operating_intrinsics_profile_for_geometry()
         prior: tuple[CameraPoseNed, CameraPoseNed] | None
         try:
@@ -1449,6 +1490,7 @@ class OpticalPoseController:
             }
 
         self._frozen_frames = frozen
+        self._frozen_yaw90_reference = yaw90_reference
         self._frozen_intrinsics_profile = profile
         self._frozen_prior_poses = prior
         self._frozen_capture_monotonic_s = captured_monotonic_s
@@ -1467,6 +1509,7 @@ class OpticalPoseController:
             },
             "operating_intrinsics_profile_sha256": "" if profile is None else profile.profile_sha256,
             "prior_pose_available": prior is not None,
+            "yaw90_reference": copy.deepcopy(self._frozen_yaw90_reference),
             "coordinate_contract": "native decoded pixels; u right, v down; no resize/overlay",
         }
         self._append_event("optical_pose_burst_captured", event_payload)
@@ -1528,6 +1571,7 @@ class OpticalPoseController:
         self.panel.optical_pose_wiris_ftp_thread = thread
         self.panel.optical_pose_wiris_ftp_worker = worker
         pending_payload = dict(payload or {})
+        pending_payload["_capture_yaw90_reference"] = self._capture_yaw90_reference()
         raw_gps = getattr(self.panel, "latest_gps", {})
         raw_gps = raw_gps if isinstance(raw_gps, Mapping) else {}
         pending_payload["_ftp_request_gnss_snapshot"] = {
@@ -1685,6 +1729,7 @@ class OpticalPoseController:
         self.panel.optical_pose_wiris_ftp_oz_thread = thread
         self.panel.optical_pose_wiris_ftp_oz_worker = worker
         pending_payload = dict(payload or {})
+        pending_payload["_capture_yaw90_reference"] = self._capture_yaw90_reference()
         raw_gps = getattr(self.panel, "latest_gps", {})
         raw_gps = raw_gps if isinstance(raw_gps, Mapping) else {}
         pending_payload["_ftp_request_gnss_snapshot"] = {
@@ -1935,6 +1980,11 @@ class OpticalPoseController:
         }
         self._append_event("optical_pose_burst_imported", event_payload)
         ftp_gnss_snapshot = values.get("_ftp_request_gnss_snapshot")
+        self._frozen_yaw90_reference = copy.deepcopy(values.get("_capture_yaw90_reference"))
+        self._append_event("optical_pose_yaw90_reference_bound", {
+            "burst_id": burst_id, "frames": event_payload["frames"],
+            "yaw90_reference": self._frozen_yaw90_reference,
+        })
         if isinstance(ftp_gnss_snapshot, Mapping):
             self._capture_drone_rtk_observation(
                 session_id=session_id,
@@ -2093,9 +2143,11 @@ class OpticalPoseController:
     def set_workstation_optical_pose_mountain_max_points(
         self, payload: Mapping[str, Any]
     ) -> dict[str, Any]:
-        """Set how many spread correspondences Mountain keeps for later Auto-select runs.
+        """Set how many spread correspondences Mountain/Cloud keep for later Auto-select runs.
 
-        See ``detect_mountain``'s ``max_points``; does not itself re-run detection.
+        ``0`` keeps every RANSAC inlier (the default); a positive value caps
+        the spread selection. See ``detect_mountain``'s ``max_points``; does
+        not itself re-run detection.
         """
 
         raw = payload.get("max_points")
@@ -2103,10 +2155,13 @@ class OpticalPoseController:
             count = int(raw)
         except (TypeError, ValueError) as exc:
             raise ValueError("max_points must be an integer") from exc
-        clamped = min(
-            self._MOUNTAIN_MAX_POINTS_MAX,
-            max(self._MOUNTAIN_MAX_POINTS_MIN, count),
-        )
+        if count <= 0:
+            clamped = 0
+        else:
+            clamped = min(
+                self._MOUNTAIN_MAX_POINTS_MAX,
+                max(self._MOUNTAIN_MAX_POINTS_MIN, count),
+            )
         self._mountain_max_points = clamped
         return self.workstation_optical_pose_snapshot()
 
@@ -2127,14 +2182,17 @@ class OpticalPoseController:
         values = dict(payload or {})
         mode = str(values.get("mode") or "").strip().lower()
         if mode:
+            # Mountain and Cloud suggestions share the ridge annotation, so
+            # clearing either mode discards both.
+            modes = {"mountain", "cloud"} if mode in {"mountain", "cloud"} else {mode}
             self._auto_suggestions = {
                 suggestion_id: value
                 for suggestion_id, value in self._auto_suggestions.items()
-                if str(value.get("mode") or "") != mode
+                if str(value.get("mode") or "") not in modes
             }
             if (
                 self._last_accepted_auto_suggestion is not None
-                and str(self._last_accepted_auto_suggestion.get("mode") or "") == mode
+                and str(self._last_accepted_auto_suggestion.get("mode") or "") in modes
             ):
                 self._last_accepted_auto_suggestion = None
         else:
@@ -2162,6 +2220,7 @@ class OpticalPoseController:
             }
         clone._frozen_intrinsics_profile = self._frozen_intrinsics_profile
         clone._frozen_prior_poses = self._frozen_prior_poses
+        clone._frozen_yaw90_reference = copy.deepcopy(self._frozen_yaw90_reference)
         clone._active_poses = self._active_poses
         clone._frozen_capture_monotonic_s = self._frozen_capture_monotonic_s
         # Freeze the few live-``panel`` fields that ``_intrinsics_snapshot``'s
@@ -2194,7 +2253,7 @@ class OpticalPoseController:
         """Freeze the current owner evidence before background computation."""
 
         normalized_mode = str(mode or "").strip().lower()
-        if normalized_mode not in {"horizon", "mountain"}:
+        if normalized_mode not in {"horizon", "mountain", "cloud"}:
             raise ValueError(f"unsupported optical-pose auto-selection mode: {mode!r}")
         missing = [side for side in ("left", "right") if side not in self._frozen_frames]
         if missing:
@@ -2220,6 +2279,8 @@ class OpticalPoseController:
             return self._compute_auto_select_horizon(payload)
         if normalized_mode == "mountain":
             return self._compute_auto_select_mountain(payload)
+        if normalized_mode == "cloud":
+            return self._compute_auto_select_cloud(payload)
         raise ValueError(f"unsupported optical-pose auto-selection mode: {mode!r}")
 
     def commit_workstation_optical_pose_auto_selection(
@@ -2373,9 +2434,35 @@ class OpticalPoseController:
         suggestion = self._compute_auto_select_mountain(dict(payload or {}))
         return self.commit_workstation_optical_pose_auto_selection(suggestion)
 
+    def auto_select_workstation_optical_pose_cloud(
+        self,
+        payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create and immediately commit a Cloud far-field suggestion."""
+
+        suggestion = self._compute_auto_select_cloud(dict(payload or {}))
+        return self.commit_workstation_optical_pose_auto_selection(suggestion)
+
+    def _compute_auto_select_cloud(
+        self,
+        payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Cloud mode: the Mountain matcher without any ridge bias.
+
+        Every mutual match is treated as a far-field sky/cloud correspondence
+        and the resulting points feed the rotation-only Cloud solve.
+        """
+
+        return self._compute_auto_select_mountain(
+            payload, far_field_only=True, mode="cloud"
+        )
+
     def _compute_auto_select_mountain(
         self,
         payload: Mapping[str, Any] | None = None,
+        *,
+        far_field_only: bool = False,
+        mode: str = "mountain",
     ) -> dict[str, Any]:
         """Create a reviewed stereo-feature Mountain suggestion.
 
@@ -2412,6 +2499,7 @@ class OpticalPoseController:
             prior_rotation_right_from_left_rdf=prior_rotation,
             ridge_margin_fraction=self._mountain_ridge_margin_fraction,
             max_points=self._mountain_max_points,
+            far_field_only=far_field_only,
         )
         sides = {
             "left": self._auto_suggestion_side_mapping(
@@ -2432,7 +2520,7 @@ class OpticalPoseController:
         warnings = [*applicability_warnings, *result.warnings]
         if baseline_warning:
             warnings.append(f"GNSS baseline unavailable during suggestion: {baseline_warning}")
-        suggestion_id = f"auto-mountain-{uuid.uuid4().hex}"
+        suggestion_id = f"auto-{mode}-{uuid.uuid4().hex}"
         input_hashes: dict[str, str] = {}
         if profile is not None:
             input_hashes["operating_intrinsics_profile_sha256"] = profile.profile_sha256
@@ -2445,7 +2533,7 @@ class OpticalPoseController:
         suggestion = {
             "schema": "optical-pose-auto-suggestion-v1",
             "suggestion_id": suggestion_id,
-            "mode": "mountain",
+            "mode": mode,
             "state": result.state,
             "provenance_state": "AUTO_PROPOSED",
             "detection_method": result.detection_method,
@@ -2461,6 +2549,9 @@ class OpticalPoseController:
             "failure_reason": result.failure_reason or baseline_warning,
             "warnings": warnings,
             "sides": sides,
+            # Rotation-only far-field fit over every RANSAC inlier (see
+            # optical_pose_auto_select._fit_far_field_relative_rotation).
+            "relative_rotation": dict(result.metadata.get("relative_rotation") or {}),
             "source_frames": {
                 side: {
                     "frame_id": self._frozen_frames[side]["artifact"].frame_id,
@@ -2644,7 +2735,7 @@ class OpticalPoseController:
         if suggestion is None:
             raise ValueError(f"unknown automatic optical-pose suggestion: {suggestion_id}")
         mode = str(suggestion.get("mode") or "").lower()
-        if mode == "mountain":
+        if mode in {"mountain", "cloud"}:
             accepted = self._validated_mountain_suggestion_for_acceptance(
                 suggestion, payload
             )
@@ -2676,7 +2767,25 @@ class OpticalPoseController:
                 "annotation_review": self._annotation_review,
             },
         )
+        self._persist_accepted_suggestion_alignment_row(accepted)
         return self.workstation_optical_pose_snapshot()
+
+    def _persist_accepted_suggestion_alignment_row(self, accepted: Mapping[str, Any]) -> None:
+        """Append one compact ``alignment`` row for an accepted suggestion.
+
+        Acceptance used to live only in memory plus one bulky run event, so
+        nothing reached ``alignment.jsonl`` or the ``04_Alignment`` sheet.
+        The row carries the evidence needed to audit a Measurement's camera
+        relative rotation without re-parsing the event payload.
+        """
+
+        writer = getattr(self.panel, "append_workstation_data", None)
+        if not callable(writer):
+            return
+        try:
+            writer("alignment", accepted_suggestion_alignment_row(accepted), priority=True)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            pass
 
     @staticmethod
     def _annotation_mappings_from_suggestion(
@@ -2688,6 +2797,7 @@ class OpticalPoseController:
         annotation_key = {
             "horizon": "horizon_line",
             "mountain": "ridge_polyline",
+            "cloud": "ridge_polyline",
         }.get(mode)
         if annotation_key is None:
             return {}
@@ -3332,12 +3442,48 @@ class OpticalPoseController:
                 "left_fix_type": left_fix_type,
                 "right_fix_type": right_fix_type,
                 "minimum_fix_type": _MOUNTAIN_MINIMUM_GNSS_FIX_TYPE,
-                "apply_eligible": apply_eligible,
-                "translation_gate_reasons": list(gate_reasons),
+                "apply_eligible": True,
+                "translation_gate_reasons": [],
+                "quality_warnings": list(gate_reasons),
+                "quality_passed": apply_eligible,
                 "coordinate_contract": "right GNSS antenna minus left GNSS antenna; world NED metres",
             }
         )
         return baseline_ned, details
+
+    def _frozen_pair_simultaneity(self) -> tuple[bool | None, float | None, str]:
+        """Return (verified, |right-left| delta s, reason) for the frozen pair.
+
+        ``verified`` is ``True`` when both artifacts share the app-receive
+        clock and the delta is within ``CLOUD_FRAME_PAIR_MAX_DELTA_S``,
+        ``False`` when the delta is known and exceeds it, and ``None`` when
+        the clock domain cannot be confirmed (evidence only, not a gate).
+        """
+
+        artifacts = []
+        for side in ("left", "right"):
+            row = self._frozen_frames.get(side)
+            artifact = row.get("artifact") if isinstance(row, Mapping) else None
+            if artifact is None:
+                return None, None, f"{side} frozen artifact unavailable"
+            artifacts.append(artifact)
+        left_artifact, right_artifact = artifacts
+        if not (
+            _frame_clock_domain_verified(left_artifact)
+            and _frame_clock_domain_verified(right_artifact)
+        ):
+            return None, None, "frame clock domain not confirmed as app-receive"
+        try:
+            delta_s = abs(float(right_artifact.timestamp_s) - float(left_artifact.timestamp_s))
+        except (TypeError, ValueError):
+            return None, None, "frame timestamps unavailable"
+        if not math.isfinite(delta_s):
+            return None, None, "frame timestamps non-finite"
+        if delta_s > CLOUD_FRAME_PAIR_MAX_DELTA_S:
+            return False, delta_s, (
+                f"left/right frame delta {delta_s:.3f}s exceeds {CLOUD_FRAME_PAIR_MAX_DELTA_S:.3f}s"
+            )
+        return True, delta_s, ""
 
     @staticmethod
     def _resolve_mountain_lever_arm(
@@ -3366,6 +3512,30 @@ class OpticalPoseController:
         self,
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
+        """Build metric stereo R,t from GNSS and paired Mountain ``(u,v)`` clicks."""
+
+        return self._solve_gnss_mountain(payload, rotation_only=False)
+
+    def solve_workstation_optical_pose_cloud_rotation(
+        self,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Rotation-only Cloud solve from far-field sky/cloud correspondences.
+
+        Same paired ridge-annotation ``(u,v)`` inputs and Mountain rotation
+        solver, but the candidate never observes translation (the Cloud
+        measurement method fills N/E/D from live GNSS) and the frozen pair
+        must be simultaneous for the rotation to be apply-eligible.
+        """
+
+        return self._solve_gnss_mountain(payload, rotation_only=True)
+
+    def _solve_gnss_mountain(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        rotation_only: bool,
+    ) -> dict[str, Any]:
         """Build metric stereo R,t from GNSS and paired Mountain ``(u,v)`` clicks.
 
         No GeoTIFF, terrain height, or 3-D object correspondence is used.
@@ -3380,7 +3550,11 @@ class OpticalPoseController:
         """
 
         profile, _applicability = self._require_frozen_intrinsics()
-        priors = self._resolve_prior_poses(payload, prefer_frozen=True)
+        from Workstation.workstation_core.optical_yaw90_reference import reference_poses, canonical_evidence
+        reference = copy.deepcopy(self._frozen_yaw90_reference)
+        if reference is None:
+            raise RuntimeError("Yaw90 capture reference missing; capture again with P1/GNSS inputs")
+        priors = reference_poses(reference)
         annotations = self._annotation_root(payload)
         points_by_side: dict[str, tuple[tuple[float, float], ...]] = {}
         input_hashes: list[tuple[str, str]] = [
@@ -3417,7 +3591,14 @@ class OpticalPoseController:
         self._validate_mountain_point_distribution(left_points, side="left")
         self._validate_mountain_point_distribution(right_points, side="right")
 
-        baseline_ned, gnss_details = self._resolve_gnss_baseline_for_mountain(payload)
+        baseline_ned = tuple(reference["baseline_ned_m"])
+        gnss_details = {
+            "source": "yaw90_capture_reference", "reference_sha256": reference["sha256"],
+            "ned_m": list(baseline_ned), "baseline_m": math.sqrt(sum(v*v for v in baseline_ned)),
+            "apply_eligible": True, "quality_warnings": reference["warnings"],
+            "fix_quality": "RTK_FIXED" if all((reference["gps"][s] or {}).get("fix_type") == 6 for s in ("left", "right")) else "DEGRADED",
+            **{f"{s}_{k}": (reference["gps"][s] or {}).get(k) for s in ("left", "right") for k in ("fix_type", "rtk_label")},
+        }
         baseline_left_rdf = _matvec(
             _mat_transpose(priors[0].rotation_ned_from_camera_rdf),
             baseline_ned,
@@ -3437,7 +3618,7 @@ class OpticalPoseController:
         prior_stereo = stereo_pose_from_absolute(*priors)
         left = priors[0]
         left_anchor_sha256 = _payload_sha256(_pose_mapping(left))
-        rotation_config = MountainRotationConfig()
+        rotation_config = MountainRotationConfig(quality_advisory=True)
         try:
             solve = solve_mountain_relative_rotation_robust(
                 left_bearings_rdf=left_bearings,
@@ -3470,6 +3651,14 @@ class OpticalPoseController:
         ) ** 0.25
         rotation_apply_eligible = bool(solve.apply_eligible)
         gnss_apply_eligible = bool(gnss_details.get("apply_eligible"))
+        sync_verified: bool | None = None
+        sync_delta_s: float | None = None
+        sync_reason = ""
+        if rotation_only:
+            gnss_apply_eligible = False
+            sync_verified, sync_delta_s, sync_reason = self._frozen_pair_simultaneity()
+            if sync_verified is False:
+                rotation_apply_eligible = False
         observable = PoseDofMask(
             roll_deg=rotation_apply_eligible,
             pitch_deg=rotation_apply_eligible,
@@ -3497,17 +3686,35 @@ class OpticalPoseController:
                 ("gnss_baseline_sha256", _payload_sha256(gnss_details)),
                 ("left_anchor_pose_sha256", left_anchor_sha256),
                 ("lever_arm_status", lever_arm_status),
-                ("pose_component_sources.left_rotation", "prior_anchor"),
-                ("pose_component_sources.left_position", "prior_anchor"),
-                ("pose_component_sources.relative_rotation", "mountain_correspondences"),
-                ("pose_component_sources.relative_translation", "capture_gnss_baseline"),
+                ("pose_component_sources.left_rotation", "capture_gnss_yaw90_p1_roll_pitch_assumed"),
+                ("pose_component_sources.left_position", "capture_P1_local_origin_assumed"),
+                (
+                    "pose_component_sources.relative_rotation",
+                    "cloud_far_field_correspondences" if rotation_only else "mountain_correspondences",
+                ),
+                (
+                    "pose_component_sources.relative_translation",
+                    "not_applied_rotation_only" if rotation_only else "capture_gnss_baseline",
+                ),
                 ("pose_component_sources.right_rotation", "derived"),
                 ("pose_component_sources.right_position", "derived"),
                 ("pose_component_sources.lever_arm", lever_arm_status),
             )
         )
+        if rotation_only:
+            input_hashes.append(
+                (
+                    "frame_pair_simultaneity",
+                    "VERIFIED" if sync_verified else "EXCEEDED" if sync_verified is False else "UNVERIFIED",
+                )
+            )
         warnings: list[str] = [
-            "GNSS is authoritative for right-minus-left metric translation in world NED",
+            (
+                "Cloud candidate is rotation-only: translation is never applied; the Cloud "
+                "measurement method fills N/E/D from live GNSS"
+                if rotation_only
+                else "GNSS is authoritative for right-minus-left metric translation in world NED"
+            ),
             "Mountain uses only same-order left/right frozen u,v clicks; no GeoTIFF or terrain height",
             "relative R is conditioned on the selected Left absolute anchor; changing the anchor "
             "changes/invalidates this candidate even for identical pixels and GNSS baseline",
@@ -3520,7 +3727,28 @@ class OpticalPoseController:
                 "proxy with zero correction; this is an assumption, not a measurement"
             ),
         ]
-        if not gnss_apply_eligible:
+        warnings.extend(solve.quality_warnings)
+        warnings.extend(gnss_details.get("quality_warnings", ()))
+        warnings.append("gate_policy=mountain-cloud-availability-v1; quality thresholds are advisory")
+        input_hashes.append(("gate_policy", "mountain-cloud-availability-v1"))
+        input_hashes.extend((("yaw90_reference_sha256", reference["sha256"]),
+                             ("reference_source", "capture_gnss_yaw90_p1_roll_pitch")))
+        warnings.extend(reference["assumptions"])
+        if rotation_only:
+            warnings.append(
+                "correspondences are far-field sky/cloud texture with no ridge bias; the "
+                "GNSS baseline direction only conditions the rotation fit"
+            )
+            if sync_verified is True:
+                warnings.append(
+                    f"frame pair simultaneity VERIFIED: |right-left| = {sync_delta_s:.3f}s "
+                    f"<= {CLOUD_FRAME_PAIR_MAX_DELTA_S:.3f}s"
+                )
+            elif sync_verified is False:
+                warnings.append(f"frame pair simultaneity EXCEEDED: {sync_reason}; rotation not apply-eligible")
+            else:
+                warnings.append(f"frame pair simultaneity UNVERIFIED: {sync_reason}")
+        elif not gnss_apply_eligible:
             warnings.append(
                 "GNSS + Mountain translation requires fix_type >= 3 (3D fix or better) on "
                 "both Left and Right; "
@@ -3532,14 +3760,19 @@ class OpticalPoseController:
             and str(gnss_details.get("right_rtk_label") or "").upper() == "RTK_FIXED"
         ):
             warnings.append(
-                "GNSS + Mountain translation accepted with 3D fix or better without "
+                "GNSS + Mountain translation accepted from finite capture positions without "
                 "RTK_FIXED on both sides; the Mountain measurement remains ESTIMATED; "
                 f"left={gnss_details.get('left_rtk_label')} "
                 f"right={gnss_details.get('right_rtk_label')}"
             )
         if not rotation_apply_eligible:
+            reasons = list(solve.ineligibility_reasons)
+            if rotation_only and sync_verified is False:
+                reasons.append(sync_reason)
             warnings.append(
-                "Mountain rotation is not apply-eligible: " + "; ".join(solve.ineligibility_reasons)
+                ("Cloud" if rotation_only else "Mountain")
+                + " rotation is not apply-eligible: "
+                + "; ".join(reasons)
             )
         uncertainty: list[tuple[str, float]] = []
         if math.isfinite(solve.jacobian_condition):
@@ -3555,6 +3788,8 @@ class OpticalPoseController:
             ("gnss_baseline_m", float(gnss_details["baseline_m"])),
             ("gnss_minimum_fix_type", float(_MOUNTAIN_MINIMUM_GNSS_FIX_TYPE)),
         ]
+        if rotation_only and sync_delta_s is not None:
+            quality.append(("frame_pair_delta_s", float(sync_delta_s)))
         for side in ("left", "right"):
             fix_type = gnss_details.get(f"{side}_fix_type")
             if fix_type is not None:
@@ -3571,11 +3806,16 @@ class OpticalPoseController:
         else:
             warnings.append("Sampson residual metrics are unavailable (non-finite; too few inliers)")
         candidate = OpticalPoseCandidate(
-            candidate_id=f"gnss-mountain-uv-{uuid.uuid4().hex}",
-            method="gnss-constrained-mountain-uv",
+            candidate_id=(
+                f"cloud-rotation-{uuid.uuid4().hex}"
+                if rotation_only
+                else f"gnss-mountain-uv-{uuid.uuid4().hex}"
+            ),
+            method="cloud-far-field-rotation" if rotation_only else "gnss-constrained-mountain-uv",
+            reference_evidence_json=canonical_evidence(reference),
             left_pose_ned=left,
             right_pose_ned=right,
-            optimized_dofs=_ALL_DOF,
+            optimized_dofs=_ROTATION_DOF if rotation_only else _ALL_DOF,
             observability=_mask_observability(observable),
             source_observation_ids=tuple(
                 dict.fromkeys((*source_ids, f"gnss-baseline:{_payload_sha256(gnss_details)}"))
@@ -4459,6 +4699,11 @@ class OpticalPoseController:
                     else "BLOCKED · " + ", ".join(intrinsics["applicability"]["reasons"])
                 ),
                 "base_extrinsics": "LOADED" if selected_extrinsics is not None else "NOT SELECTED",
+                "yaw90_reference": (
+                    "GNSS Yaw90 · 촬영 시 고정 · " + str(self._frozen_yaw90_reference.get("state"))
+                    + " · " + "; ".join(self._frozen_yaw90_reference.get("blocking_reasons", ()))
+                    if self._frozen_yaw90_reference else "촬영 요청 시 P1/GNSS 기준 필요"
+                ),
                 "terrain": terrain_state,
                 "mountain_uv": mountain_uv_state,
                 "target_reference": (
@@ -4475,6 +4720,7 @@ class OpticalPoseController:
             # Persistent identity/path projection; unlike the UI frame keys,
             # this is safe to store in session_static.json.
             "frozen_frame_artifacts": frozen_frame_artifacts,
+            "yaw90_reference": copy.deepcopy(self._frozen_yaw90_reference),
             "candidates": candidate_rows,
             "selection_history": [selection.selection_id for selection in self._selection_history],
             # Automatic proposals are audit/UI evidence only.  They contain
@@ -5098,6 +5344,9 @@ class OpticalPoseController:
                 "operating_intrinsics_profile_sha256": operating_profile.profile_sha256,
                 "previous_profile_id": selection.previous_profile_id,
                 "coordinate_contract": "OpenCV optical RDF; X_right=R_right_from_left*X_left+T metres",
+                **({"yaw90_reference": json.loads(candidate.reference_evidence_json),
+                    "left_pose": _pose_mapping(poses[0]), "right_pose": _pose_mapping(poses[1])}
+                   if candidate.reference_evidence_json else {}),
             },
         )
         active_intrinsics = compose_stereo_calibration(current_intrinsics, profile)
@@ -5206,3 +5455,57 @@ __all__ = [
     "OpticalPoseAutoSelectJob",
     "OpticalPoseController",
 ]
+
+
+_SUGGESTION_MODE_METHOD_IDS = {
+    "mountain": "mountain_gnss",
+    "cloud": "cloud_gnss",
+    "horizon": "horizon_hybrid",
+}
+
+
+def accepted_suggestion_alignment_row(accepted: Mapping[str, Any]) -> dict[str, Any]:
+    """Flat ``alignment`` stream row describing one accepted auto suggestion."""
+
+    mode = str(accepted.get("mode") or "").lower()
+    rotation = accepted.get("relative_rotation")
+    rotation = rotation if isinstance(rotation, Mapping) else {}
+    frames = accepted.get("source_frames")
+    frames = frames if isinstance(frames, Mapping) else {}
+    hashes = accepted.get("input_hashes")
+    hashes = hashes if isinstance(hashes, Mapping) else {}
+    baseline = accepted.get("gnss_baseline")
+    baseline = baseline if isinstance(baseline, Mapping) else {}
+
+    def _frame_sha(side: str) -> str:
+        value = frames.get(side)
+        return str(value.get("image_sha256") or "") if isinstance(value, Mapping) else ""
+
+    return {
+        "schema": "workstation-alignment-event-v1",
+        "event_type": "optical_pose_auto_suggestion_accepted",
+        "updated_utc_ns": int(accepted.get("accepted_utc_ns") or time.time_ns()),
+        "method_id": _SUGGESTION_MODE_METHOD_IDS.get(mode, ""),
+        "mode": mode,
+        "source": str(accepted.get("suggestion_id") or ""),
+        "source_sha256": str(hashes.get("gnss_baseline_sha256") or ""),
+        "state": accepted.get("state"),
+        "detection_method": accepted.get("detection_method"),
+        "inlier_count": accepted.get("inlier_count"),
+        "match_count": accepted.get("match_count"),
+        "residual_px": accepted.get("residual_px"),
+        "confidence": accepted.get("confidence"),
+        "eligible": accepted.get("eligible"),
+        "relative_rotation_available": bool(rotation.get("available")),
+        "relative_yaw_right_minus_left_deg": rotation.get("yaw_right_minus_left_deg"),
+        "relative_pitch_right_minus_left_deg": rotation.get("pitch_right_minus_left_deg"),
+        "relative_roll_right_minus_left_deg": rotation.get("roll_right_minus_left_deg"),
+        "relative_fit_inlier_count": rotation.get("fit_inlier_count"),
+        "relative_fit_residual_px": rotation.get("fit_residual_px"),
+        "far_field_du_median_px": rotation.get("far_field_du_median_px"),
+        "far_field_dv_median_px": rotation.get("far_field_dv_median_px"),
+        "left_image_sha256": _frame_sha("left"),
+        "right_image_sha256": _frame_sha("right"),
+        "gnss_baseline_m": baseline.get("baseline_m"),
+        "gnss_baseline_fix_quality": baseline.get("fix_quality"),
+    }

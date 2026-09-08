@@ -191,3 +191,71 @@ def test_recording_owner_to_real_store_publishes_exact_jsonl(tmp_path, monkeypat
     assert row["p2_source_selection"] == "GPS2"
     assert row["schema"] == "workstation-measurement-data-record-v1"
     assert store.snapshot()["streams"]["gnss.baseline.center"]["written_records"] == 1
+
+
+def test_frozen_gnss_position_is_logged_with_utc_based_cause(monkeypatch) -> None:
+    """Age resets on every packet, so a producer repeating one position must
+    be called out in the log, and the UTC field must say which side froze."""
+
+    from Workstation import sensor_presentation_controller as module
+    from dataclasses import replace
+
+    logs: list[str] = []
+    panel = SimpleNamespace(
+        latest_gps={},
+        gnss_monitor=SimpleNamespace(update_position=lambda *_args: None),
+        baseline_gps_rate_history={},
+        _fmt_record_float=lambda value, _digits: value,
+        _record_external_timeline_row=lambda *_args: None,
+        _record_gnss_baseline_center=lambda *_args: None,
+        _telemetry_source_label=lambda topic: topic,
+        _refresh_rtk_baseline=lambda: None,
+        _refresh_baseline_alignment_ui=lambda: None,
+        _refresh_gnss_base_tab=lambda: None,
+        _refresh_gnss_operation_readiness=lambda: None,
+        _append_baseline_sample_if_active=lambda: None,
+        _refresh_distance=lambda: None,
+        _log=logs.append,
+    )
+    clock = [500.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    controller = module.SensorPresentationController(panel)
+    threshold = module.GNSS_FROZEN_POSITION_PACKETS
+
+    # Receiver output frozen: same position, UTC keeps advancing.
+    base = replace(_gps("drone", timestamp_s=10.0), gps_utc_us=1_700_000_000_000_000)
+    for index in range(threshold - 1):
+        controller._update_gps("drone", replace(base, timestamp_s=10.0 + index, gps_utc_us=base.gps_utc_us + index * 200_000))
+    assert logs == []
+    assert not getattr(panel, "_gnss_position_frozen", {})
+    controller._update_gps("drone", replace(base, timestamp_s=20.0, gps_utc_us=base.gps_utc_us + 9 * 200_000))
+    assert len(logs) == 1
+    assert "Drone GNSS 위치 고정 감지" in logs[0]
+    assert "수신기 위치 출력 정지" in logs[0]
+    # The UI-facing state is published on the panel as soon as the threshold
+    # is reached and tracks the packet count afterwards.
+    assert panel._gnss_position_frozen["drone"]["packets"] == threshold
+    assert panel._gnss_position_frozen["drone"]["utc_frozen"] is False
+    assert panel._gnss_position_frozen["drone"]["since_s"] == 10.0
+    assert panel._gnss_position_frozen["drone"]["fix_type"] == 6
+    assert panel._gnss_position_frozen["drone"]["satellites"] == 20
+    assert panel._gnss_position_frozen["drone"]["ground_speed_m_s"] is None
+    assert "fix=6 sats=20 vel=--" in logs[0]
+
+    # Rate limited while the position stays frozen.
+    controller._update_gps("drone", replace(base, timestamp_s=21.0, gps_utc_us=base.gps_utc_us + 10 * 200_000))
+    assert len(logs) == 1
+
+    assert panel._gnss_position_frozen["drone"]["packets"] == threshold + 1
+
+    # A moving position resets the watch and clears the published state.
+    moved = replace(base, latitude_deg=base.latitude_deg + 1e-6, timestamp_s=22.0)
+    controller._update_gps("drone", moved)
+    assert "drone" not in panel._gnss_position_frozen
+    clock[0] += module.GNSS_FROZEN_LOG_INTERVAL_S
+    # Autopilot re-sending one stale fix: UTC frozen too.
+    for index in range(threshold):
+        controller._update_gps("drone", replace(moved, timestamp_s=23.0 + index))
+    assert len(logs) == 2
+    assert "autopilot이 같은 fix를 재전송" in logs[1]
+    assert panel._gnss_position_frozen["drone"]["utc_frozen"] is True

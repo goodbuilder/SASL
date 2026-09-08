@@ -20,6 +20,7 @@ from Workstation.workstation_core.measurement_data_store import (
     allocate_timestamped_path,
 )
 from Workstation.workstation_core.measurement_record import MeasurementRegistry
+from Workstation.workstation_core.measurement_artifacts import measurement_path_sort_key
 from Workstation.workstation_core.measurement_workbook import MeasurementWorkbookWriter
 
 
@@ -34,9 +35,13 @@ DATA_STORAGE_CONTROLLER_METHODS = (
     "retry_data_storage",
     "allocate_workstation_data_artifact",
     "allocate_measurement_artifact",
+    "measurement_storage_context",
+    "rebuild_latest_measurement_workbook",
     "flush_workstation_data",
     "close_workstation_data",
+    "archive_session_recordings",
     "measurement_registry",
+    "measurement_results_snapshot",
     "measurement_workbook_snapshot",
     "latest_measurement_workbook_path",
     "finalize_measurement_workbooks",
@@ -52,7 +57,21 @@ class DataStorageController:
         self._root: Path | None = None
         self._configuration_error = ""
         self._workbook_writer: MeasurementWorkbookWriter | None = None
-        self._registry = MeasurementRegistry(data_root_provider=self._configured_root)
+        self._registry = MeasurementRegistry(
+            data_root_provider=self._configured_root,
+            per_run_storage=True,
+            context_started=self._start_storage_context,
+            context_stopped=lambda measurement_id: self.store.finish_measurement(measurement_id),
+            journal_sink=lambda payload: self.append_workstation_data("measurement.journal", payload, priority=True),
+        )
+        self._rebuild_thread: threading.Thread | None = None
+        self._rebuild_error = ""
+        self._repair_thread: threading.Thread | None = None
+        self._repair_errors: dict[str, str] = {}
+
+    def _start_storage_context(self, context) -> None:
+        self._rebuild_error = ""
+        self.store.register_measurement(context)
 
     def _default_root(self) -> Path:
         configured = getattr(
@@ -146,9 +165,25 @@ class DataStorageController:
 
     def measurement_registry(self) -> MeasurementRegistry:
         if self._workbook_writer is None:
-            self._workbook_writer = MeasurementWorkbookWriter()
+            self._workbook_writer = MeasurementWorkbookWriter(source_storage_reader=self._source_storage_for_workbook)
             self._registry.set_writer(self._workbook_writer)
         return self._registry
+
+    def measurement_results_snapshot(self, measurement_id=None, pair_id=None):
+        """Read existing records without starting the workbook writer or storage."""
+        return self._registry.results_snapshot(measurement_id, pair_id)
+
+    def _source_storage_for_workbook(self, measurement_id: str) -> dict[str, Any]:
+        checkpoint = self.store.export_checkpoint(timeout_s=1.0, measurement_id=measurement_id)
+        snapshot = checkpoint.storage_snapshot
+        streams = {
+            value["stream"]: value for value in snapshot.get("stream_instances", {}).values()
+            if value.get("measurement_id") == measurement_id
+        }
+        degraded = any(v.get("state") == "FAILED" or v.get("dropped_records") or (v.get("csv") or {}).get("state") == "FAILED" or (v.get("csv") or {}).get("dropped_records") for v in streams.values())
+        state = "DEGRADED" if degraded else "OK"
+        return {"state": state if checkpoint.settled else "PENDING", "streams": streams,
+                "pending_records": checkpoint.pending_before_cutoff, "settled": checkpoint.settled}
 
     def append_workstation_data(
         self,
@@ -168,6 +203,18 @@ class DataStorageController:
     def data_storage_snapshot(self) -> dict[str, Any]:
         try:
             snapshot = self.store.snapshot()
+            from Workstation.workstation_core.measurement_csv_mirror import failed_mirrors
+            external = {str(path): error for path, error in failed_mirrors().items() if path.is_relative_to(self._configured_root())}
+            external.update(self._repair_errors)
+            if external:
+                snapshot["state"] = "DEGRADED"
+                for name, error in external.items():
+                    path = Path(name)
+                    snapshot["streams"][f"rtcm/{path.stem}"] = {
+                        "path": str(path), "state": "ACTIVE", "dropped_records": 0,
+                        "last_error": "", "csv": {"path": str(path.with_suffix('.csv')), "state": "FAILED", "last_error": error, "dropped_records": 0},
+                    }
+            snapshot["csv_repairing"] = self._repair_thread is not None and self._repair_thread.is_alive()
             if self._configuration_error:
                 snapshot = dict(snapshot)
                 snapshot["configuration_error"] = self._configuration_error
@@ -195,7 +242,29 @@ class DataStorageController:
             self.store.retry_failed()
         except (OSError, TypeError, ValueError):
             pass
+        self._retry_external_mirrors()
         return self.data_storage_snapshot()
+
+    def _retry_external_mirrors(self) -> None:
+        if self._registry.current() is not None or bool(getattr(self.panel, "_manual_recording_active", False)):
+            return  # the active RTCM owner retries its own mirror on the next row
+        if self._repair_thread is not None and self._repair_thread.is_alive():
+            return
+        root = self._configured_root()
+        def repair() -> None:
+            from Workstation.workstation_core.measurement_csv_mirror import failed_mirrors, repair_owned_jsonl_mirror
+            journals = sorted(root.glob("*/raw/*_measurement_journal.*"), key=measurement_path_sort_key)
+            paths = set(journals[-1].parent.parent.glob("raw/gnss/*.rtcm.jsonl")) if journals else set()
+            paths.update(path for path in failed_mirrors() if path.is_relative_to(root))
+            errors = {}
+            for path in paths:
+                try:
+                    repair_owned_jsonl_mirror(path)
+                except Exception as exc:
+                    errors[str(path)] = str(exc)
+            self._repair_errors = errors
+        self._repair_thread = threading.Thread(target=repair, name="measurement-csv-repair", daemon=True)
+        self._repair_thread.start()
 
     def allocate_workstation_data_artifact(
         self,
@@ -204,7 +273,11 @@ class DataStorageController:
         label: str,
         suffix: str,
         utc_ns: int | None = None,
+        measurement_id: str | None = None,
     ) -> Path:
+        context = self._artifact_context(measurement_id)
+        if context is not None:
+            return context.allocate(category, label, suffix)
         return allocate_timestamped_path(
             self._configured_root(),
             category,
@@ -213,9 +286,29 @@ class DataStorageController:
             utc_ns=utc_ns,
         )
 
-    def allocate_measurement_artifact(self, *, label: str, suffix: str) -> Path | None:
+    def _artifact_context(self, measurement_id: str | None = None):
+        registry = getattr(self, "_registry", None)
+        if registry is None:
+            return None
+        if measurement_id is None:
+            record = registry.current()
+            if record is None or not record.running:
+                return None
+            measurement_id = record.measurement_id
+        return registry.context_for(measurement_id)
+
+    def measurement_storage_context(self, measurement_id: str | None = None) -> dict[str, Any]:
+        context = self._artifact_context(measurement_id)
+        return {} if context is None else {**context.metadata(), "root": str(context.root)}
+
+    def allocate_measurement_artifact(self, *, label: str, suffix: str, measurement_id: str | None = None) -> Path | None:
         """``<root>/<measurement prefix>_<label>[-NN]<suffix>`` for the running Measurement."""
 
+        context = self._artifact_context(measurement_id)
+        if context is not None:
+            return context.allocate("media", label, suffix)
+        if measurement_id is not None:
+            return None
         record = self._registry.current()
         if record is None or not record.running or not record.file_prefix:
             return None
@@ -256,12 +349,47 @@ class DataStorageController:
         root = self._configured_root()
         try:
             candidates = sorted(
-                (path for path in root.glob(f"*{MEASUREMENT_WORKBOOK_SUFFIX}") if path.is_file()),
-                key=lambda path: path.name,
+                (path for pattern in (f"*{MEASUREMENT_WORKBOOK_SUFFIX}", f"*/*{MEASUREMENT_WORKBOOK_SUFFIX}") for path in root.glob(pattern) if path.is_file()),
+                key=measurement_path_sort_key,
             )
         except OSError:
             return None
         return candidates[-1] if candidates else None
+
+    def rebuild_latest_measurement_workbook(self) -> bool:
+        """Queue a rebuild from saved input only; never block the Qt thread."""
+        if self._registry.current() is not None:
+            return False
+        if self._registry.pending_job_count() or any(r.pending_method_count() for r in self._registry.records()):
+            return False
+        if bool(getattr(self.panel, "_manual_recording_active", False)):
+            return False
+        if self._workbook_writer is not None and self._workbook_writer.snapshot().get("state") == "WRITING":
+            return False
+        if self._rebuild_thread is not None and self._rebuild_thread.is_alive():
+            return False
+        root = self._configured_root()
+        journals = sorted({p.with_suffix(".jsonl") for pattern in ("*/raw/*_measurement_journal.jsonl", "*/raw/*_measurement_journal.csv") for p in root.glob(pattern)}, key=measurement_path_sort_key)
+        if not journals:
+            self._rebuild_error = "재생성할 Measurement 원본 기록이 없습니다."
+            return False
+        source = journals[-1]
+        self._rebuild_error = ""
+
+        def rebuild() -> None:
+            from Workstation.workstation_core.measurement_journal import load_measurement_record
+            from Workstation.workstation_core.measurement_workbook import write_measurement_workbook
+            try:
+                if self._store is not None and self._store.alive:
+                    self._store.export_checkpoint(timeout_s=5.0)
+                record = load_measurement_record(source)
+                write_measurement_workbook(record.snapshot(), record.workbook_path)
+            except Exception as exc:
+                self._rebuild_error = f"{type(exc).__name__}: {exc}"
+
+        self._rebuild_thread = threading.Thread(target=rebuild, name="measurement-workbook-rebuild", daemon=True)
+        self._rebuild_thread.start()
+        return True
 
     def measurement_workbook_snapshot(self) -> dict[str, Any]:
         writer = self._workbook_writer
@@ -269,6 +397,8 @@ class DataStorageController:
         latest = self.latest_measurement_workbook_path()
         writer_status = {} if writer is None else writer.snapshot()
         state = str(writer_status.get("state") or "IDLE")
+        if state == "IDLE" and latest is not None:
+            state = "READY"
         pending_jobs = sum(int(row.get("pending_method_jobs") or 0) for row in registry_status["records"])
         return {
             "schema": MEASUREMENT_WORKBOOK_STATUS_SCHEMA,
@@ -284,6 +414,8 @@ class DataStorageController:
             "failure_count": int(writer_status.get("failure_count") or 0),
             "writer_alive": bool(writer_status.get("writer_alive", False)),
             "recording_active": bool(registry_status["current_measurement_id"]),
+            "rebuilding": self._rebuild_thread is not None and self._rebuild_thread.is_alive(),
+            "rebuild_error": self._rebuild_error,
         }
 
     def flush_workstation_data(self) -> bool:
@@ -312,8 +444,93 @@ class DataStorageController:
         self._registry.set_writer(None)
         return bool(closed)
 
+    def archive_session_recordings(self) -> bool:
+        """Move this session's files under ``<root>/<YYYYMMDD_HHMMSS>/`` after close.
+
+        Every writer of one process shares the store's creation token, so the
+        session is identifiable by filename. Once the store is closed the
+        token-stamped stream files, the ``frames``/``raw`` trees they reference
+        by relative path, and the run artifacts (``<prefix>_measurement.xlsx``,
+        ``<prefix>_left/right.mp4``) started during the session are renamed
+        into one folder named by the token time. Idempotent: an already
+        archived session (or nothing to move) returns ``True``; an open store
+        returns ``False`` so the lifecycle retries after ``close``.
+        """
+
+        store = self._store
+        if store is None or not bool(getattr(store, "timestamped_filenames", False)):
+            return True
+        stamp = str(getattr(store, "file_stamp", "") or "")
+        if len(stamp) < 15:
+            return True
+        try:
+            lifecycle = str((store.snapshot() or {}).get("lifecycle_state") or "").upper()
+        except (OSError, RuntimeError, TypeError, ValueError):
+            lifecycle = ""
+        if lifecycle == "OPEN":
+            return False
+        root = Path(getattr(store, "root", self._root or self._configured_root()))
+        folder_name = stamp[:15]
+        target = root / folder_name
+        moved: list[str] = []
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            return True
+
+        def _move(source: Path, destination: Path) -> None:
+            if destination.exists():
+                return
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            source.rename(destination)
+            moved.append(source.name)
+
+        try:
+            for entry in entries:
+                name = entry.name
+                if entry.is_dir():
+                    if name in {"frames", "raw"}:
+                        _move(entry, target / name)
+                    continue
+                if not entry.is_file():
+                    continue
+                if f"_{stamp}." in name or name.endswith(f"_{stamp}"):
+                    _move(entry, target / name)
+                    continue
+                prefix = name[:15]
+                if (
+                    len(name) > 16
+                    and prefix[:8].isdigit()
+                    and prefix[8] == "_"
+                    and prefix[9:15].isdigit()
+                    and prefix >= folder_name
+                    and name[15] in "_-"
+                ):
+                    run_dir = target / "runs" / prefix
+                    _move(entry, run_dir / name)
+        except OSError as exc:
+            logger = getattr(self.panel, "_log", None)
+            if callable(logger):
+                logger(f"[저장] 세션 폴더 정리 실패 ({folder_name}): {exc}")
+            return False
+        if moved:
+            logger = getattr(self.panel, "_log", None)
+            if callable(logger):
+                logger(f"[저장] 세션 파일 {len(moved)}개를 {target} 아래로 정리했습니다")
+        return True
+
     def close_workstation_data(self, *, timeout_s: float = 2.0) -> bool:
         deadline = time.monotonic() + max(0.0, float(timeout_s))
+        repair = getattr(self, "_repair_thread", None)
+        if repair is not None and repair.is_alive():
+            repair.join(timeout=max(0.0, deadline - time.monotonic()))
+            if repair.is_alive():
+                return False
+        rebuild = getattr(self, "_rebuild_thread", None)
+        if rebuild is not None and rebuild.is_alive():
+            rebuild.join(timeout=max(0.0, deadline - time.monotonic()))
+            if rebuild.is_alive():
+                return False
         workbooks_closed = self.finalize_measurement_workbooks(
             timeout_s=max(0.0, deadline - time.monotonic())
         )

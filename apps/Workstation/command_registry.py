@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 from typing import Callable, Any
 
@@ -76,7 +77,13 @@ class CommandRegistry(QtCore.QObject):
         try:
             result = spec.handler()
         except Exception as exc:  # pragma: no cover - defensive UI boundary.
-            self.failed.emit(command_id, str(exc))
+            # The status bar shows the message for a few seconds only; keep
+            # the traceback on stderr (captured into run.log) so a silently
+            # failing operator command can be diagnosed afterwards.
+            logging.getLogger(__name__).error(
+                "command %s failed: %s: %s", command_id, type(exc).__name__, exc, exc_info=True
+            )
+            self.failed.emit(command_id, f"{type(exc).__name__}: {exc}")
             return False
         if result is False:
             self.failed.emit(command_id, "handler rejected command")

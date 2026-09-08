@@ -29,6 +29,8 @@ from Workstation.workstation_core.mavlink_liveness import (
     MavlinkSideLiveness,
 )
 from Workstation.workstation_core.pixhawk_radio_policy import (
+    RADIO_MINIMAL_STREAM_REQUESTS,
+    RADIO_MINIMAL_DISABLED_MESSAGE_IDS,
     RadioStreamPolicy,
     RadioStreamTier,
     radio_stream_requests,
@@ -440,6 +442,12 @@ MAVLINK_GCS_SOURCE_SYSTEM = 255
 MAVLINK_GCS_SOURCE_COMPONENT = 190
 MAVLINK_GCS_HEARTBEAT_INTERVAL_S = 1.0
 MAVLINK_COMMAND_RECEIVE_POLL_S = 0.05
+# A PX4 NSH reply is complete once the prompt comes back or the link goes
+# quiet. Waiting out the full command timeout instead kept the per-side
+# MAVLink send lock busy for ~4.5 s per shell command (6 commands per
+# sensor_mag poll cycle), which starved RTCM injection on the same link.
+MAVLINK_SHELL_OUTPUT_IDLE_S = 0.5
+_NSH_PROMPT_TAIL_RE = re.compile(r"nsh>\s*(?:\x1b?\[[0-9;]*[A-Za-z]\s*)*$")
 MAVLINK_RTCM_STATUS_INTERVAL_S = 5.0
 MAVLINK_EXPECTED_SYSTEM_IDS = {"left": 1, "right": 2, "drone": 3}
 MAVLINK_BOOT_TIME_UINT32_MODULUS = 1 << 32
@@ -1485,15 +1493,20 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
     def radio_status_snapshot(self, side: str) -> RadioStatusState | None:
         return self._radio_status.get(str(side))
 
+    def _uses_minimal_radio_profile(self, camera: str) -> bool:
+        return str(camera) in {"left", "right"} and self.transports.get(str(camera)) == "radio"
+
     def _active_stream_requests(self, camera: str) -> tuple[tuple[str, float], ...]:
         if self.transports.get(str(camera)) != "radio":
             return MAVLINK_STOCK_STREAM_REQUESTS
+        if self._uses_minimal_radio_profile(camera):
+            return RADIO_MINIMAL_STREAM_REQUESTS
         policy = self._radio_stream_policies.setdefault(str(camera), RadioStreamPolicy())
         return radio_stream_requests(policy.tier)
 
     def _advance_radio_stream_policy(self, camera: str, *, now_s: float) -> None:
         camera = str(camera)
-        if self.transports.get(camera) != "radio":
+        if self.transports.get(camera) != "radio" or self._uses_minimal_radio_profile(camera):
             return
         health = self.mavlink_health_snapshot(camera, now_s=now_s)
         qualified = health.state is MavlinkLivenessState.LIVE
@@ -1541,7 +1554,10 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         # PARAM reads must reserve the receive path (see exclusive_command's
         # docstring) or spin_once's 20ms timer silently drains the
         # PARAM_VALUE response before this blocking read ever sees it.
-        with self.exclusive_command(camera):
+        # The receive path is reserved for the whole exchange, but the side's
+        # send lock is taken only for the request frame: RTCM injection and
+        # heartbeats on the same radio must not wait out a PARAM timeout.
+        with self.exclusive_command(camera, hold_send_lock=False):
             connection = self.connections[camera]
             return _mavlink_read_param_int(
                 connection,
@@ -1553,10 +1569,11 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                     connection,
                     now_s=time.monotonic(),
                 ),
+                send_lock=self._mavlink_send_locks.setdefault(camera, threading.RLock()),
             )
 
     def read_param(self, camera: str, name: str, *, timeout_s: float = 2.0) -> int | float | None:
-        with self.exclusive_command(camera):
+        with self.exclusive_command(camera, hold_send_lock=False):
             connection = self.connections[camera]
             return _mavlink_read_param(
                 connection,
@@ -1568,10 +1585,11 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                     connection,
                     now_s=time.monotonic(),
                 ),
+                send_lock=self._mavlink_send_locks.setdefault(camera, threading.RLock()),
             )
 
     def set_param_int(self, camera: str, name: str, value: int, *, timeout_s: float = 2.0) -> int | None:
-        with self.exclusive_command(camera):
+        with self.exclusive_command(camera, hold_send_lock=False):
             connection = self.connections[camera]
             actual = _mavlink_set_param_int(
                 connection,
@@ -1584,6 +1602,7 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                     connection,
                     now_s=time.monotonic(),
                 ),
+                send_lock=self._mavlink_send_locks.setdefault(camera, threading.RLock()),
             )
         if actual == int(value):
             self.status_changed.emit(f"{camera_label_ko(camera)} PX4 param 설정 확인: {name}={actual}")
@@ -1730,6 +1749,12 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         self._mavlink_stream_last_request_s[camera] = now_s
         try:
             with self._mavlink_send_locks.setdefault(camera, threading.RLock()):
+                if self._uses_minimal_radio_profile(camera):
+                    for message_id in RADIO_MINIMAL_DISABLED_MESSAGE_IDS:
+                        mav.command_long_send(
+                            target_system, target_component, command_id, 0,
+                            message_id, -1, 0, 0, 0, 0, 0,
+                        )
                 for message_name, rate_hz in requests:
                     message_id = MAVLINK_MESSAGE_IDS[message_name]
                     interval_us = int(1_000_000 / float(rate_hz))
@@ -1764,6 +1789,7 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             self._imu_stream_last_request_s[key] = now_s
             self._imu_stream_outage_reported.discard(key)
         profile = (
+            "Radio Minimal" if self._uses_minimal_radio_profile(camera) else
             f"Radio {self._radio_stream_policies[camera].tier.name}"
             if self.transports.get(camera) == "radio"
             else "Ethernet Stock"
@@ -1910,7 +1936,7 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 command_id,
                 0,
                 MAVLINK_MESSAGE_IDS["ATTITUDE"],
-                int(1_000_000 / 30.0),
+                int(1_000_000 / (5.0 if self._uses_minimal_radio_profile(camera) else 30.0)),
                 0,
                 0,
                 0,
@@ -1959,6 +1985,7 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 connection,
                 now_s=time.monotonic(),
             ),
+            send_lock=self._mavlink_send_locks.setdefault(camera, threading.RLock()),
         )
         if result.flag_label != "respond+exclusive":
             self.status_changed.emit(f"{camera_label_ko(camera)} PX4 shell fallback 사용: {result.flag_label}")
@@ -2230,6 +2257,17 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         previous = self._last_health_states.get(str(camera))
         if previous is health.state:
             return
+        if (
+            previous is MavlinkLivenessState.LIVE
+            and health.state is MavlinkLivenessState.QUALIFYING
+            and health.stall_reason == "ACTIVE_COMMAND"
+            and health.qualification_elapsed_s >= health.qualification_required_s
+        ):
+            # A qualification-preserving command (sensor_mag shell poll every
+            # 2 s) parks the model in QUALIFYING only while it owns the
+            # receive path; the side is still qualified, so logging the
+            # LIVE -> QUALIFYING -> LIVE blip twice per poll is pure noise.
+            return
         self._last_health_states[str(camera)] = health.state
         detail = ""
         if health.state is MavlinkLivenessState.INITIAL_RX_TIMEOUT:
@@ -2331,7 +2369,7 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         This method is called only from the subscriber's receive owner.  It
         never emits the persistent ``stream_setup_required`` signal and sends
         no command itself.  Clearing the ephemeral request marker lets the
-        next expected-system HEARTBEAT use the existing one-shot Stock-profile
+        next expected-system HEARTBEAT use the existing one-shot transport-profile
         path.
         """
 
@@ -2371,7 +2409,7 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         self.status_changed.emit(
             f"{camera_label_ko(camera)} PX4 재부팅 감지: ATTITUDE time_boot_ms "
             f"{evidence.previous_time_boot_ms}->{evidence.current_time_boot_ms}; "
-            "liveness 재검증/Stock stream profile 1회 재요청 대기"
+            "liveness 재검증/transport stream profile 1회 재요청 대기"
         )
         return True
 
@@ -3089,19 +3127,42 @@ def _mavlink_message_type(message: Any) -> str:
     return str(getattr(message, "type", "") or "")
 
 
+def _shell_output_ends_with_prompt(chunks: list[str]) -> bool:
+    """True when the accumulated NSH output ends with the ``nsh>`` prompt."""
+
+    return _NSH_PROMPT_TAIL_RE.search("".join(chunks[-3:])) is not None
+
+
 def _read_mavlink_shell_output(
     connection: Any,
     *,
     timeout_s: float,
     on_unmatched: Callable[[Any], None] | None = None,
     on_receive_poll: Callable[[], None] | None = None,
+    idle_timeout_s: float | None = MAVLINK_SHELL_OUTPUT_IDLE_S,
+    stop_at_prompt: bool = True,
 ) -> str:
+    """Collect SERIAL_CONTROL output until the prompt, an idle gap, or ``timeout_s``.
+
+    ``timeout_s`` stays the hard upper bound. ``idle_timeout_s`` ends the read
+    once output has started and then paused, and ``stop_at_prompt`` ends it as
+    soon as the NSH prompt is back; pass ``None``/``False`` to wait the full
+    timeout as before.
+    """
+
     recv_match = getattr(connection, "recv_match", None)
     if recv_match is None:
         return ""
     deadline = time.monotonic() + max(0.0, float(timeout_s))
     chunks: list[str] = []
+    last_output_s: float | None = None
     while time.monotonic() < deadline:
+        if (
+            idle_timeout_s is not None
+            and last_output_s is not None
+            and time.monotonic() - last_output_s >= float(idle_timeout_s)
+        ):
+            break
         if on_receive_poll is not None:
             on_receive_poll()
         message = recv_match(blocking=True, timeout=MAVLINK_COMMAND_RECEIVE_POLL_S)
@@ -3116,6 +3177,9 @@ def _read_mavlink_shell_output(
         text = _serial_control_output_from_message(message)
         if text:
             chunks.append(text)
+            last_output_s = time.monotonic()
+            if stop_at_prompt and _shell_output_ends_with_prompt(chunks):
+                break
     return "".join(chunks)
 
 
@@ -3133,10 +3197,22 @@ def _send_mavlink_shell_command(
     timeout_s: float = 0.8,
     on_unmatched: Callable[[Any], None] | None = None,
     on_receive_poll: Callable[[], None] | None = None,
+    send_lock: Any = None,
 ) -> MavlinkShellCommandResult:
+    """Run one NSH command over SERIAL_CONTROL.
+
+    ``send_lock`` (the side's re-entrant MAVLink send lock) is held only around
+    each write, never across the blocking reads, so RTCM injection and GCS
+    heartbeats on the same link keep flowing while the reply is awaited.
+    """
+
     mav = getattr(connection, "mav", None)
     if mav is None or not hasattr(mav, "serial_control_send"):
         raise RuntimeError("MAVLink serial control을 지원하지 않는 연결입니다.")
+    write_lock = send_lock if send_lock is not None else nullcontext()
+    # A multi-line payload returns one prompt per line; only a single command
+    # may treat the first prompt as the end of its reply.
+    stop_at_prompt = "\n" not in command.strip()
     mavlink = getattr(connection, "mavlink", None)
     device = _mavlink_constant(mavlink, "SERIAL_CONTROL_DEV_SHELL", 10)
     respond_flag = _mavlink_constant(mavlink, "SERIAL_CONTROL_FLAG_RESPOND", 2)
@@ -3151,7 +3227,8 @@ def _send_mavlink_shell_command(
         probe_output = ""
         for label, flags in variants:
             # Opening the shell first matters on PX4 NSH links that only respond after a read request.
-            mav.serial_control_send(device, flags, 0, 0, 0, [0] * 70)
+            with write_lock:
+                mav.serial_control_send(device, flags, 0, 0, 0, [0] * 70)
             output = _read_mavlink_shell_output(
                 connection,
                 timeout_s=min(timeout_s, 0.25),
@@ -3163,12 +3240,14 @@ def _send_mavlink_shell_command(
                 selected_flags = flags
                 probe_output = output
                 break
-        _send_mavlink_shell_payload(mav, device=device, flags=selected_flags, payload=payload)
+        with write_lock:
+            _send_mavlink_shell_payload(mav, device=device, flags=selected_flags, payload=payload)
         command_output = _read_mavlink_shell_output(
             connection,
             timeout_s=timeout_s,
             on_unmatched=on_unmatched,
             on_receive_poll=on_receive_poll,
+            stop_at_prompt=stop_at_prompt,
         )
         return MavlinkShellCommandResult(
             command=command,
@@ -3180,7 +3259,8 @@ def _send_mavlink_shell_command(
         # the host-side serial descriptor alone does not hand the PX4 shell
         # back and can leave later USB diagnostics with a dead-looking link.
         try:
-            mav.serial_control_send(device, 0, 0, 0, 0, [0] * 70)
+            with write_lock:
+                mav.serial_control_send(device, 0, 0, 0, 0, [0] * 70)
         except Exception:
             pass
 
@@ -3346,13 +3426,15 @@ def _mavlink_read_param(
     timeout_s: float = 2.0,
     on_unmatched: Callable[[Any], None] | None = None,
     on_receive_poll: Callable[[], None] | None = None,
+    send_lock: Any = None,
 ) -> int | float | None:
     mav = getattr(connection, "mav", None)
     if mav is None or not hasattr(mav, "param_request_read_send"):
         return None
     target_system = int(getattr(connection, "target_system", 0) or 1)
     target_component = int(getattr(connection, "target_component", 0) or 1)
-    mav.param_request_read_send(target_system, target_component, _mavlink_param_id(name), -1)
+    with (send_lock if send_lock is not None else nullcontext()):
+        mav.param_request_read_send(target_system, target_component, _mavlink_param_id(name), -1)
     return _mavlink_recv_param_value_typed(
         connection,
         name,
@@ -3369,6 +3451,7 @@ def _mavlink_read_param_int(
     timeout_s: float = 2.0,
     on_unmatched: Callable[[Any], None] | None = None,
     on_receive_poll: Callable[[], None] | None = None,
+    send_lock: Any = None,
 ) -> int | None:
     if on_unmatched is None and hasattr(connection, "param_fetch_one"):
         try:
@@ -3390,7 +3473,8 @@ def _mavlink_read_param_int(
         return None
     target_system = int(getattr(connection, "target_system", 0) or 1)
     target_component = int(getattr(connection, "target_component", 0) or 1)
-    mav.param_request_read_send(target_system, target_component, _mavlink_param_id(name), -1)
+    with (send_lock if send_lock is not None else nullcontext()):
+        mav.param_request_read_send(target_system, target_component, _mavlink_param_id(name), -1)
     return _mavlink_recv_param_value(
         connection,
         name,
@@ -3408,6 +3492,7 @@ def _mavlink_set_param_int(
     timeout_s: float = 2.0,
     on_unmatched: Callable[[Any], None] | None = None,
     on_receive_poll: Callable[[], None] | None = None,
+    send_lock: Any = None,
 ) -> int | None:
     mav = getattr(connection, "mav", None)
     if mav is None or not hasattr(mav, "param_set_send"):
@@ -3416,13 +3501,14 @@ def _mavlink_set_param_int(
     target_system = int(getattr(connection, "target_system", 0) or 1)
     target_component = int(getattr(connection, "target_component", 0) or 1)
     param_type = _mavlink_constant(mavlink, "MAV_PARAM_TYPE_INT32", 6)
-    mav.param_set_send(
-        target_system,
-        target_component,
-        _mavlink_param_id(name),
-        _mavlink_int_to_param_float(int(value)),
-        param_type,
-    )
+    with (send_lock if send_lock is not None else nullcontext()):
+        mav.param_set_send(
+            target_system,
+            target_component,
+            _mavlink_param_id(name),
+            _mavlink_int_to_param_float(int(value)),
+            param_type,
+        )
     return _mavlink_recv_param_value(
         connection,
         name,

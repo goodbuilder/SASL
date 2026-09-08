@@ -169,16 +169,33 @@ device. CAN2 priority remains editable even when its instance is outside the sto
 range; the screen reports candidate versus actual instead of blocking the operator or inventing
 an active-source result.
 
-The Pixhawk `Magn` tables add read-only `RAW yaw°` and `Corrected yaw°` beside each IMU/CAN row.
+The Pixhawk `Magn` tables add read-only `RAW yaw°`, `Corrected yaw°`, and `PX4 yaw°` beside each
+IMU/CAN row.
 RAW is the signed `atan2(-y,x)` diagnostic in producer sensor axes with no calibration or tilt
 correction. Corrected yaw applies the matching read-back `CAL_MAG` transformation and remains
 `PARAM 대기` until the operator performs the manual parameter refresh. PX4 yaw is retained as
-backend diagnostic evidence only; it is not an operator-table column. PX4 yaw is the fresh firmware `ATTITUDE.yaw` reference only when the row's exact
+the fresh firmware `ATTITUDE.yaw` reference only when the row's exact
 device ID matches the active `vehicle_magnetometer` device; standard `SCALED_IMU*` rows without
-that identity remain `ID 확인 대기`. The existing priority/active-device verification procedure
+that identity remain `ID 확인 대기`; its `EKF2_MAG_DECL` declination correction is included in
+the estimator value. The adjacent hidden `Δyaw°` remains `PX4−RAW`. The existing priority/active-device verification procedure
 is now exposed on the same Pixhawk page, while the Advanced PX4 MAG controls remain a fallback.
 
 ### Calibration calculation execution
+
+Measurement's Method result table follows one pair for up to one second, updating each
+Method as its result arrives. Then it advances to the newest pair; calculation and saving
+continue for every pair. Coordinate mode and row selection only change the view. The
+selected row's detail reports matching Quality, all coordinate forms and R,t inputs.
+Methods that previously participated remain visible when blocked. New runs clear old
+values; after Stop, late results may still complete the last run. Existing representative
+Method controls and primary history are independent of this read-only comparison.
+
+Mountain/Cloud Solve uses capture-request GNSS Yaw90 with P1 Roll/Pitch. Readiness
+`Mountain/Cloud 기준` reports missing reference inputs; Base R,t is not required for these
+methods. Capture remains available without telemetry; Solve then requires recapture with
+reference inputs. Candidate details show assumed Left and image-derived Right poses.
+Reverse/telemetry changes affect future captures only. Cloud fills translation from pair
+GNSS, and both actual measurement poses are recorded.
 
 `Checkerboard capture validation` copies the currently displayed left/right images, fixes
 their timing decision at capture time, then encodes PNG files and runs checkerboard
@@ -280,6 +297,15 @@ comparison remain analysis evidence rather than a hidden calibration truth.
 
 ### Alignment R,t method workflow
 
+`Baseline Yaw90` is appended to the existing method tabs. Its live views replace the visible
+frozen-reference/candidate regions only while selected, retaining their objects and operator state.
+Observe P1→P2 azimuth plus ∠Dr–P1–P2 / ∠Dr–P2–P1 in the fixed GNSS table alongside the P1/P2
+Roll/Pitch table and camera pair. Iterate yaw aiming and physical leveling; no 0° target column or
+automatic completion gate is added. Center line is local display chrome, now removed from
+Calibration. Reverse Apply/Save has moved from Measurement Settings; run transitions lock edits.
+The original Telemetry midpoint table is retained as collapsed reference data in this tab.
+Pixhawk's shared direction/alignment and Drone geometry displays remain available.
+
 Select `Alignment` in Navigation. Common readiness and frozen-reference controls appear above six
 promoted method tabs; there is no separate `Optical pose` Navigation item or outer `R,t methods`
 wrapper. The workflow is:
@@ -316,7 +342,7 @@ wrapper. The workflow is:
    declared vertical datum; a skyline alone is not promoted to a 3-D correspondence or
    truth source.
    The solver tabs are `Horizon`, `Mountain + GNSS`, `Terrain PnP`,
-   `Drone Rotation`, `Drone Multi-view`, `References`, and `Combine`. Tab changes automatically
+   `Drone Rotation`, `Drone Multi-view`, and `Combine`. Tab changes automatically
    select Horizon/Ridge/Target annotation mode without deleting points from other modes.
 4. Inspect immutable candidates, residual/uncertainty evidence, warnings, observable
    degrees of freedom, and—when reviewing a Mountain + GNSS candidate—the numeric OpenCV
@@ -364,15 +390,18 @@ to live truth.
 
 ### Measurement method readiness and parallel evaluation
 
-Measurement and Overview always show all eight method categories. At child creation the latest
+Measurement and Overview always show every catalog method category (ten, including the Cloud
+far-field rotation + live GNSS hybrid). At child creation the latest
 successful non-Pixhawk Draft and exact operating K,D are frozen as child-only inputs without
 changing global Alignment Active. Horizon combines observed Roll/Pitch with pair-frozen Pixhawk
 Yaw and GNSS Translation. Single-target Drone Rotation re-solves Yaw with pair-frozen Pixhawk
-Roll/Pitch; full Drone Rotation adds pair-frozen GNSS Translation. Mountain, Multi-view, Terrain,
-and Combined must already be full 6-DOF. Readiness is per method, so an unavailable GNSS-dependent
+Roll/Pitch; full Drone Rotation adds pair-frozen GNSS Translation. Cloud far-field rotation
+supplies Roll/Pitch/Yaw from sky/cloud correspondences and adds pair-frozen GNSS Translation; it
+never observes translation itself. Mountain, Multi-view, Terrain, and Combined must already be
+full 6-DOF. Readiness is per method, so an unavailable GNSS-dependent
 method does not block an independent Checkerboard or full Multi-view/Terrain profile.
 
-Every matched pair fans out to all eight methods from one immutable snapshot. Pixhawk attitude +
+Every matched pair fans out to every catalog method from one immutable snapshot. Pixhawk attitude +
 GNSS/RTK is always the representative result and is never replaced by a comparison method. Missing
 input, solver failure, timeout, and queue overflow remain explicit per-method terminal outcomes.
 The pair's attitude/GPS snapshots are selected before hybrid geometry is resolved, and the final
@@ -395,8 +424,8 @@ coordinate is identical. Swapping which board is plugged in does not change the 
 drops anything. The pair's capture span is reported as an advisory beyond the configured
 left/right timestamp limit and is never blocked. A Base that physically moves while asserting the
 same coordinate is not detectable in software and remains a field procedure rule.
-When no method is ready, the matched detections/native references are retained and all eight
-method streams record BLOCKED rather than discarding the pair or fabricating R,t.
+When no method is ready, the matched detections/native references are retained and every
+method stream records BLOCKED rather than discarding the pair or fabricating R,t.
 Candidate details show left/right observability independently; Apply/Combine enables a common
 axis only when both sides observed it.
 
@@ -462,8 +491,8 @@ recording without stopping or restarting their workers. Its logical clock-epoch 
 only time-dependent cross-epoch results. Old Session folders and writer failures are never
 consulted.
 
-The readiness table remains an evidence projection. The compact method table lists all eight method
-categories; missing candidates/profiles remain `BLOCKED` with their required inputs. Clicking one
+The readiness table remains an evidence projection. The compact method table lists every catalog
+method category (ten); missing candidates/profiles remain `BLOCKED` with their required inputs. Clicking one
 method navigates to read-only detail without merging PX4 body-FRD/world-NED, GNSS NED, candidate
 virtual-FRD/world-NED, or OpenCV RDF contracts.
 
@@ -577,7 +606,7 @@ optical RDF or `baseline_center_frd` measurement output.
 `Devices > Pixhawk` keeps the separate P1/P2 ATTITUDE diagnostic. It is not used for the camera
 installation angle.
 
-`Devices > Telemetry` derives `GNSS BASELINE_CENTER F/R/D/Rg/Angle` from selected P1/P2 and Drone
+`Alignment > Baseline Yaw90` displays the midpoint reference derived from selected P1/P2 and Drone
 GNSS. Its origin is the P1/P2 GNSS antenna midpoint; Right is horizontal P1→P2, Down is NED Down,
 and Forward is Right×Down. The acute horizontal installation angle is
 `atan2(|Forward|,|Right|)` and `90° error=|90°−angle|`; 90° is the target. `CURRENT` requires every
@@ -585,7 +614,8 @@ application-receive age <=2.0 s and a maximum three-source receive-timestamp spr
 `STALE` retains finite values with actual timing; `WAITING` shows no fabricated zero. Fix type
 remains evidence rather than a gate.
 This local-level antenna frame is not optical RDF, P1 body FRD, or camera/Measurement
-`baseline_center_frd`. No command, setting, recording field, or user-entered distance is added.
+`baseline_center_frd`. Moving this reference to Baseline Yaw90 does not change its recorded fields
+or add a user-entered distance.
 
 ## 13. Detection
 

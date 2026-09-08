@@ -19,13 +19,16 @@ import re
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from Workstation.workstation_core.measurement_methods import MEASUREMENT_METHOD_IDS
 from Workstation.workstation_core.method_result_evidence import derive_method_result
+from Workstation.workstation_core.measurement_artifacts import (
+    KST, MeasurementStorageContext, reserve_measurement_context,
+)
 
 STATUS_NOT_ATTEMPTED = "N/A"
 STATUS_PENDING = "PENDING"
@@ -43,6 +46,7 @@ METHOD_SHEET_NAMES: Mapping[str, str] = {
     "terrain_pnp": "16_Terrain_PnP",
     "combined_hybrid": "17_Combined",
     "pixhawk_rp_gps_baseline_yaw": "18_Pixhawk_RP_GPS_Yaw",
+    "cloud_gnss": "19_Cloud_GNSS",
 }
 
 _PX4_GROUP_BY_SAMPLE_TYPE: Mapping[str, str] = {
@@ -257,6 +261,7 @@ class MeasurementRecord:
         started_monotonic_ns: int,
         metadata: Mapping[str, Any] | None = None,
         calibration: Mapping[str, Any] | None = None,
+        journal_sink: Callable[[Mapping[str, Any]], bool] | None = None,
     ) -> None:
         self.measurement_id = str(measurement_id)
         self.file_prefix = str(file_prefix)
@@ -271,6 +276,8 @@ class MeasurementRecord:
         self.selected_method_id = ""
         self.metadata: dict[str, Any] = dict(metadata or {})
         self.calibration: dict[str, Any] = dict(calibration or {})
+        self._journal_sink = journal_sink
+        self._journal_sequence = 0
         self.counters: dict[str, dict[str, int]] = {
             method_id: {
                 "VALID": 0,
@@ -291,6 +298,8 @@ class MeasurementRecord:
         self._detection_index: dict[str, DetectionRow] = {}
         self._pairs: dict[str, PairRow] = {}
         self._method_results: dict[tuple[str, str], MethodResultRow] = {}
+        self._comparison_participants: set[str] = set()
+        self._comparison_latest_pair_id = ""
         self._telemetry: dict[str, list[dict[str, Any]]] = {}
         self._events: list[EventRow] = []
         self._artifacts: list[dict[str, Any]] = []
@@ -321,6 +330,23 @@ class MeasurementRecord:
     def _bump(self) -> None:
         self._revision += 1
 
+    def _journal(self, kind: str, payload: Mapping[str, Any]) -> None:
+        if self._journal_sink is None:
+            return
+        self._journal_sequence += 1
+        try:
+            accepted = self._journal_sink({
+                "schema": "workstation-measurement-journal-v1",
+                "measurement_id": self.measurement_id,
+                "journal_sequence": self._journal_sequence,
+                "kind": kind,
+                "payload": dict(payload),
+            })
+        except Exception:
+            accepted = False
+        if not accepted:
+            self._storage["journal_dropped_records"] = int(self._storage.get("journal_dropped_records", 0)) + 1
+
     # -- lifecycle ------------------------------------------------------
 
     def stop(self, *, stopped_local: datetime, stopped_utc_ns: int, stopped_monotonic_ns: int) -> None:
@@ -342,6 +368,8 @@ class MeasurementRecord:
                 )
             )
             self._bump()
+
+            self._journal("stop", {"stopped_local": stopped_local.isoformat(), "stopped_utc_ns": stopped_utc_ns, "stopped_monotonic_ns": stopped_monotonic_ns})
 
     def _pending_locked(self) -> int:
         return sum(
@@ -388,6 +416,7 @@ class MeasurementRecord:
                 )
             )
             self._bump()
+            self._journal("event", asdict(self._events[-1]))
 
     # -- calibration / alignment ---------------------------------------
 
@@ -395,11 +424,13 @@ class MeasurementRecord:
         with self._lock:
             self.calibration = dict(calibration)
             self._bump()
+            self._journal("calibration", self.calibration)
 
     def add_alignment_row(self, row: Mapping[str, Any]) -> None:
         with self._lock:
             self._alignment_rows.append(dict(row))
             self._bump()
+            self._journal("alignment", row)
 
     # -- detections / pairs --------------------------------------------
 
@@ -462,12 +493,16 @@ class MeasurementRecord:
                 )
             )
         with self._lock:
+            added = []
             for row in rows:
                 if row.detection_id in self._detection_index:
                     continue
                 self._detections[camera].append(row)
                 self._detection_index[row.detection_id] = row
+                added.append(asdict(row))
             self._bump()
+            if added:
+                self._journal("detections", {"camera": camera, "rows": added})
 
     def register_pair(
         self,
@@ -507,6 +542,11 @@ class MeasurementRecord:
         now_ns = int(time.monotonic_ns() if submitted_monotonic_ns is None else submitted_monotonic_ns)
         with self._lock:
             self._pairs[pair_id] = row
+            previous = self._pairs.get(self._comparison_latest_pair_id)
+            if previous is None or pair_sequence >= previous.pair_sequence:
+                self._comparison_latest_pair_id = pair_id
+            self._comparison_participants.update(submitted_method_ids)
+            self._comparison_participants.update(k for k, v in evidence.items() if v.get("ready"))
             for detection_id in (left_id, right_id):
                 detection = self._detection_index.get(detection_id)
                 if detection is not None:
@@ -539,6 +579,13 @@ class MeasurementRecord:
                     )
                     self.counters[method_id][STATUS_NOT_ATTEMPTED] += 1
             self._bump()
+            self._journal("pair", {
+                "snapshot_payload": dict(snapshot_payload),
+                "submitted_method_ids": list(submitted_method_ids),
+                "not_attempted": dict(not_attempted),
+                "method_evidence": evidence,
+                "submitted_monotonic_ns": now_ns,
+            })
         return row
 
     def note_outcome(self, outcome_record: Mapping[str, Any]) -> MethodResultRow | None:
@@ -563,7 +610,11 @@ class MeasurementRecord:
             row.attempted = True
             row.outcome = dict(outcome_record)
             try:
-                row.derived = derive_method_result(outcome_record)
+                frozen = outcome_record.get("recorded_geometry")
+                row.derived = dict(frozen) if isinstance(frozen, Mapping) else derive_method_result(outcome_record)
+                # Capture once from this immutable attempt, before persistence.
+                # Both workbook views and future rebuilds use these same values.
+                row.outcome["recorded_geometry"] = row.derived
             except Exception as exc:  # noqa: BLE001 - evidence derivation must never lose the outcome.
                 row.derived = None
                 row.reason = f"evidence derivation failed: {exc}"
@@ -576,6 +627,7 @@ class MeasurementRecord:
             if self.state != RECORD_STATE_RUNNING and not self._pending_locked():
                 self.state = RECORD_STATE_STOPPED
             self._bump()
+            self._journal("outcome", row.outcome)
             return row
 
     def fail_pending(self, reason: str) -> int:
@@ -605,6 +657,10 @@ class MeasurementRecord:
                     )
                 )
                 self._bump()
+                self._journal("fail_pending", {
+                    "rows": [asdict(row) for row in self._method_results.values() if row.outcome and row.outcome.get("completed_monotonic_ns") == now_ns],
+                    "event": asdict(self._events[-1]),
+                })
         return failed
 
     # -- telemetry / store observation ----------------------------------
@@ -675,6 +731,33 @@ class MeasurementRecord:
 
     # -- snapshot -------------------------------------------------------
 
+    def results_snapshot(self, pair_id: str | None = None) -> dict[str, Any]:
+        """Bounded read-only copy for the live Method comparison (no geometry or I/O)."""
+        import copy
+        with self._lock:
+            latest = self._comparison_latest_pair_id
+            pair = self._pairs.get(pair_id or latest)
+            rows = []
+            for method_id in MEASUREMENT_METHOD_IDS:
+                if method_id not in self._comparison_participants:
+                    continue
+                row = None if pair is None else self._method_results.get((pair.pair_id, method_id))
+                if row is None:
+                    rows.append({"method_id": method_id, "status": "N/A", "reason": "당시 미참여"})
+                    continue
+                rows.append({"method_id": method_id, "status": row.status if row.attempted else "BLOCKED",
+                             "reason": row.reason, "attempted": row.attempted,
+                             "derived": copy.deepcopy(row.derived or {}),
+                             "outcome": copy.deepcopy(row.outcome or {}),
+                             "evidence": copy.deepcopy(row.evidence)})
+            return {"schema": "measurement-results-view-v1", "measurement_id": self.measurement_id,
+                    "run_state": self.state, "revision": self._revision,
+                    "latest_pair_id": latest, "pair_id": "" if pair is None else pair.pair_id,
+                    "pair_sequence": None if pair is None else pair.pair_sequence,
+                    "created_unix_ns": None if pair is None else pair.created_unix_ns,
+                    "created_monotonic_ns": None if pair is None else pair.created_monotonic_ns,
+                    "rows": rows, "all_terminal": bool(rows) and all(r["status"] != STATUS_PENDING for r in rows)}
+
     def snapshot(self) -> MeasurementSnapshot:
         with self._lock:
             stopped_local_iso = "" if self.stopped_local is None else self.stopped_local.isoformat()
@@ -737,6 +820,10 @@ class MeasurementRegistry:
         data_root_provider: Callable[[], Path],
         writer: Any | None = None,
         clock_local: Callable[[], datetime] | None = None,
+        per_run_storage: bool = False,
+        context_started: Callable[[MeasurementStorageContext], None] | None = None,
+        context_stopped: Callable[[str], None] | None = None,
+        journal_sink: Callable[[Mapping[str, Any]], bool] | None = None,
     ) -> None:
         self._data_root_provider = data_root_provider
         self._writer = writer
@@ -745,6 +832,11 @@ class MeasurementRegistry:
         self._records: dict[str, MeasurementRecord] = {}
         self._current_id = ""
         self._reserved_prefixes: set[str] = set()
+        self._per_run_storage = per_run_storage
+        self._context_started = context_started
+        self._context_stopped = context_stopped
+        self._journal_sink = journal_sink
+        self._contexts: dict[str, MeasurementStorageContext] = {}
         self.observer_errors = 0
 
     @property
@@ -766,18 +858,26 @@ class MeasurementRegistry:
         metadata: Mapping[str, Any] | None = None,
         calibration: Mapping[str, Any] | None = None,
     ) -> MeasurementRecord:
-        local = started_local or self._clock_local()
+        local = (
+            datetime.fromtimestamp(started_utc_ns // 1_000_000_000, tz=KST).replace(microsecond=(started_utc_ns % 1_000_000_000) // 1000)
+            if self._per_run_storage else started_local or self._clock_local()
+        )
         prefix = measurement_file_prefix(local)
         path: Path | None = None
         allocation_error = ""
         try:
             with self._lock:
-                path = allocate_measurement_workbook_path(
-                    Path(self._data_root_provider()),
-                    prefix,
-                    reserved=self._reserved_prefixes,
-                )
+                if self._per_run_storage:
+                    context = reserve_measurement_context(Path(self._data_root_provider()), measurement_id, started_utc_ns, started_monotonic_ns)
+                    self._contexts[measurement_id] = context
+                    path = context.workbook_path
+                else:
+                    path = allocate_measurement_workbook_path(
+                        Path(self._data_root_provider()), prefix, reserved=self._reserved_prefixes,
+                    )
                 prefix = path.name.removesuffix("_measurement.xlsx")
+            if self._per_run_storage and self._context_started is not None:
+                self._context_started(context)
         except Exception as exc:  # noqa: BLE001 - storage never gates Measurement Start.
             allocation_error = f"{type(exc).__name__}: {exc}"
         record = MeasurementRecord(
@@ -789,7 +889,13 @@ class MeasurementRegistry:
             started_monotonic_ns=started_monotonic_ns,
             metadata=metadata,
             calibration=calibration,
+            journal_sink=self._journal_sink,
         )
+        record._journal("start", {
+            "file_prefix": prefix, "started_local": local.isoformat(),
+            "started_utc_ns": started_utc_ns, "started_monotonic_ns": started_monotonic_ns,
+            "metadata": record.metadata, "calibration": record.calibration,
+        })
         record.add_event(
             "MEASUREMENT_STARTED",
             detail=str(path or "workbook path unavailable"),
@@ -816,7 +922,10 @@ class MeasurementRegistry:
         if record is None:
             return None
         record.stop(
-            stopped_local=stopped_local or self._clock_local(),
+            stopped_local=(
+                datetime.fromtimestamp(stopped_utc_ns // 1_000_000_000, tz=KST).replace(microsecond=(stopped_utc_ns % 1_000_000_000) // 1000)
+                if self._per_run_storage else stopped_local or self._clock_local()
+            ),
             stopped_utc_ns=stopped_utc_ns,
             stopped_monotonic_ns=stopped_monotonic_ns,
         )
@@ -824,11 +933,24 @@ class MeasurementRegistry:
             if self._current_id == record.measurement_id:
                 self._current_id = ""
         self._request_write(record, "stop")
+        if self._context_stopped is not None:
+            self._context_stopped(measurement_id)
         return record
+
+    def context_for(self, measurement_id: str) -> MeasurementStorageContext | None:
+        with self._lock:
+            return self._contexts.get(str(measurement_id))
 
     def current(self) -> MeasurementRecord | None:
         with self._lock:
             return self._records.get(self._current_id) if self._current_id else None
+
+    def results_snapshot(self, measurement_id: str | None = None, pair_id: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            record = self._records.get(self._current_id) if self._current_id else next(reversed(self._records.values()), None)
+        if record is None:
+            return {"measurement_id": "", "pair_id": "", "latest_pair_id": "", "rows": [], "all_terminal": False}
+        return record.results_snapshot(pair_id if measurement_id == record.measurement_id else None)
 
     def record_for(self, measurement_id: str) -> MeasurementRecord | None:
         with self._lock:
@@ -866,6 +988,8 @@ class MeasurementRegistry:
 
     def _observe_store_record(self, stream: str, payload: Mapping[str, Any]) -> None:
         stream = str(stream)
+        if stream == "measurement.journal":
+            return
         if stream == "events":
             event_type = str(payload.get("event_type") or "")
             generation = str(payload.get("runtime_generation") or payload.get("measurement_id") or "")
@@ -873,13 +997,13 @@ class MeasurementRegistry:
                 return
             record = self.record_for(generation) if generation else self.current()
             if record is not None and event_type:
-                record.add_event(event_type, payload=payload, utc_ns=_int_or_none(payload.get("recorded_utc_ns")))
+                record.add_event(event_type, detail=str(payload.get("detail") or payload.get("error") or ""), payload=payload, utc_ns=_int_or_none(payload.get("recorded_utc_ns")))
             return
         target: MeasurementRecord | None = None
         tagged = str(payload.get("measurement_id") or payload.get("runtime_generation") or "")
         if tagged:
             target = self.record_for(tagged)
-        if target is None:
+        if target is None and not tagged:
             target = self.current()
         if target is None:
             return
@@ -928,6 +1052,7 @@ class MeasurementRegistry:
             record.fail_pending(reason)
             if record.running:
                 record.add_event("APPLICATION_SHUTDOWN", detail=str(reason))
+                self.stop(record.measurement_id, stopped_utc_ns=time.time_ns(), stopped_monotonic_ns=time.monotonic_ns())
         writer = self._writer
         if writer is None:
             return

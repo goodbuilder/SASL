@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Any, Mapping
 from collections.abc import Callable, Iterator, Sequence
 
+from Workstation.workstation_core.measurement_artifacts import MeasurementStorageContext
+
 
 DATA_STORE_SCHEMA = "workstation-measurement-data-store-v1"
 DATA_RECORD_SCHEMA = "workstation-measurement-data-record-v1"
@@ -72,6 +74,7 @@ STREAM_PATHS: dict[str, Path] = {
     "events": Path("events.jsonl"),
     "measurements": Path("measurements.jsonl"),
     "method_evaluations": Path("method_evaluations.jsonl"),
+    "method_results": Path("method_results.jsonl"),
     "camera.left": Path("camera_left.jsonl"),
     "camera.right": Path("camera_right.jsonl"),
     "px4.left": Path("px4_left.jsonl"),
@@ -85,6 +88,7 @@ STREAM_PATHS: dict[str, Path] = {
     "artifacts": Path("artifacts.jsonl"),
     "application.log": Path("application_log.jsonl"),
     "native.frames": Path("native_frames.jsonl"),
+    "measurement.journal": Path("measurement_journal.jsonl"),
 }
 CSV_STREAM_PATHS: dict[str, Path] = {
     stream: relative.with_suffix(".csv")
@@ -133,14 +137,16 @@ PRIORITY_STREAMS = frozenset(
         "events",
         "measurements",
         "method_evaluations",
+        "method_results",
         "capture.events",
         "alignment",
         "artifacts",
         "native.frames",
+        "measurement.journal",
     }
 )
 ESSENTIAL_RETRY_STREAMS = frozenset(
-    {"events", "measurements", "method_evaluations"}
+    {"events", "measurements", "method_evaluations", "measurement.journal"}
 )
 RETRY_RESERVE_MAX_BYTES = 8 * 1024 * 1024
 _FSYNC = os.fsync
@@ -161,7 +167,7 @@ def _is_permanent_csv_error(error: str) -> bool:
     return any(marker in text for marker in _PERMANENT_CSV_ERROR_MARKERS)
 
 
-def _json_safe(value: Any) -> Any:
+def _json_safe(value: Any, *, preserve_source_fields: bool = False) -> Any:
     if value is None or isinstance(value, (bool, int, str)):
         return value
     if isinstance(value, float):
@@ -172,15 +178,15 @@ def _json_safe(value: Any) -> Any:
         return str(value)
     if isinstance(value, Mapping):
         return {
-            str(key): _json_safe(item)
+            str(key): _json_safe(item, preserve_source_fields=preserve_source_fields)
             for key, item in value.items()
-            if str(key) not in _SESSION_MEMBERSHIP_FIELDS
+            if preserve_source_fields or str(key) not in _SESSION_MEMBERSHIP_FIELDS
         }
     if isinstance(value, (tuple, list)):
-        return [_json_safe(item) for item in value]
+        return [_json_safe(item, preserve_source_fields=preserve_source_fields) for item in value]
     to_mapping = getattr(value, "to_mapping", None)
     if callable(to_mapping):
-        return _json_safe(to_mapping())
+        return _json_safe(to_mapping(), preserve_source_fields=preserve_source_fields)
     raise TypeError(f"unsupported measurement data value: {type(value).__name__}")
 
 
@@ -254,6 +260,7 @@ class _CsvState:
     last_error: str = ""
     written_records: int = 0
     dropped_records: int = 0
+    recovered_records: int = 0
 
 
 class _CsvHandle:
@@ -342,6 +349,11 @@ class MeasurementDataStore:
         )
         self._states = {name: _StreamState() for name in STREAM_PATHS}
         self._csv_states = {name: _CsvState() for name in STREAM_PATHS}
+        # ``_record_index`` high-water mark per stream so successive
+        # ``LiveDataRows`` owners (one per Measurement run) continue the
+        # sequence instead of restarting at 0 inside the same file.
+        self._record_index_next: dict[str, int] = {name: 0 for name in STREAM_PATHS}
+        self._record_index_lock = threading.Lock()
         self._handles: dict[str, Any] = {}
         self._csv_handles: dict[str, _CsvHandle] = {}
         self._state_lock = threading.RLock()
@@ -353,6 +365,7 @@ class MeasurementDataStore:
         self._active_operations = 0
         self._next_sequence = 0
         self._pending_sequences: set[int] = set()
+        self._pending_streams: dict[int, str] = {}
         self._enqueue_observers: list[Callable[[str, Mapping[str, Any]], None]] = []
         self._enqueue_observer_errors = 0
         self._retry_reserve: deque[_QueuedRecord] = deque()
@@ -367,6 +380,10 @@ class MeasurementDataStore:
         self._csv_next_retry_monotonic_s: dict[str, float | None] = {
             name: None for name in STREAM_PATHS
         }
+        self._contexts: dict[str, MeasurementStorageContext] = {}
+        self.current_measurement_id = ""
+        self._last_measurement_id = ""
+        self._csv_rebuild_requested: set[str] = set()
         self._stop_requested = threading.Event()
         self._flush_requested = threading.Event()
         self._thread = threading.Thread(
@@ -382,7 +399,7 @@ class MeasurementDataStore:
 
     def path_for(self, stream: str) -> Path:
         try:
-            return self._stream_paths[str(stream)]
+            return self._stream_paths[self.scoped_stream(str(stream))]
         except KeyError as exc:
             raise ValueError(f"unknown measurement data stream: {stream}") from exc
 
@@ -390,9 +407,61 @@ class MeasurementDataStore:
         """Return the same-stem CSV mirror path for one logical stream."""
 
         name = str(stream)
-        if name not in CSV_STREAM_PATHS:
+        if name not in self._stream_paths:
             raise ValueError(f"unknown measurement data stream: {name}")
         return self.path_for(name).with_suffix(".csv")
+
+    @staticmethod
+    def logical_stream(stream: str) -> str:
+        return str(stream).rsplit("::", 1)[-1]
+
+    def scoped_stream(self, stream: str, measurement_id: str | None = None) -> str:
+        if stream not in STREAM_PATHS:
+            return stream
+        owner = self.current_measurement_id if measurement_id is None else str(measurement_id)
+        return f"{owner}::{stream}" if owner in self._contexts else stream
+
+    def register_measurement(self, context: MeasurementStorageContext) -> None:
+        """Register immutable destinations; the existing writer owns all runs."""
+        with self._state_lock:
+            if context.measurement_id not in self._contexts:
+                context.root.relative_to(self.root)
+                self._contexts[context.measurement_id] = context
+                for stream, relative in STREAM_PATHS.items():
+                    key = f"{context.measurement_id}::{stream}"
+                    self._stream_paths[key] = context.stream_path(relative.stem)
+                    self._states[key] = _StreamState()
+                    self._csv_states[key] = _CsvState()
+                    self._retry_backoff_s[key] = self._csv_retry_backoff_s[key] = 1.0
+                    self._next_retry_monotonic_s[key] = None
+                    self._csv_next_retry_monotonic_s[key] = None
+            self.current_measurement_id = context.measurement_id
+            self._last_measurement_id = context.measurement_id
+
+    def finish_measurement(self, measurement_id: str) -> None:
+        with self._state_lock:
+            if self.current_measurement_id == str(measurement_id):
+                self.current_measurement_id = ""
+            self._flush_requested.set()
+
+    def claim_record_index_base(self, stream: str) -> int:
+        """Return the next free ``_record_index`` for ``stream`` in this file."""
+
+        with self._record_index_lock:
+            return int(self._record_index_next.get(str(stream), 0))
+
+    def observe_record_index(self, stream: str, index: int) -> None:
+        """Advance the per-stream ``_record_index`` high-water mark."""
+
+        with self._record_index_lock:
+            current = int(self._record_index_next.get(str(stream), 0))
+            self._record_index_next[str(stream)] = max(current, int(index) + 1)
+
+    def allocate_record_index(self, stream: str) -> int:
+        with self._record_index_lock:
+            value = self._record_index_next.get(stream, 0)
+            self._record_index_next[stream] = value + 1
+            return value
 
     def stream_paths_for_export(self, stream: str) -> tuple[Path, ...]:
         """Return current and legacy files that may contain a stream."""
@@ -402,6 +471,8 @@ class MeasurementDataStore:
         except KeyError as exc:
             raise ValueError(f"unknown measurement data stream: {stream}") from exc
         candidates = [self.path_for(stream), self.root / relative]
+        with self._state_lock:
+            candidates.extend(path for key, path in self._stream_paths.items() if self.logical_stream(key) == stream)
         if self.timestamped_filenames:
             candidates.extend(
                 sorted(
@@ -409,6 +480,7 @@ class MeasurementDataStore:
                     key=lambda path: path.name,
                 )
             )
+            candidates.extend(sorted(self.root.glob(f"*/raw/*_{relative.stem}.jsonl")))
         unique: list[Path] = []
         for candidate in candidates:
             if candidate not in unique:
@@ -424,6 +496,8 @@ class MeasurementDataStore:
         except KeyError as exc:
             raise ValueError(f"unknown measurement data stream: {name}") from exc
         candidates = [self.csv_path_for(name), self.root / relative]
+        with self._state_lock:
+            candidates.extend(path.with_suffix(".csv") for key, path in self._stream_paths.items() if self.logical_stream(key) == name)
         if self.timestamped_filenames:
             candidates.extend(
                 sorted(
@@ -431,6 +505,7 @@ class MeasurementDataStore:
                     key=lambda path: path.name,
                 )
             )
+            candidates.extend(sorted(self.root.glob(f"*/raw/*_{relative.stem}.csv")))
         unique: list[Path] = []
         for candidate in candidates:
             if candidate not in unique:
@@ -470,11 +545,22 @@ class MeasurementDataStore:
         name = str(stream)
         if name not in STREAM_PATHS:
             raise ValueError(f"unknown measurement data stream: {name}")
+        logical_name = name
+        value = dict(value)
+        # Presence of an empty identity explicitly denotes an outside-run row.
+        tagged = "measurement_id" in value or "runtime_generation" in value
+        owner = str(value.get("measurement_id") or value.get("runtime_generation") or "") if tagged else self.current_measurement_id
+        with self._state_lock:
+            context = self._contexts.get(owner)
+            if context is not None:
+                value.update(context.metadata())
+                value.setdefault("runtime_generation", owner)
+            name = self.scoped_stream(name, owner)
         # Observers see every producer record before admission so evidence
         # capture never depends on JSONL success, lifecycle, or queue space.
         for observer in tuple(self._enqueue_observers):
             try:
-                observer(name, value)
+                observer(logical_name, value)
             except Exception:  # noqa: BLE001 - observers must never affect storage.
                 self._enqueue_observer_errors += 1
         with self._state_lock:
@@ -484,11 +570,15 @@ class MeasurementDataStore:
         now_monotonic_ns = time.monotonic_ns()
         try:
             record = {
-                str(key): _json_safe(item)
+                str(key): _json_safe(item, preserve_source_fields=context is not None)
                 for key, item in value.items()
                 if str(key) not in _SESSION_MEMBERSHIP_FIELDS
             }
             record.setdefault("schema", DATA_RECORD_SCHEMA)
+            if context is not None:
+                membership = {key: value[key] for key in _SESSION_MEMBERSHIP_FIELDS if key in value}
+                if membership:
+                    record["source_session_membership"] = _json_safe(membership, preserve_source_fields=True)
             record.setdefault("recorded_utc_ns", now_utc_ns)
             record.setdefault("recorded_monotonic_ns", now_monotonic_ns)
             encoded = (
@@ -520,6 +610,7 @@ class MeasurementDataStore:
             self._next_sequence += 1
             sequence = self._next_sequence
             self._pending_sequences.add(sequence)
+            self._pending_streams[sequence] = name
         queued = _QueuedRecord(name, encoded, now_monotonic_ns, sequence)
         try:
             with self._state_lock:
@@ -532,7 +623,7 @@ class MeasurementDataStore:
                         self._settle_sequence_unlocked(queued.sequence)
                     return accepted
             use_priority = (
-                name in PRIORITY_STREAMS if priority is None else bool(priority)
+                logical_name in PRIORITY_STREAMS if priority is None else bool(priority)
             )
             target = self._priority if use_priority else self._bulk
             try:
@@ -605,6 +696,7 @@ class MeasurementDataStore:
                 for name in csv_failed:
                     self._csv_next_retry_monotonic_s[name] = None
                     self._csv_retry_backoff_s[name] = 1.0
+                    self._csv_rebuild_requested.add(name)
             self._drain_retry_reserve()
         finally:
             with self._lifecycle_condition:
@@ -614,7 +706,7 @@ class MeasurementDataStore:
     def request_flush(self) -> None:
         self._flush_requested.set()
 
-    def export_checkpoint(self, *, timeout_s: float = 5.0) -> MeasurementDataCheckpoint:
+    def export_checkpoint(self, *, timeout_s: float = 5.0, measurement_id: str | None = None) -> MeasurementDataCheckpoint:
         """Flush and return complete-file byte limits for a background export.
 
         The cutoff covers records admitted before this call. Producers remain
@@ -637,6 +729,7 @@ class MeasurementDataStore:
                 while True:
                     pending = sum(
                         1 for sequence in self._pending_sequences if sequence <= cutoff
+                        and (measurement_id is None or self._pending_streams.get(sequence, "").startswith(f"{measurement_id}::"))
                     )
                     if pending == 0:
                         break
@@ -686,38 +779,42 @@ class MeasurementDataStore:
 
     def snapshot(self) -> dict[str, Any]:
         with self._state_lock:
-            csv_retry_pending_by_stream = {name: 0 for name in STREAM_PATHS}
+            csv_retry_pending_by_stream = {name: 0 for name in self._states}
             for item in self._csv_retry_reserve:
                 csv_retry_pending_by_stream[item.stream] += 1
             streams: dict[str, dict[str, Any]] = {}
             for name, state in self._states.items():
                 csv_state = self._csv_states[name]
+                logical_name = self.logical_stream(name)
+                owner = name.rsplit("::", 1)[0] if "::" in name else ""
+                context = self._contexts.get(owner)
+                path = self._stream_paths[name]
                 streams[name] = {
-                    "path": str(self.path_for(name)),
-                    "paths": [
-                        str(path) for path in self.stream_paths_for_export(name)
-                    ],
+                    "path": str(path),
+                    "paths": [str(path)],
+                    "measurement_id": owner,
+                    "stream": logical_name,
                     "filename_mode": (
                         "timestamped" if self.timestamped_filenames else "fixed"
                     ),
-                    "file_stamp": self.file_stamp,
+                    "file_stamp": context.file_stamp if context else self.file_stamp,
                     "state": state.state,
                     "last_write_utc_ns": state.last_write_utc_ns,
                     "last_error": state.last_error,
                     "written_records": state.written_records,
                     "dropped_records": state.dropped_records,
-                    "priority": name in PRIORITY_STREAMS,
+                    "priority": logical_name in PRIORITY_STREAMS,
                     "csv": {
-                        "path": str(self.csv_path_for(name)),
-                        "paths": [
-                            str(path) for path in self.csv_paths_for_export(name)
-                        ],
+                        "path": str(path.with_suffix(".csv")),
+                        "paths": [str(path.with_suffix(".csv"))],
                         "state": csv_state.state,
                         "last_write_utc_ns": csv_state.last_write_utc_ns,
                         "last_error": csv_state.last_error,
                         "written_records": csv_state.written_records,
                         "dropped_records": csv_state.dropped_records,
                         "retry_pending": csv_retry_pending_by_stream[name],
+                        "recovered_records": csv_state.recovered_records,
+                        "unmirrored_records": max(0, state.written_records - csv_state.written_records),
                     },
                 }
             retry_pending = len(self._retry_reserve)
@@ -741,6 +838,10 @@ class MeasurementDataStore:
             active_enqueues = self._active_enqueues
             active_operations = self._active_operations
             checkpoint_pending_records = len(self._pending_sequences)
+            selected_owner = self.current_measurement_id or self._last_measurement_id
+            visible_streams = {
+                name: streams[self.scoped_stream(name, selected_owner)] for name in STREAM_PATHS
+            }
         failed = sum(1 for value in streams.values() if value["state"] == "FAILED")
         dropped = sum(int(value["dropped_records"]) for value in streams.values())
         csv_failed = sum(
@@ -781,7 +882,9 @@ class MeasurementDataStore:
             "csv_dropped_records": csv_dropped,
             "csv_next_retry_monotonic_s": csv_next_retry,
             "csv_next_retry_by_stream": csv_retry_deadlines,
-            "streams": streams,
+            "measurement_id": selected_owner,
+            "streams": visible_streams,
+            "stream_instances": streams,
         }
 
     def close(self, *, timeout_s: float = 2.0) -> bool:
@@ -822,9 +925,11 @@ class MeasurementDataStore:
                     self._stop_requested.is_set()
                     and self._priority.empty()
                     and self._bulk.empty()
+                    and not self._csv_rebuild_requested
                 ):
                     break
                 self._maybe_retry_failed()
+                self._repair_csv_mirrors()
                 self._drain_retry_reserve()
                 item = self._next_record()
                 if item is not None:
@@ -891,7 +996,7 @@ class MeasurementDataStore:
             existing = self._handles.get(stream)
             if existing is not None:
                 return existing
-            path = self.path_for(stream)
+            path = self._stream_paths[stream]
             path.parent.mkdir(parents=True, exist_ok=True)
             existed = path.exists()
             if path.is_symlink():
@@ -991,7 +1096,7 @@ class MeasurementDataStore:
             existing = self._csv_handles.get(stream)
             if existing is not None:
                 return existing
-            path = self.csv_path_for(stream)
+            path = self._stream_paths[stream].with_suffix(".csv")
             path.parent.mkdir(parents=True, exist_ok=True)
             existed = path.exists()
             if path.is_symlink():
@@ -1111,7 +1216,7 @@ class MeasurementDataStore:
         self,
         item: _QueuedRecord,
     ) -> bool:
-        if item.stream not in ESSENTIAL_RETRY_STREAMS:
+        if self.logical_stream(item.stream) not in ESSENTIAL_RETRY_STREAMS:
             self._states[item.stream].dropped_records += 1
             return False
         item_bytes = len(item.payload)
@@ -1144,6 +1249,7 @@ class MeasurementDataStore:
 
     def _settle_sequence_unlocked(self, sequence: int) -> None:
         self._pending_sequences.discard(int(sequence))
+        self._pending_streams.pop(int(sequence), None)
         self._lifecycle_condition.notify_all()
 
     def _maybe_retry_failed(self) -> None:
@@ -1175,10 +1281,59 @@ class MeasurementDataStore:
                     state.state = "IDLE"
                     state.last_error = ""
                     self._close_csv_handle(name)
+                    self._csv_rebuild_requested.add(name)
                 self._csv_next_retry_monotonic_s[name] = None
                 self._csv_retry_backoff_s[name] = min(
                     30.0, self._csv_retry_backoff_s[name] * 2.0
                 )
+
+    def _repair_csv_mirrors(self) -> None:
+        """Rebuild lost CSV rows from the durable JSONL, on the writer only."""
+        with self._state_lock:
+            names = tuple(self._csv_rebuild_requested)
+            self._csv_rebuild_requested.clear()
+        for name in names:
+            source = self._stream_paths[name]
+            target = source.with_suffix(".csv")
+            temporary = target.with_name(f".{target.name}.repair-{os.getpid()}.tmp")
+            try:
+                with self._io_lock:
+                    self._close_csv_handle(name)
+                    if target.is_symlink() or (target.exists() and not target.is_file()):
+                        raise OSError("CSV mirror must be a regular file, not a symlink")
+                    if target.exists() and target.stat().st_size:
+                        with target.open(encoding="utf-8", newline="") as existing:
+                            if tuple(next(csv.reader(existing), ())) != CSV_FIELDNAMES:
+                                raise OSError("CSV header is invalid or foreign")
+                    count = 0
+                    with source.open("rb") as raw, temporary.open("w", encoding="utf-8", newline="") as output:
+                        writer = csv.DictWriter(output, fieldnames=CSV_FIELDNAMES, lineterminator="\n")
+                        writer.writeheader()
+                        for payload in raw:
+                            if not payload.endswith(b"\n"):
+                                raise OSError("JSONL contains an incomplete record; CSV repair deferred")
+                            writer.writerow(self._csv_row_from_payload(payload))
+                            count += 1
+                        output.flush()
+                        _FSYNC(output.fileno())
+                    os.replace(temporary, target)
+                    with self._state_lock:
+                        state = self._csv_states[name]
+                        state.recovered_records += max(0, count - state.written_records)
+                        state.written_records = count
+                        state.dropped_records = 0
+                        state.state = "ACTIVE"
+                        state.last_error = ""
+                        state.last_write_utc_ns = time.time_ns()
+                        self._csv_retry_reserve = deque(item for item in self._csv_retry_reserve if item.stream != name)
+                        self._csv_retry_reserve_bytes = sum(len(item.payload) for item in self._csv_retry_reserve)
+            except (OSError, ValueError, UnicodeError, csv.Error) as exc:
+                self._mark_csv_failed(name, f"CSV repair failed: {exc}")
+            finally:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _drain_retry_reserve(self) -> None:
         while True:
@@ -1223,6 +1378,13 @@ class MeasurementDataStore:
                     handle.flush()
                 except OSError as exc:
                     self._mark_csv_failed(stream, f"flush failed: {exc}")
+            # Completed runs retain immutable routes, but need not retain open
+            # descriptors. Late records reopen their own append-only file.
+            with self._state_lock:
+                for stream in set(self._handles) | set(self._csv_handles):
+                    if "::" in stream and stream.rsplit("::", 1)[0] != self.current_measurement_id:
+                        self._close_handle(stream)
+                        self._close_csv_handle(stream)
 
     def _close_handle(self, stream: str) -> None:
         handle = self._handles.pop(stream, None)
@@ -1260,17 +1422,70 @@ class LiveDataRows(Sequence[dict[str, Any]]):
     ) -> None:
         self.store = store
         self.stream = str(stream)
+        self.measurement_id = str(getattr(store, "current_measurement_id", "") or "")
+        scope = getattr(store, "scoped_stream", None)
+        self._stream_key = scope(self.stream, self.measurement_id) if callable(scope) else self.stream
         self.preview_limit = max(1, int(preview_limit))
         self.priority = priority
         self._rows: list[dict[str, Any]] = []
         self._admitted_indices: set[int] = set()
         self._owner_epoch = 0
         self._lock = threading.RLock()
+        self._index_base = self._claim_index_base()
+        self._record_routes: dict[int, tuple[str, int]] = {}
+
+    def _claim_index_base(self) -> int:
+        claim = getattr(self.store, "claim_record_index_base", None)
+        if not callable(claim):
+            return 0
+        try:
+            return max(0, int(claim(self._stream_key)))
+        except (TypeError, ValueError):
+            return 0
+
+    def _record_index_for(self, local_index: int, row: Mapping[str, Any] | None = None) -> int:
+        """File-wide ``_record_index`` for a row of this owner.
+
+        Allocate in the payload's frozen destination, including a late result
+        delivered through the current owner's collection. Keep the allocation
+        for replacements/retries so a row never changes its file or identity.
+        """
+
+        payload = row or {}
+        owner = str(payload.get("measurement_id") or payload.get("runtime_generation") or "")
+        scope = getattr(self.store, "scoped_stream", None)
+        key = scope(self.stream, owner) if callable(scope) else self._stream_key
+        existing = self._record_routes.get(local_index)
+        if existing is not None:
+            if existing[0] != key:
+                raise ValueError("a recorded row cannot move between Measurements")
+            return existing[1]
+        allocate = getattr(self.store, "allocate_record_index", None)
+        global_index = int(allocate(key)) if callable(allocate) else self._index_base + int(local_index)
+        self._record_routes[local_index] = key, global_index
+        observe = getattr(self.store, "observe_record_index", None)
+        if callable(observe):
+            try:
+                observe(key, global_index)
+            except (TypeError, ValueError):
+                pass
+        return global_index
+
+    @property
+    def record_index_base(self) -> int:
+        return self._index_base
 
     @property
     def preview_rows(self) -> list[dict[str, Any]]:
         with self._lock:
             return [dict(row) for row in self._rows[-self.preview_limit :]]
+
+    def _bound_row(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        owner = str(row.get("measurement_id") or row.get("runtime_generation") or self.measurement_id)
+        stored = dict(_json_safe(dict(row), preserve_source_fields=owner in getattr(self.store, "_contexts", {})))
+        if self.measurement_id or getattr(self.store, "_contexts", None):
+            stored.setdefault("measurement_id", str(stored.get("runtime_generation") or "") if "runtime_generation" in stored else self.measurement_id)
+        return stored
 
     @property
     def write_error(self) -> str | None:
@@ -1299,7 +1514,7 @@ class LiveDataRows(Sequence[dict[str, Any]]):
         row: Mapping[str, Any],
     ) -> RowWriteAdmission:
         with self._lock:
-            stored = dict(_json_safe(dict(row)))
+            stored = self._bound_row(row)
             index = len(self._rows)
             lease = (self._owner_epoch, index)
             admitted = self.store.enqueue(
@@ -1307,7 +1522,7 @@ class LiveDataRows(Sequence[dict[str, Any]]):
                 {
                     **stored,
                     "_record_operation": "append",
-                    "_record_index": index,
+                    "_record_index": self._record_index_for(index, stored),
                 },
                 priority=self.priority,
             )
@@ -1339,7 +1554,7 @@ class LiveDataRows(Sequence[dict[str, Any]]):
             resolved = index if index >= 0 else len(self._rows) + index
             if resolved < 0 or resolved >= len(self._rows):
                 raise IndexError(index)
-            stored = dict(_json_safe(dict(row)))
+            stored = self._bound_row(row)
             self._rows[resolved] = stored
             operation = (
                 "replace" if resolved in self._admitted_indices else "append"
@@ -1349,7 +1564,7 @@ class LiveDataRows(Sequence[dict[str, Any]]):
                 {
                     **stored,
                     "_record_operation": operation,
-                    "_record_index": resolved,
+                    "_record_index": self._record_index_for(resolved, stored),
                 },
                 priority=self.priority,
             )
@@ -1383,7 +1598,7 @@ class LiveDataRows(Sequence[dict[str, Any]]):
                     row_index=resolved,
                     lease=current_lease,
                 )
-            stored = dict(_json_safe(dict(row)))
+            stored = self._bound_row(row)
             operation = (
                 "replace" if resolved in self._admitted_indices else "append"
             )
@@ -1392,7 +1607,7 @@ class LiveDataRows(Sequence[dict[str, Any]]):
                 {
                     **stored,
                     "_record_operation": operation,
-                    "_record_index": resolved,
+                    "_record_index": self._record_index_for(resolved, stored),
                 },
                 priority=self.priority,
             )
@@ -1426,6 +1641,8 @@ class LiveDataRows(Sequence[dict[str, Any]]):
             self._owner_epoch += 1
             self._rows.clear()
             self._admitted_indices.clear()
+            self._record_routes.clear()
+            self._index_base = self._claim_index_base()
 
     def discard_spool(self) -> bool:
         return self.close()

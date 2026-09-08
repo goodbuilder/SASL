@@ -610,3 +610,428 @@ P2 sensors_status_mag:
 Therefore P2 `MAG1=396809` appearing in a Shell/UI topology list does not prove that GPS1 is
 physically connected. The UI must surface stale/healthy state and the actual active device
 separately; the stale GPS1 record is not a live magnetometer input.
+
+## 10. P1-P2 ΔYaw를 0°대로 낮춘 MAG priority 저장/재부팅 절차 (2026-09-06)
+
+### 배경: Telemetry Radio 링크 자체가 죽어 있었음
+
+조사 시작 시점에 P1/P2/Drone 지상 라디오(D30JNMVH/DU0E49VU/DU0E4O0F) 3개 모두 raw
+serial 레벨에서 8초간 0바이트 수신이었다. `+++`/`ATI5`로 확인한 지상 라디오 자체
+NETID(25/26/27)는 정상이었지만 `RTI5`(원격 조회)가 전부 무응답이었고, 공중 라디오 LED가
+P1/P2 모두 **solid red**로 확인됐다. Holybro 공식 문서 기준 solid red는 "firmware
+update(bootloader) 모드"이며, 이 상태에서는 응용 펌웨어가 전혀 실행되지 않는다.
+
+- [SiK Telemetry Radio V3 — LED and Connection (Holybro)](https://docs.holybro.com/radio/sik-telemetry-radio-v3/led-and-connection)
+- [SIK Telemetry radio V3 solid red led — ArduPilot Discourse](https://discuss.ardupilot.org/t/sik-telemetry-radio-v3-solid-red-led/98980)
+
+즉 **P1/P2 공중 SiK 라디오가 부팅로더에 멈춰 있어 Telemetry Radio로는 현재 아무 것도
+연결할 수 없다.** 이 항목은 별도 QGroundControl SiK 펌웨어 복구가 필요하며 이번 작업에서는
+해결하지 않았다. 아래 측정/조치는 전부 P1/P2 직접 USB(`/dev/ttyACM0`, `/dev/ttyACM1`,
+sysid로 자동 식별, `usb-Auterion_PX4_FMU_v6X.x_0-if00` by-id는 두 보드가 동일 USB
+serial ID 0을 보고해 side-stable하지 않음)로 수행했다.
+
+USB 진단 중 다른(이전 날짜) 워크트리에서 실행 중이던 Workstation 프로세스가 같은 두 USB 포트에
+동시 접속해 있어 heartbeat sysid가 깨지는(garbled, sysid=0) 현상이 있었다. 그 프로세스를
+종료한 뒤에는 정상화됐다 — 같은 Pixhawk를 raw MAVLink로 진단할 때는 그 포트를 쓰는 다른
+프로세스가 없는지 `fuser`로 먼저 확인해야 한다.
+
+### P1/P2 전체 파라미터 비교 (읽기 전용, USB)
+
+`PARAM_REQUEST_LIST`로 P1 1173개, P2 1183개 파라미터를 모두 덤프해 `MAG/GYRO/EKF2/ATT_/
+SENS_BOARD` 키워드로 필터링한 결과, 실제로 값이 다른 항목은 다음뿐이었다.
+
+```text
+CAL_GYRO1_XOFF: P1=-0.001711  P2=0.006096   (정상적인 개별 자이로 바이어스)
+CAL_GYRO1_YOFF: P1=0.003596   P2=0.003268   (정상적인 개별 자이로 바이어스)
+CAL_GYRO1_ZOFF: P1=-0.009193  P2=-0.009615  (정상적인 개별 자이로 바이어스)
+CAL_MAG2_ID:    P1=8944899    P2=8944643    (보드별 고유 RM3100 CAN1 device id, 정상)
+EKF2_MAG_DECL:  P1=-8.034926  P2=-8.034929  (사실상 동일, 무시 가능)
+IMU_GYRO_RATEMAX: P1=400  P2=800           (비대칭 — 이번엔 건드리지 않음, 후속 과제)
+SENS_MAG_RATE:  P1=15.0  P2=200.0          (비대칭 — 이번엔 건드리지 않음, 후속 과제)
+EKF2_GPS_CTRL:  P1=7  P2=7                 (2026-09-04 진단 당시 P2=2였던 것이 이미 수정되어 있음)
+```
+
+`IMU_GYRO_RATEMAX`/`SENS_MAG_RATE` 비대칭은 실제로 있으나, 아래 조치만으로 목표(ΔYaw
+최소화)를 달성해 이번에는 변경하지 않았다. 남겨진 후속 과제로 기록한다.
+
+### 조치: MAG2(CAN1 RM3100) 우선순위 전환 — priority만 바꾸면 반영되지 않는다
+
+두 보드 모두 기존 활성 소스는 `CAL_MAG1_PRIO=100`(GPS1 내장 IST8310)이었고, 이 상태의
+ΔYaw(P2-P1) 기준값은 다음과 같았다(USB, 8초, 935 samples).
+
+```text
+baseline (MAG1 active): ΔYaw median = +10.844°, range 10.812°~10.901°
+```
+
+`CAL_MAG1_PRIO=0`, `CAL_MAG2_PRIO=100`을 PARAM_SET으로 두 보드에 적용하고 readback으로
+확인했지만(둘 다 OK), **30초 이상 기다려도 ΔYaw는 거의 그대로였다**(11.5~11.6°대). 즉
+`CAL_MAGn_PRIO`를 RAM에서만 바꾸는 것으로는 EKF2가 실제로 새 마그네토미터 인스턴스로
+재선택되지 않는다. 과거 섹션들의 MAG2 재현성이 낮았던 것(-0.6°~-8° 사이에서 요동)은 일부
+세션이 저장/재부팅 없이 측정했기 때문일 가능성이 있다.
+
+해결책은 `MAV_CMD_PREFLIGHT_STORAGE`(param1=1, flash 저장) 후 `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN`
+(param1=1)으로 두 보드를 재부팅하는 것이었다. 재부팅 후 재연결해 `CAL_MAG1_PRIO=0`,
+`CAL_MAG2_PRIO=100`이 유지된 것과 `SYS_STATUS`의 마그네토미터 `present/enabled/healthy`가
+모두 `True`인 것을 확인했다.
+
+```text
+after save+reboot, 45s / 4442 paired samples:
+ΔYaw(P2-P1) median = -0.006°, mean = -0.007°, range -0.015°~+0.005°
+P1 yaw ≈ 0.004°~0.008°, P2 yaw ≈ -0.003°~0.000° (드리프트 없음, 살아있는 노이즈로 확인 — 값이 얼어붙은 것 아님)
+```
+
+두 보드 모두 disarm 상태에서 진행했고, arm 중이었다면 스크립트가 거부하도록 gate를 뒀다.
+이번 조치로 변경한 파라미터는 `CAL_MAG0~3_PRIO` 네 개뿐이며 flash에 저장했다. 다른
+파라미터(`SENS_MAG_RATE`, `IMU_GYRO_RATEMAX` 등)는 변경하지 않았다.
+
+### 결론
+
+같은 마운트에 붙은 P1/P2의 ΔYaw는 활성 마그네토미터 선택(`CAL_MAGn_PRIO`)에 의해
+지배되며, GPS1 내장 IST8310(MAG1)은 보드마다 다른 헤딩 바이어스를 갖고 CAN1 RM3100
+(MAG2)은 두 보드 간 거의 완벽히 일치한다. 단, **우선순위 변경은 반드시 PARAM_SAVE +
+재부팅까지 마쳐야 EKF2 마그네토미터 선택에 반영된다.**
+
+### 라이브 PARAM_SET 이력현상(hysteresis) 주의
+
+재부팅 없이 PARAM_SET만으로 `SENS_MAG_RATE`/`IMU_GYRO_RATEMAX`를 바꿨다가 되돌린 뒤에도
+ΔYaw가 원래 값으로 돌아오지 않았다(-0.006° → +1.12° → 되돌린 후 +1.26°). 이후 저장+재부팅으로
+초기화하자 -0.017°로 재현됐고, 그 깨끗한 상태에서 같은 값을 다시 라이브로 바꿨을 때는 -0.016°로
+영향이 없었다. 따라서 **센서/EKF2 관련 파라미터 비교 실험은 반드시 매 변경마다 저장+재부팅한
+깨끗한 상태에서 측정**해야 하며, 라이브 변경 직후의 수치는 비교 근거로 쓰지 않는다.
+
+### SENS_MAG_RATE / IMU_GYRO_RATEMAX 비대칭 해소 (2026-09-06)
+
+P1을 P2와 같은 `SENS_MAG_RATE=200`, `IMU_GYRO_RATEMAX=800`으로 맞추고 저장+재부팅했다.
+재부팅 직후 ΔYaw median `0.000°`(range -0.007°~+0.005°, 742 samples)로 비대칭 상태와 차이가
+없었다. 두 보드의 현재 확정값은 `CAL_MAG0/1/3_PRIO=0`, `CAL_MAG2_PRIO=100`, `SENS_MAG_RATE=200`,
+`IMU_GYRO_RATEMAX=800`, `EKF2_GPS_CTRL=7`, `EKF2_MAG_TYPE=1`, `SENS_BOARD_ROT=0`이며 flash에 저장돼
+있다. 장시간 드리프트 관찰 결과는 아래 11절에 기록한다.
+
+## 11. Telemetry Radio(공중 SiK) 복구 조사 — 소프트웨어 경로 없음 (2026-09-06)
+
+### 시도한 경로와 결과
+
+1. **RF 경유 복구**: 불가능. ArduPilot SiK 저장소의 `Firmware/bootloader/bootloader.c`에는
+   radio/tdm/freq_hopping 관련 코드가 전혀 없다(순수 UART 부트로더). 부트로더에 멈춘 공중
+   라디오는 RF 링크를 만들 수 없으므로 지상 라디오에서 어떤 명령을 보내도 닿지 않는다.
+   `AT&UPDATE`(`Firmware/radio/at.c`)는 **로컬** 라디오를 부트로더로 보내는 명령일 뿐이다.
+2. **PX4 SERIAL_CONTROL passthrough 경유**(`uploader.py --mavlink --mavport N`): 이 펌웨어에서
+   불가능. `uploader.py`는 pymavlink `MavlinkSerialPort`로 SERIAL_CONTROL device 0~5(TEL1/TEL2/
+   GPS1/GPS2/TEL3/TEL4)에 바이트를 relay하는데, PX4 쪽 처리(`mavlink_receiver.cpp
+   handle_message_serial_control`)는 `CONFIG_DRIVERS_SERIALPASSTHROUGH`가 빌드된 경우에만 device
+   0~5를 다루고, 아니면 SHELL(10) 외 모든 device를 조용히 무시한다. P1 NuttShell에서 직접
+   확인한 결과 `serialpassthrough status` → `nsh: serialpassthrough: command not found`,
+   즉 **현재 실행 중인 stable PX4 v1.17.0 FMUv6X 펌웨어에는 이 모듈이 없다**. (참고: 로컬에
+   있는 최신 PX4 main 소스와 `boards/auterion/fmu-v6x/default.px4board`에는
+   `CONFIG_DRIVERS_SERIALPASSTHROUGH=y`가 있어 착오를 일으킬 수 있으니 실행 중인 보드의
+   `nsh` 응답을 기준으로 판단한다.)
+   - 시도 중 `MAV_0_CONFIG=101`(TELEM1=`/dev/ttyS6`) mavlink 인스턴스가 같은 UART를 점유하는
+     것이 원인일 가능성을 배제하기 위해 P1에서 `MAV_0_CONFIG=0`으로 끄고 재부팅해 재시도했으나
+     동일하게 무응답이었고, 이후 `101`로 원복했다.
+   - pymavlink 부작용: `MavlinkSerialPort`는 `MAVLINK20` 없이 v1 파서로 연결하므로 같은 메시지가
+     v1/v2로 섞이면 `mavutil.add_message`에서 `'NoneType' object does not support item
+     assignment`로 크래시한다. 우회는 `os.environ["MAVLINK20"]="1"` + `add_message` 관용 패치.
+3. **NuttShell 경유**: SHELL(10)은 동작하지만 텍스트 콘솔이라 SiK 부트로더의 바이너리 sync/
+   program 프로토콜을 UART로 중계할 수단이 없다.
+
+### 결론과 필요한 물리 작업
+
+P1/P2 공중 SiK 라디오(ATI5 기준 `RFD SiK 2.0 on HM-TRP`, 915 MHz, NETID 25/26) 복구는
+**라디오 모듈의 TX/RX/GND에 USB-TTL(3.3V) 어댑터를 직접 연결**한 뒤 다음을 실행해야 한다.
+
+```text
+python3 SiK_src/Firmware/tools/uploader.py --port /dev/ttyUSBx radio~hm_trp.ihx
+```
+
+펌웨어 이미지는 `https://firmware.ardupilot.org/SiK/stable/radio~hm_trp.ihx`(SiK 2.2,
+commit 4479658)이며 유효한 Intel HEX(101,122 bytes)임을 확인했다. 라디오가 이미 부트로더에
+있으므로(solid red) `+++`/`AT&UPDATE` 단계 없이 부트로더 sync가 바로 잡혀야 한다. 복구 후에는
+NETID(P1=25, P2=26), `AIR_SPEED=64`, `MAVLINK=1`, 915~928 MHz 대역을 지상 라디오와 동일하게
+다시 설정하고 공중 라디오 전원을 완전히 재인가해야 링크가 살아난다(7절 참조).
+
+이 작업이 끝나기 전까지 P1/P2 운용은 USB(`/dev/ttyACM*`, sysid로 식별) 또는 Ethernet만
+가능하다.
+
+2026-09-07 기준으로 P1/P2/Drone 공중 라디오는 다시 정상 동작하며 Telemetry Radio 연결이 확인됐다.
+13절을 참조한다.
+
+## 12. 정정: 10절의 "ΔYaw≈0°"는 mag 미융합 상태였음 — 원인과 실제 수정 (2026-09-06)
+
+### 무엇이 잘못됐나
+
+10절에서 `CAL_MAG0/1/3_PRIO=0`, `CAL_MAG2_PRIO=100`으로 바꾸고 재부팅한 뒤 P1/P2 yaw가 모두
+`0.00°` 부근에서 ΔYaw≈0°로 나온 것은 **정렬이 된 결과가 아니라 EKF2가 자력계를 전혀 받지 못해
+초기 yaw=0에서 자이로 적분만 하고 있던 상태**였다. NuttShell(SERIAL_CONTROL dev 10)로 직접 읽은
+근거:
+
+```text
+estimator_status_flags: cs_yaw_align=False cs_mag_hdg=False cs_mag=False (P1, P2 동일)
+estimator_status:       mag_device_id=0  mag_strength_gs=nan
+sensors status (MAG):   validator best: -1, 등록된 mag sensor 0개, "MAG 8944643 EN: 1"만 표시
+listener vehicle_magnetometer / sensors_status_mag: never published
+listener sensor_mag -i 0..3: 4개 인스턴스 모두 실시간 데이터 있음 (RM3100은 instance 3)
+```
+
+이 상태에서 관찰된 "드리프트"(P2만 +0.071°/30 s ≈ +8.5°/h, P1 평탄, IMU 온도 불변, raw mag
+방위각 불변)는 자력계나 열이 아니라 **P2 자이로 Z 잔여 바이어스(≈0.04 mrad/s)의 자유 적분**이었다.
+
+### 원인: 다른 CAL_MAG 슬롯을 priority 0으로 두면 상위 인덱스 mag가 voter에 등록되지 않는다
+
+`src/modules/sensors/vehicle_magnetometer/VehicleMagnetometer.cpp` `Run()`:
+
+```text
+if (_calibration[uorb_index].enabled()) {          // priority > 0 일 때만
+    if (!was_advertised) {
+        if (uorb_index > 0) { _voter.add_new_validator(); }   // 인스턴스가 처음 나타날 때만 추가
+        ...
+    }
+    _voter.put(uorb_index, ...);
+}
+```
+
+validator는 "처음 나타난 시점에 enabled인 인스턴스"에 대해서만 하나씩 추가된다. sensor_mag
+instance 0(내장), 1(GPS1), 2(RM3100 backup)를 prio 0으로 끄면 validator가 index 0 하나뿐이고,
+instance 3(RM3100 primary)의 `put(3, …)`은 존재하지 않는 validator로 가서 조용히 버려진다. 결과:
+mag 선택 불가 → `vehicle_magnetometer` 미발행 → EKF2 mag 없음 → yaw 미정렬.
+9/4(`25/50/100/75`), 9/5(`1/1/100/1`)에 정상이었던 이유가 이것이다.
+
+**규칙: 사용하지 않는 CAL_MAGn_PRIO는 0이 아니라 1로 둔다.** (0은 "비활성"이며 위 부작용을 만든다.)
+
+### 조치와 실측
+
+1. P2를 `CAL_MAG0/1/3_PRIO=1`, `CAL_MAG2_PRIO=100`으로 저장+재부팅 → `sensors status` validator
+   `best: 3`, EKF `cs_yaw_align=True cs_mag_hdg=True mag_device_id=8944643`,
+   `mag_strength_gs=0.474`(WMM ref 0.496, `EKF2_MAG_CHECK=1` 통과). P1도 동일 적용 →
+   `mag_device_id=8944899`, 융합 확인.
+2. 두 보드 모두 RM3100 융합 상태의 **실제 ΔYaw = -6.54°**(P1 -161.84°, P2 -168.39°, 20 s/2003
+   samples, range -6.562°~-6.517°). 9/5 기록(-7.28°/-8.25°)과 같은 수준이며 RM3100 개별 바이어스
+   (offset 0 / scale 1, 미보정)가 원인이다.
+3. 파라미터만으로 상수 오차 제거: 외부 mag 장착 yaw 오프셋 `CAL_MAG2_YAW`(deg)를 P2에 적용.
+   - `+6.54` → ΔYaw `-15.07°` (부호 반대, 이동량 -8.5°: hard-iron 미보정 벡터라 1:1이 아니라 약
+     1.3배로 반영됨)
+   - `-5.0` → **ΔYaw `+0.057°`** (P1 -161.83°, P2 -161.77°, 20 s/1936 samples,
+     range +0.015°~+0.081°), 두 보드 모두 실제 헤딩·mag 융합 상태.
+   - 변경마다 PARAM_SAVE + 재부팅 후 측정했다.
+
+주의: `CAL_MAG2_YAW`는 **현재 장착 방향에서의 상수 오차만** 상쇄한다. hard-iron/scale이 미보정이면
+헤딩이 바뀔 때 오차가 다시 달라질 수 있으므로, 운용 전 QGroundControl RM3100 재보정이 근본 해결이며
+그 뒤에는 `CAL_MAG2_YAW`를 0으로 되돌리고 ΔYaw를 재측정해야 한다. `CAL_MAG2_YAW`≠0을 넣으면 PX4가
+`CAL_MAG2_ROT`를 자동으로 `100`(ROTATION_CUSTOM)으로 바꾸는데 이는 정상이다.
+
+### 잔여 흔들림의 원인: EKF2_HEAD_NOISE=0.3 rad 기본값
+
+`1/1/100/1` + `CAL_MAG2_YAW=-5.0` 상태에서 15분 관찰(60 s 간격, USB):
+
+```text
+P2-P1: 0.126 0.137 0.153 0.234 0.208 0.213 0.213 0.238 0.255 0.213 0.231 0.220 0.275 0.373 0.511
+P2 raw mag 방위각: 15분 내내 152.4~152.6° (±0.06°) — 자력계는 안정
+P2 raw zgyro 평균: ±0.07 mrad/s 요동 (≈0.24°/min 상당), P1은 ±0.03
+IMU 온도: P1 35.7→36.1°C, P2 34.9→35.5°C (히터 비활성, SENS_EN_THERMAL=-1)
+```
+
+즉 자력계 측정은 고정인데 EKF yaw(P2)가 자이로 Z 바이어스 요동을 따라 0.1~0.3° 흔들리고 되돌아오는
+데 수 분이 걸린다. 원인은 `EKF2_HEAD_NOISE=0.3 rad`(≈17°) 기본값이 mag heading 보정 게인을 매우 작게
+만들어 yaw가 사실상 자이로 적분을 따르기 때문이다. 정지 벤치에서 자력계가 안정하므로
+**`EKF2_HEAD_NOISE=0.05`**(양쪽)로 낮춰 yaw가 mag heading을 단단히 따르게 했다.
+
+- `EKF2_HEAD_NOISE=0.05` 적용·재부팅 후 ΔYaw `-0.625°` — 느슨한 추종에서 +0.057°였던 값이 "실제 mag
+  heading 차이"로 드러남. 기울기 -1.29°/°로 `CAL_MAG2_YAW`를 재조정:
+  `-4.52` → `-1.244°`(방향 오판), **`-5.48` → `-0.004°`**(P1 -161.90°, P2 -161.88°, 20 s/1937 samples,
+  range -0.041°~+0.018°).
+
+### 최종 확정 파라미터 (flash 저장, 2026-09-06)
+
+```text
+P1: CAL_MAG0/1/3_PRIO=1  CAL_MAG2_PRIO=100 (ID 8944899)  CAL_MAG2_YAW=0
+P2: CAL_MAG0/1/3_PRIO=1  CAL_MAG2_PRIO=100 (ID 8944643)  CAL_MAG2_YAW=0 / CAL_MAG2_ROT=0 (트림 제거, 아래 항목 참조)
+공통: EKF2_HEAD_NOISE=0.02  EKF2_GYR_B_NOISE=0.005  CAL_GYRO1_PRIO=75  CAL_ACC1_PRIO=75 (IMU #1 2818066 고정)
+      SENS_MAG_RATE=200  IMU_GYRO_RATEMAX=800  EKF2_MAG_TYPE=1  EKF2_GPS_CTRL=0(아래 "리그 이동 후" 항목)  MAV_0_CONFIG=101  SENS_BOARD_ROT=0
+```
+
+최종 설정 재부팅 후 5분: ΔYaw 0.033~0.048°, P1/P2 각각의 yaw 변화 ±0.012° 이내, 양쪽 선택 자이로
+`2818066 (1)` 확인.
+
+### 리그 이동 후 mag heading 융합 중단 — HEAD_NOISE 게이트와 GPS aiding의 상호작용 (2026-09-06)
+
+운영자가 리그를 움직인 뒤 ΔYaw가 0.05° → 1.96° → 2.34°로 계속 벌어졌다. 양쪽 모두
+`cs_mag_hdg=False`, `cs_mag_heading_consistent=False`, P2는 `starting_gps_fusion=True`였고 raw mag
+방위각은 고정인데 EKF yaw만 자이로 적분으로 흘렀다(12절 초반과 같은 메커니즘).
+
+원인(`src/modules/ekf2/EKF/aid_sources/magnetometer/mag_control.cpp`):
+
+```text
+493: mag_heading_consistent = (|innov_lpf| < EKF2_HEAD_NOISE) && (|innov| < EKF2_HEAD_NOISE)
+181: heading 융합 유지 조건 = mag_heading_consistent || !isNorthEastAidingActive()
+```
+
+즉 `EKF2_HEAD_NOISE`는 측정 노이즈이면서 동시에 **heading 일관성 게이트**다. 0.02 rad(1.15°)로 줄인 상태에서
+GPS 위치/속도 aiding이 활성화되면(양쪽 GPS 검사 통과 후), 리그 회전 등으로 innovation이 1.15°를 넘는 순간
+heading 융합이 중단되고, 융합이 없으니 innovation이 다시 줄지 않아 복구되지 않는다. 벤치 실험 중에는
+양쪽 `gps_checks_passed=False`(NE aiding 없음)라 이 게이트가 작동하지 않아 드러나지 않았다.
+
+조치: **`EKF2_GPS_CTRL=0`**(양쪽)으로 NE aiding을 끄면 181행 조건이 항상 참이 되어 heading 융합이 게이트되지
+않는다. D 실험에서 GPS 융합 유무는 yaw에 영향이 없었고, Workstation의 `GLOBAL_POSITION_INT`는 optional
+evidence이며 RTK baseline은 raw GPS(`GPS_RAW_INT`/`GPS2_RAW`)를 쓴다. 대안은 HEAD_NOISE를 0.1~0.3으로
+되돌리는 것(게이트 5.7~17°)이지만 흔들림이 0.1~0.5°로 커진다. 이동하는 기체에 같은 설정을 쓸 때는
+반드시 이 트레이드오프를 다시 평가한다. GPS_CTRL=0이면 WMM 기준값이 없어(`mag_strength_ref_gs=nan`)
+편각은 저장된 `EKF2_MAG_DECL=-8.03°`, 세기 검사는 0.45 G±0.4 기본값으로 동작한다.
+
+### CAL_MAG2_YAW 트림 제거 (2026-09-06, 운영자 결정)
+
+리그 이동 후 트림값이 자세에 종속적임이 확인되어(-5.48 기준 자세에서 0.0°, 이동 후 -0.41°) 운영자 결정으로
+P2 `CAL_MAG2_YAW=0`, `CAL_MAG2_ROT=0`으로 되돌렸다. 저장·재부팅 후 mag 융합 유지(`cs_mag_hdg=True`),
+**ΔYaw = -7.29°**(P1 -161.18°, P2 -168.47°, 20 s/1926 samples, range -7.310°~-7.284°). 이것이 현재
+자세에서 두 RM3100의 순수 차이이며, 9/5 기록(-7.28°)과 일치한다. 상대/절대 yaw 보정은 이제 파라미터가
+아니라 RM3100 보정 또는 RTK baseline 방위각 기반 측정 방식으로 해결한다.
+
+### 절대 방위 오차 (2026-09-06)
+
+운영자가 리그의 실제 방향을 약 **187°**(남에서 서쪽으로 7°)로 확인한 시점에 두 보드의 ATTITUDE.yaw는
+`-161.9°`(= 진방위 198.1°, `EKF2_MAG_DECL=-8.03°` 적용값)였다. 즉 P1/P2는 서로 0.05° 안에서 일치하지만
+**절대 방위는 약 +11° 치우쳐** 있다. 원인은 RM3100 hard-iron/scale 미보정(측정 자기 경사각 67.2° vs
+한국 기준 약 53°)과 장착 회전 미보정(`CAL_MAG2_ROT=0`)이며, `CAL_MAG2_YAW` 트림은 P2를 P1에 맞춘
+것이지 절대 방위를 맞춘 것이 아니다. 운영자 결정으로 절대 방위는 파라미터로 보정하지 않는다
+(근본 해결은 QGC RM3100 보정 후 `CAL_MAG2_YAW=0` 복귀). 절대 방위가 필요한 계산은 Pixhawk yaw가 아니라
+RTK P1→P2 baseline 방위각(`pixhawk_rp_gps_baseline_yaw` 방식)을 써야 한다.
+
+파라미터 백업(2026-09-06T0939KST, USB `PARAM_REQUEST_LIST`, QGC overlay 형식):
+`Pixhawk/P1/parameters-full-20260906T0939KST.params`(1173개),
+`Pixhawk/P2/parameters-full-20260906T0939KST.params`(1183개), 그리고 이번 튜닝값만 담은
+`Pixhawk/P1|P2/yaw-tune-20260906T0939KST.params`. 복원 시 overlay를 PARAM_SET → PARAM_SAVE → 재부팅. 남은 +0.035° 상수는 `CAL_MAG2_YAW`를 약 +0.03° 더 조정하면 없앨 수 있으나 노이즈
+수준이라 그대로 두었다.
+
+최종 설정으로 재부팅 후 10분 관찰(60 s 간격):
+
+```text
+P2-P1: 0.038 0.024 0.042 0.039 0.066 0.062 0.068 0.071 0.082 0.084   (범위 0.02~0.08°)
+P1 yaw Δ: -0.03°, P2 yaw Δ: +0.01~+0.04° (둘 다 mag 방위각 ±0.07° 이내로 고정)
+```
+
+이전 설정(HEAD_NOISE 0.3)의 15분 0.13~0.51° 흔들림 대비 안정적이며, 선형 드리프트는 없다.
+
+### 추가 파라미터 실험 (각각 저장+재부팅 후 5분, 60 s 간격)
+
+| 실험 | 변경 | ΔYaw 범위(5분) | 판정 |
+|---|---|---|---|
+| 기준 | HEAD_NOISE 0.05 | 0.024~0.084° (10분, 서서히 벌어짐) | — |
+| A | `EKF2_GYR_B_NOISE` 0.001→**0.005** (양쪽) | -0.011~+0.029° | 채택 — 자이로 바이어스 요동을 EKF가 더 빨리 흡수, 벌어짐 사라짐 |
+| B | A + `EKF2_HEAD_NOISE` 0.05→**0.02** (양쪽) | -0.015~+0.002° | 채택 — 가장 조용함 |
+| C | B + P2 IMU를 #2(3407882)로 (`CAL_GYRO2/ACC2_PRIO=75`) | -0.075~-0.052° | 기각 — 흔들림 폭은 같고 -0.06° 상수 오프셋만 생김(다른 IMU = 다른 프레임/미보정 offset) |
+
+| D | B + `EKF2_GPS_CTRL` 7→0 (GPS 위치/속도 융합 제거, 양쪽) | 0.039~0.058° | 기각 — B와 동일, EKF 위치 출력만 잃음. mag 융합은 WMM 없이도 유지됨(`mag_strength_ref_gs=nan`, 기본 0.45 G ±0.4 검사). 7로 원복 |
+
+| E | B + `SENS_MAG_RATE` 200→5 (RM3100 25 Hz 발행을 5샘플 평균, 양쪽) | 0.083~0.099° (폭 0.016°) | 기각 — 흔들림 폭 B와 동일. mag 노이즈는 병목이 아님. 200으로 원복 |
+| F | B + `EKF2_HEAD_NOISE` 0.02→0.01 (양쪽) | -0.071~-0.023° (폭 0.048°) | 기각 — mag 노이즈가 yaw로 더 전달돼 폭이 3배. 0.02로 원복 |
+
+| G | B + `EKF2_MAG_TYPE` 1→0 (Automatic, 양쪽) | 0.023~0.048° (폭 0.025°) | 동일 — 지상에서는 `cs_mag_hdg=True, cs_mag_3d=False`로 1과 같은 heading-only 동작. 1로 원복 |
+
+`EKF2_MAG_TYPE` 0/1 차이는 **비행 중에만** 생긴다: 0은 이륙 후 3축 벡터 융합으로 전환해 body 고정
+hard-iron을 학습하지만(미보정 RM3100엔 이점) 자기 간섭에 민감하고 전환 시 yaw 스텝이 생길 수 있다.
+P1/P2가 정지 기준국이면 1을 유지한다.
+
+### P1/P2 EKF2·SENS 파라미터 동일성 확인 (2026-09-06, USB PARAM readback)
+
+| 파라미터 | P1 | P2 | 동일 | 비고 |
+|---|---|---|---|---|
+| `EKF2_GPS_CTRL` | 7 | 7 | O | bit0 위경도, bit1 고도, bit2 3D 속도 ON; **bit3 dual-antenna heading OFF** — GPS yaw 미사용 |
+| `EKF2_MAG_ACCLIM` | 0.5 | 0.5 | O | 기본값 |
+| `EKF2_HDG_GATE` | 2.6 | 2.6 | O | 기본값 |
+| `EKF2_MAG_CHECK` | 1 | 1 | O | 세기 검사 ON (WMM ref 0.496 G, 실측 P1 0.515 / P2 0.474 G 통과) |
+| `EKF2_MAG_CHK_STR` | 0.2 | 0.2 | O | 기본값 |
+| `EKF2_MAG_CHK_INC` | 20.0 | 20.0 | O | 기본값 (CHECK bit1 OFF라 미사용) |
+| `SENS_MAG_MODE` | 1 | 1 | O | 기본값 |
+| `EKF2_MULTI_MAG` | 0 | 0 | O | 단일 EKF, voter가 고른 mag 하나 |
+| `SENS_MAG_RATE` | 200 | 200 | O | 캡 (RM3100 실제 25 Hz) |
+| `EKF2_MULTI_IMU` | 0 | 0 | O | 단일 EKF, IMU #1(2818066) 고정 |
+| `SENS_IMU_TEMP` | 55 | 55 | O | `SENS_EN_THERMAL=-1`이라 히터 비활성, 실측 35~36 °C |
+| `EKF2_MAG_GATE` | 3.0 | 3.0 | O | type 1에선 미사용 |
+| `EKF2_MAG_TYPE` / `EKF2_HEAD_NOISE` / `EKF2_GYR_B_NOISE` | 1 / 0.02 / 0.005 | 동일 | O | 최종 채택값 |
+| `EKF2_DECL_TYPE` | 3 | 3 | O | GPS/WMM 편각 사용·저장 |
+| `EKF2_MAG_DECL` | -8.034926 | -8.034929 | △ | WMM 자동 저장값의 부동소수 차이, 실질 동일 |
+| `GPS_YAW_OFFSET` / `EKF2_GPS_YAW_OFF` | 0 / 0 | 0 / 0 | O | — |
+
+의도적으로 다른 값은 `CAL_MAG2_ID`(보드별 RM3100), `CAL_MAG2_YAW`(P2 -5.48), `CAL_MAG2_ROT`(P2 100 자동)뿐이다.
+yaw 소스는 양쪽 모두 mag heading 하나이며 dual GNSS heading은 꺼져 있다.
+
+재부팅 간 재현성: 같은 설정이라도 재부팅마다 상수항이 약 ±0.05° 범위에서 흩어진다(B +0.03, D +0.04,
+E +0.085, F -0.05, 최초 -0.004). raw mag 방위각도 run마다 0.05~0.1° 달라지므로(P1 175.30~175.50°,
+P2 152.2~152.6°) 이는 자력계/환경 측 변동이며 현재 파라미터 튜닝의 바닥이다. 따라서 `CAL_MAG2_YAW`를
+0.03° 단위로 트림하는 것은 의미가 없다.
+
+"EKF에서 다른 센서를 빼는" 관점의 정리: `EKF2_MAG_TYPE=1`(heading-only)과 GPS yaw 비트 미사용으로
+yaw에는 이미 **선택된 mag heading + 선택된 IMU 자이로**만 들어간다. 다른 mag 인스턴스는 voter에서
+선택되지 않으면 EKF에 전달되지 않고(prio 1은 failover 후보), baro는 고도만, GPS는 D 실험대로 yaw에
+영향이 없다. 남는 결합은 accel(기울기 → mag 수평 투영)뿐이며 이는 IMU 고정으로 상수화된다.
+
+C를 되돌리며 확인한 사실: `CAL_GYRO*_PRIO`가 모두 50이면 **재부팅마다 선택 IMU가 바뀔 수 있다**
+(P2가 #1→#0으로 바뀜). IMU가 바뀌면 위처럼 ΔYaw에 수십 m° 오프셋이 생기므로, `CAL_MAG2_YAW`를
+튜닝했을 때의 IMU #1(2818066)을 양쪽 모두 `CAL_GYRO1_PRIO=75`, `CAL_ACC1_PRIO=75`로 고정했다.
+
+`EKF2_HEAD_NOISE=0.02`는 정지·저자기간섭 환경 기준이다. 비행/이동 중 자기 간섭이 큰 환경에서는
+mag 노이즈가 yaw로 더 직접 전달되므로, 그런 운용에서 흔들림이 보이면 0.1~0.2 사이로 되돌려 재평가한다.
+
+## 13. Telemetry Radio 링크 복귀 확인과 Workstation 라디오 endpoint 저장 (2026-09-07)
+
+### 관찰 (10:36~10:46 KST)
+
+11절 당시 부트로더(solid red)에 멈춰 있던 P1/P2 공중 SiK 라디오는 이 시점에 응용 펌웨어로
+동작하고 있었다(복구 작업 자체는 이 세션에서 수행하지 않았고 방법도 확인하지 못했다). 지상
+라디오 3개는 모두 `/dev/serial/by-id`에 있었고, Pixhawk 직접 USB(`ttyACM*`)와 Ethernet
+(`10.0.0.2/.3` ping 100% loss)은 없었다.
+
+| 지상 라디오 | 커널 포트 | 역할 | passive probe (57600, pymavlink) |
+|---|---|---|---|
+| `D30JNMVH` | `ttyUSB1` | P1 / NETID 25 | 실행 중 Workstation이 점유 중이라 probe 불가(multiple access) |
+| `DU0E49VU` | `ttyUSB0` | P2 / NETID 26 | sysid 2 HEARTBEAT 4/10 s, 5/15 s; `RADIO_STATUS rssi=64 remrssi=64 noise=29 remnoise=50 rxerrors=5231` |
+| `DU0E4O0F` | `ttyUSB2` | Drone / NETID 27 | sysid 3 HEARTBEAT 4/15 s, ATTITUDE 12, GPS_RAW_INT 8 |
+
+같은 시간 실행 중이던 Workstation(`run.sh --maximized`, `run.log`)은 P1을 `D30JNMVH @ 57600`,
+P2를 `DU0E49VU @ 57600`으로 열어 각각 expected sysid heartbeat를 받았고 두 side 모두
+`liveness: LIVE`에 도달했다(P2 1회, P1 2회 기록). P2 RSSI 64는 9/2 기록(154~213)보다 크게 낮으므로
+안테나/거리/전원 상태를 확인한다.
+
+### LIVE ↔ QUALIFYING 반복의 의미
+
+`workstation_core/mavlink_liveness.py`는 side에 활성 명령이 있으면(`_active_command`)
+`QUALIFYING`(reason `ACTIVE_COMMAND`)으로 보고한다. Connect 직후 자동으로 시작되는
+`Stable PX4 sensor_mag Shell polling`(2 s cadence, `listener sensor_mag -i N`)이 57600 라디오에서는
+응답이 느려 거의 항상 활성이므로, 링크가 정상이어도 P1/P2가 `LIVE`와
+`QUALIFYING; qualification=00:10/00:10`을 오간다. 이것은 링크 단절이나 heartbeat 손실이 아니다.
+heartbeat/ATTITUDE가 실제로 끊기면 `ATTITUDE_STALE`, `RX_STALLED`, `INITIAL_RX_TIMEOUT`으로 나타난다.
+
+### 포트 동시 접근 주의 (재현됨)
+
+Workstation이 P2 Connect를 여는 순간 외부 raw probe가 같은 `ttyUSB0`을 열어
+`오른쪽 sensor_mag Shell polling 실패: device reports readiness to read but returned no data
+(device disconnected or multiple access on port?)`와 PARAM 작업 실패가 1회 발생했다. probe 종료 후
+heartbeat가 다시 들어와 LIVE로 회복했다. `fuser`로 미리 확인해도 그 사이에 앱이 포트를 열 수 있으므로,
+Workstation이 실행 중이면 라디오 포트에 raw probe를 붙이지 않는다(10절의 규칙을 반대 방향으로도 적용).
+
+### Workstation 설정 저장
+
+이 워크트리의 `.local/workstation_data/stereo_distance_settings.json`은 새로 생성된 파일이어서
+`*_pixhawk_radio_device`가 모두 비어 있었고, P2/Drone Connect preflight가
+`RADIO DEVICE MISSING: RADIO device is empty`로 실패했다(P1은 UI에서 후보를 골라 연결). Settings
+workspace의 in-memory mirror는 Save 전까지 JSON을 바꾸지 않으므로 파일에는 반영되지 않았다.
+2026-08-21 작업 복사본의 설정과 2026-09-02 세 링크 검증 기록의 값을 `load_settings → replace →
+save_settings`로 옮겨 저장했다. 변경된 키는 아래 여섯 개뿐이다.
+
+```text
+left_pixhawk_transport/right/drone = radio (변경 없음), baud 57600 (변경 없음)
+left_pixhawk_radio_device  = /dev/serial/by-id/usb-FTDI_FT231X_USB_UART_D30JNMVH-if00-port0
+right_pixhawk_radio_device = /dev/serial/by-id/usb-FTDI_FT231X_USB_UART_DU0E49VU-if00-port0
+drone_pixhawk_radio_device = /dev/serial/by-id/usb-FTDI_FT231X_USB_UART_DU0E4O0F-if00-port0
+left/right/drone_pixhawk_radio_usb_serial = D30JNMVH / DU0E49VU / DU0E4O0F
+```
+
+재로드 후 세 device 모두 존재하고 서로 다른 커널 포트로 resolve되어 serial preflight 조건
+(`RADIO READY`)을 만족했다. 앱 종료 시 `_shutdown_save_settings`가 메모리 값으로 파일을 다시 쓰므로,
+실행 중인 앱에서 Drone 라디오 device를 선택하지 않고 종료하면 Drone 항목만 다시 비워질 수 있다.
+P1/P2는 이미 메모리에 같은 값이 있어 유지된다. `settings_controller`가
+`pixhawk_transport_schema_version=1`로 쓰고 `load_settings`가 매 기동마다 2로 재저장하는 것은
+값에 영향이 없는 기존 동작이다.
+
+### 남은 항목
+
+RTCM/RTK, 장시간 soak, restart/Resume, Workstation-owned 자동 재연결은 여전히 `NOT_RUN`이다.
+Ethernet 경로(P1 RX 장애, P2 eth0 DOWN)는 변하지 않았다.

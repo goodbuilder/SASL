@@ -29,6 +29,7 @@ import xlsxwriter
 
 from Workstation.workstation_core.measurement_methods import (
     CHECKERBOARD_STEREO,
+    CLOUD_GNSS,
     COMBINED_HYBRID,
     DRONE_RTK_MULTIVIEW,
     DRONE_RTK_ROTATION_HYBRID,
@@ -72,6 +73,7 @@ METHOD_SHEET_NAMES: dict[str, str] = {
     DRONE_RTK_MULTIVIEW: "M_Drone_RTK_Multiview",
     TERRAIN_PNP: "M_Terrain_PnP",
     COMBINED_HYBRID: "M_Combined",
+    CLOUD_GNSS: "M_Cloud_GNSS",
 }
 if tuple(METHOD_SHEET_NAMES) != MEASUREMENT_METHOD_IDS:
     raise RuntimeError("method worksheet mapping must cover every canonical method in order")

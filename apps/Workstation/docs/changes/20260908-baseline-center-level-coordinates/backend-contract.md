@@ -1,0 +1,3 @@
+# Backend Contract
+
+Frame baseline_center_local_level_frd. Source point and method right optical origin are in left optical RDF metres. Subtract half the right origin, convert RDF to body FRD, rotate with raw pair-frozen P1 attitude into NED, project onto horizontal P1 forward and right; Down is NED Down. Raw P1 quaternion is shared across methods; method geometry quaternion never overrides it. Each method retains its own optical midpoint. No GNSS absolute origin needed. Quaternion, source point, midpoint and source age recorded. Missing/invalid input or vertical forward gives null extra fields and reason. Range is rotation invariant.

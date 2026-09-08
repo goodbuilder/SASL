@@ -164,15 +164,15 @@ class InspectorWidget(QtWidgets.QWidget):
         self.mountain_max_points_combo = QtWidgets.QComboBox()
         self.mountain_max_points_combo.setObjectName("inspectorMountainMaxPoints")
         self.mountain_max_points_combo.setEditable(False)
-        for count in (4, 8, 12, 16, 20, 30, 40):
-            label = f"{count}" + ("  (default)" if count == 12 else "")
+        for count in (0, 4, 8, 12, 16, 20, 30, 40, 80, 200):
+            label = "All inliers  (default)" if count == 0 else f"{count}"
             self.mountain_max_points_combo.addItem(label, count)
         self.mountain_max_points_combo.setToolTip(
-            "How many spatially-spread correspondences Mountain keeps for the\n"
-            "final suggestion, out of however many actually pass matching and\n"
-            "RANSAC. More gives the solver more evidence but crowds the overlay;\n"
-            "fewer keeps the overlay readable. Takes effect on the next\n"
-            "Auto-select Mountain run, not live."
+            "How many spatially-spread correspondences Mountain/Cloud keep for\n"
+            "the final suggestion. 'All inliers' stores and shows every match\n"
+            "that passes RANSAC (complete evidence for the relative-rotation\n"
+            "fit); a number caps the overlay to that many spread points.\n"
+            "Takes effect on the next Auto-select run, not live."
         )
         self.mountain_max_points_combo.currentIndexChanged.connect(self._request_mountain_max_points)
         self.mountain_margin_section.add_row("Max points", self.mountain_max_points_combo)
@@ -329,6 +329,20 @@ class InspectorWidget(QtWidgets.QWidget):
         self._refresh_context_details(context_id)
         self._refresh_active_geometry()
         self._refresh_mountain_margin_control(context_id)
+
+    def clear_selection(self, context_id: str, *, owner: str) -> bool:
+        """Leave one view's details without clearing another view's selection."""
+
+        context_id = canonical_context_id(context_id)
+        if (
+            context_id != self._context_id
+            or self._selection is None
+            or self._selection.get("selection_owner") != owner
+        ):
+            return False
+        self._selection = None
+        self.refresh(context_id, self._status_model)
+        return True
 
     def inspect_selection(
         self,

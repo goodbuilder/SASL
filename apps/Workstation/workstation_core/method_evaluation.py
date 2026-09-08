@@ -391,6 +391,15 @@ class MethodEvaluationOutcome:
     def to_record(self) -> dict[str, object]:
         payload = self.canonical_payload()
         payload["method_evaluation_sha256"] = self.canonical_sha256()
+        if self.method_id in {"mountain_gnss", "cloud_gnss"}:
+            payload["usable"] = self.status in {"VALID", "ESTIMATED"}
+            payload["blocking_reasons"] = list(self.reasons)
+            payload["quality_warnings"] = list(self.warnings)
+            payload["gate_policy"] = (
+                "mountain-cloud-availability-v1"
+                if any("gate_policy=mountain-cloud-availability-v1" in w for w in self.warnings)
+                else "legacy_or_unspecified"
+            )
         return payload
 
     @classmethod
@@ -652,6 +661,11 @@ def evaluate_method_request(
         )
     geometry = calculate_measurement_geometry(attempt)
     payload = _geometry_result_payload(geometry)
+    from Workstation.workstation_core.target_coordinates import target_coordinates_from_attempt
+    payload.update(target_coordinates_from_attempt(
+        attempt.canonical_payload(),
+        None if geometry.triangulated is None else geometry.triangulated.source_point_left_rdf_m,
+    ))
     reasons: tuple[str, ...] = ()
     outcome_warnings = tuple(geometry.warnings)
     if geometry.match is None or geometry.triangulated is None or geometry.estimate is None:

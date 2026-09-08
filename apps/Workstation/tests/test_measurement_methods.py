@@ -1685,3 +1685,25 @@ def test_field_live_readiness_has_no_frame_drop_advisory_in_normal_operation(mon
 
     assert gnss_ready is True
     assert all("correction frame changed" not in warning for warning in advisories)
+
+
+def test_cloud_gnss_is_the_tenth_catalog_method() -> None:
+    from Workstation.workstation_core.measurement_methods import (
+        CLOUD_GNSS,
+        MEASUREMENT_METHOD_LABELS,
+        MEASUREMENT_METHOD_MISSING_INSTANCE_REASONS,
+        MEASUREMENT_METHOD_REQUIRED_INPUTS,
+        measurement_method_id_for_candidate,
+    )
+    from Workstation.workstation_core.measurement_record import METHOD_SHEET_NAMES as RECORD_SHEETS
+    from Workstation.workstation_core.session_review import METHOD_SHEET_NAMES as REVIEW_SHEETS
+
+    assert len(MEASUREMENT_METHOD_IDS) == 10
+    assert MEASUREMENT_METHOD_IDS[-1] == CLOUD_GNSS == "cloud_gnss"
+    assert "Cloud" in MEASUREMENT_METHOD_LABELS[CLOUD_GNSS]
+    assert "configured GNSS translation fill" in MEASUREMENT_METHOD_REQUIRED_INPUTS[CLOUD_GNSS]
+    assert CLOUD_GNSS in MEASUREMENT_METHOD_MISSING_INSTANCE_REASONS
+    assert measurement_method_id_for_candidate("cloud-far-field-rotation") == CLOUD_GNSS
+    assert measurement_method_id_for_candidate("optical_pose/cloud-far-field-rotation") == CLOUD_GNSS
+    assert RECORD_SHEETS[CLOUD_GNSS] == "19_Cloud_GNSS"
+    assert REVIEW_SHEETS[CLOUD_GNSS] == "M_Cloud_GNSS"

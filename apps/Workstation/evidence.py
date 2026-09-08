@@ -963,11 +963,21 @@ class EvidenceAdapter:
         )
         fix_type = _integer(getattr(state, "fix_type", None))
         rtk_label = str(getattr(state, "rtk_label", "UNKNOWN") or "UNKNOWN")
+        frozen = self._gnss_position_frozen(state_key)
         return {
             "side": side,
             "receiver_source": source,
             "state": rtk_label,
             "rtk_label": rtk_label,
+            "position_frozen": frozen is not None,
+            "position_frozen_packets": None if frozen is None else _integer(frozen.get("packets")),
+            "position_frozen_cause": (
+                None
+                if frozen is None
+                else "autopilot re-sending one stale fix (GPS UTC frozen)"
+                if frozen.get("utc_frozen")
+                else "receiver position output frozen while GPS UTC advances"
+            ),
             "fix_type": fix_type,
             "satellites": _integer(getattr(state, "satellites_used", None)),
             "eph_m": _number(getattr(state, "eph_m", None)),
@@ -996,6 +1006,16 @@ class EvidenceAdapter:
             "position_contract": "WGS84 latitude/longitude degrees; altitude metres",
             **provenance,
         }
+
+    def _gnss_position_frozen(self, key: str) -> Mapping[str, object] | None:
+        """Return the producer-side frozen-position evidence for one GPS key."""
+
+        store = getattr(self.panel, "_gnss_position_frozen", {}) or {}
+        entry = store.get(key) if isinstance(store, Mapping) else None
+        if not isinstance(entry, Mapping):
+            return None
+        packets = _integer(entry.get("packets"))
+        return entry if packets is not None and packets > 0 else None
 
     def _magnetometer_yaw_fields(
         self,
@@ -1086,6 +1106,13 @@ class EvidenceAdapter:
         attitude_status = attitude_cache.get(side) if isinstance(attitude_cache, Mapping) else None
         board_params = getattr(attitude_status, "params", None)
         board_params = board_params if isinstance(board_params, Mapping) else None
+        if board_params is None or _integer(board_params.get("SENS_BOARD_ROT")) is None:
+            # The automatic path reads SENS_BOARD_ROT on its own; the full
+            # attitude-calibration readback only happens on operator request.
+            rotation_cache = getattr(self.panel, "_px4_board_rotation_params", {}) or {}
+            rotation_params = rotation_cache.get(side) if isinstance(rotation_cache, Mapping) else None
+            if isinstance(rotation_params, Mapping) and _integer(rotation_params.get("SENS_BOARD_ROT")) is not None:
+                board_params = {**(board_params or {}), "SENS_BOARD_ROT": rotation_params["SENS_BOARD_ROT"]}
         calibration = calibrated_magnetometer_yaw_deg(
             x=xmag,
             y=ymag,
@@ -2115,6 +2142,21 @@ class EvidenceAdapter:
                 overall_state = "WAITING"
 
         reasons: list[str] = []
+        drone_frozen = self._gnss_position_frozen("drone")
+        if drone_frozen is not None:
+            # A vehicle whose GNSS keeps repeating one position produces a
+            # triangle that only looks current: age resets on every packet
+            # while the vertex never moves. Say so ahead of every other reason.
+            overall_state = "FROZEN"
+            cause = (
+                "autopilot이 같은 fix 재전송"
+                if drone_frozen.get("utc_frozen")
+                else "수신기 위치 출력 정지"
+            )
+            reasons.append(
+                f"Drone GNSS 위치 고정 ×{_integer(drone_frozen.get('packets'))} ({cause}); "
+                "각도/벡터는 정지된 드론 위치 기준"
+            )
         if estimate.reason and geometry_state != "CURRENT":
             reasons.append(estimate.reason)
         if p1_attitude_state not in {"CURRENT"}:
@@ -2125,6 +2167,7 @@ class EvidenceAdapter:
             reasons.append("one or both horizontal triangle angles are undefined")
         return {
             "state": overall_state,
+            "drone_position_frozen": drone_frozen is not None,
             "reason": "; ".join(dict.fromkeys(reasons)) or "all geometry inputs current",
             "vectors": tuple(vectors),
             "angles": angles_rows,

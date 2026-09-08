@@ -386,6 +386,7 @@ def test_workstation_shutdown_orders_runtime_stop_before_settings_save(
         "verify-resource-cleanup",
         "save-settings",
         "close-measurement-data-writer",
+        "archive-session-recordings",
     )
     panel.close()
     app.processEvents()
@@ -751,7 +752,9 @@ def test_workstation_every_flat_app_setting_has_an_editable_surface() -> None:
     } <= measurement_keys
     assert set(sync_aliases.values()) <= time_keys
     assert set(calibration_aliases.values()) <= calibration_keys
-    assert window.settings_workspace.measurement_fallback_list.count() == 9
+    from Workstation.workstation_core.measurement_methods import MEASUREMENT_METHOD_IDS
+
+    assert window.settings_workspace.measurement_fallback_list.count() == len(MEASUREMENT_METHOD_IDS) == 10
     assert "zoom_level" not in calibration_keys
     assert window.advanced.zoom_level_spin.value() > 0
     assert not set(sync_aliases.values()) & measurement_keys
@@ -1065,7 +1068,7 @@ def test_settings_save_does_not_persist_when_visible_payload_apply_is_rejected()
     assert persisted == []
     assert failures[-1] == (
         "measurement.save_settings",
-        "measurement settings apply was rejected",
+        "RuntimeError: measurement settings apply was rejected",
     )
 
     window.close()

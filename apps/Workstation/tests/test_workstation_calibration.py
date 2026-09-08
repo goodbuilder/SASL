@@ -481,6 +481,215 @@ def test_calibration_fit_preview_keeps_both_source_edges_and_fixed_metadata_heig
     preview.deleteLater()
     app.processEvents()
 
+def test_camera_preview_center_line_is_one_red_column_and_toggles_off() -> None:
+    from PyQt5 import QtGui
+
+    from Workstation.workspaces import CameraPreview
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    preview = CameraPreview("left", crop_to_fill=False, lock_chrome_height=True)
+    preview.image.resize(160, 90)
+    source = QtGui.QImage(160, 90, QtGui.QImage.Format_RGB888)
+    source.fill(QtGui.QColor("black"))
+    preview.set_frame(source, {})
+
+    preview._render()
+    plain = preview.image.pixmap().toImage()
+    assert all(plain.pixelColor(x, 45).red() < 50 for x in range(plain.width()))
+
+    preview.set_center_line_visible(True)
+    preview._render()
+    lined = preview.image.pixmap().toImage()
+    red_columns = [
+        x for x in range(lined.width()) if lined.pixelColor(x, 45).red() > 200
+    ]
+    assert red_columns == [lined.width() // 2]
+    assert all(
+        lined.pixelColor(lined.width() // 2, y).red() > 200
+        for y in range(lined.height())
+    )
+    # The source frame stays untouched; only the rendered copy carries chrome.
+    assert all(source.pixelColor(x, 45).red() == 0 for x in range(source.width()))
+
+    preview.set_center_line_visible(False)
+    preview._render()
+    cleared = preview.image.pixmap().toImage()
+    assert all(cleared.pixelColor(x, 45).red() < 50 for x in range(cleared.width()))
+    preview.deleteLater()
+    app.processEvents()
+
+def test_calibration_center_line_moved_without_changing_live_previews() -> None:
+    from Workstation.workspaces import CalibrationWorkspace
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    workspace = CalibrationWorkspace(backend, lambda: None, lambda _command_id: True)
+
+    assert not hasattr(workspace, "center_line_checkbox")
+    assert all(not p.center_line_visible() for p in workspace.previews.values())
+    workspace.deleteLater()
+    app.processEvents()
+
+
+def test_camera_preview_zoom_keeps_center_line_on_native_image_center() -> None:
+    from PyQt5 import QtCore, QtGui
+
+    from Workstation.workspaces import CameraPreview
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    preview = CameraPreview("left", crop_to_fill=False, wheel_zoom=True)
+    preview.resize(200, 160)
+    preview.show()
+    app.processEvents()
+    preview.image.resize(160, 90)
+    source = QtGui.QImage(160, 90, QtGui.QImage.Format_RGB888)
+    source.fill(QtGui.QColor("black"))
+    preview.set_frame(source, {})
+    preview.set_center_line_visible(True)
+
+    def red_columns():
+        rendered = preview.image.pixmap().toImage()
+        return [x for x in range(rendered.width()) if rendered.pixelColor(x, 45).red() > 200]
+
+    try:
+        # Raster midline x=80 maps to 60 + (80 - 60) * 1.2 = 84.
+        point = preview.image.pos() + QtCore.QPoint(60, 45)
+        QtWidgets.QApplication.sendEvent(preview, _wheel_event(preview, point, 120))
+        assert red_columns() == [84]
+
+        # Zooming into the left edge moves the native center outside the view.
+        # A red line clamped to the viewport edge would be a false aiming guide.
+        point = preview.image.pos() + QtCore.QPoint(8, 45)
+        for _ in range(20):
+            QtWidgets.QApplication.sendEvent(preview, _wheel_event(preview, point, 120))
+        assert preview.zoom_factor() == 8.0
+        assert red_columns() == []
+
+        for _ in range(20):
+            QtWidgets.QApplication.sendEvent(preview, _wheel_event(preview, point, -120))
+        assert preview.zoom_factor() == 1.0
+        assert red_columns() == [80]
+        assert all(source.pixelColor(x, 45).red() == 0 for x in range(source.width()))
+    finally:
+        preview.close()
+        preview.deleteLater()
+        app.processEvents()
+
+
+def _wheel_event(widget: QtWidgets.QWidget, pos: "QtCore.QPoint", delta: int) -> "QtGui.QWheelEvent":
+    from PyQt5 import QtCore, QtGui
+
+    return QtGui.QWheelEvent(
+        QtCore.QPointF(pos),
+        QtCore.QPointF(widget.mapToGlobal(pos)),
+        QtCore.QPoint(0, 0),
+        QtCore.QPoint(0, delta),
+        QtCore.Qt.NoButton,
+        QtCore.Qt.NoModifier,
+        QtCore.Qt.NoScrollPhase,
+        False,
+    )
+
+
+def _white_pixel_count(image: "QtGui.QImage") -> int:
+    return sum(
+        1
+        for y in range(image.height())
+        for x in range(image.width())
+        if image.pixelColor(x, y).red() > 200
+    )
+
+
+def test_calibration_preview_wheel_zooms_around_pointer_and_snaps_back() -> None:
+    from PyQt5 import QtCore, QtGui
+
+    from Workstation.workspaces import CameraPreview
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    preview = CameraPreview(
+        "left", crop_to_fill=False, lock_chrome_height=True, wheel_zoom=True
+    )
+    preview.resize(200, 160)
+    preview.show()
+    app.processEvents()
+    preview.image.resize(160, 90)
+    source = QtGui.QImage(160, 90, QtGui.QImage.Format_RGB888)
+    source.fill(QtGui.QColor("black"))
+    for x in range(78, 82):
+        for y in range(43, 47):
+            source.setPixelColor(x, y, QtGui.QColor("white"))
+    preview.set_frame(source, {})
+    preview._render()
+    baseline = _white_pixel_count(preview.image.pixmap().toImage())
+    assert baseline > 0
+    assert preview.zoom_factor() == 1.0
+
+    center = preview.image.pos() + QtCore.QPoint(80, 45)
+    zoom_in = _wheel_event(preview, center, 120)
+    QtWidgets.QApplication.sendEvent(preview, zoom_in)
+    assert zoom_in.isAccepted()
+    assert preview.zoom_factor() == pytest.approx(1.2)
+    # The pointed pixel (image center) stays under the pointer.
+    assert preview.image.pixmap().toImage().pixelColor(80, 45).red() > 200
+
+    for _ in range(5):
+        QtWidgets.QApplication.sendEvent(preview, _wheel_event(preview, center, 120))
+    assert preview.zoom_factor() == pytest.approx(1.2**6)
+    zoomed = preview.image.pixmap().toImage()
+    assert _white_pixel_count(zoomed) > 4 * baseline
+    assert zoomed.pixelColor(80, 45).red() > 200
+    for _ in range(12):
+        QtWidgets.QApplication.sendEvent(preview, _wheel_event(preview, center, -120))
+    assert preview.zoom_factor() == 1.0
+    assert _white_pixel_count(preview.image.pixmap().toImage()) == baseline
+
+    # Wheel input outside the image surface is left for the enclosing page.
+    outside = _wheel_event(preview, QtCore.QPoint(preview.width() - 1, preview.height() - 1), 120)
+    outside.ignore()
+    QtWidgets.QApplication.sendEvent(preview, outside)
+    assert preview.zoom_factor() == 1.0
+    assert not outside.isAccepted()
+
+    # Zoom never changes the source frame handed to capture/evidence.
+    assert _white_pixel_count(source) == 16
+    preview.deleteLater()
+    app.processEvents()
+
+
+def test_camera_preview_without_wheel_zoom_ignores_wheel() -> None:
+    from PyQt5 import QtCore, QtGui
+
+    from Workstation.workspaces import CameraPreview
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    preview = CameraPreview("left", crop_to_fill=False, lock_chrome_height=True)
+    preview.resize(200, 160)
+    preview.show()
+    app.processEvents()
+    preview.image.resize(160, 90)
+    source = QtGui.QImage(160, 90, QtGui.QImage.Format_RGB888)
+    source.fill(QtGui.QColor("black"))
+    preview.set_frame(source, {})
+    event = _wheel_event(preview, preview.image.pos() + QtCore.QPoint(80, 45), 120)
+    event.ignore()
+    QtWidgets.QApplication.sendEvent(preview, event)
+    assert preview.zoom_factor() == 1.0
+    assert not event.isAccepted()
+    preview.deleteLater()
+    app.processEvents()
+
+
+def test_calibration_workspace_previews_opt_into_wheel_zoom() -> None:
+    from Workstation.workspaces import CalibrationWorkspace
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    workspace = CalibrationWorkspace(_FakeBackend(), lambda: None, lambda _command_id: True)
+    assert all(p.wheel_zoom for p in workspace.previews.values())
+    assert all(p.wheel_zoom for p in workspace.ftp_previews.values())
+    workspace.deleteLater()
+    app.processEvents()
+
+
 def test_calibration_workspace_routes_capture_events_to_the_matching_camera_log() -> None:
     from PyQt5 import QtGui
 

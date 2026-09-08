@@ -700,6 +700,15 @@ class RtcmDataPlaneWorker(QtCore.QObject):
                     )
                 continue
             self._plane.record_evidence_written(written)
+            if written.get("csv_error"):
+                self.integrity_failed.emit({
+                    "schema": "workstation-rtcm-integrity-failure-v1",
+                    "sequence": record.sequence, "source": record.source,
+                    "record_kind": record.record_kind, "session_id": context.session_id,
+                    "context_token": context.context_token,
+                    "session_root": str(context.session_root),
+                    "format": "CSV", "error": f"CSV mirror: {written['csv_error']}",
+                })
             evidence_key = (context.context_token, str(context.session_root))
             if evidence_key != self._evidence_started_key:
                 self._evidence_started_key = evidence_key

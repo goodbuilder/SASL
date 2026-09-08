@@ -1,0 +1,22 @@
+# Yaw-delta tuning overlay for P2 (sysid 2) — only the parameters changed/pinned on 2026-09-06.
+# Apply with PARAM_SET, then PARAM_SAVE and reboot. Never set unused CAL_MAGn_PRIO to 0 (use 1).
+#
+# Vehicle-Id Component-Id Name Value Type
+2	1	CAL_MAG0_PRIO	1	6
+2	1	CAL_MAG1_PRIO	1	6
+2	1	CAL_MAG2_PRIO	100	6
+2	1	CAL_MAG3_PRIO	1	6
+2	1	CAL_MAG2_ID	8944643	6
+2	1	CAL_MAG2_ROT	0	6
+2	1	CAL_MAG2_ROLL	0	9
+2	1	CAL_MAG2_PITCH	0	9
+2	1	CAL_MAG2_YAW	0	9
+2	1	EKF2_HEAD_NOISE	0.02	9
+2	1	EKF2_GYR_B_NOISE	0.005	9
+2	1	EKF2_MAG_TYPE	1	6
+2	1	EKF2_GPS_CTRL	0	6
+2	1	CAL_GYRO1_PRIO	75	6
+2	1	CAL_ACC1_PRIO	75	6
+2	1	SENS_MAG_RATE	200	9
+2	1	IMU_GYRO_RATEMAX	800	6
+2	1	MAV_0_CONFIG	101	6

@@ -72,3 +72,18 @@ This is a transport PASS, not a GNSS solution PASS. Both GPS messages carried
 correctly remained `NO FIX`. P1's outbound Ethernet telemetry is stable while
 its inbound ARP/GCS/RTCM path remains failed. See the JSON record for exact
 counts, gaps and pcap provenance.
+
+## 2026-09-06 parameter backup after yaw-delta tuning
+
+- `parameters-full-20260906T0939KST.params`: complete onboard parameter table
+  (1173 params) read over USB with `PARAM_REQUEST_LIST`, QGC overlay format
+  (`Vehicle-Id Component-Id Name Value Type`). Read-only capture; the board was
+  disarmed and no file/firmware write was performed.
+- `yaw-tune-20260906T0939KST.params`: only the parameters changed or pinned on
+  2026-09-06 (`CAL_MAG0/1/3_PRIO=1`, `CAL_MAG2_PRIO=100`, `EKF2_HEAD_NOISE=0.02`,
+  `EKF2_GYR_B_NOISE=0.005`, `CAL_GYRO1_PRIO=CAL_ACC1_PRIO=75`, `SENS_MAG_RATE=200`,
+  `IMU_GYRO_RATEMAX=800`, and `EKF2_GPS_CTRL=0` — set after the full capture
+  because `EKF2_HEAD_NOISE=0.02` doubles as the mag-heading consistency gate and
+  GPS NE aiding made heading fusion drop out once the rig was moved; see
+  `../../Pixhawk.md` section 12). Apply with PARAM_SET, then PARAM_SAVE and reboot.
+  Never set an unused `CAL_MAGn_PRIO` to 0 — see `../../Pixhawk.md` section 12.

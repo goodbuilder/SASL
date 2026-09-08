@@ -72,7 +72,8 @@ def test_mountain_regression_partial_width_silhouette_stays_off_sky() -> None:
 
     assert result.state == "GOOD"
     assert result.match_count >= 4
-    assert 4 <= len(result.left.points) <= 12
+    # default max_points=0 keeps every RANSAC inlier
+    assert len(result.left.points) == result.inlier_count >= 4
     # The sky/cloud band fills roughly the top ~45% of this frame; the tree
     # silhouette and grass horizon sit well below that. The originally
     # broken line-fit put points as high as the top few percent of the
@@ -112,7 +113,8 @@ def test_mountain_regression_real_stereo_ridge_pair_stays_off_cloud() -> None:
 
     assert result.state == "GOOD"
     assert result.match_count >= 4
-    assert 4 <= len(result.left.points) <= 12
+    # default max_points=0 keeps every RANSAC inlier
+    assert len(result.left.points) == result.inlier_count >= 4
     # Known bad points from the original failure were (1250, 209) and
     # (142, 81) -- isolated cloud keypoints far above the true ridge
     # (~470-513). This threshold sits well between the two clusters.

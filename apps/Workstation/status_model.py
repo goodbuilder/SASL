@@ -612,6 +612,9 @@ class BackendStatusAdapter(QtCore.QObject):
                 if policy is not None:
                     tier = getattr(getattr(policy, "tier", None), "name", "UNKNOWN")
                     detail_parts.append(f"optional-tier={tier}")
+                    cap = getattr(policy, "tier_cap", None)
+                    if cap is not None and getattr(cap, "name", "STOCK") != "STOCK":
+                        detail_parts.append(f"optional-cap={cap.name}")
             if state in {"CONNECTING", "MAVLINK INITIAL RX TIMEOUT"}:
                 listener_age_s = getattr(health, "listener_age_s", None)
                 if listener_age_s is not None:

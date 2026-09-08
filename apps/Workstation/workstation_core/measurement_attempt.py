@@ -1235,6 +1235,7 @@ class MeasurementAttempt:
     measurement_geometry_sha256: str = ""
     measurement_selection_reason: str = "legacy"
     measurement_component_sources: tuple[tuple[str, str], ...] = ()
+    measurement_pose_evidence_json: str = ""
     measurement_policy_id: str = FIELD_MEASUREMENT_POLICY_ID
     measurement_validity: str = "VALID"
     hard_block_reasons: tuple[str, ...] = ()
@@ -1266,9 +1267,28 @@ class MeasurementAttempt:
     measurement_yaw_reverse: bool = False
     measurement_yaw_consensus: bool | None = None
     measurement_yaw_low_margin: bool = False
+    # Both perpendicular GPS-baseline yaw branches are kept so a wrong branch
+    # can be flipped offline without re-measuring. Compass degrees, NED yaw.
+    measurement_yaw_candidate_minus90_deg: float | None = None
+    measurement_yaw_candidate_plus90_deg: float | None = None
+    measurement_yaw_alternate_deg: float | None = None
+    measurement_yaw_p1_error_minus90_deg: float | None = None
+    measurement_yaw_p1_error_plus90_deg: float | None = None
+    measurement_yaw_p2_error_minus90_deg: float | None = None
+    measurement_yaw_p2_error_plus90_deg: float | None = None
+    geometry_left_quaternion_wxyz_alternate: tuple[float, float, float, float] | None = None
+    geometry_right_quaternion_wxyz_alternate: tuple[float, float, float, float] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "attempt_id", int(self.attempt_id))
+        if self.measurement_pose_evidence_json:
+            evidence = json.loads(self.measurement_pose_evidence_json)
+            if not isinstance(evidence, dict) or evidence.get("schema") != "measurement-optical-pose-evidence-v1":
+                raise ValueError("invalid measurement optical pose evidence")
+            from .optical_yaw90_reference import canonical_evidence, reference_poses
+            if evidence.get("yaw90_reference") is not None:
+                reference_poses(evidence["yaw90_reference"])
+            object.__setattr__(self, "measurement_pose_evidence_json", canonical_evidence(evidence))
         object.__setattr__(self, "attempt_session_id", str(self.attempt_session_id))
         object.__setattr__(self, "detection_pair_key", tuple(self.detection_pair_key))
         for name in ("created_monotonic_s", "created_wall_s", "detection_midpoint_monotonic_s"):
@@ -1310,6 +1330,8 @@ class MeasurementAttempt:
         for field_name in (
             "geometry_left_quaternion_wxyz",
             "geometry_right_quaternion_wxyz",
+            "geometry_left_quaternion_wxyz_alternate",
+            "geometry_right_quaternion_wxyz_alternate",
         ):
             value = getattr(self, field_name)
             if value is not None:
@@ -1341,6 +1363,13 @@ class MeasurementAttempt:
             "measurement_yaw_p2_age_s",
             "measurement_yaw_score_minus90_deg",
             "measurement_yaw_score_plus90_deg",
+            "measurement_yaw_candidate_minus90_deg",
+            "measurement_yaw_candidate_plus90_deg",
+            "measurement_yaw_alternate_deg",
+            "measurement_yaw_p1_error_minus90_deg",
+            "measurement_yaw_p1_error_plus90_deg",
+            "measurement_yaw_p2_error_minus90_deg",
+            "measurement_yaw_p2_error_plus90_deg",
         ):
             object.__setattr__(
                 self,
@@ -1589,6 +1618,7 @@ class MeasurementAttempt:
             payload.pop("requested_timestamp_basis", None)
             payload.pop("timing_fallback_reason", None)
         optional_defaults = {
+            "measurement_pose_evidence_json": "",
             "geometry_left_quaternion_wxyz": None,
             "geometry_right_quaternion_wxyz": None,
             "measurement_yaw_source": "",
@@ -1605,6 +1635,15 @@ class MeasurementAttempt:
             "measurement_yaw_reverse": False,
             "measurement_yaw_consensus": None,
             "measurement_yaw_low_margin": False,
+            "measurement_yaw_candidate_minus90_deg": None,
+            "measurement_yaw_candidate_plus90_deg": None,
+            "measurement_yaw_alternate_deg": None,
+            "measurement_yaw_p1_error_minus90_deg": None,
+            "measurement_yaw_p1_error_plus90_deg": None,
+            "measurement_yaw_p2_error_minus90_deg": None,
+            "measurement_yaw_p2_error_plus90_deg": None,
+            "geometry_left_quaternion_wxyz_alternate": None,
+            "geometry_right_quaternion_wxyz_alternate": None,
         }
         for name, default in optional_defaults.items():
             if payload.get(name) == default:

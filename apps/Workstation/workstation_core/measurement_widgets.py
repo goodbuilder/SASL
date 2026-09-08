@@ -45,6 +45,11 @@ class DistanceHistoryPoint:
     class_name: str | None = None
     sample_key: tuple[object, ...] | None = None
     recording_elapsed_s: float | None = None
+    # WGS84 coordinates from this same measurement, separate from FRD metres.
+    target_latitude_deg: float | None = None
+    target_longitude_deg: float | None = None
+    target_altitude_ellipsoid_m: float | None = None
+    target_altitude_msl_m: float | None = None
 
 
 def triangulation_3d_scene_points(

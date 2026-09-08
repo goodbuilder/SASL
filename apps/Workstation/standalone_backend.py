@@ -57,6 +57,45 @@ class StandalonePanelBackend(QtCore.QObject):
     def measurement_run_snapshot(self) -> Any:
         return self._call("measurement_run_snapshot")
 
+    def baseline_yaw90_snapshot(self) -> Any:
+        from Workstation.baseline_yaw90_controller import baseline_yaw90_snapshot
+
+        return baseline_yaw90_snapshot(self.panel)
+
+    def alignment_live_rt_snapshot(self) -> Any:
+        from Workstation.alignment_rt_controller import alignment_live_rt_snapshot
+
+        return alignment_live_rt_snapshot(self.panel)
+
+    def apply_baseline_yaw90_settings(self, payload: dict[str, object], *, persist: bool = False) -> Any:
+        return self._call("apply_baseline_yaw90_settings", dict(payload), persist=persist)
+
+    def connect_baseline_yaw90_preview(self, receiver: object) -> None:
+        """Subscribe display-only views to the existing camera owner once."""
+        panel = self.panel
+
+        def subscribe(signal, callback):
+            signal.connect(callback)
+
+            def detach(_destroyed=None):
+                try:
+                    signal.disconnect(callback)
+                except (RuntimeError, TypeError):
+                    pass  # The producer may already have been destroyed.
+
+            receiver.destroyed.connect(detach)
+
+        clear_signal = getattr(panel, "camera_preview_cleared", None)
+        if clear_signal is not None:
+            subscribe(clear_signal, receiver.clear_previews)
+        for side in ("left", "right"):
+            pane = getattr(panel, f"{side}_pane", None)
+            signal = getattr(pane, "frame_changed", None)
+            if signal is not None:
+                subscribe(signal,
+                    lambda _label, image, metadata, side=side: receiver.set_frame(side, image, metadata)
+                )
+
     def optical_pose_snapshot(self, *, include_frames: bool = True) -> Any:
         return self._call(
             "workstation_optical_pose_snapshot",
@@ -113,6 +152,9 @@ class StandalonePanelBackend(QtCore.QObject):
     def optical_pose_solve_gnss_mountain(self, payload: dict[str, object]) -> Any:
         return self._call("solve_workstation_optical_pose_gnss_mountain", dict(payload))
 
+    def optical_pose_solve_cloud_rotation(self, payload: dict[str, object]) -> Any:
+        return self._call("solve_workstation_optical_pose_cloud_rotation", dict(payload))
+
     def optical_pose_solve_drone_yaw(self, payload: dict[str, object]) -> Any:
         return self._call("solve_workstation_optical_pose_drone_yaw", dict(payload))
 
@@ -134,6 +176,12 @@ class StandalonePanelBackend(QtCore.QObject):
     def optical_pose_auto_select_mountain(self, payload: dict[str, object] | None = None) -> Any:
         return self._call(
             "auto_select_workstation_optical_pose_mountain",
+            dict(payload or {}),
+        )
+
+    def optical_pose_auto_select_cloud(self, payload: dict[str, object] | None = None) -> Any:
+        return self._call(
+            "auto_select_workstation_optical_pose_cloud",
             dict(payload or {}),
         )
 
@@ -511,6 +559,12 @@ class StandalonePanelBackend(QtCore.QObject):
     def measurement_methods_snapshot(self) -> Any:
         return self._call("workstation_measurement_methods_snapshot")
 
+    def measurement_results_snapshot(self, measurement_id=None, pair_id=None) -> Any:
+        reader = getattr(self.panel, "measurement_results_snapshot", None)
+        if not callable(reader):
+            return {"measurement_id": "", "pair_id": "", "rows": [], "reason": "기록 결과 없음"}
+        return reader(measurement_id, pair_id)
+
     def select_measurement_method(self, payload: dict[str, object]) -> Any:
         return self._call("select_workstation_measurement_method", dict(payload))
 
@@ -675,6 +729,9 @@ class StandalonePanelBackend(QtCore.QObject):
 
     def advanced_refresh_px4_mag(self, camera: str, *, read_params: bool = True) -> Any:
         return self._call("workstation_refresh_px4_mag", camera, read_params=read_params)
+
+    def advanced_refresh_px4_board_rotation(self, camera: str) -> Any:
+        return self._call("workstation_refresh_px4_board_rotation", camera)
 
     def advanced_refresh_px4_attitude_cal(self, camera: str, *, read_params: bool = True) -> Any:
         return self._call("workstation_refresh_px4_attitude_cal", camera, read_params=read_params)

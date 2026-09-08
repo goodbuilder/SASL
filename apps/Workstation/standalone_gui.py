@@ -1727,6 +1727,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "drone": Px4MagManager(MockParameterStore(current_pixhawk_6x_mag_params())),
         }
         self._px4_mag_status_cache: dict[str, object] = {}
+        # CAL_MAG names a partial Radio readback is still missing, per side.
+        self._px4_mag_status_incomplete: dict[str, tuple[str, ...]] = {}
+        # Lightweight SENS_BOARD_ROT readback used by the corrected-yaw gate
+        # before the full attitude-calibration status has been requested.
+        self._px4_board_rotation_params: dict[str, dict[str, object]] = {}
         self._px4_mag_verification_targets: dict[str, dict[str, object]] = {}
         self._px4_attitude_cal_status_cache: dict[str, Px4AttitudeCalStatus] = {}
         self._px4_calibration_parameter_error: dict[str, str] = {}
@@ -3792,6 +3797,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 LifecycleStep(
                     "close-measurement-data-writer",
                     lambda: self.close_workstation_data(timeout_s=0.25),
+                ),
+                LifecycleStep(
+                    "archive-session-recordings",
+                    lambda: self.archive_session_recordings(),
                 ),
             ]
         )
@@ -7354,8 +7363,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         }
 
     def _recording_session_dir(self, stamp: str | None = None) -> Path:
-        # Compatibility name only: new writes have one type-owned data root,
-        # never a timestamped Session directory.
+        context_reader = getattr(self, "measurement_storage_context", None)
+        if callable(context_reader):
+            context = context_reader(stamp)
+            if context.get("root"):
+                return Path(str(context["root"]))
         reader = getattr(self, "data_storage_snapshot", None)
         if callable(reader):
             snapshot = reader()
@@ -10899,9 +10911,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def retry_data_storage(self, *args: Any, **kwargs: Any) -> Any: ...
         def allocate_workstation_data_artifact(self, *args: Any, **kwargs: Any) -> Any: ...
         def allocate_measurement_artifact(self, *args: Any, **kwargs: Any) -> Any: ...
+        def measurement_storage_context(self, *args: Any, **kwargs: Any) -> Any: ...
+        def rebuild_latest_measurement_workbook(self, *args: Any, **kwargs: Any) -> Any: ...
         def flush_workstation_data(self, *args: Any, **kwargs: Any) -> Any: ...
         def close_workstation_data(self, *args: Any, **kwargs: Any) -> Any: ...
+        def archive_session_recordings(self, *args: Any, **kwargs: Any) -> Any: ...
         def measurement_registry(self, *args: Any, **kwargs: Any) -> Any: ...
+        def measurement_results_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
         def measurement_workbook_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
         def latest_measurement_workbook_path(self, *args: Any, **kwargs: Any) -> Any: ...
         def finalize_measurement_workbooks(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -10923,6 +10939,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def commit_workstation_optical_pose_auto_selection(self, *args: Any, **kwargs: Any) -> Any: ...
         def auto_select_workstation_optical_pose_horizon(self, *args: Any, **kwargs: Any) -> Any: ...
         def auto_select_workstation_optical_pose_mountain(self, *args: Any, **kwargs: Any) -> Any: ...
+        def auto_select_workstation_optical_pose_cloud(self, *args: Any, **kwargs: Any) -> Any: ...
+        def solve_workstation_optical_pose_cloud_rotation(self, *args: Any, **kwargs: Any) -> Any: ...
         def accept_workstation_optical_pose_suggestion(self, *args: Any, **kwargs: Any) -> Any: ...
         def record_workstation_optical_pose_annotation(self, *args: Any, **kwargs: Any) -> Any: ...
         def workstation_optical_pose_candidate_poses(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -11405,6 +11423,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def shutdown_for_close(self, *args: Any, **kwargs: Any) -> Any: ...
         def closeEvent(self, *args: Any, **kwargs: Any) -> Any: ...
         def _stop_calibration_preview_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def apply_baseline_yaw90_settings(self, *args: Any, **kwargs: Any) -> Any: ...
         def save_current_settings_from_ui(self, *args: Any, **kwargs: Any) -> Any: ...
         def save_workstation_calibration_setup(self, *args: Any, **kwargs: Any) -> Any: ...
         def workstation_settings_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -11945,7 +11964,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         return result
 
     def measurement_mag_start_gate(self) -> bool:
-        """Reject only methods whose selected inputs consume live Pixhawk data."""
+        """Report MAG active-selection readiness for methods that consume live Pixhawk data.
+
+        The result is advisory: ``start_yolo`` logs an unverified side and
+        continues. The refreshed ``_last_measurement_mag_gate`` snapshot is
+        still recorded as run provenance.
+        """
 
         try:
             snapshot = self._measurement_view_controller().workstation_measurement_methods_snapshot()
@@ -11994,7 +12018,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         gate = self.workstation_px4_mag_measurement_gate(("left", "right"))
         if not bool(gate.get("ready")):
             self._log(
-                "[측정] MAG active-selection verification blocked: "
+                "[측정] MAG active-selection 미검증 (측정 시작은 차단하지 않음): "
                 + "; ".join(str(value) for value in gate.get("blockers") or ())
             )
             return False
@@ -12078,6 +12102,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.latest_vehicle_mag_device_ids[side] = None
             timestamps[side] = None
             self._px4_mag_status_cache.pop(side, None)
+            self._px4_mag_status_incomplete.pop(side, None)
+            self._px4_board_rotation_params.pop(side, None)
             targets.pop(side, None)
             self._px4_calibration_parameter_error.pop(side, None)
             for key in tuple(self._px4_calibration_reset_error):
@@ -12686,6 +12712,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if read_params and self._start_pixhawk_parameter_worker(camera, "mag_refresh"):
             return
         self.refresh_px4_mag_manager(camera, read_params=bool(read_params))
+
+    def workstation_refresh_px4_board_rotation(self, camera: str) -> bool:
+        """Read only SENS_BOARD_ROT so internal-MAG corrected yaw can be shown."""
+        camera = str(camera or "")
+        if camera not in {"left", "right"}:
+            raise ValueError(f"Unknown Pixhawk side: {camera}")
+        return bool(self._start_pixhawk_parameter_worker(camera, "board_rotation_refresh"))
 
     def workstation_refresh_px4_attitude_cal(self, camera: str, *, read_params: bool = True) -> None:
         camera = str(camera or "")
@@ -13456,12 +13489,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             if callable(writer):
                 try:
                     from Workstation.workstation_core.package_provenance import redact_secrets
+                    from Workstation.workstation_core.log_level import classify_log_level
 
                     writer(
                         "application.log",
                         {
                             "message": redact_secrets(str(text)),
                             "source": "Workstation._log",
+                            "level": classify_log_level(text),
                         },
                         priority=False,
                     )
@@ -13487,9 +13522,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
                     log_path = self._recording_session_dir(session_id) / "audit" / "application_log.jsonl"
                     log_path.parent.mkdir(parents=True, exist_ok=True)
+                    from Workstation.workstation_core.log_level import classify_log_level
+
                     record = {
                         "schema": "workstation-application-log-v1",
                         "utc_ns": time.time_ns(),
+                        "level": classify_log_level(text),
                         "message": redact_secrets(str(text)),
                     }
                     prepared_paths = getattr(

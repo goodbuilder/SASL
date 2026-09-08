@@ -343,7 +343,7 @@ def test_real_panel_ignores_old_session_and_prepares_type_owned_paths(
     assert panel.measurement_run_snapshot()["state"] == "RUNNING"
     assert starts == [{"enable_detection": True, "switch_to_depth": True}]
     assert panel.data_storage_snapshot()["root"] == str(tmp_path / "recordings")
-    # Measurement-owned videos share the workbook's Start prefix, flat in the root.
+    # Every Measurement owns its start-stamped directory and media paths.
     prefix = panel._measurement_file_prefix
     assert prefix
     assert {path.name for path in panel.video_recording_paths.values()} == {
@@ -351,7 +351,7 @@ def test_real_panel_ignores_old_session_and_prepares_type_owned_paths(
         f"{prefix}_right.mp4",
     }
     assert all(
-        path.parent == tmp_path / "recordings"
+        path.parent == tmp_path / "recordings" / prefix / "media"
         for path in panel.video_recording_paths.values()
     )
     assert panel.measurement_workbook_snapshot()["current_measurement_id"] == panel._measurement_id
@@ -359,7 +359,7 @@ def test_real_panel_ignores_old_session_and_prepares_type_owned_paths(
 
     assert panel.close_workstation_data(timeout_s=5.0)
     # Shutdown finalises the running Measurement into its own workbook.
-    workbooks = sorted((tmp_path / "recordings").glob("*_measurement.xlsx"))
+    workbooks = sorted((tmp_path / "recordings").glob("*/*_measurement.xlsx"))
     assert [path.name for path in workbooks] == [f"{prefix}_measurement.xlsx"]
     from Workstation.workstation_core.measurement_xlsx_read import read_workbook, table_rows
 

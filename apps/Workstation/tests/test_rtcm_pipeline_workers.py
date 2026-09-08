@@ -1304,3 +1304,61 @@ def test_panel_owned_pipeline_starts_and_stops_without_leaking_qthread(
     assert controller._stop_rtcm_pipeline() is True
     panel.deleteLater()
     app.processEvents()
+
+
+def test_base_rtcm_frame_is_queued_with_receive_timestamp(monkeypatch) -> None:
+    """NTRIP/base frames carry their receive time so stale ones are dropped, not sent late."""
+
+    import time as _time
+
+    emitted: list[dict[str, object]] = []
+    worker = SimpleNamespace(
+        request_envelope=SimpleNamespace(emit=emitted.append),
+        request=SimpleNamespace(emit=lambda *_args: pytest.fail("legacy untimed enqueue used")),
+    )
+    panel = SimpleNamespace(
+        _record_gnss_base_rtcm_frame=lambda payload: None,
+        gnss_operation_manager=SimpleNamespace(state=None),
+        _gnss_base_rtcm_target_sides=lambda **kwargs: ("left", "right"),
+        mavlink_pixhawk=object(),
+        _ensure_pixhawk_rtcm_worker=lambda: worker,
+        _set_health_label=lambda *args, **kwargs: None,
+        _refresh_gnss_base_rtcm_stats=lambda: None,
+        _refresh_gnss_operation_readiness=lambda: None,
+        gnss_base_status_labels={"rtcm_injection": object()},
+        _px4_mag_camera_label=lambda side: side,
+    )
+    controller = GnssRuntimeController(panel)
+    monkeypatch.setattr(controller, "_append_rtcm_package_evidence", lambda *args, **kwargs: None)
+    monkeypatch.setattr(controller, "_rtcm_ui_update_due", lambda: False)
+
+    before_ns = _time.monotonic_ns()
+    controller._handle_gnss_base_rtcm_frame(b"\xd3\x00\x03abc")
+    after_ns = _time.monotonic_ns()
+
+    assert len(emitted) == 1
+    envelope = emitted[0]
+    assert envelope["targets"] == ("left", "right")
+    assert envelope["payload"] == b"\xd3\x00\x03abc"
+    assert before_ns <= int(envelope["receive_monotonic_ns"]) <= after_ns
+
+
+def test_rtcm_drop_log_is_throttled_with_pending_count(monkeypatch) -> None:
+    logs: list[str] = []
+    panel = SimpleNamespace(
+        _log=logs.append,
+        _record_gnss_base_rtcm_injection=lambda *args, **kwargs: None,
+        _px4_mag_camera_label=lambda side: side,
+    )
+    controller = GnssRuntimeController(panel)
+    monkeypatch.setattr(controller, "_rtcm_result_ui_update_due", lambda: False)
+    clock = [10.0]
+    monkeypatch.setattr("Workstation.gnss_runtime_controller.time.monotonic", lambda: clock[0])
+
+    for _ in range(3):
+        controller._apply_pixhawk_rtcm_result({"payload_bytes": 10, "dropped": 1})
+    assert logs == ["[GNSS] RTCM 오래된 대기 프레임 1개를 폐기했습니다."]
+
+    clock[0] += 5.0
+    controller._apply_pixhawk_rtcm_result({"payload_bytes": 10, "dropped": 1})
+    assert logs[-1] == "[GNSS] RTCM 오래된 대기 프레임 3개를 폐기했습니다."

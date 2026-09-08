@@ -70,6 +70,8 @@ from Workstation.workstation_core.px4_attitude_cal_manager import (
     build_attitude_cal_status,
 )
 
+BOARD_ROTATION_PARAM_NAMES = ("SENS_BOARD_ROT",)
+
 
 class PixhawkUsbDiscoveryWorker(QtCore.QObject):
     """Probe USB serial candidates without blocking the owner UI."""
@@ -1271,6 +1273,33 @@ class PixhawkRtcmInjectionWorker(QtCore.QObject):
         return tuple(outcomes)
 
 
+class PixhawkWorkerInterrupted(RuntimeError):
+    """Raised inside a Pixhawk worker when its thread was asked to stop."""
+
+
+def _pixhawk_worker_interruption_requested() -> bool:
+    """True once shutdown called ``requestInterruption()`` on this worker's thread.
+
+    The shell and PARAM workers run long sequences of blocking radio round
+    trips (six ``listener`` commands, or 75 CAL_MAG parameters with retries).
+    ``QThread.quit()`` alone cannot stop a slot that is already executing, so
+    each sequence checks this flag between steps and bails out; otherwise the
+    close sequence waits out the whole readback before it may disconnect.
+    """
+
+    thread = QtCore.QThread.currentThread()
+    checker = getattr(thread, "isInterruptionRequested", None)
+    try:
+        return bool(checker()) if callable(checker) else False
+    except RuntimeError:
+        return False
+
+
+def _raise_if_pixhawk_worker_interrupted(what: str) -> None:
+    if _pixhawk_worker_interruption_requested():
+        raise PixhawkWorkerInterrupted(f"{what} interrupted by shutdown")
+
+
 class PixhawkShellCommandWorker(QtCore.QObject):
     """Run one blocking MAVLink shell/reboot operation off the UI thread."""
 
@@ -1309,10 +1338,15 @@ class PixhawkShellCommandWorker(QtCore.QObject):
                 else "PX4 SHELL"
             )
             try:
+                # Shell replies are awaited without holding the side's send
+                # lock: send_shell_command_with_result locks each write on its
+                # own, so RTCM injection keeps flowing during the wait. The
+                # reboot path issues a single COMMAND_LONG and keeps the lock.
                 command_context = self.subscriber.exclusive_command(
                     self.camera,
                     command_label=command_label,
                     preserve_qualification=self.operation == "sensor_mag_shell_poll",
+                    hold_send_lock=self.operation == "reboot",
                 )
             except TypeError:
                 # Keep older test doubles/compatibility adapters usable while
@@ -1332,6 +1366,7 @@ class PixhawkShellCommandWorker(QtCore.QObject):
                     output_parts: list[str] = []
                     flag_labels: list[str] = []
                     for command in commands:
+                        _raise_if_pixhawk_worker_interrupted(f"PX4 shell '{command}'")
                         shell_result = self.subscriber.send_shell_command_with_result(
                             self.camera,
                             command,
@@ -1383,13 +1418,41 @@ class PixhawkParameterWorker(QtCore.QObject):
         self.armed = bool(armed)
         self.priorities = {str(key): int(value) for key, value in dict(priorities or {}).items()}
 
+    # A Radio PARAM_REQUEST_READ is a single MAVLink frame each way. On a
+    # shared 57600 telemetry link one lost frame otherwise leaves ``None`` in
+    # the middle of the CAL_MAG status, so every name gets one bounded retry.
+    PARAM_READ_ATTEMPTS = 2
+    PARAM_READ_TIMEOUT_S = 1.5
+
+    def _read_param_with_retry(self, name: str) -> int | float | None:
+        value: int | float | None = None
+        for _attempt in range(max(1, int(self.PARAM_READ_ATTEMPTS))):
+            _raise_if_pixhawk_worker_interrupted(f"PARAM read {name}")
+            value = self.subscriber.read_param(
+                self.camera, name, timeout_s=self.PARAM_READ_TIMEOUT_S
+            )
+            if value is not None:
+                break
+        return value
+
     def _read_mag_params(self) -> dict[str, int | float | None]:
         return {
             # MAG calibration includes REAL32 offset/scale/soft-iron values;
             # using the integer-only reader would destroy the QGC result.
-            name: self.subscriber.read_param(self.camera, name, timeout_s=1.5)
+            name: self._read_param_with_retry(name)
             for name in MAG_PARAM_NAMES
         }
+
+    def _read_board_rotation_params(self) -> dict[str, int | float | None]:
+        """Read only the board mounting rotation the corrected-yaw gate needs.
+
+        Internal (board/GPS) magnetometer rows cannot show a CAL_MAG-corrected
+        yaw without ``SENS_BOARD_ROT``. The full attitude-calibration readback
+        is 49 sequential Radio PARAM round trips, so this single-parameter
+        operation keeps the automatic path cheap.
+        """
+
+        return {name: self._read_param_with_retry(name) for name in BOARD_ROTATION_PARAM_NAMES}
 
     def _read_mag_priority_params(self) -> dict[str, int | float | None]:
         """Read only the identity/priority surface needed by ``mag_apply``.
@@ -1400,16 +1463,10 @@ class PixhawkParameterWorker(QtCore.QObject):
         write the requested priority.
         """
 
-        return {
-            name: self.subscriber.read_param(self.camera, name, timeout_s=1.5)
-            for name in MAG_PRIORITY_PARAM_NAMES
-        }
+        return {name: self._read_param_with_retry(name) for name in MAG_PRIORITY_PARAM_NAMES}
 
     def _read_attitude_params(self) -> dict[str, int | float | None]:
-        return {
-            name: self.subscriber.read_param(self.camera, name, timeout_s=1.5)
-            for name in ATTITUDE_CAL_PARAM_NAMES
-        }
+        return {name: self._read_param_with_retry(name) for name in ATTITUDE_CAL_PARAM_NAMES}
 
     @staticmethod
     def _role_for_device_id(device_id: int | None) -> str | None:
@@ -1458,6 +1515,7 @@ class PixhawkParameterWorker(QtCore.QObject):
             else:
                 continue
             name = f"CAL_MAG{slot.slot}_PRIO"
+            _raise_if_pixhawk_worker_interrupted(f"PARAM set {name}")
             actual = self.subscriber.set_param_int(self.camera, name, expected, timeout_s=2.0)
             if actual != expected:
                 raise RuntimeError(f"{name} readback mismatch: expected={expected}, actual={actual}")
@@ -1499,6 +1557,12 @@ class PixhawkParameterWorker(QtCore.QObject):
             elif self.operation == "attitude_refresh":
                 status = build_attitude_cal_status(self._read_attitude_params())
                 result = {"kind": self.operation, "camera": self.camera, "status": status}
+            elif self.operation == "board_rotation_refresh":
+                result = {
+                    "kind": self.operation,
+                    "camera": self.camera,
+                    "params": self._read_board_rotation_params(),
+                }
             elif self.operation == "calibration_refresh":
                 mag_status = build_mag_status(
                     self._read_mag_params(),

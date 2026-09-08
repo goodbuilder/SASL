@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import inspect
 import time
 from collections.abc import Mapping
@@ -287,6 +289,20 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 "Read P2 MAG priorities and active-selection evidence.",
                 "device",
                 lambda: self._pixhawk_mag_refresh("right"),
+            ),
+            (
+                "pixhawk.board_rotation.refresh.p1",
+                "Refresh P1 board rotation",
+                "Read P1 SENS_BOARD_ROT so internal/GPS MAG rows can show a CAL_MAG-corrected yaw.",
+                "device",
+                lambda: self._pixhawk_board_rotation_refresh("left"),
+            ),
+            (
+                "pixhawk.board_rotation.refresh.p2",
+                "Refresh P2 board rotation",
+                "Read P2 SENS_BOARD_ROT so internal/GPS MAG rows can show a CAL_MAG-corrected yaw.",
+                "device",
+                lambda: self._pixhawk_board_rotation_refresh("right"),
             ),
             (
                 "pixhawk.mag.apply.p1",
@@ -797,6 +813,8 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             "pixhawk.refresh_parameters.p2",
             "pixhawk.mag.refresh.p1",
             "pixhawk.mag.refresh.p2",
+            "pixhawk.board_rotation.refresh.p1",
+            "pixhawk.board_rotation.refresh.p2",
             "pixhawk.mag.apply.p1",
             "pixhawk.mag.apply.p2",
             "pixhawk.recover_eth_mavlink.p1",
@@ -984,6 +1002,9 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             lambda: self._select_context("tasks.advanced"),
             self.commands.invoke,
         )
+        self.alignment.open_measurement_requested.connect(
+            lambda: self._select_context("processing.measurement")
+        )
         self.pixhawk.inspection_requested.connect(
             lambda selection: self._inspect_selection("devices.pixhawk", selection)
         )
@@ -995,6 +1016,9 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         )
         self.alignment.inspection_requested.connect(
             lambda selection: self._inspect_selection("processing.alignment", selection)
+        )
+        self.alignment.inspection_clear_requested.connect(
+            lambda owner: self.inspector.clear_selection("processing.alignment", owner=owner)
         )
         self.alignment.optical_pose_command_requested.connect(
             self._handle_optical_pose_command
@@ -1137,7 +1161,11 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         if self._optical_pose_auto_thread is not None and self._optical_pose_auto_thread.isRunning():
             self.statusBar().showMessage("An optical-pose auto-selection is already running", 3000)
             return
-        mode = "horizon" if command_id.endswith("horizon") else "mountain"
+        mode = {
+            "alignment.pose.auto_select_horizon": "horizon",
+            "alignment.pose.auto_select_mountain": "mountain",
+            "alignment.pose.auto_select_cloud": "cloud",
+        }.get(command_id, "mountain")
         prepare = getattr(self.backend, "optical_pose_prepare_auto_select", None)
         if not callable(prepare):
             self._handle_optical_pose_auto_failed(
@@ -1244,12 +1272,14 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         ) and command_id not in {
             "alignment.pose.auto_select_horizon",
             "alignment.pose.auto_select_mountain",
+            "alignment.pose.auto_select_cloud",
         }:
             self.statusBar().showMessage("Wait for the optical-pose auto-selection to finish", 3000)
             return
         if command_id in {
             "alignment.pose.auto_select_horizon",
             "alignment.pose.auto_select_mountain",
+            "alignment.pose.auto_select_cloud",
         }:
             self._start_optical_pose_auto_selection(command_id, values)
             return
@@ -1347,6 +1377,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                     "alignment.pose.solve_horizon": "optical_pose_solve_horizon",
                     "alignment.pose.solve_terrain": "optical_pose_solve_terrain",
                     "alignment.pose.solve_gnss_mountain": "optical_pose_solve_gnss_mountain",
+                    "alignment.pose.solve_cloud_rotation": "optical_pose_solve_cloud_rotation",
                     "alignment.pose.solve_drone_yaw": "optical_pose_solve_drone_yaw",
                     "alignment.pose.solve_drone_rtk_multiview": "optical_pose_solve_drone_rtk_multiview",
                     "alignment.pose.solve_combined": "optical_pose_solve_combined",
@@ -1391,9 +1422,26 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             # _require_frozen_intrinsics() clears) -- give it as much room as
             # the "not eligible" case below, not the default 3s toast.
             self.statusBar().showMessage(f"{command_id}: failed — {exc}", 10000)
+            # The toast fades; the Diagnostics log and run.log (traceback)
+            # are where a "Solve did nothing" report gets diagnosed.
+            logging.getLogger(__name__).error(
+                "optical pose command %s failed: %s: %s",
+                command_id,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            panel = getattr(self.backend, "panel", None)
+            logger = getattr(panel, "_log", None)
+            if callable(logger):
+                try:
+                    logger(f"[명령] {command_id} 실패: {type(exc).__name__}: {exc}")
+                except Exception:
+                    pass
             if command_id in {
                 "alignment.pose.auto_select_horizon",
                 "alignment.pose.auto_select_mountain",
+                "alignment.pose.auto_select_cloud",
             }:
                 # The status bar toast fades in 10s; keep the reason visible
                 # next to the Auto-select buttons until the next attempt.
@@ -1408,6 +1456,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         if command_id in {
             "alignment.pose.auto_select_horizon",
             "alignment.pose.auto_select_mountain",
+            "alignment.pose.auto_select_cloud",
         } and isinstance(snapshot, dict):
             suggestions = snapshot.get("auto_suggestions")
             latest = suggestions[-1] if isinstance(suggestions, list) and suggestions else None
@@ -1708,6 +1757,9 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
     def _pixhawk_mag_refresh(self, camera: str) -> object:
         return self.backend.advanced_refresh_px4_mag(camera, read_params=True)
 
+    def _pixhawk_board_rotation_refresh(self, camera: str) -> object:
+        return self.backend.advanced_refresh_px4_board_rotation(camera)
+
     def _pixhawk_mag_apply(self, camera: str) -> object:
         return self.backend.advanced_apply_px4_mag_priorities(
             camera,
@@ -1866,6 +1918,10 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
 
     def _measurement_apply_settings(self) -> object:
         return self.backend.apply_measurement_settings(self.measurement.settings_payload())
+
+    def _open_baseline_yaw90(self) -> None:
+        self._select_context("processing.alignment")
+        self.alignment.open_baseline_yaw90()
 
     def _measurement_save_settings(self) -> object:
         applied = self.backend.apply_measurement_settings(
@@ -2165,6 +2221,15 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
     def _show_command_error(self, command_id: str, message: str) -> None:
         label = self.commands.action(command_id).text() if command_id in self.commands._actions else command_id
         self.statusBar().showMessage(f"{label}: {message}", 5000)
+        # A 5-second status-bar message is easy to miss; the Diagnostics log
+        # is where the operator looks when "nothing happened".
+        panel = getattr(self.backend, "panel", None)
+        logger = getattr(panel, "_log", None)
+        if callable(logger):
+            try:
+                logger(f"[명령] {label} 실패: {message}")
+            except Exception:
+                pass
 
     def _show_command_accepted(self, command_id: str, _result: object) -> None:
         label = self.commands.action(command_id).text() if command_id in self.commands._actions else command_id

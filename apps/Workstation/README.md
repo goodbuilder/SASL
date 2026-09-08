@@ -1,15 +1,72 @@
 # SASL StereoWIRIS Workstation
 
+### 2026-09-08: Target geographic coordinates in Measurement records
+
+Measurement results additionally store `target_latitude_deg`, `target_longitude_deg`,
+`target_altitude_ellipsoid_m`, and `target_altitude_msl_m` in the result records and
+workbook coordinate/method/flat sheets. Existing Forward/Right/Down/Range retain their
+baseline-center camera frame. Target position uses the frozen left optical RDF point,
+the method's world rotation and P1 GNSS origin, with coincident Pixhawk/optical centers
+and the existing GNSS-antenna-as-camera-origin approximation. Camera mounting rotation
+is retained. Relative-only profiles without a world anchor have no target coordinates.
+Missing ellipsoid height leaves geographic fields empty; missing target geoid height
+leaves MSL empty. These missing outputs do not block existing distance calculation.
+Target fields are calculated positions, not direct GNSS target measurements.
+Journal rebuilds retain the original values; `reproduce_target_coordinates_exact()` in
+`workstation_core/measurement_reproduce.py` independently reruns the workbook's frozen
+geometry and geolocation inputs. See [the coordinate schema](docs/RECORDING_SCHEMA.md).
+
+During Measurement, `Result` is followed by `Target 위치 · WGS84`: the same latest
+accepted result's target latitude/longitude (nine decimal places) and ellipsoid/MSL
+altitudes (three decimal places, metres). The line below shows the age of that result.
+Unavailable fields show `--`; a new result with missing coordinates clears the prior
+coordinates. Clicking a value opens its geographic unit/frame detail in Inspector.
+The display uses the immutable history result and does not read newer GNSS/attitude
+or perform coordinate conversion during screen refresh.
+
 ## Purpose
 
 This package provides the operator Workstation for synchronized stereo-camera capture,
 calibration, Measurement, Pixhawk/GNSS evidence, and recording. It owns its runtime and UI
 independently from the Legacy application.
 
-`Devices > Pixhawk` keeps the raw P1/P2 ATTITUDE and GNSS evidence. The camera-installation
-alignment value is shown separately in `Devices > Telemetry`: it is the horizontal angle between
-the P1→P2 GNSS baseline and the vector from the P1/P2 GNSS midpoint to Drone GNSS, plus its absolute
-error from the 90° target. Drone ATTITUDE/yaw is not used for this value.
+`Alignment > Baseline Yaw90` gathers live left/right previews, the display-only `Center line`,
+P1/P2 Roll/Pitch, and a permanently visible GNSS table: P1→P2 baseline azimuth (North=0°,
+clockwise), ∠Dr–P1–P2, and ∠Dr–P2–P1 (horizontal internal angles). Adjust yaw and physically
+level each rig repeatedly while observing these values; there is no level-target column or
+automatic alignment verdict. Azimuth remains available without Drone or ATTITUDE. Missing,
+stale and producer-reported frozen inputs retain their individual status.
+
+After restarting Workstation, use the mouse wheel over either Baseline Yaw90 live
+image to zoom its display independently from 1× to 8× around the cursor. Wheel up
+zooms in; wheel down zooms out. Returning to 1× restores the centered full image.
+New frames retain the selected display zoom. The `Center line` follows the native
+image midpoint, remains one display pixel wide, and disappears when that midpoint
+is outside the zoomed view. This is display-only zoom; camera optical zoom, native
+source pixels and measurement coordinates remain unchanged.
+
+Open installation alignment from `Alignment > Baseline Yaw90`; the Measurement
+shortcut button was removed on 2026-09-08.
+
+The tab reuses the existing baseline-yaw method and camera streams. Reverse uses its original
+setting key: Apply changes the current setting; Save persists it. Changes are locked during
+Measurement startup, running and stopping. Measurement navigation does not select a method or
+start a run. The collapsed midpoint reference retains GNSS local-level F/R/D/Rg and the original
+midpoint line angle/90° deviation; it is not camera `baseline_center_frd`. Near-target convergence
+does not establish parallel camera yaw. Existing measurements and recordings are unchanged.
+
+`Devices > Pixhawk` retains its common ATTITUDE, baseline and Drone geometry displays.
+The installation table has moved from Telemetry, Reverse from Measurement Settings, and Center
+line from Calibration. Calibration Live/FTP, zoom, capture and profiles remain available.
+Other Alignment tabs retain their frozen frames, annotations and candidates across a Yaw90 visit.
+Leaving Yaw90 clears only its Inspector detail selection so an inactive snapshot cannot remain
+labelled CURRENT. Window-height and Diagnostics-dock changes refit the live pair from the actual
+viewport size; queued layout updates coalesce and stop while another Method is shown.
+If the display snapshot query fails or returns malformed rows, the tables and Inspector keep the
+last confirmed display values, show `조회 오류`, and advance their ages until the next successful
+read. Reverse edits pause while this state is unverified; the existing draft remains. This is
+display history, not a substitute for current Measurement evidence. It never clears or rewrites
+the last-valid P1/P2 attitude/GNSS inputs used for continued distance calculation after disconnect.
 
 Calibration's default `촬영` surface shows the existing Left/Right checkerboard overlays together
 with source-backed board state, current-process inspection outcomes, and persisted capture-set
@@ -23,14 +80,15 @@ horizontal internal angles `∠Dr-P1-P2` and `∠Dr-P2-P1` in degrees. These are
 read-only aids: the angles use only horizontal North/East data, while missing/stale GNSS or
 ATTITUDE remains visible as `WAITING`/`STALE` and no derived geometry is persisted.
 
-The same `Devices > Pixhawk` page shows `RAW yaw°` and `Corrected yaw°` beside each visible
+The same `Devices > Pixhawk` page shows `RAW yaw°`, `Corrected yaw°`, and `PX4 yaw°` beside each visible
 IMU/CAN magnetometer row. RAW is the signed `atan2(-y,x)` diagnostic in the producer sensor axes
 with no calibration, sensor rotation, board rotation, or tilt correction. Corrected yaw applies
 the manually read-back `CAL_MAG` transformation and shows `PARAM 대기` until that readback exists.
-PX4 yaw/Δ remain diagnostic read-model fields rather than operator-table columns. PX4 yaw is the current
-firmware `ATTITUDE.yaw` reference only when the row's exact device ID matches the active
+`PX4 yaw°` is the current firmware `ATTITUDE.yaw` reference with PX4 estimator processing and
+`EKF2_MAG_DECL` declination correction, only when the row's exact device ID matches the active
 `vehicle_magnetometer` device and ATTITUDE is fresh; unmatched or identity-free rows show an
-explicit waiting/non-selected state. The same page also exposes independent P1/P2 `MAG Priority /
+explicit waiting/non-selected state. The hidden `Δyaw°` remains `PX4−RAW` wrapped to
+`[-180°,180°)`. The same page also exposes independent P1/P2 `MAG Priority /
 active selection` controls for `BOARD`, `CAN1`, `CAN2`, `GPS1_MAG`, and `GPS2_MAG`. `Apply & Verify`
 requires Disarm, verifies the CAL_MAG PARAM readback, then waits for a post-apply
 `vehicle_magnetometer.device_id` and fresh ATTITUDE. A live-Pixhawk Measurement is blocked until
@@ -38,33 +96,61 @@ each required side reaches `ACTIVE VERIFIED`; non-live-Pixhawk methods retain th
 The Advanced PX4 MAG controls remain as a fallback.
 
 Measurement remains an observation interval rather than a package-completion transaction. There is
-still no storage/completeness gate before a Measurement can start, but a selected method that
-consumes live Pixhawk evidence now requires the independent per-side MAG active-selection check
-above. Pressing `측정 시작` freezes a new run identity/time and records the verified MAG selection
-provenance; camera, Base GNSS/NTRIP, Target and recording continue to follow their existing
-method-specific lifecycle.
+still no storage/completeness gate before a Measurement can start. For a selected method that
+consumes live Pixhawk evidence the independent per-side MAG active-selection check above is
+advisory: an unverified side is logged as a warning and no longer blocks `측정 시작`. Pressing
+`측정 시작` freezes a new run identity/time and records the current MAG selection snapshot
+(verified or not) as provenance; camera, Base GNSS/NTRIP, Target and recording continue to follow
+their existing method-specific lifecycle.
 After an abnormal process exit, restart likewise leaves the incomplete run as inert append-only
 history and creates a new runtime generation only when the operator presses `측정 시작` again.
 
-Structured records append to timestamped, type-owned files beneath the repository-root `recordings/`
-folder by default. A blank `measurement_data_root` selects that default; an explicit custom value
-remains relative to `SASL_WORKSTATION_DATA_ROOT`. Each new data writer uses one shared creation-time
-token in names such as `measurements_YYYYMMDD_HHMMSS_nnnnnnn+0900.jsonl`; legacy fixed JSONL names
-remain readable. Videos, still images, native PNGs, and ULogs use their own creation-time filename
-and never replace an existing file. Each row retains its UTC, monotonic, and available source-clock
-evidence, so an operator can collect or join records later.
-Storage failures and bounded-queue drops are visible in `Data > Status`, but do not stop camera,
-Detection, GNSS/RTCM routing, target telemetry, or the next Measurement. Result/event queues are
-reserved ahead of bulk camera/PX4/GNSS traffic.
+Each Measurement owns `recordings/<start stamp>/` by default. A blank
+`measurement_data_root` selects that default; a custom value stays relative to
+`SASL_WORKSTATION_DATA_ROOT`. The first Start click freezes one KST token,
+`YYYYMMDD_HHMMSS_nnnnnnnnn+0900`. Every Measurement output uses that token, including
+`<stamp>_measurement.xlsx`, `raw/<stamp>_<stream>.jsonl` and its same-stem CSV, MP4
+segments, PNGs, imported still images, RTCM bytes/indexes, and ULogs/metadata. A collision
+allocates one suffix for the entire run. Source capture/receive clocks remain separately
+recorded. Late results keep the original run's directory and stamp.
 
-The same data root may contain timestamped derived workbooks such as
-`latest_measurement_YYYYMMDD_HHMMSS_nnnnnnn+0900.xlsx` for stopped Measurements. Each export uses a
-new filename, is generated only after the run has returned to `IDLE`, and may be updated/opened from
-`Data > Status`. Timestamped JSONL remains the source of truth. A missing source or field is shown as
-zero rows/Excel `#N/A`; unlike-rate sources are kept on separate sheets rather than joined by an
-invented timestamp rule.
+Structured originals are stored as JSONL plus CSV, with complete canonical payloads in
+CSV `record_json`; there is no extra ZIP backup. The durable Measurement journal includes
+frozen inputs, detections, pair/method decisions, recorded R,t and outcomes, so `Data >
+Rebuild Latest XLSX` can reconstruct the latest Measurement after restart. `Retry Storage`
+repairs missing CSV rows from JSONL, including overflowed retry rows and stopped-run RTCM
+indexes. Failures and bounded-queue drops remain visible without blocking Measurement.
+Existing histories and outside-Measurement capture/manual-record paths stay intact.
 
-If an essential stream (`events`, `measurements`, or `method_evaluations`) cannot write, the
+The workbook opens with `00_요약`, `01_거리비교`, `02_좌표결과`, `03_진단`, `04_Rt`, and `05_그래프`.
+The dedicated R,t table and every Method tab use the same frozen records; all 12 R,t
+columns remain expanded on Method tabs. Source/evidence tables follow, while exact and
+internal analysis tables are normally hidden. Distances/coordinates/t display three decimals,
+R nine, angles two and elapsed seconds three, without rounding the stored workbook numbers.
+Reader sheets use `—` for missing values; compatibility evidence tables retain `N/A`.
+The summary includes method counts, distance statistics and a link to `05_그래프`. This sheet
+contains twelve editable Excel charts: camera Forward/Right/Down/Range, horizontal
+Forward/Right/Down/Range, and target latitude/longitude/ellipsoid height/MSL height. Each chart
+compares Methods against elapsed seconds from Measurement start; Method colours and dash
+styles stay consistent across charts. Latitude/longitude use degrees; distances and heights
+use metres. Horizontal outputs retain each Method's midpoint and the pair-frozen P1 level
+axes; geographic heights retain their separate datums. Only finite `VALID`/`ESTIMATED` values
+are plotted. Missing/failed values create gaps, one result appears as a point, and an empty
+field shows `데이터 없음` without a numeric axis. Chart-only sampling is capped at 2,000 points
+per Method per field and retains bucket extremes and gaps; tables retain all rows using
+numbered continuation sheets at Excel's limit. After restarting the app, use `Data > Open
+Latest Measurement XLSX` for new exports or `Rebuild Latest XLSX` to add the charts to a saved
+run. Rebuilding preserves recorded values; unavailable older coordinate fields stay empty.
+The existing exact-reproduction sheets and camera-RDF/stereo-center-FRD contracts remain intact.
+Noto Sans CJK KR is the report font; another machine may substitute an installed CJK font.
+
+The background writer updates the same run workbook atomically at checkpoints, Stop and late
+completion. `Open Latest Measurement XLSX` includes the new run directories; rebuild is a
+background operation disabled during active recording or pending calculations. Different-rate
+sensor streams keep separate rows/sheets, without an invented timestamp join. Raw storage
+health and incomplete reconstruction are reported independently of calculation status.
+
+If an essential stream (`events`, `measurements`, `method_evaluations`, or `measurement.journal`) cannot write, the
 background owner retains FIFO records in a 256-record/8 MiB reserve and retries with bounded
 backoff. Video and high-rate telemetry are never accumulated without bound; their drops remain
 visible and the observation continues.
@@ -81,13 +167,13 @@ on bounded worker-owned paths while the Qt UI consumes latest-state snapshots.
 
 Each board transport is `Radio`, `Ethernet`, or `USB`. Radio and USB are both serial links that
 open one exclusive device path and share the same Connect preflight; they differ in bandwidth
-policy, so Radio keeps its tiered stream throttle while USB carries the stock stream set of a
-direct cable. USB connects through the board's existing bootstrap endpoint, so the saved Radio
+policy: P1/P2 Radio uses a fixed minimal stream profile; Drone Radio retains its tiered
+stream policy, and USB carries the stock stream set of a direct cable. USB connects through the board's existing bootstrap endpoint, so the saved Radio
 endpoint survives a transport switch. The application never pretends to
 remove a radio, plug in Ethernet, or power-cycle a board; it waits for actual sysid, carrier,
 readback, and cross-endpoint evidence before enabling the next action.
 
-`Devices > Telemetry` exposes one read-only `GNSS BASELINE_CENTER F/R/D/Rg/Angle` reference whenever
+`Alignment > Baseline Yaw90` exposes a collapsed read-only GNSS midpoint reference whenever
 selected P1/P2 and Drone GNSS positions are available. Its origin is the P1/P2 GNSS antenna
 midpoint; Right is horizontal P1→P2, Down is NED Down, and Forward is Right×Down. The horizontal
 baseline↔Drone angle is `atan2(|Forward|,|Right|)` and the displayed installation error is
@@ -97,7 +183,7 @@ While Measurement or Manual Record is active, every primary Drone GNSS callback 
 self-contained best-effort row in `gnss_baseline_center.jsonl`; raw P1/P2/Drone files remain
 unchanged.
 
-The same Telemetry workspace provides bounded read-only `Find Network` discovery for an Ethernet
+The Telemetry workspace provides bounded read-only `Find Network` discovery for an Ethernet
 Drone Pixhawk. It passively observes UDP MAVLink ports, shows NIC/source IP/listen port/system ID,
 and permits selection only when a HEARTBEAT identifies `sysid=3`. `Use selected` fills the existing
 MAVLink URL; Apply, Save and Connect remain separate explicit commands. Apply/Save preserve the
@@ -172,10 +258,10 @@ opens but its camera/recording sources are marked unavailable. Any already-live 
 visible. Stop that observation, select `Auto` or `Software`, and retry; Workstation does not silently
 override an explicit decoder choice.
 
-Before installing the camera, open `Devices > Telemetry` and inspect the P1/P2/Drone GNSS rows and
-the `GNSS BASELINE_CENTER F/R/D/Rg/Angle` row. Adjust the camera position/orientation until the
-horizontal baseline↔Drone angle is 90° and the displayed 90° error is near 0°. `CURRENT/STALE/WAITING`
-describes GNSS freshness/timing only; it is not a camera measurement verdict.
+For camera installation, open `Alignment > Baseline Yaw90` and observe the azimuth and two
+GNSS vertex angles alongside live previews and P1/P2 Roll/Pitch. Iterate yaw aiming and physical
+leveling. The midpoint reference is optional detail; no GNSS angle or CURRENT state is a camera
+alignment acceptance verdict.
 
 The Workstation/Legacy launchers and common runtime doctor start from a closed operator
 environment: user-site packages and ambient Python, loader, GI and GStreamer plugin/system/scanner
@@ -276,8 +362,8 @@ action or `Guided rollback`. A saved device change is never hidden by Cancel. A 
 record is archived before a new read-only Check. P2 Ethernet failure after completion disconnects
 only P2; DU remains owned by Drone and there is no automatic Radio fallback.
 
-After P1, P2 and Drone positions appear in `Devices > Telemetry`, inspect the fixed
-`GNSS BASELINE_CENTER F/R/D/Rg/Angle` row directly below `Live position`. `CURRENT` requires each
+After P1, P2 and Drone positions appear in `Devices > Telemetry`, use `Alignment > Baseline Yaw90`
+for installation and its collapsed midpoint reference for the former GNSS table. `CURRENT` requires each
 source age to be at most 2.0 s and the three application-receive timestamps to span at most 1000 ms.
 `STALE` retains the finite signed values and angle with actual age/skew and reason; `WAITING` uses
 `--` for missing/invalid geometry. Fix labels remain evidence and do not require RTK Fixed. The existing
@@ -674,6 +760,30 @@ the run, duplicate clicks and other optical-pose mutations are ignored until com
 result is committed only if its frozen frame IDs and SHA-256 identities still match the current
 burst. The status strip shows `RUNNING`, `LOW_CONFIDENCE`, or the failure reason.
 
+`Auto-select Mountain` biases SIFT/ORB matches toward the ridge using a per-frame sky/ground
+classifier, and it also measures whether that classifier found a separable ground class at all:
+ground must be at least 2× more textured than sky and, unless overwhelmingly so (≥6×), at least
+12% of full scale darker. When neither frame has a separable ground class (an all-sky or all-cloud
+pair) the action still runs: it skips the ridge bias, matches the far-field sky/cloud texture
+unfiltered, applies the usual inlier/distribution/confidence gates, and adds the warning
+`no separable ground/ridge in either frame; correspondences are far-field sky/cloud texture, valid
+for rotation only when both frames are simultaneous`. The suggestion metadata records the filter
+tier that produced the points (`ridge_boundary`, `ground_only`, `unfiltered`, or
+`unfiltered_all_sky`) and the per-side `sky_ground_separability` metrics so a proposal can be
+audited offline.
+
+`Auto-select Cloud` (same tab) is the dedicated far-field path: it runs the Mountain matcher with no
+ridge bias at all (tier `cloud_far_field`), and its points are meant for `Solve Cloud rotation`, which
+reuses the Mountain rotation solver but produces a **rotation-only** candidate
+(`cloud-far-field-rotation`): translation is never apply-eligible, and the rotation is apply-eligible
+only when the frozen left/right frames are simultaneous within 0.350 s on the app-receive clock
+(`frame_pair_simultaneity` = `VERIFIED`/`EXCEEDED`/`UNVERIFIED` in the candidate provenance). The
+tenth measurement method, `Cloud far-field rotation + live GNSS` (`cloud_gnss`), consumes that
+candidate and fills N/E/D from live GNSS, like the Drone RTK Rotation hybrid. Auto Mountain remains
+usable without a ridge; Cloud is the explicit choice when the operator knows the scene is sky. Thresholds were calibrated
+against all-sky synthetic frames (texture ratio 1.05–1.11, brightness gap ≤ 0.17) and real ridge
+photos (ratio 3.4–9.5, gap ≥ 0.30); see `tests/test_optical_pose_mountain_all_sky.py`.
+
 The three manual actions have distinct roles: `Manual Horizon` marks two visible horizon
 points and estimates Roll/Pitch only; `Manual Mountain` marks matching terrain features in
 the same order on both images and supplies the paired observations for the GNSS + Mountain
@@ -687,7 +797,7 @@ the cursor from 1× to 8×. Zoom changes presentation only: annotation coordinat
 pixels remain unchanged, and returning to 1× recenters the full image.
 
 The Alignment solver surface exposes top-level `Horizon`, `Mountain + GNSS`, `Terrain PnP`,
-`Drone Rotation`, `Drone Multi-view`, `References`, and `Combine` tabs below the common frozen
+`Drone Rotation`, `Drone Multi-view`, and `Combine` tabs below the common frozen
 preview. On wide screens each camera preview is shown side by side and the common Candidate review
 stays to the right of the selected method; narrow screens stack the previews and place Candidate
 review below the tabs. Measurement no longer chooses one geometry method or promotes an automatic
@@ -738,8 +848,21 @@ and immutable numeric metadata, never QImage or raw pixel bytes; native PNGs are
 Each Alignment method tab shows method-specific evidence alongside the read-only Candidate
 observability summary: Horizon shows model/RMS/sensitivity, Mountain shows pair/inlier/Sampson/baseline/lever-arm
 metrics, Terrain shows GeoTIFF/2D↔3D/reprojection/rank data, Drone tabs show target/observation/sync
-and 3D-spread data, References shows profile compatibility, and Combine shows source/axis conflict
-status. References only registers reusable sources; Combine only composes them.
+and 3D-spread data, and Combine shows source/axis conflict status.
+
+Alignment's `R,t · 실시간` table automatically refreshes `Attitude + GNSS` and `GNSS Yaw90`
+at the existing visible-page status cadence. No Capture, Use suggestion, calibration, or
+registration is required to view these transforms. `References` and its manual registration
+buttons were removed on 2026-09-08. The live table shows the 3×3 rotation, translation in
+OpenCV optical RDF metres, state and oldest input age. `X_right = R * X_left + t` is the
+same canonical direction used by Measurement; t is not the P1→P2 NED baseline vector.
+GNSS Yaw90 uses each Pixhawk's Roll/Pitch and the shared baseline-perpendicular yaw,
+including the existing Reverse setting. The selected GPS1/GPS2 receivers are respected.
+Finite old values remain visible as STALE; missing inputs show WAITING, and query errors
+retain the last readout as ERROR while its age advances. These live rows never register
+or apply a candidate, write parameters, warm Measurement caches, or change a run's inputs.
+Solved candidates and Combine retain their independent selection. In Baseline Yaw90 setup,
+the live table follows the installation surface so the first-viewport controls stay in place.
 
 `Clear` removes the selected annotation mode from both frozen frames. Local `Import Pair` asks only
 for the Left and Right image paths and dispatches them without a zoom dialog or synthetic
@@ -974,6 +1097,7 @@ Its candidate rows are transient and read-only. The selected URL keeps the exist
   | rig and target PX4 | `px4_left_<timestamp>.jsonl`, `px4_right_<timestamp>.jsonl`, `px4_drone_<timestamp>.jsonl` |
   | Base GNSS | `gnss_base_<timestamp>.jsonl` |
   | GNSS baseline-center derived evidence | `gnss_baseline_center_<timestamp>.jsonl` |
+  | per-method thin results | `method_results_<timestamp>.jsonl` |
   | analysis comparisons | `geometry_comparisons_<timestamp>.jsonl` |
   | Alignment changes | `alignment_<timestamp>.jsonl` |
   | binary inventory/logs | `artifacts_<timestamp>.jsonl`, `native_frames_<timestamp>.jsonl`, `application_log_<timestamp>.jsonl` |
@@ -985,6 +1109,12 @@ Its candidate rows are transient and read-only. The selected URL keeps the exist
   sheets, and `Issues`. Manual-record-only and unrelated application/capture/alignment streams are
   excluded. Original clock fields remain exact, UTC epoch fields gain KST ISO columns, and integers
   beyond Excel's 15-digit precision are stored as text.
+  The `00_Summary` method table lists, per catalog method, the result-status counts and
+  Forward/Right/Down/Range min/max, plus the **latest VALID R,t** of that method (`R,t pair`,
+  `R,t rows`, `R11..R33` = R_right_from_left, `T_R/T_D/T_F` = T in right-camera RDF metres — the same
+  contract as the per-method sheets) and `R spread deg` / `T spread m`, the largest deviation of the
+  other VALID rows in the same Measurement from that latest transform. Methods without a VALID row
+  show `N/A`.
 
 - The writer removes Session membership fields, adds host UTC and monotonic record timestamps, and
   preserves producer coordinate/source-clock fields. A torn final JSONL fragment is left as one bad
@@ -1107,8 +1237,17 @@ Its candidate rows are transient and read-only. The selected URL keeps the exist
   native OpenCV `(u, v)` pixels and are kept separate from manual annotation payloads until
   explicit approval.
 - Horizon suggestions are two endpoint candidates from a distortion-corrected gradient/Hough
-  skyline line. Mountain suggestions use OpenCV SIFT, or ORB when SIFT is unavailable, followed
-  by mutual ratio matching, RANSAC epipolar filtering, and spatially distributed point selection.
+  skyline line. Mountain and Cloud suggestions share one SIFT path (ORB when SIFT is
+  unavailable): mutual ratio matching, then RANSAC epipolar filtering. By default every RANSAC
+  inlier is kept, displayed, and stored (`max_points` 0 = all); a positive `max_points` caps
+  the suggestion to that many spatially distributed points instead.
+- Every Mountain/Cloud suggestion also carries `relative_rotation`: a rotation-only far-field fit
+  (homography at infinity, Kabsch over all inliers with residual trimming) giving
+  `rotation_right_from_left_rdf` plus `roll/pitch/yaw_right_minus_left_deg` (right camera in the
+  left camera's virtual FRD, 3-2-1), `far_field_du/dv_median_px`, `fit_inlier_count`, and
+  `fit_residual_px`. Negative yaw is toe-in. It assumes features at infinity; residual parallax of
+  nearer features biases yaw by about `atan(B/D)`. The same mapping is repeated under each side's
+  `metadata.relative_rotation`.
 - Automatic suggestion evidence includes `detection_method`, `confidence`, `match_count`/
   `inlier_count`, `residual_px`, `eligible`, `copy_eligible`, `copy_block_reason`, and
   `failure_reason`. Mountain approval also records the shared exclusion indices, original/retained
@@ -1146,7 +1285,8 @@ Its candidate rows are transient and read-only. The selected URL keeps the exist
 
 ## Operational Rules
 
-- Read `RAW yaw°` as a sensor-axis diagnostic, not a calibrated compass heading. Read `PX4 yaw°`
+- Read `RAW yaw°` as a sensor-axis diagnostic, not a calibrated compass heading. Read `Corrected yaw°`
+  as CAL_MAG-corrected sensor-vector yaw, still without magnetic-declination correction. Read `PX4 yaw°`
   as the firmware estimator reference for the verified active MAG; `Δyaw°` is
   `PX4−RAW` wrapped to `[-180°,180°)`. `미선택`, `ID 확인 대기`, `STALE`, and `대기` are
   intentional evidence states, not zero values or alignment verdicts.
@@ -1169,7 +1309,7 @@ Its candidate rows are transient and read-only. The selected URL keeps the exist
 - Apply/Save use the current form value as authoritative configuration input. Periodic status
   refresh cannot overwrite a dirty edit with a stale connection endpoint.
 
-- Treat `GNSS BASELINE_CENTER F/R/D/Rg/Angle` as the camera-installation reference. The angle is the
+- Treat the collapsed GNSS midpoint reference in Baseline Yaw90 as position evidence. Its line angle is the
   acute horizontal angle between the P1→P2 baseline line and midpoint→Drone GNSS line; 90° means
   the Drone is on the perpendicular through the P1/P2 midpoint. `90° error` is an absolute distance
   from that target. Do not interpret `CURRENT` as measurement acceptance; use only current inputs for
@@ -1356,7 +1496,7 @@ Its candidate rows are transient and read-only. The selected URL keeps the exist
   contention is reported as control-channel busy and retried up to five times; it is not labeled
   as a camera failure. TCP command responses are accumulated across fragments until terminator,
   EOF, bounded idle, or the request deadline.
-- Treat `GNSS BASELINE_CENTER F/R/D/Rg/Angle` as a GNSS antenna-midpoint local-level reference only.
+- Treat the Baseline Yaw90 midpoint reference as a GNSS antenna-midpoint local-level reference only.
   Compute `v=Drone-(P1+P2)/2` in local NED, Right from horizontal P1→P2, Down from NED Down,
   Forward as Right×Down, `Rg=√(F²+R²+D²)`, and `angle=atan2(|F|,|R|)`. Never write these values into camera
   `baseline_center_frd`, left/right optical, Measurement, or recording fields. A zero/vertical-only
@@ -1690,8 +1830,9 @@ Its candidate rows are transient and read-only. The selected URL keeps the exist
 
 `RAW yaw°` uses the raw producer-axis vector and `atan2(-y,x)` only. It does not apply
 `CAL_MAG` correction, sensor/board rotation, tilt compensation, magnetic declination, or PX4
-estimator fusion. `PX4 yaw°` is the firmware `ATTITUDE.yaw` value after PX4's own selected-sensor
-processing, but it is shown beside a row only when that row's exact device ID matches the active
+estimator fusion. `Corrected yaw°` applies CAL_MAG correction and sensor rotation but does not apply
+magnetic declination. `PX4 yaw°` is the firmware `ATTITUDE.yaw` value after PX4's own selected-sensor
+processing and configured declination handling, but it is shown beside a row only when that row's exact device ID matches the active
 `vehicle_magnetometer` identity and its ATTITUDE sample is fresh. Standard `SCALED_IMU*` telemetry
 does not carry that physical device ID, so its corrected cell may remain `ID 확인 대기` even when
 RAW yaw is available.
@@ -2252,16 +2393,17 @@ Endpoints closer together than 25% of the image width are rejected outright, sin
 endpoint baseline amplifies click noise into a large angular error.
 
 **Mountain.** Same-order left/right frozen `(u,v)` clicks (or accepted auto-suggestions) supply
-paired image bearings; capture-time GNSS supplies a metric baseline; the selected Left absolute
-pose supplies the world-frame anchor. The *direction* of that baseline conditions a two-stage
+paired image bearings; capture-time GNSS supplies a metric baseline; capture-request P1
+Roll/Pitch and GNSS Yaw90 supply the assumed Left anchor. The *direction* of that baseline conditions a two-stage
 robust epipolar-rotation fit (`(u,v)` correspondences), while the baseline's *metric length* only
 scales the resulting translation -- the fitted rotation and its normalized Sampson residual are
 provably invariant to the baseline's metric length. Correspondences are classified inlier/outlier
 by a normalized Sampson threshold after a soft-L1 seed solve, and the candidate is only
-`apply_eligible` when the final fit has full rotation rank, a bounded Jacobian condition number,
-and a sufficient inlier count/ratio. GNSS translation is `apply_eligible` when the same frozen
-Capture contains finite Left/Right latitude, longitude, and altitude, both numeric
-`fix_type >= 3` (3D fix or better), and a finite non-zero P1-to-P2 NED baseline. `RTK_FIXED` is
+`apply_eligible` when the final fit has full rotation rank and finite rotation/residuals.
+Condition and inlier count/ratio are quality warnings under the availability policy.
+GNSS translation is `apply_eligible` when the same frozen Capture contains finite
+Left/Right latitude, longitude, and altitude and a finite non-zero P1-to-P2 NED baseline.
+Low/unknown fix quality is a warning. `RTK_FIXED` is
 retained as quality evidence, not a Mountain translation blocker; a usable non-fixed baseline
 keeps explicit warnings and its `mountain_gnss` Measurement outcome is `ESTIMATED`. Mountain never
 measures the Left absolute pose -- it remains the
@@ -2280,6 +2422,65 @@ frozen Mountain image.
 
 ## Change Log
 
+- 2026-09-08: Added `05_그래프` with twelve native Method-comparison charts for camera FRD,
+  horizontal FRD and WGS84 results. The summary links to the charts; missing values retain
+  gaps and empty charts show `데이터 없음`. Kept time labels below negative Down/height plots
+  and removed arbitrary empty-chart scales after rendering verification. Chart source fields,
+  stored precision and measurement calculations are unchanged. See
+  [verification evidence](docs/changes/20260908-measurement-result-charts.md).
+
+- 2026-09-08: Measurement displays participating Methods in one pair-consistent result
+  table, switching between original FRD, existing method-midpoint/P1 local-level FRD,
+  and WGS84. Quality, coordinates and R,t details come from the selected Method/pair
+  record, not shared labels or the last primary history value. A displayed pair stays
+  until all rows terminate or one second elapses, then jumps to the latest available
+  pair. This display deadline never cancels workers or changes stored outcomes.
+  Late outcomes remain in their own run/pair. BLOCKED/PENDING rows have no carried-over
+  numbers; partial geolocation affects only coordinate availability. Row selection is
+  read-only and does not change the representative Method. Existing preview/history
+  remains separate. No coordinate formula, archive schema or calculation policy changed.
+
+- 2026-09-08: Enabled independent 1×–8× mouse-wheel display zoom in the Baseline
+  Yaw90 live previews. Zoom persists across incoming frames and returns to the
+  centered full image at 1×. Corrected the Center line to clip at its transformed
+  native position instead of appearing at a viewport edge when the image midpoint
+  is outside the zoomed view. See [verification evidence](docs/changes/20260908-baseline-yaw90-preview-zoom.md).
+
+- 2026-09-08: Mountain/Cloud use capture-request P1 Roll/Pitch and P1→P2 GNSS Yaw90
+  (existing branch/Reverse rule) with identity initial relative rotation. Prior stereo
+  R,t is not required. Camera virtual FRD is assumed aligned with P1 body FRD; antenna
+  centers approximate optical centers. RTSP/FTP requests freeze inputs before completion;
+  later telemetry/Reverse changes do not retarget a frozen image. Missing inputs block
+  Solve, not Capture. Imported images without original reference evidence need recapture.
+  Both candidate poses and the full Yaw90 reference are persisted. Canonical attempts add
+  optional checksummed pose evidence: Mountain capture positions or Cloud pair positions,
+  both actual orientations and R,t. CSV record_json retains it; XLSX section D expands it.
+  Empty legacy fields preserve old hashes. Restart, Capture, Solve, then start a new run.
+
+- 2026-09-08: Mountain/Cloud use `mountain-cloud-availability-v1`: finite full-rank
+  rotation fits remain usable when inlier count/ratio or condition quality thresholds fail.
+  Finite non-zero capture GNSS baselines remain usable with low/unknown fix quality,
+  recorded as warnings. Missing inputs, invalid K,D/frame identity, rank deficiency,
+  non-finite rotation/residuals and Cloud known excessive frame delta still block.
+  New candidates must be solved again; existing candidates and historical records are not
+  reclassified. Ready Method tooltips expose warnings; computed warned results are ESTIMATED.
+  Mountain/Cloud outcome records additionally expose usable, blocking_reasons,
+  quality_warnings and gate_policy; legacy hashes retain their canonical payload contract.
+
+- 2026-09-07: Added start-click-owned Measurement directories and JSONL/CSV journal recovery.
+  Reworked XLSX into five reader tabs plus preserved evidence, with a dedicated R,t tab and
+  expanded R,t on every Method tab. Added CSV reconciliation, per-run late-result routing,
+  and saved-input XLSX rebuilding. Coordinates and solver arithmetic are unchanged.
+
+- 2026-09-07: Consolidated the Baseline Yaw90 installation workflow in an appended Alignment Method
+  tab with live azimuth, vertex-angle and R/P tables, local Center line, and guarded Reverse
+  Apply/Save. Moved Telemetry installation details and removed Calibration's Center line control;
+  shared Pixhawk displays and existing measurement/recording contracts remain unchanged.
+  Review follow-up: clear scoped Inspector details on tab exit and refit previews on viewport
+  resize, including Diagnostics-dock changes.
+  Display-query failure follow-up: retain confirmed values with advancing ages and consistent
+  table/Inspector error state, recover automatically, and preserve Measurement input caches.
+
 - 2026-09-04: The Pixhawk IMU magnetometer table now keeps the three standard `SCALED_IMU*`
   rows and appends RM3100 `CAN1_MAG`/`CAN2_MAG` rows received through stable-firmware
   `DEBUG_VECT`. RM3100 keeps its `mavlink/DEBUG_VECT` topic, Gauss unit, and the same RAW/PX4
@@ -2293,6 +2494,11 @@ frozen Mountain image.
 - 2026-09-05: Stable PX4 RM3100 readback now polls `listener sensor_mag` and
   `listener vehicle_magnetometer` through the existing exclusive MAVLink Shell owner. The five
   fixed rows per Pixhawk keep raw/PX4/Δyaw provenance and do not require custom firmware.
+
+- 2026-09-08: Made `PX4 yaw°` visible in the Pixhawk IMU/CAN magnetometer tables. It is the
+  fresh active-device-matched `ATTITUDE.yaw` estimator value with PX4 magnetic-declination
+  handling; the hidden `Δyaw°` remains `PX4−RAW` and RAW/CAL_MAG-corrected yaw semantics are
+  unchanged.
 
 - 2026-09-05: Added independent P1/P2 MAG Priority controls to `Devices > Pixhawk`. Runtime apply
   now has a visible active-device/fresh-ATTITUDE verification state, and live-Pixhawk Measurement
@@ -3184,3 +3390,23 @@ frozen Mountain image.
   environment-variable selection explicit in the GNSS settings surface.
 - 2026-08-13: Moved the Pixhawk, GNSS / RTK, and Alignment operation tabs to the top of
   the Alignment workspace for immediate field access.
+
+### 2026-09-08 — P1/P2 Radio minimal streams
+
+P1/P2 Radio connections automatically request ATTITUDE, GPS_RAW_INT and GPS2_RAW at
+5 Hz, SYS_STATUS and BATTERY_STATUS at 1 Hz, and leave HEARTBEAT at the autopilot
+default rate. Normal-mode background streams and prior optional IMU/debug/position
+requests are explicitly disabled with MAV_CMD_SET_MESSAGE_INTERVAL (-1). These are
+requested rates; missing sensors and Radio loss can reduce actual reception.
+
+The profile is reapplied after reconnect and detected PX4 reboot. Healthy-link tier
+escalation is disabled for P1/P2 Radio, and stale ATTITUDE recovery requests 5 Hz.
+This is persistent Workstation behavior, not a saved PX4 Minimal mode or parameter
+change: MAV_0_MODE, MAV_0_RATE, modem power, RTCM routing and Shell polling are unchanged.
+USB/Ethernet and Drone retain their existing profiles. Radio IMU/debug/local-position
+panels no longer receive periodic streams disabled by this profile; use USB/Ethernet
+for those observations. ATTITUDE orientation and GPS lat/lon/MSL-alt contracts are unchanged.
+
+The application sends interval requests; successful transmission is not an ACK/readback
+claim. Link loss can prevent application. Reconnect reapplies the profile. RF coexistence
+and USB supply effects remain separate unresolved limits from the measured investigation.

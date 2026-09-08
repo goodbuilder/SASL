@@ -126,4 +126,10 @@ def find_marker_row(rows: list[list[object]], marker: str) -> int:
     raise KeyError(marker)
 
 
+def table_rows_with_parts(sheets: dict[str, list[list[object]]], name: str) -> list[dict[str, object]]:
+    """Read a machine table including numbered continuation worksheets."""
+    return [row for sheet, grid in sheets.items() if sheet == name or re.fullmatch(re.escape(name) + r"_\d+", sheet)
+            for row in table_rows(grid)]
+
+
 __all__ = ["find_marker_row", "read_workbook", "table_rows"]

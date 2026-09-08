@@ -37,6 +37,7 @@ from Workstation.workstation_core.measurement_methods import (
 from Workstation.workstation_core.yolo_stream import DEFAULT_YOLO_WEIGHTS
 
 SETTINGS_CONTROLLER_METHODS = [
+    "apply_baseline_yaw90_settings",
     "save_current_settings_from_ui",
     "save_workstation_calibration_setup",
     "workstation_settings_snapshot",
@@ -51,6 +52,19 @@ SETTINGS_CONTROLLER_METHODS = [
 class WorkstationSettingsController:
     def __init__(self, panel):
         self.panel = panel
+
+    def apply_baseline_yaw90_settings(self, payload: dict[str, object], *, persist: bool = False) -> dict[str, object]:
+        from Workstation.baseline_yaw90_controller import reverse_editable
+
+        key = "measurement_baseline_yaw_reverse"
+        if set(payload) != {key} or type(payload[key]) is not bool:
+            raise ValueError("Baseline Yaw90 accepts only a boolean Reverse setting")
+        if not reverse_editable(self.panel):
+            raise RuntimeError("Stop Measurement before changing Baseline Yaw90 Reverse")
+        self.panel._workstation_setting_overrides[key] = payload[key]
+        if persist:
+            self.save_current_settings_from_ui()
+        return {"reverse": payload[key], "saved": bool(persist)}
 
     def save_current_settings_from_ui(self) -> None:
         panel = self.panel

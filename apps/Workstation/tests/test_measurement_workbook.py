@@ -44,12 +44,12 @@ from Workstation.tests.measurement_fixtures import (
 )
 
 EXPECTED_SHEETS = (
-    "00_Summary",
+    "00_요약", "01_거리비교", "02_좌표결과", "03_진단", "04_Rt", "05_그래프",
+    *(METHOD_SHEET_NAMES[method_id] for method_id in MEASUREMENT_METHOD_IDS),
     "01_Left_Detections",
     "02_Right_Detections",
     "03_Calibration",
     "04_Alignment",
-    *(METHOD_SHEET_NAMES[method_id] for method_id in MEASUREMENT_METHOD_IDS),
     *ALWAYS_PRESENT_TELEMETRY_SHEETS,
     "50_Events",
     "90_Flat",
@@ -212,18 +212,31 @@ def test_detection_calibration_alignment_summary_and_flat_sheets(tmp_path: Path)
     assert alignment[0]["method_id"] == "checkerboard_stereo" and alignment[0]["T_R"] == -0.4
     assert alignment[0]["timestamp_utc_ns"] == "1757000000000000001"
 
-    summary = sheets["00_Summary"]
+    summary = sheets["00_요약"]
     keys = {row[0]: row[1] for row in summary if len(row) > 1 and isinstance(row[0], str)}
-    assert keys["Measurement ID"] == MEASUREMENT_ID
-    assert keys["Stereo pair count"] == 3
-    assert keys["Stop local time"] != "N/A"
+    assert keys["영상 쌍 수"] == 3
+    assert keys["종료 시각"] != "측정 중"
     header_row = next(index for index, row in enumerate(summary) if row and row[0] == "Method")
     method_rows = table_rows(summary, header_row)
-    checker = next(row for row in method_rows if row["Method"] == "checkerboard_stereo")
-    assert checker["Attempted count"] == 3 and checker["PENDING count"] == 1 and checker["BLOCKED count"] == 1
-    assert checker["Range min"] == checker["Range max"] and checker["Range min"] > 0
-    terrain = next(row for row in method_rows if row["Method"] == "terrain_pnp")
-    assert terrain["N/A count"] == 3 and terrain["Range min"] == "N/A"
+    checker = next(row for row in method_rows if row["Method"] == "Checkerboard")
+    assert checker["시도"] == 3 and checker["미산출"] == 2
+    assert checker["최소 (m)"] == checker["최대 (m)"] and checker["최소 (m)"] > 0
+    checker_raw = sheets["11_Checkerboard"]
+    checker_header = next(
+        index for index, row in enumerate(checker_raw) if row and "Status" in row and "R11" in row
+    )
+    checker_sheet = table_rows(checker_raw, checker_header)
+    valid_row = next(row for row in checker_sheet if row["Status"] == "VALID")
+    rt_sheet = sheets["04_Rt"]
+    rt_header = next(i for i, r in enumerate(rt_sheet) if r and r[0] == "R,t 번호")
+    rt = next(r for r in table_rows(rt_sheet, rt_header) if r["R,t 번호"] == valid_row["rt_id"])
+    for name in ("R11", "R22", "R33", "T_R", "T_D", "T_F"):
+        assert rt[name] == valid_row[name]
+    rt_summary = next(r for r in table_rows(rt_sheet, 4) if r["Method"] == "Checkerboard")
+    assert rt_summary["R,t 확보"] == 2  # includes the zero-baseline BLOCKED attempt
+    assert rt_summary["R"] == "고정" and rt_summary["t"] == "변화"
+    terrain = next(row for row in method_rows if row["Method"] == "Terrain PnP")
+    assert terrain["미시도"] == 3 and terrain["최소 (m)"] == "—"
     with zipfile.ZipFile(path) as archive:
         summary_xml = archive.read("xl/worksheets/sheet1.xml").decode()
     assert "location=\"&apos;10_Pixhawk_RTK&apos;!A1\"" in summary_xml or "10_Pixhawk_RTK" in summary_xml

@@ -52,10 +52,85 @@ SENSOR_PRESENTATION_METHODS = [
 ]
 
 
+# Consecutive GPS packets carrying an identical position before the link is
+# reported as frozen. A stationary RTK receiver can repeat a 1e-7 deg position
+# for a few epochs; a flying vehicle cannot.
+GNSS_FROZEN_POSITION_PACKETS = 10
+GNSS_FROZEN_LOG_INTERVAL_S = 30.0
+
+
 class SensorPresentationController:
     def __init__(self, panel):
         self.panel = panel
         self._last_camera_parameters_refresh_s = 0.0
+        # camera -> (position, utc, repeat count, last log monotonic, first seen app time)
+        self._gnss_frozen_watch: dict[str, tuple[tuple[object, ...], object, int, float, float]] = {}
+
+    def _observe_gnss_frozen_position(self, camera: str, gps: GpsPositionState) -> None:
+        """Log when a link keeps delivering the same GNSS position.
+
+        Every GPS_RAW_INT rebuilds ``latest_gps[camera]`` from the packet and
+        stamps the receive time, so an age that keeps resetting while the
+        position never moves means the producer is repeating itself, not the
+        Workstation. ``gps_utc_us`` separates the two producer-side causes:
+        a frozen receiver output still advances UTC, whereas an autopilot
+        re-sending one stale fix repeats the same UTC as well.
+        """
+
+        frozen_store = getattr(self.panel, "_gnss_position_frozen", None)
+        if not isinstance(frozen_store, dict):
+            frozen_store = {}
+            setattr(self.panel, "_gnss_position_frozen", frozen_store)
+        position = (gps.latitude_deg, gps.longitude_deg, gps.altitude_m)
+        if any(value is None for value in position):
+            self._gnss_frozen_watch.pop(camera, None)
+            frozen_store.pop(camera, None)
+            return
+        utc = gps.gps_utc_us
+        previous = self._gnss_frozen_watch.get(camera)
+        now_s = time.monotonic()
+        if previous is None or previous[0] != position:
+            self._gnss_frozen_watch[camera] = (position, utc, 1, float("-inf"), float(gps.timestamp_s))
+            frozen_store.pop(camera, None)
+            return
+        _position, previous_utc, count, last_log_s, first_seen_s = previous
+        count += 1
+        utc_frozen = utc is not None and previous_utc == utc
+        raw = getattr(gps, "raw", None)
+        raw_vel = getattr(raw, "vel", None) if raw is not None else None
+        ground_speed_m_s = None if raw_vel in (None, 65535) else float(raw_vel) * 0.01
+        if count >= GNSS_FROZEN_POSITION_PACKETS:
+            # Operator-visible state: the Telemetry position table and the
+            # Drone geometry status read this instead of the log. fix/sats/
+            # speed tell a receiver hold (many sats, zero speed, DGPS/RTK fix)
+            # apart from a lost fix that keeps its last position.
+            frozen_store[camera] = {
+                "packets": count,
+                "utc_frozen": utc_frozen,
+                "since_s": first_seen_s,
+                "fix_type": gps.fix_type,
+                "satellites": gps.satellites_used,
+                "ground_speed_m_s": ground_speed_m_s,
+            }
+        if count >= GNSS_FROZEN_POSITION_PACKETS and now_s - last_log_s >= GNSS_FROZEN_LOG_INTERVAL_S:
+            last_log_s = now_s
+            logger = getattr(self.panel, "_log", None)
+            if callable(logger):
+                label = {"left": "P1", "right": "P2", "drone": "Drone"}.get(
+                    camera.split("_", 1)[0], camera
+                )
+                cause = (
+                    "GPS UTC도 정지: autopilot이 같은 fix를 재전송 중 (GPS driver/uORB 확인)"
+                    if utc_frozen
+                    else "GPS UTC는 진행: 수신기 위치 출력 정지 (static hold/fix 상실 확인)"
+                )
+                speed_text = "--" if ground_speed_m_s is None else f"{ground_speed_m_s:.2f}m/s"
+                logger(
+                    f"[픽스호크] {label} GNSS 위치 고정 감지: 연속 {count}개 패킷 동일 "
+                    f"lat/lon/alt={position[0]:.7f}/{position[1]:.7f}/{position[2]:.3f} · "
+                    f"fix={gps.fix_type} sats={gps.satellites_used} vel={speed_text} · {cause}"
+                )
+        self._gnss_frozen_watch[camera] = (position, utc, count, last_log_s, first_seen_s)
 
     def _update_extrinsic(self, camera: str, extrinsic: CameraExtrinsicState) -> None:
         # Drone Telemetry shares the receive subscriber but is a position/
@@ -146,6 +221,7 @@ class SensorPresentationController:
 
     def _update_gps(self, camera: str, gps: GpsPositionState) -> None:
         self.panel.latest_gps[camera] = gps
+        self._observe_gnss_frozen_position(camera, gps)
         if camera in {"left", "right"}:
             publisher = getattr(self.panel, "measurement_source_transition", None)
             if callable(publisher):

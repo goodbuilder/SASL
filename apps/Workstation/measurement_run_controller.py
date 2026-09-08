@@ -263,6 +263,14 @@ class MeasurementRunController:
     ) -> bool:
         if self.state in {"STARTING", "RUNNING", "STOPPING"}:
             return False
+        click_clocks = getattr(self.panel, "_measurement_start_click_clocks", None)
+        self.panel._measurement_start_click_clocks = None
+        if click_clocks is None:
+            monotonic_before = time.monotonic_ns()
+            started_utc_ns = time.time_ns()
+            started_monotonic_ns = (monotonic_before + time.monotonic_ns()) // 2
+        else:
+            started_utc_ns, started_monotonic_ns = click_clocks
         # Method workers are application-lifetime: a previous Measurement's
         # in-flight jobs keep running and their outcomes are routed to that
         # Measurement's own record by measurement_id.
@@ -289,10 +297,6 @@ class MeasurementRunController:
                 method_config = {}
 
         generation = f"run-{uuid.uuid4().hex}"
-        monotonic_before = time.monotonic_ns()
-        started_utc_ns = time.time_ns()
-        monotonic_after = time.monotonic_ns()
-        started_monotonic_ns = (monotonic_before + monotonic_after) // 2
         self.panel._measurement_run_generation = generation
         self.panel._measurement_run_queued_reason = ""
         self.panel._measurement_run_metadata = {
