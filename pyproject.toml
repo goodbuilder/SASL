@@ -1,0 +1,27 @@
+[tool.pytest.ini_options]
+testpaths = ["apps/StereoWIRIS/tests", "apps/Workstation/tests", "apps/PoseSimulation/test", "apps/Simulation/tests"]
+addopts = "--strict-markers"
+norecursedirs = [
+  ".git",
+  ".venv*",
+  "build",
+  "install",
+  "log",
+  "apps/Simulation/PX4-Autopilot",
+  "apps/Simulation/reports",
+  "apps/StereoWIRIS/recordings",
+  "common/ros",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+extend-exclude = [
+  "apps/Simulation/PX4-Autopilot",
+  "apps/Simulation/reports",
+  "apps/StereoWIRIS/recordings",
+  "ref",
+  "common/ros",
+  "build",
+  "install",
+]

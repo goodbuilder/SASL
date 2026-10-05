@@ -12,6 +12,12 @@ import cv2
 import csv
 from datetime import datetime
 import os
+from pathlib import Path
+
+
+PACKAGE_ROOT = Path(__file__).resolve().parent
+DEFAULT_MODEL_PATH = str(PACKAGE_ROOT / "yolov8n_uav.pt")
+DEFAULT_CSV_DIR = os.environ.get("SASL_WIRIS_CSV_DIR", str(Path.cwd() / "data"))
 
 
 class WirisYoloNode(Node):
@@ -23,7 +29,7 @@ class WirisYoloNode(Node):
 
         # ==== Stereo / YOLO params ====
         self.declare_parameter('use_stereo', True)
-        self.declare_parameter('model_path', '/home/saslab/ros2_ws/src/wiris_stereo/wiris_stereo/yolov8n_uav.pt')
+        self.declare_parameter('model_path', DEFAULT_MODEL_PATH)
         self.declare_parameter('conf_thres', 0.4)
         self.declare_parameter('device', 'auto')
         self.declare_parameter('uav_class_id', 0)
@@ -46,7 +52,7 @@ class WirisYoloNode(Node):
         self.declare_parameter('force_height', 1080)
 
         # ==== CSV Logging ====
-        self.declare_parameter('csv_dir', '/data/rosbags/data/')
+        self.declare_parameter('csv_dir', DEFAULT_CSV_DIR)
 
         # ==== Debug / Logging ====
         # N 프레임마다 원본/최종 해상도 로그 출력

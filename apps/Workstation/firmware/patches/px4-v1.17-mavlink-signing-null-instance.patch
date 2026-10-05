@@ -1,0 +1,14 @@
+diff --git a/src/modules/mavlink/mavlink_main.cpp b/src/modules/mavlink/mavlink_main.cpp
+index d1f4686f29..8b5e1fca71 100644
+--- a/src/modules/mavlink/mavlink_main.cpp
++++ b/src/modules/mavlink/mavlink_main.cpp
+@@ -330,8 +330,8 @@ Mavlink::get_instance_for_status(const mavlink_status_t *status)
+ {
+ 	LockGuard lg{mavlink_module_mutex};
+ 
+ 	for (Mavlink *inst : mavlink_module_instances) {
+-		if (status == mavlink_get_channel_status(inst->get_instance_id())) {
++		if ((inst != nullptr) && (status == inst->get_status())) {
+ 			return inst;
+ 		}
+ 	}

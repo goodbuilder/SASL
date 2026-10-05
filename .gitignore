@@ -8,6 +8,7 @@ __pycache__/
 htmlcov/
 
 # Local Codex/agent session state
+.local/
 .codex
 .agents/
 .omx/
@@ -36,14 +37,25 @@ workspace/live_measurement_check/
 # px4_msgs has one canonical reproducible checkout under workspace/main.
 # Do not vendor a second machine-local source tree into Simulation.
 Simulation/px4_msgs/
+apps/Simulation/px4_msgs/
 
 # Local PX4 firmware checkout/build tree. Commit patches/docs instead.
-firmware/PX4-Autopilot/
+common/firmware/PX4-Autopilot/
 Simulation/PX4-Autopilot/
+apps/Simulation/PX4-Autopilot/
 
 # Large generated experiment/runtime outputs
+workstation_data/
+recordings/
+StereoWIRIS/recordings/**
+!StereoWIRIS/recordings/
+!StereoWIRIS/recordings/README.md
+apps/StereoWIRIS/recordings/**
+!apps/StereoWIRIS/recordings/
+!apps/StereoWIRIS/recordings/README.md
 Simulation/results/
 Simulation/Simulation/results/
+apps/Simulation/results/
 Simulation/reports/**
 !Simulation/reports/
 !Simulation/reports/**/*.md
@@ -52,20 +64,42 @@ Simulation/reports/**
 !Simulation/reports/experiments/*.md
 !Simulation/reports/experiments/*.csv
 Simulation/reports/experiments/EXP-*/
+apps/Simulation/reports/**
+!apps/Simulation/reports/
+!apps/Simulation/reports/**/*.md
+!apps/Simulation/reports/**/*.txt
+!apps/Simulation/reports/experiments/
+!apps/Simulation/reports/experiments/*.md
+!apps/Simulation/reports/experiments/*.csv
+apps/Simulation/reports/experiments/EXP-*/
 Simulation/bags/
+Simulation/recordings/
+apps/Simulation/bags/
+apps/Simulation/recordings/
+apps/Simulation/Recordings/
 *.bag
 *.db3
 *.ulg
+perf.data
 
 # Model weights and large binary assets
 *.pt
 *.onnx
 *.engine
 ref/yolo_models/
+apps/Workstation/models/
+*.pcap
+apps/Workstation/crash.log
 
 # Captured calibration/raw media. Keep derived JSON calibration files tracked.
 StereoDistance/calibration_captures/left/
 StereoDistance/calibration_captures/right/
+apps/StereoWIRIS/calibration_captures/left/
+apps/StereoWIRIS/calibration_captures/right/
+# Workstation legacy/source-tree capture root. New writes use
+# .local/workstation_data/calibration, but existing field data must never be
+# swept into source commits during migration.
+apps/Workstation/calibration/
 *.mp4
 *.mkv
 *.avi

@@ -1,0 +1,49 @@
+std_msgs/Header header
+
+string schema
+bool valid
+string status
+
+string source_application
+string context_id_sha256
+
+string run_id
+string case_id
+string scenario_name
+uint64 simulation_epoch
+bool simulation_epoch_valid
+string simulation_epoch_source
+
+string repository
+string branch
+string commit_sha
+string git_status
+
+string generated_sdf_sha256
+
+string world_frame
+string camera_error_frame
+string camera_error_axes
+string rotation_composition
+string quaternion_order
+
+float64 nominal_baseline_m
+float64 zoom_index
+bool zoom_index_valid
+string zoom_index_source
+uint32 camera_image_width_px
+uint32 camera_image_height_px
+float64 camera_update_rate_hz
+float64 camera_horizontal_fov_rad
+string observation_mode
+
+geometry_msgs/Pose nominal_left_optical_pose_world_enu
+geometry_msgs/Pose nominal_right_optical_pose_world_enu
+
+geometry_msgs/Vector3 left_direct_rpy_deg
+geometry_msgs/Vector3 right_direct_rpy_deg
+geometry_msgs/Vector3 common_rpy_deg
+geometry_msgs/Vector3 relative_rpy_deg
+
+geometry_msgs/Vector3 left_effective_rpy_deg
+geometry_msgs/Vector3 right_effective_rpy_deg

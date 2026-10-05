@@ -62,7 +62,7 @@ For the PX4 ROS message overlay used by `StereoWIRIS`, run:
 
 ```bash
 cd SASL
-scripts/bootstrap_ros_workspace.sh
+tools/bootstrap_ros_workspace.sh
 ```
 
 This prepares `workspace/main/src/px4_msgs` at the pinned PX4 message
@@ -71,17 +71,179 @@ The source clone and generated overlay are intentionally not tracked by
 this repository; they are reproducible local state. The script keeps the
 ROS build/log cache under `~/.cache/sasl_ros_workspace/...` so ROS message
 generation does not depend on the checkout path being ASCII-only.
-`StereoWIRIS/run.sh` and `Simulation/run_operator_view.sh` consume this
+`apps/StereoWIRIS/run.sh` and `apps/Simulation/run_operator_view.sh` consume this
 single canonical overlay. The Simulation runner validates both the pinned
 source revision and the bootstrap-generated overlay commit stamp before
 starting; StereoWIRIS applies the same validation. Both print the bootstrap
 command when the dependency is missing or stale. Do not create a second
-`Simulation/px4_msgs` or `px4_msgs_ws` checkout; those machine-local fallback
+`apps/Simulation/px4_msgs` or `px4_msgs_ws` checkout; those machine-local fallback
 workspaces are not runtime inputs.
 
 If a future task requires PX4 firmware/DDS export changes, keep the
 patch, submodule, fork reference, or setup script inside `SASL` so the
 notebook clone can reproduce the same firmware source state.
+
+## Simulation StereoDistanceNode boundaries
+
+`apps/Simulation/stereo_ground_sim/stereo_ground_sim/stereo_distance_node.py`
+owns ROS subscriptions/publications, runtime workers, coordinate transforms,
+and Gazebo command I/O.  Deterministic policies are kept outside that ROS node:
+
+- `mission_timeline.py` calculates mission phases and scalar setpoints. Its
+  altitude and vertical velocity contract is world ENU (`z` positive up); the
+  approach distance is a scenario scalar, not a PX4 NED or camera-frame vector.
+- `observation_contract.py` validates observation modes and builds immutable
+  pixel/provenance records. Pixels use OpenCV `(u=right, v=down)` order, while
+  its declared triangulation output remains baseline-center FRD `[F,R,D]`.
+- `pair_evaluation_registry.py` exclusively owns the pair/measurement/world-ENU
+  alignment join and bounded evaluated/failed tombstones. Terminal evaluation
+  removes all three join entries atomically, preventing late Ground Truth from
+  resurrecting a completed pair.
+- `research_terminal_coordinator.py` owns per-epoch/pair terminal deduplication
+  plus recorder submission/close failure state. Record payload construction
+  remains schema-compatible while its lifecycle no longer belongs to the ROS
+  node.
+- `pair_work_scheduler.py` owns the measurement/GT-alignment ready queues and
+  alternates the two work classes so a continuous image stream cannot starve
+  delayed Ground Truth evaluation.
+- `evaluation_pipeline.py` computes signed component, Euclidean position, and
+  range errors only after estimates and Ground Truth share baseline-center FRD
+  `[F,R,D]`; it performs no world/camera/PX4 frame conversion.
+- `gazebo_target_controller.py` owns command throttling and Gazebo service
+  execution. Mission distance maps to world ENU `y`, altitude to ENU `z/+up`,
+  and yaw is encoded about world `+Z`.
+- `ground_truth_provider.py` owns old-epoch rejection, bounded future records,
+  reset quarantine, and timestamp-ordered release. It retains world ENU
+  position and XYZW world-from-reference orientation without converting them.
+- `stereo_measurement_pipeline.py` owns OpenCV optical pixel-to-ray and
+  closest-ray triangulation. It accepts `(u=right,v=down)` observations plus
+  world-ENU camera poses and emits baseline-center FRD `[F,R,D]` metres with
+  the canonical geometry-policy diagnostics.
+- `pose_source_provider.py` validates and owns PX4 attitude, raw GPS, and fused
+  global-position caches. Pair snapshots preserve PX4 Hamilton WXYZ
+  body-FRD-to-earth-NED semantics and native timestamps before later pose or
+  baseline conversion.
+- `pose_conversion_adapter.py` validates source age/epoch/skew and converts
+  frozen PX4/GPS sources into camera poses. PX4 Hamilton WXYZ remains
+  body-FRD-to-earth-NED; GPS separation is world ENU; camera outputs use
+  world-ENU centres with OpenCV optical RDF basis; the UAM public reference is
+  explicitly baseline-center FRD metres.
+- `runtime_worker_lifecycle.py` owns creation, role assignment, and bounded
+  joining of plot, measurement, and RViz worker threads.
+- `runtime_worker_loops.py` owns condition waiting, fair measurement/late-GT
+  dequeue, target-rate pacing, drain termination, latest-only RViz scheduling,
+  and per-iteration fault containment. It delegates pair math and all frame
+  conversion to the measurement/pose pipelines.
+- `pair_measurement_orchestrator.py` owns the per-pair ordering of image decode,
+  observation acquisition, and Nominal/Optical/GPS/diagnostic ray calls. Every
+  ray variant receives the same pixels, dimensions, pair timestamp, and frozen
+  pose-source snapshot.
+- `visualization_payloads.py` serializes read-only metric snapshots into public
+  `[forward,right,down,range]` plot arrays and never mutates measurement state.
+  It also owns finite-safe JSON serialization for ray metrics and preserves
+  FRD point arrays plus their source provenance.
+- `research_record_policy.py` gates eligible experiment samples on evaluated,
+  finite OpenCV pixels and Nominal/Corrected/GT baseline-center FRD vectors;
+  a world-ENU or otherwise mismatched output frame cannot enter the sample set.
+- `research_record_fields.py` owns stable CSV flattening for diagnostic FRD
+  rays and camera-oracle world-ENU/XYZ plus orientation-XYZW fields. It only
+  serializes existing values and performs no frame conversion. It also builds
+  the Operational calibration contract, keeping observed pixels, PX4
+  body-FRD-to-earth-NED attitude, baseline-center FRD positions, and world-ENU
+  Ground Truth in separately named fields.
+- `research_terminal_record_builder.py` owns the complete immutable terminal
+  pair payload, including schema identity, queue counters, observation fields,
+  Nominal/Corrected/GT FRD values, oracle/debug labels, and eligibility policy.
+  The node only claims the terminal pair and submits the finished record.
+- `rviz_geometry.py` constructs display-only camera frustum and ray primitives
+  exclusively as world ENU metre points; optical basis vectors are consumed
+  only inside the geometry builder. It also owns the explicit UAM
+  baseline-center-FRD reference to world-ENU display-ray conversion.
+- `rviz_publisher.py` exclusively serializes and publishes distance text,
+  camera/FOV, ray, authoritative-drone, and ray-metrics ROS messages. Every
+  Marker position is Gazebo world ENU metres; baseline-center FRD measurement
+  topics remain outside this display publisher. The node keeps compatibility
+  delegates while constructing the publisher owner during ROS setup.
+- `yolo_model_runtime.py` exclusively owns the loaded model, model device,
+  warmup/error/fallback state, class filtering, and single/pair inference.
+  Detection outputs retain OpenCV top-left pixel order `(u=right,v=down)` and
+  perform no stereo or world-frame conversion. Historical node attributes and
+  methods remain compatibility properties/delegates backed by that owner.
+- `observation_projection.py` projects world-ENU reference points through
+  world-ENU camera poses into OpenCV `(u=right,v=down)` observations and owns
+  the optional image-bounds gate plus synthetic bbox construction.
+- `diagnostic_ray_pipeline.py` owns canonical-FRD validity checks, signed
+  Attitude/Operational-minus-Optical component deltas, and the diagnostic
+  source-composition order. Its pose inputs remain world ENU/OpenCV optical,
+  its GPS baseline remains an ENU separation, and every public ray result is
+  baseline-center FRD metres.
+- `measurement_publication.py` owns canonical position, plot, detection, and
+  profile-status ROS serialization in baseline-center FRD metres.
+- `runtime_configuration.py`, `pair_ground_truth_coordinator.py`, and
+  `camera_pose_coordinator.py` own profile loading, epoch/pair/GT routing, and
+  camera/PX4/GPS intake without collapsing ENU/NED/FRD/RDF contracts.
+- `research_recording_setup.py`, `research_terminal_facade.py`,
+  `runtime_control_coordinator.py`, and `triangulation_facade.py` own recording
+  setup, terminal submission, runtime lifecycle, and pipeline assembly.
+
+`StereoDistanceNode` is now the ROS parameter, topic, callback, and lifecycle
+assembly layer; its class body is approximately 1,065 lines. `Workstation` and
+StereoWIRIS remain independently launched apps and do not import each other's
+app implementation.
+
+## Workstation application boundaries
+
+`Workstation` and `StereoWIRIS` are separate applications. They may use
+app-neutral contracts from `apps/Workstation/workstation_core` or `sasl_common`, but neither
+application may import the other application's UI, controllers, workers, or
+runtime entry point. Similar behavior must be implemented and tested within
+each application's own package. Launch `Workstation` with
+`python -m Workstation`; `apps/StereoWIRIS/main.py --ui workstation` is rejected
+instead of crossing the application boundary.
+
+`apps/Workstation/standalone_gui.py` remains the PyQt panel assembly and
+compatibility facade. Runtime responsibilities extracted from that facade are:
+
+- `camera_time_sync_controller.py`: WIRIS STUS/GDTI, RTCP/NTP readiness,
+  drift metrics, and time-sync presentation.
+- `camera_stream_controller.py`: camera preview/detection start, retry, stop,
+  and stream resource cleanup lifecycle.
+- `wiris_control_controller.py`: workstation WIRIS SDK command, PC UTC, and
+  optical-zoom orchestration.
+- `app_lifecycle_controller.py`: bounded application shutdown and auxiliary
+  worker cleanup.
+- `recording_controller.py`: session state, recording rows and timelines,
+  camera/PX4/GNSS metadata, save orchestration, and recording presentation.
+- `session_workers.py`: background persistence of a completed session.
+- `wiris_runtime_workers.py`: WIRIS clock, STIP, RTSP enablement, stream
+  reachability, and optional LRF polling work.
+- `device_runtime_workers.py`: camera-network discovery/configuration and
+  Pixhawk discovery, connection, shell, parameter, RTCM, and setup work.
+- `device_runtime_controller.py`: workstation camera-network and Pixhawk
+  connection/setup worker lifecycles plus their UI state transitions.
+- `gnss_runtime_workers.py`: GNSS base serial, NTRIP, and serial discovery
+  work.
+- `gnss_runtime_controller.py`: GNSS operation mode, base serial, NTRIP,
+  survey-in, readiness, RTCM routing, and associated UI state transitions.
+- `calibration_workers.py`: checkerboard capture, calibration, random
+  validation, and preview detection work.
+- `calibration_controller.py`: checkerboard capture, file scanning, random
+  validation, calibration result application, and persistence workflow.
+- `measurement_view_controller.py`: measurement-attempt assembly, explicit
+  baseline/optical frame conversions, triangulation execution, and distance
+  and alignment presentation.
+- `sensor_presentation_controller.py`: Pixhawk attitude, GNSS, magnetometer,
+  relative-heading, and sensor-health presentation without frame conversion.
+
+The facade re-exports historical worker names and delegates historical panel
+methods so existing integrations keep their public interface while ownership
+stays in workstation modules. Recording coordinate fields retain their
+declared contracts: PX4 attitude is body FRD relative to earth NED, camera
+observations are OpenCV optical RDF, GNSS deltas are NED where explicitly
+named, and public measurements are baseline/stereo-center FRD
+`[forward,right,down]` metres. Timestamp fields distinguish monotonic host
+time, Unix UTC, GPS UTC, and RTP/RTCP-derived time instead of aliasing them as a
+single clock.
 
 ## Main Tabs
 
@@ -615,42 +777,355 @@ Use only standard Python libraries plus PyQt6.
 
 ## Purpose
 
-This repository now contains a runnable desktop UI prototype for the stereo vision surveillance MVP described above. The `ref/` directory remains reference-only; the application code is self-contained under `uam_stereo_ui/`.
+SASL is a stereo-vision surveillance and measurement workspace for two WIRIS cameras and two Pixhawk units. It contains four independently launched applications: `StereoWIRIS`, `Workstation`, `Simulation`, and `PoseSimulation`. Shared Python contracts, ROS interfaces, and reproducible firmware material live under `common/`; `ref/` is reference-only.
 
 ## Current Run Flow
 
-Install the Qt binding and run the package module:
+Ubuntu 22.04 operators use one repository-root Python environment. PyGObject,
+GStreamer, and ffmpeg are Ubuntu dependencies rather than pip packages:
 
 ```bash
-python3 -m pip install -r requirements.txt
-python3 -m uam_stereo_ui
+sudo apt-get update
+grep -Ev '^[[:space:]]*(#|$)' requirements/ubuntu-22.04-operator-runtime.txt | xargs sudo apt-get install
+tools/check_operator_runtime.sh --deployment
+
+# Preserve the old environment for rollback; do not delete it.
+if [[ -d .venv ]]; then mv .venv ".venv.backup-$(date +%Y%m%d-%H%M%S)"; fi
+python3 -m venv --system-site-packages .venv
+.venv/bin/python -m pip install -r requirements.txt
+
+# Model bytes are approved external artifacts, not Git content.
+install -Dm0644 "$APPROVED_WORKSTATION_MODEL" .local/workstation_data/models/yolov8m.pt
+install -Dm0644 "$APPROVED_LEGACY_MODEL" apps/StereoWIRIS/yolov8n_uav.pt
+
+tools/check_operator_runtime.sh --execution
+apps/Workstation/run.sh --check
+apps/StereoWIRIS/run.sh --check --mavlink-only
+apps/Workstation/run.sh
 ```
 
-The app tries PyQt6 first and falls back to PySide6 if PyQt6 is unavailable.
+Both operator launchers accept only `.venv/bin/python`; setting `PYTHON_BIN` to an app,
+Simulation, or system interpreter is an error. Manual `.pth` injection of
+`/usr/lib/python3/dist-packages` is unsupported. Legacy StereoWIRIS additionally requires the
+pinned ROS 2/PX4 message overlay prepared by `tools/bootstrap_ros_workspace.sh`; its common
+runtime gate runs before that overlay is sourced. Development and CI dependencies are declared
+in `requirements/dev.txt`. Optional PyAV is isolated in `requirements/optional-pyav.txt`.
+Set `APPROVED_WORKSTATION_MODEL` and `APPROVED_LEGACY_MODEL` to the locally supplied approved
+source files before running the two `install` commands. The launchers validate the installed
+size and SHA-256 against `apps/Workstation/model-manifest.json` and
+`apps/StereoWIRIS/model-manifest.json`; neither model is downloaded or stored in Git.
+
+For the manual cross-zoom calibration flow, open `Pre-run Calibration`. At
+the large-board pose, set both visible cameras to nominal 1×, capture matching
+left/right checkerboard pairs, load or calculate the selected K,D, then use
+`R,t + Apply > Calculate R,t only` and `Save R,t`. At the measurement zoom,
+load the 8× K,D profile, load the saved 1× R,t profile, and select
+`Apply K,D + R,t`. `Read actual zoom` requests a `GZVV` readback from both
+cameras; its result is evidence and does not gate application.
+
+For Simulation, `apps/Simulation/run_operator_view.sh` starts the operator
+view. Its rqt `Auto` action generates a FOV-constrained path and converts every
+absolute Gazebo world ENU point to a PX4 home-relative local NED setpoint using
+the configured `DRONE_SPAWN_X/Y/Z_M` origin before arming and entering
+OFFBOARD. Simulation operator recordings, Waypoint automatic sessions, and
+Auto-generated paths all live below `apps/Simulation/Recordings/`; Mission
+creates a recording there only when an rqt Save preset is pressed. Auto creates
+one `auto_YYYYMMDD_HHMMSS_Full/` session directly below that root and stores
+its generated path, telemetry, XLSX, compact CSVs, and left/right MP4 together.
 
 ## Inputs/Outputs and Interfaces
 
-- Inputs are disconnected application state, editable settings controls, mapping swap buttons, sync source selection, video backend selection, YOLO `.pt` model selection, and the stereo parameter lock toggle.
-- Outputs are the seven UI tabs: Live, Device, Calibration, Control, Events, Settings, and Debug.
-- No hardware, ROS2 graph, RTSP stream, MAVLink endpoint, image asset, or external service is required for the prototype.
+- Hardware inputs include WIRIS visible RTSP/control streams, Pixhawk telemetry, GNSS/RTK, calibration profiles, and optional ROS 2 topics in Legacy.
+- The Workstation Pixhawk action row includes `Reset level cal.`. It resets
+  only PX4 `SENS_BOARD_X_OFF`, `SENS_BOARD_Y_OFF`, and `SENS_BOARD_Z_OFF` on
+  connected, disarmed Pixhawks through the PX4 `param reset` command.
+- Workstation WIRIS auto-connect probes the configured control port and SDK
+  default port (`2240`), verifies `HIWS`, enables Ethernet/RTSP mode, and
+  waits for both visible frames before starting Preview.
+- The optional WIRIS laser rangefinder is read over each camera's TCP control
+  port with `GLRD`. A numeric response is interpreted as metres; an `ERR` or
+  invalid response remains an error rather than being converted to a value.
+- Alignment displays `LRF L` and `LRF R` status cards with the latest distance,
+  raw response, sample age, and error detail. The cards are backed by the
+  Workstation `StatusModel` and do not synthesize a value before a camera
+  responds.
+- Workstation stores per-zoom intrinsics as `intrinsics_zoom_##.json` and the
+  large-board stereo transform as an independent
+  `extrinsics_zoom_##_large_board.json` profile. Measurement and recording
+  provenance retain both profile paths, SHA-256 hashes, source zoom levels,
+  manual/cross-zoom selection, actual zoom readback, and
+  `validation_gate=disabled`.
+- Stereo R,t uses OpenCV optical RDF `[Right, Down, Forward]` with
+  `X_right = R_left_to_right X_left + T_left_to_right_m`. The right-camera
+  origin expressed in the left optical frame is the distinct derived value
+  `C_right_in_left = -R_left_to_right^T T_left_to_right_m`; OpenCV T and the
+  camera origin are never aliases.
+- Public measurement vectors retain their declared frame and axis contract. Raw local GNSS baseline is NED `[North, East, Down]`; P1 body projection is FRD `[Forward, Right, Down]`; camera optical rays are RDF `[Right, Down, Forward]`; public stereo results use their declared stereo-center FRD schema.
+- Selector observation exports use stereo-center RDF component order. Canonical `nominal_pose_right/down/forward_m` fields and compatibility `raw_right/down/forward_m` fields are exact aliases in that exported schema; neither is a public FRD array or a new coordinate conversion.
+- Runtime recordings are written below `apps/StereoWIRIS/recordings/` or `.local/workstation_data/recordings/` and are not source files. Reusable evidence belongs in a minimized, anonymized `tests/fixtures/` dataset with its schema/frame contract.
+- Simulation runtime outputs use `apps/Simulation/Recordings/` as their common
+  ignored root: `operator_<timestamp>_<mode>/`,
+  `waypoint_<timestamp>_lite/`, and `auto_<timestamp>_Full/`.
+- Simulation Auto waypoint generation consumes absolute Gazebo world ENU
+  `[East, North, Up]` points and outputs PX4 local mission fields
+  `[north_m, east_m, altitude_agl_m]`, where
+  `north=world_north-origin_north`, `east=world_east-origin_east`, and the
+  MAVLink NED setpoint uses `down=-altitude_agl_m` with
+  `altitude_agl_m=world_up-origin_up`.
 
 ## Operational Rules
+
+- Run `tools/check_operator_runtime.sh --deployment` after OS/package changes and
+  `--execution` after recreating `.venv`. The doctor is read-only: it never runs apt, pip, or
+  creates a venv. Exit `0` means ready or allowed Auto/software operation, `1` means a required
+  dependency is missing, and `2` means an invalid command or interpreter.
+- `apps/Workstation/run.sh --check` and `apps/StereoWIRIS/run.sh --check` add each app's settings,
+  model, and import checks to the common Gst/GstRtp and element factory checks.
+- GStreamer must provide `rtspsrc`, `rtph264depay`, `h264parse`, `queue`, `videoconvert`,
+  `appsink`, `avdec_h264`, `mp4mux`, and `filesink`. `nvh264dec` plus a working NVIDIA driver is
+  optional acceleration; `avdec_h264` remains mandatory in every decoder mode.
 
 - Camera and Pixhawk mapping changes are applied in-memory and reflected across relevant tabs.
 - Stereo parameter lock disables zoom, focus, and resolution controls in the Control tab.
 - Time sync source changes update the Live tab sync mode.
 - Video receiver backend changes update Live status and Debug diagnostics.
 - YOLO `.pt` model selection updates Live status and Debug diagnostics, but does not run inference yet.
+- Workstation `Tasks > All settings` exposes the remaining camera/WIRIS, YOLO/RTSP, PX4/MAVLink, runtime, and GNSS/RTK settings; Apply delegates to the existing owner and Save persists the same settings schema at `.local/workstation_data/stereo_distance_settings.json`. ROS2/uXRCE and still-image clock controls are intentionally absent from this surface.
+- Workstation is a repository-level package in `apps/Workstation/`, alongside `StereoWIRIS`; it launches through `apps/Workstation/standalone_gui.py` and `apps/Workstation/standalone_backend.py`. The Legacy implementation remains under `apps/StereoWIRIS/wiris_stereo_distance/legacy_gui.py`, while `gui.py` remains a compatibility alias. The two UI runtimes no longer import or instantiate each other's panel owner.
+- Shared Python code is rooted at `common/python/sasl_common`; shared ROS message source is rooted at `common/ros`; reproducible Pixhawk material is rooted at `common/firmware`. Launchers and colcon builds add those paths explicitly instead of relying on a machine-local installation.
+- Workstation-owned runtime modules live in `apps/Workstation/workstation_core/`; they import only `Workstation.workstation_core` and neutral `sasl_common` modules. This keeps Workstation's MAVLink-only telemetry and live RTCP/NTP frame timing independent from Legacy's optional middleware and still-image workflow.
+- Workstation and Legacy StereoWIRIS are separate applications, not two skins
+  over one runtime owner. Domain files are therefore not replaced with imports
+  from the other app. Workstation decomposition stays inside `apps/Workstation/`
+  and `apps/Workstation/workstation_core/`; only deliberately app-neutral contracts may live in
+  `common/python/sasl_common`.
+- `apps/Workstation/workstation_core/gnss_protocol.py` owns Workstation UBX/RTCM framing,
+  field-base serial probing, and WGS84 geodetic/ECEF parsing. It never aliases
+  those values to PX4 NED, body FRD, or camera frames. The former
+  `standalone_gui` symbols remain re-exported for compatibility.
+- `apps/Workstation/workstation_core/runtime_camera_status.py` owns pure live-stream status and
+  timestamp formatting. RTCP/NTP UTC, source-clock seconds, and host-receive
+  time remain distinct provenance domains; the Qt panel only renders the
+  resulting text.
+- `apps/Workstation/telemetry_plots.py` owns Workstation-only attitude, generic
+  telemetry, and RTK/alignment plot widgets. Plot inputs retain their source
+  contracts—GPS local NED `[N,E,D]` and P1 optical RDF
+  `[Right,Down,Forward]`—and the widgets do not perform frame conversion.
+- `apps/Workstation/workstation_core/mavlink_parameter_store.py` owns integer PARAM write/readback
+  enforcement and REAL32-preserving calibration reads. It handles MAVLink wire
+  types only and does not interpret coordinate values.
+- The standalone copy currently preserves the shared measurement, camera, telemetry, calibration, and recording modules and their coordinate/schema contracts. Lifecycle sequencing is shared only through the UI-neutral `common/python/sasl_common/lifecycle.py`; Legacy and Workstation keep separate panel/resource owners.
+- Workstation recordings, retryable spools, calibration captures, and alignment files live under `.local/workstation_data/` (recordings under `.local/workstation_data/recordings/`). Legacy continues to use `apps/StereoWIRIS/stereo_distance_settings.json` and `apps/StereoWIRIS/recordings/`; the two stores are not migrated or read through each other.
+- Workstation intentionally omits the ROS2/uXRCE Pixhawk connection, namespace/topic discovery, and still-image/FTP/EXIF clock workflow. Legacy retains those existing workflows under `apps/StereoWIRIS/`.
+- `apps/StereoWIRIS/main.py --ui workstation` is rejected because the applications
+  are independent. Launch Workstation with `apps/Workstation/run.sh`; direct module
+  execution requires `PYTHONPATH=common/python python -m Workstation`. Legacy keeps its canonical ROS/PX4 overlay
+  validation and ROS setup.
+- Workstation field flow is exposed in `Run > Experiment` in the operator's order: `0` QGC Pixhawk calibration (external), `1` connect/verify WIRIS, Pixhawk, and Base GNSS, `2` start Base Survey-in or NTRIP, `3` initial WIRIS time sync, `4` verify RTCM delivery and numeric Pixhawk `fix_type`, `5–7` physically align the baseline and Roll/Pitch/Yaw with repeated evidence sampling, `8` perform the final time-sync quality check/resync, `9` confirm YOLO/measurement settings, `10` measure, and `11` save. The underlying Setup/Run/Tasks pages remain available from each step.
+- If WIRIS services are still booting, `Connect cameras` keeps the auto-connect
+  request pending and retries up to six times at 1.5-second intervals. Automatic
+  connection does not launch the unbounded 1–65535 TCP port scan; manual control
+  discovery retains the broader scan for cameras using a non-standard port.
+- QGC Pixhawk sensor calibration is documented as an external prerequisite; Workstation does not duplicate that operation. Internal camera intrinsic/stereo calibration remains supported in `Tasks > Calibration` and should be completed before the field sequence.
+- Workstation `Tasks > Calibration > Load intrinsics` opens a JSON file picker,
+  validates positive image dimensions, finite 3×3 camera matrices, positive
+  `fx/fy`, and finite distortion coefficients, then applies the selected
+  profile. Zoom metadata mismatch and unequal left/right calibration
+  resolution are reported as non-blocking evidence. `Load current zoom`
+  retains the deterministic `intrinsics_zoom_##.json` lookup, while
+  `Apply intrinsics` only reapplies the result already held in memory.
+- K,D and stereo R,t have independent profile lifecycles. The application may
+  intentionally combine, for example, `intrinsics_zoom_08.json` with
+  `extrinsics_zoom_01_large_board.json`; a source-zoom mismatch, unavailable
+  `GZVV` readback, or missing external validation does not disable
+  `Apply K,D + R,t`. Malformed/non-finite K,D or R,t and an invalid rotation
+  contract are still rejected.
+- RTK baseline evidence keeps the raw selected `P1→P2` GPS/RTK vector as local NED `[North, East, Down]`. When P1 attitude is available, Workstation also derives a separate `P1→P2 @ P1 body FRD` display/recording vector `[Forward, Right, Down]` using the inverse of the PX4 body-FRD→world-NED quaternion; this derived value is not camera optical RDF or public `baseline_center_frd`.
+- Measurement Run control keeps Preview, Detection, Record, and Save session together; Current measurement quality mirrors the existing ray-gap, midpoint-range, method, attitude-timing, and Raw `baseline_center_frd` evidence.
+- Recording shows an advisory experiment preflight for both camera streams, RTCP/NTP sync, detection, active stereo calibration, and the selected Pixhawk/GNSS or checkerboard geometry path. It reports missing evidence without changing the existing start/stop command behavior.
+- GNSS readiness records numeric PX4/MAVLink `fix_type` for P1 and P2. The configurable `minimum_fix_type` defaults to `3` (3D fix); `RTK_FIXED=6` is shown as a fixed-sample ratio and is required only when the operator sets the threshold to `6` or enables the legacy `require_rtk_fixed` policy. A route can therefore be usable without claiming that every field condition is RTK_FIXED.
+- GNSS/NTRIP field procedure (Workstation `./run.sh` and Legacy `apps/StereoWIRIS/run.sh --ui legacy`): select `현장 Base Survey-in`, `NTRIP 보조 Fixed Base`, or `Network RTK 직접`. The recommended absolute-WGS84 path is `NTRIP 보조 Fixed Base`: connect the Base F9P/HG-C08 over USB, enter the current experiment's site/point and address, enter that experiment's caster/provider and mountpoint, select `Base GNSS` GGA, keep Fixed Base height as `WGS84 ellipsoid`, and route RTCM to `좌/우 Pixhawk`. The saved defaults are Survey-in `300 s` / `0.5 m`, target `both`, and profile reuse disabled; the Base USB path prefers the detected u-blox `/dev/serial/by-id/...` path and falls back to the operator-selected port.
+- Site/provider data are per-session metadata. Do not reuse a prior site's fixed-coordinate profile or hardcode a caster/mountpoint; start each experiment with a new site/address and current service selection. Assisted mode uses the latest Base WGS84 geodetic sample for NTRIP GGA, validates repeated RTK Fixed Base samples, and records the coordinate/status. Rover RTK Fixed is displayed and retained as evidence but is not a normal measurement prerequisite unless the readiness threshold is explicitly raised to `6`; both Rover RTCM routes still must be active and healthy.
+- GNSS coordinate contract: Base/rover positions are WGS84 latitude/longitude degrees with an explicit height datum; `CFG-TMODE3` receives WGS84 ECEF centimetres plus the `0.1 mm` high part. The resulting rover baseline remains local NED `[North, East, Down]`; no Base geodetic value is written into PX4 body-FRD, camera optical RDF, or stereo-center fields.
+- Physical alignment sampling stores raw NED `[North, East, Down]`, a separate P1 body-FRD `[Forward, Right, Down]` projection, relative P2-to-P1 `[Roll, Pitch, Yaw]`, numeric fix types, and iteration quality. The operator changes the hardware physically; Workstation does not apply software R/P/Y or translation corrections. Existing ENU alignment profiles remain preserved and the new evidence is stored under a separate `physical_alignment` block.
+- Experiment protocol method: purpose is to expose the ordered field checklist; inputs are StatusModel states plus existing calibration, time-sync, RTCM/fix, baseline, physical-alignment, and recording evidence; output is per-step `READY`, `WAIT`, `CHECK`, `SAMPLING`, `RUNNING`, or `EXTERNAL`. `READY` is software evidence only; hardware acceptance and long-duration validation remain outside this check.
+- While recording is `ACTIVE` or `FINALIZING`, Preview stop, camera/Pixhawk mapping swaps, and Save session are disabled so the session protocol cannot be interrupted or saved prematurely.
+- Workstation default screens keep the operator path compact: connect cameras → check timing/devices → measure → record. Discovery, low-level controls, and file review remain under `More tools`, `Advanced`, or `Diagnostics` without removing their command IDs.
+- `Reset level cal.` is deliberately narrower than a factory reset: it restores
+  only the Level Horizon fine-tuning offsets after an explicit confirmation.
+  `SENS_BOARD_ROT`, `CAL_ACC*`, `CAL_GYRO*`, MAG parameters, airframe settings,
+  and other PX4 configuration remain unchanged. A MAVLink connection and
+  disarmed state are required; the resulting attitude parameters are read back
+  automatically.
+- Workstation `Pixhawk` keeps the primary operator actions at the top in this order: `Connect` → `Find USB` → `Find network` → `Find host IP` → `Swap P1/P2`. The evidence groups then follow this order: `Connection` → `Attitude (R/P/Y)` → `P1/P2 GNSS receivers` → `P1→P2 baseline` → `Discovered endpoints` → `ETH MAV`.
+- `P1 ETH MAV` and `P2 ETH MAV` use the corresponding configured USB control port and baud rate to start PX4 Ethernet MAVLink at runtime, then reconnect the UDP MAVLink stream. Confirm the link with Heartbeat and `ATTITUDE`/R/P/Y telemetry; USB control status and MAVLink telemetry status are displayed separately.
+- Workstation `Advanced` opens directly on its tool tabs without duplicating the global CAM L/CAM R/P1/P2/REC/MEAS status summary. Use the dedicated camera, Pixhawk, measurement, and recording workspaces for those runtime states; each Advanced tool retains its own operation status.
+- Workstation WIRIS SDK commands are sent from `Advanced > Camera control > WIRIS SDK command`. Select the left, right, or both-camera target and the protocol terminator, then use `Command responses` to read each camera's TCP reply or failure inline; the latest aggregate result remains in the status line and the existing Diagnostics log is retained. `Clear responses` clears only the current UI history and does not send a camera command.
+- Selecting the `Alignment` workspace starts the Workstation-owned LRF polling
+  worker once. It polls both cameras at 5 Hz and keeps the latest valid distance
+  visible while the app is running; returning to Alignment reuses the worker.
+  Each card is `WAITING` before the first response, `LIVE` for a fresh value,
+  `STALE` when the last good sample is older than one second, or `ERROR` for a
+  fresh failed read. Application shutdown stops the worker.
+- Workstation cards show only the value plus age/quality when useful. Frame and provenance details remain available on value tooltips and in Inspector/Diagnostics; the literal `source=` and `frame=` prefixes are not shown in the default metadata rows, and the underlying status/evidence fields are unchanged.
+- Workstation status severity never changes a card, row, or status-label
+  background. Neutral backgrounds remain fixed; only a small dot, short state
+  text, icon, or thin border uses the status color. Valid sample-backed values
+  show age separately (`● VALID · 38 ms`), and camera/Pixhawk/measurement
+  samples older than the presentation freshness threshold are shown as
+  `STALE` rather than remaining green.
+- The obsolete minimum-bounding-box controls are not exposed or persisted; the remaining detection-gate controls are unchanged.
 - The UI does not synthesize telemetry. Runtime values remain empty or UNKNOWN until a backend updates the shared state.
+- Changes to the Legacy UI are not automatically propagated to the standalone Workstation copy; update and test both copies deliberately until the remaining migration is complete.
+- Do not commit venvs, ROS build/install/log trees, runtime recordings, profiler output, downloaded models, or generated experiment runs. Machine-local state is grouped under ignored `.local/`; audit the checkout with `python3 tools/check_repository_policy.py` and `python3 tools/check_portable_paths.py`. Historical calibration/change evidence retains captured provenance through explicit policy classification; active paths must pass with zero findings.
+- Run the targeted tests first. The repository-wide test configuration in `pyproject.toml` excludes generated overlays, PX4 source, reports, and recordings from collection.
+- Regenerate an Auto path after changing `DRONE_SPAWN_X_M`,
+  `DRONE_SPAWN_Y_M`, or `DRONE_SPAWN_Z_M`; do not reuse a mission CSV made for
+  another PX4 home origin. Use rqt `Stop` to request `LAND` if the live path or
+  detections are not behaving as expected.
+- Sealed qualification security tests require the immutable external fixture. Set `SASL_QUALIFICATION_FIXTURE=/path/to/exact-profile-freeze-...` to run them; without it they are reported as explicit skips rather than reading a developer-specific absolute path.
 
 ## Known Limitations and Workarounds
 
-- Real WIRIS, Pixhawk, RTSP, YOLO, stereo matching, ROS2, and calibration persistence are not connected yet.
-- Settings are not persisted to disk.
-- If neither PyQt6 nor PySide6 is installed, the app cannot launch; install `requirements.txt` or install PySide6 manually.
+- NVIDIA availability is checked with both the `nvh264dec` factory and `nvidia-smi`. Auto emits
+  a warning and uses `avdec_h264` when either is unavailable. Explicit NVIDIA mode never falls
+  back to software and rejects camera start with an Auto/Software recovery instruction.
+- A factory/driver startup check is not proof of sustained real-camera decoding. Validate both
+  left/right RTSP streams on target hardware after driver or GStreamer changes.
+
+- Real WIRIS, Pixhawk, RTSP, YOLO, stereo matching, and calibration persistence are not connected yet in this software-only validation slice.
+- LRF polling requires a reachable WIRIS TCP control endpoint and the optional
+  laser rangefinder hardware. Without a device response, Alignment correctly
+  remains `WAITING` or reports `ERROR`; it does not estimate distance from the
+  stereo measurement pipeline.
+- Workstation still has a large compatibility facade in
+  `apps/Workstation/standalone_gui.py`; GNSS/Pixhawk sensor presentation and
+  measurement/view-controller extraction remain in progress. Shared neutral
+  domain contracts remain common dependencies, and long-duration hardware
+  validation is pending. ROS2/uXRCE and still-image clock support are
+  Legacy-only by design.
+- Workstation settings and recordings are persisted under the ignored `.local/workstation_data/` runtime root. Preserved pre-reorganization local state is under `.local/legacy/`; active Legacy settings and recordings remain under `apps/StereoWIRIS/`.
+- `ETH MAV` changes the running PX4 Ethernet MAVLink state only. Use the separate `ETH 저장` operation when the Ethernet MAVLink configuration must survive a Pixhawk reboot. A `CONNECTED` or Heartbeat state alone does not prove that attitude data is flowing; verify `ATTITUDE` and the R/P/Y values as well. Indoor GNSS may remain `NO DATA` while attitude telemetry is valid.
+- Historical recordings and `perf.data` are still tracked repository debt. CI reports all 237 paths but temporarily permits that fixed cleanup debt; remove the escape hatch after a reviewed `git rm --cached` migration. New runtime output is ignored now.
+- The sealed qualification fixture is intentionally not bundled because it is immutable experiment evidence. The normal software suite currently reports 98 skips when `SASL_QUALIFICATION_FIXTURE` is absent.
+- Hardware/ROS integration remains platform-specific. ROS packages come from `/opt/ros/humble` and the reproducible repo bootstrap rather than pip.
+- The level-calibration reset is not a substitute for QGroundControl Sensor
+  Setup. If the accelerometer or gyro calibration itself is invalid, rerun the
+  corresponding QGC calibration rather than using this button; the Workstation
+  button intentionally does not erase `CAL_ACC*` or `CAL_GYRO*`.
+- WIRIS SDK/RTSP services may be unavailable briefly after camera power-up. If
+  six automatic attempts are exhausted, confirm camera power, Ethernet Mode,
+  configured IPs, and TCP control port before retrying. A reachable TCP port
+  alone is not sufficient; Workstation also requires a valid `HIWS` response
+  and a first visible RTSP frame from each camera.
+- The Workstation deliberately does not decide whether a 1× large-board R,t
+  remains physically valid with 8× K,D. Verify that assumption externally with
+  the retained 1×/8× calibration images and the experiment's acceptance
+  criteria. `GZVV` failure or mismatch is informational, so the operator is
+  responsible for confirming the actual hardware zoom before measurement.
 
 ## Change Log
 
+- 2026-08-27: Closed the clean-Ubuntu model provisioning gap exposed by an official Jammy KVM
+  recreation. The Ubuntu manifest now includes `python3-cairo` so the system PyGObject dependency
+  graph passes `pip check`; Legacy's ignored `yolov8n_uav.pt` now has a tracked size/SHA-256
+  manifest, explicit provisioning instructions, and fail-closed runtime validation.
+
+- 2026-08-26: Established the canonical Ubuntu 22.04 operator runtime: one root
+  `--system-site-packages` venv, read-only deployment/execution doctor, system-owned
+  PyGObject/GStreamer, root-owned pip manifests, strict launcher/direct-entry gates, explicit
+  decoder capability reporting, NVIDIA fail-closed behavior, and parent-interpreter camera
+  children. Removed launcher apt/pip actions and app/Simulation/system Python fallback.
+
+- 2026-08-13: Added independent Workstation K,D and stereo R,t profiles,
+  fixed-intrinsic large-board `R,t only` calculation, manual 1× R,t + 8× K,D
+  composition without a validation gate, nominal 1×/8× controls with `GZVV`
+  readback, active-bundle UI/provenance, and explicit OpenCV RDF transform
+  contracts. Updated the Simulation PX4 launcher test to follow the configured
+  `x500_2m` target model.
+
+- 2026-08-12: Added `Pixhawk > Reset level cal.` beside `Swap P1/P2`. After
+  confirmation and disarm validation it resets only PX4 Level Horizon offsets
+  (`SENS_BOARD_X_OFF/Y_OFF/Z_OFF`) on connected Pixhawks, then refreshes the
+  attitude-calibration readback without changing board rotation or IMU sensor
+  calibration parameters.
+
+- 2026-08-12: Fixed Workstation WIRIS camera auto-connect during camera boot.
+  Automatic discovery no longer blocks on a full 1–65535 TCP scan when the
+  configured/default SDK port is unavailable; it now performs bounded retries
+  while waiting for `HIWS`, Ethernet/RTSP mode, and both first visible frames.
+
+- 2026-08-12: Added persistent Workstation Alignment LRF monitoring. Alignment
+  now polls both WIRIS cameras with `GLRD` at 5 Hz, displays live/stale/error
+  distance cards in metres, retains raw response evidence, and shuts the worker
+  down with the application. Added the `GLRD` entry to the WIRIS command catalog.
+
+- 2026-08-10: Changed Simulation Auto to automatically run the Full recorder
+  and place waypoint files, telemetry, XLSX, compact CSVs, and both overlay MP4
+  files together in `Recordings/auto_YYYYMMDD_HHMMSS_Full/`. Mission remains
+  opt-in recording only.
+- 2026-08-10: Unified Simulation rqt Save sessions, Waypoint automatic lite
+  sessions, and Auto-generated waypoint paths below the ignored
+  `apps/Simulation/Recordings/` runtime root.
+- 2026-08-10: Fixed Simulation rqt Auto waypoint generation to subtract the
+  configured drone spawn/home world-ENU origin before sending PX4 local-NED
+  mission setpoints. Added origin metadata, coordinate-contract regression
+  coverage, and operator documentation.
+- 2026-08-10: Consolidated repository tools under `tools/`, project documents under `docs/`, firmware parameters under `common/firmware/`, and machine-local caches, models, runtime data, and preserved legacy application state under ignored `.local/`. Kept `ref/` and the reproducible `workspace/` at the repository root.
+- 2026-08-10: Introduced the `common/` ownership boundary, moving shared Python contracts to `common/python`, cross-application ROS message sources to `common/ros`, and reproducible Pixhawk material to `common/firmware`. Updated launch and build paths without changing coordinate or message schemas.
+- 2026-08-10: Moved the Workstation application, `workstation_core`, dedicated UI documentation, and dedicated tests under the repository-level `apps/Workstation/` directory. Updated imports and launchers to `Workstation`, while preserving runtime settings and recordings under `workstation_data/`.
+- 2026-08-10: Simplified the Workstation Pixhawk ETH MAV labels to `P1/P2 ETH MAV`; the USB control transport remains documented in the operation description and implementation.
+- 2026-08-10: Reordered the Workstation `Pixhawk` screen so the five primary connection actions are first, followed by `Connection`, `Attitude (R/P/Y)`, `P1/P2 GNSS receivers`, `P1→P2 baseline`, `Discovered endpoints`, and `ETH MAV`. Documented the per-Pixhawk USB runtime Ethernet MAVLink start workflow and the Heartbeat/`ATTITUDE` verification rule.
+- 2026-08-10: Fixed Workstation `Advanced > Camera control` initialization so
+  the first WIRIS catalog item immediately populates the command, terminator,
+  and description instead of leaving Send with an empty command. Corrected the
+  owner-panel Send button binding so the asynchronous TCP worker starts and
+  restores the actual command button after completion.
+- 2026-08-10: Removed the duplicated CAM/Pixhawk/recording/measurement Status
+  summary from the top of Workstation `Advanced`; its tool tabs and local
+  operation statuses remain unchanged.
+- 2026-08-10: Added an inline WIRIS SDK TCP response history to Workstation
+  `Advanced > Camera control`, including per-camera replies, failures, command
+  target/context, latest status, and a local clear action while retaining the
+  existing Diagnostics log.
+- 2026-08-10: Split Workstation WIRIS/time-sync workers, recording/session
+  lifecycle, checkerboard calibration workflow, and camera-network/Pixhawk
+  runtime orchestration into workstation-owned controllers/workers. Preserved
+  compatibility delegates and coordinate/time contracts, and removed the
+  StereoWIRIS-to-workstation runtime import.
+- 2026-08-10: Moved GNSS/NTRIP/survey-in/RTCM orchestration, measurement and
+  alignment presentation, and Pixhawk/GNSS sensor presentation out of the
+  Workstation panel facade. The facade retains historical method delegates and
+  UI assembly while controller modules own domain state transitions.
+- 2026-08-10: Completed the recommended final Workstation split by moving
+  camera stream/detection lifecycle, WIRIS command and optical-zoom control,
+  and application shutdown cleanup into workstation-owned controllers. UI
+  builders, settings binding, and compatibility delegates remain in the panel
+  intentionally.
+- 2026-08-10: Changed Workstation `Load intrinsics` to an explicit validated
+  file-selection workflow, retained automatic per-zoom lookup as `Load current
+  zoom`, and made `Apply intrinsics` a memory-only application action.
+- 2026-08-10: Replaced severity-colored Workstation card, row, measurement,
+  sensor-health, and protocol backgrounds with fixed neutral backgrounds.
+  Status color is limited to compact dots/text/icons/borders, valid values show
+  neutral age text, and stale sample-backed states are labeled explicitly.
+- 2026-08-09: Declared the shared Python runtime and development dependencies, added bounded pytest/ruff configuration and CI, documented both intentional UI products, and added repository policy checks plus runtime-recording ignore/contract documentation. Historical tracked artifacts remain an explicitly reported cleanup debt.
+- 2026-08-09: Reconciled operator telemetry schema evolution by accepting legacy public-FRD `raw_*` input aliases, preserving canonical `nominal_pose_*` fields, and emitting explicit stereo-center RDF `raw_*` compatibility aliases required by deployed residual selectors.
+- 2026-08-09: Removed developer-home dependencies from sealed qualification tests, repaired current ROS/PX4 launcher fixtures and research-statistics schema reads, and restored the repository-wide baseline to 2,094 passed with 98 explicit external-fixture skips.
+- 2026-08-09: Promoted Workstation to the repository-level `apps/Workstation/` package alongside `StereoWIRIS`; its copied owner and shared measurement/saved-coordinate contracts remain unchanged.
+- 2026-08-09: Separated Workstation runtime state into `workstation_data/`, kept Legacy storage under `apps/StereoWIRIS/`, and moved the retryable lifecycle coordinator to neutral `sasl_common/lifecycle.py`.
+- 2026-08-09: Hid repetitive `source=` provenance labels from Workstation main cards while retaining the source field and detailed provenance in Inspector/Diagnostics.
+- 2026-08-09: Added a Workstation-wide settings surface for the remaining Legacy-only AppSettings, including nested GNSS/RTK operation settings, with owner-backed Apply/Save and no new settings store.
+- 2026-08-09: Removed the unused minimum-bounding-box setting from the StereoWIRIS settings model, JSON schema, Legacy UI, Workstation UI, and evidence projection; existing image-pixel bbox coordinates remain unchanged.
+- 2026-08-09: Reordered Workstation field actions around the experiment protocol, added the Time/Sync workspace and measurement quality/run-control surface, grouped Pixhawk/GNSS/Alignment and calibration actions, and added recording safety gates.
+- 2026-08-09: Removed Workstation ROS2/uXRCE connection/discovery and still-image/FTP/EXIF TimeSync workflows; retained MAVLink, PC UTC, RTCP/NTP, and checkerboard calibration paths while leaving Legacy unchanged.
+- 2026-08-09: Made the Workstation launcher boundary explicit: Workstation no longer bootstraps the ROS2/PX4 overlay or imports ROS2 bindings at startup; Legacy bootstrap and workflows remain unchanged.
+- 2026-08-09: Added Workstation MAVLink endpoint/heartbeat/target identity to source-backed evidence and PX4 timeline rows without changing measurement frames, units, or time axes.
+- 2026-08-09: Added received MAVLink source system/component, sequence, and message-id provenance to Workstation telemetry state, evidence, measurement snapshots, and session rows without changing measurement frames, units, or time axes.
+- 2026-08-09: Added a mode-specific, advisory experiment preflight to Recording so operators can follow the camera → sync → detection → calibration → geometry protocol before capture.
+- 2026-08-09: Removed the literal `source=` prefix from Inspector provenance display while retaining the underlying source metadata.
+- 2026-08-09: Simplified the Workstation visual hierarchy and operator vocabulary: navigation now follows Setup/Run/Tasks, primary controls use short action labels, and frame/provenance details move from repeated metadata rows to tooltips and diagnostics without changing commands or coordinate contracts.
+- 2026-08-09: Added an explicit P1→P2 body-FRD projection alongside the unchanged raw NED RTK baseline, with separate Alignment/Inspector/Diagnostics/preflight/recording fields and inverse-quaternion coordinate tests.
 - 2026-05-04: Removed simulated mock state, live mock refreshes, fake target overlays, mock events, mock topics, and fake calibration values; the UI now starts in a disconnected state.
 - 2026-05-04: Added Detection settings for selecting a YOLO `.pt` model path and reflecting the selected model in Live and Debug views.
 - 2026-05-04: Added the standalone Qt UI prototype package with README-specified tabs, shared models, reusable widgets, and cross-tab state wiring.

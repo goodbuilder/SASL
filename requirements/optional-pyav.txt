@@ -1,0 +1,2 @@
+# Optional RTSP backend. The supported default is the Ubuntu GStreamer stack.
+av>=11,<16

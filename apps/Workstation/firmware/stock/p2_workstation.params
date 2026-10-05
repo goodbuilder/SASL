@@ -1,0 +1,28 @@
+# Onboard parameter overlay for the SASL Workstation P2 / Right Pixhawk
+#
+# Stack: PX4 Pro
+# Vehicle: Quadrotor
+# Version: 1.17.0 stock
+# Git Revision: d6f12ad1c4f70ad3230afd7d86e971421e02fef4
+# Scope: Ethernet MAVLink, dual serial F9P, and DroneCAN RM3100 activation only.
+# Calibration, airframe, actuator, battery, and safety parameters are intentionally excluded.
+# Load with only P2 connected. The row Vehicle-Id is 1 because stock PX4 boots with MAV_SYS_ID=1;
+# this overlay changes MAV_SYS_ID to 2 and the new identity takes effect after reboot.
+#
+# Vehicle-Id Component-Id Name Value Type
+1	1	GPS_1_CONFIG	201	6
+1	1	GPS_1_PROTOCOL	1	6
+1	1	GPS_2_CONFIG	202	6
+1	1	GPS_2_PROTOCOL	1	6
+1	1	MAV_2_BROADCAST	1	6
+1	1	MAV_2_CONFIG	1000	6
+1	1	MAV_2_MODE	0	6
+1	1	MAV_2_RADIO_CTL	0	6
+1	1	MAV_2_RATE	2000000	6
+1	1	MAV_2_REMOTE_PRT	14551	6
+1	1	MAV_2_UDP_PRT	14551	6
+1	1	MAV_PROTO_VER	2	6
+1	1	MAV_SYS_ID	2	6
+1	1	UAVCAN_BITRATE	1000000	6
+1	1	UAVCAN_ENABLE	2	6
+1	1	UAVCAN_SUB_MAG	1	6

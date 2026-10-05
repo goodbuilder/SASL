@@ -1,0 +1,61 @@
+/pose_simulation/pose_visualization:
+  ros__parameters:
+    # Typed M3 result inputs.  All pose topics are PoseStamped world poses;
+    # their represented local frame is defined by the topic name and adapter.
+    pose_error_topic: pose_error
+    stereo_geometry_topic: stereo_geometry
+    status_topic: status
+    gt_target_topic: target/ground_truth
+    actual_left_topic: actual_pose/left
+    actual_right_topic: actual_pose/right
+    ideal_gt_rig_topic: ideal_pose/ground_truth/rig
+    ideal_gt_left_topic: ideal_pose/ground_truth/left
+    ideal_gt_right_topic: ideal_pose/ground_truth/right
+
+    # RTK is not implemented by the current M3 source.  Keep these empty or
+    # disabled until a validated RTK target/ideal pose interface exists.
+    rtk_target_topic: ""
+    ideal_rtk_rig_topic: ideal_pose/rtk/rig
+    ideal_rtk_left_topic: ideal_pose/rtk/left
+    ideal_rtk_right_topic: ideal_pose/rtk/right
+
+    marker_topic: visualization/markers
+    diagnostics_topic: diagnostics
+
+    ray_mode: normalized
+    normalized_ray_length_m: 50.0
+    camera_axis_length_m: 5.0
+    rig_axis_length_m: 10.0
+    target_marker_scale_m: 12.0
+    optical_center_scale_m: 3.0
+    frustum_length_m: 3.0
+    frustum_width_m: 1.0
+    frustum_height_m: 0.7
+    marker_visual_scale: 1.0
+    ray_shaft_width_m: 2.0
+    ray_head_width_m: 2.0
+    ray_line_width_m: 2.0
+
+    # RViz MESH_RESOURCE assets.  The camera is the existing WIRIS STL; the
+    # x500 mesh is generated from the Gazebo DAE so RViz loads STL for both.
+    show_meshes: true
+    camera_mesh_resource: package://pose_simulation/models/wiris_camera/meshes/WIRIS.stl
+    camera_mesh_scale_m: 0.001
+    drone_mesh_resource: package://pose_simulation/models/x500_15m/meshes/x500_15m.stl
+    drone_mesh_scale_m: 22.0
+
+    show_actual: true
+    show_gt_ideal: true
+    show_rtk_ideal: false
+    show_actual_forward: true
+    show_gt_los: true
+    show_rtk_los: false
+    show_error_arcs: true
+    show_baseline: true
+    show_text: true
+    show_detailed_optical_axes: false
+
+    # Marker snapshots are deduplicated; keep them until the next snapshot.
+    marker_lifetime_s: 0.0
+    angular_visual_scale: 1.0
+    position_error_visual_scale: 1.0

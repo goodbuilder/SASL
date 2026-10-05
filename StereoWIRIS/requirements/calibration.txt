@@ -1,7 +1,0 @@
-# Standalone calibration/bootstrap subset. OpenCV, NumPy, and PyYAML also
-# appear in runtime.txt because live undistortion and alignment require them.
-# Keep this subset self-contained so bootstrap_calibration_deps.sh can repair
-# the calibration stack without reinstalling every runtime package.
-numpy<2
-opencv-python<4.10
-PyYAML

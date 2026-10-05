@@ -1,0 +1,24 @@
+{
+  "schema": "workstation-pixhawk-ethernet-parameter-proposal-v1",
+  "side": "P2",
+  "status": "applied-and-post-reboot-verified",
+  "applied_at": "2026-08-30T15:26:25+09:00",
+  "derived_from": [
+    "../../P1/ethernet_params.json",
+    "Workstation P2 network contract"
+  ],
+  "parameters_to_apply": {
+    "MAV_SYS_ID": 2,
+    "MAV_2_CONFIG": 1000,
+    "MAV_2_MODE": 0,
+    "MAV_2_BROADCAST": 1,
+    "MAV_2_REMOTE_PRT": 14551,
+    "MAV_2_UDP_PRT": 14551,
+    "MAV_2_RATE": 2000000
+  },
+  "excluded_from_copy": [
+    "sensor calibration parameters",
+    "board GUID and hardware identity",
+    "P1 parameters_backup.bson"
+  ]
+}

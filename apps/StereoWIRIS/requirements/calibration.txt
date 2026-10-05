@@ -1,0 +1,3 @@
+# Compatibility entry point. Calibration uses the canonical repository runtime
+# because OpenCV, NumPy, and PyYAML are required by normal operation as well.
+-r ../../../requirements/runtime.txt

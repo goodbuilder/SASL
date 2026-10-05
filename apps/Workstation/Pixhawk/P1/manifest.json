@@ -1,0 +1,56 @@
+{
+  "schema": "workstation-pixhawk-config-snapshot-v1",
+  "captured_at": "2026-08-30T14:57:59+09:00",
+  "side": "P1",
+  "capture_mode": "read-only",
+  "board_mutations": [],
+  "identity": {
+    "mavlink_system_id": 1,
+    "mavlink_component_id": 1,
+    "hardware_arch": "PX4_FMU_V6X",
+    "hardware_type": "V6X",
+    "px4_version": "1.17.0",
+    "px4_git_hash": "d6f12ad1c4f70ad3230afd7d86e971421e02fef4",
+    "px4_guid": "000600000000363633383433510600210026"
+  },
+  "usb_source": {
+    "device": "/dev/ttyACM1",
+    "vendor_id": "3185",
+    "model_id": "0035",
+    "vendor": "Auterion",
+    "model": "PX4_FMU_v6X.x",
+    "reported_serial": "0",
+    "by_path": "/dev/serial/by-path/pci-0000:00:14.0-usb-0:3:1.0"
+  },
+  "remote_artifacts": [
+    {
+      "remote_path": "/fs/microsd/etc/extras.txt",
+      "local_path": "extras.txt",
+      "status": "captured",
+      "bytes": 58,
+      "sha256": "9eed6b399310602180d00e2f70d6e39a6df6ebe43bd1205fc7ef3dfa233809e3"
+    },
+    {
+      "remote_path": "/fs/microsd/net.cfg",
+      "local_path": null,
+      "status": "missing",
+      "mavftp_error": "FileNotFound"
+    },
+    {
+      "remote_path": "/fs/microsd/parameters_backup.bson",
+      "local_path": "parameters_backup.bson",
+      "status": "captured",
+      "bytes": 2393,
+      "sha256": "888396d81190687172ddfcfa23c5123df3d27155bbf56da9224d25044d1417cb"
+    },
+    {
+      "remote_path": "/fs/mtd_params",
+      "local_path": null,
+      "status": "virtual-path-zero-byte-read",
+      "reported_storage_bytes": 896,
+      "mavftp_bytes": 0,
+      "usable_backup": false
+    }
+  ]
+}
+

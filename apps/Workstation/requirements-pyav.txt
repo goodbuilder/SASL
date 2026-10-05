@@ -1,0 +1,2 @@
+# Compatibility entry point for the repository-owned optional backend.
+-r ../../requirements/optional-pyav.txt

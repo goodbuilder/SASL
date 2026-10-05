@@ -1,0 +1,96 @@
+{
+  "schema": "workstation-pixhawk-config-snapshot-v1",
+  "captured_at": "2026-08-30T15:06:13+09:00",
+  "side": "P2",
+  "status": "configured-usb-verified-ethernet-field-test-pending",
+  "capture_mode": "approved-read-write",
+  "board_mutations": [
+    "write /fs/microsd/etc/extras.txt",
+    "write /fs/microsd/net.cfg",
+    "set MAV_SYS_ID and approved MAV_2 parameters",
+    "MAV_CMD_PREFLIGHT_STORAGE accepted",
+    "PX4 reboot"
+  ],
+  "identity": {
+    "physical_assignment": "P2",
+    "observed_mavlink_system_id": 1,
+    "configured_mavlink_system_id": 2,
+    "mavlink_component_id": 1,
+    "hardware_arch": "PX4_FMU_V6X",
+    "hardware_type": "V6X",
+    "px4_version": "1.17.0",
+    "px4_git_hash": "d6f12ad1c4f70ad3230afd7d86e971421e02fef4",
+    "px4_guid": "0006000000003837393834335109002d004a"
+  },
+  "usb_source": {
+    "device": "/dev/ttyACM0",
+    "vendor_id": "3185",
+    "model_id": "0035",
+    "vendor": "Auterion",
+    "model": "PX4_FMU_v6X.x",
+    "reported_serial": "0",
+    "by_path": "/dev/serial/by-path/pci-0000:00:14.0-usb-0:3:1.0"
+  },
+  "remote_artifacts": [
+    {
+      "remote_path": "/fs/microsd/etc/extras.txt",
+      "local_path": "extras.txt",
+      "status": "captured-post-reboot",
+      "bytes": 58,
+      "sha256": "fe2a7b8ec016b0a423e8266281ddcd232f34ce67d088aca047a8ea3fcbe978d5"
+    },
+    {
+      "remote_path": "/fs/microsd/net.cfg",
+      "status": "write-readback-pass-then-post-reboot-missing",
+      "pre_reboot_bytes": 84,
+      "pre_reboot_sha256": "77c9c6dfbaf3af110ab51c69e22b5731f63111f7a2d2933b3df2de326b6bfffc",
+      "post_reboot_mavftp_error": "FileNotFound"
+    },
+    {
+      "remote_path": "/fs/microsd/parameters_backup.bson",
+      "local_path": "parameters_backup.bson",
+      "status": "captured",
+      "bytes": 1279,
+      "sha256": "19ea64113fd730a5bcb2df00db87c3cb9eca759eeb4f9aa979f7a3f109a3ac7f"
+    },
+    {
+      "remote_path": "/fs/mtd_params",
+      "status": "virtual-path-zero-byte-read",
+      "mavftp_bytes": 0,
+      "usable_backup": false
+    },
+    {
+      "remote_path": "/fs/microsd/parameters_backup.bson",
+      "local_path": "parameters_backup.after_config.bson",
+      "status": "captured-post-config",
+      "bytes": 1352,
+      "sha256": "71a9b4f04c49002e3da47c26771bf9a3b0eeb84d5908e8b451f0f3bf62b958d1"
+    }
+  ],
+  "local_proposals": [
+    "proposed/extras.txt",
+    "proposed/net.cfg",
+    "proposed/ethernet_params.json"
+  ],
+  "readback_artifacts": [
+    "board_identity.txt",
+    "ethernet_params.json",
+    "ethernet_params.after_config.json",
+    "ethernet_runtime.json",
+    "workstation_endpoint.json"
+  ],
+  "pending_field_evidence": [
+    "P2 10.0.0.3:14551 Ethernet packet arrival after host NIC restoration"
+  ],
+  "verification": {
+    "parameters_backup_bson_entries": 62,
+    "parameters_backup_bson_sha256_verified": true,
+    "post_config_backup_bson_entries": 66,
+    "post_config_backup_bson_sha256_verified": true,
+    "post_reboot_system_id_2_verified": true,
+    "post_reboot_parameter_readback_verified": true,
+    "extras_post_reboot_hash_verified": true,
+    "json_syntax_verified": true,
+    "approved_proposed_values_applied": true
+  }
+}

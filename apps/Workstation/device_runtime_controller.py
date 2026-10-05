@@ -1,0 +1,3838 @@
+"""Workstation camera-network and Pixhawk runtime orchestration.
+
+This controller owns workstation-specific worker lifecycles and UI state.
+It does not reinterpret PX4 body-FRD, earth-NED, GPS, or camera coordinates.
+"""
+
+from __future__ import annotations
+
+import time
+from collections.abc import Mapping, Sequence
+from ipaddress import IPv4Address
+from pathlib import Path
+
+from PyQt5 import QtCore, QtWidgets
+
+from Workstation.device_runtime_workers import (
+    CameraNetworkAddressApplyWorker,
+    CameraNetworkDiscoveryWorker,
+    NetworkRoleApplyWorker,
+    PixhawkConnectionWorker,
+    PixhawkDisconnectWorker,
+    PixhawkHostIpDiscoveryWorker,
+    PixhawkNetworkDiscoveryWorker,
+    PixhawkParameterWorker,
+    PixhawkMavFtpTransferWorker,
+    PixhawkPersistentConfigWorker,
+    PixhawkShellCommandWorker,
+    PixhawkStreamSetupWorker,
+    PixhawkUsbBootstrapWorker,
+    PixhawkUsbFlashWorker,
+    PixhawkUsbRecoveryWorker,
+)
+from Workstation.runtime_paths import WORKSTATION_DATA_ROOT
+from Workstation.workstation_core.pixhawk_firmware import atomic_write_firmware_evidence
+from Workstation.workstation_core.network import (
+    DEFAULT_HOST_ADDRESS,
+    NETWORK_ROLE_CAMERA,
+    NETWORK_ROLE_P1,
+    NETWORK_ROLE_P2,
+    NetworkRoleAssignment,
+    NetworkRoleInterfaceRequest,
+    NetworkRoleMovePlan,
+    NetworkRoleOwnedEntries,
+    PixhawkAssignmentValidation,
+    candidate_matches_stable_id,
+    candidate_stable_id,
+    network_role_requirements,
+    network_interface_stable_id,
+    normalize_stable_id,
+    plan_network_role_move,
+    rtsp_host_port,
+    validate_pixhawk_network_assignment,
+)
+from Workstation.workstation_core.mavlink_liveness import MAVLINK_QUALIFICATION_S
+from Workstation.workstation_core.pixhawk_attitude import (
+    DualPixhawkMavlinkSubscriber,
+    USB_MAVLINK_IDENTITY_MAX_AGE_S,
+    camera_label_ko,
+)
+from Workstation.workstation_core.px4_attitude_cal_manager import (
+    LEVEL_HORIZON_RESET_PARAM_NAMES,
+)
+from Workstation.workstation_core.px4_mag_manager import missing_mag_status_params
+from Workstation.workstation_core.px4_calibration_groups import px4_calibration_group
+
+# Legacy fallback for test doubles/older subscriber adapters that do not yet
+# publish the subscriber-owned all-RX liveness snapshot. Production decisions
+# use the 10-second expected-system packet-silence state instead.
+_MAVLINK_STALE_TIMEOUT_S = 5.0
+_PX4_SENSOR_MAG_SHELL_POLL_INTERVAL_MS = 2000
+_PX4_SENSOR_MAG_SHELL_TIMEOUT_S = 4.0
+
+
+def _connect_gui_signal(signal, callback) -> None:
+    """Queue worker/subscriber callbacks onto the panel's Qt owner thread.
+
+    Panel controller methods are installed dynamically as Python delegates.
+    Keep the worker-to-widget boundary explicit instead of relying on PyQt's
+    callable inference for ``AutoConnection``.
+    """
+
+    signal.connect(callback, QtCore.Qt.QueuedConnection)
+
+
+def _wire_worker_thread_cleanup(worker: QtCore.QObject, thread: QtCore.QThread) -> None:
+    """Wire the fixed worker/thread lifecycle cleanup skeleton.
+
+    ``worker.moveToThread(thread)``, ``thread.started.connect(worker.run)``,
+    domain-specific signal connections, and any extra ``thread.finished``
+    cleanup hook remain the caller's responsibility -- only the fixed,
+    always-identical tail (``finished`` -> ``quit``/``deleteLater`` ->
+    ``deleteLater``) is consolidated here, so no call site risks losing a
+    connection that differs from this shared part.
+    """
+
+    worker.finished.connect(thread.quit)
+    worker.finished.connect(worker.deleteLater)
+    thread.finished.connect(thread.deleteLater)
+
+
+DEVICE_RUNTIME_CONTROLLER_METHODS = [
+    "toggle_mavlink_connection",
+    "set_pixhawk_transport",
+    "configure_pixhawk_radio",
+    "configure_pixhawk_usb",
+    "start_pixhawk_mavftp_upload",
+    "start_pixhawk_mavftp_download",
+    "cancel_pixhawk_mavftp_transfer",
+    "pixhawk_transfer_snapshot",
+    "_apply_pixhawk_mavftp_progress",
+    "_apply_pixhawk_mavftp_result",
+    "_pixhawk_mavftp_failed",
+    "_clear_pixhawk_mavftp_worker",
+    "start_pixhawk_usb_flash",
+    "cancel_pixhawk_usb_flash",
+    "_apply_pixhawk_usb_flash_progress",
+    "_apply_pixhawk_usb_flash_result",
+    "_pixhawk_usb_flash_failed",
+    "_clear_pixhawk_usb_flash_worker",
+    "_stop_pixhawk_operation_workers",
+    "reset_px4_calibration_group",
+    "discover_pc_camera_ip",
+    "_apply_camera_network_discovery",
+    "_camera_network_discovery_failed",
+    "_clear_camera_network_discovery",
+    "discover_pc_pixhawk_ip",
+    "_apply_pixhawk_host_ip_discovery",
+    "_pixhawk_host_ip_discovery_failed",
+    "_clear_pixhawk_host_ip_discovery",
+    "_append_pixhawk_host_ip_candidates",
+    "discover_pixhawk_network",
+    "_apply_pixhawk_network_discovery",
+    "_pixhawk_network_discovery_failed",
+    "_clear_pixhawk_network_discovery",
+    "request_network_role_assignment",
+    "_continue_network_role_assignment",
+    "_apply_network_role_result",
+    "_network_role_apply_failed",
+    "_clear_network_role_apply_worker",
+    "_poll_network_role_reconnect",
+    "_continue_network_role_reconnect",
+    "_begin_network_role_rollback",
+    "_continue_network_role_rollback",
+    "assign_pixhawk_network_candidate",
+    "_commit_pixhawk_network_assignment",
+    "_pixhawk_network_preflight",
+    "_pixhawk_selected_transport",
+    "_pixhawk_selected_endpoint",
+    "_pixhawk_selected_baud",
+    "_pixhawk_connect_preflight_sides",
+    "apply_pc_camera_ip",
+    "_apply_camera_network_address_result",
+    "_camera_network_apply_failed",
+    "_clear_camera_network_apply",
+    "_update_mavlink_optional_timeline",
+    "_mavlink_connected_sides",
+    "_mavlink_open_sides",
+    "_refresh_mavlink_side_actions",
+    "_mavlink_target_sides",
+    "_sync_mavlink_subscriber_settings",
+    "_ensure_mavlink_subscriber",
+    "_handle_mavlink_status_changed",
+    "_schedule_mavlink_status_ui_refresh",
+    "_flush_mavlink_status_ui_refresh",
+    "_configured_mavlink_sides",
+    "_mavlink_setup_target_sides",
+    "_apply_mavlink_pixhawk_setup",
+    "apply_manual_mavlink_stream_setup",
+    "_start_pixhawk_stream_setup_worker",
+    "_handle_mavlink_stream_setup_required",
+    "_clear_pixhawk_stream_setup_worker",
+    "bootstrap_ethernet_mavlink_from_usb",
+    "recover_stalled_pixhawk_via_verified_usb",
+    "_apply_pixhawk_usb_recovery_result",
+    "_pixhawk_usb_recovery_failed",
+    "_clear_pixhawk_usb_recovery_worker",
+    "_apply_pixhawk_usb_bootstrap_result",
+    "_clear_pixhawk_usb_bootstrap_worker",
+    "_temporary_mavlink_heartbeat",
+    "_ethernet_mavlink_bootstrap_command",
+    "connect_mavlink_pixhawk",
+    "_apply_pixhawk_connection_result",
+    "_pixhawk_connection_failed",
+    "_clear_pixhawk_connection_worker",
+    "disconnect_mavlink_pixhawk",
+    "apply_selected_pixhawk_candidate",
+    "apply_persistent_pixhawk_eth",
+    "_apply_pixhawk_persistent_config_result",
+    "_clear_pixhawk_persistent_config_worker",
+    "reboot_pixhawk_from_mavlink",
+    "_persistent_pixhawk_eth_command",
+    "_persistent_pixhawk_extras_text",
+    "_persistent_pixhawk_net_cfg_text",
+    "_persistent_pixhawk_eth_setup",
+    "_px4_sensor_mag_shell_command",
+    "_px4_sensor_mag_shell_commands",
+    "_sync_px4_sensor_mag_shell_polling",
+    "_stop_px4_sensor_mag_shell_polling",
+    "_poll_px4_sensor_mag_shell",
+    "_start_pixhawk_shell_worker",
+    "_apply_pixhawk_shell_worker_result",
+    "_pixhawk_shell_worker_failed",
+    "_handle_sensor_mag_shell_poll_failed",
+    "_clear_pixhawk_shell_worker",
+    "reset_px4_level_calibration",
+    "_start_pixhawk_parameter_worker",
+    "_apply_pixhawk_parameter_worker_result",
+    "_pixhawk_parameter_worker_failed",
+    "_clear_pixhawk_parameter_worker"
+]
+
+
+class DeviceRuntimeController:
+    def __init__(self, panel):
+        self.panel = panel
+        self._sensor_mag_shell_poll_timer: QtCore.QTimer | None = None
+        self._sensor_mag_shell_poll_error_last_s: dict[str, float] = {}
+
+    def _publish_measurement_source(
+        self, source_id: str, state: str, detail: str
+    ) -> None:
+        publisher = getattr(self.panel, "measurement_source_transition", None)
+        if callable(publisher):
+            try:
+                publisher(source_id, state, detail)
+            except (RuntimeError, TypeError, ValueError):
+                pass
+
+    def _source_connection_allowed_during_recording(self) -> bool:
+        if not self.panel._session_recording_active():
+            return True
+        return bool(getattr(self.panel, "_automatic_session_recording", False))
+
+    def toggle_mavlink_connection(self, camera: str | None = None) -> bool | None:
+        if not self._source_connection_allowed_during_recording():
+            self.panel._log(
+                "[픽스호크] 수동 기록 중에는 MAVLink 연결을 변경할 수 없습니다."
+            )
+            return False
+        if camera is None:
+            if self.panel._mavlink_open_sides():
+                self.panel.disconnect_mavlink_pixhawk()
+            else:
+                self.panel.connect_mavlink_pixhawk()
+            return None
+        if camera in self.panel._mavlink_open_sides():
+            self.panel.disconnect_mavlink_pixhawk(camera)
+        else:
+            self.panel.connect_mavlink_pixhawk(camera)
+        return None
+
+    def set_pixhawk_transport(self, camera: str, transport: str) -> bool:
+        camera = str(camera)
+        if camera not in {"left", "right", "drone"}:
+            raise ValueError(f"Unknown Pixhawk role: {camera}")
+        normalized = str(transport or "").strip().lower()
+        if normalized not in {"radio", "ethernet", "usb"}:
+            raise ValueError(f"Unknown Pixhawk transport: {transport}")
+        attribute = f"{camera}_pixhawk_transport"
+        previous = self._pixhawk_selected_transport(camera)
+        if previous == normalized:
+            return False
+        setattr(self.panel, attribute, normalized)
+        if camera in self.panel._mavlink_open_sides():
+            self.panel._log(
+                f"[픽스호크] {self.panel._px4_mag_camera_label(camera)} transport "
+                f"{previous} -> {normalized}; 기존 연결을 해제하고 Connect를 기다립니다."
+            )
+            self.panel.disconnect_mavlink_pixhawk(camera)
+        else:
+            subscriber = getattr(self.panel, "mavlink_pixhawk", None)
+            setter = getattr(subscriber, "set_transport", None)
+            if callable(setter):
+                setter(camera, normalized)
+            self.panel._log(
+                f"[픽스호크] {self.panel._px4_mag_camera_label(camera)} transport를 "
+                f"{normalized}로 선택했습니다. Connect를 누르세요."
+            )
+        saver = getattr(self.panel, "_save_current_settings", None)
+        if callable(saver):
+            saver()
+        status = getattr(self.panel, "pixhawk_connection_label", None)
+        setter = getattr(status, "setText", None)
+        if callable(setter):
+            setter(
+                f"{self.panel._px4_mag_camera_label(camera)} {normalized.upper()} selected · PRESS CONNECT"
+            )
+        refresher = getattr(self.panel, "_refresh_operation_header", None)
+        if callable(refresher):
+            refresher()
+        return True
+
+    def configure_pixhawk_radio(self, camera: str, device: str, baud: int) -> bool:
+        camera = str(camera)
+        if camera not in {"left", "right", "drone"}:
+            raise ValueError(f"Unknown Pixhawk role: {camera}")
+        device = str(device or "").strip()
+        baud = int(baud)
+        if baud <= 0:
+            raise ValueError("Radio baud must be positive")
+        device_attribute = f"{camera}_pixhawk_radio_device"
+        baud_attribute = f"{camera}_pixhawk_radio_baud"
+        changed = (
+            str(getattr(self.panel, device_attribute, "") or "") != device
+            or int(getattr(self.panel, baud_attribute, 57_600)) != baud
+        )
+        if not changed:
+            return False
+        setattr(self.panel, device_attribute, device)
+        setattr(self.panel, baud_attribute, baud)
+        if camera in self.panel._mavlink_open_sides():
+            self.panel.disconnect_mavlink_pixhawk(camera)
+            self.panel._log(
+                f"[픽스호크] {self.panel._px4_mag_camera_label(camera)} Radio endpoint 변경으로 "
+                "기존 연결을 해제했습니다. Connect를 다시 누르세요."
+            )
+        else:
+            subscriber = getattr(self.panel, "mavlink_pixhawk", None)
+            if subscriber is not None:
+                subscriber.urls[camera] = device
+                subscriber.baudrates[camera] = baud
+        saver = getattr(self.panel, "_save_current_settings", None)
+        if callable(saver):
+            saver()
+        return True
+
+    def configure_pixhawk_usb(self, camera: str, device: str, baud: int) -> bool:
+        """Write the USB serial endpoint that USB transport connects through.
+
+        The value lives in the existing bootstrap endpoint that recovery and
+        firmware work already own, so both surfaces stay on one device path.
+        """
+
+        camera = str(camera)
+        if camera not in {"left", "right", "drone"}:
+            raise ValueError(f"Unknown Pixhawk role: {camera}")
+        device = str(device or "").strip()
+        baud = int(baud)
+        if baud <= 0:
+            raise ValueError("USB baud must be positive")
+        if self._pixhawk_usb_endpoint(camera) == device and self._pixhawk_usb_baud(camera) == baud:
+            return False
+        url_widget = getattr(self.panel, f"{camera}_pixhawk_bootstrap_url_edit", None)
+        url_setter = getattr(url_widget, "setText", None)
+        if callable(url_setter):
+            url_setter(device)
+        else:
+            setattr(self.panel, f"{camera}_pixhawk_bootstrap_url", device)
+        baud_widget = getattr(self.panel, f"{camera}_pixhawk_bootstrap_baud_spin", None)
+        baud_setter = getattr(baud_widget, "setValue", None)
+        if callable(baud_setter):
+            baud_setter(baud)
+        else:
+            setattr(self.panel, f"{camera}_pixhawk_bootstrap_baud", baud)
+        if camera in self.panel._mavlink_open_sides():
+            self.panel.disconnect_mavlink_pixhawk(camera)
+            self.panel._log(
+                f"[픽스호크] {self.panel._px4_mag_camera_label(camera)} USB endpoint 변경으로 "
+                "기존 연결을 해제했습니다. Connect를 다시 누르세요."
+            )
+        elif self._pixhawk_selected_transport(camera) == "usb":
+            subscriber = getattr(self.panel, "mavlink_pixhawk", None)
+            if subscriber is not None:
+                subscriber.urls[camera] = device
+                subscriber.baudrates[camera] = baud
+        saver = getattr(self.panel, "_save_current_settings", None)
+        if callable(saver):
+            saver()
+        return True
+
+    def start_pixhawk_mavftp_upload(
+        self,
+        camera: str,
+        local_path: str,
+        remote_path: str,
+        *,
+        resume: bool = False,
+        category: str = "file_upload",
+        direction: str = "upload",
+    ) -> bool:
+        camera = str(camera)
+        if camera not in {"left", "right", "drone"}:
+            raise ValueError(f"Unknown Pixhawk role: {camera}")
+        source = Path(str(local_path)).expanduser()
+        direction = str(direction)
+        if direction == "upload" and not source.is_file():
+            raise ValueError(f"Local transfer file does not exist: {source}")
+        if direction == "download" and not source.parent.is_dir():
+            source.parent.mkdir(parents=True, exist_ok=True)
+        if direction not in {"upload", "download"}:
+            raise ValueError(f"Unsupported MAVFTP direction: {direction}")
+        remote_path = str(remote_path or "").strip()
+        if not remote_path.startswith("/") or ".." in Path(remote_path).parts:
+            raise ValueError("Remote MAVFTP path must be absolute and must not contain '..'")
+        subscriber = getattr(self.panel, "mavlink_pixhawk", None)
+        if subscriber is None or camera not in getattr(subscriber, "connections", {}):
+            raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 연결이 없습니다.")
+        threads = getattr(self.panel, "pixhawk_mavftp_threads", {})
+        if camera in threads:
+            raise RuntimeError(f"{camera_label_ko(camera)} transfer가 이미 진행 중입니다.")
+        observed_ns = time.time_ns()
+        evidence_path = (
+            WORKSTATION_DATA_ROOT
+            / "pixhawk_transfers"
+            / camera
+            / f"{observed_ns}-{source.name}.json"
+        )
+        thread = QtCore.QThread(self.panel)
+        worker = PixhawkMavFtpTransferWorker(
+            subscriber,
+            camera=camera,
+            local_path=str(source),
+            remote_path=remote_path,
+            resume=bool(resume),
+            evidence_path=str(evidence_path),
+            direction=direction,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        _connect_gui_signal(worker.progress, self.panel._apply_pixhawk_mavftp_progress)
+        _connect_gui_signal(
+            worker.completed,
+            lambda result, category=category: self.panel._apply_pixhawk_mavftp_result(
+                result,
+                category=category,
+            ),
+        )
+        _connect_gui_signal(
+            worker.failed,
+            lambda error, camera=camera: self.panel._pixhawk_mavftp_failed(camera, error),
+        )
+        _wire_worker_thread_cleanup(worker, thread)
+        _connect_gui_signal(
+            thread.finished,
+            lambda camera=camera: self.panel._clear_pixhawk_mavftp_worker(camera),
+        )
+        self.panel.pixhawk_mavftp_threads[camera] = thread
+        self.panel.pixhawk_mavftp_workers[camera] = worker
+        self.panel.pixhawk_transfer_status[camera] = {
+            "state": "RESUMING" if resume else direction.upper() + "ING",
+            "category": str(category),
+            "local_path": str(source),
+            "remote_path": remote_path,
+            "sent": 0,
+            "total": source.stat().st_size if source.is_file() else 0,
+            "direction": direction,
+        }
+        self._log_pixhawk_admin_start(camera, str(category))
+        thread.start()
+        return True
+
+    def start_pixhawk_mavftp_download(
+        self,
+        camera: str,
+        remote_path: str,
+        local_path: str,
+        *,
+        resume: bool = False,
+        category: str = "file_download",
+    ) -> bool:
+        return self.start_pixhawk_mavftp_upload(
+            camera,
+            local_path,
+            remote_path,
+            resume=resume,
+            category=category,
+            direction="download",
+        )
+
+    def cancel_pixhawk_mavftp_transfer(self, camera: str) -> bool:
+        worker = getattr(self.panel, "pixhawk_mavftp_workers", {}).get(str(camera))
+        if worker is None:
+            return False
+        worker.cancel()
+        return True
+
+    def _apply_pixhawk_mavftp_progress(self, result: object) -> None:
+        data = dict(result or {})
+        camera = str(data.get("camera") or "")
+        current = dict(self.panel.pixhawk_transfer_status.get(camera) or {})
+        current.update(data)
+        # The progress payload's own "direction" field (set by
+        # PixhawkMavFtpTransferWorker) is the source of truth for which way
+        # the transfer is going; fall back to whatever direction was seeded
+        # at transfer start if a given progress event omits it, rather than
+        # always hardcoding "UPLOADING" regardless of actual direction.
+        direction = str(data.get("direction") or current.get("direction") or "").strip().lower()
+        if direction in {"upload", "download"}:
+            current["state"] = direction.upper() + "ING"
+        self.panel.pixhawk_transfer_status[camera] = current
+
+    def _apply_pixhawk_mavftp_result(self, result: object, *, category: str) -> None:
+        data = dict(result or {})
+        camera = str(data.get("camera") or "")
+        data["state"] = "STAGED" if category == "firmware_stage" else "COMPLETED"
+        data["category"] = str(category)
+        self.panel.pixhawk_transfer_status[camera] = data
+        self.panel._log(
+            f"[픽스호크 FTP] role={camera} state={data['state']} "
+            f"remote={data.get('remote_path')} bytes={data.get('remote_size')} "
+            f"remote_crc32={int(data.get('remote_crc32') or 0):08x} "
+            f"local_sha256={data.get('local_sha256')}"
+        )
+
+    def _pixhawk_mavftp_failed(self, camera: str, error: str) -> None:
+        current = dict(self.panel.pixhawk_transfer_status.get(str(camera)) or {})
+        current.update(state="PARTIAL/FAILED", error=str(error))
+        self.panel.pixhawk_transfer_status[str(camera)] = current
+        self.panel._log(f"[픽스호크 FTP] role={camera} failed={error}")
+
+    def _clear_pixhawk_mavftp_worker(self, camera: str) -> None:
+        self.panel.pixhawk_mavftp_threads.pop(str(camera), None)
+        self.panel.pixhawk_mavftp_workers.pop(str(camera), None)
+
+    def pixhawk_transfer_snapshot(self) -> dict[str, object]:
+        return {
+            side: dict(value)
+            for side, value in getattr(self.panel, "pixhawk_transfer_status", {}).items()
+        }
+
+    def start_pixhawk_usb_flash(
+        self,
+        camera: str,
+        usb_device: str,
+        firmware_path: str,
+    ) -> bool:
+        camera = str(camera)
+        expected_ids = {"left": 1, "right": 2, "drone": 3}
+        if camera not in expected_ids:
+            raise ValueError(f"Unknown Pixhawk role: {camera}")
+        if getattr(self.panel, "pixhawk_usb_flash_thread", None) is not None:
+            raise RuntimeError("another USB firmware flash is already active")
+        if camera in self.panel._mavlink_open_sides():
+            raise RuntimeError(
+                f"{camera_label_ko(camera)} telemetry must be disconnected before USB flash"
+            )
+        usb_device = str(usb_device or "").strip()
+        firmware = Path(str(firmware_path)).expanduser()
+        if not usb_device:
+            raise ValueError("direct Pixhawk USB device is required")
+        if not firmware.is_file():
+            raise ValueError(f"firmware file does not exist: {firmware}")
+        uploader = Path(__file__).resolve().parent / "tools" / "px_uploader.py"
+        thread = QtCore.QThread(self.panel)
+        worker = PixhawkUsbFlashWorker(
+            camera=camera,
+            expected_system_id=expected_ids[camera],
+            usb_device=usb_device,
+            firmware_path=str(firmware),
+            uploader_path=str(uploader),
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        _connect_gui_signal(worker.progress, self.panel._apply_pixhawk_usb_flash_progress)
+        _connect_gui_signal(worker.completed, self.panel._apply_pixhawk_usb_flash_result)
+        _connect_gui_signal(
+            worker.failed,
+            lambda error, camera=camera: self.panel._pixhawk_usb_flash_failed(camera, error),
+        )
+        _wire_worker_thread_cleanup(worker, thread)
+        _connect_gui_signal(thread.finished, self.panel._clear_pixhawk_usb_flash_worker)
+        self.panel.pixhawk_usb_flash_thread = thread
+        self.panel.pixhawk_usb_flash_worker = worker
+        self.panel.pixhawk_usb_flash_status = {
+            "state": "STARTING",
+            "camera": camera,
+            "usb_device": usb_device,
+            "firmware_path": str(firmware),
+        }
+        thread.start()
+        return True
+
+    def cancel_pixhawk_usb_flash(self) -> bool:
+        worker = getattr(self.panel, "pixhawk_usb_flash_worker", None)
+        if worker is None:
+            return False
+        worker.cancel()
+        return True
+
+    def _apply_pixhawk_usb_flash_progress(self, message: str) -> None:
+        current = dict(getattr(self.panel, "pixhawk_usb_flash_status", {}) or {})
+        current.update(state="FLASHING", detail=str(message))
+        self.panel.pixhawk_usb_flash_status = current
+
+    def _apply_pixhawk_usb_flash_result(self, result: object) -> None:
+        data = dict(result or {})
+        observed_ns = time.time_ns()
+        evidence_path = (
+            WORKSTATION_DATA_ROOT
+            / "pixhawk_firmware_flashes"
+            / str(data.get("camera") or "unknown")
+            / f"{observed_ns}.json"
+        )
+        data["evidence_path"] = str(evidence_path)
+        atomic_write_firmware_evidence(evidence_path, data)
+        self.panel.pixhawk_usb_flash_status = data
+        self.panel._log(
+            f"[픽스호크 FLASH] role={data.get('camera')} state=FLASHED/VERIFIED "
+            f"board={data.get('detected_board_id')} firmware_sha256="
+            f"{(data.get('firmware') or {}).get('sha256')} · telemetry remains disconnected"
+        )
+
+    def _pixhawk_usb_flash_failed(self, camera: str, error: str) -> None:
+        current = dict(getattr(self.panel, "pixhawk_usb_flash_status", {}) or {})
+        current.update(state="FAILED/UNKNOWN", camera=str(camera), error=str(error))
+        self.panel.pixhawk_usb_flash_status = current
+        self.panel._log(f"[픽스호크 FLASH] role={camera} failed={error}")
+
+    def _clear_pixhawk_usb_flash_worker(self) -> None:
+        self.panel.pixhawk_usb_flash_thread = None
+        self.panel.pixhawk_usb_flash_worker = None
+
+    def reset_px4_level_calibration(self) -> bool:
+        """Reset only PX4 Level Horizon fine-tuning offsets on both Pixhawks.
+
+        The board mounting rotation and the individual accelerometer/gyro
+        calibration slots are deliberately left untouched.  The PX4 shell's
+        ``param reset`` command restores each named parameter to the firmware
+        default and persists the change.
+        """
+
+        if self.panel._session_recording_active():
+            self.panel._log("[픽스호크] 세션 기록 중에는 수평 보정 파라미터를 초기화할 수 없습니다.")
+            return False
+        target_sides = tuple(self.panel._mavlink_open_sides())
+        if not target_sides:
+            self.panel._log("[픽스호크] 수평 보정 초기화 차단: MAVLink 연결이 없습니다.")
+            return False
+        armed_sides = tuple(
+            side
+            for side in target_sides
+            if bool(getattr(self.panel.px4_mag_managers.get(side), "armed", False))
+        )
+        if armed_sides:
+            labels = ", ".join(self.panel._px4_mag_camera_label(side) for side in armed_sides)
+            self.panel._log(
+                f"[픽스호크] 수평 보정 초기화 차단: {labels}가 armed 상태입니다. Disarm 후 다시 시도하세요."
+            )
+            return False
+
+        parameter_text = ", ".join(LEVEL_HORIZON_RESET_PARAM_NAMES)
+        labels = ", ".join(self.panel._px4_mag_camera_label(side) for side in target_sides)
+        result = QtWidgets.QMessageBox.question(
+            self.panel,
+            "Reset Level Horizon Calibration",
+            (
+                f"{labels}의 PX4 수평(Level Horizon) 미세 보정값을 펌웨어 기본값으로 초기화합니다.\n\n"
+                f"대상: {parameter_text}\n"
+                "보드 장착 방향(SENS_BOARD_ROT), 가속도계/자이로(CAL_ACC*/CAL_GYRO*)와 "
+                "다른 PX4 파라미터는 변경하지 않습니다.\n\n"
+                "기체를 반드시 Disarm한 상태에서 진행하세요. 계속할까요?"
+            ),
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if result != QtWidgets.QMessageBox.Yes:
+            self.panel._log("[픽스호크] 수평 보정 파라미터 초기화를 취소했습니다.")
+            return False
+
+        command = "param reset " + " ".join(LEVEL_HORIZON_RESET_PARAM_NAMES)
+        started = False
+        for side in target_sides:
+            started = (
+                self.panel._start_pixhawk_shell_worker(
+                    side,
+                    command,
+                    operation="reset_level_calibration",
+                    timeout_s=3.0,
+                    on_complete=lambda _result, camera=side: self.panel._start_pixhawk_parameter_worker(
+                        camera, "attitude_refresh"
+                    ),
+                )
+                or started
+            )
+        if not started:
+            self.panel._log("[픽스호크] 수평 보정 파라미터 초기화 명령을 시작하지 못했습니다.")
+            return False
+        self.panel._log(
+            f"[픽스호크] {labels} 수평 보정 초기화를 요청했습니다: {parameter_text}. "
+            "PX4 PARAM readback을 갱신합니다."
+        )
+        return True
+
+    def _stop_pixhawk_operation_workers(self, *, wait: bool) -> bool:
+        self._stop_px4_sensor_mag_shell_polling()
+        all_stopped = True
+        for attr in (
+            "network_role_apply_thread",
+            "pixhawk_network_discovery_thread",
+            "pixhawk_connection_thread",
+            "pixhawk_disconnection_thread",
+            "pixhawk_stream_setup_thread",
+            "pixhawk_usb_bootstrap_thread",
+            "pixhawk_usb_recovery_thread",
+            "pixhawk_usb_flash_thread",
+            "pixhawk_persistent_config_thread",
+            "pixhawk_rtcm_thread",
+        ):
+            thread = getattr(self.panel, attr, None)
+            if thread is None:
+                continue
+            worker_attr = attr.replace("_thread", "_worker")
+            worker = getattr(self.panel, worker_attr, None)
+            if attr == "pixhawk_usb_flash_thread" and worker is not None:
+                try:
+                    worker.cancel()
+                except Exception:
+                    pass
+            if attr == "pixhawk_rtcm_thread" and worker is not None:
+                try:
+                    worker.clear_pending()
+                except Exception:
+                    pass
+            thread.quit()
+            if thread.isRunning():
+                if not wait or not thread.wait(1000):
+                    all_stopped = False
+                    continue
+            if not thread.isRunning() and getattr(self.panel, attr, None) is thread:
+                setattr(self.panel, attr, None)
+                if getattr(self.panel, worker_attr, None) is worker:
+                    setattr(self.panel, worker_attr, None)
+        for workers in (self.panel.pixhawk_shell_threads, self.panel.pixhawk_parameter_threads):
+            for camera, thread in list(workers.items()):
+                try:
+                    # The worker checks this flag between radio round trips;
+                    # quit() alone would wait out the whole PARAM/shell
+                    # sequence (minutes on a lossy radio) before returning.
+                    interrupter = getattr(thread, "requestInterruption", None)
+                    if callable(interrupter):
+                        interrupter()
+                    thread.quit()
+                    if thread.isRunning():
+                        if not wait or not thread.wait(1000):
+                            all_stopped = False
+                            continue
+                except RuntimeError:
+                    pass
+                if not thread.isRunning():
+                    workers.pop(camera, None)
+                    if workers is self.panel.pixhawk_shell_threads:
+                        self.panel.pixhawk_shell_workers.pop(camera, None)
+                    else:
+                        self.panel.pixhawk_parameter_workers.pop(camera, None)
+        transfer_threads = getattr(self.panel, "pixhawk_mavftp_threads", {})
+        transfer_workers = getattr(self.panel, "pixhawk_mavftp_workers", {})
+        for camera, thread in list(transfer_threads.items()):
+            worker = transfer_workers.get(camera)
+            if worker is not None:
+                try:
+                    worker.cancel()
+                except Exception:
+                    pass
+            thread.quit()
+            if thread.isRunning() and (not wait or not thread.wait(1000)):
+                all_stopped = False
+                continue
+            transfer_threads.pop(camera, None)
+            transfer_workers.pop(camera, None)
+        return all_stopped
+
+    def discover_pc_camera_ip(self) -> None:
+        if self.panel.camera_network_discovery_thread is not None:
+            self.panel._log("[연결] PC IP 탐색이 이미 진행 중입니다.")
+            return
+        self.panel._log("[연결] PC IP 탐색: 카메라망 인터페이스와 PC IP를 함께 탐색합니다.")
+        self.panel.workstation_camera_discovery_status = "SEARCHING"
+        self.panel.detect_pc_ip_button.setEnabled(False)
+        self.panel.camera_connection_label.setText("camera host IP: discovering...")
+        self.panel.camera_network_discovery_thread = QtCore.QThread(self.panel)
+        self.panel.camera_network_discovery_worker = CameraNetworkDiscoveryWorker(
+            host_address=self.panel.host_address_edit.text().strip() or DEFAULT_HOST_ADDRESS,
+            host_hints=self.panel._camera_host_hints(),
+        )
+        self.panel.camera_network_discovery_worker.moveToThread(self.panel.camera_network_discovery_thread)
+        self.panel.camera_network_discovery_thread.started.connect(self.panel.camera_network_discovery_worker.run)
+        self.panel.camera_network_discovery_worker.discovered.connect(self.panel._apply_camera_network_discovery)
+        self.panel.camera_network_discovery_worker.failed.connect(self.panel._camera_network_discovery_failed)
+        self.panel.camera_network_discovery_worker.finished.connect(self.panel.camera_network_discovery_thread.quit)
+        self.panel.camera_network_discovery_worker.finished.connect(self.panel.camera_network_discovery_worker.deleteLater)
+        self.panel.camera_network_discovery_thread.finished.connect(self.panel.camera_network_discovery_thread.deleteLater)
+        self.panel.camera_network_discovery_thread.finished.connect(self.panel._clear_camera_network_discovery)
+        self.panel.camera_network_discovery_thread.start()
+
+    def _apply_camera_network_discovery(self, result: object) -> None:
+        data = dict(result or {})
+        candidates = list(data.get("candidates") or [])
+        candidate_projector = getattr(
+            self.panel, "_set_camera_candidate_rows", None
+        )
+        if callable(candidate_projector):
+            candidate_projector(candidates, [], [], [])
+        if not candidates:
+            self.panel.workstation_camera_discovery_status = "FOUND 0 HOST INTERFACES"
+            self.panel._log("[연결] PC IP 탐색: 사용할 수 있는 유선 인터페이스를 찾지 못했습니다.")
+            self.panel.camera_connection_label.setText("camera host IP: interface not found")
+            self.panel._refresh_operation_header()
+            return
+        self.panel._apply_host_interface_candidates(candidates)
+        self.panel.workstation_camera_discovery_status = f"FOUND {len(candidates)} HOST INTERFACES"
+        interface_name = self.panel.interface_edit.text().strip()
+        resolved_address = data.get("resolved_address")
+        if resolved_address is None:
+            connection_name = data.get("connection_name")
+            addresses = tuple(data.get("addresses") or ())
+            if connection_name is None:
+                self.panel._log(f"[연결] PC IP 탐색: {interface_name}에 활성 NetworkManager 연결이 없습니다.")
+            else:
+                if addresses:
+                    address_text = ", ".join(str(address) for address in addresses)
+                    self.panel._log(f"[연결] PC IP 탐색: 활성 프로필 {connection_name} 주소={address_text}")
+                else:
+                    self.panel._log(f"[연결] PC IP 탐색: 활성 프로필 {connection_name}에서 주소를 찾지 못했습니다.")
+            self.panel.camera_connection_label.setText("camera host IP: not found")
+            self.panel._refresh_operation_header()
+            return
+        resolved_text = str(resolved_address)
+        self.panel.host_address_edit.setText(resolved_text)
+        self.panel._log(
+            f"[연결] PC IP 탐색: NetworkManager 활성 프로필에서 카메라망 IP를 찾았습니다: "
+            f"{interface_name} {resolved_text}"
+        )
+        self.panel.camera_connection_label.setText(f"camera host IP: found {resolved_text}")
+        self.panel._refresh_operation_header()
+
+    def _camera_network_discovery_failed(self, error: str) -> None:
+        self.panel.workstation_camera_discovery_status = f"ERROR · {error}"
+        self.panel._log(f"[연결] PC IP 탐색 실패: {error}")
+        self.panel.camera_connection_label.setText(f"camera host IP: failed ({error})")
+        self.panel._refresh_operation_header()
+
+    def _clear_camera_network_discovery(self) -> None:
+        self.panel.camera_network_discovery_thread = None
+        self.panel.camera_network_discovery_worker = None
+        self.panel.detect_pc_ip_button.setEnabled(True)
+
+    def discover_pc_pixhawk_ip(self) -> None:
+        if self.panel.pixhawk_host_ip_discovery_thread is not None:
+            self.panel._log("[픽스호크] PC IP 탐색이 이미 진행 중입니다.")
+            return
+        if self.panel._pixhawk_candidate_discovery_active():
+            self.panel._log(
+                "[픽스호크] 다른 Discovery가 진행 중이어서 PC IP 탐색을 시작하지 않았습니다."
+            )
+            return
+        self.panel.detect_pixhawk_host_ip_button.setEnabled(False)
+        self.panel.workstation_pixhawk_discovery_status = "SEARCHING HOST IP"
+        self.panel.pixhawk_connection_label.setText("pixhawk host IP: discovering...")
+        self.panel.pixhawk_host_ip_discovery_thread = QtCore.QThread(self.panel)
+        self.panel.pixhawk_host_ip_discovery_worker = PixhawkHostIpDiscoveryWorker()
+        self.panel.pixhawk_host_ip_discovery_worker.moveToThread(self.panel.pixhawk_host_ip_discovery_thread)
+        self.panel.pixhawk_host_ip_discovery_thread.started.connect(self.panel.pixhawk_host_ip_discovery_worker.run)
+        self.panel.pixhawk_host_ip_discovery_worker.discovered.connect(self.panel._apply_pixhawk_host_ip_discovery)
+        self.panel.pixhawk_host_ip_discovery_worker.failed.connect(self.panel._pixhawk_host_ip_discovery_failed)
+        self.panel.pixhawk_host_ip_discovery_worker.finished.connect(self.panel.pixhawk_host_ip_discovery_thread.quit)
+        self.panel.pixhawk_host_ip_discovery_worker.finished.connect(self.panel.pixhawk_host_ip_discovery_worker.deleteLater)
+        self.panel.pixhawk_host_ip_discovery_thread.finished.connect(self.panel.pixhawk_host_ip_discovery_thread.deleteLater)
+        self.panel.pixhawk_host_ip_discovery_thread.finished.connect(self.panel._clear_pixhawk_host_ip_discovery)
+        self.panel.pixhawk_host_ip_discovery_thread.start()
+
+    def _apply_pixhawk_host_ip_discovery(self, interfaces: object) -> None:
+        rows = list(interfaces or [])
+        if not rows:
+            self.panel.workstation_pixhawk_discovery_status = "FOUND 0 HOST INTERFACES"
+            self.panel._log("[픽스호크] PC IP 탐색: 활성 IPv4 인터페이스를 찾지 못했습니다.")
+            self.panel.pixhawk_connection_label.setText("pixhawk host IP: not found")
+            self.panel._refresh_operation_header()
+            return
+        self.panel._append_pixhawk_host_ip_candidates(rows)
+        self.panel.workstation_pixhawk_discovery_status = f"FOUND {len(rows)} HOST INTERFACES"
+        self.panel.pixhawk_connection_label.setText("pixhawk host IP: 후보 표시됨 - 표에서 PC_IP를 선택해 적용하세요")
+        self.panel._refresh_operation_header()
+
+    def _pixhawk_host_ip_discovery_failed(self, error: str) -> None:
+        self.panel.workstation_pixhawk_discovery_status = f"ERROR · {error}"
+        self.panel._log(f"[픽스호크] PC IP 탐색 실패: {error}")
+        self.panel.pixhawk_connection_label.setText(f"pixhawk host IP: failed ({error})")
+        self.panel._refresh_operation_header()
+
+    def _clear_pixhawk_host_ip_discovery(self) -> None:
+        self.panel.pixhawk_host_ip_discovery_thread = None
+        self.panel.pixhawk_host_ip_discovery_worker = None
+        self.panel.detect_pixhawk_host_ip_button.setEnabled(True)
+
+    def discover_pixhawk_network(self) -> None:
+        """Discover wired NIC/address/route choices without changing host state."""
+
+        if self.panel.pixhawk_network_discovery_thread is not None:
+            self.panel._log("[픽스호크] Ethernet NIC/route 탐색이 이미 진행 중입니다.")
+            return
+        if self.panel._pixhawk_candidate_discovery_active():
+            self.panel._log(
+                "[픽스호크] 다른 Discovery가 진행 중이어서 Ethernet NIC/route 탐색을 시작하지 않았습니다."
+            )
+            return
+        self.panel._begin_pixhawk_candidate_discovery("SEARCHING NETWORK")
+        self.panel.pixhawk_connection_label.setText("Pixhawk network: discovering NIC/address/routes...")
+        thread = QtCore.QThread(self.panel)
+        worker = PixhawkNetworkDiscoveryWorker(
+            p1_peer=self.panel.left_pixhawk_eth_ip_edit.text().strip(),
+            p2_peer=self.panel.right_pixhawk_eth_ip_edit.text().strip(),
+            p1_endpoint=self.panel.left_mavlink_url_edit.text().strip(),
+            p2_endpoint=self.panel.right_mavlink_url_edit.text().strip(),
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        _connect_gui_signal(worker.discovered, self.panel._apply_pixhawk_network_discovery)
+        _connect_gui_signal(worker.failed, self.panel._pixhawk_network_discovery_failed)
+        _wire_worker_thread_cleanup(worker, thread)
+        _connect_gui_signal(thread.finished, self.panel._clear_pixhawk_network_discovery)
+        self.panel.pixhawk_network_discovery_thread = thread
+        self.panel.pixhawk_network_discovery_worker = worker
+        self.panel._log("[픽스호크] read-only Ethernet NIC/IPv4/route 탐색을 시작했습니다.")
+        self.panel._refresh_operation_header()
+        thread.start()
+
+    def _apply_pixhawk_network_discovery(self, result: object) -> None:
+        rows: list[dict[str, object]] = []
+        for raw in result or ():
+            if not isinstance(raw, dict):
+                continue
+            row = dict(raw)
+            carrier = str(row.get("carrier") or "UNKNOWN")
+            local_cidr = str(row.get("local_cidr") or "")
+            p1_state = str(row.get("p1_route_state") or "NO ROUTE")
+            p2_state = str(row.get("p2_route_state") or "NO ROUTE")
+            row.update(
+                {
+                    "kind": "NETWORK",
+                    "value": local_cidr or "--",
+                    "baud": "",
+                    "status": f"LINK {carrier} · P1 {p1_state} · P2 {p2_state}",
+                }
+            )
+            rows.append(row)
+        self.panel._set_pixhawk_candidate_rows(rows, source="network")
+        self.panel.workstation_pixhawk_discovery_status = f"FOUND {len(rows)} NETWORK CHOICES"
+
+        assignments = getattr(self.panel, "pixhawk_network_assignments", {})
+        statuses = getattr(self.panel, "pixhawk_network_assignment_status", {})
+        for side, prefix in (("left", "p1"), ("right", "p2")):
+            assignment = assignments.get(side) or {}
+            interface_name = str(assignment.get("interface") or "")
+            local_address = str(assignment.get("local_address") or "").split("/", 1)[0]
+            if not interface_name:
+                statuses[side] = {
+                    "state": "LEGACY AUTO ROUTE",
+                    "detail": "no explicit NIC assignment",
+                }
+                continue
+            stable_id = self._saved_network_stable_id(side)
+            match, renamed_from = self._match_network_row(
+                rows,
+                interface_name=interface_name,
+                local_address=local_address,
+                stable_id=stable_id,
+            )
+            if match is None:
+                statuses[side] = {
+                    "state": "REASSIGN REQUIRED",
+                    "detail": self._missing_assignment_detail(
+                        rows,
+                        interface_name=interface_name,
+                        local_address=local_address,
+                        stable_id=stable_id,
+                    ),
+                }
+                continue
+            if renamed_from:
+                self._adopt_renamed_network_interface(side, renamed_from, match, stable_id)
+                interface_name = str(match.get("interface") or "")
+            route_state = str(match.get(f"{prefix}_route_state") or "NO ROUTE")
+            detail = str(match.get(f"{prefix}_route") or "")
+            if renamed_from:
+                detail = f"{detail} · NIC renamed {renamed_from} -> {interface_name}".strip(" ·")
+            statuses[side] = {
+                "state": "ASSIGNED" if route_state == "ROUTE OK" else route_state,
+                "detail": detail,
+            }
+        self.panel.pixhawk_network_assignment_status = statuses
+        for row in rows:
+            self.panel._log(
+                f"[픽스호크] NIC 후보: {row.get('interface', '--')} "
+                f"{row.get('local_cidr') or '--'} carrier={row.get('carrier', 'UNKNOWN')} "
+                f"P1={row.get('p1_route_state', 'NO ROUTE')} "
+                f"P2={row.get('p2_route_state', 'NO ROUTE')}"
+            )
+        self.panel.pixhawk_connection_label.setText(
+            f"Pixhawk network: {len(rows)} NIC/address choices found"
+        )
+        self.panel._refresh_operation_header()
+
+    def _saved_network_stable_id(self, side: str) -> str:
+        """Return the persisted MAC identity for one side's assigned NIC."""
+
+        roles = getattr(self.panel, "network_role_assignments", {}) or {}
+        entry = roles.get(self._role_for_side(side))
+        if isinstance(entry, Mapping):
+            stored = normalize_stable_id(entry.get("stable_id"))
+            if stored:
+                return stored
+        field = (
+            "left_mavlink_interface_stable_id"
+            if side == "left"
+            else "right_mavlink_interface_stable_id"
+        )
+        return normalize_stable_id(
+            getattr(getattr(self.panel, "settings", None), field, "")
+        )
+
+    @staticmethod
+    def _match_network_row(
+        rows: list[dict[str, object]],
+        *,
+        interface_name: str,
+        local_address: str,
+        stable_id: str,
+    ) -> tuple[dict[str, object] | None, str]:
+        """Match a saved assignment by kernel name first, then by persisted MAC.
+
+        The second element is the previous kernel name when the same physical
+        NIC came back under a different one, and is empty otherwise.
+        """
+
+        for row in rows:
+            if (
+                str(row.get("interface") or "") == interface_name
+                and str(row.get("local_ip") or "") == local_address
+            ):
+                return row, ""
+        if not stable_id:
+            return None, ""
+        for row in rows:
+            if not candidate_matches_stable_id(row, stable_id):
+                continue
+            if str(row.get("local_ip") or "") != local_address:
+                continue
+            return row, interface_name
+        return None, ""
+
+    @staticmethod
+    def _missing_assignment_detail(
+        rows: list[dict[str, object]],
+        *,
+        interface_name: str,
+        local_address: str,
+        stable_id: str,
+    ) -> str:
+        """Name the NIC the saved identity resolves to when the address moved."""
+
+        if stable_id:
+            for row in rows:
+                if not candidate_matches_stable_id(row, stable_id):
+                    continue
+                return (
+                    f"saved {local_address or '--'} is no longer on {stable_id}; "
+                    f"that NIC is now {row.get('interface') or '--'} "
+                    f"{row.get('local_cidr') or '--'}"
+                )
+        return f"saved {interface_name} {local_address or '--'} is not present"
+
+    def _adopt_renamed_network_interface(
+        self,
+        side: str,
+        previous_interface: str,
+        row: dict[str, object],
+        stable_id: str,
+    ) -> None:
+        """Follow one saved NIC to its new kernel name without touching the host."""
+
+        interface_name = str(row.get("interface") or "")
+        assignments = getattr(self.panel, "pixhawk_network_assignments", {})
+        assignment = dict(assignments.get(side) or {})
+        assignment["interface"] = interface_name
+        assignments[side] = assignment
+        roles = getattr(self.panel, "network_role_assignments", None)
+        if isinstance(roles, dict):
+            role = self._role_for_side(side)
+            entry = dict(roles.get(role) or {})
+            entry["interface"] = interface_name
+            entry["stable_id"] = str(entry.get("stable_id") or stable_id)
+            roles[role] = entry
+        label = self.panel._px4_mag_camera_label(side)
+        self.panel._log(
+            f"[픽스호크] {label} NIC 이름이 {previous_interface} -> {interface_name}로 바뀌었습니다. "
+            f"저장된 식별자 {stable_id}로 같은 물리 NIC를 확인해 배정을 유지합니다."
+        )
+        try:
+            self.panel._save_current_settings()
+        except Exception as exc:
+            self.panel._log(
+                f"[픽스호크] {label} NIC 이름 변경 저장 실패; 이번 실행에만 유지됩니다: {exc}"
+            )
+
+    def _pixhawk_network_discovery_failed(self, error: str) -> None:
+        self.panel._set_pixhawk_candidate_rows([])
+        self.panel.workstation_pixhawk_discovery_status = f"ERROR · {error}"
+        self.panel.pixhawk_connection_label.setText(f"Pixhawk network discovery failed: {error}")
+        self.panel._log(f"[픽스호크] Ethernet NIC/route 탐색 실패: {error}")
+        self.panel._refresh_operation_header()
+
+    def _clear_pixhawk_network_discovery(self) -> None:
+        self.panel.pixhawk_network_discovery_thread = None
+        self.panel.pixhawk_network_discovery_worker = None
+        self.panel._refresh_session_toggle_buttons()
+
+    @staticmethod
+    def _role_for_side(side: str) -> str:
+        return NETWORK_ROLE_P1 if str(side) == "left" else NETWORK_ROLE_P2
+
+    @staticmethod
+    def _side_for_role(role: str) -> str | None:
+        return "left" if role == NETWORK_ROLE_P1 else "right" if role == NETWORK_ROLE_P2 else None
+
+    def _network_role_mapping_locked(self) -> bool:
+        if self.panel._session_recording_active():
+            return True
+        snapshot_reader = getattr(self.panel, "measurement_run_snapshot", None)
+        if not callable(snapshot_reader):
+            return False
+        try:
+            snapshot = snapshot_reader()
+        except Exception:
+            return False
+        state = str(snapshot.get("state") or "IDLE").upper() if isinstance(snapshot, dict) else "IDLE"
+        return state in {"QUEUED", "STARTING", "RUNNING", "STOPPING", "FINALIZING"}
+
+    @staticmethod
+    def _candidate_stable_id(candidate: dict[str, object]) -> str:
+        return candidate_stable_id(candidate)
+
+    def _network_role_requirements_for(self, roles: Sequence[str]):
+        camera_peers: list[str] = []
+        for edit_name in ("left_rtsp_url_edit", "right_rtsp_url_edit"):
+            edit = getattr(self.panel, edit_name, None)
+            if edit is None:
+                continue
+            try:
+                host, _port = rtsp_host_port(edit.text().strip())
+            except (TypeError, ValueError):
+                continue
+            if host not in camera_peers:
+                camera_peers.append(host)
+        if not camera_peers:
+            camera_peers = ["10.0.0.231", "10.0.0.232"]
+        camera_address = self.panel.host_address_edit.text().strip() or "10.0.0.11/32"
+        pixhawk_address = self.panel.pixhawk_host_address_edit.text().strip() or "10.0.0.10"
+        return network_role_requirements(
+            roles,
+            camera_local_address=camera_address,
+            camera_peers=camera_peers,
+            pixhawk_local_address=pixhawk_address,
+            p1_peer=self.panel.left_pixhawk_eth_ip_edit.text().strip(),
+            p2_peer=self.panel.right_pixhawk_eth_ip_edit.text().strip(),
+        )
+
+    def _network_role_owned_entries_for(self, stable_id: str) -> NetworkRoleOwnedEntries:
+        mapping = getattr(self.panel, "network_role_owned_entries", {})
+        return NetworkRoleOwnedEntries.from_mapping(mapping.get(stable_id, {}))
+
+    def _network_role_requests(
+        self,
+        plan: NetworkRoleMovePlan,
+        *,
+        target_stable_id: str,
+        after: bool,
+        owned_by_interface: dict[str, NetworkRoleOwnedEntries] | None = None,
+    ) -> tuple[NetworkRoleInterfaceRequest, ...]:
+        grouped = plan.roles_by_interface(after=after)
+        before_grouped = plan.roles_by_interface(after=False)
+        assignments = plan.after_assignments if after else plan.before_assignments
+        stable_by_interface: dict[str, str] = {}
+        for assignment in assignments:
+            if assignment.interface and assignment.stable_id:
+                stable_by_interface.setdefault(assignment.interface, assignment.stable_id)
+        stable_by_interface[plan.target_interface] = target_stable_id
+        order = list(plan.affected_interfaces if after else reversed(plan.affected_interfaces))
+        requests: list[NetworkRoleInterfaceRequest] = []
+        for interface in order:
+            stable_id = stable_by_interface.get(interface) or f"name:{interface}"
+            owned = (
+                (owned_by_interface or {}).get(interface)
+                if owned_by_interface is not None
+                else self._network_role_owned_entries_for(stable_id)
+            )
+            requests.append(
+                NetworkRoleInterfaceRequest(
+                    interface,
+                    stable_id,
+                    self._network_role_requirements_for(grouped.get(interface, ())),
+                    owned or NetworkRoleOwnedEntries(),
+                    self._network_role_requirements_for(before_grouped.get(interface, ())),
+                )
+            )
+        return tuple(requests)
+
+    def _network_role_active_roles(self, affected_interfaces: Sequence[str]) -> tuple[str, ...]:
+        affected = set(affected_interfaces)
+        assignments = getattr(self.panel, "network_role_assignments", {})
+        active: list[str] = []
+        camera_assignment = assignments.get(NETWORK_ROLE_CAMERA) or {}
+        camera_running = bool(
+            getattr(self.panel, "camera_connected", False)
+            or getattr(self.panel.left_pane, "worker", None)
+            or getattr(self.panel.right_pane, "worker", None)
+        )
+        if camera_running and str(camera_assignment.get("interface") or "") in affected:
+            active.append(NETWORK_ROLE_CAMERA)
+        open_sides = self.panel._mavlink_open_sides()
+        for role, side in ((NETWORK_ROLE_P1, "left"), (NETWORK_ROLE_P2, "right")):
+            assignment = assignments.get(role) or {}
+            if side in open_sides and str(assignment.get("interface") or "") in affected:
+                active.append(role)
+        return tuple(active)
+
+    def _confirm_network_role_assignment(
+        self,
+        role: str,
+        plan: NetworkRoleMovePlan,
+        active_roles: Sequence[str],
+    ) -> bool:
+        override = getattr(self.panel, "_network_role_confirmation_override", None)
+        if callable(override):
+            return bool(override(role, plan, tuple(active_roles)))
+        import os
+
+        if os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":
+            # No modal dialog can be shown/answered under an offscreen QPA
+            # platform, so auto-confirm rather than hang indefinitely; leave
+            # an audit trail since this silently applies a network role
+            # change that can drop active Pixhawk/camera links.
+            self.panel._log(
+                f"[네트워크] QT_QPA_PLATFORM=offscreen: role={role} 변경을 "
+                f"확인창 없이 자동 승인했습니다 (active={', '.join(active_roles) or 'none'})"
+            )
+            return True
+        before = plan.roles_by_interface(after=False)
+        after = plan.roles_by_interface(after=True)
+        active_text = ", ".join(active_roles) or "none"
+        result = QtWidgets.QMessageBox.question(
+            self.panel,
+            "Apply Network Role",
+            (
+                f"Role: {role.upper()}\n"
+                f"Before: {before}\n"
+                f"After: {after}\n"
+                f"Active owners that will restart: {active_text}\n\n"
+                "Find/startup never applies this automatically. Continue with OS authorization?"
+            ),
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        return result == QtWidgets.QMessageBox.Yes
+
+    def request_network_role_assignment(
+        self,
+        role: str,
+        candidate: dict[str, object],
+    ) -> bool:
+        if getattr(self.panel, "network_role_apply_thread", None) is not None or getattr(
+            self.panel, "network_role_operation", None
+        ) is not None:
+            self.panel._log("[네트워크] 다른 NIC 역할 적용이 진행 중입니다.")
+            return False
+        if self._network_role_mapping_locked():
+            self.panel._log("[네트워크] Measurement/기록/저장 중에는 NIC 역할을 변경할 수 없습니다.")
+            return False
+        interface = str(candidate.get("interface") or "").strip()
+        if not interface:
+            self.panel._log("[네트워크] 선택 후보에 물리 NIC가 없습니다.")
+            return False
+        stable_id = self._candidate_stable_id(candidate)
+        plan = plan_network_role_move(
+            getattr(self.panel, "network_role_assignments", {}),
+            role=role,
+            target_interface=interface,
+            target_stable_id=stable_id,
+        )
+        active_roles = self._network_role_active_roles(plan.affected_interfaces)
+        camera_active_sides = tuple(
+            side
+            for side in ("left", "right")
+            if getattr(getattr(self.panel, f"{side}_pane", None), "worker", None) is not None
+        )
+        if not self._confirm_network_role_assignment(role, plan, active_roles):
+            self.panel.network_role_status = {"state": "CANCELLED", "detail": "operator cancelled"}
+            return False
+        requests = self._network_role_requests(
+            plan,
+            target_stable_id=stable_id,
+            after=True,
+        )
+        self.panel.network_role_operation = {
+            "role": role,
+            "candidate": dict(candidate),
+            "plan": plan,
+            "target_stable_id": stable_id,
+            "requests": requests,
+            "active_roles": tuple(active_roles),
+            "camera_active_sides": camera_active_sides,
+            "phase": "STOPPING",
+            "deadline_s": time.monotonic() + 12.0,
+            "before_owned": {
+                str(key): {
+                    "addresses": list((value or {}).get("addresses") or ()),
+                    "routes": list((value or {}).get("routes") or ()),
+                }
+                for key, value in getattr(self.panel, "network_role_owned_entries", {}).items()
+            },
+            "before_endpoints": {
+                "left": self.panel.left_mavlink_url_edit.text().strip(),
+                "right": self.panel.right_mavlink_url_edit.text().strip(),
+            },
+        }
+        self.panel.network_role_status = {
+            "state": "STOPPING AFFECTED" if active_roles else "APPLYING",
+            "detail": f"{role} -> {interface}",
+        }
+        if NETWORK_ROLE_CAMERA in active_roles:
+            self.panel.stop_yolo_streams()
+        pixhawk_sides = [
+            side
+            for role_name in active_roles
+            if (side := self._side_for_role(role_name)) is not None
+        ]
+        if pixhawk_sides:
+            self.panel.disconnect_mavlink_pixhawk(
+                None if len(pixhawk_sides) == 2 else pixhawk_sides[0]
+            )
+        QtCore.QTimer.singleShot(0, self.panel._continue_network_role_assignment)
+        return True
+
+    def _network_role_owners_stopped(self, active_roles: Sequence[str]) -> bool:
+        if NETWORK_ROLE_CAMERA in active_roles and bool(
+            getattr(self.panel, "camera_connected", False)
+            or getattr(self.panel.left_pane, "worker", None)
+            or getattr(self.panel.right_pane, "worker", None)
+        ):
+            return False
+        open_sides = self.panel._mavlink_open_sides()
+        for role in active_roles:
+            side = self._side_for_role(role)
+            if side is not None and side in open_sides:
+                return False
+        return getattr(self.panel, "pixhawk_disconnection_thread", None) is None
+
+    def _continue_network_role_assignment(self) -> None:
+        operation = getattr(self.panel, "network_role_operation", None)
+        if not isinstance(operation, dict) or operation.get("phase") != "STOPPING":
+            return
+        active_roles = tuple(operation.get("active_roles") or ())
+        if not self._network_role_owners_stopped(active_roles):
+            if time.monotonic() >= float(operation.get("deadline_s") or 0.0):
+                self._network_role_apply_failed("timed out stopping affected device owners")
+                return
+            QtCore.QTimer.singleShot(50, self.panel._continue_network_role_assignment)
+            return
+        operation["phase"] = "APPLYING"
+        self.panel.network_role_status = {"state": "APPLYING", "detail": str(operation.get("role"))}
+        self._start_network_role_worker(tuple(operation.get("requests") or ()), mode="apply")
+
+    def _start_network_role_worker(
+        self,
+        requests: Sequence[NetworkRoleInterfaceRequest],
+        *,
+        mode: str,
+    ) -> None:
+        if self.panel.network_role_apply_thread is not None:
+            raise RuntimeError("network role worker already active")
+        operation = self.panel.network_role_operation
+        if not isinstance(operation, dict):
+            raise RuntimeError("network role operation is missing")
+        operation["worker_mode"] = mode
+        operation["active_requests"] = tuple(requests)
+        thread = QtCore.QThread(self.panel)
+        worker = NetworkRoleApplyWorker(requests)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        _connect_gui_signal(worker.completed, self.panel._apply_network_role_result)
+        _connect_gui_signal(worker.failed, self.panel._network_role_apply_failed)
+        _wire_worker_thread_cleanup(worker, thread)
+        _connect_gui_signal(thread.finished, self.panel._clear_network_role_apply_worker)
+        self.panel.network_role_apply_thread = thread
+        self.panel.network_role_apply_worker = worker
+        thread.start()
+
+    def _set_network_role_status(self, state: str, detail: str) -> None:
+        self.panel.network_role_status = {"state": str(state), "detail": str(detail)}
+        self.panel._log(f"[네트워크] {state}: {detail}")
+        self.panel._refresh_operation_header()
+
+    def _apply_role_assignment_state(
+        self,
+        assignments: Sequence[NetworkRoleAssignment],
+        *,
+        candidate: dict[str, object] | None,
+        restore_endpoints: bool = False,
+    ) -> None:
+        mapping = {
+            assignment.role: {
+                "interface": assignment.interface,
+                "stable_id": assignment.stable_id,
+            }
+            for assignment in assignments
+        }
+        self.panel.network_role_assignments = mapping
+        camera = mapping.get(NETWORK_ROLE_CAMERA, {})
+        self.panel.interface_edit.setText(str(camera.get("interface") or ""))
+        camera_requirements = self._network_role_requirements_for((NETWORK_ROLE_CAMERA,))
+        if camera_requirements.addresses:
+            self.panel.host_address_edit.setText(camera_requirements.addresses[0])
+
+        operation = getattr(self.panel, "network_role_operation", None)
+        before_endpoints = operation.get("before_endpoints", {}) if isinstance(operation, dict) else {}
+        for role, side, prefix in (
+            (NETWORK_ROLE_P1, "left", "p1"),
+            (NETWORK_ROLE_P2, "right", "p2"),
+        ):
+            assignment = mapping.get(role, {})
+            local_requirements = self._network_role_requirements_for((role,))
+            local_ip = (
+                local_requirements.addresses[0].split("/", 1)[0]
+                if local_requirements.addresses
+                else ""
+            )
+            self.panel.pixhawk_network_assignments[side] = {
+                "interface": str(assignment.get("interface") or ""),
+                "local_address": local_ip,
+            }
+            endpoint_edit = (
+                self.panel.left_mavlink_url_edit
+                if side == "left"
+                else self.panel.right_mavlink_url_edit
+            )
+            if restore_endpoints:
+                endpoint_edit.setText(str(before_endpoints.get(side) or endpoint_edit.text()))
+            elif candidate is not None and role == str(operation.get("role") if isinstance(operation, dict) else ""):
+                endpoint = str(candidate.get(f"{prefix}_endpoint") or "").strip()
+                if endpoint:
+                    endpoint_edit.setText(endpoint)
+            self.panel.pixhawk_network_assignment_status[side] = {
+                "state": "ASSIGNED · PRESS CONNECT",
+                "detail": f"{assignment.get('interface') or '--'} {local_ip or '--'}",
+            }
+        self.panel._sync_mavlink_subscriber_settings()
+
+    def _apply_network_role_result(self, result: object) -> None:
+        operation = getattr(self.panel, "network_role_operation", None)
+        if not isinstance(operation, dict):
+            return
+        results = tuple(result or ())
+        requests = tuple(operation.get("active_requests") or ())
+        if len(results) != len(requests):
+            self._network_role_apply_failed("worker result/request count mismatch")
+            return
+        owned_by_interface: dict[str, NetworkRoleOwnedEntries] = {}
+        for request, interface_result in zip(requests, results):
+            owned = getattr(interface_result, "owned_after", NetworkRoleOwnedEntries())
+            owned_by_interface[request.interface] = owned
+            self.panel.network_role_owned_entries[request.stable_id] = owned.to_mapping()
+        mode = str(operation.get("worker_mode") or "apply")
+        plan = operation.get("plan")
+        if not isinstance(plan, NetworkRoleMovePlan):
+            self._network_role_apply_failed("network role plan is missing")
+            return
+        if mode == "rollback":
+            before_owned = operation.get("before_owned", {})
+            self.panel.network_role_owned_entries = {
+                str(key): {
+                    "addresses": list((value or {}).get("addresses") or ()),
+                    "routes": list((value or {}).get("routes") or ()),
+                }
+                for key, value in before_owned.items()
+            }
+            for request, interface_result in zip(requests, results):
+                self.panel.network_role_owned_entries[request.stable_id] = (
+                    interface_result.owned_after.to_mapping()
+                )
+            self._apply_role_assignment_state(
+                plan.before_assignments,
+                candidate=None,
+                restore_endpoints=True,
+            )
+            self.panel._save_current_settings()
+            self._set_network_role_status(
+                "ROLLED BACK",
+                "host state restored; Pixhawk remains disconnected until Connect",
+            )
+            if getattr(self.panel, "network_role_apply_thread", None) is None:
+                self.panel.network_role_operation = None
+            else:
+                operation["phase"] = "COMPLETE_NO_RECONNECT"
+            return
+
+        operation["owned_after_by_interface"] = owned_by_interface
+        self._apply_role_assignment_state(
+            plan.after_assignments,
+            candidate=dict(operation.get("candidate") or {}),
+        )
+        self.panel._save_current_settings()
+        for role in (NETWORK_ROLE_P1, NETWORK_ROLE_P2):
+            side = self._side_for_role(role)
+            assignment = self.panel.network_role_assignments.get(role, {})
+            self.panel.pixhawk_network_assignment_status[side] = {
+                "state": "ASSIGNED · PRESS CONNECT",
+                "detail": str(assignment.get("interface") or ""),
+            }
+        self._set_network_role_status(
+            "APPLIED",
+            "network role applied; Pixhawk remains disconnected until Connect",
+        )
+        if getattr(self.panel, "network_role_apply_thread", None) is None:
+            self.panel.network_role_operation = None
+        else:
+            operation["phase"] = "COMPLETE_NO_RECONNECT"
+
+    def _restart_network_role_active_owners(self, operation: dict[str, object]) -> None:
+        if NETWORK_ROLE_CAMERA in tuple(operation.get("active_roles") or ()):
+            camera_running = bool(
+                getattr(self.panel, "camera_connected", False)
+                or getattr(self.panel.left_pane, "worker", None)
+                or getattr(self.panel.right_pane, "worker", None)
+            )
+            if not camera_running and not bool(operation.get("camera_restart_started", False)):
+                operation["camera_restart_started"] = True
+                self.panel.connect_cameras()
+        QtCore.QTimer.singleShot(0, self.panel._continue_network_role_reconnect)
+
+    def _continue_network_role_reconnect(self) -> None:
+        operation = getattr(self.panel, "network_role_operation", None)
+        if not isinstance(operation, dict) or str(operation.get("phase")) not in {
+            "RECONNECTING",
+            "ROLLBACK_RECONNECTING",
+            "RESTORING OWNERS",
+        }:
+            return
+        queue = operation.get("reconnect_queue")
+        if isinstance(queue, list):
+            queue.clear()
+        self._set_network_role_status(
+            "APPLIED · PRESS CONNECT",
+            "automatic Pixhawk reconnect is disabled",
+        )
+        self.panel.network_role_operation = None
+
+    def _network_role_device_evidence_ready(self, operation: dict[str, object]) -> bool:
+        active_roles = tuple(operation.get("active_roles") or ())
+        if NETWORK_ROLE_CAMERA in active_roles:
+            if not bool(getattr(self.panel, "camera_connected", False)):
+                return False
+            frame_times = getattr(self.panel, "camera_frame_times", {}) or {}
+            for side in tuple(operation.get("camera_active_sides") or ("left", "right")):
+                if not bool(frame_times.get(side)):
+                    return False
+        for role in active_roles:
+            side = self._side_for_role(str(role))
+            if side is None:
+                continue
+            subscriber = getattr(self.panel, "mavlink_pixhawk", None)
+            health_reader = getattr(subscriber, "mavlink_health_snapshot", None)
+            if not callable(health_reader):
+                if side not in self.panel._mavlink_connected_sides():
+                    return False
+                continue
+            try:
+                health = health_reader(side)
+            except Exception:
+                return False
+            expected = 1 if side == "left" else 2
+            if not bool(getattr(health, "identity_verified", False)):
+                return False
+            if int(getattr(health, "observed_system_id", 0) or 0) != expected:
+                return False
+            heartbeat_age = getattr(health, "heartbeat_rx_age_s", None)
+            attitude_age = getattr(health, "attitude_rx_age_s", None)
+            if heartbeat_age is None or attitude_age is None:
+                return False
+            if float(heartbeat_age) > 3.0 or float(attitude_age) > 2.0:
+                return False
+        queue = operation.get("reconnect_queue")
+        return not isinstance(queue, list) or not queue
+
+    def _poll_network_role_reconnect(self) -> None:
+        operation = getattr(self.panel, "network_role_operation", None)
+        if not isinstance(operation, dict):
+            return
+        phase = str(operation.get("phase") or "")
+        if phase not in {"RECONNECTING", "ROLLBACK_RECONNECTING", "RESTORING OWNERS"}:
+            return
+        queue = operation.get("reconnect_queue")
+        if isinstance(queue, list) and queue and self.panel.pixhawk_connection_thread is None:
+            self._continue_network_role_reconnect()
+            return
+        if self._network_role_device_evidence_ready(operation):
+            if phase == "RECONNECTING":
+                self.panel._save_current_settings()
+                for role in (NETWORK_ROLE_P1, NETWORK_ROLE_P2):
+                    side = self._side_for_role(role)
+                    assignment = self.panel.network_role_assignments.get(role, {})
+                    self.panel.pixhawk_network_assignment_status[side] = {
+                        "state": "ASSIGNED",
+                        "detail": str(assignment.get("interface") or ""),
+                    }
+                self._set_network_role_status("APPLIED", "selected NIC role and device evidence verified")
+            elif phase == "ROLLBACK_RECONNECTING":
+                self._set_network_role_status("ROLLED BACK", str(operation.get("failure_reason") or "move failed"))
+            else:
+                self._set_network_role_status("ERROR", str(operation.get("failure_reason") or "role apply failed"))
+            self.panel.network_role_operation = None
+            return
+        if time.monotonic() >= float(operation.get("deadline_s") or 0.0):
+            if phase == "RECONNECTING":
+                self._begin_network_role_rollback("device evidence timeout on selected NIC")
+            else:
+                self._set_network_role_status("ROLLBACK PARTIAL", str(operation.get("failure_reason") or "owner restore timeout"))
+                self.panel.network_role_operation = None
+            return
+        QtCore.QTimer.singleShot(100, self.panel._continue_network_role_reconnect)
+
+    def _begin_network_role_rollback(self, reason: str) -> None:
+        operation = getattr(self.panel, "network_role_operation", None)
+        if not isinstance(operation, dict):
+            return
+        operation["failure_reason"] = str(reason)
+        operation["phase"] = "ROLLBACK_STOPPING"
+        operation["deadline_s"] = time.monotonic() + 12.0
+        self._set_network_role_status("ROLLING BACK", reason)
+        active_roles = tuple(operation.get("active_roles") or ())
+        if NETWORK_ROLE_CAMERA in active_roles and bool(
+            getattr(self.panel, "camera_connected", False)
+            or getattr(self.panel.left_pane, "worker", None)
+            or getattr(self.panel.right_pane, "worker", None)
+        ):
+            self.panel.stop_yolo_streams()
+        open_sides = self.panel._mavlink_open_sides()
+        pix_sides = [
+            side
+            for role in active_roles
+            if (side := self._side_for_role(str(role))) is not None and side in open_sides
+        ]
+        if pix_sides:
+            self.panel.disconnect_mavlink_pixhawk(None if len(pix_sides) == 2 else pix_sides[0])
+        QtCore.QTimer.singleShot(50, self.panel._continue_network_role_rollback)
+
+    def _continue_network_role_rollback(self) -> None:
+        operation = getattr(self.panel, "network_role_operation", None)
+        if not isinstance(operation, dict) or operation.get("phase") != "ROLLBACK_STOPPING":
+            return
+        active_roles = tuple(operation.get("active_roles") or ())
+        if not self._network_role_owners_stopped(active_roles):
+            if time.monotonic() >= float(operation.get("deadline_s") or 0.0):
+                self._set_network_role_status("ROLLBACK PARTIAL", "could not stop new owners for rollback")
+                self.panel.network_role_operation = None
+                return
+            QtCore.QTimer.singleShot(50, self.panel._continue_network_role_rollback)
+            return
+        plan = operation.get("plan")
+        if not isinstance(plan, NetworkRoleMovePlan):
+            self._set_network_role_status("ROLLBACK PARTIAL", "missing move plan")
+            self.panel.network_role_operation = None
+            return
+        requests = self._network_role_requests(
+            plan,
+            target_stable_id=str(operation.get("target_stable_id") or ""),
+            after=False,
+            owned_by_interface=dict(operation.get("owned_after_by_interface") or {}),
+        )
+        operation["phase"] = "ROLLBACK_APPLYING"
+        self._start_network_role_worker(requests, mode="rollback")
+
+    def _network_role_apply_failed(self, error: str) -> None:
+        operation = getattr(self.panel, "network_role_operation", None)
+        if not isinstance(operation, dict):
+            self._set_network_role_status("ERROR", error)
+            return
+        mode = str(operation.get("worker_mode") or "apply")
+        operation["failure_reason"] = str(error)
+        if mode == "rollback":
+            self._set_network_role_status("ROLLBACK PARTIAL", error)
+            if getattr(self.panel, "network_role_apply_thread", None) is None:
+                self.panel.network_role_operation = None
+            else:
+                operation["phase"] = "COMPLETE_NO_RECONNECT"
+            return
+        self._set_network_role_status(
+            "ERROR",
+            f"{error}; Pixhawk remains disconnected until Connect",
+        )
+        if getattr(self.panel, "network_role_apply_thread", None) is None:
+            self.panel.network_role_operation = None
+        else:
+            operation["phase"] = "COMPLETE_NO_RECONNECT"
+
+    def _clear_network_role_apply_worker(self) -> None:
+        self.panel.network_role_apply_thread = None
+        self.panel.network_role_apply_worker = None
+        operation = getattr(self.panel, "network_role_operation", None)
+        if isinstance(operation, dict) and operation.get("phase") == "COMPLETE_NO_RECONNECT":
+            self.panel.network_role_operation = None
+        self.panel._refresh_session_toggle_buttons()
+
+    def assign_pixhawk_network_candidate(self, candidate_id: str, side: str) -> bool:
+        side = str(side)
+        if side not in {"left", "right"}:
+            self.panel._log(f"[픽스호크] NIC 후보 적용 대상이 올바르지 않습니다: {side}")
+            return False
+        if self.panel._session_recording_active():
+            self.panel._log("[픽스호크] 데이터 기록 중에는 P1/P2 NIC 배정을 변경할 수 없습니다.")
+            return False
+        candidates = self.panel._pixhawk_candidate_rows_by_source.get("network", [])
+        candidate = next(
+            (
+                dict(row)
+                for row in candidates
+                if str(row.get("candidate_id") or "") == str(candidate_id)
+            ),
+            None,
+        )
+        if candidate is None:
+            self.panel._log("[픽스호크] 선택한 NIC 후보가 최신 탐색 결과에 없습니다. Find network를 다시 실행하세요.")
+            return False
+        if hasattr(self.panel, "network_role_assignments"):
+            return self.request_network_role_assignment(
+                self._role_for_side(side),
+                candidate,
+            )
+        if side in self.panel._mavlink_open_sides():
+            self.panel._pending_pixhawk_network_assignment[side] = candidate
+            self.panel.pixhawk_network_assignment_status[side] = {
+                "state": "DISCONNECTING TO REASSIGN",
+                "detail": str(candidate.get("interface") or ""),
+            }
+            self.panel._log(
+                f"[픽스호크] {self.panel._px4_mag_camera_label(side)} 기존 연결을 해제한 뒤 "
+                "새 NIC+endpoint 배정을 저장합니다."
+            )
+            self.panel.disconnect_mavlink_pixhawk(side)
+            return True
+        return self._commit_pixhawk_network_assignment(side, candidate)
+
+    def _commit_pixhawk_network_assignment(
+        self, side: str, candidate: dict[str, object]
+    ) -> bool:
+        side = str(side)
+        prefix = "p1" if side == "left" else "p2"
+        endpoint = str(candidate.get(f"{prefix}_endpoint") or "").strip()
+        interface_name = str(candidate.get("interface") or "").strip()
+        local_address = str(candidate.get("local_ip") or "").strip()
+        if not interface_name or not endpoint:
+            self.panel.pixhawk_network_assignment_status[side] = {
+                "state": "ASSIGN FAILED",
+                "detail": "candidate interface or endpoint is missing",
+            }
+            return False
+        old_assignment = dict(self.panel.pixhawk_network_assignments.get(side) or {})
+        old_status = dict(self.panel.pixhawk_network_assignment_status.get(side) or {})
+        self.panel.pixhawk_network_assignments[side] = {
+            "interface": interface_name,
+            "local_address": local_address,
+        }
+        endpoint_edit = (
+            self.panel.left_mavlink_url_edit if side == "left" else self.panel.right_mavlink_url_edit
+        )
+        old_endpoint = endpoint_edit.text()
+        endpoint_edit.setText(endpoint)
+        route_state = str(candidate.get(f"{prefix}_route_state") or "NO ROUTE")
+        self.panel.pixhawk_network_assignment_status[side] = {
+            "state": "ASSIGNED" if route_state == "ROUTE OK" else route_state,
+            "detail": str(candidate.get(f"{prefix}_route") or ""),
+        }
+        self.panel._sync_mavlink_subscriber_settings()
+        try:
+            self.panel._save_current_settings()
+        except Exception as exc:
+            self.panel.pixhawk_network_assignments[side] = old_assignment
+            endpoint_edit.setText(old_endpoint)
+            self.panel.pixhawk_network_assignment_status[side] = {
+                "state": "ASSIGN FAILED",
+                "detail": f"settings save failed: {exc}",
+                "previous_state": str(old_status.get("state") or ""),
+            }
+            self.panel._sync_mavlink_subscriber_settings()
+            self.panel._log(
+                f"[픽스호크] {self.panel._px4_mag_camera_label(side)} NIC 배정 저장 실패; "
+                f"기존 배정을 유지합니다: {exc}"
+            )
+            return False
+        label = self.panel._px4_mag_camera_label(side)
+        self.panel._log(
+            f"[픽스호크] {label} NIC+endpoint 배정 저장: {interface_name} "
+            f"{local_address or '--'} · {endpoint} · route={route_state}"
+        )
+        self.panel.pixhawk_connection_label.setText(
+            f"{label} assigned: {interface_name} {local_address or '--'} · Connect를 누르세요"
+        )
+        self.panel._refresh_operation_header()
+        return True
+
+    def _pixhawk_network_preflight(
+        self,
+        side: str,
+        *,
+        peer_override: str | None = None,
+        endpoint_override: str | None = None,
+    ) -> PixhawkAssignmentValidation:
+        side = str(side)
+        assignment = (
+            getattr(self.panel, "pixhawk_network_assignments", {}).get(side) or {}
+        )
+        if side == "left":
+            endpoint = self.panel.left_mavlink_url_edit.text().strip()
+            peer = self.panel.left_pixhawk_eth_ip_edit.text().strip()
+        elif side == "right":
+            endpoint = self.panel.right_mavlink_url_edit.text().strip()
+            peer = self.panel.right_pixhawk_eth_ip_edit.text().strip()
+        elif side == "drone":
+            endpoint = str(getattr(self.panel, "drone_telemetry_url", "") or "").strip()
+            peer = str(getattr(self.panel, "drone_pixhawk_eth_ip", "") or "").strip()
+        else:
+            return PixhawkAssignmentValidation(False, "UNKNOWN ROLE", side)
+        if peer_override is not None:
+            peer = str(peer_override).strip()
+        if endpoint_override is not None:
+            endpoint = str(endpoint_override).strip()
+        validation = validate_pixhawk_network_assignment(
+            interface_name=str(assignment.get("interface") or ""),
+            local_address=str(assignment.get("local_address") or ""),
+            peer_host=peer,
+            endpoint=endpoint,
+        )
+        statuses = getattr(self.panel, "pixhawk_network_assignment_status", None)
+        if not isinstance(statuses, dict):
+            statuses = {}
+            self.panel.pixhawk_network_assignment_status = statuses
+        statuses[side] = {
+            "state": validation.state,
+            "detail": validation.detail,
+        }
+        return validation
+
+    def _pixhawk_selected_transport(self, side: str) -> str:
+        side = str(side)
+        if side not in {"left", "right", "drone"}:
+            raise ValueError(f"Unknown Pixhawk role: {side}")
+        attribute = f"{side}_pixhawk_transport"
+        if hasattr(self.panel, attribute):
+            raw_value = getattr(self.panel, attribute)
+        elif hasattr(getattr(self.panel, "settings", None), attribute):
+            raw_value = getattr(self.panel.settings, attribute)
+        else:
+            # Compatibility for focused controller doubles created before the
+            # transport schema. Production panels always carry the migrated
+            # explicit Radio default.
+            raw_value = "ethernet"
+        value = str(raw_value or "radio").strip().lower()
+        return value if value in {"radio", "ethernet", "usb"} else "radio"
+
+    def _pixhawk_transport_is_serial(self, side: str) -> bool:
+        """Radio and USB both own one exclusive serial device path."""
+
+        return self._pixhawk_selected_transport(side) in {"radio", "usb"}
+
+    def _pixhawk_usb_endpoint(self, side: str) -> str:
+        """Read the USB serial path from the bootstrap widget it is edited in.
+
+        USB transport shares the bootstrap endpoint that recovery and firmware
+        work already use, so there is one device path per board to keep current.
+        """
+
+        widget = getattr(self.panel, f"{side}_pixhawk_bootstrap_url_edit", None)
+        reader = getattr(widget, "text", None)
+        if callable(reader):
+            return str(reader()).strip()
+        return str(getattr(self.panel, f"{side}_pixhawk_bootstrap_url", "") or "").strip()
+
+    def _pixhawk_usb_baud(self, side: str) -> int:
+        widget = getattr(self.panel, f"{side}_pixhawk_bootstrap_baud_spin", None)
+        reader = getattr(widget, "value", None)
+        if callable(reader):
+            return int(reader())
+        return int(getattr(self.panel, f"{side}_pixhawk_bootstrap_baud", 57_600))
+
+    def _pixhawk_selected_endpoint(self, side: str) -> str:
+        side = str(side)
+        transport = self._pixhawk_selected_transport(side)
+        if transport == "radio":
+            return str(getattr(self.panel, f"{side}_pixhawk_radio_device", "") or "").strip()
+        if transport == "usb":
+            return self._pixhawk_usb_endpoint(side)
+        if side == "left":
+            return self.panel.left_mavlink_url_edit.text().strip()
+        if side == "right":
+            return self.panel.right_mavlink_url_edit.text().strip()
+        return str(getattr(self.panel, "drone_telemetry_url", "") or "").strip()
+
+    def _pixhawk_selected_baud(self, side: str) -> int:
+        side = str(side)
+        transport = self._pixhawk_selected_transport(side)
+        if transport == "radio":
+            return int(getattr(self.panel, f"{side}_pixhawk_radio_baud", 57_600))
+        if transport == "usb":
+            return self._pixhawk_usb_baud(side)
+        if side == "left":
+            return int(self.panel.left_mavlink_baud_spin.value())
+        if side == "right":
+            return int(self.panel.right_mavlink_baud_spin.value())
+        return int(getattr(self.panel, "drone_telemetry_baud", 57_600))
+
+    def _pixhawk_serial_preflight(self, side: str) -> PixhawkAssignmentValidation:
+        label = "USB" if self._pixhawk_selected_transport(side) == "usb" else "RADIO"
+        endpoint = self._pixhawk_selected_endpoint(side)
+        if not endpoint:
+            return PixhawkAssignmentValidation(
+                False,
+                f"{label} DEVICE MISSING",
+                f"{label} device is empty; select a discovered candidate and press Connect",
+            )
+        path = Path(endpoint)
+        if not path.exists():
+            return PixhawkAssignmentValidation(
+                False,
+                f"{label} DEVICE MISSING",
+                f"{endpoint} is not present; select an available candidate",
+            )
+        subscriber = getattr(self.panel, "mavlink_pixhawk", None)
+        if subscriber is not None:
+            urls = getattr(subscriber, "urls", {})
+            connections = getattr(subscriber, "connections", {})
+            for other in ("left", "right", "drone"):
+                if other != side and other in connections and str(urls.get(other) or "") == endpoint:
+                    return PixhawkAssignmentValidation(
+                        False,
+                        f"{label} DEVICE BUSY",
+                        f"{endpoint} is already owned by {camera_label_ko(other)}",
+                    )
+        return PixhawkAssignmentValidation(True, f"{label} READY", endpoint)
+
+    def _pixhawk_connect_preflight_sides(
+        self, pending_sides: Sequence[str]
+    ) -> tuple[tuple[str, ...], dict[str, str]]:
+        connect_sides: list[str] = []
+        preflight_errors: dict[str, str] = {}
+        for side in pending_sides:
+            validation = (
+                self._pixhawk_serial_preflight(side)
+                if self._pixhawk_transport_is_serial(side)
+                else self._pixhawk_network_preflight(side)
+            )
+            if validation.ok:
+                connect_sides.append(str(side))
+                continue
+            error = f"{validation.state}: {validation.detail}"
+            preflight_errors[str(side)] = error
+            self._publish_measurement_source(f"pixhawk.{side}", "UNAVAILABLE", error)
+            self.panel._log(
+                f"[픽스호크] {self.panel._px4_mag_camera_label(side)} Connect preflight 실패: {error}"
+            )
+        return tuple(connect_sides), preflight_errors
+
+    def _append_pixhawk_host_ip_candidates(self, interfaces: Sequence[object]) -> None:
+        hints: list[IPv4Address] = []
+        for text in (
+            self.panel.left_pixhawk_eth_ip_edit.text().strip(),
+            self.panel.right_pixhawk_eth_ip_edit.text().strip(),
+            *self.panel._active_mavlink_remote_hosts(),
+        ):
+            if not text:
+                continue
+            try:
+                hints.append(IPv4Address(str(text).split("/", 1)[0]))
+            except ValueError:
+                continue
+        rows: list[dict[str, object]] = []
+        seen: set[tuple[str, str]] = set()
+        for candidate in interfaces:
+            ip_text = str(candidate.address.ip)
+            interface_name = str(getattr(candidate, "name", ""))
+            key = (interface_name, ip_text)
+            if key in seen:
+                continue
+            seen.add(key)
+            matching_hints = [str(hint) for hint in hints if hint in candidate.address.network]
+            status_parts = [str(candidate.address.network)]
+            if matching_hints:
+                status_parts.append("Pixhawk subnet match: " + ", ".join(matching_hints))
+            if interface_name.startswith(("wl", "wlan")):
+                status_parts.append("Wi-Fi")
+            else:
+                status_parts.append("wired/other")
+            rows.append(
+                {
+                    "kind": "PC_IP",
+                    "value": ip_text,
+                    "baud": "",
+                    "status": " | ".join(status_parts),
+                    "interface": interface_name,
+                }
+            )
+        if rows:
+            self.panel._append_pixhawk_candidate_rows(rows, source="pc")
+            for row in rows:
+                self.panel._log(
+                    f"[픽스호크] PC IP 후보: {row['interface']} {row['value']} "
+                    f"({row['status']})"
+                )
+
+    def apply_pc_camera_ip(self) -> None:
+        if self.panel.camera_network_apply_thread is not None:
+            self.panel._log("[연결] PC IP 적용이 이미 진행 중입니다.")
+            return
+        interface_name = self.panel.interface_edit.text().strip()
+        address_text = self.panel.host_address_edit.text().strip()
+        if not interface_name or not address_text:
+            self.panel._log("[연결] PC IP 적용 실패: 인터페이스와 주소를 먼저 지정하세요.")
+            self.panel.camera_connection_label.setText("camera host IP: missing")
+            return
+        if hasattr(self.panel, "network_role_assignments"):
+            self.request_network_role_assignment(
+                NETWORK_ROLE_CAMERA,
+                {
+                    "kind": "NETWORK",
+                    "interface": interface_name,
+                    "local_cidr": address_text,
+                    "candidate_id": f"camera:{interface_name}",
+                },
+            )
+            return
+        self.panel._log(f"[연결] PC IP 적용 시도: {interface_name} {address_text}")
+        self.panel.apply_pc_ip_button.setEnabled(False)
+        self.panel.camera_connection_label.setText("camera host IP: applying...")
+        self.panel.camera_network_apply_thread = QtCore.QThread(self.panel)
+        self.panel.camera_network_apply_worker = CameraNetworkAddressApplyWorker(
+            interface_name=interface_name,
+            address_text=address_text,
+        )
+        self.panel.camera_network_apply_worker.moveToThread(self.panel.camera_network_apply_thread)
+        self.panel.camera_network_apply_thread.started.connect(self.panel.camera_network_apply_worker.run)
+        self.panel.camera_network_apply_worker.applied.connect(self.panel._apply_camera_network_address_result)
+        self.panel.camera_network_apply_worker.failed.connect(self.panel._camera_network_apply_failed)
+        self.panel.camera_network_apply_worker.finished.connect(self.panel.camera_network_apply_thread.quit)
+        self.panel.camera_network_apply_worker.finished.connect(self.panel.camera_network_apply_worker.deleteLater)
+        self.panel.camera_network_apply_thread.finished.connect(self.panel.camera_network_apply_thread.deleteLater)
+        self.panel.camera_network_apply_thread.finished.connect(self.panel._clear_camera_network_apply)
+        self.panel.camera_network_apply_thread.start()
+
+    def _apply_camera_network_address_result(self, result: object) -> None:
+        data = dict(result or {})
+        interface_name = str(data.get("interface_name") or self.panel.interface_edit.text().strip())
+        address_text = str(data.get("address_text") or self.panel.host_address_edit.text().strip())
+        if not bool(data.get("ok")):
+            message = str(data.get("message") or "unknown error")
+            self.panel._log(f"[연결] PC IP 적용 실패: {message}")
+            self.panel.camera_connection_label.setText("camera host IP: apply failed")
+            self.panel._refresh_operation_header()
+            return
+        self.panel._log(f"[연결] PC IP 적용 완료: {data.get('message', '')}")
+        addresses = str(data.get("addresses") or "")
+        if addresses:
+            self.panel._log(f"[연결] 네트워크 인터페이스 상태:\n{addresses}")
+        self.panel.interface_edit.setText(interface_name)
+        self.panel.host_address_edit.setText(address_text)
+        self.panel._save_current_settings()
+        self.panel.camera_connection_label.setText(f"camera host IP: applied {address_text}")
+        self.panel._refresh_operation_header()
+
+    def _camera_network_apply_failed(self, error: str) -> None:
+        self.panel._log(f"[연결] PC IP 적용 worker 실패: {error}")
+        self.panel.camera_connection_label.setText(f"camera host IP: failed ({error})")
+        self.panel._refresh_operation_header()
+
+    def _clear_camera_network_apply(self) -> None:
+        self.panel.camera_network_apply_thread = None
+        self.panel.camera_network_apply_worker = None
+        self.panel.apply_pc_ip_button.setEnabled(True)
+
+    def _update_mavlink_optional_timeline(self, camera: str, payload: dict[str, object]) -> None:
+        sample_type = str(payload.get("sample_type") or "mavlink_status")
+        values = {key: value for key, value in payload.items() if key != "sample_type"}
+        self.panel._record_external_timeline_row(camera, sample_type, values)
+
+    def _mavlink_connected_sides(self) -> set[str]:
+        if self.panel.mavlink_pixhawk is None:
+            return set()
+        subscriber = self.panel.mavlink_pixhawk
+        connections = getattr(subscriber, "connections", {})
+        health_reader = getattr(subscriber, "mavlink_health_snapshot", None)
+        if callable(health_reader):
+            connected: set[str] = set()
+            for side in ("left", "right", "drone"):
+                if side not in connections:
+                    continue
+                try:
+                    health = health_reader(side)
+                except Exception:
+                    continue
+                if bool(getattr(health, "identity_verified", False)) and bool(
+                    getattr(health, "command_eligible", False)
+                ):
+                    connected.add(side)
+            return connected
+        heartbeat_sides = getattr(subscriber, "_heartbeat_logged", set())
+        try:
+            return {
+                side
+                for side in ("left", "right", "drone")
+                if side in connections and side in heartbeat_sides
+            }
+        except TypeError:
+            return set()
+
+    def _mavlink_open_sides(self) -> set[str]:
+        if self.panel.mavlink_pixhawk is None:
+            return set()
+        connections = getattr(self.panel.mavlink_pixhawk, "connections", {})
+        try:
+            return {side for side in ("left", "right", "drone") if side in connections}
+        except TypeError:
+            return set()
+
+    def _refresh_mavlink_side_actions(self) -> None:
+        connected_sides = self.panel._mavlink_connected_sides()
+        self.panel.left_px4_shell_button.setEnabled("left" in connected_sides)
+        self.panel.right_px4_shell_button.setEnabled("right" in connected_sides)
+        self.panel.left_persist_eth_button.setEnabled("left" in connected_sides)
+        self.panel.right_persist_eth_button.setEnabled("right" in connected_sides)
+        self.panel.left_reboot_pixhawk_button.setEnabled("left" in connected_sides)
+        self.panel.right_reboot_pixhawk_button.setEnabled("right" in connected_sides)
+
+    def _mavlink_target_sides(self, camera: str | None) -> tuple[str, ...]:
+        if camera is None:
+            return ("left", "right", "drone")
+        if camera not in {"left", "right", "drone"}:
+            raise ValueError(f"Unknown Pixhawk side: {camera}")
+        return (camera,)
+
+    def _sync_mavlink_subscriber_settings(self) -> None:
+        if self.panel.mavlink_pixhawk is None:
+            return
+        if hasattr(self.panel.mavlink_pixhawk, "urls"):
+            for side in ("left", "right", "drone"):
+                self.panel.mavlink_pixhawk.urls[side] = self._pixhawk_selected_endpoint(side)
+        if hasattr(self.panel.mavlink_pixhawk, "baudrates"):
+            for side in ("left", "right", "drone"):
+                self.panel.mavlink_pixhawk.baudrates[side] = self._pixhawk_selected_baud(side)
+        if hasattr(self.panel.mavlink_pixhawk, "peer_hosts"):
+            self.panel.mavlink_pixhawk.peer_hosts["left"] = (
+                self.panel.left_pixhawk_eth_ip_edit.text().strip()
+            )
+            self.panel.mavlink_pixhawk.peer_hosts["right"] = (
+                self.panel.right_pixhawk_eth_ip_edit.text().strip()
+            )
+            self.panel.mavlink_pixhawk.peer_hosts["drone"] = str(
+                getattr(self.panel, "drone_pixhawk_eth_ip", "") or ""
+            ).strip()
+        setter = getattr(self.panel.mavlink_pixhawk, "set_transport", None)
+        if callable(setter):
+            for side in ("left", "right", "drone"):
+                setter(side, self._pixhawk_selected_transport(side))
+
+    def _ensure_mavlink_subscriber(self) -> DualPixhawkMavlinkSubscriber:
+        if self.panel.mavlink_pixhawk is None:
+            self.panel.mavlink_pixhawk = DualPixhawkMavlinkSubscriber(
+                left_url=self._pixhawk_selected_endpoint("left"),
+                right_url=self._pixhawk_selected_endpoint("right"),
+                drone_url=self._pixhawk_selected_endpoint("drone"),
+                left_baud=self._pixhawk_selected_baud("left"),
+                right_baud=self._pixhawk_selected_baud("right"),
+                drone_baud=self._pixhawk_selected_baud("drone"),
+                custom_watches=tuple(self.panel.custom_watch_specs),
+                peer_hosts={
+                    "left": self.panel.left_pixhawk_eth_ip_edit.text().strip(),
+                    "right": self.panel.right_pixhawk_eth_ip_edit.text().strip(),
+                    "drone": str(getattr(self.panel, "drone_pixhawk_eth_ip", "") or "").strip(),
+                },
+                transports={
+                    side: self._pixhawk_selected_transport(side)
+                    for side in ("left", "right", "drone")
+                },
+            )
+            self.panel.mavlink_pixhawk.extrinsic_changed.connect(self.panel._update_extrinsic)
+            self.panel.mavlink_pixhawk.gps_changed.connect(self.panel._update_gps)
+            self.panel.mavlink_pixhawk.mag_sensor_changed.connect(self.panel._update_mag_sensor)
+            self.panel.mavlink_pixhawk.gps_sensor_changed.connect(self.panel._update_gps_sensor)
+            self.panel.mavlink_pixhawk.gnss_relative_changed.connect(self.panel._update_gnss_relative)
+            self.panel.mavlink_pixhawk.custom_watch_changed.connect(self.panel._update_custom_watch)
+            optional_timeline_changed = getattr(self.panel.mavlink_pixhawk, "optional_timeline_changed", None)
+            if optional_timeline_changed is not None:
+                optional_timeline_changed.connect(self.panel._update_mavlink_optional_timeline)
+            _connect_gui_signal(
+                self.panel.mavlink_pixhawk.shell_output,
+                self.panel._append_px4_shell_output,
+            )
+            _connect_gui_signal(
+                self.panel.mavlink_pixhawk.status_changed,
+                self.panel._handle_mavlink_status_changed,
+            )
+        else:
+            self.panel._sync_mavlink_subscriber_settings()
+        return self.panel.mavlink_pixhawk
+
+    def _handle_mavlink_status_changed(self, text: str) -> None:
+        self.panel._log(f"[픽스호크] {text}")
+        # The connect worker emits progress after inserting its socket but
+        # before its completion callback starts the GUI-owned receive timer.
+        # Defer the visual refresh so the connect worker's receive queue can
+        # drain before Qt repaints the side actions.
+        self.panel._schedule_mavlink_status_ui_refresh()
+
+    def _schedule_mavlink_status_ui_refresh(self) -> None:
+        if bool(getattr(self.panel, "_mavlink_status_ui_refresh_pending", False)):
+            return
+        self.panel._mavlink_status_ui_refresh_pending = True
+        QtCore.QTimer.singleShot(0, self.panel._flush_mavlink_status_ui_refresh)
+
+    def _flush_mavlink_status_ui_refresh(self) -> None:
+        self.panel._mavlink_status_ui_refresh_pending = False
+        self.panel._refresh_mavlink_side_actions()
+
+    def _configured_mavlink_sides(self) -> tuple[str, ...]:
+        return tuple(
+            side
+            for side in ("left", "right", "drone")
+            if self._pixhawk_selected_endpoint(side)
+        )
+
+    def _mavlink_setup_target_sides(self, target_sides: tuple[str, ...]) -> set[str]:
+        configured = set(self.panel._configured_mavlink_sides())
+        connected = self.panel._mavlink_connected_sides()
+        return {side for side in target_sides if side in configured or side in connected}
+
+    def _apply_mavlink_pixhawk_setup(self, subscriber: DualPixhawkMavlinkSubscriber, target_sides: tuple[str, ...]) -> None:
+        # Compatibility facade only. Connection callbacks never call this;
+        # an explicit manual command owns persistent MAV_2 setup.
+        self.apply_manual_mavlink_stream_setup(target_sides)
+
+    def apply_manual_mavlink_stream_setup(
+        self,
+        cameras: Sequence[str] | None = None,
+    ) -> bool:
+        subscriber = self.panel.mavlink_pixhawk
+        if subscriber is None:
+            return False
+        requested = tuple(cameras or ("left", "right", "drone"))
+        target_sides = tuple(
+            side
+            for side in requested
+            if side in getattr(subscriber, "connections", {})
+            and self._pixhawk_selected_transport(side) == "ethernet"
+        )
+        if not target_sides:
+            self.panel._log(
+                "[픽스호크] 수동 MAV_2 설정 대상이 없습니다. 연결된 Ethernet 보드를 선택하세요."
+            )
+            return False
+        for side in target_sides:
+            self._log_pixhawk_admin_start(side, "persistent_ethernet_setup")
+        return self.panel._start_pixhawk_stream_setup_worker(subscriber, target_sides)
+
+    def _start_pixhawk_stream_setup_worker(
+        self,
+        subscriber: DualPixhawkMavlinkSubscriber | None = None,
+        cameras: Sequence[str] = (),
+    ) -> bool:
+        subscriber = subscriber or self.panel.mavlink_pixhawk
+        if subscriber is None:
+            return False
+        if self.panel.pixhawk_stream_setup_thread is not None:
+            self.panel._log("[픽스호크] MAVLink stream 설정이 이미 진행 중입니다.")
+            return False
+        target_sides = tuple(str(side) for side in cameras if str(side) in getattr(subscriber, "connections", {}))
+        if not target_sides:
+            return False
+        thread = QtCore.QThread(self.panel)
+        worker = PixhawkStreamSetupWorker(
+            subscriber,
+            host_ip=self.panel.pixhawk_host_address_edit.text().strip(),
+            ports={
+                "left": self.panel._mavlink_stream_port(self.panel.left_mavlink_url_edit.text().strip(), default=14550),
+                "right": self.panel._mavlink_stream_port(self.panel.right_mavlink_url_edit.text().strip(), default=14551),
+                "drone": self.panel._mavlink_stream_port(
+                    str(getattr(self.panel, "drone_telemetry_url", "") or ""),
+                    default=14552,
+                ),
+            },
+            sysids={"left": 1, "right": 2, "drone": 3},
+            rate=self.panel.mavlink_stream_rate_spin.value(),
+            cameras=target_sides,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(
+            lambda result: self.panel._log(
+                f"[픽스호크] MAVLink stream 설정 완료: {', '.join(target_sides)} "
+                f"host={result.get('host_ip', '')}"
+            )
+        )
+        worker.failed.connect(lambda error: self.panel._log(f"[픽스호크] MAVLink stream 설정 실패: {error}"))
+        _wire_worker_thread_cleanup(worker, thread)
+        thread.finished.connect(self.panel._clear_pixhawk_stream_setup_worker)
+        self.panel.pixhawk_stream_setup_thread = thread
+        self.panel.pixhawk_stream_setup_worker = worker
+        thread.start()
+        return True
+
+    def _handle_mavlink_stream_setup_required(self, camera: str) -> None:
+        self.panel._log(
+            f"[픽스호크] 자동 persistent setup 요청 무시: {camera}; 수동 명령을 사용하세요."
+        )
+
+    def _clear_pixhawk_stream_setup_worker(self) -> None:
+        self.panel.pixhawk_stream_setup_thread = None
+        self.panel.pixhawk_stream_setup_worker = None
+
+    def _set_pixhawk_usb_bootstrap_status(self, camera: str, state: str, detail: str) -> None:
+        statuses = getattr(self.panel, "pixhawk_usb_bootstrap_status", None)
+        if not isinstance(statuses, dict):
+            statuses = {}
+            self.panel.pixhawk_usb_bootstrap_status = statuses
+        statuses[str(camera)] = {
+            "state": str(state).upper(),
+            "detail": str(detail),
+            "updated_s": time.monotonic(),
+        }
+
+    def bootstrap_ethernet_mavlink_from_usb(self, camera: str) -> None:
+        if camera not in {"left", "right"}:
+            raise ValueError(f"Unknown Pixhawk side: {camera}")
+        label = self.panel._px4_mag_camera_label(camera)
+        self._set_pixhawk_usb_bootstrap_status(
+            camera,
+            "RUNNING",
+            "USB shell로 단일 Ethernet MAVLink 설정 저장·재부팅 중",
+        )
+        if camera == "left":
+            usb_url = self.panel.left_pixhawk_bootstrap_url_edit.text().strip()
+            usb_baud = self.panel.left_pixhawk_bootstrap_baud_spin.value()
+        else:
+            usb_url = self.panel.right_pixhawk_bootstrap_url_edit.text().strip()
+            usb_baud = self.panel.right_pixhawk_bootstrap_baud_spin.value()
+        if not usb_url:
+            self._set_pixhawk_usb_bootstrap_status(camera, "ERROR", "USB 부트스트랩 포트가 비어 있습니다.")
+            self.panel._log(f"[픽스호크] {label} ETH MAVLink USB 부트스트랩 실패: USB 부트스트랩 포트가 비어 있습니다.")
+            return
+        try:
+            command = self.panel._ethernet_mavlink_bootstrap_command(camera, mode="normal")
+        except Exception as exc:
+            self._set_pixhawk_usb_bootstrap_status(camera, "ERROR", f"시작 명령 생성 실패: {exc}")
+            self.panel._log(f"[픽스호크] {label} ETH MAVLink USB 부트스트랩 명령 생성 실패: {exc}")
+            return
+        if self.panel.pixhawk_usb_bootstrap_thread is not None:
+            self._set_pixhawk_usb_bootstrap_status(camera, "RUNNING", "다른 USB ETH MAV 시작이 이미 진행 중입니다.")
+            self.panel._log(f"[픽스호크] {label} USB 부트스트랩이 이미 진행 중입니다.")
+            return
+        try:
+            fallback_command = self.panel._ethernet_mavlink_bootstrap_command(camera, mode="onboard")
+        except Exception as exc:
+            self._set_pixhawk_usb_bootstrap_status(camera, "ERROR", f"fallback 명령 생성 실패: {exc}")
+            self.panel._log(f"[픽스호크] {label} ETH MAVLink USB fallback 명령 생성 실패: {exc}")
+            return
+        thread = QtCore.QThread(self.panel)
+        worker = PixhawkUsbBootstrapWorker(
+            camera=camera,
+            usb_url=usb_url,
+            baud_candidates=self.panel._usb_bootstrap_baud_candidates(usb_baud),
+            command=command,
+            fallback_command=fallback_command,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self.panel._apply_pixhawk_usb_bootstrap_result)
+        worker.failed.connect(
+            lambda error, camera=camera, label=label: self._pixhawk_usb_bootstrap_failed(camera, label, error)
+        )
+        _wire_worker_thread_cleanup(worker, thread)
+        thread.finished.connect(self.panel._clear_pixhawk_usb_bootstrap_worker)
+        self.panel.pixhawk_usb_bootstrap_thread = thread
+        self.panel.pixhawk_usb_bootstrap_worker = worker
+        self.panel._log(f"[픽스호크] {label} USB Ethernet MAVLink 부트스트랩을 시작했습니다.")
+        thread.start()
+
+    def _pixhawk_usb_bootstrap_failed(self, camera: str, label: str, error: str) -> None:
+        self._set_pixhawk_usb_bootstrap_status(camera, "ERROR", str(error))
+        self.panel._log(f"[픽스호크] {label} ETH MAVLink USB 부트스트랩 실패: {error}")
+
+    def _apply_pixhawk_usb_bootstrap_result(self, result: object) -> None:
+        data = dict(result or {})
+        camera = str(data.get("camera") or "")
+        if camera not in {"left", "right"}:
+            return
+        selected_baud = int(data.get("baud") or 0)
+        self._set_pixhawk_usb_bootstrap_status(
+            camera,
+            "RECOVERED",
+            "단일 Ethernet MAVLink 설정·재부팅 완료; UDP telemetry 확인 중",
+        )
+        self.panel._set_usb_bootstrap_baud(camera, selected_baud)
+        output = str(data.get("output") or "").strip()
+        if output:
+            self.panel._log(
+                f"[픽스호크 USB] {self.panel._px4_mag_camera_label(camera)} PX4 shell 응답 "
+                f"({data.get('flag_label', '')}): {output[-800:]}"
+            )
+        self.panel._log(
+            f"[픽스호크] {self.panel._px4_mag_camera_label(camera)} USB {selected_baud} baud "
+            "단일-instance 설정·재부팅 명령 완료. Connect를 눌러 확인하세요."
+        )
+        self.panel._save_current_settings()
+
+    def _clear_pixhawk_usb_bootstrap_worker(self) -> None:
+        self.panel.pixhawk_usb_bootstrap_thread = None
+        self.panel.pixhawk_usb_bootstrap_worker = None
+
+    def _set_pixhawk_usb_recovery_status(self, camera: str, state: str, detail: str) -> None:
+        statuses = getattr(self.panel, "pixhawk_usb_recovery_status", None)
+        if not isinstance(statuses, dict):
+            statuses = {}
+            self.panel.pixhawk_usb_recovery_status = statuses
+        statuses[str(camera)] = {
+            "state": str(state).upper(),
+            "detail": str(detail),
+            "updated_s": time.monotonic(),
+        }
+
+    def _pixhawk_usb_recovery_block_reason(self, camera: str) -> str:
+        if camera not in {"left", "right"}:
+            return f"unknown Pixhawk side: {camera}"
+        recording_active = getattr(self.panel, "_session_recording_active", None)
+        if callable(recording_active) and bool(recording_active()):
+            return "measurement recording is active"
+        run_state = str(getattr(self.panel, "_measurement_run_state", "IDLE") or "IDLE").upper()
+        if run_state in {"QUEUED", "STARTING", "RUNNING", "STOPPING"}:
+            return f"Measurement lifecycle is {run_state}"
+        if getattr(self.panel, "_session_save_thread", None) is not None:
+            return "session save/finalization worker is active"
+        if bool(getattr(self.panel, "_measurement_package_finalize_requested", False)):
+            return "measurement package finalization is pending"
+        if bool(getattr(self.panel, "_session_save_retry_required", False)):
+            return "session save recovery is pending"
+        for attribute, label in (
+            ("pixhawk_connection_thread", "Pixhawk connect"),
+            ("pixhawk_disconnection_thread", "Pixhawk disconnect"),
+            ("pixhawk_stream_setup_thread", "PX4 stream setup"),
+            ("pixhawk_usb_bootstrap_thread", "USB Ethernet bootstrap"),
+            ("pixhawk_persistent_config_thread", "PX4 persistent config"),
+            ("pixhawk_usb_discovery_thread", "USB discovery"),
+            ("pixhawk_network_discovery_thread", "network discovery"),
+            ("pixhawk_usb_recovery_thread", "USB recovery"),
+        ):
+            if getattr(self.panel, attribute, None) is not None:
+                return f"{label} is active"
+        for attribute, label in (
+            ("pixhawk_shell_threads", "PX4 shell/reboot command"),
+            ("pixhawk_parameter_threads", "PX4 parameter command"),
+        ):
+            active = getattr(self.panel, attribute, {}) or {}
+            if active:
+                return f"{label} is active"
+        subscriber = getattr(self.panel, "mavlink_pixhawk", None)
+        health_reader = getattr(subscriber, "mavlink_health_snapshot", None)
+        if not callable(health_reader):
+            return "current Ethernet MAVLink liveness evidence is unavailable"
+        try:
+            health = health_reader(camera)
+        except Exception as exc:
+            return f"Ethernet MAVLink liveness read failed: {exc}"
+        state = str(
+            getattr(
+                getattr(health, "state", None),
+                "value",
+                getattr(health, "state", ""),
+            )
+        )
+        if state != "ETH MAVLINK RX STALLED":
+            return f"verified-USB recovery is allowed only for ETH MAVLINK RX STALLED (current={state or 'UNKNOWN'})"
+        return ""
+
+    def _verified_usb_identity_for_side(
+        self,
+        camera: str,
+        *,
+        now_s: float,
+    ) -> tuple[dict[str, object] | None, str]:
+        expected_system_id = 1 if camera == "left" else 2
+        evidence = getattr(self.panel, "pixhawk_usb_identity_evidence", ()) or ()
+        matching: list[dict[str, object]] = []
+        stale_matching = False
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            try:
+                system_id = int(item.get("system_id"))
+            except (TypeError, ValueError):
+                continue
+            if system_id != expected_system_id:
+                continue
+            observed_s = item.get("observed_monotonic_s")
+            try:
+                age_s = max(0.0, now_s - float(observed_s))
+            except (TypeError, ValueError):
+                stale_matching = True
+                continue
+            if age_s > USB_MAVLINK_IDENTITY_MAX_AGE_S:
+                stale_matching = True
+                continue
+            try:
+                baud = int(item.get("baud") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not str(item.get("device") or "") or baud <= 0:
+                continue
+            if item.get("component_id") is None:
+                continue
+            candidate = dict(item)
+            candidate["identity_age_s"] = age_s
+            matching.append(candidate)
+        if len(matching) > 1:
+            return None, f"sysid {expected_system_id} is present on multiple current USB devices"
+        if not matching:
+            if stale_matching:
+                return None, f"sysid {expected_system_id} USB identity evidence is stale"
+            return None, f"no current unique USB heartbeat for sysid {expected_system_id}"
+        return matching[0], ""
+
+    def recover_stalled_pixhawk_via_verified_usb(self, camera: str) -> bool:
+        if camera not in {"left", "right"}:
+            raise ValueError(f"Unknown Pixhawk side: {camera}")
+        label = self.panel._px4_mag_camera_label(camera)
+        blocked = self._pixhawk_usb_recovery_block_reason(camera)
+        if blocked:
+            detail = f"복구 차단: {blocked}"
+            self._set_pixhawk_usb_recovery_status(camera, "ERROR", detail)
+            self.panel._log(f"[픽스호크] {label} verified-USB 복구 차단: {blocked}")
+            return False
+        evidence, error = self._verified_usb_identity_for_side(camera, now_s=time.monotonic())
+        if evidence is None:
+            detail = (
+                f"{error}. Find USB로 identity를 다시 확인하거나 {label}만 수동 전원 재부팅하세요."
+            )
+            self._set_pixhawk_usb_recovery_status(camera, "ERROR", detail)
+            self.panel._log(f"[픽스호크] {label} verified-USB 복구 불가: {detail}")
+            return False
+        expected_system_id = 1 if camera == "left" else 2
+        device = str(evidence.get("device") or "")
+        component_id = int(evidence.get("component_id") or 0)
+        result = QtWidgets.QMessageBox.question(
+            self.panel,
+            f"{label} verified-USB 재부팅",
+            (
+                f"{label} ETH MAVLink 전체 수신 정지를 복구합니다.\n\n"
+                f"USB: {device}\n"
+                f"MAVLink identity: sysid={expected_system_id}, compid={component_id}\n"
+                "이 USB identity를 worker가 즉시 다시 검증한 뒤 해당 Pixhawk에만 재부팅 명령을 보냅니다.\n"
+                "명령 전송은 복구 성공이 아니며 Ethernet heartbeat+ATTITUDE "
+                f"{MAVLINK_QUALIFICATION_S:.0f}초 검증을 다시 시작합니다.\n\n"
+                "계속할까요?"
+            ),
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if result != QtWidgets.QMessageBox.Yes:
+            self._set_pixhawk_usb_recovery_status(camera, "CANCELLED", "operator가 재부팅을 취소했습니다.")
+            self.panel._log(f"[픽스호크] {label} verified-USB 재부팅을 취소했습니다.")
+            return False
+        thread = QtCore.QThread(self.panel)
+        worker = PixhawkUsbRecoveryWorker(
+            camera=camera,
+            evidence=evidence,
+            expected_system_id=expected_system_id,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self.panel._apply_pixhawk_usb_recovery_result)
+        worker.failed.connect(
+            lambda failure, camera=camera: self.panel._pixhawk_usb_recovery_failed(camera, failure)
+        )
+        _wire_worker_thread_cleanup(worker, thread)
+        thread.finished.connect(self.panel._clear_pixhawk_usb_recovery_worker)
+        self.panel.pixhawk_usb_recovery_thread = thread
+        self.panel.pixhawk_usb_recovery_worker = worker
+        self._set_pixhawk_usb_recovery_status(
+            camera,
+            "RUNNING",
+            f"sysid={expected_system_id} USB identity 재검증 후 one-shot reboot 대기",
+        )
+        self.panel._log(
+            f"[픽스호크] {label} verified-USB recovery 시작: {device}, "
+            f"sysid={expected_system_id}, compid={component_id}"
+        )
+        thread.start()
+        return True
+
+    def _apply_pixhawk_usb_recovery_result(self, result: object) -> None:
+        data = dict(result or {})
+        camera = str(data.get("camera") or "")
+        if camera not in {"left", "right"}:
+            return
+        label = self.panel._px4_mag_camera_label(camera)
+        detail = (
+            f"USB reboot command sent to sysid={data.get('system_id')} via {data.get('device')}; "
+            f"Ethernet expected-sysid packet 재개 및 {MAVLINK_QUALIFICATION_S:.0f}초 qualification 대기"
+        )
+        self._set_pixhawk_usb_recovery_status(camera, "COMMAND_SENT", detail)
+        self.panel._log(
+            f"[픽스호크] {label} {detail}. command send만으로 LIVE/READY로 처리하지 않습니다."
+        )
+
+    def _pixhawk_usb_recovery_failed(self, camera: str, error: str) -> None:
+        label = self.panel._px4_mag_camera_label(camera)
+        detail = f"USB identity 재검증/재부팅 실패: {error}; {label} 수동 전원 재부팅을 사용하세요."
+        self._set_pixhawk_usb_recovery_status(camera, "ERROR", detail)
+        self.panel._log(f"[픽스호크] {label} {detail}")
+
+    def _clear_pixhawk_usb_recovery_worker(self) -> None:
+        self.panel.pixhawk_usb_recovery_thread = None
+        self.panel.pixhawk_usb_recovery_worker = None
+
+    def _temporary_mavlink_heartbeat(self, subscriber: DualPixhawkMavlinkSubscriber, camera: str) -> bool:
+        connection = getattr(subscriber, "connections", {}).get(camera)
+        if connection is None:
+            return False
+        wait_heartbeat = getattr(connection, "wait_heartbeat", None)
+        if wait_heartbeat is None:
+            return True
+        mav = getattr(connection, "mav", None)
+        mavlink = getattr(connection, "mavlink", None)
+        if mav is not None and hasattr(mav, "heartbeat_send"):
+            try:
+                mav.heartbeat_send(
+                    getattr(mavlink, "MAV_TYPE_GENERIC", 0),
+                    getattr(mavlink, "MAV_AUTOPILOT_INVALID", 8),
+                    0,
+                    0,
+                    0,
+                )
+            except Exception:
+                pass
+        try:
+            return wait_heartbeat(timeout=1.2) is not None
+        except Exception:
+            return False
+
+    def _ethernet_mavlink_bootstrap_command(
+        self,
+        camera: str,
+        *,
+        mode: str = "normal",
+        eth_ip_override: str | None = None,
+        mavlink_url_override: str | None = None,
+    ) -> str:
+        if eth_ip_override is None and mavlink_url_override is None:
+            setup = self.panel._persistent_pixhawk_eth_setup(camera)
+        else:
+            setup = self.panel._persistent_pixhawk_eth_setup(
+                camera,
+                eth_ip_override=eth_ip_override,
+                mavlink_url_override=mavlink_url_override,
+            )
+        if mode not in {"normal", "onboard"}:
+            raise ValueError(f"Unsupported Ethernet MAVLink bootstrap mode: {mode}")
+        extras = "/fs/microsd/etc/extras.txt"
+        net_cfg = "/fs/microsd/net.cfg"
+        extras_lines = list(setup["extras_lines"])
+        net_cfg_lines = list(setup["net_cfg_lines"])
+        # MAV_2_CONFIG is the sole owner of the Ethernet MAVLink instance.
+        # A second manual start can bind the same UDP port on NuttX and emit a
+        # duplicate unicast stream beside the parameter-owned broadcast stream.
+        # Persist the interface files and reboot so rc.serial creates exactly
+        # one instance; never stop or manually start one from recovery.
+        return "\n".join(
+            (
+                "mkdir /fs/microsd/etc",
+                *setup["param_lines"],
+                "param save",
+                f"echo '{extras_lines[0]}' > {extras}",
+                *(f"echo '{line}' >> {extras}" for line in extras_lines[1:]),
+                f"echo '{net_cfg_lines[0]}' > {net_cfg}",
+                *(f"echo '{line}' >> {net_cfg}" for line in net_cfg_lines[1:]),
+                "reboot",
+            )
+        )
+
+    def connect_mavlink_pixhawk(self, camera: str | None = None, *, force_setup: bool = False) -> None:
+        if not self._source_connection_allowed_during_recording():
+            self.panel._log(
+                "[픽스호크] 수동 기록 중에는 MAVLink 연결을 변경할 수 없습니다."
+            )
+            return
+        if getattr(self.panel, "pixhawk_disconnection_thread", None) is not None:
+            self.panel._log("[픽스호크] MAVLink 연결 해제가 끝난 뒤 다시 연결하세요.")
+            return
+        target_sides = self.panel._mavlink_target_sides(camera)
+        open_sides = self.panel._mavlink_open_sides()
+        pending_sides = tuple(side for side in target_sides if side not in open_sides)
+        for side in pending_sides:
+            self._publish_measurement_source(
+                f"pixhawk.{side}", "WAITING_RESOURCE", "MAVLink connect requested"
+            )
+        if not pending_sides:
+            stale_sides = tuple(side for side in target_sides if self._mavlink_side_is_stale(side))
+            if not stale_sides:
+                return
+            self._reconnect_stale_mavlink_sides(camera, stale_sides, force_setup)
+            return
+        if self.panel.pixhawk_connection_thread is not None:
+            self.panel._log("[픽스호크] MAVLink 연결 작업이 이미 진행 중입니다.")
+            return
+        connect_sides, preflight_errors = self._pixhawk_connect_preflight_sides(pending_sides)
+        if not connect_sides:
+            fail_label = ", ".join(
+                f"{self.panel._px4_mag_camera_label(side)} ({error})"
+                for side, error in preflight_errors.items()
+            )
+            self.panel.pixhawk_connection_label.setText(
+                f"Pixhawk Connect preflight failed: {fail_label or 'no disconnected side'}"
+            )
+            self.panel._refresh_session_toggle_buttons()
+            self.panel._refresh_operation_header()
+            if "drone" in pending_sides:
+                self.panel.drone_telemetry_connection_state = "ERROR"
+                self.panel.drone_telemetry_last_error = fail_label or "Connect preflight failed"
+            return
+        subscriber = self.panel._ensure_mavlink_subscriber()
+        if hasattr(subscriber, "last_connect_errors"):
+            subscriber.last_connect_errors.update(preflight_errors)
+        worker_camera = connect_sides[0] if len(connect_sides) == 1 else None
+        label = " / ".join(self.panel._px4_mag_camera_label(side) for side in connect_sides)
+        thread = QtCore.QThread(self.panel)
+        worker = PixhawkConnectionWorker(subscriber, connect_sides)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        _connect_gui_signal(
+            worker.completed,
+            lambda _result, camera=worker_camera, force_setup=force_setup, target_sides=pending_sides:
+            self.panel._apply_pixhawk_connection_result(camera, force_setup, target_sides),
+        )
+        _connect_gui_signal(
+            worker.failed,
+            lambda error, camera=worker_camera, target_sides=pending_sides: self.panel._pixhawk_connection_failed(
+                camera, target_sides, error
+            ),
+        )
+        _wire_worker_thread_cleanup(worker, thread)
+        _connect_gui_signal(
+            thread.finished,
+            self.panel._clear_pixhawk_connection_worker,
+        )
+        self.panel.pixhawk_connection_thread = thread
+        self.panel.pixhawk_connection_worker = worker
+        self.panel.pixhawk_connection_label.setText(f"픽스호크 MAVLink: {label} 연결 중...")
+        self.panel._refresh_session_toggle_buttons()
+        self.panel._log(f"[픽스호크] {label} MAVLink 연결을 시작했습니다.")
+        thread.start()
+
+    def _apply_pixhawk_connection_result(
+        self,
+        camera: str | None,
+        force_setup: bool,
+        target_sides: Sequence[str],
+    ) -> None:
+        subscriber = self.panel.mavlink_pixhawk
+        if subscriber is None:
+            return
+        try:
+            subscriber.start_receive_timer()
+        except Exception as exc:
+            self.panel._pixhawk_connection_failed(camera, tuple(target_sides), str(exc))
+            return
+        self._sync_px4_sensor_mag_shell_polling()
+        ensure_rtcm_worker = getattr(self.panel, "_ensure_pixhawk_rtcm_worker", None)
+        if callable(ensure_rtcm_worker) and (
+            getattr(self.panel, "rtcm_pipeline_worker", None) is not None
+            or getattr(self.panel, "pixhawk_rtcm_worker", None) is not None
+        ):
+            ensure_rtcm_worker()
+        if force_setup or self.panel.mavlink_configure_streams_checkbox.isChecked():
+            self.panel._log(
+                "[픽스호크] Connect는 영구 MAV_2 설정을 실행하지 않습니다. "
+                "필요하면 수동 Ethernet 설정 명령을 사용하세요."
+            )
+        self.panel._refresh_session_toggle_buttons()
+        self.panel._refresh_mavlink_side_actions()
+        # A request that targets both sides (``camera=None``, e.g. auto-start)
+        # can partially fail: DualPixhawkMavlinkSubscriber.start() only raises
+        # when every requested side fails, so a lone P2 failure alongside a
+        # successful P1 never reaches ``_pixhawk_connection_failed`` and must be
+        # surfaced here instead of being reported as a full success.
+        connect_errors = getattr(subscriber, "last_connect_errors", {})
+        failed_sides = {side: connect_errors[side] for side in target_sides if side in connect_errors}
+        if failed_sides:
+            ok_sides = [side for side in target_sides if side not in failed_sides]
+            ok_label = (
+                " / ".join(self.panel._px4_mag_camera_label(side) for side in ok_sides)
+                if ok_sides
+                else "없음"
+            )
+            fail_label = ", ".join(
+                f"{self.panel._px4_mag_camera_label(side)} ({error})"
+                for side, error in failed_sides.items()
+            )
+            self.panel.pixhawk_connection_label.setText(
+                f"픽스호크 MAVLink: {ok_label} 연결됨, 실패: {fail_label}"
+            )
+            self.panel._log(f"[픽스호크] MAVLink 부분 연결: 성공={ok_label}, 실패={fail_label}")
+            for side in ok_sides:
+                self._publish_measurement_source(
+                    f"pixhawk.{side}", "PENDING", "MAVLink socket open; data pending"
+                )
+            for side, error in failed_sides.items():
+                self._publish_measurement_source(
+                    f"pixhawk.{side}", "UNAVAILABLE", str(error)
+                )
+        else:
+            label = " / ".join(self.panel._px4_mag_camera_label(side) for side in target_sides)
+            self.panel.pixhawk_connection_label.setText(f"픽스호크 MAVLink: {label} 세션 시작, 데이터 대기 중")
+            self.panel._log(f"[픽스호크] {label} MAVLink 세션이 시작됐습니다. 데이터 수신을 기다립니다.")
+            for side in target_sides:
+                self._publish_measurement_source(
+                    f"pixhawk.{side}", "PENDING", "MAVLink socket open; data pending"
+                )
+        if "drone" in target_sides and "drone" in getattr(subscriber, "connections", {}):
+            self.panel.drone_telemetry_connection_state = "CONNECTED"
+            self.panel.drone_telemetry_last_error = ""
+        ethernet_sides = tuple(
+            side
+            for side in target_sides
+            if self._pixhawk_selected_transport(side) == "ethernet"
+        )
+        if ethernet_sides:
+            self.panel._request_mavlink_eth0_status(ethernet_sides)
+        self.panel.refresh_px4_mag_manager()
+        self.panel.refresh_px4_attitude_cal_status()
+        self.panel._refresh_operation_header()
+
+    def _pixhawk_connection_failed(
+        self,
+        camera: str | None,
+        target_sides: Sequence[str],
+        error: str,
+    ) -> None:
+        if self.panel.mavlink_pixhawk is not None:
+            try:
+                self.panel.mavlink_pixhawk.stop(camera)
+            except Exception:
+                pass
+            if not getattr(self.panel.mavlink_pixhawk, "connections", {}):
+                self.panel.mavlink_pixhawk = None
+        self._sync_px4_sensor_mag_shell_polling()
+        self.panel._refresh_session_toggle_buttons()
+        self.panel._refresh_mavlink_side_actions()
+        label = " / ".join(self.panel._px4_mag_camera_label(side) for side in target_sides)
+        self.panel.pixhawk_connection_label.setText(f"pixhawk MAVLink {label}: failed ({error})")
+        self.panel._log(f"[픽스호크] {label} MAVLink 연결 실패: {error}")
+        for side in target_sides:
+            self._publish_measurement_source(
+                f"pixhawk.{side}", "UNAVAILABLE", str(error)
+            )
+        if "drone" in target_sides:
+            self.panel.drone_telemetry_connection_state = "ERROR"
+            self.panel.drone_telemetry_last_error = str(error)
+        self.panel._refresh_operation_header()
+
+    def _clear_pixhawk_connection_worker(self) -> None:
+        self.panel.pixhawk_connection_thread = None
+        self.panel.pixhawk_connection_worker = None
+        self.panel._refresh_session_toggle_buttons()
+
+    def _mavlink_side_is_stale(self, side: str) -> bool:
+        """True only for confirmed all-RX silence, never ATTITUDE-only stale.
+
+        A live host socket is not remote recovery evidence. New subscribers
+        expose the expected-system packet state; the old ATTITUDE timeout is
+        retained only for compatible test/legacy adapters.
+        """
+
+        subscriber = self.panel.mavlink_pixhawk
+        if subscriber is None or side not in getattr(subscriber, "connections", {}):
+            return False
+        health_reader = getattr(subscriber, "mavlink_health_snapshot", None)
+        if callable(health_reader):
+            try:
+                health = health_reader(side)
+            except Exception:
+                return False
+            state = getattr(getattr(health, "state", None), "value", getattr(health, "state", ""))
+            return str(state) == "ETH MAVLINK RX STALLED"
+        if side in getattr(subscriber, "_active_command_cameras", set()):
+            return False
+        timestamps = self.panel.pixhawk_attitude_times.get(side)
+        if not timestamps:
+            return False
+        return time.monotonic() - timestamps[-1] > _MAVLINK_STALE_TIMEOUT_S
+
+    def _reconnect_stale_mavlink_sides(
+        self,
+        camera: str | None,
+        stale_sides: Sequence[str],
+        force_setup: bool,
+    ) -> None:
+        label = " / ".join(self.panel._px4_mag_camera_label(side) for side in stale_sides)
+        self.panel._log(
+            f"[픽스호크] {label} Ethernet MAVLink 전체 수신이 정지했습니다. "
+            "host UDP socket 재연결은 PX4-side stall을 복구하지 않으므로 자동 실행하지 않습니다. "
+            "RTCM/추가 명령을 차단하고 verified-USB 또는 named-side 전원 복구를 사용하세요."
+        )
+        status_label = getattr(self.panel, "pixhawk_connection_label", None)
+        set_text = getattr(status_label, "setText", None)
+        if callable(set_text):
+            set_text(f"픽스호크 MAVLink: {label} ETH RX STALLED · RTCM/명령 차단")
+        refresh_actions = getattr(self.panel, "_refresh_mavlink_side_actions", None)
+        if callable(refresh_actions):
+            refresh_actions()
+
+    def disconnect_mavlink_pixhawk(self, camera: str | None = None) -> None:
+        if not self._source_connection_allowed_during_recording():
+            self.panel._log(
+                "[픽스호크] 수동 기록 중에는 MAVLink 연결을 변경할 수 없습니다."
+            )
+            return
+        if getattr(self.panel, "pixhawk_connection_thread", None) is not None:
+            self.panel._log("[픽스호크] MAVLink 연결 작업이 끝난 뒤 연결을 해제하세요.")
+            return
+        if self.panel.pixhawk_disconnection_thread is not None:
+            self.panel._log("[픽스호크] MAVLink 연결 해제 작업이 이미 진행 중입니다.")
+            return
+        target_sides = self.panel._mavlink_target_sides(camera)
+        self._stop_px4_sensor_mag_shell_polling()
+        subscriber = self.panel.mavlink_pixhawk
+        if subscriber is None:
+            self._finish_pixhawk_disconnect(camera, target_sides)
+            return
+        if not getattr(subscriber, "connections", {}):
+            # No transport can block, so avoid creating a QThread that the
+            # retryable shutdown path would otherwise have to wait for.
+            self._finish_pixhawk_disconnect(camera, target_sides)
+            return
+        open_sides = set(getattr(subscriber, "connections", {}))
+        if open_sides.issubset(set(target_sides)):
+            # The disconnect worker owns only the potentially blocking
+            # transport close.  Quiesce the QTimer synchronously on its GUI
+            # owner before that worker can empty the final connection set, so
+            # no receive callback can arrive after full-disconnect begins.
+            stop_receive_timer = getattr(subscriber, "stop_receive_timer", None)
+            if callable(stop_receive_timer):
+                stop_receive_timer()
+        # ``subscriber.stop()`` closes the underlying serial/socket connection,
+        # which can block for as long as an in-flight shell/parameter worker
+        # holds a concurrent blocking read on the same connection (they share
+        # ``_command_state_lock``). Running that on the GUI thread froze the
+        # whole app for the duration; do it on a worker thread instead, the
+        # same way ``connect_mavlink_pixhawk`` already does for ``start()``.
+        thread = QtCore.QThread(self.panel)
+        worker = PixhawkDisconnectWorker(subscriber, camera)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(
+            lambda _result, camera=camera, target_sides=target_sides:
+            self._finish_pixhawk_disconnect(camera, target_sides),
+            QtCore.Qt.QueuedConnection,
+        )
+        worker.failed.connect(
+            lambda error, camera=camera, target_sides=target_sides:
+            self._finish_pixhawk_disconnect(camera, target_sides, error=error),
+            QtCore.Qt.QueuedConnection,
+        )
+        _wire_worker_thread_cleanup(worker, thread)
+        thread.finished.connect(
+            self._clear_pixhawk_disconnection_worker,
+            QtCore.Qt.QueuedConnection,
+        )
+        self.panel.pixhawk_disconnection_thread = thread
+        self.panel.pixhawk_disconnection_worker = worker
+        self.panel._refresh_session_toggle_buttons()
+        thread.start()
+
+    def _finish_pixhawk_disconnect(
+        self,
+        camera: str | None,
+        target_sides: Sequence[str],
+        *,
+        error: str | None = None,
+    ) -> None:
+        disconnected_subscriber = self.panel.mavlink_pixhawk
+        if not getattr(self.panel.mavlink_pixhawk, "connections", {}):
+            self.panel.mavlink_pixhawk = None
+        if self.panel.mavlink_pixhawk is None and disconnected_subscriber is not None:
+            controller_factory = getattr(self.panel, "_gnss_runtime_controller", None)
+            if callable(controller_factory):
+                controller = controller_factory()
+                retire = getattr(controller, "_retire_pixhawk_rtcm_worker", None)
+                if callable(retire):
+                    retire(
+                        expected_subscriber=disconnected_subscriber,
+                        wait=False,
+                    )
+        connection_thread = getattr(self.panel, "pixhawk_connection_thread", None)
+        if connection_thread is not None and connection_thread.isRunning():
+            connection_thread.quit()
+        for side in target_sides:
+            self.panel.pixhawk_attitude_times[side].clear()
+        for side in target_sides:
+            self._publish_measurement_source(
+                f"pixhawk.{side}", "LEFT", "MAVLink disconnected"
+            )
+        self.panel._clear_px4_mag_manager_connection_state(camera)
+        self.panel._clear_px4_attitude_cal_connection_state(camera)
+        self._sync_px4_sensor_mag_shell_polling()
+        self.panel._refresh_session_toggle_buttons()
+        self.panel._refresh_mavlink_side_actions()
+        label = " / ".join(self.panel._px4_mag_camera_label(side) for side in target_sides)
+        if error is not None:
+            self.panel.pixhawk_connection_label.setText(f"픽스호크 MAVLink: {label} 연결 해제 중 오류 ({error})")
+            self.panel._log(f"[픽스호크] {label} MAVLink 연결 해제 중 오류: {error}")
+        elif self.panel.mavlink_pixhawk is None:
+            self.panel.pixhawk_connection_label.setText("픽스호크: 연결 해제")
+            self.panel._log(f"[픽스호크] {label} MAVLink 연결을 해제했습니다.")
+        else:
+            self.panel.pixhawk_connection_label.setText(f"픽스호크 MAVLink: {label} 연결 해제")
+            self.panel._log(f"[픽스호크] {label} MAVLink 연결을 해제했습니다.")
+        pending_assignments = getattr(
+            self.panel, "_pending_pixhawk_network_assignment", {}
+        )
+        for side in target_sides:
+            candidate = (
+                pending_assignments.pop(side, None)
+                if isinstance(pending_assignments, dict)
+                else None
+            )
+            if candidate is None:
+                continue
+            if error is not None:
+                self.panel.pixhawk_network_assignment_status[side] = {
+                    "state": "ASSIGN FAILED",
+                    "detail": f"disconnect failed: {error}",
+                }
+                continue
+            self._commit_pixhawk_network_assignment(side, candidate)
+        if "drone" in target_sides:
+            self.panel.drone_telemetry_connection_state = "DISCONNECTED"
+        self.panel._refresh_operation_header()
+
+    def _clear_pixhawk_disconnection_worker(self) -> None:
+        self.panel.pixhawk_disconnection_thread = None
+        self.panel.pixhawk_disconnection_worker = None
+        self.panel._refresh_session_toggle_buttons()
+
+    def apply_selected_pixhawk_candidate(self, side: str, *, source: str | None = None) -> None:
+        if source is None:
+            source = "pc" if side == "host" else "mavlink"
+        entry = self.panel._selected_pixhawk_candidate(source)
+        if entry is None:
+            return
+        kind = str(entry.get("kind", ""))
+        value = str(entry.get("value", "")).strip()
+        if not value:
+            self.panel._log("[픽스호크] 선택 후보에 적용할 값이 없습니다.")
+            return
+        if kind == "PC_IP":
+            if side != "host":
+                self.panel._log("[픽스호크] PC IP 후보는 Host에 적용 버튼으로 적용하세요.")
+                return
+            old_text = self.panel.pixhawk_host_address_edit.text().strip()
+            self.panel.pixhawk_host_address_edit.setText(value)
+            self.panel._log(
+                f"[픽스호크] 선택 PC IP 후보를 Pixhawk Host IP에 적용했습니다: "
+                f"{old_text or '<empty>'} -> {value} ({entry.get('interface', '')})"
+            )
+            self.panel.pixhawk_connection_label.setText(f"Pixhawk Host IP 후보 적용됨: {value}")
+            self.panel._save_current_settings()
+            self.panel._refresh_operation_header()
+            return
+        if side not in {"left", "right"}:
+            self.panel._log(f"[픽스호크] {kind} 후보는 P1/P2에 적용하세요.")
+            return
+        mavlink_was_active = side in self.panel._mavlink_open_sides()
+        selected_transport = self._pixhawk_selected_transport(side)
+        expected_system_id = 1 if side == "left" else 2
+        observed_system_id = entry.get("system_id")
+        if (
+            selected_transport in {"radio", "usb"}
+            and observed_system_id is not None
+            and int(observed_system_id) != expected_system_id
+        ):
+            self.panel._log(
+                f"[픽스호크] {self.panel._px4_mag_camera_label(side)} "
+                f"{selected_transport.upper()} 후보 거부: "
+                f"expected sysid {expected_system_id}, got {int(observed_system_id)}"
+            )
+            return
+        if selected_transport == "radio" and kind in {"USB", "MAVLink"}:
+            try:
+                baud = int(entry.get("baud") or 57_600)
+            except (TypeError, ValueError):
+                baud = 57_600
+            self.configure_pixhawk_radio(side, value, baud)
+            self.panel.pixhawk_connection_label.setText(
+                f"{self.panel._px4_mag_camera_label(side)} Radio 후보 적용됨 · "
+                f"Connect에서 sysid {expected_system_id} 검증"
+            )
+            self.panel._log(
+                f"[픽스호크] {self.panel._px4_mag_camera_label(side)} Radio endpoint hint 적용: "
+                f"{value} @ {baud}; 연결은 Connect에서만 시작합니다."
+            )
+            self.panel._refresh_operation_header()
+            return
+        if kind == "USB":
+            try:
+                baud = int(entry.get("baud") or 0)
+            except (TypeError, ValueError):
+                baud = 0
+            if side == "left":
+                self.panel.left_pixhawk_bootstrap_url_edit.setText(value)
+                if baud:
+                    self.panel.left_pixhawk_bootstrap_baud_spin.setValue(baud)
+            else:
+                self.panel.right_pixhawk_bootstrap_url_edit.setText(value)
+                if baud:
+                    self.panel.right_pixhawk_bootstrap_baud_spin.setValue(baud)
+        elif kind == "MAVLink":
+            try:
+                baud = int(entry.get("baud") or 0)
+            except (TypeError, ValueError):
+                baud = 0
+            if side == "left":
+                self.panel.left_mavlink_url_edit.setText(value)
+                if baud:
+                    self.panel.left_mavlink_baud_spin.setValue(baud)
+            else:
+                self.panel.right_mavlink_url_edit.setText(value)
+                if baud:
+                    self.panel.right_mavlink_baud_spin.setValue(baud)
+        else:
+            self.panel._log(f"[픽스호크] 지원하지 않는 후보 종류입니다: {kind}")
+            return
+        label = "Pixhawk 1" if side == "left" else "Pixhawk 2"
+        self.panel._log(f"[픽스호크] 선택 후보를 {label}에 적용했습니다: {kind} {value}")
+        if kind in {"USB", "MAVLink"}:
+            self.panel._refresh_mavlink_side_actions()
+            if kind == "MAVLink" and mavlink_was_active:
+                self.panel._log(f"[픽스호크] {label} MAVLink URL 후보 적용으로 기존 {label} MAVLink 세션을 해제합니다. 다시 연결하세요.")
+                self.panel.disconnect_mavlink_pixhawk(side)
+            if kind == "USB":
+                self.panel.pixhawk_connection_label.setText(f"{label} USB 부트스트랩 후보 적용됨: ETH MAV 시작(USB)을 누르세요.")
+            else:
+                self.panel.pixhawk_connection_label.setText(f"{label} MAVLink URL 후보 적용됨: {label} MAVLink 연결을 누르세요.")
+        self.panel._refresh_operation_header()
+
+    def apply_persistent_pixhawk_eth(self, camera: str) -> None:
+        if self.panel.mavlink_pixhawk is None or camera not in self.panel.mavlink_pixhawk.connections:
+            self.panel._log(f"[픽스호크] {camera_label_ko(camera)} ETH 영구 설정 실패: MAVLink 연결이 없습니다.")
+            return
+        try:
+            command = self.panel._persistent_pixhawk_eth_command(camera)
+            extras_text = self.panel._persistent_pixhawk_extras_text(camera)
+            net_cfg_text = self.panel._persistent_pixhawk_net_cfg_text(camera)
+        except Exception as exc:
+            self.panel._log(f"[픽스호크] {camera_label_ko(camera)} ETH 설정 생성 실패: {exc}")
+            return
+        if self.panel.pixhawk_persistent_config_thread is not None:
+            self.panel._log(f"[픽스호크] {camera_label_ko(camera)} ETH 영구 설정이 이미 진행 중입니다.")
+            return
+        thread = QtCore.QThread(self.panel)
+        worker = PixhawkPersistentConfigWorker(
+            self.panel.mavlink_pixhawk,
+            camera=camera,
+            command=command,
+            extras_text=extras_text,
+            net_cfg_text=net_cfg_text,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self.panel._apply_pixhawk_persistent_config_result)
+        worker.failed.connect(
+            lambda error, camera=camera: self.panel._log(
+                f"[픽스호크] {camera_label_ko(camera)} ETH 영구 설정 실패: {error}. "
+                "PX4 shell과 MAVLink FTP가 모두 막히면 앱만으로 저장할 수 없습니다."
+            )
+        )
+        _wire_worker_thread_cleanup(worker, thread)
+        thread.finished.connect(self.panel._clear_pixhawk_persistent_config_worker)
+        self.panel.pixhawk_persistent_config_thread = thread
+        self.panel.pixhawk_persistent_config_worker = worker
+        self._log_pixhawk_admin_start(camera, "persistent_ethernet_config")
+        self.panel._log(f"[픽스호크] {camera_label_ko(camera)} ETH shell/FTP 영구 설정을 시작했습니다.")
+        thread.start()
+
+    def _apply_pixhawk_persistent_config_result(self, result: object) -> None:
+        data = dict(result or {})
+        camera = str(data.get("camera") or "")
+        if camera not in {"left", "right", "drone"}:
+            return
+        output = str(data.get("output") or "").strip()
+        if output:
+            self.panel._log(
+                f"[픽스호크] {camera_label_ko(camera)} ETH shell 응답 "
+                f"({data.get('flag_label', '')}): {output[-800:]}"
+            )
+        self.panel._log(
+            f"[픽스호크] {camera_label_ko(camera)} ETH MAVLink FTP 영구 저장 완료: "
+            "/fs/microsd/net.cfg, /fs/microsd/etc/extras.txt. "
+            "재부팅 후 eth0와 Ethernet MAVLink stream 적용을 확인하세요."
+        )
+
+    def _clear_pixhawk_persistent_config_worker(self) -> None:
+        self.panel.pixhawk_persistent_config_thread = None
+        self.panel.pixhawk_persistent_config_worker = None
+
+    def reboot_pixhawk_from_mavlink(self, camera: str) -> None:
+        if self.panel.mavlink_pixhawk is None or camera not in self.panel.mavlink_pixhawk.connections:
+            self.panel._log(f"[픽스호크] {camera_label_ko(camera)} 재부팅 실패: MAVLink 연결이 없습니다.")
+            return
+        health_reader = getattr(self.panel.mavlink_pixhawk, "mavlink_health_snapshot", None)
+        if callable(health_reader):
+            try:
+                health = health_reader(camera)
+            except Exception as exc:
+                self.panel._log(
+                    f"[픽스호크] {camera_label_ko(camera)} 재부팅 차단: liveness 확인 실패 ({exc})"
+                )
+                return
+            state = str(
+                getattr(
+                    getattr(health, "state", None),
+                    "value",
+                    getattr(health, "state", ""),
+                )
+            )
+            if not bool(getattr(health, "command_eligible", False)):
+                self.panel._log(
+                    f"[픽스호크] {camera_label_ko(camera)} 재부팅 명령 차단: "
+                    f"state={state or 'UNKNOWN'}. Connect 상태와 identity를 확인하세요."
+                )
+                return
+        result = QtWidgets.QMessageBox.question(
+            self.panel,
+            f"{camera_label_ko(camera)} PX4 재부팅",
+            f"{camera_label_ko(camera)} Pixhawk에 MAVLink 재부팅 명령을 보냅니다.\n계속할까요?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if result != QtWidgets.QMessageBox.Yes:
+            self.panel._log(f"[픽스호크] {camera_label_ko(camera)} MAVLink 재부팅 명령을 취소했습니다.")
+            return
+        self.panel._start_pixhawk_shell_worker(
+            camera,
+            "MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN",
+            operation="reboot",
+            timeout_s=1.0,
+        )
+
+    def _persistent_pixhawk_eth_command(self, camera: str) -> str:
+        setup = self.panel._persistent_pixhawk_eth_setup(camera)
+        extras = "/fs/microsd/etc/extras.txt"
+        extras_lines = list(setup["extras_lines"])
+        return "\n".join(
+            (
+                "mkdir /fs/microsd/etc",
+                *setup["param_lines"],
+                "param save",
+                *extras_lines,
+                "mavlink status",
+                f"echo '{extras_lines[0]}' > {extras}",
+                *(f"echo '{line}' >> {extras}" for line in extras_lines[1:]),
+                f"cat {extras}",
+            )
+        )
+
+    def _persistent_pixhawk_extras_text(self, camera: str) -> str:
+        setup = self.panel._persistent_pixhawk_eth_setup(camera)
+        return "\n".join(setup["extras_lines"]) + "\n"
+
+    def _persistent_pixhawk_net_cfg_text(self, camera: str) -> str:
+        setup = self.panel._persistent_pixhawk_eth_setup(camera)
+        return "\n".join(setup["net_cfg_lines"]) + "\n"
+
+    def _persistent_pixhawk_eth_setup(
+        self,
+        camera: str,
+        *,
+        eth_ip_override: str | None = None,
+        mavlink_url_override: str | None = None,
+    ) -> dict[str, object]:
+        if camera == "left":
+            eth_ip = self.panel.left_pixhawk_eth_ip_edit.text().strip()
+            mavlink_url = self.panel.left_mavlink_url_edit.text().strip()
+            mavlink_default_port = 14550
+            mavlink_system_id = 1
+        elif camera == "right":
+            eth_ip = self.panel.right_pixhawk_eth_ip_edit.text().strip()
+            mavlink_url = self.panel.right_mavlink_url_edit.text().strip()
+            mavlink_default_port = 14551
+            mavlink_system_id = 2
+        elif camera == "drone":
+            eth_ip = str(getattr(self.panel, "drone_pixhawk_eth_ip", "") or "").strip()
+            mavlink_url = str(getattr(self.panel, "drone_telemetry_url", "") or "").strip()
+            mavlink_default_port = 14552
+            mavlink_system_id = 3
+        else:
+            raise ValueError(f"Unknown Pixhawk side: {camera}")
+        if eth_ip_override is not None:
+            eth_ip = str(eth_ip_override).strip()
+        if mavlink_url_override is not None:
+            mavlink_url = str(mavlink_url_override).strip()
+        assignment = getattr(self.panel, "pixhawk_network_assignments", {}).get(camera) or {}
+        host_ip = str(assignment.get("local_address") or "").strip().split("/", 1)[0]
+        if not host_ip:
+            host_ip = self.panel._pixhawk_host_ip_for_mavlink()
+        for label, value in (("Pixhawk ETH IP", eth_ip), ("Pixhawk Host IP", host_ip)):
+            if not value or any(ch.isspace() or ch in "'\";`$" for ch in value):
+                raise ValueError(f"{label} 값이 비어 있거나 shell 명령에 사용할 수 없는 문자를 포함합니다: {value!r}")
+        ifup_cmd = "ifup eth0"
+        ifconfig_cmd = f"ifconfig eth0 {eth_ip} netmask 255.255.255.0 up"
+        mavlink_port = self.panel._mavlink_stream_port(mavlink_url, default=mavlink_default_port)
+        mavlink_rate = self.panel.mavlink_stream_rate_spin.value()
+        param_lines = [
+            f"param set MAV_SYS_ID {mavlink_system_id}",
+            "param set MAV_2_CONFIG 1000",
+            "param set MAV_2_MODE 0",
+            "param set MAV_2_BROADCAST 1",
+            f"param set MAV_2_REMOTE_PRT {mavlink_port}",
+            f"param set MAV_2_UDP_PRT {mavlink_port}",
+            f"param set MAV_2_RATE {mavlink_rate}",
+        ]
+        # rc.serial owns the one MAVLink instance through MAV_2_CONFIG.
+        # extras.txt only establishes the board-specific Ethernet interface.
+        extras_lines = [ifup_cmd, ifconfig_cmd]
+        net_cfg_lines = [
+            "DEVICE=eth0",
+            "BOOTPROTO=static",
+            "NETMASK=255.255.255.0",
+            f"IPADDR={eth_ip}",
+            f"ROUTER={host_ip}",
+        ]
+        return {
+            "eth_ip": eth_ip,
+            "host_ip": host_ip,
+            "ifup_cmd": ifup_cmd,
+            "ifconfig_cmd": ifconfig_cmd,
+            "param_lines": param_lines,
+            "extras_lines": extras_lines,
+            "net_cfg_lines": net_cfg_lines,
+        }
+
+    def _log_pixhawk_admin_start(self, camera: str, category: str) -> None:
+        stats = getattr(self.panel, "gnss_base_rtcm_stats", {}) or {}
+        injection = stats.get("injection", {}) if isinstance(stats, dict) else {}
+        side_stats = injection.get(str(camera), {}) if isinstance(injection, dict) else {}
+        last_delivery_s = side_stats.get("last_delivery_s") if isinstance(side_stats, dict) else None
+        if last_delivery_s is None:
+            return
+        try:
+            age_s = max(0.0, time.monotonic() - float(last_delivery_s))
+        except (TypeError, ValueError):
+            return
+        if age_s > 3.0:
+            return
+        transport = self._pixhawk_selected_transport(str(camera))
+        observed = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        self.panel._log(
+            f"[픽스호크 ADMIN] role={camera} transport={transport} "
+            f"category={category} started={observed} rtcm_age_s={age_s:.3f}"
+        )
+
+    @staticmethod
+    def _px4_sensor_mag_shell_commands() -> tuple[str, ...]:
+        """Build individually framed stable-PX4 sensor readback commands."""
+        return tuple(
+            [
+                *(f"listener sensor_mag -i {instance} -n 1" for instance in range(5)),
+                "listener vehicle_magnetometer -n 1",
+            ]
+        )
+
+    @classmethod
+    def _px4_sensor_mag_shell_command(cls) -> str:
+        """Return the operator-readable representation of the command sequence."""
+        return "; ".join(cls._px4_sensor_mag_shell_commands())
+
+    def _ensure_px4_sensor_mag_shell_poll_timer(self) -> QtCore.QTimer:
+        timer = self._sensor_mag_shell_poll_timer
+        if timer is None:
+            timer = QtCore.QTimer()
+            timer.setInterval(_PX4_SENSOR_MAG_SHELL_POLL_INTERVAL_MS)
+            timer.timeout.connect(self._poll_px4_sensor_mag_shell)
+            self._sensor_mag_shell_poll_timer = timer
+        return timer
+
+    def _sync_px4_sensor_mag_shell_polling(self) -> None:
+        """Keep one bounded Shell poller aligned with live P1/P2 links."""
+        timer = self._ensure_px4_sensor_mag_shell_poll_timer()
+        open_sides_reader = getattr(self.panel, "_mavlink_open_sides", None)
+        open_sides = set(open_sides_reader()) if callable(open_sides_reader) else set()
+        target_sides = tuple(side for side in ("left", "right") if side in open_sides)
+        if not target_sides:
+            timer.stop()
+            return
+        if timer.isActive():
+            return
+        timer.start()
+        labels = "/".join(self.panel._px4_mag_camera_label(side) for side in target_sides)
+        self.panel._log(
+            f"[픽스호크] Stable PX4 sensor_mag Shell polling 시작: {labels} "
+            "(2s cadence, active device readback 포함)"
+        )
+        QtCore.QTimer.singleShot(0, self._poll_px4_sensor_mag_shell)
+
+    def _stop_px4_sensor_mag_shell_polling(self) -> None:
+        timer = self._sensor_mag_shell_poll_timer
+        if timer is not None:
+            timer.stop()
+
+    def _poll_px4_sensor_mag_shell(self) -> None:
+        open_sides_reader = getattr(self.panel, "_mavlink_open_sides", None)
+        open_sides = set(open_sides_reader()) if callable(open_sides_reader) else set()
+        for camera in ("left", "right"):
+            if camera not in open_sides:
+                continue
+            # Manual Shell, PARAM, calibration, and other admin commands retain
+            # the same per-camera exclusive owner.  A periodic diagnostic poll
+            # must yield silently while one of those commands is active.
+            if camera in getattr(self.panel, "pixhawk_shell_threads", {}):
+                continue
+            self.panel._start_pixhawk_shell_worker(
+                camera,
+                self._px4_sensor_mag_shell_commands(),
+                operation="sensor_mag_shell_poll",
+                timeout_s=_PX4_SENSOR_MAG_SHELL_TIMEOUT_S,
+                on_complete=lambda result, camera=camera: self.panel._apply_px4_sensor_mag_shell_result(
+                    camera, result
+                ),
+            )
+
+    def _handle_sensor_mag_shell_poll_failed(self, camera: str, error: str) -> None:
+        now_s = time.monotonic()
+        last_s = self._sensor_mag_shell_poll_error_last_s.get(camera, float("-inf"))
+        if now_s - last_s < 5.0:
+            return
+        self._sensor_mag_shell_poll_error_last_s[camera] = now_s
+        self.panel._log(
+            f"[픽스호크] {camera_label_ko(camera)} sensor_mag Shell polling 실패: {error}"
+        )
+
+    def _start_pixhawk_shell_worker(
+        self,
+        camera: str,
+        command: str,
+        *,
+        operation: str = "shell",
+        timeout_s: float = 2.0,
+        on_complete=None,
+    ) -> bool:
+        if self.panel.mavlink_pixhawk is None or camera not in self.panel._mavlink_open_sides():
+            self.panel._log(f"[픽스호크] {camera_label_ko(camera)} MAVLink 명령 실패: 연결이 없습니다.")
+            return False
+        if camera in self.panel.pixhawk_shell_threads:
+            self.panel._log(f"[픽스호크] {camera_label_ko(camera)} MAVLink 명령이 이미 진행 중입니다.")
+            return False
+        self._log_pixhawk_admin_start(camera, operation)
+        thread = QtCore.QThread(self.panel)
+        worker = PixhawkShellCommandWorker(
+            self.panel.mavlink_pixhawk,
+            camera=camera,
+            command=command,
+            operation=operation,
+            timeout_s=timeout_s,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(
+            lambda result, camera=camera, callback=on_complete: self.panel._apply_pixhawk_shell_worker_result(
+                camera, result, callback
+            )
+        )
+        worker.failed.connect(
+            lambda error, camera=camera, operation=operation: self.panel._pixhawk_shell_worker_failed(
+                camera, error, operation
+            )
+        )
+        _wire_worker_thread_cleanup(worker, thread)
+        thread.finished.connect(lambda camera=camera, thread=thread: self.panel._clear_pixhawk_shell_worker(camera, thread))
+        self.panel.pixhawk_shell_threads[camera] = thread
+        self.panel.pixhawk_shell_workers[camera] = worker
+        thread.start()
+        return True
+
+    def _apply_pixhawk_shell_worker_result(self, camera: str, result: object, callback=None) -> None:
+        data = dict(result or {})
+        output = str(data.get("output") or "")
+        if output:
+            self.panel._append_px4_shell_output(camera, output)
+        operation = str(data.get("operation") or "shell")
+        command = str(data.get("command") or "")
+        if operation == "reboot":
+            self.panel._log(f"[픽스호크] {camera_label_ko(camera)} MAVLink 재부팅 명령을 전송했습니다.")
+        elif operation != "sensor_mag_shell_poll":
+            flag = str(data.get("flag_label") or "")
+            suffix = f" ({flag})" if flag else ""
+            self.panel._log(f"[픽스호크] {camera_label_ko(camera)} PX4 Shell 명령 완료{suffix}: {command}")
+        if operation.startswith("reset_calibration:"):
+            group = operation.split(":", 1)[1]
+            reset_errors = getattr(self.panel, "_px4_calibration_reset_error", None)
+            if not isinstance(reset_errors, dict):
+                reset_errors = {}
+                setattr(self.panel, "_px4_calibration_reset_error", reset_errors)
+            reset_errors.pop(f"{camera}:{group}", None)
+            reset_pending = getattr(self.panel, "_px4_calibration_reset_pending", None)
+            if isinstance(reset_pending, dict):
+                reset_pending.pop(camera, None)
+        if callable(callback):
+            callback(data)
+
+    def _pixhawk_shell_worker_failed(
+        self,
+        camera: str,
+        error: str,
+        operation: str = "shell",
+    ) -> None:
+        if str(operation) == "sensor_mag_shell_poll":
+            self._handle_sensor_mag_shell_poll_failed(camera, error)
+            return
+        message = f"[픽스호크] {camera_label_ko(camera)} MAVLink 명령 실패: {error}"
+        self.panel._log(message)
+        dialog = self.panel.px4_shell_dialogs.get(camera)
+        if dialog is not None:
+            dialog.append_output(f"\n[error] {error}\n")
+        reset_pending = getattr(self.panel, "_px4_calibration_reset_pending", None)
+        group = reset_pending.pop(camera, None) if isinstance(reset_pending, dict) else None
+        if group:
+            reset_errors = getattr(self.panel, "_px4_calibration_reset_error", None)
+            if not isinstance(reset_errors, dict):
+                reset_errors = {}
+                setattr(self.panel, "_px4_calibration_reset_error", reset_errors)
+            reset_errors[f"{camera}:{group}"] = str(error)
+
+    def reset_px4_calibration_group(self, camera: str, group: str) -> bool:
+        """Reset one calibration-owned parameter group on one Pixhawk.
+
+        PX4's shell resolves the firmware-specific defaults.  The Workstation
+        only owns the group membership and never substitutes a host-side
+        numeric default table.
+        """
+
+        camera = str(camera or "")
+        if camera not in {"left", "right"}:
+            raise ValueError(f"Unknown Pixhawk side: {camera}")
+        calibration = px4_calibration_group(group)
+        if not calibration.resettable:
+            self.panel._log(
+                f"[픽스호크] {camera_label_ko(camera)} {calibration.label}은 수동 파라미터 그룹이라 초기화하지 않습니다."
+            )
+            return False
+        if self.panel.mavlink_pixhawk is None or camera not in self.panel._mavlink_open_sides():
+            self.panel._log(f"[픽스호크] {camera_label_ko(camera)} 캘리브레이션 초기화 실패: MAVLink 연결이 없습니다.")
+            return False
+        manager = self.panel.px4_mag_managers.get(camera)
+        if bool(getattr(manager, "armed", False)):
+            self.panel._log(
+                f"[픽스호크] {camera_label_ko(camera)} {calibration.label} 초기화 차단: Disarm required"
+            )
+            return False
+        parameter_text = ", ".join(calibration.reset_parameter_names)
+        result = QtWidgets.QMessageBox.question(
+            self.panel,
+            f"Reset {calibration.label}",
+            (
+                f"{camera_label_ko(camera)}의 {calibration.label} 파라미터를 PX4 firmware default로 초기화합니다.\n\n"
+                f"대상: {parameter_text}\n"
+                f"{calibration.description}\n"
+                "센서 device_id/priority는 그대로 유지되므로 재캘리브레이션 없이 계속 armable하며, "
+                "이후 raw(보정 없음) 센서 값이 그대로 사용됩니다. 필요하면 QGC에서 다시 캘리브레이션하세요.\n"
+                "기체는 반드시 Disarm 상태여야 합니다. 계속할까요?"
+            ),
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if result != QtWidgets.QMessageBox.Yes:
+            self.panel._log(
+                f"[픽스호크] {camera_label_ko(camera)} {calibration.label} 초기화를 취소했습니다."
+            )
+            return False
+
+        command = "param reset " + " ".join(calibration.reset_parameter_names)
+        reset_pending = getattr(self.panel, "_px4_calibration_reset_pending", None)
+        if not isinstance(reset_pending, dict):
+            reset_pending = {}
+            setattr(self.panel, "_px4_calibration_reset_pending", reset_pending)
+        reset_pending[camera] = calibration.key
+        started = self.panel._start_pixhawk_shell_worker(
+            camera,
+            command,
+            operation=f"reset_calibration:{calibration.key}",
+            timeout_s=4.0,
+            on_complete=lambda _result, camera=camera: self.panel._start_pixhawk_parameter_worker(
+                camera, "calibration_refresh"
+            ),
+        )
+        if not started:
+            reset_pending.pop(camera, None)
+        return started
+
+    def _clear_pixhawk_shell_worker(self, camera: str, thread: QtCore.QThread) -> None:
+        if self.panel.pixhawk_shell_threads.get(camera) is thread:
+            self.panel.pixhawk_shell_threads.pop(camera, None)
+            self.panel.pixhawk_shell_workers.pop(camera, None)
+
+    def _start_pixhawk_parameter_worker(
+        self,
+        camera: str,
+        operation: str,
+        *,
+        priorities: dict[str, int] | None = None,
+    ) -> bool:
+        subscriber = self.panel.mavlink_pixhawk
+        if subscriber is None or camera not in self.panel._mavlink_open_sides():
+            self.panel._log(f"[픽스호크] {camera_label_ko(camera)} PARAM 작업 실패: MAVLink 연결이 없습니다.")
+            return False
+        if camera in self.panel.pixhawk_parameter_threads:
+            self.panel._log(f"[픽스호크] {camera_label_ko(camera)} PARAM 작업이 이미 진행 중입니다.")
+            return False
+        manager = self.panel.px4_mag_managers.get(camera) if hasattr(self.panel, "px4_mag_managers") else None
+        actual_selected = self.panel.latest_vehicle_mag_device_ids.get(camera)
+        armed = bool(getattr(manager, "armed", False))
+        thread = QtCore.QThread(self.panel)
+        worker = PixhawkParameterWorker(
+            subscriber,
+            camera=camera,
+            operation=operation,
+            actual_selected_device_id=actual_selected,
+            armed=armed,
+            priorities=priorities,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self.panel._apply_pixhawk_parameter_worker_result)
+        worker.failed.connect(
+            lambda error, camera=camera, operation=operation: self.panel._pixhawk_parameter_worker_failed(
+                camera, operation, error
+            )
+        )
+        _wire_worker_thread_cleanup(worker, thread)
+        thread.finished.connect(
+            lambda camera=camera, thread=thread: self.panel._clear_pixhawk_parameter_worker(camera, thread)
+        )
+        self.panel.pixhawk_parameter_threads[camera] = thread
+        self.panel.pixhawk_parameter_workers[camera] = worker
+        self._log_pixhawk_admin_start(camera, operation)
+        self.panel._set_px4_mag_manager_button_state(
+            camera,
+            refresh_enabled=False,
+            actions_enabled=False,
+            tooltip="MAVLink PARAM 작업 중",
+        )
+        thread.start()
+        return True
+
+    def _apply_pixhawk_parameter_worker_result(self, result: object) -> None:
+        data = dict(result or {})
+        kind = str(data.get("kind") or "")
+        status = data.get("status")
+        camera = ""
+        if hasattr(status, "actual_selected_device_id"):
+            camera = next(
+                (
+                    side
+                    for side in ("left", "right", "drone")
+                    if self.panel.latest_vehicle_mag_device_ids.get(side)
+                    == getattr(status, "actual_selected_device_id", None)
+                    and side in self.panel.pixhawk_parameter_threads
+                ),
+                "",
+            )
+        camera = str(data.get("camera") or camera)
+        # The worker payload is intentionally allowed to carry the side
+        # explicitly; older fake workers may only return a status object.
+        if not camera:
+            for side, worker in self.panel.pixhawk_parameter_workers.items():
+                if worker.operation == kind:
+                    camera = side
+                    break
+        if kind == "calibration_refresh":
+            mag_status = data.get("mag_status")
+            attitude_status = data.get("attitude_status")
+            if not camera or (mag_status is None and attitude_status is None):
+                return
+            self.panel._px4_calibration_parameter_error.pop(camera, None)
+            if mag_status is not None:
+                manager = self.panel.px4_mag_managers.get(camera)
+                if manager is not None:
+                    manager.actual_selected_device_id = getattr(mag_status, "actual_selected_device_id", None)
+                    manager.armed = bool(getattr(mag_status, "armed", False))
+                self.panel._render_px4_mag_status(camera, mag_status)
+            if attitude_status is not None:
+                self.panel._render_px4_attitude_cal_status(camera, attitude_status, using_real_params=True)
+            return
+        if kind == "board_rotation_refresh":
+            if camera:
+                self._apply_px4_board_rotation_readback(camera, data.get("params"))
+            return
+        if not camera or status is None:
+            return
+        if kind in {"mag_refresh", "mag_apply"}:
+            self.panel._px4_calibration_parameter_error.pop(camera, None)
+            manager = self.panel.px4_mag_managers.get(camera)
+            if manager is not None:
+                manager.actual_selected_device_id = getattr(status, "actual_selected_device_id", None)
+                manager.armed = bool(getattr(status, "armed", False))
+            self.panel._render_px4_mag_status(camera, status)
+            if kind == "mag_refresh":
+                # Success used to be silent, so a missing failure line could not
+                # be told apart from a readback that never ran.
+                slot_summary = ", ".join(
+                    f"CAL_MAG{getattr(slot, 'slot', '?')}="
+                    f"{getattr(slot, 'device_id', None)}/prio={getattr(slot, 'priority', None)}"
+                    for slot in (getattr(status, "slots", ()) or ())
+                ) or "slots N/A"
+                missing = self._record_px4_mag_readback_completeness(camera, status)
+                if missing:
+                    preview = ", ".join(missing[:6]) + (" …" if len(missing) > 6 else "")
+                    self.panel._log(
+                        f"[PX4 MAG] {self.panel._px4_mag_camera_label(camera)} CAL_MAG PARAM readback "
+                        f"불완전 ({len(missing)}개 미수신: {preview}): {slot_summary}"
+                    )
+                else:
+                    self.panel._log(
+                        f"[PX4 MAG] {self.panel._px4_mag_camera_label(camera)} CAL_MAG PARAM readback 완료: "
+                        f"{slot_summary}"
+                    )
+            applied = tuple(str(item) for item in data.get("applied") or ())
+            missing = tuple(str(item) for item in data.get("missing") or ())
+            if kind == "mag_apply":
+                targets = getattr(self.panel, "_px4_mag_verification_targets", None)
+                if not isinstance(targets, dict):
+                    targets = {}
+                    setattr(self.panel, "_px4_mag_verification_targets", targets)
+                targets[camera] = {
+                    "expected_device_id": getattr(status, "expected_selected_device_id", None),
+                    "started_s": time.monotonic(),
+                }
+                self.panel._log(
+                    f"[PX4 MAG] {self.panel._px4_mag_camera_label(camera)} Workstation PARAM 적용: "
+                    f"{', '.join(applied) or 'none'}"
+                )
+                if missing:
+                    self.panel._log(
+                        f"[PX4 MAG] {self.panel._px4_mag_camera_label(camera)} 미적용 role: {', '.join(missing)}"
+                    )
+                # PARAM readback is not active-selection evidence. Force an
+                # independent vehicle_magnetometer/Shell sample after the
+                # worker releases the receive owner.
+                read_shell = getattr(self.panel, "_read_px4_sensor_mag_shell", None)
+                if callable(read_shell):
+                    QtCore.QTimer.singleShot(0, lambda camera=camera: read_shell(camera))
+        elif kind == "attitude_refresh":
+            self.panel._px4_calibration_parameter_error.pop(camera, None)
+            self.panel._render_px4_attitude_cal_status(camera, status, using_real_params=True)
+
+    def _record_px4_mag_readback_completeness(self, camera: str, status: object) -> tuple[str, ...]:
+        """Remember which CAL_MAG PARAMs a rendered status is still missing.
+
+        The slot table renders whatever arrived, but the automatic readback
+        keeps retrying (bounded) while identity, priority, or correction
+        coefficients are absent -- a partially read status must not be
+        mistaken for a finished one.
+        """
+
+        store = getattr(self.panel, "_px4_mag_status_incomplete", None)
+        if not isinstance(store, dict):
+            store = {}
+            setattr(self.panel, "_px4_mag_status_incomplete", store)
+        missing = missing_mag_status_params(getattr(status, "params", None))
+        if missing:
+            store[camera] = missing
+        else:
+            store.pop(camera, None)
+        return missing
+
+    def _apply_px4_board_rotation_readback(self, camera: str, params: object) -> None:
+        values = dict(params) if isinstance(params, Mapping) else {}
+        rotation = values.get("SENS_BOARD_ROT")
+        label = self.panel._px4_mag_camera_label(camera)
+        if rotation is None:
+            self.panel._log(f"[PX4 MAG] {label} SENS_BOARD_ROT readback 실패: 응답 없음")
+            return
+        store = getattr(self.panel, "_px4_board_rotation_params", None)
+        if not isinstance(store, dict):
+            store = {}
+            setattr(self.panel, "_px4_board_rotation_params", store)
+        previous = store.get(camera, {}).get("SENS_BOARD_ROT") if isinstance(store.get(camera), Mapping) else None
+        store[camera] = {"SENS_BOARD_ROT": rotation}
+        if previous != rotation:
+            self.panel._log(
+                f"[PX4 MAG] {label} SENS_BOARD_ROT readback 완료: {int(rotation)} "
+                "(internal/GPS MAG corrected yaw 보드 회전 기준)"
+            )
+
+    def _pixhawk_parameter_worker_failed(self, camera: str, operation: str, error: str) -> None:
+        if operation == "calibration_refresh":
+            self.panel._px4_calibration_parameter_error[camera] = str(error)
+        if operation == "mag_apply":
+            targets = getattr(self.panel, "_px4_mag_verification_targets", None)
+            if not isinstance(targets, dict):
+                targets = {}
+                setattr(self.panel, "_px4_mag_verification_targets", targets)
+            targets[camera] = {
+                "expected_device_id": None,
+                "started_s": time.monotonic(),
+                "error": str(error),
+            }
+        self.panel._log(
+            f"[픽스호크] {camera_label_ko(camera)} PARAM 작업 실패 ({operation}): {error}"
+        )
+        if operation == "mag_refresh" or operation == "mag_apply":
+            self.panel._set_px4_mag_manager_button_state(
+                camera,
+                refresh_enabled=True,
+                actions_enabled=True,
+                tooltip="",
+            )
+        elif operation == "attitude_refresh":
+            button = self.panel.px4_attitude_cal_refresh_buttons.get(camera)
+            if button is not None:
+                button.setEnabled(True)
+
+    def _clear_pixhawk_parameter_worker(self, camera: str, thread: QtCore.QThread) -> None:
+        if self.panel.pixhawk_parameter_threads.get(camera) is not thread:
+            return
+        self.panel.pixhawk_parameter_threads.pop(camera, None)
+        self.panel.pixhawk_parameter_workers.pop(camera, None)
+        manager = self.panel.px4_mag_managers.get(camera) if hasattr(self.panel, "px4_mag_managers") else None
+        armed = bool(getattr(manager, "armed", False))
+        self.panel._set_px4_mag_manager_button_state(
+            camera,
+            refresh_enabled=True,
+            actions_enabled=not armed,
+            tooltip="Disarm required" if armed else "",
+        )
+        button = self.panel.px4_attitude_cal_refresh_buttons.get(camera) if hasattr(self.panel, "px4_attitude_cal_refresh_buttons") else None
+        if button is not None:
+            button.setEnabled(True)

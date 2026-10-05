@@ -1,0 +1,1985 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+import hashlib
+import json
+import math
+from dataclasses import asdict, dataclass
+from typing import Any, Iterable
+
+from Workstation.workstation_core.coordinate_contract import (
+    BASELINE_TRANSLATION_FRAME,
+    BODY_FRAME,
+    CAMERA_FRAME,
+    CAMERA_MOUNT_PROFILE,
+    MEASUREMENT_AXIS_CONTRACT,
+    MEASUREMENT_FRAME,
+    PUBLIC_MEASUREMENT_VECTOR_CONTRACT,
+    WORLD_FRAME,
+)
+from Workstation.workstation_core.rtk_geometry import ned_delta_m
+from Workstation.workstation_core.measurement_methods import (
+    PIXHAWK_RTK_LIVE,
+    normalize_measurement_method_id,
+)
+from Workstation.workstation_core.measurement_policy import (
+    FIELD_MEASUREMENT_POLICY_ID,
+    MEASUREMENT_VALIDITY_VALUES,
+)
+from Workstation.workstation_core.stereo import (
+    StereoCalibration,
+    TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC,
+)
+from Workstation.workstation_core.triangulation import (
+    camera_translation_right_in_left_camera,
+    invert_left_to_right_camera_transform,
+)
+
+
+MetadataScalar = str | int | float | bool | None
+
+QUATERNION_NORM_EPSILON = 1.0e-12
+CAMERA_MATRIX_TOLERANCE = 1.0e-12
+# Runtime calibration validation allows serialization noise; 1e-9 remains a
+# synthetic geometry test tolerance, not a hardware/calibration acceptance gate.
+ROTATION_MATRIX_TOLERANCE = 1.0e-6
+CHECKERBOARD_FRAME_CONTRACT = (
+    "opencv_optical:RDF(right,down,forward); "
+    "X_right = R_left_to_right * X_left + T_left_to_right_m"
+)
+LIVE_DISTANCE_MAX_APP_DELTA_NS = 100_000_000
+
+DETECTION_METADATA_ALLOWLIST = (
+    "camera_id",
+    "frame_id",
+    "frame_key",
+    "frame_descriptor_sha256",
+    "source_native_frame_id",
+    "native_ring_available",
+    "native_ring_unavailable_reason",
+    "native_width",
+    "native_height",
+    "native_channels",
+    "native_byte_length",
+    "native_pixel_format",
+    "timestamp_s",
+    "app_receive_monotonic_ns",
+    "app_receive_timestamp_role",
+    "source_timestamp_s",
+    "timestamp_source",
+    "timestamp_reference",
+    "rtp_timestamp",
+    "rtp_ssrc",
+    "stream_generation",
+    "rtp_marker_seq",
+    "rtp_pts_s",
+    "rtcp_sr_ntp_raw",
+    "rtcp_sr_ntp_unix_s",
+    "rtcp_sr_rtp_timestamp",
+    "rtcp_clock_rate_hz",
+    "rtcp_sr_age_s",
+    "rtcp_sr_received_wall_s",
+    "rtcp_sr_pc_offset_s",
+    "rtcp_frame_ntp_unix_s",
+    "rtcp_frame_received_wall_s",
+    "rtcp_frame_receive_delay_s",
+    "rtcp_frame_transport_delay_s",
+    "rtcp_camera_ntp_rate",
+    "rtcp_camera_media_rate",
+    "rtcp_sr_received_count",
+    "rtsp_transport",
+    "rtcp_timing_invalid_reason",
+    "media_recovery_basis",
+    "media_integrity_mode",
+    "media_integrity_unverified",
+    "source_media_integrity_verified",
+    "media_random_access_guaranteed",
+    "rtp_integrity_latched",
+    "measurement_input_admitted",
+    "clock_epoch_id",
+    "clock_epoch_state",
+)
+
+RECORD_ONLY_CLOCK_METADATA_KEYS = frozenset(
+    {
+        "source_timestamp_s",
+        "timestamp_source",
+        "timestamp_reference",
+        "rtp_timestamp",
+        "rtp_ssrc",
+        "rtp_marker_seq",
+        "rtp_pts_s",
+        "rtcp_sr_ntp_raw",
+        "rtcp_sr_ntp_unix_s",
+        "rtcp_sr_rtp_timestamp",
+        "rtcp_clock_rate_hz",
+        "rtcp_sr_age_s",
+        "rtcp_sr_received_wall_s",
+        "rtcp_sr_pc_offset_s",
+        "rtcp_frame_ntp_unix_s",
+        "rtcp_frame_received_wall_s",
+        "rtcp_frame_receive_delay_s",
+        "rtcp_frame_transport_delay_s",
+        "rtcp_camera_ntp_rate",
+        "rtcp_camera_media_rate",
+        "rtcp_sr_received_count",
+        "rtsp_transport",
+        "rtcp_timing_invalid_reason",
+        "clock_epoch_id",
+        "clock_epoch_state",
+    }
+)
+
+
+def _finite_float(value: Any, *, name: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{name} must be finite")
+    return parsed
+
+
+def _optional_finite_float(value: Any, *, name: str) -> float | None:
+    return None if value is None else _finite_float(value, name=name)
+
+
+def _optional_int(value: Any) -> int | None:
+    return None if value is None else int(value)
+
+
+def _finite_tuple(values: Iterable[Any], *, name: str, length: int | None = None) -> tuple[float, ...]:
+    parsed = tuple(_finite_float(value, name=name) for value in values)
+    if length is not None and len(parsed) != length:
+        raise ValueError(f"{name} must contain {length} values")
+    return parsed
+
+
+def _determinant_3x3(matrix: tuple[tuple[float, float, float], ...]) -> float:
+    return (
+        matrix[0][0] * (matrix[1][1] * matrix[2][2] - matrix[1][2] * matrix[2][1])
+        - matrix[0][1] * (matrix[1][0] * matrix[2][2] - matrix[1][2] * matrix[2][0])
+        + matrix[0][2] * (matrix[1][0] * matrix[2][1] - matrix[1][1] * matrix[2][0])
+    )
+
+
+def _validate_rotation_matrix(
+    matrix: tuple[tuple[float, float, float], ...],
+    *,
+    name: str,
+) -> None:
+    max_orthogonality_error = max(
+        abs(
+            sum(matrix[row][left] * matrix[row][right] for row in range(3))
+            - (1.0 if left == right else 0.0)
+        )
+        for left in range(3)
+        for right in range(3)
+    )
+    if max_orthogonality_error > ROTATION_MATRIX_TOLERANCE:
+        raise ValueError(f"{name} must be orthonormal within 1e-6")
+    if abs(_determinant_3x3(matrix) - 1.0) > ROTATION_MATRIX_TOLERANCE:
+        raise ValueError(f"{name} determinant must equal +1 within 1e-6")
+
+
+def _canonical_json_bytes(payload: Any) -> bytes:
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _sha256_payload(payload: Any) -> str:
+    return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+
+
+def _canonical_detection_metadata_items(
+    metadata_items: Any,
+    *,
+    project_allowlisted_keys: bool = False,
+) -> tuple[tuple[str, MetadataScalar], ...]:
+    """Validate and order immutable detection timestamp metadata."""
+
+    if metadata_items is None:
+        return ()
+    if type(metadata_items) not in (tuple, list):
+        raise TypeError("timestamp metadata must be a tuple or list of key/value pairs")
+
+    values_by_key: dict[str, MetadataScalar] = {}
+    for raw_item in metadata_items:
+        if type(raw_item) not in (tuple, list):
+            raise TypeError("each timestamp metadata item must be a tuple or list")
+        if len(raw_item) != 2:
+            raise ValueError("each timestamp metadata item must contain exactly two values")
+        key, value = raw_item
+        if type(key) is not str:
+            raise TypeError("timestamp metadata keys must be strings")
+        if key not in DETECTION_METADATA_ALLOWLIST:
+            if project_allowlisted_keys:
+                continue
+            raise ValueError(f"timestamp metadata key is not allowed: {key}")
+        if key in values_by_key:
+            raise ValueError(f"duplicate timestamp metadata key: {key}")
+        if value is None or type(value) in (str, bool, int):
+            values_by_key[key] = value
+        elif type(value) is float:
+            if not math.isfinite(value) and key in RECORD_ONLY_CLOCK_METADATA_KEYS:
+                values_by_key[key] = None
+            else:
+                values_by_key[key] = _finite_float(
+                    value,
+                    name=f"timestamp_metadata.{key}",
+                )
+        elif key in RECORD_ONLY_CLOCK_METADATA_KEYS:
+            values_by_key[key] = None
+        else:
+            raise TypeError(f"timestamp_metadata.{key} must be an immutable scalar")
+
+    return tuple(
+        (key, values_by_key[key])
+        for key in DETECTION_METADATA_ALLOWLIST
+        if key in values_by_key
+    )
+
+
+def _metadata_items(metadata: Any) -> tuple[tuple[str, MetadataScalar], ...]:
+    if metadata is None:
+        return ()
+    if isinstance(metadata, Mapping):
+        raw_items = tuple(metadata.items())
+    elif type(metadata) in (tuple, list):
+        raw_items = metadata
+    else:
+        raise TypeError("observation timestamp metadata must be a Mapping, tuple, or list")
+    return _canonical_detection_metadata_items(
+        raw_items,
+        project_allowlisted_keys=True,
+    )
+
+
+@dataclass(frozen=True)
+class DetectionSnapshot:
+    camera: str
+    app_receive_monotonic_s: float
+    width_px: int
+    height_px: int
+    bbox_xyxy_px: tuple[float, float, float, float]
+    center_px: tuple[float, float]
+    confidence: float
+    class_id: int
+    class_name: str | None
+    pairing_timestamp_basis: str
+    pairing_timestamp_s: float
+    timestamp_metadata_items: tuple[tuple[str, MetadataScalar], ...] = ()
+    candidate_class_ids: tuple[int, ...] = ()
+    pixel_frame: str = CAMERA_FRAME
+    pixel_unit: str = "px"
+    selected_candidate_index: int = 0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "camera", str(self.camera))
+        object.__setattr__(self, "selected_candidate_index", int(self.selected_candidate_index))
+        object.__setattr__(self, "app_receive_monotonic_s", _finite_float(self.app_receive_monotonic_s, name="app_receive_monotonic_s"))
+        object.__setattr__(self, "width_px", int(self.width_px))
+        object.__setattr__(self, "height_px", int(self.height_px))
+        object.__setattr__(self, "bbox_xyxy_px", _finite_tuple(self.bbox_xyxy_px, name="bbox_xyxy_px", length=4))
+        object.__setattr__(self, "center_px", _finite_tuple(self.center_px, name="center_px", length=2))
+        object.__setattr__(self, "confidence", _finite_float(self.confidence, name="confidence"))
+        object.__setattr__(self, "class_id", int(self.class_id))
+        object.__setattr__(self, "class_name", None if self.class_name is None else str(self.class_name))
+        object.__setattr__(self, "pairing_timestamp_basis", str(self.pairing_timestamp_basis))
+        object.__setattr__(self, "pairing_timestamp_s", _finite_float(self.pairing_timestamp_s, name="pairing_timestamp_s"))
+        object.__setattr__(
+            self,
+            "timestamp_metadata_items",
+            _canonical_detection_metadata_items(self.timestamp_metadata_items),
+        )
+        object.__setattr__(
+            self,
+            "candidate_class_ids",
+            tuple(int(class_id) for class_id in self.candidate_class_ids),
+        )
+        object.__setattr__(self, "pixel_frame", str(self.pixel_frame))
+        object.__setattr__(self, "pixel_unit", str(self.pixel_unit))
+        _finite_float(self.app_receive_monotonic_s, name="app_receive_monotonic_s")
+        _finite_float(self.pairing_timestamp_s, name="pairing_timestamp_s")
+        _finite_tuple(self.bbox_xyxy_px, name="bbox_xyxy_px", length=4)
+        _finite_tuple(self.center_px, name="center_px", length=2)
+        _finite_float(self.confidence, name="confidence")
+        if self.width_px <= 0 or self.height_px <= 0:
+            raise ValueError("detection image dimensions must be positive")
+        if self.camera not in {"left", "right"}:
+            raise ValueError("detection camera must be left or right")
+        x1, y1, x2, y2 = self.bbox_xyxy_px
+        if not (0.0 <= x1 < x2 <= float(self.width_px)):
+            raise ValueError("bbox_xyxy_px must satisfy 0 <= x1 < x2 <= width")
+        if not (0.0 <= y1 < y2 <= float(self.height_px)):
+            raise ValueError("bbox_xyxy_px must satisfy 0 <= y1 < y2 <= height")
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("confidence must be between 0 and 1")
+        if self.class_id < 0 or any(class_id < 0 for class_id in self.candidate_class_ids):
+            raise ValueError("class IDs must be non-negative")
+        if self.pixel_frame != CAMERA_FRAME or self.pixel_unit != "px":
+            raise ValueError("detection pixels must use camera_optical_rdf pixel coordinates")
+    @classmethod
+    def from_observation(
+        cls,
+        observation: Any,
+        *,
+        pairing_timestamp_basis: str,
+        pairing_timestamp_s: float,
+    ) -> "DetectionSnapshot":
+        if cls is not DetectionSnapshot:
+            raise TypeError("DetectionSnapshot.from_observation does not support subclasses")
+        x1 = _finite_float(observation.x1, name="x1")
+        y1 = _finite_float(observation.y1, name="y1")
+        x2 = _finite_float(observation.x2, name="x2")
+        y2 = _finite_float(observation.y2, name="y2")
+        return cls(
+            camera=str(observation.camera),
+            app_receive_monotonic_s=_finite_float(observation.timestamp_s, name="timestamp_s"),
+            width_px=int(observation.width),
+            height_px=int(observation.height),
+            bbox_xyxy_px=(x1, y1, x2, y2),
+            center_px=((x1 + x2) / 2.0, (y1 + y2) / 2.0),
+            confidence=_finite_float(observation.confidence, name="confidence"),
+            class_id=int(observation.class_id),
+            class_name=None if observation.class_name is None else str(observation.class_name),
+            pairing_timestamp_basis=str(pairing_timestamp_basis),
+            pairing_timestamp_s=_finite_float(pairing_timestamp_s, name="pairing_timestamp_s"),
+            timestamp_metadata_items=_metadata_items(getattr(observation, "timestamp_metadata", None)),
+            candidate_class_ids=tuple(getattr(observation, "candidate_class_ids", ()) or ()),
+            selected_candidate_index=int(getattr(observation, "selected_candidate_index", 0) or 0),
+        )
+
+    @property
+    def timestamp_s(self) -> float:
+        return self.app_receive_monotonic_s
+
+    @property
+    def app_receive_monotonic_ns(self) -> int:
+        value = self.timestamp_metadata.get("app_receive_monotonic_ns")
+        if value is not None and type(value) is not int:
+            raise ValueError("app_receive_monotonic_ns must be an exact integer")
+        result = value if value is not None else int(
+            round(self.app_receive_monotonic_s * 1_000_000_000.0)
+        )
+        if result < 0:
+            raise ValueError("app_receive_monotonic_ns must be non-negative")
+        return result
+
+    @property
+    def width(self) -> int:
+        return self.width_px
+
+    @property
+    def height(self) -> int:
+        return self.height_px
+
+    @property
+    def x1(self) -> float:
+        return self.bbox_xyxy_px[0]
+
+    @property
+    def y1(self) -> float:
+        return self.bbox_xyxy_px[1]
+
+    @property
+    def x2(self) -> float:
+        return self.bbox_xyxy_px[2]
+
+    @property
+    def y2(self) -> float:
+        return self.bbox_xyxy_px[3]
+
+    @property
+    def center(self) -> tuple[float, float]:
+        return self.center_px
+
+    @property
+    def timestamp_metadata(self) -> dict[str, MetadataScalar]:
+        """Return a detached compatibility copy; the snapshot stores tuples only."""
+
+        return dict(self.timestamp_metadata_items)
+
+    @property
+    def same_class_candidate_count(self) -> int:
+        candidates = self.candidate_class_ids or (self.class_id,)
+        return sum(class_id == self.class_id for class_id in candidates)
+
+
+def live_pair_timing_evidence(
+    left: DetectionSnapshot,
+    right: DetectionSnapshot,
+    *,
+    requested_basis: str,
+    effective_basis: str,
+    fallback_reason: str = "",
+    max_abs_delta_ns: int = LIVE_DISTANCE_MAX_APP_DELTA_NS,
+) -> dict[str, object]:
+    """Freeze selected timing plus distinct app/RTCP evidence for one live pair."""
+
+    if left.camera != "left" or right.camera != "right":
+        raise ValueError("live pair timing requires exact Left/Right identity")
+    left_app_ns = _safe_app_receive_monotonic_ns(left)
+    right_app_ns = _safe_app_receive_monotonic_ns(right)
+    signed_app_delta_ns = right_app_ns - left_app_ns
+    abs_app_delta_ns = abs(signed_app_delta_ns)
+
+    left_metadata = left.timestamp_metadata
+    right_metadata = right.timestamp_metadata
+    def record_only_ntp_s(metadata: Mapping[str, object], side: str) -> float | None:
+        try:
+            return _optional_finite_float(
+                metadata.get("rtcp_frame_ntp_unix_s"),
+                name=f"{side} rtcp_frame_ntp_unix_s",
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    left_ntp_s = record_only_ntp_s(left_metadata, "left")
+    right_ntp_s = record_only_ntp_s(right_metadata, "right")
+    signed_ntp_delta_s = (
+        None
+        if left_ntp_s is None or right_ntp_s is None
+        else right_ntp_s - left_ntp_s
+    )
+    requested = str(requested_basis or TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC)
+    effective = str(effective_basis or TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC)
+    if effective in {"detection", "camera_receive", "app_receive"}:
+        effective = TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC
+    if effective == "camera_rtcp":
+        left_selected_s = (
+            left.pairing_timestamp_s
+            if left.pairing_timestamp_basis in {"camera_rtcp", "camera_rtc_required"}
+            else left_ntp_s
+        )
+        right_selected_s = (
+            right.pairing_timestamp_s
+            if right.pairing_timestamp_basis in {"camera_rtcp", "camera_rtc_required"}
+            else right_ntp_s
+        )
+        if left_selected_s is None or right_selected_s is None:
+            raise ValueError("RTCP_TIMESTAMP_UNAVAILABLE")
+        selected_delta_ns = int(
+            round((right_selected_s - left_selected_s) * 1_000_000_000.0)
+        )
+        ntp_role = "selected_distance_pairing"
+        app_role = "attitude_association_and_fallback"
+    elif effective == TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC:
+        selected_delta_ns = signed_app_delta_ns
+        ntp_role = "record_only"
+        app_role = "selected_distance_pairing"
+    else:
+        raise ValueError(f"unsupported live pair timing basis: {effective}")
+    selected_abs_delta_ns = abs(selected_delta_ns)
+    limit_ns = max(0, int(max_abs_delta_ns))
+    # A pair beyond the configured window is still measured; the excess is
+    # recorded so the analysis can weigh it, never used to drop the pair.
+    limit_exceeded = selected_abs_delta_ns > limit_ns
+    limit_exceeded_code = ""
+    if limit_exceeded:
+        limit_exceeded_code = (
+            "APP_RECEIVE_DELTA_EXCEEDED"
+            if effective == TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC
+            else "RTCP_DELTA_EXCEEDED"
+        )
+    return {
+        "schema": "workstation-live-pair-timing-v2",
+        "requested_time_basis": requested,
+        "time_basis": effective,
+        "time_basis_role": "authoritative_distance",
+        "fallback_active": bool(
+            fallback_reason
+            and effective == TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC
+            and requested != effective
+        ),
+        "fallback_reason": str(fallback_reason or ""),
+        "left_app_receive_monotonic_ns": left_app_ns,
+        "right_app_receive_monotonic_ns": right_app_ns,
+        "app_receive_pair_delta_ns": signed_app_delta_ns,
+        "app_receive_pair_abs_delta_ns": abs_app_delta_ns,
+        "app_receive_evidence_role": app_role,
+        "selected_pair_delta_ns": selected_delta_ns,
+        "selected_pair_abs_delta_ns": selected_abs_delta_ns,
+        "selected_left_pairing_timestamp_s": left.pairing_timestamp_s,
+        "selected_right_pairing_timestamp_s": right.pairing_timestamp_s,
+        "pair_delta_s": selected_abs_delta_ns * 1.0e-9,
+        "pair_timing_limit_ns": limit_ns,
+        "pair_timing_limit_exceeded": limit_exceeded,
+        "pair_timing_limit_exceeded_code": limit_exceeded_code,
+        "app_receive_timestamp_source_by_side": {
+            side: (
+                "exact_monotonic_ns"
+                if detection.timestamp_metadata.get("app_receive_monotonic_ns")
+                is not None
+                else "legacy_float_derived"
+            )
+            for side, detection in (("left", left), ("right", right))
+        },
+        "left_rtcp_frame_ntp_unix_s": left_ntp_s,
+        "right_rtcp_frame_ntp_unix_s": right_ntp_s,
+        "rtcp_pair_delta_s": signed_ntp_delta_s,
+        "ntp_evidence_role": ntp_role,
+        "left_clock_epoch_id": str(left_metadata.get("clock_epoch_id") or ""),
+        "right_clock_epoch_id": str(right_metadata.get("clock_epoch_id") or ""),
+        "left_clock_epoch_state": str(left_metadata.get("clock_epoch_state") or ""),
+        "right_clock_epoch_state": str(right_metadata.get("clock_epoch_state") or ""),
+        "operator_approved_sync_assumption": False,
+    }
+
+
+def app_receive_pair_timing_evidence(
+    left: DetectionSnapshot,
+    right: DetectionSnapshot,
+    *,
+    max_abs_delta_ns: int = LIVE_DISTANCE_MAX_APP_DELTA_NS,
+) -> dict[str, object]:
+    """Compatibility wrapper for explicitly app-selected live pairs."""
+
+    return live_pair_timing_evidence(
+        left,
+        right,
+        requested_basis=TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC,
+        effective_basis=TIMESTAMP_BASIS_APP_RECEIVE_MONOTONIC,
+        max_abs_delta_ns=max_abs_delta_ns,
+    )
+
+
+@dataclass(frozen=True)
+class AttitudeSnapshot:
+    camera: str
+    app_receive_monotonic_s: float
+    quaternion_wxyz: tuple[float, float, float, float]
+    namespace: str
+    topic: str
+    px4_timestamp_s: float | None
+    roll_deg: float
+    pitch_deg: float
+    yaw_deg: float
+    px4_timestamp_us: int | None = None
+    px4_timestamp_sample_us: int | None = None
+    delta_q_reset: tuple[float, float, float, float] | None = None
+    quat_reset_counter: int | None = None
+    quaternion_order: str = "wxyz"
+    orientation_from_frame: str = BODY_FRAME
+    orientation_to_frame: str = WORLD_FRAME
+    mavlink_source_system: int | None = None
+    mavlink_source_component: int | None = None
+    mavlink_sequence: int | None = None
+    mavlink_message_id: int | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "camera", str(self.camera))
+        object.__setattr__(self, "app_receive_monotonic_s", _finite_float(self.app_receive_monotonic_s, name="attitude timestamp"))
+        object.__setattr__(
+            self,
+            "quaternion_wxyz",
+            _finite_tuple(self.quaternion_wxyz, name="quaternion_wxyz", length=4),
+        )
+        object.__setattr__(self, "namespace", str(self.namespace))
+        object.__setattr__(self, "topic", str(self.topic))
+        object.__setattr__(self, "px4_timestamp_s", _optional_finite_float(self.px4_timestamp_s, name="px4_timestamp_s"))
+        object.__setattr__(self, "roll_deg", _finite_float(self.roll_deg, name="roll_deg"))
+        object.__setattr__(self, "pitch_deg", _finite_float(self.pitch_deg, name="pitch_deg"))
+        object.__setattr__(self, "yaw_deg", _finite_float(self.yaw_deg, name="yaw_deg"))
+        object.__setattr__(self, "px4_timestamp_us", _optional_int(self.px4_timestamp_us))
+        object.__setattr__(self, "px4_timestamp_sample_us", _optional_int(self.px4_timestamp_sample_us))
+        if self.delta_q_reset is not None:
+            object.__setattr__(
+                self,
+                "delta_q_reset",
+                _finite_tuple(self.delta_q_reset, name="delta_q_reset", length=4),
+            )
+        object.__setattr__(self, "quat_reset_counter", _optional_int(self.quat_reset_counter))
+        object.__setattr__(self, "quaternion_order", str(self.quaternion_order))
+        object.__setattr__(self, "orientation_from_frame", str(self.orientation_from_frame))
+        object.__setattr__(self, "orientation_to_frame", str(self.orientation_to_frame))
+        _finite_float(self.app_receive_monotonic_s, name="attitude timestamp")
+        q = _finite_tuple(self.quaternion_wxyz, name="quaternion_wxyz", length=4)
+        if math.sqrt(sum(value * value for value in q)) <= QUATERNION_NORM_EPSILON:
+            raise ValueError("quaternion_wxyz norm must be greater than 1e-12")
+        _optional_finite_float(self.px4_timestamp_s, name="px4_timestamp_s")
+        for name, value in (("roll_deg", self.roll_deg), ("pitch_deg", self.pitch_deg), ("yaw_deg", self.yaw_deg)):
+            _finite_float(value, name=name)
+        if self.quaternion_order != "wxyz":
+            raise ValueError("quaternion order must be wxyz")
+        if self.camera not in {"left", "right"}:
+            raise ValueError("attitude camera must be left or right")
+        if self.orientation_from_frame != BODY_FRAME or self.orientation_to_frame != WORLD_FRAME:
+            raise ValueError("attitude must rotate PX4 body FRD components into world NED")
+
+    @classmethod
+    def from_state(cls, state: Any) -> "AttitudeSnapshot":
+        return cls(
+            camera=str(state.camera),
+            app_receive_monotonic_s=_finite_float(state.timestamp_s, name="attitude timestamp"),
+            quaternion_wxyz=tuple(_finite_tuple(state.q, name="quaternion_wxyz", length=4)),  # type: ignore[arg-type]
+            namespace=str(state.namespace),
+            topic=str(state.topic),
+            px4_timestamp_s=_optional_finite_float(getattr(state, "px4_timestamp_s", None), name="px4_timestamp_s"),
+            roll_deg=_finite_float(state.roll_deg, name="roll_deg"),
+            pitch_deg=_finite_float(state.pitch_deg, name="pitch_deg"),
+            yaw_deg=_finite_float(state.yaw_deg, name="yaw_deg"),
+            px4_timestamp_us=_optional_int(getattr(state, "px4_timestamp_us", None)),
+            px4_timestamp_sample_us=_optional_int(getattr(state, "px4_timestamp_sample_us", None)),
+            delta_q_reset=(
+                None
+                if getattr(state, "delta_q_reset", None) is None
+                else tuple(_finite_tuple(state.delta_q_reset, name="delta_q_reset", length=4))
+            ),
+            quat_reset_counter=_optional_int(getattr(state, "quat_reset_counter", None)),
+            mavlink_source_system=_optional_int(getattr(state, "mavlink_source_system", None)),
+            mavlink_source_component=_optional_int(getattr(state, "mavlink_source_component", None)),
+            mavlink_sequence=_optional_int(getattr(state, "mavlink_sequence", None)),
+            mavlink_message_id=_optional_int(getattr(state, "mavlink_message_id", None)),
+        )
+
+    @property
+    def timestamp_s(self) -> float:
+        return self.app_receive_monotonic_s
+
+    @property
+    def q(self) -> tuple[float, float, float, float]:
+        return self.quaternion_wxyz
+
+
+@dataclass(frozen=True)
+class GpsSnapshot:
+    camera: str
+    app_receive_monotonic_s: float
+    latitude_deg: float | None
+    longitude_deg: float | None
+    altitude_m: float | None
+    fix_type: int | None
+    satellites_used: int | None
+    eph_m: float | None
+    epv_m: float | None
+    rtk_label: str
+    namespace: str
+    topic: str
+    px4_timestamp_s: float | None
+    px4_timestamp_us: int | None = None
+    px4_timestamp_sample_us: int | None = None
+    gps_utc_us: int | None = None
+    gps_timestamp_time_relative_us: int | None = None
+    altitude_ellipsoid_m: float | None = None
+    velocity_n_m_s: float | None = None
+    velocity_e_m_s: float | None = None
+    velocity_d_m_s: float | None = None
+    velocity_ned_valid: bool | None = None
+    hdop: float | None = None
+    vdop: float | None = None
+    device_id: int | None = None
+    time_source: str = ""
+    heading_deg: float | None = None
+    heading_accuracy_deg: float | None = None
+    position_frame: str = "wgs84_geodetic"
+    angle_unit: str = "deg"
+    altitude_unit: str = "m"
+    mavlink_source_system: int | None = None
+    mavlink_source_component: int | None = None
+    mavlink_sequence: int | None = None
+    mavlink_message_id: int | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "camera", str(self.camera))
+        object.__setattr__(self, "app_receive_monotonic_s", _finite_float(self.app_receive_monotonic_s, name="GPS timestamp"))
+        for name in (
+            "latitude_deg",
+            "longitude_deg",
+            "altitude_m",
+            "eph_m",
+            "epv_m",
+            "px4_timestamp_s",
+            "heading_deg",
+            "heading_accuracy_deg",
+            "altitude_ellipsoid_m",
+            "velocity_n_m_s",
+            "velocity_e_m_s",
+            "velocity_d_m_s",
+            "hdop",
+            "vdop",
+        ):
+            object.__setattr__(self, name, _optional_finite_float(getattr(self, name), name=name))
+        object.__setattr__(self, "fix_type", None if self.fix_type is None else int(self.fix_type))
+        object.__setattr__(self, "satellites_used", None if self.satellites_used is None else int(self.satellites_used))
+        for name in (
+            "px4_timestamp_us",
+            "px4_timestamp_sample_us",
+            "gps_utc_us",
+            "gps_timestamp_time_relative_us",
+            "device_id",
+        ):
+            object.__setattr__(self, name, _optional_int(getattr(self, name)))
+        object.__setattr__(
+            self,
+            "velocity_ned_valid",
+            None if self.velocity_ned_valid is None else bool(self.velocity_ned_valid),
+        )
+        object.__setattr__(self, "time_source", str(self.time_source))
+        for name in ("rtk_label", "namespace", "topic", "position_frame", "angle_unit", "altitude_unit"):
+            object.__setattr__(self, name, str(getattr(self, name)))
+        _finite_float(self.app_receive_monotonic_s, name="GPS timestamp")
+        for name, value in (
+            ("latitude_deg", self.latitude_deg),
+            ("longitude_deg", self.longitude_deg),
+            ("altitude_m", self.altitude_m),
+            ("eph_m", self.eph_m),
+            ("epv_m", self.epv_m),
+            ("px4_timestamp_s", self.px4_timestamp_s),
+            ("heading_deg", self.heading_deg),
+            ("heading_accuracy_deg", self.heading_accuracy_deg),
+        ):
+            _optional_finite_float(value, name=name)
+        if self.camera not in {"left", "right"}:
+            raise ValueError("GPS camera must be left or right")
+        if self.latitude_deg is not None and not -90.0 <= self.latitude_deg <= 90.0:
+            raise ValueError("latitude_deg must be between -90 and 90")
+        if self.longitude_deg is not None and not -180.0 <= self.longitude_deg <= 180.0:
+            raise ValueError("longitude_deg must be between -180 and 180")
+        if self.eph_m is not None and self.eph_m < 0.0:
+            raise ValueError("eph_m must be non-negative")
+        if self.epv_m is not None and self.epv_m < 0.0:
+            raise ValueError("epv_m must be non-negative")
+        if self.position_frame != "wgs84_geodetic" or self.angle_unit != "deg" or self.altitude_unit != "m":
+            raise ValueError("GPS snapshot frame/unit contract mismatch")
+
+    @classmethod
+    def from_state(cls, state: Any) -> "GpsSnapshot":
+        return cls(
+            camera=str(state.camera),
+            app_receive_monotonic_s=_finite_float(state.timestamp_s, name="GPS timestamp"),
+            latitude_deg=_optional_finite_float(state.latitude_deg, name="latitude_deg"),
+            longitude_deg=_optional_finite_float(state.longitude_deg, name="longitude_deg"),
+            altitude_m=_optional_finite_float(state.altitude_m, name="altitude_m"),
+            fix_type=None if state.fix_type is None else int(state.fix_type),
+            satellites_used=None if state.satellites_used is None else int(state.satellites_used),
+            eph_m=_optional_finite_float(state.eph_m, name="eph_m"),
+            epv_m=_optional_finite_float(state.epv_m, name="epv_m"),
+            rtk_label=str(state.rtk_label),
+            namespace=str(state.namespace),
+            topic=str(state.topic),
+            px4_timestamp_s=_optional_finite_float(getattr(state, "px4_timestamp_s", None), name="px4_timestamp_s"),
+            px4_timestamp_us=_optional_int(getattr(state, "px4_timestamp_us", None)),
+            px4_timestamp_sample_us=_optional_int(getattr(state, "px4_timestamp_sample_us", None)),
+            gps_utc_us=_optional_int(getattr(state, "gps_utc_us", None)),
+            gps_timestamp_time_relative_us=_optional_int(
+                getattr(state, "gps_timestamp_time_relative_us", None)
+            ),
+            altitude_ellipsoid_m=_optional_finite_float(
+                getattr(state, "altitude_ellipsoid_m", None), name="altitude_ellipsoid_m"
+            ),
+            velocity_n_m_s=_optional_finite_float(
+                getattr(state, "velocity_n_m_s", None), name="velocity_n_m_s"
+            ),
+            velocity_e_m_s=_optional_finite_float(
+                getattr(state, "velocity_e_m_s", None), name="velocity_e_m_s"
+            ),
+            velocity_d_m_s=_optional_finite_float(
+                getattr(state, "velocity_d_m_s", None), name="velocity_d_m_s"
+            ),
+            velocity_ned_valid=getattr(state, "velocity_ned_valid", None),
+            hdop=_optional_finite_float(getattr(state, "hdop", None), name="hdop"),
+            vdop=_optional_finite_float(getattr(state, "vdop", None), name="vdop"),
+            device_id=_optional_int(getattr(state, "device_id", None)),
+            time_source=str(getattr(state, "time_source", "")),
+            heading_deg=_optional_finite_float(getattr(state, "heading_deg", None), name="heading_deg"),
+            heading_accuracy_deg=_optional_finite_float(
+                getattr(state, "heading_accuracy_deg", None), name="heading_accuracy_deg"
+            ),
+            mavlink_source_system=_optional_int(getattr(state, "mavlink_source_system", None)),
+            mavlink_source_component=_optional_int(getattr(state, "mavlink_source_component", None)),
+            mavlink_sequence=_optional_int(getattr(state, "mavlink_sequence", None)),
+            mavlink_message_id=_optional_int(getattr(state, "mavlink_message_id", None)),
+        )
+
+    @property
+    def timestamp_s(self) -> float:
+        return self.app_receive_monotonic_s
+
+    @property
+    def has_position(self) -> bool:
+        return self.latitude_deg is not None and self.longitude_deg is not None and self.altitude_m is not None
+
+
+@dataclass(frozen=True)
+class CameraIntrinsicsSnapshot:
+    width_px: int
+    height_px: int
+    camera_matrix: tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]
+    distortion_coefficients: tuple[float, ...]
+    reprojection_error_px: float
+    image_count: int
+    pixel_unit: str = "px"
+    camera_frame: str = CAMERA_FRAME
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "width_px", int(self.width_px))
+        object.__setattr__(self, "height_px", int(self.height_px))
+        matrix = tuple(tuple(_finite_tuple(row, name="camera_matrix", length=3)) for row in self.camera_matrix)
+        object.__setattr__(self, "camera_matrix", matrix)
+        object.__setattr__(
+            self,
+            "distortion_coefficients",
+            _finite_tuple(self.distortion_coefficients, name="distortion_coefficients"),
+        )
+        object.__setattr__(self, "reprojection_error_px", _finite_float(self.reprojection_error_px, name="reprojection_error_px"))
+        object.__setattr__(self, "image_count", int(self.image_count))
+        object.__setattr__(self, "pixel_unit", str(self.pixel_unit))
+        object.__setattr__(self, "camera_frame", str(self.camera_frame))
+        if self.width_px <= 0 or self.height_px <= 0:
+            raise ValueError("intrinsics dimensions must be positive")
+        if len(self.camera_matrix) != 3 or any(len(row) != 3 for row in self.camera_matrix):
+            raise ValueError("camera_matrix must be 3x3")
+        for row in self.camera_matrix:
+            _finite_tuple(row, name="camera_matrix", length=3)
+        _finite_tuple(self.distortion_coefficients, name="distortion_coefficients")
+        _finite_float(self.reprojection_error_px, name="reprojection_error_px")
+        if self.image_count < 0:
+            raise ValueError("image_count must be non-negative")
+        if not self.distortion_coefficients:
+            raise ValueError("distortion_coefficients must not be empty")
+        if self.camera_matrix[0][0] <= 0.0 or self.camera_matrix[1][1] <= 0.0:
+            raise ValueError("camera_matrix focal lengths must be positive")
+        if any(abs(self.camera_matrix[2][index] - expected) > CAMERA_MATRIX_TOLERANCE for index, expected in enumerate((0.0, 0.0, 1.0))):
+            raise ValueError("camera_matrix last row must be [0, 0, 1]")
+        if self.pixel_unit != "px" or self.camera_frame != CAMERA_FRAME:
+            raise ValueError("intrinsics frame/unit contract mismatch")
+
+    @classmethod
+    def from_intrinsics(cls, intrinsics: Any) -> "CameraIntrinsicsSnapshot":
+        matrix = tuple(tuple(_finite_tuple(row, name="camera_matrix", length=3)) for row in intrinsics.camera_matrix)
+        return cls(
+            width_px=int(intrinsics.width),
+            height_px=int(intrinsics.height),
+            camera_matrix=matrix,  # type: ignore[arg-type]
+            distortion_coefficients=tuple(_finite_tuple(intrinsics.distortion_coefficients, name="distortion_coefficients")),
+            reprojection_error_px=_finite_float(intrinsics.reprojection_error_px, name="reprojection_error_px"),
+            image_count=int(intrinsics.image_count),
+        )
+
+    @property
+    def width(self) -> int:
+        return self.width_px
+
+    @property
+    def height(self) -> int:
+        return self.height_px
+
+
+@dataclass(frozen=True)
+class CheckerboardExtrinsicsSnapshot:
+    rotation_left_to_right: tuple[
+        tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]
+    ]
+    translation_left_to_right_m: tuple[float, float, float]
+    reprojection_error_px: float
+    pair_count: int
+    frame_contract: str
+
+    def __post_init__(self) -> None:
+        rotation = tuple(
+            tuple(_finite_tuple(row, name="rotation_left_to_right", length=3))
+            for row in self.rotation_left_to_right
+        )
+        object.__setattr__(self, "rotation_left_to_right", rotation)
+        object.__setattr__(
+            self,
+            "translation_left_to_right_m",
+            _finite_tuple(self.translation_left_to_right_m, name="translation_left_to_right_m", length=3),
+        )
+        object.__setattr__(self, "reprojection_error_px", _finite_float(self.reprojection_error_px, name="checkerboard reprojection_error_px"))
+        object.__setattr__(self, "pair_count", int(self.pair_count))
+        object.__setattr__(self, "frame_contract", str(self.frame_contract))
+        if len(self.rotation_left_to_right) != 3 or any(len(row) != 3 for row in self.rotation_left_to_right):
+            raise ValueError("rotation_left_to_right must be 3x3")
+        for row in self.rotation_left_to_right:
+            _finite_tuple(row, name="rotation_left_to_right", length=3)
+        _finite_tuple(self.translation_left_to_right_m, name="translation_left_to_right_m", length=3)
+        _finite_float(self.reprojection_error_px, name="checkerboard reprojection_error_px")
+        if self.pair_count < 0:
+            raise ValueError("pair_count must be non-negative")
+        _validate_rotation_matrix(self.rotation_left_to_right, name="rotation_left_to_right")
+        if self.frame_contract != CHECKERBOARD_FRAME_CONTRACT:
+            raise ValueError("checkerboard frame_contract does not match the active RDF transform contract")
+
+    @classmethod
+    def from_extrinsics(cls, extrinsics: Any) -> "CheckerboardExtrinsicsSnapshot":
+        rotation = tuple(
+            tuple(_finite_tuple(row, name="rotation_left_to_right", length=3))
+            for row in extrinsics.rotation_left_to_right
+        )
+        return cls(
+            rotation_left_to_right=rotation,  # type: ignore[arg-type]
+            translation_left_to_right_m=tuple(
+                _finite_tuple(extrinsics.translation_left_to_right_m, name="translation_left_to_right_m", length=3)
+            ),  # type: ignore[arg-type]
+            reprojection_error_px=_finite_float(
+                extrinsics.reprojection_error_px, name="checkerboard reprojection_error_px"
+            ),
+            pair_count=int(extrinsics.pair_count),
+            frame_contract=str(extrinsics.frame_contract),
+        )
+
+
+@dataclass(frozen=True)
+class StereoIntrinsicsSnapshot:
+    left: CameraIntrinsicsSnapshot
+    right: CameraIntrinsicsSnapshot
+    checkerboard_extrinsics: CheckerboardExtrinsicsSnapshot | None
+    active_zoom_level: int
+    selected_profile_path: str
+    content_sha256: str
+    intrinsics_content_sha256: str = ""
+    selected_extrinsics_profile_path: str = ""
+    extrinsics_content_sha256: str = ""
+    intrinsics_source_zoom_level: int | None = None
+    extrinsics_source_zoom_level: int | None = None
+    selection_mode: str = "legacy_combined"
+    validation_gate: str = "disabled"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "active_zoom_level", int(self.active_zoom_level))
+        object.__setattr__(self, "selected_profile_path", str(self.selected_profile_path))
+        object.__setattr__(self, "content_sha256", str(self.content_sha256))
+        object.__setattr__(
+            self,
+            "intrinsics_source_zoom_level",
+            self.active_zoom_level
+            if self.intrinsics_source_zoom_level is None
+            else int(self.intrinsics_source_zoom_level),
+        )
+        object.__setattr__(
+            self,
+            "extrinsics_source_zoom_level",
+            None
+            if self.extrinsics_source_zoom_level is None
+            else int(self.extrinsics_source_zoom_level),
+        )
+        object.__setattr__(
+            self,
+            "selected_extrinsics_profile_path",
+            str(self.selected_extrinsics_profile_path),
+        )
+        object.__setattr__(self, "selection_mode", str(self.selection_mode))
+        object.__setattr__(self, "validation_gate", str(self.validation_gate))
+        if not isinstance(self.left, CameraIntrinsicsSnapshot) or not isinstance(
+            self.right, CameraIntrinsicsSnapshot
+        ):
+            raise TypeError("left/right intrinsics must be immutable CameraIntrinsicsSnapshot values")
+        if self.checkerboard_extrinsics is not None and not isinstance(
+            self.checkerboard_extrinsics, CheckerboardExtrinsicsSnapshot
+        ):
+            raise TypeError("checkerboard_extrinsics must be an immutable snapshot")
+        if self.active_zoom_level < 0:
+            raise ValueError("active_zoom_level must be non-negative")
+        if len(self.content_sha256) != 64 or any(character not in "0123456789abcdef" for character in self.content_sha256):
+            raise ValueError("content_sha256 must be a lowercase SHA-256 hex digest")
+        intrinsic_digest = self.intrinsics_content_sha256 or _sha256_payload(
+            {"left": asdict(self.left), "right": asdict(self.right)}
+        )
+        object.__setattr__(self, "intrinsics_content_sha256", intrinsic_digest)
+        extrinsics_digest = self.extrinsics_content_sha256
+        if self.checkerboard_extrinsics is not None and not extrinsics_digest:
+            extrinsics_digest = _sha256_payload(asdict(self.checkerboard_extrinsics))
+        object.__setattr__(self, "extrinsics_content_sha256", extrinsics_digest)
+        for name, digest in (
+            ("intrinsics_content_sha256", intrinsic_digest),
+            ("extrinsics_content_sha256", extrinsics_digest),
+        ):
+            if digest and (
+                len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise ValueError(f"{name} must be a lowercase SHA-256 hex digest")
+        if self.intrinsics_source_zoom_level is not None and self.intrinsics_source_zoom_level < 0:
+            raise ValueError("intrinsics_source_zoom_level must be non-negative")
+        if self.extrinsics_source_zoom_level is not None and self.extrinsics_source_zoom_level < 0:
+            raise ValueError("extrinsics_source_zoom_level must be non-negative")
+        if self.validation_gate != "disabled":
+            raise ValueError("calibration validation_gate must remain disabled")
+
+    @classmethod
+    def from_result(
+        cls,
+        result: Any,
+        *,
+        active_zoom_level: int,
+        selected_profile_path: str,
+        selected_extrinsics_profile_path: str = "",
+        intrinsics_source_zoom_level: int | None = None,
+        extrinsics_source_zoom_level: int | None = None,
+        selection_mode: str = "legacy_combined",
+    ) -> "StereoIntrinsicsSnapshot":
+        left = CameraIntrinsicsSnapshot.from_intrinsics(result.left)
+        right = CameraIntrinsicsSnapshot.from_intrinsics(result.right)
+        extrinsics = (
+            None
+            if result.extrinsics is None
+            else CheckerboardExtrinsicsSnapshot.from_extrinsics(result.extrinsics)
+        )
+        content = {
+            "left": asdict(left),
+            "right": asdict(right),
+            "checkerboard_extrinsics": None if extrinsics is None else asdict(extrinsics),
+        }
+        return cls(
+            left=left,
+            right=right,
+            checkerboard_extrinsics=extrinsics,
+            active_zoom_level=int(active_zoom_level),
+            selected_profile_path=str(selected_profile_path),
+            content_sha256=_sha256_payload(content),
+            intrinsics_content_sha256=_sha256_payload(
+                {"left": asdict(left), "right": asdict(right)}
+            ),
+            selected_extrinsics_profile_path=str(selected_extrinsics_profile_path),
+            extrinsics_content_sha256=(
+                "" if extrinsics is None else _sha256_payload(asdict(extrinsics))
+            ),
+            intrinsics_source_zoom_level=(
+                int(active_zoom_level)
+                if intrinsics_source_zoom_level is None
+                else int(intrinsics_source_zoom_level)
+            ),
+            extrinsics_source_zoom_level=(
+                None
+                if extrinsics_source_zoom_level is None
+                else int(extrinsics_source_zoom_level)
+            ),
+            selection_mode=str(selection_mode),
+            validation_gate="disabled",
+        )
+
+    @property
+    def extrinsics(self) -> CheckerboardExtrinsicsSnapshot | None:
+        return self.checkerboard_extrinsics
+
+
+@dataclass(frozen=True)
+class BaselineSnapshot:
+    source: str
+    baseline_m: float
+    ned_right_from_left_m: tuple[float, float, float] | None
+    translation_right_in_left_rdf_m: tuple[float, float, float] | None
+    left_basis_quaternion_wxyz: tuple[float, float, float, float] | None
+    fix_quality: str
+    warnings: tuple[str, ...]
+    usable_for_translation: bool
+    unusable_reason: str
+    gps_pair_delta_s: float | None
+    left_age_at_capture_s: float | None
+    right_age_at_capture_s: float | None
+    left_age_from_detection_midpoint_s: float | None
+    right_age_from_detection_midpoint_s: float | None
+    baseline_frame: str = WORLD_FRAME
+    translation_frame: str = BASELINE_TRANSLATION_FRAME
+    unit: str = "m"
+    left_basis_attitude_monotonic_s: float | None = None
+    gps_selection_basis: str = "latest_app_monotonic_at_attempt_capture"
+    gps_clock_domain: str = "app_monotonic_receive"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source", str(self.source))
+        object.__setattr__(self, "baseline_m", _finite_float(self.baseline_m, name="baseline_m"))
+        if self.ned_right_from_left_m is not None:
+            object.__setattr__(
+                self,
+                "ned_right_from_left_m",
+                _finite_tuple(self.ned_right_from_left_m, name="ned_right_from_left_m", length=3),
+            )
+        if self.translation_right_in_left_rdf_m is not None:
+            object.__setattr__(
+                self,
+                "translation_right_in_left_rdf_m",
+                _finite_tuple(
+                    self.translation_right_in_left_rdf_m,
+                    name="translation_right_in_left_rdf_m",
+                    length=3,
+                ),
+            )
+        if self.left_basis_quaternion_wxyz is not None:
+            object.__setattr__(
+                self,
+                "left_basis_quaternion_wxyz",
+                _finite_tuple(
+                    self.left_basis_quaternion_wxyz,
+                    name="left_basis_quaternion_wxyz",
+                    length=4,
+                ),
+            )
+        object.__setattr__(self, "warnings", tuple(str(value) for value in self.warnings))
+        object.__setattr__(self, "fix_quality", str(self.fix_quality))
+        object.__setattr__(self, "usable_for_translation", bool(self.usable_for_translation))
+        object.__setattr__(self, "unusable_reason", str(self.unusable_reason))
+        for name in (
+            "gps_pair_delta_s",
+            "left_age_at_capture_s",
+            "right_age_at_capture_s",
+            "left_age_from_detection_midpoint_s",
+            "right_age_from_detection_midpoint_s",
+        ):
+            object.__setattr__(self, name, _optional_finite_float(getattr(self, name), name=name))
+        object.__setattr__(self, "baseline_frame", str(self.baseline_frame))
+        object.__setattr__(self, "translation_frame", str(self.translation_frame))
+        object.__setattr__(self, "unit", str(self.unit))
+        object.__setattr__(
+            self,
+            "left_basis_attitude_monotonic_s",
+            _optional_finite_float(
+                self.left_basis_attitude_monotonic_s,
+                name="left_basis_attitude_monotonic_s",
+            ),
+        )
+        object.__setattr__(self, "gps_selection_basis", str(self.gps_selection_basis))
+        object.__setattr__(self, "gps_clock_domain", str(self.gps_clock_domain))
+        _finite_float(self.baseline_m, name="baseline_m")
+        if self.ned_right_from_left_m is not None:
+            _finite_tuple(self.ned_right_from_left_m, name="ned_right_from_left_m", length=3)
+        if self.translation_right_in_left_rdf_m is not None:
+            _finite_tuple(
+                self.translation_right_in_left_rdf_m,
+                name="translation_right_in_left_rdf_m",
+                length=3,
+            )
+        if self.left_basis_quaternion_wxyz is not None:
+            _finite_tuple(self.left_basis_quaternion_wxyz, name="left_basis_quaternion_wxyz", length=4)
+        for name, value in (
+            ("gps_pair_delta_s", self.gps_pair_delta_s),
+            ("left_age_at_capture_s", self.left_age_at_capture_s),
+            ("right_age_at_capture_s", self.right_age_at_capture_s),
+            ("left_age_from_detection_midpoint_s", self.left_age_from_detection_midpoint_s),
+            ("right_age_from_detection_midpoint_s", self.right_age_from_detection_midpoint_s),
+        ):
+            _optional_finite_float(value, name=name)
+        if self.baseline_m < 0.0:
+            raise ValueError("baseline_m must be non-negative")
+        if (
+            self.baseline_frame != WORLD_FRAME
+            or self.translation_frame != BASELINE_TRANSLATION_FRAME
+            or self.unit != "m"
+        ):
+            raise ValueError("baseline frame/unit contract mismatch")
+
+
+@dataclass(frozen=True)
+class GeometryConfigSnapshot:
+    focal_length_px: float
+    max_time_delta_s: float | None
+    max_vertical_delta_px: float | None
+    require_same_class: bool
+    timestamp_basis: str
+    manual_focal_override: bool
+    require_rtk_fixed_setting: bool = False
+    field_quality_gates_advisory: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "focal_length_px", _finite_float(self.focal_length_px, name="focal_length_px"))
+        object.__setattr__(self, "max_time_delta_s", _optional_finite_float(self.max_time_delta_s, name="max_time_delta_s"))
+        object.__setattr__(self, "max_vertical_delta_px", _optional_finite_float(self.max_vertical_delta_px, name="max_vertical_delta_px"))
+        object.__setattr__(self, "require_same_class", bool(self.require_same_class))
+        object.__setattr__(self, "timestamp_basis", str(self.timestamp_basis))
+        object.__setattr__(self, "manual_focal_override", bool(self.manual_focal_override))
+        object.__setattr__(self, "require_rtk_fixed_setting", bool(self.require_rtk_fixed_setting))
+        object.__setattr__(self, "field_quality_gates_advisory", bool(self.field_quality_gates_advisory))
+        _finite_float(self.focal_length_px, name="focal_length_px")
+        _optional_finite_float(self.max_time_delta_s, name="max_time_delta_s")
+        _optional_finite_float(self.max_vertical_delta_px, name="max_vertical_delta_px")
+
+    def to_stereo_calibration(self, *, baseline_m: float) -> StereoCalibration:
+        return StereoCalibration(
+            focal_length_px=self.focal_length_px,
+            baseline_m=_finite_float(baseline_m, name="baseline_m"),
+            max_time_delta_s=float("inf") if self.max_time_delta_s is None else self.max_time_delta_s,
+            max_vertical_delta_px=(
+                float("inf") if self.max_vertical_delta_px is None else self.max_vertical_delta_px
+            ),
+            require_same_class=self.require_same_class,
+            timestamp_basis=self.timestamp_basis,
+            quality_gates_advisory=self.field_quality_gates_advisory,
+        )
+
+
+@dataclass(frozen=True)
+class MeasurementAttempt:
+    attempt_id: int
+    attempt_session_id: str
+    detection_pair_key: tuple[MetadataScalar, ...]
+    created_monotonic_s: float
+    created_wall_s: float
+    detection_midpoint_monotonic_s: float
+    timestamp_basis: str
+    triangulation_source: str
+    left_detection: DetectionSnapshot
+    right_detection: DetectionSnapshot
+    left_attitude: AttitudeSnapshot | None
+    right_attitude: AttitudeSnapshot | None
+    left_gps: GpsSnapshot | None
+    right_gps: GpsSnapshot | None
+    intrinsics: StereoIntrinsicsSnapshot | None
+    baseline: BaselineSnapshot | None
+    geometry_config: GeometryConfigSnapshot
+    left_attitude_age_s: float | None
+    right_attitude_age_s: float | None
+    attitude_pair_delta_s: float | None
+    relative_roll_deg: float | None
+    relative_pitch_deg: float | None
+    relative_yaw_deg: float | None
+    source_quality: str
+    warnings: tuple[str, ...]
+    measurement_method_id: str = PIXHAWK_RTK_LIVE
+    measurement_method_instance_id: str = ""
+    measurement_geometry_kind: str = "legacy"
+    measurement_geometry_sha256: str = ""
+    measurement_selection_reason: str = "legacy"
+    measurement_component_sources: tuple[tuple[str, str], ...] = ()
+    measurement_pose_evidence_json: str = ""
+    measurement_policy_id: str = FIELD_MEASUREMENT_POLICY_ID
+    measurement_validity: str = "VALID"
+    hard_block_reasons: tuple[str, ...] = ()
+    advisory_reasons: tuple[str, ...] = ()
+    measurement_started_monotonic_s: float | None = None
+    world_frame: str = WORLD_FRAME
+    body_frame: str = BODY_FRAME
+    camera_frame: str = CAMERA_FRAME
+    camera_mount_profile: str = CAMERA_MOUNT_PROFILE
+    measurement_frame: str = MEASUREMENT_FRAME
+    measurement_axis_contract: str = MEASUREMENT_AXIS_CONTRACT
+    public_vector_contract: str = PUBLIC_MEASUREMENT_VECTOR_CONTRACT
+    measurement_unit: str = "m"
+    requested_timestamp_basis: str = ""
+    timing_fallback_reason: str = ""
+    geometry_left_quaternion_wxyz: tuple[float, float, float, float] | None = None
+    geometry_right_quaternion_wxyz: tuple[float, float, float, float] | None = None
+    measurement_yaw_source: str = ""
+    measurement_yaw_selection_mode: str = ""
+    measurement_yaw_branch_offset_deg: float | None = None
+    measurement_yaw_baseline_azimuth_deg: float | None = None
+    measurement_yaw_selected_deg: float | None = None
+    measurement_yaw_p1_reference_deg: float | None = None
+    measurement_yaw_p2_reference_deg: float | None = None
+    measurement_yaw_p1_age_s: float | None = None
+    measurement_yaw_p2_age_s: float | None = None
+    measurement_yaw_score_minus90_deg: float | None = None
+    measurement_yaw_score_plus90_deg: float | None = None
+    measurement_yaw_reverse: bool = False
+    measurement_yaw_consensus: bool | None = None
+    measurement_yaw_low_margin: bool = False
+    # Both perpendicular GPS-baseline yaw branches are kept so a wrong branch
+    # can be flipped offline without re-measuring. Compass degrees, NED yaw.
+    measurement_yaw_candidate_minus90_deg: float | None = None
+    measurement_yaw_candidate_plus90_deg: float | None = None
+    measurement_yaw_alternate_deg: float | None = None
+    measurement_yaw_p1_error_minus90_deg: float | None = None
+    measurement_yaw_p1_error_plus90_deg: float | None = None
+    measurement_yaw_p2_error_minus90_deg: float | None = None
+    measurement_yaw_p2_error_plus90_deg: float | None = None
+    geometry_left_quaternion_wxyz_alternate: tuple[float, float, float, float] | None = None
+    geometry_right_quaternion_wxyz_alternate: tuple[float, float, float, float] | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "attempt_id", int(self.attempt_id))
+        if self.measurement_pose_evidence_json:
+            evidence = json.loads(self.measurement_pose_evidence_json)
+            if not isinstance(evidence, dict) or evidence.get("schema") != "measurement-optical-pose-evidence-v1":
+                raise ValueError("invalid measurement optical pose evidence")
+            from .optical_yaw90_reference import canonical_evidence, reference_poses
+            if evidence.get("yaw90_reference") is not None:
+                reference_poses(evidence["yaw90_reference"])
+            object.__setattr__(self, "measurement_pose_evidence_json", canonical_evidence(evidence))
+        object.__setattr__(self, "attempt_session_id", str(self.attempt_session_id))
+        object.__setattr__(self, "detection_pair_key", tuple(self.detection_pair_key))
+        for name in ("created_monotonic_s", "created_wall_s", "detection_midpoint_monotonic_s"):
+            object.__setattr__(self, name, _finite_float(getattr(self, name), name=name))
+        for name in (
+            "left_attitude_age_s",
+            "right_attitude_age_s",
+            "attitude_pair_delta_s",
+            "relative_roll_deg",
+            "relative_pitch_deg",
+            "relative_yaw_deg",
+            "measurement_started_monotonic_s",
+        ):
+            object.__setattr__(self, name, _optional_finite_float(getattr(self, name), name=name))
+        for name in (
+            "timestamp_basis",
+            "triangulation_source",
+            "source_quality",
+            "world_frame",
+            "body_frame",
+            "camera_frame",
+            "camera_mount_profile",
+            "measurement_frame",
+            "measurement_axis_contract",
+            "public_vector_contract",
+            "measurement_unit",
+        ):
+            object.__setattr__(self, name, str(getattr(self, name)))
+        object.__setattr__(
+            self,
+            "requested_timestamp_basis",
+            str(self.requested_timestamp_basis or self.timestamp_basis),
+        )
+        object.__setattr__(
+            self,
+            "timing_fallback_reason",
+            str(self.timing_fallback_reason or ""),
+        )
+        for field_name in (
+            "geometry_left_quaternion_wxyz",
+            "geometry_right_quaternion_wxyz",
+            "geometry_left_quaternion_wxyz_alternate",
+            "geometry_right_quaternion_wxyz_alternate",
+        ):
+            value = getattr(self, field_name)
+            if value is not None:
+                object.__setattr__(
+                    self,
+                    field_name,
+                    _finite_tuple(value, name=field_name, length=4),
+                )
+        object.__setattr__(self, "measurement_yaw_source", str(self.measurement_yaw_source or ""))
+        object.__setattr__(
+            self,
+            "measurement_yaw_selection_mode",
+            str(self.measurement_yaw_selection_mode or ""),
+        )
+        object.__setattr__(self, "measurement_yaw_reverse", bool(self.measurement_yaw_reverse))
+        object.__setattr__(self, "measurement_yaw_low_margin", bool(self.measurement_yaw_low_margin))
+        object.__setattr__(
+            self,
+            "measurement_yaw_consensus",
+            None if self.measurement_yaw_consensus is None else bool(self.measurement_yaw_consensus),
+        )
+        for field_name in (
+            "measurement_yaw_branch_offset_deg",
+            "measurement_yaw_baseline_azimuth_deg",
+            "measurement_yaw_selected_deg",
+            "measurement_yaw_p1_reference_deg",
+            "measurement_yaw_p2_reference_deg",
+            "measurement_yaw_p1_age_s",
+            "measurement_yaw_p2_age_s",
+            "measurement_yaw_score_minus90_deg",
+            "measurement_yaw_score_plus90_deg",
+            "measurement_yaw_candidate_minus90_deg",
+            "measurement_yaw_candidate_plus90_deg",
+            "measurement_yaw_alternate_deg",
+            "measurement_yaw_p1_error_minus90_deg",
+            "measurement_yaw_p1_error_plus90_deg",
+            "measurement_yaw_p2_error_minus90_deg",
+            "measurement_yaw_p2_error_plus90_deg",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _optional_finite_float(getattr(self, field_name), name=field_name),
+            )
+        object.__setattr__(self, "warnings", tuple(str(value) for value in self.warnings))
+        hard_reasons = tuple(
+            dict.fromkeys(str(value) for value in self.hard_block_reasons if str(value))
+        )
+        advisory_reasons = tuple(
+            dict.fromkeys(str(value) for value in self.advisory_reasons if str(value))
+        )
+        if not hard_reasons:
+            hard_reasons = tuple(self.missing_geometry_inputs)
+        if not advisory_reasons:
+            advisory_reasons = tuple(self.warnings)
+        validity = "INVALID" if hard_reasons else "ESTIMATED" if advisory_reasons else "VALID"
+        object.__setattr__(self, "measurement_policy_id", str(self.measurement_policy_id))
+        object.__setattr__(self, "measurement_validity", validity)
+        object.__setattr__(self, "hard_block_reasons", hard_reasons)
+        object.__setattr__(self, "advisory_reasons", advisory_reasons)
+        if self.measurement_policy_id != FIELD_MEASUREMENT_POLICY_ID:
+            raise ValueError(f"measurement_policy_id must be {FIELD_MEASUREMENT_POLICY_ID}")
+        if self.measurement_validity not in MEASUREMENT_VALIDITY_VALUES:
+            raise ValueError("unsupported measurement_validity")
+        object.__setattr__(
+            self,
+            "measurement_method_id",
+            normalize_measurement_method_id(self.measurement_method_id),
+        )
+        object.__setattr__(
+            self,
+            "measurement_method_instance_id",
+            str(self.measurement_method_instance_id or self.measurement_method_id),
+        )
+        object.__setattr__(
+            self,
+            "measurement_geometry_kind",
+            str(self.measurement_geometry_kind),
+        )
+        object.__setattr__(
+            self,
+            "measurement_geometry_sha256",
+            str(self.measurement_geometry_sha256),
+        )
+        object.__setattr__(
+            self,
+            "measurement_selection_reason",
+            str(self.measurement_selection_reason),
+        )
+        object.__setattr__(
+            self,
+            "measurement_component_sources",
+            tuple(
+                (str(name), str(source))
+                for name, source in self.measurement_component_sources
+            ),
+        )
+        if self.measurement_geometry_kind not in {
+            "legacy",
+            "live_pixhawk_mount",
+            "live_pixhawk_baseline_yaw",
+            "relative_pose",
+            "unresolved",
+        }:
+            raise ValueError("unsupported measurement_geometry_kind")
+        if self.measurement_geometry_kind != "legacy" and (
+            len(self.measurement_geometry_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.measurement_geometry_sha256
+            )
+        ):
+            raise ValueError("measurement_geometry_sha256 must be lowercase SHA-256 hex")
+        if type(self.left_detection) is not DetectionSnapshot or type(
+            self.right_detection
+        ) is not DetectionSnapshot:
+            raise TypeError("detections must be exact immutable DetectionSnapshot values")
+        for value in (self.left_attitude, self.right_attitude):
+            if value is not None and not isinstance(value, AttitudeSnapshot):
+                raise TypeError("attitudes must be immutable AttitudeSnapshot values")
+        for value in (self.left_gps, self.right_gps):
+            if value is not None and not isinstance(value, GpsSnapshot):
+                raise TypeError("GPS inputs must be immutable GpsSnapshot values")
+        if self.intrinsics is not None and not isinstance(self.intrinsics, StereoIntrinsicsSnapshot):
+            raise TypeError("intrinsics must be an immutable StereoIntrinsicsSnapshot")
+        if self.baseline is not None and not isinstance(self.baseline, BaselineSnapshot):
+            raise TypeError("baseline must be an immutable BaselineSnapshot")
+        if not isinstance(self.geometry_config, GeometryConfigSnapshot):
+            raise TypeError("geometry_config must be an immutable GeometryConfigSnapshot")
+        if self.attempt_id <= 0:
+            raise ValueError("attempt_id must be positive")
+        if not self.attempt_session_id:
+            raise ValueError("attempt_session_id must not be empty")
+        for name, value in (
+            ("created_monotonic_s", self.created_monotonic_s),
+            ("created_wall_s", self.created_wall_s),
+            ("detection_midpoint_monotonic_s", self.detection_midpoint_monotonic_s),
+            ("left_attitude_age_s", self.left_attitude_age_s),
+            ("right_attitude_age_s", self.right_attitude_age_s),
+            ("attitude_pair_delta_s", self.attitude_pair_delta_s),
+            ("relative_roll_deg", self.relative_roll_deg),
+            ("relative_pitch_deg", self.relative_pitch_deg),
+            ("relative_yaw_deg", self.relative_yaw_deg),
+            ("measurement_started_monotonic_s", self.measurement_started_monotonic_s),
+        ):
+            if value is None:
+                continue
+            _finite_float(value, name=name)
+        for value in self.detection_pair_key:
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError("detection_pair_key must not contain NaN or Inf")
+            if value is not None and not isinstance(value, (str, int, float, bool)):
+                raise ValueError("detection_pair_key values must be scalar")
+        if self.triangulation_source not in {"pixhawk", "checkerboard"}:
+            raise ValueError("triangulation_source must be pixhawk or checkerboard")
+        expected_contracts = {
+            "world_frame": WORLD_FRAME,
+            "body_frame": BODY_FRAME,
+            "camera_frame": CAMERA_FRAME,
+            "camera_mount_profile": CAMERA_MOUNT_PROFILE,
+            "measurement_frame": MEASUREMENT_FRAME,
+            "measurement_axis_contract": MEASUREMENT_AXIS_CONTRACT,
+            "public_vector_contract": PUBLIC_MEASUREMENT_VECTOR_CONTRACT,
+            "measurement_unit": "m",
+        }
+        for field_name, expected in expected_contracts.items():
+            if getattr(self, field_name) != expected:
+                raise ValueError(f"{field_name} must be {expected}")
+        if self.left_detection.camera != "left" or self.right_detection.camera != "right":
+            raise ValueError("attempt detections must preserve left/right camera identity")
+        for field_name, value, expected_camera in (
+            ("left_attitude", self.left_attitude, "left"),
+            ("right_attitude", self.right_attitude, "right"),
+            ("left_gps", self.left_gps, "left"),
+            ("right_gps", self.right_gps, "right"),
+        ):
+            if value is not None and value.camera != expected_camera:
+                raise ValueError(f"{field_name} must preserve {expected_camera} camera identity")
+        if self.triangulation_source == "checkerboard":
+            if self.baseline is not None and not self.baseline.source.startswith(
+                ("checkerboard", "relative-pose:")
+            ):
+                raise ValueError("relative-pose attempts must use profile baseline provenance")
+        if self.triangulation_source == "pixhawk" and self.baseline is not None:
+            if not self.baseline.source.startswith("gps-rtk"):
+                raise ValueError("Pixhawk attempts must use GPS/RTK baseline provenance")
+            basis = self.baseline.left_basis_quaternion_wxyz
+            if self.baseline.translation_right_in_left_rdf_m is not None:
+                expected_basis = (
+                    self.geometry_left_quaternion_wxyz
+                    or (None if self.left_attitude is None else self.left_attitude.quaternion_wxyz)
+                )
+                if expected_basis is None or basis != expected_basis:
+                    raise ValueError("baseline translation and right-ray target must use the same selected left quaternion")
+                # geometry_left_quaternion_wxyz-only attempts (e.g.
+                # live_pixhawk_baseline_yaw) have no live left_attitude
+                # object to compare a timestamp against; the quaternion
+                # equality check above is the invariant that applies there.
+                if (
+                    self.left_attitude is not None
+                    and self.baseline.left_basis_attitude_monotonic_s != self.left_attitude.timestamp_s
+                ):
+                    raise ValueError("baseline translation and right-ray target must use the same selected left attitude timestamp")
+
+    @property
+    def left(self) -> DetectionSnapshot:
+        return self.left_detection
+
+    @property
+    def right(self) -> DetectionSnapshot:
+        return self.right_detection
+
+    @property
+    def baseline_m(self) -> float:
+        return 0.0 if self.baseline is None else self.baseline.baseline_m
+
+    @property
+    def baseline_source(self) -> str:
+        if self.baseline is not None:
+            return self.baseline.source
+        return "checkerboard-waiting" if self.triangulation_source == "checkerboard" else "gps-rtk-waiting"
+
+    @property
+    def translation_right_in_left_m(self) -> tuple[float, float, float] | None:
+        return None if self.baseline is None else self.baseline.translation_right_in_left_rdf_m
+
+    @property
+    def geometry_left_quaternion(self) -> tuple[float, float, float, float] | None:
+        return self.geometry_left_quaternion_wxyz or (
+            None if self.left_attitude is None else self.left_attitude.quaternion_wxyz
+        )
+
+    @property
+    def geometry_right_quaternion(self) -> tuple[float, float, float, float] | None:
+        return self.geometry_right_quaternion_wxyz or (
+            None if self.right_attitude is None else self.right_attitude.quaternion_wxyz
+        )
+
+    @property
+    def pair_sequence(self) -> int:
+        return self.attempt_id
+
+    @property
+    def pair_id(self) -> str:
+        return f"{self.attempt_session_id}:{self.attempt_id:020d}"
+
+    @property
+    def missing_geometry_inputs(self) -> tuple[str, ...]:
+        missing: list[str] = []
+        if self.intrinsics is None:
+            missing.append("intrinsics")
+        if self.triangulation_source == "checkerboard":
+            extrinsics = None if self.intrinsics is None else self.intrinsics.checkerboard_extrinsics
+            if extrinsics is None:
+                missing.extend(("checkerboard_rotation", "checkerboard_translation"))
+            return tuple(missing)
+        if self.left_attitude is None:
+            missing.append("left_attitude")
+        if self.right_attitude is None:
+            missing.append("right_attitude")
+        if self.left_gps is None:
+            missing.append("left_gps")
+        if self.right_gps is None:
+            missing.append("right_gps")
+        if self.baseline is None or self.baseline.ned_right_from_left_m is None:
+            missing.append("ned_baseline")
+        if self.translation_right_in_left_m is None:
+            missing.append("translation_right_in_left_m")
+        return tuple(missing)
+
+    @property
+    def is_geometry_ready(self) -> bool:
+        return not self.missing_geometry_inputs
+
+    def stereo_calibration(self) -> StereoCalibration:
+        return self.geometry_config.to_stereo_calibration(baseline_m=self.baseline_m)
+
+    def canonical_payload(self) -> dict[str, Any]:
+        payload = asdict(self)
+        if (
+            self.requested_timestamp_basis == self.timestamp_basis
+            and not self.timing_fallback_reason
+        ):
+            payload.pop("requested_timestamp_basis", None)
+            payload.pop("timing_fallback_reason", None)
+        optional_defaults = {
+            "measurement_pose_evidence_json": "",
+            "geometry_left_quaternion_wxyz": None,
+            "geometry_right_quaternion_wxyz": None,
+            "measurement_yaw_source": "",
+            "measurement_yaw_selection_mode": "",
+            "measurement_yaw_branch_offset_deg": None,
+            "measurement_yaw_baseline_azimuth_deg": None,
+            "measurement_yaw_selected_deg": None,
+            "measurement_yaw_p1_reference_deg": None,
+            "measurement_yaw_p2_reference_deg": None,
+            "measurement_yaw_p1_age_s": None,
+            "measurement_yaw_p2_age_s": None,
+            "measurement_yaw_score_minus90_deg": None,
+            "measurement_yaw_score_plus90_deg": None,
+            "measurement_yaw_reverse": False,
+            "measurement_yaw_consensus": None,
+            "measurement_yaw_low_margin": False,
+            "measurement_yaw_candidate_minus90_deg": None,
+            "measurement_yaw_candidate_plus90_deg": None,
+            "measurement_yaw_alternate_deg": None,
+            "measurement_yaw_p1_error_minus90_deg": None,
+            "measurement_yaw_p1_error_plus90_deg": None,
+            "measurement_yaw_p2_error_minus90_deg": None,
+            "measurement_yaw_p2_error_plus90_deg": None,
+            "geometry_left_quaternion_wxyz_alternate": None,
+            "geometry_right_quaternion_wxyz_alternate": None,
+        }
+        for name, default in optional_defaults.items():
+            if payload.get(name) == default:
+                payload.pop(name, None)
+        return payload
+
+    @classmethod
+    def from_canonical_payload(cls, payload: Mapping[str, Any]) -> "MeasurementAttempt":
+        """Rebuild an attempt from persisted canonical evidence.
+
+        The reconstruction boundary is deliberately strict: nested values are
+        passed through the same immutable snapshot validators used at capture
+        time, and the rebuilt canonical bytes must match the supplied payload.
+        This makes a stored attempt independently hashable and usable as an
+        offline recalculation input instead of retaining only an opaque digest.
+        """
+
+        if cls is not MeasurementAttempt:
+            raise TypeError("MeasurementAttempt.from_canonical_payload does not support subclasses")
+        if not isinstance(payload, Mapping):
+            raise TypeError("canonical measurement attempt payload must be a mapping")
+        values = dict(payload)
+
+        def required_mapping(name: str) -> dict[str, Any]:
+            value = values.get(name)
+            if not isinstance(value, Mapping):
+                raise ValueError(f"{name} must be a mapping")
+            return dict(value)
+
+        def optional_snapshot(name: str, snapshot_type: type) -> Any:
+            value = values.get(name)
+            if value is None:
+                return None
+            if not isinstance(value, Mapping):
+                raise ValueError(f"{name} must be a mapping or null")
+            return snapshot_type(**dict(value))
+
+        values["left_detection"] = DetectionSnapshot(**required_mapping("left_detection"))
+        values["right_detection"] = DetectionSnapshot(**required_mapping("right_detection"))
+        values["left_attitude"] = optional_snapshot("left_attitude", AttitudeSnapshot)
+        values["right_attitude"] = optional_snapshot("right_attitude", AttitudeSnapshot)
+        values["left_gps"] = optional_snapshot("left_gps", GpsSnapshot)
+        values["right_gps"] = optional_snapshot("right_gps", GpsSnapshot)
+        intrinsics = values.get("intrinsics")
+        if intrinsics is None:
+            values["intrinsics"] = None
+        elif isinstance(intrinsics, Mapping):
+            intrinsics_values = dict(intrinsics)
+            intrinsics_values["left"] = CameraIntrinsicsSnapshot(
+                **dict(intrinsics_values["left"])
+            )
+            intrinsics_values["right"] = CameraIntrinsicsSnapshot(
+                **dict(intrinsics_values["right"])
+            )
+            checkerboard = intrinsics_values.get("checkerboard_extrinsics")
+            intrinsics_values["checkerboard_extrinsics"] = (
+                None
+                if checkerboard is None
+                else CheckerboardExtrinsicsSnapshot(**dict(checkerboard))
+            )
+            values["intrinsics"] = StereoIntrinsicsSnapshot(**intrinsics_values)
+        else:
+            raise ValueError("intrinsics must be a mapping or null")
+        values["baseline"] = optional_snapshot("baseline", BaselineSnapshot)
+        values["geometry_config"] = GeometryConfigSnapshot(
+            **required_mapping("geometry_config")
+        )
+        attempt = cls(**values)
+        supplied_bytes = _canonical_json_bytes(payload)
+        if _canonical_json_bytes(attempt.canonical_payload()) != supplied_bytes:
+            raise ValueError("canonical measurement attempt payload changed during reconstruction")
+        return attempt
+
+    def canonical_json(self) -> str:
+        """Return the exact canonical JSON whose bytes define ``canonical_sha256``."""
+
+        return _canonical_json_bytes(self.canonical_payload()).decode("utf-8")
+
+    def canonical_sha256(self) -> str:
+        return _sha256_payload(self.canonical_payload())
+
+    @property
+    def terminal_record_id(self) -> str:
+        """Stable terminal-row identity derived from the canonical attempt."""
+
+        return f"attempt:{self.canonical_sha256()}"
+
+    def content_canonical_payload(self) -> dict[str, Any]:
+        payload = self.canonical_payload()
+        for field_name in (
+            "attempt_id",
+            "attempt_session_id",
+            "created_monotonic_s",
+            "created_wall_s",
+        ):
+            payload.pop(field_name)
+        if payload["intrinsics"] is not None:
+            payload["intrinsics"].pop("selected_profile_path")
+        return payload
+
+    def content_sha256(self) -> str:
+        return _sha256_payload(self.content_canonical_payload())
+
+    def instance_canonical_payload(self) -> dict[str, Any]:
+        return {
+            "measurement_attempt_content_sha256": self.content_sha256(),
+            "instance": self.canonical_payload(),
+        }
+
+    def instance_sha256(self) -> str:
+        return _sha256_payload(self.instance_canonical_payload())
+
+
+@dataclass(frozen=True)
+class BlockedMeasurementPair:
+    """Matched detections retained when no complete measurement geometry exists."""
+
+    detection_pair_key: tuple[MetadataScalar, ...]
+    created_monotonic_s: float
+    created_wall_s: float
+    timestamp_basis: str
+    left_detection: DetectionSnapshot
+    right_detection: DetectionSnapshot
+    status: str
+    reasons: tuple[str, ...]
+    readiness_sha256: str
+    readiness_payload_json: str = ""
+    requested_timestamp_basis: str = ""
+    timing_fallback_reason: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "detection_pair_key", tuple(self.detection_pair_key))
+        object.__setattr__(
+            self,
+            "created_monotonic_s",
+            _finite_float(self.created_monotonic_s, name="created_monotonic_s"),
+        )
+        object.__setattr__(
+            self,
+            "created_wall_s",
+            _finite_float(self.created_wall_s, name="created_wall_s"),
+        )
+        object.__setattr__(self, "timestamp_basis", str(self.timestamp_basis))
+        object.__setattr__(
+            self,
+            "requested_timestamp_basis",
+            str(self.requested_timestamp_basis or self.timestamp_basis),
+        )
+        object.__setattr__(
+            self,
+            "timing_fallback_reason",
+            str(self.timing_fallback_reason or ""),
+        )
+        object.__setattr__(self, "status", str(self.status))
+        object.__setattr__(self, "reasons", tuple(str(value) for value in self.reasons))
+        object.__setattr__(self, "readiness_sha256", str(self.readiness_sha256))
+        readiness_payload_json = str(self.readiness_payload_json or "")
+        if readiness_payload_json:
+            try:
+                readiness_payload = json.loads(readiness_payload_json)
+            except json.JSONDecodeError as exc:
+                raise ValueError("readiness_payload_json must contain valid JSON") from exc
+            if not isinstance(readiness_payload, Mapping):
+                raise ValueError("readiness_payload_json must contain a JSON object")
+            canonical_readiness_json = _canonical_json_bytes(readiness_payload).decode("utf-8")
+            if _sha256_payload(readiness_payload) != self.readiness_sha256:
+                raise ValueError("readiness payload does not match readiness_sha256")
+            readiness_payload_json = canonical_readiness_json
+        object.__setattr__(self, "readiness_payload_json", readiness_payload_json)
+        if not self.status or not self.reasons:
+            raise ValueError("blocked measurement pairs require status and reasons")
+        if self.left_detection.camera != "left" or self.right_detection.camera != "right":
+            raise ValueError("blocked pair detections must preserve left/right identity")
+        if len(self.readiness_sha256) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in self.readiness_sha256
+        ):
+            raise ValueError("readiness_sha256 must be SHA-256 hex")
+
+    def canonical_payload(self) -> dict[str, Any]:
+        payload = asdict(self)
+        if (
+            self.requested_timestamp_basis == self.timestamp_basis
+            and not self.timing_fallback_reason
+        ):
+            payload.pop("requested_timestamp_basis", None)
+            payload.pop("timing_fallback_reason", None)
+        return payload
+
+    def canonical_json(self) -> str:
+        """Return the exact canonical JSON retained as blocked-pair evidence."""
+
+        return _canonical_json_bytes(self.canonical_payload()).decode("utf-8")
+
+    def canonical_sha256(self) -> str:
+        return _sha256_payload(self.canonical_payload())
+
+    @property
+    def terminal_record_id(self) -> str:
+        """Stable terminal-row identity in the blocked-pair namespace."""
+
+        return f"blocked:{self.canonical_sha256()}"
+
+
+def _safe_app_receive_monotonic_ns(observation: Any) -> int:
+    """Read app_receive_monotonic_ns tolerantly for identity/evidence keys.
+
+    A malformed value (e.g. a legacy float where an exact int is required)
+    must degrade to a derived timestamp instead of raising out of a
+    Qt-timer-driven pairing/recording loop; an explicit ``0`` is a real
+    value here (near process/monotonic-clock start) and must not be treated
+    as absent.
+    """
+
+    try:
+        value = getattr(observation, "app_receive_monotonic_ns", None)
+    except (AttributeError, ValueError):
+        value = None
+    if value is None:
+        metadata = getattr(observation, "timestamp_metadata", {}) or {}
+        value = metadata.get("app_receive_monotonic_ns")
+    if value is None:
+        value = round(float(observation.timestamp_s) * 1_000_000_000.0)
+    return int(value)
+
+
+def detection_pair_key(
+    *,
+    triangulation_source: str,
+    timestamp_basis: str,
+    left: Any,
+    right: Any,
+    left_pairing_timestamp_s: float,
+    right_pairing_timestamp_s: float,
+) -> tuple[MetadataScalar, ...]:
+    """Return an identity stronger than the legacy (left_ts, right_ts, method) key."""
+
+    return (
+        str(triangulation_source),
+        str(timestamp_basis),
+        _safe_app_receive_monotonic_ns(left),
+        _safe_app_receive_monotonic_ns(right),
+        _finite_float(left.timestamp_s, name="left timestamp"),
+        _finite_float(right.timestamp_s, name="right timestamp"),
+        _finite_float(left_pairing_timestamp_s, name="left pairing timestamp"),
+        _finite_float(right_pairing_timestamp_s, name="right pairing timestamp"),
+        *(_finite_float(value, name="left bbox") for value in (left.x1, left.y1, left.x2, left.y2)),
+        *(_finite_float(value, name="right bbox") for value in (right.x1, right.y1, right.x2, right.y2)),
+        int(left.class_id),
+        int(right.class_id),
+    )
+
+
+def build_pixhawk_baseline_snapshot(
+    *,
+    left_gps: GpsSnapshot,
+    right_gps: GpsSnapshot,
+    selected_left_quaternion_wxyz: tuple[float, float, float, float] | None,
+    selected_left_attitude_monotonic_s: float | None,
+    created_monotonic_s: float,
+    detection_midpoint_monotonic_s: float,
+) -> BaselineSnapshot:
+    ned = ned_delta_m(left_gps, right_gps)  # type: ignore[arg-type]
+    baseline_m = 0.0 if ned is None else math.sqrt(sum(value * value for value in ned))
+    warnings: list[str] = []
+    if left_gps.fix_type != 6:
+        warnings.append(f"left {left_gps.rtk_label}")
+    if right_gps.fix_type != 6:
+        warnings.append(f"right {right_gps.rtk_label}")
+    fix_quality = "DEGRADED" if warnings else "GOOD"
+    fixes_usable = left_gps.has_position and right_gps.has_position
+    usable = fixes_usable and baseline_m > 0.0
+    if not fixes_usable:
+        unusable_reason = "GPS position missing or non-finite"
+    elif baseline_m <= 0.0:
+        unusable_reason = "GPS baseline length <= 0"
+    else:
+        unusable_reason = ""
+    translation = None
+    basis = None
+    if usable and ned is not None and selected_left_quaternion_wxyz is not None:
+        basis = tuple(selected_left_quaternion_wxyz)
+        translation = camera_translation_right_in_left_camera(
+            baseline_right_in_left_world_m=ned,
+            left_body_to_world_q=selected_left_quaternion_wxyz,
+            scale_to_m=None,
+        )
+    return BaselineSnapshot(
+        source="gps-rtk" if usable else "gps-rtk-blocked",
+        baseline_m=baseline_m,
+        ned_right_from_left_m=ned,
+        translation_right_in_left_rdf_m=translation,
+        left_basis_quaternion_wxyz=basis,
+        fix_quality=fix_quality,
+        warnings=tuple(warnings),
+        usable_for_translation=translation is not None,
+        unusable_reason=unusable_reason,
+        gps_pair_delta_s=abs(left_gps.timestamp_s - right_gps.timestamp_s),
+        left_age_at_capture_s=max(0.0, created_monotonic_s - left_gps.timestamp_s),
+        right_age_at_capture_s=max(0.0, created_monotonic_s - right_gps.timestamp_s),
+        left_age_from_detection_midpoint_s=abs(detection_midpoint_monotonic_s - left_gps.timestamp_s),
+        right_age_from_detection_midpoint_s=abs(detection_midpoint_monotonic_s - right_gps.timestamp_s),
+        left_basis_attitude_monotonic_s=selected_left_attitude_monotonic_s if translation is not None else None,
+    )
+
+
+def build_checkerboard_baseline_snapshot(
+    intrinsics: StereoIntrinsicsSnapshot | None,
+    *,
+    source: str = "checkerboard",
+) -> BaselineSnapshot | None:
+    extrinsics = None if intrinsics is None else intrinsics.checkerboard_extrinsics
+    if extrinsics is None:
+        return None
+    _rotation, translation = invert_left_to_right_camera_transform(
+        extrinsics.rotation_left_to_right,
+        extrinsics.translation_left_to_right_m,
+    )
+    baseline_m = math.sqrt(sum(value * value for value in translation))
+    usable = baseline_m > 0.0
+    return BaselineSnapshot(
+        source=str(source) if usable else f"{source}-waiting",
+        baseline_m=baseline_m,
+        ned_right_from_left_m=None,
+        translation_right_in_left_rdf_m=translation if usable else None,
+        left_basis_quaternion_wxyz=None,
+        fix_quality="NOT_USED",
+        warnings=() if usable else ("checkerboard baseline length <= 0",),
+        usable_for_translation=usable,
+        unusable_reason="" if usable else "checkerboard baseline length <= 0",
+        gps_pair_delta_s=None,
+        left_age_at_capture_s=None,
+        right_age_at_capture_s=None,
+        left_age_from_detection_midpoint_s=None,
+        right_age_from_detection_midpoint_s=None,
+        left_basis_attitude_monotonic_s=None,
+        gps_selection_basis="NOT_USED",
+        gps_clock_domain="NOT_USED",
+    )

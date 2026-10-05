@@ -1,0 +1,112 @@
+# Verification
+
+## Result
+
+Latest display-query failure follow-up is complete: six new error/malformed-data cases failed
+before the patch and now pass. Expanded display/Measurement tests (92) also pass, including open
+Inspector recovery, empty exceptions, source-cache preservation after disconnect, save/apply
+followed by a read error, and retained frozen reference values. Full regression: 2033 passed,
+2 failed, 2 skipped (155.54 s). The failures are the inherited error-text expectation and a color
+literal policy test catching concurrently changed measurement_workbook.py colors (for example
+#202932). Neither command_registry.py nor measurement_workbook.py was changed for this fix.
+Command: `env -u PYTHONPATH PYTHONNOUSERSITE=1 ../../.venv/bin/python -m pytest tests -q -p no:cacheprovider --tb=short --junitxml=/tmp/baseline-yaw90-query-error-regression.xml`
+
+Display-query reproduction and visual evidence: an injected UI read exception now retains Roll
++1.25° and Pitch −2.50° in the table and Inspector, both labelled 조회 오류 with matching age
+5.13 s. Repeated failures advance age from the original successful read rather than compounding
+it. `/tmp/baseline-yaw90-query-error-1366.png` is the inspected offscreen artifact (fake data).
+The mutation boundary was checked using real MeasurementViewController cache selectors: after
+both live sources were removed and the UI read failed, both retained attitude/GPS pairs were
+still returned. No distance-input cache, measurement selection, source timestamp or saved setting
+is written by the display fallback.
+
+Review follow-up complete: two defects were reproduced and corrected. The three new transition
+test cases failed before the fix and pass after it. The related six-file UI, Calibration,
+Telemetry and lifecycle suite passes 154 tests. The full follow-up ran 2017 passed, 2 failed,
+2 skipped (157.16 s). One failure (CSV stream names) passes on isolated recheck after the
+concurrent worktree's test expectation gained measurement.journal; that file was not edited in
+this UI fix. The other is the previously recorded error-text mismatch.
+
+### Initial implementation result
+
+Implementation and all scoped automated checks passed. The complete suite is not all-green:
+2013 passed, 1 pre-existing failure, 2 skipped (147.80 s). No solver, recording schema or
+Pixhawk shared-display changes were made by this work.
+
+## Commands and evidence
+
+- Final clean-runtime regression:
+  `env -u PYTHONPATH PYTHONNOUSERSITE=1 ../../.venv/bin/python -m pytest tests -q -p no:cacheprovider --tb=short --junitxml=/tmp/baseline-yaw90-clean-regression.xml`
+- New isolated workflow tests cover independent azimuth without Drone/attitude, selected GPS2,
+  future timestamps, snapshot non-mutation, optional source failure, run-state guards, pending
+  Preview versus Detection, original-setting persistence, draft preservation, retryable save
+  failure, frozen-position display, overlay/source separation, signal cleanup, optical state/scroll
+  restoration and main-window navigation/layout at both target sizes.
+- The targeted UI suite after migration passed 108 tests. Subsequent snapshot/method/recording
+  tests passed 88 tests; the later focused integration/stub suite passed 71 tests.
+- `./run.sh --check`: PASS. Existing optional NVIDIA checks warned: missing nvh264dec and
+  CUDA_ERROR_UNKNOWN (999); Auto selected avdec_h264. GPU decoding is not certified by this check.
+- `git diff --check`: PASS.
+- `../../tools/check_portable_paths.py`: 26 pre-existing violations in unrelated historical
+  documents/Pixhawk metadata. No forbidden home/dated-checkout paths occur in the new modules,
+  test or packet. No portability-related settings/schema were introduced.
+
+## Known failure and environment isolation
+
+`tests/test_workstation_settings.py::test_settings_save_does_not_persist_when_visible_payload_apply_is_rejected`
+still expects `measurement settings apply was rejected`, while the already-modified registry
+emits `RuntimeError: measurement settings apply was rejected`. It failed in the pre-change
+baseline and also when the new pane was omitted in a diagnostic run. The test still verifies
+that rejected application causes no persistence; the failing assertion is its exact error text.
+This unrelated behavior/test was not changed.
+
+With ambient ROS PYTHONPATH, the logging-capture test also fails. Removing PYTHONPATH makes
+`test_command_failure_is_written_to_the_diagnostics_log` pass with the new pane intact. The final
+full run uses the same environment-cleaning principle as run.sh and has no logging-capture failure.
+The earlier baseline shutdown-list failure no longer occurs in the concurrently evolving user
+worktree; no shutdown code was changed for Baseline Yaw90.
+
+## Visual and coordinate evidence
+
+Qt offscreen main-window renders were inspected at 1366x768 and 1920x1080 with docks visible.
+Artifacts: `/tmp/baseline-yaw90-1366.png`, `/tmp/baseline-yaw90-1920.png`, regenerated by the
+main-window layout test. Test video/positions are synthetic, not live hardware measurements.
+Both images, R/P and all three GNSS rows fit the primary viewport; current state and azimuth
+remain readable. The smaller viewport uses outer scroll for lower setup/reference controls.
+Before-layout ownership was established from code and existing tests.
+
+Coordinate contract checked: selected GNSS NED [North,East,Down], clockwise North-referenced
+azimuth, unsigned horizontal vertex angles, raw PX4 body-FRD attitude in NED, and display-only
+image center. Existing GNSS midpoint local-level FRD remains separate from camera baseline_center_frd.
+The core math and recording tests retain independent numerical sentinels.
+
+## Residual field conditions and Git handoff
+
+Physical aiming/leveling accuracy, real-device reconnect behavior and GPU performance need field
+observation; offscreen tests do not certify them. No physical device or running operator app was
+restarted or reconfigured.
+
+Required new files are currently untracked: `baseline_yaw90_controller.py`,
+`baseline_yaw90_pane.py`, `tests/test_baseline_yaw90_workspace.py`, and this change packet.
+All are inside the Workstation tree; no commit was requested or made. Existing unrelated
+worktree modifications were preserved.
+
+## Review-fix evidence
+
+- New regressions: selecting azimuth then leaving setup clears only its Inspector details, keeps
+  the table row selected, makes no hidden setup read, and preserves unrelated Inspector selections.
+- At both 1366 and 1920 widths, 1080→768→1080 height changes and Diagnostics hide/show/resize keep
+  Attitude and GNSS tables visible. Switching away stops queued fit work.
+- Before the fix, a 453 px viewport retained 320 px previews with the GNSS table bottom at 585 px.
+  After the same resize, previews are 163 px and the table bottom is 428 px. Offscreen artifact:
+  `/tmp/baseline-yaw90-review-fixed-768.png` (fake inputs; layout evidence, not live hardware).
+- Scoped command: `env -u PYTHONPATH PYTHONNOUSERSITE=1 ../../.venv/bin/python -m pytest -q -p no:cacheprovider --tb=short tests/test_baseline_yaw90_workspace.py tests/test_optical_pose_workspace.py tests/test_workstation_lifecycle.py tests/test_workstation_calibration.py tests/test_workstation_telemetry.py tests/test_baseline_yaw_alignment_ui.py`
+- Source changes only affect Inspector ownership, local-tab transition routing and viewport-aware
+  preview fitting. Coordinate calculations, sensor/recording owners and Reverse persistence remain
+  unchanged.
+- Full follow-up command: `env -u PYTHONPATH PYTHONNOUSERSITE=1 ../../.venv/bin/python -m pytest tests -q -p no:cacheprovider --tb=short --junitxml=/tmp/baseline-yaw90-review-fixes-regression.xml`
+- The CSV failure was `test_csv_stream_paths_are_same_stem_for_every_fixed_stream`, which initially
+  rejected the newly present measurement.journal stream. Isolated recheck: 1 passed in 0.09 s.
+  The remaining error-text assertion was also present before this review fix.
+- `git diff --check` passes. The Inspector clear API validates both context and selection owner;
+  hidden setup snapshots are not polled, and the fit timer belongs to the pane and stops on hide.

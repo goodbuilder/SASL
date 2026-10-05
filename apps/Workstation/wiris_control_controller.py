@@ -1,0 +1,1569 @@
+"""Workstation WIRIS command, time, and optical-zoom controller."""
+
+from __future__ import annotations
+
+import math
+import hashlib
+import json
+import time
+from collections.abc import Sequence
+from datetime import datetime, timezone
+from ipaddress import IPv4Address
+
+from PyQt5 import QtCore, QtGui, QtWidgets
+
+from Workstation.wiris_runtime_workers import (
+    WIRIS_STUS_MAX_ABSOLUTE_COMPENSATION_S,
+    WIRIS_STUS_MAX_ATTEMPTS,
+    WIRIS_STUS_MAX_OPERATION_S,
+    WIRIS_STUS_RESPONSE_TIMEOUT_S,
+    WirisClockCommandWorker,
+    WirisCommandWorker,
+    WirisImageFormatWorker,
+    WirisLrfPollWorker,
+    WirisStipWorker,
+    WirisZoomWorker,
+)
+from Workstation.workstation_core.wiris_zoom import (
+    DEFAULT_ZOOM_IN_TEMPLATE,
+    DEFAULT_ZOOM_OUT_TEMPLATE,
+    DEFAULT_ZOOM_SET_TEMPLATE,
+    DEFAULT_ZOOM_QUERY_TEMPLATE,
+    DEFAULT_ZOOM_STOP_TEMPLATE,
+    LINE_TERMINATOR,
+    NUL_TERMINATOR,
+    parse_visible_zoom_response,
+)
+from Workstation.wiris_sdk_catalog import (
+    WIRIS_COMMAND_CATALOG,
+    WIRIS_DANGEROUS_COMMAND_PREFIXES,
+)
+
+WIRIS_CONTROL_METHODS = [
+    "zoom_command_text",
+    "selected_zoom_target",
+    "zoom_hosts",
+    "_control_port_spin_for_camera",
+    "_control_port_for_camera",
+    "_set_control_port_for_camera",
+    "send_zoom",
+    "_apply_wiris_zoom_result",
+    "_wiris_zoom_failed",
+    "_clear_wiris_zoom_worker",
+    "workstation_wiris_command_catalog",
+    "workstation_send_wiris_command",
+    "workstation_send_zoom",
+    "_apply_selected_wiris_command",
+    "_append_wiris_command_log",
+    "_wiris_command_needs_confirmation",
+    "_stus_command_from_unix_time",
+    "set_selected_wiris_time_from_pc",
+    "_dispatch_wiris_time_sync_initial",
+    "_start_wiris_time_sync_worker",
+    "_request_wiris_time_sync_correction",
+    "_finish_wiris_time_sync_operation",
+    "_append_stus_event",
+    "_apply_wiris_time_sync_result",
+    "_wiris_time_sync_failed",
+    "_clear_wiris_time_sync_worker",
+    "send_selected_wiris_command",
+    "_start_wiris_command_worker",
+    "_apply_wiris_command_result",
+    "_wiris_command_failed",
+    "_clear_wiris_command_worker",
+    "query_wiris_lrf_once",
+    "_apply_wiris_lrf_result",
+    "_wiris_lrf_failed",
+    "stop_wiris_lrf_polling",
+    "_clear_wiris_lrf_worker",
+    "apply_wiris_stip",
+    "_apply_wiris_stip_result",
+    "_wiris_stip_failed",
+    "_clear_wiris_stip_worker",
+    "_image_format_target_infos",
+    "_start_wiris_image_format_worker",
+    "refresh_wiris_image_format_status",
+    "apply_oz_only_image_format",
+    "set_wiris_image_format",
+    "_handle_wiris_image_format_status_completed",
+    "_handle_wiris_image_format_preset_completed",
+    "_handle_wiris_image_format_set_completed",
+    "_wiris_image_format_failed",
+    "_clear_wiris_image_format_worker",
+]
+
+
+class WirisControlController:
+    def __init__(self, panel):
+        self.panel = panel
+
+    def _reject_camera_control_during_stus(self, action: str, status_widget=None) -> bool:
+        operation = getattr(self.panel, "_camera_sync_stus_operation", None)
+        if not (isinstance(operation, dict) and operation.get("active")):
+            return False
+        message = (
+            f"{action} rejected: STUS closed-loop owns both camera control channels "
+            f"(attempt {operation.get('attempts_started', 1)}/"
+            f"{operation.get('max_attempts', WIRIS_STUS_MAX_ATTEMPTS)})"
+        )
+        if status_widget is not None:
+            status_widget.setText(message)
+        self.panel._log(f"[카메라] {message}")
+        return True
+
+    def zoom_command_text(self, action: str) -> str:
+        if action == "in":
+            return DEFAULT_ZOOM_IN_TEMPLATE
+        if action == "out":
+            return DEFAULT_ZOOM_OUT_TEMPLATE
+        if action == "stop":
+            return DEFAULT_ZOOM_STOP_TEMPLATE
+        if action == "set":
+            return DEFAULT_ZOOM_SET_TEMPLATE
+        if action == "query":
+            return DEFAULT_ZOOM_QUERY_TEMPLATE
+        raise ValueError(f"Unknown zoom action: {action}")
+
+    def selected_zoom_target(self) -> str:
+        return str(self.panel.zoom_target_combo.currentData() or "both")
+
+    def zoom_hosts(self, target: str) -> list[tuple[str, str]]:
+        if target == "left":
+            return [("left", self.panel.left_zoom_host_edit.text())]
+        if target == "right":
+            return [("right", self.panel.right_zoom_host_edit.text())]
+        if target == "both":
+            return [("left", self.panel.left_zoom_host_edit.text()), ("right", self.panel.right_zoom_host_edit.text())]
+        raise ValueError(f"Unknown zoom target: {target}")
+
+    def _control_port_spin_for_camera(self, camera: str) -> QtWidgets.QSpinBox:
+        if camera == "left":
+            return self.panel.left_control_port_spin
+        if camera == "right":
+            return self.panel.right_control_port_spin
+        raise ValueError(f"Unknown camera: {camera}")
+
+    def _control_port_for_camera(self, camera: str) -> int:
+        return int(self.panel._control_port_spin_for_camera(camera).value())
+
+    def _set_control_port_for_camera(self, camera: str, port: int) -> None:
+        if 1 <= int(port) <= 65535:
+            self.panel._control_port_spin_for_camera(camera).setValue(int(port))
+
+    def send_zoom(self, target: str, action: str) -> None:
+        if self._reject_camera_control_during_stus("Zoom", self.panel.zoom_status_label):
+            return
+        if self.panel.wiris_zoom_thread is not None:
+            self.panel._log("[카메라] 줌 명령이 이미 진행 중입니다.")
+            return
+        command_text = self.panel.zoom_command_text(action)
+        level = self.panel.zoom_level_spin.value() if action == "set" else None
+        targets = [
+            (label, host, self.panel._control_port_for_camera(label))
+            for label, host in self.panel.zoom_hosts(target)
+        ]
+        self.panel.zoom_status_label.setText("Zoom command: sending...")
+        self.panel.wiris_zoom_thread = QtCore.QThread(self.panel)
+        self.panel.wiris_zoom_worker = WirisZoomWorker(
+            targets,
+            template=command_text,
+            level=level,
+            timeout_s=self.panel.zoom_timeout_spin.value(),
+        )
+        self.panel.wiris_zoom_worker.moveToThread(self.panel.wiris_zoom_thread)
+        self.panel.wiris_zoom_thread.started.connect(self.panel.wiris_zoom_worker.run)
+        self.panel.wiris_zoom_worker.completed.connect(
+            lambda statuses, target=target, action=action: self.panel._apply_wiris_zoom_result(
+                target, action, statuses
+            )
+        )
+        self.panel.wiris_zoom_worker.failed.connect(self.panel._wiris_zoom_failed)
+        self.panel.wiris_zoom_worker.finished.connect(self.panel.wiris_zoom_thread.quit)
+        self.panel.wiris_zoom_worker.finished.connect(self.panel.wiris_zoom_worker.deleteLater)
+        self.panel.wiris_zoom_thread.finished.connect(self.panel.wiris_zoom_thread.deleteLater)
+        self.panel.wiris_zoom_thread.finished.connect(self.panel._clear_wiris_zoom_worker)
+        self.panel.wiris_zoom_thread.start()
+
+    def _apply_wiris_zoom_result(self, target: str, action: str, result: object) -> None:
+        statuses: list[str] = []
+        busy = False
+        for item in list(result or []):
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label") or "")
+            if item.get("state") == "sent":
+                response = str(item.get("response") or "")
+                if action == "query" and label in {"left", "right"}:
+                    index, ratio = parse_visible_zoom_response(response)
+                    self.panel.actual_visible_zoom[label] = {
+                        "index": index,
+                        "ratio": ratio,
+                        "response": response,
+                        "updated_monotonic_s": time.monotonic(),
+                    }
+                suffix = f" 응답={response}" if response else " 전송됨"
+                statuses.append(f"{self.panel._camera_name_ko(label)}: {item.get('command', '')}{suffix}")
+            elif item.get("state") == "busy":
+                busy = True
+                statuses.append(
+                    f"{self.panel._camera_name_ko(label)}: 제어 채널 사용 중 — 자동 재시도"
+                )
+            else:
+                statuses.append(f"{self.panel._camera_name_ko(label)}: 실패: {item.get('detail', 'unknown')}")
+        status_text = " | ".join(statuses)
+        self.panel.zoom_status_label.setText(status_text)
+        self.panel._log(f"[카메라] 줌 명령 target={target}, action={action}: {status_text}")
+        retry_key = (str(target), str(action))
+        retries = getattr(self.panel, "_zoom_control_busy_retries", None)
+        if not isinstance(retries, dict):
+            retries = {}
+            self.panel._zoom_control_busy_retries = retries
+        if busy:
+            attempt = int(retries.get(retry_key, 0)) + 1
+            retries[retry_key] = attempt
+            if attempt <= 5:
+                QtCore.QTimer.singleShot(
+                    100,
+                    lambda target=target, action=action: self.panel.send_zoom(target, action),
+                )
+            else:
+                statuses.append("제어 채널 busy 재시도 한도 초과 — 카메라 실패로 판정하지 않음")
+                self.panel.zoom_status_label.setText(" | ".join(statuses))
+                retries.pop(retry_key, None)
+        else:
+            retries.pop(retry_key, None)
+        if not busy and action in {"set", "in", "out"}:
+            self.panel._zoom_readback_target = target
+
+    def _wiris_zoom_failed(self, error: str) -> None:
+        self.panel.zoom_status_label.setText(f"Zoom command: failed ({error})")
+        self.panel._log(f"[카메라] 줌 명령 실패: {error}")
+
+    def _clear_wiris_zoom_worker(self) -> None:
+        self.panel.wiris_zoom_thread = None
+        self.panel.wiris_zoom_worker = None
+        readback_target = getattr(self.panel, "_zoom_readback_target", None)
+        if readback_target:
+            self.panel._zoom_readback_target = None
+            QtCore.QTimer.singleShot(
+                0,
+                lambda target=str(readback_target): self.panel.send_zoom(target, "query"),
+            )
+
+    def workstation_wiris_command_catalog(self) -> tuple[dict[str, str], ...]:
+        return tuple(
+            {
+                "category": str(category),
+                "label": str(label),
+                "command": str(command),
+                "terminator": str(terminator),
+                "description": str(description),
+            }
+            for category, label, command, terminator, description in WIRIS_COMMAND_CATALOG
+        )
+
+    def workstation_send_wiris_command(self, target: str, command: str, terminator: str) -> None:
+        target = str(target or "both")
+        if target not in {"both", "left", "right"}:
+            raise ValueError(f"Unknown WIRIS target: {target}")
+        command = str(command or "").strip()
+        if not command:
+            raise ValueError("WIRIS SDK command is empty")
+        terminator = str(terminator or LINE_TERMINATOR)
+        if terminator not in {LINE_TERMINATOR, NUL_TERMINATOR}:
+            raise ValueError("Unknown WIRIS command terminator")
+        self.panel._set_combo_data(self.panel.wiris_command_target_combo, target)
+        self.panel.wiris_command_edit.setText(command)
+        self.panel._set_combo_data(self.panel.wiris_command_terminator_combo, terminator)
+        self.panel.send_selected_wiris_command()
+
+    def workstation_send_zoom(self, target: str, action: str, level: int | None = None) -> None:
+        target = str(target or "both")
+        if target not in {"both", "left", "right"}:
+            raise ValueError(f"Unknown zoom target: {target}")
+        action = str(action or "")
+        if action not in {"in", "out", "stop", "set", "query"}:
+            raise ValueError(f"Unknown zoom action: {action}")
+        if action == "set":
+            if level is None:
+                raise ValueError("zoom level is required for set")
+            self.panel.zoom_level_spin.setValue(int(level))
+        self.panel.send_zoom(target, action)
+
+    def _apply_selected_wiris_command(self, *_args) -> None:
+        if not hasattr(self.panel, "wiris_command_combo"):
+            return
+        data = self.panel.wiris_command_combo.currentData()
+        if not data:
+            return
+        command, terminator, description = data
+        self.panel.wiris_command_edit.setText(str(command))
+        self.panel._set_combo_data(self.panel.wiris_command_terminator_combo, str(terminator))
+        self.panel.wiris_command_status_label.setText(str(description))
+        self.panel.wiris_command_status_label.setToolTip(str(description))
+        self.panel.wiris_command_combo.setToolTip(str(description))
+        self.panel.wiris_command_edit.setToolTip(str(description))
+
+    def _append_wiris_command_log(self, text: str) -> None:
+        self.panel.wiris_command_log.appendPlainText(text)
+        self.panel.wiris_command_log.moveCursor(QtGui.QTextCursor.End)
+
+    def _wiris_command_needs_confirmation(self, command_text: str) -> bool:
+        normalized = " ".join(command_text.upper().split())
+        return any(normalized.startswith(prefix) for prefix in WIRIS_DANGEROUS_COMMAND_PREFIXES)
+
+    def _stus_command_from_unix_time(self, unix_time_s: float) -> str:
+        seconds = int(unix_time_s)
+        microseconds = int(round((float(unix_time_s) - seconds) * 1_000_000))
+        if microseconds >= 1_000_000:
+            seconds += 1
+            microseconds -= 1_000_000
+        return f"STUS {seconds} {microseconds}"
+
+    def _append_stus_event(
+        self,
+        event_type: str,
+        payload: dict[str, object] | None = None,
+    ) -> None:
+        operation = getattr(self.panel, "_camera_sync_stus_operation", None)
+        operation_values = dict(operation) if isinstance(operation, dict) else {}
+        event: dict[str, object] = {
+            "schema": "workstation-stus-event-v1",
+            "event_type": str(event_type),
+            "operation_id": str(operation_values.get("operation_id") or ""),
+            "clock_epoch_id": str(operation_values.get("clock_epoch_id") or ""),
+            "trigger": str(operation_values.get("trigger") or "manual"),
+            "phase": str(operation_values.get("phase") or ""),
+            "attempt_index": int(operation_values.get("attempts_started") or 0),
+            "observed_at_unix_ns": time.time_ns(),
+            "observed_at_monotonic_ns": time.monotonic_ns(),
+            "coordinate_contract": "camera UTC/RTCP clock evidence; no NED/FRD/RDF conversion",
+            **dict(payload or {}),
+        }
+        canonical = json.dumps(
+            event,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        event["event_sha256"] = hashlib.sha256(canonical).hexdigest()
+        append_data = getattr(self.panel, "append_workstation_data", None)
+        if callable(append_data):
+            try:
+                append_data("events", dict(event), priority=True)
+            except Exception as exc:  # noqa: BLE001 - evidence failure remains diagnostic.
+                self.panel._log(f"[시계] STUS global event 기록 실패: {exc}")
+        append_run = getattr(self.panel, "append_workstation_run_event", None)
+        if callable(append_run) and str(getattr(self.panel, "_measurement_id", "") or ""):
+            try:
+                append_run(
+                    str(event_type),
+                    dict(event),
+                    source="WirisControlController",
+                    coordinate_contract=str(event["coordinate_contract"]),
+                )
+            except Exception as exc:  # noqa: BLE001 - do not mutate clock state from writer failure.
+                self.panel._log(f"[시계] STUS run event 기록 실패: {exc}")
+
+    def set_selected_wiris_time_from_pc(
+        self,
+        target: str | None = None,
+        *,
+        trigger: str = "manual",
+    ) -> bool | None:
+        if bool(getattr(self.panel, "_shutdown_in_progress", False)):
+            status_text = "Application shutdown is in progress; STUS start rejected"
+            self.panel.wiris_command_status_label.setText(status_text)
+            self.panel._log(f"[시계] {status_text}")
+            return False
+        trigger = "auto" if str(trigger).strip().lower() == "auto" else "manual"
+        if target is None:
+            if hasattr(self.panel, "clock_wiris_time_target_combo"):
+                target = str(self.panel.clock_wiris_time_target_combo.currentData() or "both")
+            else:
+                target = str(self.panel.wiris_command_target_combo.currentData() or "both")
+        target = str(target or "both")
+        if trigger == "auto":
+            target = "both"
+        operation = getattr(self.panel, "_camera_sync_stus_operation", None)
+        if isinstance(operation, dict) and operation.get("active"):
+            self.panel._log(
+                "[카메라] WIRIS RTC PC UTC 설정이 폐루프 검증 중입니다 "
+                f"(attempt {operation.get('attempts_started', 1)}/{operation.get('max_attempts', WIRIS_STUS_MAX_ATTEMPTS)})."
+            )
+            return False
+        if self.panel.wiris_time_sync_thread is not None:
+            self.panel._log("[카메라] WIRIS RTC PC UTC 설정이 이미 진행 중입니다.")
+            return
+        conflicting_workers = (
+            "wiris_command_thread",
+            "wiris_zoom_thread",
+            "wiris_stip_thread",
+            "wiris_lrf_thread",
+            "wiris_image_format_thread",
+            "rtsp_enable_thread",
+            "rtsp_check_thread",
+            "camera_auto_detect_thread",
+            "pnp_photo_capture_thread",
+            "oz_photo_capture_thread",
+        )
+        active_conflicts = [
+            name for name in conflicting_workers if getattr(self.panel, name, None) is not None
+        ]
+        if active_conflicts or getattr(self.panel, "_rtsp_reactivation_side", None) is not None:
+            status_text = "STUS start rejected: camera control resource busy"
+            self.panel.wiris_command_status_label.setText(status_text)
+            self.panel._log(
+                f"[시계] {status_text} ({','.join(active_conflicts) or 'RTSP reactivation'})"
+            )
+            return False
+        target_infos = [
+            (label, host, self.panel._control_port_for_camera(label), self.panel.zoom_timeout_spin.value())
+            for label, host in self.panel.zoom_hosts(target)
+        ]
+        if not target_infos:
+            status_text = "시간을 설정할 WIRIS 대상이 없습니다."
+            self.panel.wiris_command_status_label.setText(status_text)
+            if hasattr(self.panel, "clock_sync_status_label"):
+                self.panel.clock_sync_status_label.setText(status_text)
+            return
+        self.panel.wiris_set_pc_time_button.setEnabled(False)
+        self.panel.wiris_command_status_label.setText("PC UTC 설정: sending...")
+        if hasattr(self.panel, "clock_sync_status_label"):
+            self.panel.clock_sync_status_label.setText("PC UTC 설정: sending...")
+        started_monotonic_s = time.monotonic()
+        operation_id = f"stus-{time.time_ns()}"
+        self.panel._camera_sync_stus_operation = {
+            "schema": "workstation-stus-closed-loop-v3",
+            "operation_id": operation_id,
+            "clock_epoch_id": f"clock-epoch:{operation_id}",
+            "trigger": trigger,
+            "active": True,
+            "phase": "observer-preflight",
+            "target": target,
+            "target_infos": tuple(target_infos),
+            "started_monotonic_s": started_monotonic_s,
+            "started_unix_s": time.time(),
+            "deadline_monotonic_s": started_monotonic_s + WIRIS_STUS_MAX_OPERATION_S,
+            "max_operation_s": WIRIS_STUS_MAX_OPERATION_S,
+            "max_attempts": WIRIS_STUS_MAX_ATTEMPTS,
+            "attempts_started": 1,
+            "attempts_completed": 0,
+            "attempts": [],
+            "correction_observations": [],
+            "last_compensation_by_camera": {},
+        }
+        # A prior post-STUS observer warm-up may have left its shorter deadline
+        # behind after a failed operation.  The new operation is governed by
+        # its own overall deadline until the first STUS ACK starts a fresh
+        # post-command warm-up window.
+        self.panel._camera_sync_deadline_monotonic_s = None
+        self.panel._camera_sync_stus_sr_baseline = {}
+        self.panel._camera_sync_last_sr_counts = {}
+        previous_sync = getattr(self.panel, "_last_wiris_pc_utc_sync", None)
+        if isinstance(previous_sync, dict):
+            self.panel._camera_sync_stus_operation["superseded_result"] = {
+                "operation_id": previous_sync.get("operation_id"),
+                "result": previous_sync.get("result"),
+                "recorded_at_unix_s": previous_sync.get("recorded_at_unix_s"),
+            }
+        self.panel._last_wiris_pc_utc_sync = {
+            "command": "STUS",
+            "operation_id": operation_id,
+            "clock_epoch_id": f"clock-epoch:{operation_id}",
+            "trigger": trigger,
+            "target": target,
+            "result": "pending-command",
+            "ack_result": "not-run",
+            "attempt_index": 1,
+            "max_attempts": WIRIS_STUS_MAX_ATTEMPTS,
+            "recorded_at_unix_s": time.time(),
+        }
+        self._append_stus_event(
+            "camera_clock_sync_requested",
+            {
+                "target": target,
+                "max_attempts": WIRIS_STUS_MAX_ATTEMPTS,
+                "max_operation_s": WIRIS_STUS_MAX_OPERATION_S,
+            },
+        )
+        waiting_text = "PC UTC 설정: RTCP clock observer preflight..."
+        self.panel.wiris_command_status_label.setText(waiting_text)
+        self.panel._set_camera_sync_state("warming", waiting_text)
+        self.panel._camera_sync_timer.start()
+        restart_observer = getattr(self.panel, "_restart_rtcp_clock_observer", None)
+        if not callable(restart_observer) or not restart_observer(operation_id=operation_id):
+            reason = "RTCP clock observer preflight could not start"
+            self.panel._set_camera_sync_state("failed", reason)
+            self._finish_wiris_time_sync_operation("failed", reason)
+            return False
+        return None
+
+    def _dispatch_wiris_time_sync_initial(self) -> bool:
+        operation = getattr(self.panel, "_camera_sync_stus_operation", None)
+        if not isinstance(operation, dict) or not operation.get("active"):
+            return False
+        if str(operation.get("phase") or "") != "observer-preflight":
+            return False
+        if time.monotonic() >= float(operation.get("deadline_monotonic_s") or 0.0):
+            reason = f"STUS observer preflight exceeded {WIRIS_STUS_MAX_OPERATION_S:.0f}s deadline"
+            self.panel._set_camera_sync_state("failed", reason)
+            self._finish_wiris_time_sync_operation("failed", reason)
+            return False
+        operation["phase"] = "initial-command"
+        self._append_stus_event("camera_clock_sync_command_started")
+        self.panel.wiris_command_status_label.setText(
+            f"PC UTC 설정: STUS attempt 1/{WIRIS_STUS_MAX_ATTEMPTS} sending..."
+        )
+        if hasattr(self.panel, "clock_sync_status_label"):
+            self.panel.clock_sync_status_label.setText(
+                f"PC UTC 설정: STUS attempt 1/{WIRIS_STUS_MAX_ATTEMPTS} sending..."
+            )
+        return self._start_wiris_time_sync_worker(
+            target=str(operation.get("target") or "both"),
+            target_infos=tuple(operation.get("target_infos") or ()),
+            attempt_index=1,
+            operation_id=str(operation.get("operation_id") or ""),
+            operation_deadline_monotonic_s=float(operation["deadline_monotonic_s"]),
+        )
+
+    def _start_wiris_time_sync_worker(
+        self,
+        *,
+        target: str,
+        target_infos: Sequence[tuple[str, str, int, float]],
+        attempt_index: int,
+        operation_id: str,
+        operation_deadline_monotonic_s: float,
+        compensation_by_camera: dict[str, float] | None = None,
+        feedback_offset_by_camera: dict[str, float] | None = None,
+    ) -> bool:
+        if self.panel.wiris_time_sync_thread is not None:
+            return False
+        self.panel.wiris_time_sync_thread = QtCore.QThread(self.panel)
+        self.panel.wiris_time_sync_worker = WirisClockCommandWorker(
+            target_infos,
+            command_text="STUS",
+            shared_utc=True,
+            stus_compensation_by_camera=compensation_by_camera,
+            stus_feedback_offset_by_camera=feedback_offset_by_camera,
+            stus_attempt_index=attempt_index,
+            operation_id=operation_id,
+            operation_deadline_monotonic_s=operation_deadline_monotonic_s,
+        )
+        self.panel.wiris_time_sync_worker.moveToThread(self.panel.wiris_time_sync_thread)
+        self.panel.wiris_time_sync_thread.started.connect(self.panel.wiris_time_sync_worker.run)
+        self.panel.wiris_time_sync_worker.completed.connect(
+            lambda result, target=target, target_infos=target_infos: self.panel._apply_wiris_time_sync_result(
+                target, target_infos, result
+            )
+        )
+        self.panel.wiris_time_sync_worker.failed.connect(self.panel._wiris_time_sync_failed)
+        self.panel.wiris_time_sync_worker.finished.connect(self.panel.wiris_time_sync_thread.quit)
+        self.panel.wiris_time_sync_worker.finished.connect(self.panel.wiris_time_sync_worker.deleteLater)
+        self.panel.wiris_time_sync_thread.finished.connect(self.panel.wiris_time_sync_thread.deleteLater)
+        self.panel.wiris_time_sync_thread.finished.connect(self.panel._clear_wiris_time_sync_worker)
+        self.panel.wiris_time_sync_thread.start()
+        return True
+
+    def _request_wiris_time_sync_correction(
+        self,
+        *,
+        compensation_by_camera: dict[str, float],
+        feedback_offset_by_camera: dict[str, float],
+        observation: dict[str, object],
+    ) -> bool:
+        operation = getattr(self.panel, "_camera_sync_stus_operation", None)
+        if not isinstance(operation, dict) or not operation.get("active"):
+            return False
+        if str(operation.get("target") or "") != "both":
+            self._finish_wiris_time_sync_operation(
+                "failed",
+                "closed-loop correction requires the dual-camera target",
+            )
+            return False
+        if self.panel.wiris_time_sync_thread is not None:
+            return False
+        deadline_s = float(operation.get("deadline_monotonic_s") or 0.0)
+        if time.monotonic() >= deadline_s:
+            reason = f"STUS closed-loop timeout ({WIRIS_STUS_MAX_OPERATION_S:.0f}s limit)"
+            self.panel._set_camera_sync_state("failed", reason)
+            self._finish_wiris_time_sync_operation("failed", reason)
+            return False
+        attempts_started = int(operation.get("attempts_started") or 1)
+        max_attempts = int(operation.get("max_attempts") or WIRIS_STUS_MAX_ATTEMPTS)
+        if attempts_started >= max_attempts:
+            reason = f"STUS closed-loop attempt limit {attempts_started}/{max_attempts}"
+            self.panel._set_camera_sync_state("failed", reason)
+            self._finish_wiris_time_sync_operation("failed", reason)
+            return False
+        if set(compensation_by_camera) != {"left", "right"} or set(feedback_offset_by_camera) != {
+            "left",
+            "right",
+        }:
+            reason = "STUS closed-loop requires bounded Left and Right relative feedback"
+            self.panel._set_camera_sync_state("failed", reason)
+            self._finish_wiris_time_sync_operation("failed", reason)
+            return False
+        normalized_compensation: dict[str, float] = {}
+        normalized_feedback: dict[str, float] = {}
+        for camera in ("left", "right"):
+            compensation_s = WirisClockCommandWorker._normalized_explicit_stus_compensation_s(
+                compensation_by_camera.get(camera)
+            )
+            feedback_s = WirisClockCommandWorker._normalized_explicit_stus_compensation_s(
+                feedback_offset_by_camera.get(camera)
+            )
+            if compensation_s is None or feedback_s is None:
+                reason = (
+                    f"{camera} STUS closed-loop value exceeds "
+                    f"±{WIRIS_STUS_MAX_ABSOLUTE_COMPENSATION_S:.3f}s limit"
+                )
+                self.panel._set_camera_sync_state("failed", reason)
+                self._finish_wiris_time_sync_operation("failed", reason)
+                return False
+            normalized_compensation[camera] = compensation_s
+            normalized_feedback[camera] = feedback_s
+
+        attempt_index = attempts_started + 1
+        target_infos = tuple(operation.get("target_infos") or ())
+        target_labels = [str(row[0]) for row in target_infos if len(row) >= 4]
+        if len(target_labels) != 2 or set(target_labels) != {"left", "right"}:
+            reason = "STUS closed-loop frozen target set is not exactly Left then Right"
+            self.panel._set_camera_sync_state("failed", reason)
+            self._finish_wiris_time_sync_operation("failed", reason)
+            return False
+        target_infos = tuple(
+            sorted(target_infos, key=lambda row: 0 if str(row[0]) == "left" else 1)
+        )
+        operation["attempts_started"] = attempt_index
+        operation["phase"] = "correction-command"
+        operation.setdefault("correction_observations", []).append(dict(observation))
+        self._append_stus_event(
+            "camera_clock_sync_correction_requested",
+            {
+                "feedback_offset_by_camera": dict(normalized_feedback),
+                "feedback_role": "left-right-relative-error",
+                "compensation_by_camera": dict(normalized_compensation),
+                "observation": dict(observation),
+            },
+        )
+        self.panel._camera_sync_timer.stop()
+        self.panel.wiris_command_status_label.setText(
+            f"PC UTC 설정: STUS closed-loop attempt {attempt_index}/{max_attempts} sending..."
+        )
+        if hasattr(self.panel, "clock_sync_status_label"):
+            self.panel.clock_sync_status_label.setText(
+                f"PC UTC 설정: STUS closed-loop attempt {attempt_index}/{max_attempts} sending..."
+            )
+        started = self._start_wiris_time_sync_worker(
+            target="both",
+            target_infos=target_infos,
+            attempt_index=attempt_index,
+            operation_id=str(operation.get("operation_id") or ""),
+            operation_deadline_monotonic_s=deadline_s,
+            compensation_by_camera=normalized_compensation,
+            feedback_offset_by_camera=normalized_feedback,
+        )
+        if not started:
+            operation["attempts_started"] = attempts_started
+            operation["phase"] = f"observing-attempt-{attempts_started}"
+        return started
+
+    def _finish_wiris_time_sync_operation(self, state: str, reason: str) -> None:
+        operation = getattr(self.panel, "_camera_sync_stus_operation", None)
+        if not isinstance(operation, dict):
+            return
+        operation["active"] = False
+        operation["phase"] = str(state)
+        operation["result"] = str(state)
+        operation["reason"] = str(reason)
+        operation["finished_monotonic_s"] = time.monotonic()
+        operation["finished_unix_s"] = time.time()
+        self._append_stus_event(
+            "camera_clock_sync_finished",
+            {
+                "result": str(state),
+                "reason": str(reason),
+                "attempts_completed": int(operation.get("attempts_completed") or 0),
+            },
+        )
+        scheduler = getattr(self.panel, "_stus_scheduler", None)
+        mark_finished = getattr(scheduler, "mark_finished", None)
+        if callable(mark_finished):
+            mark_finished(
+                now_monotonic_s=float(operation["finished_monotonic_s"]),
+                trigger=str(operation.get("trigger") or "manual"),
+                verified=state == "verified",
+                reason=str(reason),
+            )
+        if state != "verified":
+            cancel = getattr(
+                getattr(self.panel, "wiris_time_sync_worker", None),
+                "cancel",
+                None,
+            )
+            if callable(cancel):
+                cancel()
+        last_sync = getattr(self.panel, "_last_wiris_pc_utc_sync", None)
+        if not (
+            isinstance(last_sync, dict)
+            and str(last_sync.get("operation_id") or "")
+            == str(operation.get("operation_id") or "")
+        ):
+            last_sync = {
+                "command": "STUS",
+                "operation_id": operation.get("operation_id"),
+                "target": operation.get("target"),
+                "ack_result": "unknown",
+                "recorded_at_unix_s": time.time(),
+            }
+            self.panel._last_wiris_pc_utc_sync = last_sync
+        if isinstance(last_sync, dict):
+            last_sync["result"] = (
+                "success" if state == "verified" else str(state)
+            )
+            last_sync["verification_reason"] = str(reason)
+            last_sync["closed_loop_operation"] = {
+                key: value
+                for key, value in operation.items()
+                if key != "target_infos"
+            }
+        if getattr(self.panel, "wiris_time_sync_thread", None) is None:
+            button = getattr(self.panel, "wiris_set_pc_time_button", None)
+            if button is not None:
+                button.setEnabled(True)
+
+    def _apply_wiris_time_sync_result(
+        self,
+        target: str,
+        target_infos: Sequence[tuple[str, str, int, float]],
+        result: object,
+    ) -> None:
+        data = dict(result or {})
+        operation = getattr(self.panel, "_camera_sync_stus_operation", None)
+        result_operation_id = str(data.get("operation_id") or "")
+        if (
+            result_operation_id
+            and isinstance(operation, dict)
+            and str(operation.get("operation_id") or "") == result_operation_id
+            and not operation.get("active")
+        ):
+            late_results = list(operation.get("late_results") or [])
+            late_results.append(
+                {
+                    "operation_id": result_operation_id,
+                    "attempt_index": int(data.get("stus_attempt_index") or 1),
+                    "ignored_at_unix_s": time.time(),
+                    "reason": f"terminal phase={operation.get('phase', 'unknown')}",
+                    "results": {
+                        str(label): {
+                            key: dict(row or {}).get(key)
+                            for key in (
+                                "response",
+                                "ack_ok",
+                                "skipped",
+                                "skipped_due_to",
+                                "terminal_after_response",
+                            )
+                        }
+                        for label, row in dict(data.get("results") or {}).items()
+                    },
+                }
+            )
+            operation["late_results"] = late_results[-WIRIS_STUS_MAX_ATTEMPTS:]
+            status_text = (
+                "STUS late result ignored after terminal operation "
+                f"({operation.get('phase', 'unknown')})"
+            )
+            self.panel.wiris_command_status_label.setText(status_text)
+            self.panel._log(f"[시계] {status_text}")
+            return
+        results = dict(data.get("results") or {})
+        requested_utc_by_camera: dict[str, float] = {}
+        raw_requested_by_camera = dict(data.get("requested_utc_by_camera") or {})
+        for label, *_ in target_infos:
+            value = raw_requested_by_camera.get(label)
+            if value is None:
+                value = dict(results.get(label) or {}).get("stus_requested_utc_s")
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                requested_utc_by_camera[label] = value
+
+        rtt_by_camera: dict[str, float | None] = {}
+        one_way_delay_by_camera: dict[str, float | None] = {}
+        compensation_by_camera: dict[str, float | None] = {}
+        feedback_offset_by_camera: dict[str, float | None] = {}
+        rtt_probe_errors_by_camera: dict[str, list[str]] = {}
+        rtt_probe_warnings_by_camera: dict[str, list[str]] = {}
+        timing_text_parts: list[str] = []
+        attempt_index = max(1, int(data.get("stus_attempt_index") or 1))
+        max_attempts = (
+            int(operation.get("max_attempts") or WIRIS_STUS_MAX_ATTEMPTS)
+            if isinstance(operation, dict)
+            else WIRIS_STUS_MAX_ATTEMPTS
+        )
+        statuses = {label: str(dict(results.get(label) or {}).get("response") or "") for label, *_ in target_infos}
+        for label, _host, port, _timeout_s in target_infos:
+            row = dict(results.get(label) or {})
+            response = statuses.get(label, "")
+            command = str(row.get("command") or "STUS")
+            requested_utc_s = requested_utc_by_camera.get(label, data.get("requested_utc_s"))
+            utc_text = ""
+            if requested_utc_s is not None:
+                utc_text = datetime.fromtimestamp(float(requested_utc_s), tz=timezone.utc).isoformat(timespec="microseconds")
+            utc_suffix = f" [pc_utc={utc_text.replace('+00:00', 'Z')}]" if utc_text else ""
+            self.panel._append_wiris_command_log(
+                f"> {self.panel._camera_name_ko(label)} {row.get('host', '')}:{port} {command}"
+                f"{utc_suffix}\n{response}\n"
+            )
+
+            try:
+                rtt_median_s = float(row.get("stus_rtt_median_s"))
+                if not math.isfinite(rtt_median_s) or rtt_median_s < 0.0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                rtt_median_s = None
+            try:
+                one_way_delay_s = float(row.get("stus_one_way_delay_s"))
+                if not math.isfinite(one_way_delay_s) or one_way_delay_s < 0.0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                one_way_delay_s = None
+            try:
+                compensation_s = float(row.get("stus_compensation_s"))
+                if (
+                    not math.isfinite(compensation_s)
+                    or abs(compensation_s) > WIRIS_STUS_MAX_ABSOLUTE_COMPENSATION_S
+                ):
+                    raise ValueError
+            except (TypeError, ValueError):
+                compensation_s = None
+            try:
+                feedback_offset_s = float(row.get("stus_feedback_offset_s"))
+                if (
+                    not math.isfinite(feedback_offset_s)
+                    or abs(feedback_offset_s) > WIRIS_STUS_MAX_ABSOLUTE_COMPENSATION_S
+                ):
+                    raise ValueError
+            except (TypeError, ValueError):
+                feedback_offset_s = None
+            rtt_by_camera[label] = rtt_median_s
+            one_way_delay_by_camera[label] = one_way_delay_s
+            compensation_by_camera[label] = compensation_s
+            feedback_offset_by_camera[label] = feedback_offset_s
+            probe_errors = [str(value) for value in row.get("stus_rtt_probe_errors") or []]
+            probe_warnings = [str(value) for value in row.get("stus_rtt_probe_warnings") or []]
+            rtt_probe_errors_by_camera[label] = probe_errors
+            rtt_probe_warnings_by_camera[label] = probe_warnings
+            compensation_source = str(row.get("stus_compensation_source") or "")
+            if compensation_source == "rtcp-relative-closed-loop":
+                feedback_text = (
+                    "--" if feedback_offset_s is None else f"{feedback_offset_s * 1000.0:+.2f}ms"
+                )
+                compensation_text = (
+                    "--" if compensation_s is None else f"{compensation_s * 1000.0:+.2f}ms"
+                )
+                timing_text_parts.append(
+                    f"{self.panel._camera_name_ko(label)} L/R relative feedback={feedback_text}"
+                    f"→STUS target lead={compensation_text}"
+                )
+            elif rtt_median_s is None:
+                timing_text_parts.append(f"{self.panel._camera_name_ko(label)} RTT=측정 실패(보정 0ms)")
+            else:
+                compensation_ms = 0.0 if compensation_s is None else compensation_s * 1000.0
+                timing_text_parts.append(
+                    f"{self.panel._camera_name_ko(label)} RTT={rtt_median_s * 1000.0:.2f}ms"
+                    f"→STUS 보정 {compensation_ms:.2f}ms"
+                )
+            warning_count = len(probe_warnings)
+            if warning_count:
+                timing_text_parts.append(
+                    f"{self.panel._camera_name_ko(label)} high-latency HIWS warning={warning_count}"
+                )
+            if probe_errors:
+                timing_text_parts.append(
+                    f"{self.panel._camera_name_ko(label)} HIWS errors="
+                    + " | ".join(probe_errors[-3:])
+                )
+        command_times = dict(data.get("command_times") or {})
+        tcp_start_times = dict(data.get("tcp_start_times") or {})
+        ordered_command_times = [
+            (label, float(command_times[label]))
+            for label, *_ in target_infos
+            if label in command_times
+        ]
+        ordered_tcp_times = [
+            (label, float(tcp_start_times[label]))
+            for label, *_ in target_infos
+            if label in tcp_start_times
+        ]
+        command_skew_ms = (
+            (ordered_command_times[-1][1] - ordered_command_times[0][1]) * 1000.0
+            if len(ordered_command_times) >= 2
+            else None
+        )
+        tcp_start_skew_ms = (
+            (ordered_tcp_times[-1][1] - ordered_tcp_times[0][1]) * 1000.0
+            if len(ordered_tcp_times) >= 2
+            else None
+        )
+        skew_text = ""
+        if command_skew_ms is not None:
+            skew_text = (
+                f" | 명령 UTC 차이 {self.panel._camera_name_ko(ordered_command_times[0][0])}→"
+                f"{self.panel._camera_name_ko(ordered_command_times[-1][0])}: {command_skew_ms:.3f} ms"
+            )
+        if tcp_start_skew_ms is not None:
+            skew_text += f", TCP 호출 시작 차이: {tcp_start_skew_ms:.3f} ms"
+        timing_text = ""
+        if timing_text_parts:
+            timing_text = " | STUS timing: " + ", ".join(timing_text_parts)
+        status_text = f"attempt {attempt_index}/{max_attempts} | " + " | ".join(
+            f"{self.panel._camera_name_ko(label)}: {statuses.get(label, '<no response>')}"
+            for label, *_ in target_infos
+        ) + skew_text + timing_text
+        self.panel.wiris_command_status_label.setText(status_text)
+        if hasattr(self.panel, "clock_sync_status_label"):
+            self.panel.clock_sync_status_label.setText(f"PC UTC 설정 전송: {status_text}")
+            compensation_method = str(data.get("compensation_method") or "")
+            if compensation_method == "rtcp-relative-closed-loop":
+                target_contract = (
+                    "STUS target removes Left/Right differential around the observed common mode; "
+                    "absolute SR-PC is diagnostic-only. 3 unique RTCP pad-probe SRs and bounded "
+                    "dispersion required.\n"
+                )
+            else:
+                target_contract = (
+                    "Initial STUS target = PC send UTC + bounded HIWS RTT/2 + 2ms parse margin.\n"
+                )
+            self.panel.clock_sync_summary_text.setPlainText(
+                "STUS dispatch = Left OK ACK -> Right OK ACK; Right is not sent after a Left failure.\n"
+                + target_contract
+                + f"Closed-loop bounds = {WIRIS_STUS_MAX_ATTEMPTS} attempts / "
+                f"{WIRIS_STUS_MAX_OPERATION_S:.0f}s / "
+                f"±{WIRIS_STUS_MAX_ABSOLUTE_COMPENSATION_S:.3f}s / "
+                f"STUS ACK ≤{WIRIS_STUS_RESPONSE_TIMEOUT_S:.0f}s.\n"
+                "Run RTCP/NTP 동기화 확인 after stream frames arrive to verify left/right RTC and PC UTC offsets.\n"
+                f"{status_text}"
+            )
+        successful_targets = [
+            label
+            for label, *_ in target_infos
+            if statuses.get(label, "").strip().upper() == "OK"
+        ]
+        requested_utc_s = data.get("requested_utc_s")
+        ack_result_state = "success" if len(successful_targets) == len(target_infos) else (
+            "partial" if successful_targets else "failed"
+        )
+        terminal_reasons = {
+            label: str(dict(results.get(label) or {}).get("terminal_after_response") or "")
+            for label, *_ in target_infos
+            if dict(results.get(label) or {}).get("terminal_after_response")
+        }
+        if isinstance(operation, dict) and operation.get("active"):
+            deadline_s = operation.get("deadline_monotonic_s")
+            try:
+                if time.monotonic() >= float(deadline_s):
+                    terminal_reasons["operation"] = "operation-deadline-exceeded-before-apply"
+            except (TypeError, ValueError):
+                terminal_reasons["operation"] = "operation-deadline-invalid"
+        result_state = "failed" if terminal_reasons else ack_result_state
+        operation_attempts: list[dict[str, object]] = []
+        if (
+            isinstance(operation, dict)
+            and str(operation.get("operation_id") or "") == str(data.get("operation_id") or "")
+        ):
+            operation["attempts_completed"] = max(
+                int(operation.get("attempts_completed") or 0),
+                attempt_index,
+            )
+            operation["last_compensation_by_camera"] = {
+                camera: value
+                for camera, value in compensation_by_camera.items()
+                if value is not None
+            }
+            attempt_record = {
+                "attempt_index": attempt_index,
+                "ack_result": ack_result_state,
+                "result": result_state,
+                "terminal_reasons": dict(terminal_reasons),
+                "compensation_method": data.get("compensation_method"),
+                "dispatch_policy": data.get("dispatch_policy"),
+                "responses": dict(statuses),
+                "rtt_by_camera": dict(rtt_by_camera),
+                "rtt_probe_errors_by_camera": dict(rtt_probe_errors_by_camera),
+                "rtt_probe_warnings_by_camera": dict(rtt_probe_warnings_by_camera),
+                "feedback_offset_by_camera": dict(feedback_offset_by_camera),
+                "compensation_by_camera": dict(compensation_by_camera),
+                "requested_utc_by_camera": dict(requested_utc_by_camera),
+                "ack_finished_utc_by_camera": {
+                    camera: dict(results.get(camera) or {}).get("query_finished_utc_s")
+                    for camera, *_ in target_infos
+                },
+                "recorded_at_unix_s": time.time(),
+            }
+            attempts = list(operation.get("attempts") or [])
+            attempts.append(attempt_record)
+            operation["attempts"] = attempts[-WIRIS_STUS_MAX_ATTEMPTS:]
+            operation["last_stus_ack_finished_utc_by_camera"] = dict(
+                attempt_record["ack_finished_utc_by_camera"]
+            )
+            operation["phase"] = (
+                f"acknowledged-attempt-{attempt_index}"
+                if result_state == "success"
+                else "failed"
+            )
+            operation_attempts = list(operation["attempts"])
+            self._append_stus_event(
+                "camera_clock_sync_acknowledged",
+                {
+                    "ack_result": ack_result_state,
+                    "result": result_state,
+                    "attempt": dict(attempt_record),
+                },
+            )
+        self.panel._last_wiris_pc_utc_sync = {
+            "command": "STUS",
+            "target": target,
+            "result": "pending-verification" if result_state == "success" else result_state,
+            "ack_result": ack_result_state,
+            "terminal_reasons": terminal_reasons,
+            "operation_id": data.get("operation_id"),
+            "attempt_index": attempt_index,
+            "max_attempts": max_attempts,
+            "requested_utc_s": requested_utc_s,
+            "requested_utc_by_camera": requested_utc_by_camera,
+            "successful_targets": successful_targets,
+            "responses": statuses,
+            "command_skew_ms": command_skew_ms,
+            "tcp_start_skew_ms": tcp_start_skew_ms,
+            "compensation_method": data.get("compensation_method"),
+            "dispatch_policy": data.get("dispatch_policy"),
+            "stus_parse_margin_s": data.get("stus_parse_margin_s"),
+            "stus_rtt_by_camera": rtt_by_camera,
+            "stus_rtt_probe_errors_by_camera": rtt_probe_errors_by_camera,
+            "stus_rtt_probe_warnings_by_camera": rtt_probe_warnings_by_camera,
+            "stus_one_way_delay_by_camera": one_way_delay_by_camera,
+            "stus_compensation_by_camera": compensation_by_camera,
+            "stus_feedback_offset_by_camera": feedback_offset_by_camera,
+            "stus_feedback_role": "left-right-relative-error",
+            "stus_rtt_probe_by_camera": dict(data.get("stus_rtt_by_camera") or {}),
+            "attempts": operation_attempts,
+            "limits": {
+                "max_attempts": WIRIS_STUS_MAX_ATTEMPTS,
+                "max_operation_s": WIRIS_STUS_MAX_OPERATION_S,
+                "max_abs_compensation_s": WIRIS_STUS_MAX_ABSOLUTE_COMPENSATION_S,
+                "max_stus_response_timeout_s": WIRIS_STUS_RESPONSE_TIMEOUT_S,
+            },
+            "recorded_at_unix_s": time.time(),
+        }
+        self.panel._begin_camera_sync_after_stus(
+            target=target,
+            result=result_state,
+        )
+        self.panel._log(f"[카메라] WIRIS RTC PC UTC 설정 target={target}: {status_text}")
+
+    def _wiris_time_sync_failed(self, error: str) -> None:
+        operation = getattr(self.panel, "_camera_sync_stus_operation", None)
+        if isinstance(operation, dict) and not operation.get("active"):
+            self.panel._log(
+                "[시계] terminal STUS operation after worker failure; "
+                f"late failure ignored ({operation.get('phase', 'unknown')}): {error}"
+            )
+            return
+        self.panel.wiris_command_status_label.setText(f"PC UTC 설정: failed ({error})")
+        if hasattr(self.panel, "clock_sync_status_label"):
+            self.panel.clock_sync_status_label.setText(f"PC UTC 설정: failed ({error})")
+        self.panel._set_camera_sync_state("failed", f"STUS worker failed: {error}")
+        self._finish_wiris_time_sync_operation("failed", f"STUS worker failed: {error}")
+        self.panel._log(f"[카메라] WIRIS RTC PC UTC 설정 실패: {error}")
+
+    def _clear_wiris_time_sync_worker(self) -> None:
+        self.panel.wiris_time_sync_thread = None
+        self.panel.wiris_time_sync_worker = None
+        operation = getattr(self.panel, "_camera_sync_stus_operation", None)
+        if not (isinstance(operation, dict) and operation.get("active")):
+            self.panel.wiris_set_pc_time_button.setEnabled(True)
+
+    def send_selected_wiris_command(self) -> None:
+        command_text = self.panel.wiris_command_edit.text().strip()
+        if not command_text:
+            self.panel.wiris_command_status_label.setText("전송할 명령이 비어 있습니다.")
+            return
+        if "<" in command_text or ">" in command_text or "{" in command_text or "}" in command_text:
+            self.panel.wiris_command_status_label.setText("placeholder를 실제 값으로 바꾼 뒤 전송하세요.")
+            return
+        if command_text.upper().split(maxsplit=1)[0] == "STUS":
+            self.panel.wiris_command_status_label.setText(
+                "Raw STUS is blocked: use Set camera clock so recording, Left-before-Right, "
+                "fresh-SR verification, and bounded closed-loop interlocks remain active."
+            )
+            return
+        if self._reject_camera_control_during_stus(
+            "WIRIS SDK command",
+            self.panel.wiris_command_status_label,
+        ):
+            return
+        if self.panel._wiris_command_needs_confirmation(command_text):
+            answer = QtWidgets.QMessageBox.warning(
+                self.panel,
+                "Send WIRIS SDK Command",
+                (
+                    f"이 명령은 카메라 설정, 네트워크, 녹화, 전원 상태를 바꿀 수 있습니다.\n\n"
+                    f"{command_text}\n\n"
+                    "대상 카메라가 확실할 때만 전송하세요."
+                ),
+                QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel,
+                QtWidgets.QMessageBox.Cancel,
+            )
+            if answer != QtWidgets.QMessageBox.Ok:
+                self.panel.wiris_command_status_label.setText("명령 전송이 취소되었습니다.")
+                return
+
+        target = str(self.panel.wiris_command_target_combo.currentData() or "both")
+        terminator = str(self.panel.wiris_command_terminator_combo.currentData() or LINE_TERMINATOR)
+        target_infos = [
+            (label, host, self.panel._control_port_for_camera(label), self.panel.zoom_timeout_spin.value())
+            for label, host in self.panel.zoom_hosts(target)
+        ]
+        if not target_infos:
+            self.panel.wiris_command_status_label.setText("명령을 전송할 WIRIS 대상이 없습니다.")
+            return
+
+        self.panel._start_wiris_command_worker(
+            target=target,
+            target_infos=target_infos,
+            command_text=command_text,
+            terminator=terminator,
+        )
+
+    def _start_wiris_command_worker(
+        self,
+        *,
+        target: str,
+        target_infos: Sequence[tuple[str, str, int, float]],
+        command_text: str,
+        terminator: str,
+    ) -> None:
+        if self._reject_camera_control_during_stus(
+            "WIRIS SDK command",
+            self.panel.wiris_command_status_label,
+        ):
+            return
+        if self.panel.wiris_command_thread is not None:
+            status_text = "WIRIS SDK command: another command is already in progress"
+            self.panel._log("[카메라] WIRIS SDK 명령이 이미 진행 중입니다.")
+            self._publish_wiris_command_response(
+                {
+                    "phase": "busy",
+                    "target": target,
+                    "command": command_text,
+                    "status_text": status_text,
+                }
+            )
+            return
+        self.panel.wiris_command_status_label.setText("WIRIS SDK command: sending...")
+        self._publish_wiris_command_response(
+            {
+                "phase": "sending",
+                "target": target,
+                "command": command_text,
+                "status_text": "WIRIS SDK command: sending...",
+            }
+        )
+        self.panel.wiris_command_send_button.setEnabled(False)
+        self.panel.wiris_command_thread = QtCore.QThread(self.panel)
+        self.panel.wiris_command_worker = WirisCommandWorker(
+            target_infos,
+            command_text=command_text,
+            terminator=terminator,
+        )
+        self.panel.wiris_command_worker.moveToThread(self.panel.wiris_command_thread)
+        self.panel.wiris_command_thread.started.connect(self.panel.wiris_command_worker.run)
+        self.panel.wiris_command_worker.completed.connect(
+            lambda result, target=target, command_text=command_text: self.panel._apply_wiris_command_result(
+                target, command_text, result
+            )
+        )
+        self.panel.wiris_command_worker.failed.connect(
+            lambda error, target=target, command_text=command_text: self.panel._wiris_command_failed(
+                error, target, command_text
+            )
+        )
+        self.panel.wiris_command_worker.finished.connect(self.panel.wiris_command_thread.quit)
+        self.panel.wiris_command_worker.finished.connect(self.panel.wiris_command_worker.deleteLater)
+        self.panel.wiris_command_thread.finished.connect(self.panel.wiris_command_thread.deleteLater)
+        self.panel.wiris_command_thread.finished.connect(self.panel._clear_wiris_command_worker)
+        self.panel.wiris_command_thread.start()
+
+    def _apply_wiris_command_result(self, target: str, command_text: str, result: object) -> None:
+        data = dict(result or {}) if isinstance(result, dict) else {}
+        statuses = {str(key): str(value) for key, value in dict(data.get("statuses") or {}).items()}
+        send_times = {str(key): float(value) for key, value in dict(data.get("send_times") or {}).items()}
+        target_infos = tuple(data.get("target_infos") or ())
+        for log_text in dict(data.get("command_logs") or {}).values():
+            self.panel._append_wiris_command_log(str(log_text))
+        skew_text = ""
+        ordered_times = [
+            (str(label), send_times[str(label)])
+            for label, _host, _port, _timeout_s in target_infos
+            if str(label) in send_times
+        ]
+        if len(ordered_times) >= 2:
+            first_label, first_time_s = ordered_times[0]
+            last_label, last_time_s = ordered_times[-1]
+            skew_text = (
+                f" | 전송 시각 차이 {self.panel._camera_name_ko(first_label)}→"
+                f"{self.panel._camera_name_ko(last_label)}: {(last_time_s - first_time_s) * 1000.0:.3f} ms"
+            )
+        status_text = " | ".join(
+            f"{self.panel._camera_name_ko(str(label))}: {statuses.get(str(label), '<no response>')}"
+            for label, _host, _port, _timeout_s in target_infos
+        ) + skew_text
+        self.panel.wiris_command_status_label.setText(status_text)
+        self.panel._log(f"[카메라] WIRIS SDK 명령 target={target}, command={command_text}: {status_text}")
+        self._publish_wiris_command_response(
+            {
+                **data,
+                "phase": "completed",
+                "target": target,
+                "command": command_text,
+                "status_text": status_text,
+            }
+        )
+
+    def _wiris_command_failed(self, error: str, target: str = "", command_text: str = "") -> None:
+        status_text = f"WIRIS SDK command: failed ({error})"
+        self.panel.wiris_command_status_label.setText(status_text)
+        self.panel._log(f"[카메라] WIRIS SDK 명령 실패: {error}")
+        self._publish_wiris_command_response(
+            {
+                "phase": "failed",
+                "target": target,
+                "command": command_text,
+                "status_text": status_text,
+                "error": str(error),
+            }
+        )
+
+    def _publish_wiris_command_response(self, payload: dict[str, object]) -> None:
+        signal = getattr(self.panel, "wiris_command_response", None)
+        emit = getattr(signal, "emit", None)
+        if callable(emit):
+            emit(dict(payload))
+
+    def _clear_wiris_command_worker(self) -> None:
+        self.panel.wiris_command_thread = None
+        self.panel.wiris_command_worker = None
+        self.panel.wiris_command_send_button.setEnabled(True)
+
+    def query_wiris_lrf_once(self) -> bool:
+        """Run one on-demand GLRD read on both cameras for Alignment's LRF cards.
+
+        Each call opens and closes its own control-port connection instead of
+        keeping a background poll loop running; see
+        ``WirisLrfPollWorker`` for why continuous polling was removed.
+        """
+
+        if self._reject_camera_control_during_stus("WIRIS LRF query"):
+            return False
+        thread = getattr(self.panel, "wiris_lrf_thread", None)
+        if thread is not None and thread.isRunning():
+            self.panel._log("[카메라] WIRIS LRF 조회가 이미 진행 중입니다.")
+            return False
+        target_infos = tuple(
+            (
+                label,
+                host,
+                self.panel._control_port_for_camera(label),
+                self.panel.zoom_timeout_spin.value(),
+            )
+            for label, host in self.panel.zoom_hosts("both")
+        )
+        self.panel.wiris_lrf_thread = QtCore.QThread(self.panel)
+        self.panel.wiris_lrf_worker = WirisLrfPollWorker(target_infos)
+        self.panel.wiris_lrf_worker.moveToThread(self.panel.wiris_lrf_thread)
+        self.panel.wiris_lrf_thread.started.connect(self.panel.wiris_lrf_worker.run)
+        self.panel.wiris_lrf_worker.sampled.connect(self.panel._apply_wiris_lrf_result)
+        self.panel.wiris_lrf_worker.failed.connect(self.panel._wiris_lrf_failed)
+        self.panel.wiris_lrf_worker.finished.connect(self.panel.wiris_lrf_thread.quit)
+        self.panel.wiris_lrf_worker.finished.connect(self.panel.wiris_lrf_worker.deleteLater)
+        self.panel.wiris_lrf_thread.finished.connect(self.panel.wiris_lrf_thread.deleteLater)
+        self.panel.wiris_lrf_thread.finished.connect(self.panel._clear_wiris_lrf_worker)
+        self.panel.wiris_lrf_thread.start()
+        return True
+
+    def _apply_wiris_lrf_result(self, result: object) -> None:
+        data = dict(result or {}) if isinstance(result, dict) else {}
+        cache = getattr(self.panel, "latest_wiris_lrf", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self.panel.latest_wiris_lrf = cache
+        for sample in tuple(data.get("samples") or ()):
+            if not isinstance(sample, dict):
+                continue
+            side = str(sample.get("side") or "")
+            if side not in {"left", "right"}:
+                continue
+            previous = dict(cache.get(side) or {})
+            previous_distance = previous.get("distance_m")
+            previous.update(sample)
+            distance = sample.get("distance_m")
+            try:
+                distance_value = float(distance)
+            except (TypeError, ValueError):
+                distance_value = None
+            if distance_value is not None and math.isfinite(distance_value) and distance_value >= 0.0:
+                previous["distance_m"] = distance_value
+                previous["last_good_s"] = float(sample.get("observed_s") or time.monotonic())
+                previous["last_good_unix_s"] = float(sample.get("observed_unix_s") or time.time())
+            else:
+                previous["distance_m"] = previous_distance
+            previous["last_attempt_s"] = float(sample.get("observed_s") or time.monotonic())
+            previous["last_attempt_unix_s"] = float(sample.get("observed_unix_s") or time.time())
+            previous["last_error"] = str(sample.get("error") or "")
+            cache[side] = previous
+
+    def _wiris_lrf_failed(self, error: str) -> None:
+        self.panel._log(f"[카메라] WIRIS LRF 조회 실패: {error}")
+
+    def stop_wiris_lrf_polling(self, *, wait: bool = False) -> bool:
+        """Wind down any in-flight on-demand LRF query; return false while winding down."""
+
+        thread = getattr(self.panel, "wiris_lrf_thread", None)
+        if thread is None:
+            self.panel.wiris_lrf_worker = None
+            return True
+        if thread.isRunning():
+            thread.quit()
+            if wait and not thread.wait(1500):
+                return False
+            if thread.isRunning():
+                return False
+        self.panel.wiris_lrf_thread = None
+        self.panel.wiris_lrf_worker = None
+        return True
+
+    def _clear_wiris_lrf_worker(self) -> None:
+        self.panel.wiris_lrf_thread = None
+        self.panel.wiris_lrf_worker = None
+
+    def apply_wiris_stip(self, camera: str) -> None:
+        panel = self.panel
+        if self._reject_camera_control_during_stus("WIRIS STIP", panel.camera_connection_label):
+            return
+        camera_name = panel._camera_name_ko(camera)
+        host_edit = panel.left_zoom_host_edit if camera == "left" else panel.right_zoom_host_edit
+        new_ip_edit = panel.left_stip_ip_edit if camera == "left" else panel.right_stip_ip_edit
+        url_edit = panel.left_url_edit if camera == "left" else panel.right_url_edit
+        current_host = host_edit.text().strip()
+        new_ip = new_ip_edit.text().strip()
+        mask = panel.stip_mask_edit.text().strip()
+        try:
+            IPv4Address(current_host)
+            IPv4Address(new_ip)
+            IPv4Address(mask)
+        except ValueError as exc:
+            panel._log(f"[카메라] {camera_name} STIP 입력 오류: {exc}")
+            panel.camera_connection_label.setText(f"camera STIP: {camera}=invalid-input")
+            return
+        if current_host == new_ip:
+            panel._log(f"[카메라] {camera_name} STIP 건너뜀: 현재 host와 새 IP가 같습니다 ({new_ip}).")
+            panel.camera_connection_label.setText(f"camera STIP: {camera}=unchanged")
+            return
+        port = panel._control_port_for_camera(camera)
+        reboot_text = " and reboot" if panel.stip_reboot_checkbox.isChecked() else ""
+        answer = QtWidgets.QMessageBox.warning(
+            panel,
+            "Apply WIRIS STIP",
+            (
+                f"{camera_name} WIRIS at {current_host}:{port} will be changed to {new_ip} "
+                f"with subnet mask {mask}{reboot_text}.\n\n"
+                "Use this only when the target WIRIS is uniquely identified, preferably with one camera connected."
+            ),
+            QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel,
+            QtWidgets.QMessageBox.Cancel,
+        )
+        if answer != QtWidgets.QMessageBox.Ok:
+            panel._log(f"[카메라] {camera_name} STIP 취소됨.")
+            return
+        if panel.wiris_stip_thread is not None:
+            panel._log("[카메라] STIP 적용이 이미 진행 중입니다.")
+            return
+        if camera == "left":
+            panel.left_stip_button.setEnabled(False)
+        else:
+            panel.right_stip_button.setEnabled(False)
+        panel.camera_connection_label.setText(f"camera STIP: {camera}=applying...")
+        panel.wiris_stip_thread = QtCore.QThread(panel)
+        panel.wiris_stip_worker = WirisStipWorker(
+            interface_name=panel.interface_edit.text().strip(),
+            host_address=panel.host_address_edit.text().strip(),
+            host_hints=panel._camera_host_hints(),
+            current_host=current_host,
+            new_ip=new_ip,
+            mask=mask,
+            port=port,
+            reboot=panel.stip_reboot_checkbox.isChecked(),
+            timeout_s=panel.zoom_timeout_spin.value(),
+        )
+        panel.wiris_stip_worker.moveToThread(panel.wiris_stip_thread)
+        panel.wiris_stip_thread.started.connect(panel.wiris_stip_worker.run)
+        panel.wiris_stip_worker.completed.connect(
+            lambda result, camera=camera, camera_name=camera_name, host_edit=host_edit, new_ip_edit=new_ip_edit, url_edit=url_edit, new_ip=new_ip, current_host=current_host: panel._apply_wiris_stip_result(
+                camera,
+                camera_name,
+                host_edit,
+                new_ip_edit,
+                url_edit,
+                new_ip,
+                current_host,
+                result,
+            )
+        )
+        panel.wiris_stip_worker.failed.connect(
+            lambda error, camera=camera, camera_name=camera_name: panel._wiris_stip_failed(camera, camera_name, error)
+        )
+        panel.wiris_stip_worker.finished.connect(panel.wiris_stip_thread.quit)
+        panel.wiris_stip_worker.finished.connect(panel.wiris_stip_worker.deleteLater)
+        panel.wiris_stip_thread.finished.connect(panel.wiris_stip_thread.deleteLater)
+        panel.wiris_stip_thread.finished.connect(lambda camera=camera: panel._clear_wiris_stip_worker(camera))
+        panel.wiris_stip_thread.start()
+
+    def _apply_wiris_stip_result(
+        self,
+        camera: str,
+        camera_name: str,
+        host_edit: QtWidgets.QLineEdit,
+        new_ip_edit: QtWidgets.QLineEdit,
+        url_edit: QtWidgets.QLineEdit,
+        new_ip: str,
+        current_host: str,
+        result: object,
+    ) -> None:
+        panel = self.panel
+        data = dict(result or {})
+        candidates = list(data.get("candidates") or [])
+        if candidates:
+            panel._apply_host_interface_candidates(candidates)
+        interface_name = str(data.get("interface_name") or panel.interface_edit.text().strip())
+        host_address = str(data.get("host_address") or panel.host_address_edit.text().strip())
+        if interface_name:
+            panel.interface_edit.setText(interface_name)
+        if host_address:
+            panel.host_address_edit.setText(host_address)
+        if str(data.get("state") or "failed") != "sent":
+            error = str(data.get("error") or "unknown error")
+            panel._log(f"[카메라] {camera_name} STIP 적용 실패: {error}")
+            panel.camera_connection_label.setText(f"camera STIP: {camera}=failed ({error})")
+            panel._refresh_operation_header()
+            return
+        statuses = [str(status) for status in list(data.get("statuses") or [])]
+        host_edit.setText(new_ip)
+        new_ip_edit.setText(new_ip)
+        panel._replace_rtsp_url_host(url_edit, new_ip)
+        panel._rtsp_widgets_for_camera(camera)[1].setText(new_ip)
+        panel._log(f"[카메라] {camera_name} STIP 적용: {current_host} -> {new_ip}, {'; '.join(statuses)}")
+        panel.camera_connection_label.setText(f"camera STIP: {camera}={current_host}->{new_ip}")
+        panel._save_current_settings()
+        panel._refresh_operation_header()
+
+    def _wiris_stip_failed(self, camera: str, camera_name: str, error: str) -> None:
+        self.panel._log(f"[카메라] {camera_name} STIP worker 실패: {error}")
+        self.panel.camera_connection_label.setText(f"camera STIP: {camera}=failed ({error})")
+        self.panel._refresh_operation_header()
+
+    def _clear_wiris_stip_worker(self, camera: str) -> None:
+        self.panel.wiris_stip_thread = None
+        self.panel.wiris_stip_worker = None
+        if camera == "left":
+            self.panel.left_stip_button.setEnabled(True)
+        else:
+            self.panel.right_stip_button.setEnabled(True)
+
+    # -- Image Format (Cameras tab) --------------------------------------
+
+    def _image_format_target_infos(self) -> tuple[tuple[str, str, int, float], ...]:
+        return tuple(
+            (label, host, self.panel._control_port_for_camera(label), self.panel.zoom_timeout_spin.value())
+            for label, host in self.panel.zoom_hosts("both")
+            if str(host or "").strip()
+        )
+
+    def _start_wiris_image_format_worker(
+        self,
+        commands: Sequence[str],
+        completed_handler_name: str,
+        *,
+        auto_refresh_after: bool = False,
+    ) -> bool:
+        if self._reject_camera_control_during_stus("WIRIS Image Format"):
+            return False
+        if self.panel.wiris_image_format_thread is not None:
+            self.panel._log("[카메라] Image Format 작업이 이미 진행 중입니다.")
+            return False
+        target_infos = self._image_format_target_infos()
+        if len(target_infos) != 2:
+            self.panel._log("[카메라] Image Format 작업 실패: 좌우 제어 호스트가 모두 필요합니다.")
+            return False
+        thread = QtCore.QThread(self.panel)
+        worker = WirisImageFormatWorker(target_infos, commands=commands)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(getattr(self.panel, completed_handler_name))
+        worker.failed.connect(self.panel._wiris_image_format_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self.panel._clear_wiris_image_format_worker)
+        self.panel.wiris_image_format_thread = thread
+        self.panel.wiris_image_format_worker = worker
+        self._auto_refresh_image_format_after_worker = auto_refresh_after
+        thread.start()
+        return True
+
+    def refresh_wiris_image_format_status(self) -> bool:
+        return self._start_wiris_image_format_worker(
+            ("GIVI", "GIRJ", "GISR", "GIHR", "GILC"),
+            "_handle_wiris_image_format_status_completed",
+        )
+
+    def apply_oz_only_image_format(self) -> bool:
+        return self._start_wiris_image_format_worker(
+            ("SIRJ FALSE", "SISR FALSE", "SIHR FALSE", "SIVI TRUE"),
+            "_handle_wiris_image_format_preset_completed",
+            auto_refresh_after=True,
+        )
+
+    def set_wiris_image_format(self, set_command: str, value: bool) -> bool:
+        state = "TRUE" if value else "FALSE"
+        return self._start_wiris_image_format_worker(
+            (f"{set_command} {state}",),
+            "_handle_wiris_image_format_set_completed",
+            auto_refresh_after=True,
+        )
+
+    def _handle_wiris_image_format_status_completed(self, result: object) -> None:
+        self.panel.wiris_image_format_status = result if isinstance(result, dict) else {}
+        self.panel._log(f"[카메라] Image Format 상태: {self.panel.wiris_image_format_status}")
+
+    def _handle_wiris_image_format_preset_completed(self, result: object) -> None:
+        self.panel._log(f"[카메라] OZ 전용 초기화: {result}")
+
+    def _handle_wiris_image_format_set_completed(self, result: object) -> None:
+        self.panel._log(f"[카메라] Image Format 설정: {result}")
+
+    def _wiris_image_format_failed(self, error: str) -> None:
+        self.panel._log(f"[카메라] Image Format 작업 실패: {error}")
+
+    def _clear_wiris_image_format_worker(self) -> None:
+        self.panel.wiris_image_format_thread = None
+        self.panel.wiris_image_format_worker = None
+        if getattr(self, "_auto_refresh_image_format_after_worker", False):
+            self._auto_refresh_image_format_after_worker = False
+            self.panel.refresh_wiris_image_format_status()

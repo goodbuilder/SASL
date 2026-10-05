@@ -1,0 +1,58 @@
+{
+  "schema": "workstation-pixhawk-ethernet-params-v1",
+  "verified_at": "2026-08-30T15:26:25+09:00",
+  "side": "P2",
+  "status": "applied-and-post-reboot-verified",
+  "identity": {
+    "mavlink_system_id": 2,
+    "mavlink_component_id": 1,
+    "px4_guid": "0006000000003837393834335109002d004a",
+    "armed": false
+  },
+  "parameters": {
+    "MAV_SYS_ID": 2,
+    "MAV_2_CONFIG": 1000,
+    "MAV_2_MODE": 0,
+    "MAV_2_BROADCAST": 1,
+    "MAV_2_REMOTE_PRT": 14551,
+    "MAV_2_UDP_PRT": 14551,
+    "MAV_2_RATE": 2000000
+  },
+  "write_evidence": {
+    "param_set_ack_all_matched": true,
+    "pre_reboot_param_readback_all_matched": true,
+    "preflight_storage_command_result": 0,
+    "reboot_requested": true,
+    "post_reboot_heartbeat_system_id": 2,
+    "post_reboot_param_readback_all_matched": true
+  },
+  "sd_files": {
+    "extras.txt": {
+      "post_reboot_status": "present",
+      "bytes": 58,
+      "sha256": "fe2a7b8ec016b0a423e8266281ddcd232f34ce67d088aca047a8ea3fcbe978d5"
+    },
+    "net.cfg": {
+      "pre_reboot_write_and_readback": "pass",
+      "pre_reboot_bytes": 84,
+      "pre_reboot_sha256": "77c9c6dfbaf3af110ab51c69e22b5731f63111f7a2d2933b3df2de326b6bfffc",
+      "post_reboot_status": "missing"
+    }
+  },
+  "parameter_backup": {
+    "before_path": "parameters_backup.bson",
+    "before_bytes": 1279,
+    "before_sha256": "19ea64113fd730a5bcb2df00db87c3cb9eca759eeb4f9aa979f7a3f109a3ac7f",
+    "after_path": "parameters_backup.after_config.bson",
+    "after_bytes": 1352,
+    "after_sha256": "71a9b4f04c49002e3da47c26771bf9a3b0eeb84d5908e8b451f0f3bf62b958d1",
+    "after_entries": 66,
+    "after_bson_values_verified": {
+      "MAV_SYS_ID": 2,
+      "MAV_2_RATE": 2000000,
+      "MAV_2_REMOTE_PRT": 14551,
+      "MAV_2_UDP_PRT": 14551
+    }
+  }
+}
+

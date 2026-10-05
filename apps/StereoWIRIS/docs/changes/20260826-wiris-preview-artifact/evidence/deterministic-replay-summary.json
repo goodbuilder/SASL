@@ -1,0 +1,15 @@
+{
+  "counts": {
+    "anomaly": 20,
+    "nvidia": 1521,
+    "paired": 1106,
+    "software": 1106
+  },
+  "elapsed_s": 35.55889141800071,
+  "max_mad": 2.3628819444444447,
+  "max_p99": 17.0,
+  "unmatched": {
+    "nvidia": 415,
+    "software": 0
+  }
+}

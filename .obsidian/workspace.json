@@ -1,0 +1,218 @@
+{
+  "main": {
+    "id": "a1fa08189321b27d",
+    "type": "split",
+    "children": [
+      {
+        "id": "e1656ce4da4843ca",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "eb6797c961e82976",
+            "type": "leaf",
+            "state": {
+              "type": "graph",
+              "state": {},
+              "icon": "lucide-git-fork",
+              "title": "그래프 뷰"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "37ad09d24a0054d0",
+    "type": "split",
+    "children": [
+      {
+        "id": "6874f860198d8ece",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "2b300bda59e694c8",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-folder-closed",
+              "title": "파일 탐색기"
+            }
+          },
+          {
+            "id": "8cf348eca8ae2cf5",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "검색"
+            }
+          },
+          {
+            "id": "a74177d93d57ce27",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-bookmark",
+              "title": "북마크"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "de4d278440a5ebd1",
+    "type": "split",
+    "children": [
+      {
+        "id": "05d735ef72dc8105",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "da481bbeaed9dd70",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "Simulation/PX4-Autopilot/docs/uk/SUMMARY.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "백링크"
+            }
+          },
+          {
+            "id": "867734de049a8ea5",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "Simulation/PX4-Autopilot/docs/uk/SUMMARY.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "나가는 링크"
+            }
+          },
+          {
+            "id": "e899f60b00e40ad4",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "태그"
+            }
+          },
+          {
+            "id": "9caecdc142b7e5e7",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "모든 속성"
+            }
+          },
+          {
+            "id": "27f6b0b2872889c4",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "Simulation/PX4-Autopilot/docs/uk/SUMMARY.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "개요"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:빠른 전환기 열기": false,
+      "graph:그래프 뷰 열기": false,
+      "canvas:새 캔버스 만들기": false,
+      "daily-notes:오늘의 일일 노트 열기": false,
+      "templates:템플릿 삽입": false,
+      "command-palette:명령어 팔레트 열기": false,
+      "bases:새 베이스 생성하기": false
+    }
+  },
+  "active": "eb6797c961e82976",
+  "lastOpenFiles": [
+    "apps/StereoWIRIS/docs/DESIGN.md",
+    "apps/Workstation/docs/ui/11_DESIGN_AUDIT_RESULT.md",
+    "apps/Simulation/Recordings/waypoint_20260812_103935_full/left_overlay.mp4",
+    "apps/Simulation/install/stereo_ground_sim/lib/stereo_ground_sim/stereo_distance_node.md",
+    "docs/PROJECT_INDEX.md",
+    "apps/Simulation/reports/experiments/EXP-20260622-331-b15x5-runtime-guard-threshold-sensitivity/README.md",
+    "StereoWIRIS/tests/__pycache__/test_workstation.cpython-310-pytest-6.2.5.pyc.1649729",
+    "StereoWIRIS/tests/__pycache__/test_workstation.cpython-310-pytest-6.2.5.pyc.1649546",
+    "StereoWIRIS/tests/__pycache__/test_workstation.cpython-310-pytest-6.2.5.pyc.1625475",
+    "StereoWIRIS/tests/__pycache__/test_workstation.cpython-310-pytest-6.2.5.pyc.2",
+    "yolov8n.pt",
+    "StereoWIRIS/tests/__pycache__/test_workstation.cpython-310-pytest-6.2.5.pyc.1559512",
+    "00_PROJECT_INDEX.md",
+    "Simulation/build/px4/_deps/abseil-cpp-src/README.md",
+    "Workstation/docs/ui/11_DESIGN_AUDIT_RESULT.md",
+    "StereoWIRIS/docs/AGENTS.md",
+    "Simulation/PX4-Autopilot/docs/uk/concept/architecture.md",
+    "Simulation/config/scenarios/README.md",
+    "AGENTS.md",
+    "Simulation/PX4-Autopilot/docs/uk/SUMMARY.md",
+    "무제 1",
+    "무제",
+    "Simulation/README.md",
+    "Simulation/reports/README.md",
+    "Simulation/reports/candidate_method_validation_summary_20260609.md",
+    "Simulation/PX4-Autopilot/docs/uk/_sidebar.md",
+    "modules/modules_autotune.md",
+    "modules"
+  ]
+}

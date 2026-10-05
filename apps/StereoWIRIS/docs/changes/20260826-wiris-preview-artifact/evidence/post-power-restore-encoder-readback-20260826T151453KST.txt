@@ -1,0 +1,15 @@
+timestamp=2026-08-26T15:14:53.819263+09:00
+branch=fix/workstation-optical-pose-evidence-geometry-hardening
+head=c4397995d864576c966702cfd3c398b6032f8990
+
+Left 10.0.0.231 GEBR VISIBLE = 0
+Left 10.0.0.231 GEQZ VISIBLE = 1
+Left 10.0.0.231 GEGS VISIBLE = 90
+Left 10.0.0.231 GEIR VISIBLE = 0
+
+Right 10.0.0.232 GEBR VISIBLE = 0
+Right 10.0.0.232 GEQZ VISIBLE = 1
+Right 10.0.0.232 GEGS VISIBLE = 90
+Right 10.0.0.232 GEIR VISIBLE = 0
+
+No SET command was sent. The values match the restored pre-power-loss readback.

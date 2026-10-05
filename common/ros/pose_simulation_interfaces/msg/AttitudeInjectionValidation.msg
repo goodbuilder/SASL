@@ -1,0 +1,44 @@
+std_msgs/Header header
+uint64 evaluation_id
+
+bool valid
+string status
+string invalid_reason
+
+string context_id_sha256
+string run_id
+string case_id
+string scenario_name
+string generated_sdf_sha256
+
+string world_frame
+string camera_error_frame
+string rotation_composition
+
+geometry_msgs/Vector3 left_commanded_effective_rpy_deg
+geometry_msgs/Vector3 right_commanded_effective_rpy_deg
+
+geometry_msgs/Vector3 left_observed_nominal_to_actual_rpy_deg
+geometry_msgs/Vector3 right_observed_nominal_to_actual_rpy_deg
+
+geometry_msgs/Vector3 left_component_delta_rpy_deg
+geometry_msgs/Vector3 right_component_delta_rpy_deg
+
+geometry_msgs/Vector3 left_injection_residual_rpy_deg
+geometry_msgs/Vector3 right_injection_residual_rpy_deg
+float64 left_injection_residual_rotation_deg
+float64 right_injection_residual_rotation_deg
+
+geometry_msgs/Vector3 left_gt_ideal_to_nominal_rpy_deg
+geometry_msgs/Vector3 right_gt_ideal_to_nominal_rpy_deg
+
+geometry_msgs/Vector3 left_gt_ideal_to_actual_rpy_deg
+geometry_msgs/Vector3 right_gt_ideal_to_actual_rpy_deg
+
+float64 left_composition_closure_rotation_deg
+float64 right_composition_closure_rotation_deg
+
+geometry_msgs/Vector3 relative_commanded_rpy_deg
+geometry_msgs/Vector3 relative_observed_rpy_deg
+geometry_msgs/Vector3 relative_residual_rpy_deg
+float64 relative_residual_rotation_deg

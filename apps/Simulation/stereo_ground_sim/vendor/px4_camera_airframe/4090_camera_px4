@@ -1,0 +1,97 @@
+#!/bin/sh
+#
+# @name Gazebo x500 (static stereo camera Pixhawk)
+#
+# @type Quadrotor
+#
+
+# Copied from PX4-Autopilot's stock ROMFS/px4fmu_common/init.d-posix/airframes/4001_gz_x500
+# (same params PX4_SYS_AUTOSTART=4001 sets for the target drone) so the two
+# stereo camera Pixhawks boot with a valid PX4 parameter set even though they
+# never actually fly -- see run_operator_view.sh/build.sh, which copies this
+# file into PX4-Autopilot's ROMFS before each build, and stereo_ground_sim's
+# launch, which sets PX4_SYS_AUTOSTART=4090 only for the left/right camera
+# instances (target instance 0 stays on 4001).
+
+. ${R}etc/init.d/rc.mc_defaults
+
+PX4_SIMULATOR=${PX4_SIMULATOR:=gz}
+PX4_GZ_WORLD=${PX4_GZ_WORLD:=default}
+PX4_SIM_MODEL=${PX4_SIM_MODEL:=x500}
+
+param set-default SIM_GZ_EN 1
+
+param set-default CA_AIRFRAME 0
+param set-default CA_ROTOR_COUNT 4
+
+param set-default CA_ROTOR0_PX 0.13
+param set-default CA_ROTOR0_PY 0.22
+param set-default CA_ROTOR0_KM  0.05
+
+param set-default CA_ROTOR1_PX -0.13
+param set-default CA_ROTOR1_PY -0.20
+param set-default CA_ROTOR1_KM  0.05
+
+param set-default CA_ROTOR2_PX 0.13
+param set-default CA_ROTOR2_PY -0.22
+param set-default CA_ROTOR2_KM -0.05
+
+param set-default CA_ROTOR3_PX -0.13
+param set-default CA_ROTOR3_PY 0.20
+param set-default CA_ROTOR3_KM -0.05
+
+param set-default SIM_GZ_EC_FUNC1 101
+param set-default SIM_GZ_EC_FUNC2 102
+param set-default SIM_GZ_EC_FUNC3 103
+param set-default SIM_GZ_EC_FUNC4 104
+
+param set-default SIM_GZ_EC_MIN1 150
+param set-default SIM_GZ_EC_MIN2 150
+param set-default SIM_GZ_EC_MIN3 150
+param set-default SIM_GZ_EC_MIN4 150
+
+param set-default SIM_GZ_EC_MAX1 1000
+param set-default SIM_GZ_EC_MAX2 1000
+param set-default SIM_GZ_EC_MAX3 1000
+param set-default SIM_GZ_EC_MAX4 1000
+
+param set-default MPC_THR_HOVER 0.60
+param set-default NAV_DLL_ACT 2
+
+# This camera Pixhawk is a fixed mount that never maneuvers (see
+# stereo_ground_sim.launch.py's static left/right camera poses). EKF2's
+# default MAG_TYPE=Automatic switches to 3-axis magnetometer fusion once
+# considered in-flight, which also estimates a body-fixed hard-iron bias
+# state -- but that bias state is only observable if the vehicle's attitude
+# actually changes. A camera that never maneuvers can leave that state
+# unstable (estimator_sensor_bias.mag_bias_stable=0). MAG_TYPE=1 keeps these
+# fixed cameras on 2D magnetic-heading fusion instead of 3-axis fusion. The
+# separate Gazebo ENU -> sensor FLU -> PX4 body-FRD boundary is prepared by
+# run_operator_view.sh and must be valid before this heading can be trusted.
+param set-default EKF2_MAG_TYPE 1
+
+# Simulated visible-satellite count (see CAM_L/R_SIM_GPS_USED in
+# config/simulation.env, exported by run_operator_view.sh's
+# start_px4_instance so each camera instance can get a different value).
+# PX4's SITL GPS driver (src/modules/simulation/sensor_gps_sim/SensorGpsSim.cpp)
+# only reports a 3D fix (eph=0.9m, epv=1.78m) when this is >= 4; below that
+# it reports fix_type=0 with eph=epv=100, letting this camera simulate a GPS
+# dropout for testing how the GNSS-baseline-derived Rays
+# (attitude_true_north/operational_true_north/attitude_declination) fail
+# closed. Default 10 keeps the always-fix behavior this rig has always had.
+param set-default SIM_GPS_USED ${SIM_GPS_USED:=10}
+
+# Operator MAVLink ATTITUDE diagnostics link (see operator_panel.py's
+# MavlinkAttitudeReader/MAVLINK_ATTITUDE_URL/MAVLINK_ATTITUDE_SIDE_BY_SYSID).
+# The rqt panel cross-checks its ROS2 VehicleAttitude reading against a raw
+# MAVLink ATTITUDE sample, but nothing previously pushed one to the panel's
+# listening port -- px4-rc.mavlink's default GCS/offboard/onboard links each
+# bind their own per-instance port and never target udpin:0.0.0.0:14551.
+# This airframe file only runs for the left/right camera instances (target
+# instance 0 stays on 4001), so both instances push here without touching
+# the target's link. A dedicated local port per instance avoids colliding
+# with px4-rc.mavlink's own udp_*_port_local allocations; both instances
+# push to the SAME remote port, and MAV_SYS_ID (rcS sets it to
+# px4_instance+1: left=2, right=3) is what lets the panel tell them apart.
+mavlink start -u $((14650+px4_instance)) -r 4000000 -o 14551
+mavlink stream -r 50 -s ATTITUDE -u $((14650+px4_instance))

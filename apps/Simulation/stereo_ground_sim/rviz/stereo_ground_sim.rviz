@@ -1,0 +1,167 @@
+Panels:
+  - Class: rviz_common/Displays
+    Help Height: 0
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.35
+      Cell Size: 100
+      Class: rviz_default_plugins/Grid
+      Color: 160; 160; 164
+      Enabled: true
+      Line Style:
+        Line Width: 0.03
+        Value: Lines
+      Name: Ground Grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 40
+      Reference Frame: gazebo_world_enu
+      Value: false
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: Left Camera
+      Normalize Range: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /left_camera/image
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: Right Camera
+      Normalize Range: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /right_camera/image
+      Value: true
+    - Class: rviz_default_plugins/Marker
+      Enabled: false
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /stereo/distance_marker
+      Name: Distance Text
+      Namespaces:
+        stereo: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /stereo/ray_markers
+      Name: Stereo Rays — Nominal Pose / Optical Pose / Ideal / GPS Baseline / Global Baseline / Attitude / Operational / UAM GPS Ray (World ENU)
+      Namespaces:
+        stereo_actual_drone: true
+        stereo_cameras: true
+        stereo_rays_nominal_pose: true
+        stereo_rays_optical_pose: true
+        stereo_rays_ideal: true
+        stereo_rays_gps_baseline: true
+        stereo_rays_global_baseline: true
+        stereo_rays_attitude: true
+        stereo_rays_operational: true
+        stereo_rays_uam_gps: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /stereo/camera_markers
+      Name: Stereo Cameras (World ENU)
+      Namespaces:
+        stereo_cameras: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /stereo/ground_truth_markers
+      Name: Gazebo Ground-Truth Drone (World ENU)
+      Namespaces:
+        stereo_actual_drone: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: false
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /stereo/fov_markers
+      Name: Stereo Camera FOV (World ENU)
+      Namespaces:
+        stereo_camera_fov: true
+      Queue Size: 100
+      Value: true
+  Enabled: true
+  Global Options:
+    Background Color: 32; 34; 36
+    Fixed Frame: gazebo_world_enu
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 2000
+      Focal Point:
+        X: 0
+        Y: 1000
+        Z: 5
+      Name: Current View
+      Pitch: 0.6
+      Target Frame: gazebo_world_enu
+      # View across the +Y flight/ray direction, rather than down it, so the
+      # nominal and Gazebo-oracle rays remain visually distinguishable.
+      Yaw: 1.57
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: true
+  Height: 980
+  Hide Left Dock: true
+  Hide Right Dock: true
+  Width: 1500
+  X: 20
+  Y: 20

@@ -1,0 +1,78 @@
+{
+  "left": {
+    "width": 1280,
+    "height": 720,
+    "camera_matrix": [
+      [
+        7877.5337189699285,
+        0.0,
+        608.7148317132101
+      ],
+      [
+        0.0,
+        7880.174441600016,
+        302.824830060882
+      ],
+      [
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "distortion_coefficients": [
+      5.4086178399228775,
+      188.58339473089555,
+      -0.05386494995257386,
+      -0.03609830256365952,
+      -4.826942619991359
+    ],
+    "reprojection_error_px": 0.3002889481582508,
+    "image_count": 40
+  },
+  "right": {
+    "width": 1280,
+    "height": 720,
+    "camera_matrix": [
+      [
+        8382.797841367885,
+        0.0,
+        708.4727576225713
+      ],
+      [
+        0.0,
+        8401.442543462801,
+        437.2056464251337
+      ],
+      [
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "distortion_coefficients": [
+      0.29259920881040985,
+      80.88230473086915,
+      0.017774696782895595,
+      0.004119505931945203,
+      0.4651566131021151
+    ],
+    "reprojection_error_px": 0.3203016738652659,
+    "image_count": 40
+  },
+  "board": {
+    "inner_cols": 10,
+    "inner_rows": 8,
+    "square_size_m": 0.1
+  },
+  "metadata": {
+    "source": "offline_existing_autocapture_pairs",
+    "calibration_root": "/home/moontaehyung/바탕화면/SASL-20270724/apps/Workstation/calibration/2026-08-20_18-21-24/AutoCapture/2026-08-20_18-49-57",
+    "pair_count": 40,
+    "left_image_count": 40,
+    "right_image_count": 40,
+    "capture_zoom_level": 8,
+    "calculation_mode": "pixhawk",
+    "calculated_unix_ns": 1787227857497625641,
+    "note": "Generated without camera/Pixhawk hardware from persisted checkerboard PNG pairs."
+  }
+}

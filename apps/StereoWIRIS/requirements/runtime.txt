@@ -1,0 +1,4 @@
+# Compatibility entry point. The repository manifest is the only source of
+# truth for dependencies shared by StereoWIRIS and Workstation. PyGObject and
+# GStreamer are Ubuntu packages; PyAV is an optional backend.
+-r ../../../requirements/runtime.txt

@@ -96,6 +96,28 @@ helpers, scripts, parameters, or non-app files:
   from the `SASL` root and call out any required files that are untracked,
   ignored, or outside the repository.
 
+### Path Portability Gate
+
+- Persistent application settings must never serialize a checkout-absolute,
+  dated-worktree, or user-home path for a required asset. Store paths relative
+  to `REPO_ROOT` or `SASL_WORKSTATION_DATA_ROOT`; Workstation-owned settings
+  must use the latter.
+- A file selected outside the owned data root must be copied into an owned,
+  content-addressed location and hash-verified before its path is persisted.
+  Large external directories must be explicitly migrated or remain
+  session-only; never save them as a silent absolute dependency.
+- Absolute paths are allowed only for fields explicitly classified as
+  machine-local system/device contracts (for example `/dev`, `/opt`, bounded
+  `/tmp` state, or camera-side `/`), or as immutable historical provenance.
+  Historical paths must never be used to reopen or replay an artifact when a
+  package-relative path exists.
+- Do not embed a dated checkout name such as `SASL-YYYYMMDD` in scripts,
+  configuration, or active setup documentation. Resolve the Git root at
+  runtime or use a neutral `SASL_ROOT` variable.
+- Before commit, run `python3 tools/check_portable_paths.py`. A portability
+  change is incomplete until this check and the affected settings/runtime
+  tests pass.
+
 ## Verification
 
 Do not claim a measurement, correction, or validation change is complete
