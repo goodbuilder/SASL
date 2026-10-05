@@ -72,6 +72,12 @@ board.
 
 Navigation handles system-level context. Local tabs switch views within that context.
 
+When Navigation is saved as hidden, moving the pointer to the Workstation window's left edge
+temporarily reveals the dock. It hides 400 ms after the pointer leaves the dock; moving back
+into it cancels hiding. A Navigation dock saved or manually set to visible remains pinned.
+Temporary edge reveals do not change the saved dock visibility. The toolbar and View menu
+remain available for manual visibility changes.
+
 ## 7. Diagnostics Exception
 
 Selecting Diagnostics may focus/expand the bottom dock while preserving current Workspace.

@@ -47,6 +47,10 @@ Toolbar height target: 28–34 px. Candidate groups: connection, preview/detecti
 ## 5. Navigation Dock
 
 Default width candidate: 220–280 px, initial ~240 px, minimum ~180 px. Use hierarchical tree.
+When saved hidden, reveal it while the pointer is at the Workstation window's 5 px left-edge
+strip; hide it 400 ms after the pointer leaves. A saved or manually shown Navigation remains
+pinned, and temporary reveals do not overwrite saved dock state. Toolbar and View-menu toggles
+remain the manual controls.
 
 ## 6. Workspace
 

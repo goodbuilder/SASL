@@ -44,6 +44,11 @@ from .workspaces import (
 )
 
 
+_NAVIGATION_EDGE_TRIGGER_WIDTH = 5
+_NAVIGATION_AUTO_HIDE_DELAY_MS = 400
+_NAVIGATION_POINTER_POLL_INTERVAL_MS = 100
+
+
 def _call_pnp_capture_method(capture_method: object, purpose: str) -> object:
     """Call a PnP HR/OZ capture method, tolerating a legacy zero-arg facade.
 
@@ -108,6 +113,25 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self.commands = CommandRegistry(self)
         self._current_context = "overview"
         self._closing = False
+        self._navigation_pinned_visible = True
+        self._navigation_auto_revealed = False
+        self._navigation_auto_visibility_change = False
+        self._navigation_visibility_ready = False
+        self._navigation_pointer_poll_timer = QtCore.QTimer(self)
+        self._navigation_pointer_poll_timer.setInterval(
+            _NAVIGATION_POINTER_POLL_INTERVAL_MS
+        )
+        self._navigation_pointer_poll_timer.timeout.connect(
+            self._poll_navigation_edge_reveal
+        )
+        self._navigation_auto_hide_timer = QtCore.QTimer(self)
+        self._navigation_auto_hide_timer.setSingleShot(True)
+        self._navigation_auto_hide_timer.setInterval(
+            _NAVIGATION_AUTO_HIDE_DELAY_MS
+        )
+        self._navigation_auto_hide_timer.timeout.connect(
+            self._finish_navigation_auto_hide
+        )
         self._optical_pose_auto_thread: QtCore.QThread | None = None
         self._optical_pose_auto_worker: OpticalPoseAutoSelectWorker | None = None
         self._optical_pose_auto_command_id: str | None = None
@@ -120,6 +144,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self._apply_style()
         self._ui_settings = QtCore.QSettings("SASL", "StereoWIRIS Workstation")
         self._restore_ui_state()
+        self._navigation_pointer_poll_timer.start()
         self.status_adapter.model.changed.connect(self._refresh_from_status)
         self.status_adapter.polled.connect(self._refresh_evidence_from_poll)
         self.commands.accepted.connect(self._show_command_accepted)
@@ -861,6 +886,9 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self.navigation_dock.setObjectName("navigationDock")
         self.navigation = NavigationTree(self.navigation_dock)
         self.navigation_dock.setWidget(self.navigation)
+        self.navigation_dock.visibilityChanged.connect(
+            self._on_navigation_visibility_changed
+        )
         self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, self.navigation_dock)
         self.resizeDocks([self.navigation_dock], [240], QtCore.Qt.Horizontal)
 
@@ -1511,6 +1539,13 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         state = self._ui_settings.value("dock_state")
         if isinstance(state, (bytes, bytearray)):
             self.restoreState(bytes(state))
+        saved_navigation_visibility = self._ui_settings.value("navigation_visible")
+        if saved_navigation_visibility is not None:
+            if isinstance(saved_navigation_visibility, str):
+                saved_navigation_visibility = saved_navigation_visibility.strip().lower() in {
+                    "1", "true", "yes", "on"
+                }
+            self.navigation_dock.setVisible(bool(saved_navigation_visibility))
         context = str(self._ui_settings.value("last_context", "overview") or "overview")
         self.navigation.select_context(context)
         if canonical_context_id(context) == "tasks.data":
@@ -1526,13 +1561,109 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             self.sessions.select_tab(
                 "review" if context in review_contexts else saved_tab
             )
+        self._navigation_pinned_visible = not self.navigation_dock.isHidden()
+        self._navigation_auto_revealed = False
+        self._navigation_visibility_ready = True
 
     def _save_ui_state(self) -> None:
         self._ui_settings.setValue("geometry", self.saveGeometry())
-        self._ui_settings.setValue("dock_state", self.saveState())
+        was_auto_revealed = self._navigation_auto_revealed
+        if was_auto_revealed:
+            self._set_navigation_auto_revealed(False)
+        try:
+            self._ui_settings.setValue("dock_state", self.saveState())
+        finally:
+            if was_auto_revealed:
+                self._set_navigation_auto_revealed(True)
         self._ui_settings.setValue("last_context", self._current_context)
         self._ui_settings.setValue("sessions_tab", self.sessions.current_tab_id())
+        self._ui_settings.setValue("navigation_visible", self._navigation_pinned_visible)
         self._ui_settings.sync()
+
+    def _on_navigation_visibility_changed(self, visible: bool) -> None:
+        if not self._navigation_visibility_ready or self._navigation_auto_visibility_change:
+            return
+        self._navigation_pinned_visible = bool(visible)
+        self._navigation_auto_revealed = False
+        self._navigation_auto_hide_timer.stop()
+
+    def _navigation_pointer_position(self) -> QtCore.QPoint:
+        return QtGui.QCursor.pos()
+
+    def _navigation_pointer_over_dock(self, global_position: QtCore.QPoint) -> bool:
+        if self.navigation_dock.isHidden():
+            return False
+        local_position = self.navigation_dock.mapFromGlobal(global_position)
+        return self.navigation_dock.rect().contains(local_position)
+
+    def _navigation_pointer_in_reveal_zone(self, global_position: QtCore.QPoint) -> bool:
+        local_position = self.mapFromGlobal(global_position)
+        return (
+            self.rect().contains(local_position)
+            and local_position.x() < _NAVIGATION_EDGE_TRIGGER_WIDTH
+        )
+
+    def _set_navigation_auto_revealed(self, visible: bool) -> None:
+        self._navigation_auto_hide_timer.stop()
+        self._navigation_auto_visibility_change = True
+        try:
+            if visible:
+                self.navigation_dock.show()
+            else:
+                self.navigation_dock.hide()
+        finally:
+            self._navigation_auto_visibility_change = False
+        self._navigation_auto_revealed = visible
+
+    def _poll_navigation_edge_reveal(
+        self,
+        global_position: QtCore.QPoint | None = None,
+        *,
+        active: bool | None = None,
+    ) -> None:
+        if not self._navigation_visibility_ready or self._closing or not self.isVisible():
+            return
+        if active is None:
+            active = self.isActiveWindow()
+        if not active:
+            if self._navigation_auto_revealed:
+                self._set_navigation_auto_revealed(False)
+            return
+
+        if global_position is None:
+            global_position = self._navigation_pointer_position()
+        if self._navigation_auto_revealed:
+            if self._navigation_pointer_over_dock(global_position):
+                self._navigation_auto_hide_timer.stop()
+            elif not self._navigation_auto_hide_timer.isActive():
+                self._navigation_auto_hide_timer.start()
+            return
+
+        if (
+            not self._navigation_pinned_visible
+            and self.navigation_dock.isHidden()
+            and self._navigation_pointer_in_reveal_zone(global_position)
+        ):
+            self._set_navigation_auto_revealed(True)
+
+    def _finish_navigation_auto_hide(
+        self, global_position: QtCore.QPoint | None = None
+    ) -> None:
+        if global_position is None:
+            global_position = self._navigation_pointer_position()
+        if (
+            self._navigation_auto_revealed
+            and not self._navigation_pointer_over_dock(global_position)
+        ):
+            self._set_navigation_auto_revealed(False)
+
+    def event(self, event: QtCore.QEvent) -> bool:
+        if (
+            event.type() == QtCore.QEvent.WindowDeactivate
+            and getattr(self, "_navigation_auto_revealed", False)
+        ):
+            self._set_navigation_auto_revealed(False)
+        return super().event(event)
 
     def _apply_style(self) -> None:
         self.setStyleSheet(

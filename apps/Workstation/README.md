@@ -1285,6 +1285,11 @@ Its candidate rows are transient and read-only. The selected URL keeps the exist
 
 ## Operational Rules
 
+- When Navigation is saved hidden, move the pointer to the Workstation window's left edge to
+  reveal it. It hides 400 ms after the pointer leaves; returning to the dock cancels hiding.
+  Saved or manually shown Navigation remains pinned, and temporary reveals do not change the
+  saved dock layout. The toolbar and View menu retain manual controls.
+
 - Read `RAW yaw°` as a sensor-axis diagnostic, not a calibrated compass heading. Read `Corrected yaw°`
   as CAL_MAG-corrected sensor-vector yaw, still without magnetic-declination correction. Read `PX4 yaw°`
   as the firmware estimator reference for the verified active MAG; `Δyaw°` is
