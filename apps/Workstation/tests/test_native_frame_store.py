@@ -130,11 +130,20 @@ def test_nonfinite_native_timestamp_is_persisted_as_unknown_value(tmp_path: Path
 
 
 def test_async_native_store_does_not_block_gui_timer(monkeypatch, tmp_path: Path) -> None:
+    import threading
+
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     original_persist = NativeFrameStore.persist
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+    gui_progress = threading.Event()
+    writer_threads: list[int] = []
 
     def delayed_persist(self, **kwargs):
-        time.sleep(0.2)
+        writer_threads.append(threading.get_ident())
+        writer_entered.set()
+        if not release_writer.wait(2.0):
+            raise RuntimeError("GUI timer did not release the blocked native writer")
         return original_persist(self, **kwargs)
 
     monkeypatch.setattr(NativeFrameStore, "persist", delayed_persist)
@@ -142,41 +151,71 @@ def test_async_native_store_does_not_block_gui_timer(monkeypatch, tmp_path: Path
     completed: list[dict[str, object]] = []
     store.completed.connect(completed.append)
     ticks: list[float] = []
+    callback_threads: list[object] = []
     timer = QtCore.QTimer()
     timer.setInterval(10)
-    timer.timeout.connect(lambda: ticks.append(time.monotonic()))
+
+    def observe_gui_progress():
+        # Count only GUI events delivered while the actual writer is blocked.
+        # Qt may coalesce timer expirations under load, so a fixed 200 ms sleep
+        # cannot prove how many callbacks the GUI had an opportunity to run.
+        if writer_entered.is_set() and not release_writer.is_set():
+            callback_threads.append(QtCore.QThread.currentThread())
+            ticks.append(time.monotonic())
+            if len(ticks) >= 5:
+                gui_progress.set()
+                release_writer.set()
+
+    timer.timeout.connect(observe_gui_progress)
     timer.start()
-
-    enqueue_started_s = time.monotonic()
-    scheduled = store.enqueue_pair(
-        request_id="request-1",
-        pair_id="pair-1",
-        purpose="measurement",
-        frames=(
-            (
-                "left",
-                _image(64, 48),
-                {
-                    "native_width": 64,
-                    "native_height": 48,
-                    "overlay_applied": False,
-                },
+    try:
+        enqueue_started_s = time.monotonic()
+        scheduled = store.enqueue_pair(
+            request_id="request-1",
+            pair_id="pair-1",
+            purpose="measurement",
+            frames=(
+                (
+                    "left",
+                    _image(64, 48),
+                    {
+                        "native_width": 64,
+                        "native_height": 48,
+                        "overlay_applied": False,
+                    },
+                ),
             ),
-        ),
-    )
-    assert time.monotonic() - enqueue_started_s < 0.05
-    assert scheduled is not None and scheduled["native_pair_status"] == "pending"
+        )
+        assert time.monotonic() - enqueue_started_s < 0.05
+        assert scheduled is not None and scheduled["native_pair_status"] == "pending"
 
-    deadline_s = time.monotonic() + 2.0
-    while not completed and time.monotonic() < deadline_s:
+        deadline_s = time.monotonic() + 2.0
+        while not completed and time.monotonic() < deadline_s:
+            app.processEvents()
+            time.sleep(0.005)
+
+        assert writer_entered.is_set()
+        assert gui_progress.is_set()
+        assert len(ticks) >= 5
+        assert all(thread is app.thread() for thread in callback_threads)
+        assert writer_threads == [store._writer_thread.ident]
+        assert writer_threads[0] != threading.get_ident()
+        assert completed
+        assert completed[0]["fields"]["evidence_state"] == "SAVED"
+        assert completed[0]["fields"]["native_pair_status"] == "complete"
+        saved_path = tmp_path / "session" / completed[0]["fields"]["native_left_png_path"]
+        assert saved_path.is_file()
+    finally:
+        timer.stop()
+        # Failed assertions must not strand a blocked writer or a queued Qt
+        # completion in the next test of the full regression process.
+        release_writer.set()
+        store.acknowledge("request-1")
+        assert store.close() is True
+        store._writer_thread.join(timeout=2.0)
+        assert not store._writer_thread.is_alive()
         app.processEvents()
-        time.sleep(0.005)
-    timer.stop()
-
-    assert completed
-    assert len(ticks) >= 5
-    store.acknowledge("request-1")
-    assert store.close() is True
+        store.deleteLater()
 
 
 def test_sessionless_async_native_paths_use_creation_timestamp(tmp_path: Path) -> None:

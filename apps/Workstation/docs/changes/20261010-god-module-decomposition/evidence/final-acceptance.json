@@ -1,0 +1,32 @@
+{
+  "status": "software_acceptance_pass",
+  "scope": "four god-module decomposition; no deployment/hardware qualification",
+  "candidate_inventory": "candidate-inventory.json",
+  "candidate_inventory_sha256": "18da044d40de67a33819fe488cf52846a6656f20747cb8860df4abb93bb97e97",
+  "source_files": 429,
+  "changed_since_test_start": [],
+  "full_regression": {
+    "command": "apps/Workstation/tools/run_isolated_tests.sh -q -ra --tb=short",
+    "exit_code": 0,
+    "passed": 2243,
+    "skipped": 2,
+    "warnings": 1,
+    "seconds": 237.52,
+    "log": "evidence/final-regression.log",
+    "log_sha256": "d5965c5a33cb525a360e15300872d2f290d4a0bc7237f0ec25b6ee3ff92302db"
+  },
+  "limits": [
+    "NVENC unavailable in isolated environment",
+    "optional pyproj absent",
+    "system NumPy outside installed SciPy declared range",
+    "canonical .venv absent; run.sh --check exits1",
+    "offscreen OpenGL not qualified",
+    "hardware and prolonged field operation not tested"
+  ],
+  "gates": {
+    "portable_paths": "PASS",
+    "repository_policy_allow_existing_debt": "PASS",
+    "panel_delegate_stubs": "PASS",
+    "diff_whitespace": "PASS"
+  }
+}

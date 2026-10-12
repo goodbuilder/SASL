@@ -56,6 +56,7 @@ class _SavePanel(QtCore.QObject):
         self.recording_status_label = _WidgetState()
         self.logs: list[str] = []
         self.controller: RecordingController | None = None
+        self.receiver_threads: list[QtCore.QThread] = []
 
     def _recording_session_dir(self, session_id: str) -> Path:
         return self.root / "recordings" / session_id
@@ -78,16 +79,19 @@ class _SavePanel(QtCore.QObject):
 
     @QtCore.pyqtSlot(object)
     def _handle_session_saved(self, saved_files: object) -> None:
+        self.receiver_threads.append(QtCore.QThread.currentThread())
         assert self.controller is not None
         self.controller._handle_session_saved(saved_files)
 
     @QtCore.pyqtSlot(str)
     def _handle_session_save_failed(self, error: str) -> None:
+        self.receiver_threads.append(QtCore.QThread.currentThread())
         assert self.controller is not None
         self.controller._handle_session_save_failed(error)
 
     @QtCore.pyqtSlot()
     def _handle_session_save_thread_finished(self) -> None:
+        self.receiver_threads.append(QtCore.QThread.currentThread())
         assert self.controller is not None
         self.controller._handle_session_save_thread_finished()
 
@@ -117,6 +121,8 @@ def test_save_controller_owns_real_worker_thread_with_panel_parent(tmp_path: Pat
     assert _drain_qt_events_until(lambda: panel._session_save_thread is None)
     assert panel._session_save_finalized is True
     assert panel._session_save_retry_required is False
+    assert panel.receiver_threads
+    assert all(thread is panel.thread() for thread in panel.receiver_threads)
     assert (panel._recording_session_dir(panel.recording_session_id) / "measurement.json").is_file()
 
 
@@ -151,6 +157,8 @@ def test_real_save_worker_failure_preserves_spool_and_sets_retry(
     assert panel._session_save_retry_required is True
     assert panel._session_save_finalized is False
     assert panel._session_save_last_error == "injected persistence failure"
+    assert panel.receiver_threads
+    assert all(thread is panel.thread() for thread in panel.receiver_threads)
     assert spool.spool_path.read_bytes() == before
     assert "injected persistence failure" in panel.recording_status_label.text
 

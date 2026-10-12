@@ -1942,7 +1942,7 @@ def test_cloud_auto_suggestion_is_far_field_only_and_commits_as_cloud_mode(
 
     job = controller.prepare_workstation_optical_pose_auto_selection("cloud", {})
     assert job.mode == "cloud"
-    suggestion = job.controller._compute_auto_selection(job.mode, job.payload)
+    suggestion = job.run()
 
     assert captured["far_field_only"] is True
     assert suggestion["mode"] == "cloud"

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from Workstation.wiris_workers import io as _wiris_worker_io
+
 from PyQt5 import QtCore
 
 from Workstation.tests.workstation_test_support import (
@@ -233,13 +235,16 @@ def test_repeated_mavlink_receive_error_is_rate_limited(monkeypatch) -> None:
 def test_successful_rtcm_status_is_bounded_per_side_during_frame_burst(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from dataclasses import replace
+
     from Workstation.workstation_core import pixhawk_attitude
+    from Workstation.workstation_core.pixhawk_link import wire_commands
 
     clock = [100.0]
     sent: list[tuple[object, bytes]] = []
     monkeypatch.setattr(pixhawk_attitude.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(
-        pixhawk_attitude,
+        wire_commands,
         "_send_mavlink_rtcm_data",
         lambda connection, payload: sent.append((connection, payload)) or 2,
     )
@@ -266,9 +271,12 @@ def test_successful_rtcm_status_is_bounded_per_side_during_frame_burst(
     assert len([text for text in statuses if "RTCM 주입" in text]) == 2
 
     clock[0] += 0.001
-    subscriber.mavlink_health_snapshot = lambda _side, **_kwargs: SimpleNamespace(
-        rtcm_eligible=True,
-        connection_generation=7,
+    subscriber._commands.ports = replace(
+        subscriber._commands.ports,
+        health=lambda _side, **_kwargs: SimpleNamespace(
+            rtcm_eligible=True,
+            connection_generation=7,
+        ),
     )
     for _index in range(100):
         left = subscriber.send_rtcm_data_if_eligible(
@@ -1794,7 +1802,7 @@ def test_subscriber_start_guards_and_hardens_udpin_boundary(
 ) -> None:
     from pymavlink import mavutil
 
-    from Workstation.workstation_core import pixhawk_attitude
+    from Workstation.workstation_core.pixhawk_link import endpoints
     from Workstation.workstation_core.pixhawk_attitude import (
         DualPixhawkMavlinkSubscriber,
     )
@@ -1807,12 +1815,12 @@ def test_subscriber_start_guards_and_hardens_udpin_boundary(
 
     connection = Connection()
     monkeypatch.setattr(
-        pixhawk_attitude,
+        endpoints,
         "_assert_mavlink_udpin_available",
         lambda url: calls.append(("guard", url)),
     )
     monkeypatch.setattr(
-        pixhawk_attitude,
+        endpoints,
         "_disable_mavlink_udpin_reuse",
         lambda actual, url: calls.append(("harden", url))
         if actual is connection
@@ -2588,10 +2596,11 @@ def test_pixhawk_persistent_eth_has_one_parameter_owned_mavlink_instance() -> No
 
 def test_pixhawk_stream_setup_never_creates_a_second_runtime_instance(monkeypatch) -> None:
     from Workstation.workstation_core import pixhawk_attitude
+    from Workstation.workstation_core.pixhawk_link import wire_commands
 
     commands: list[str] = []
     monkeypatch.setattr(
-        pixhawk_attitude,
+        wire_commands,
         "_send_mavlink_shell_command",
         lambda _connection, command, **_kwargs: commands.append(command),
     )
@@ -2735,7 +2744,7 @@ def test_wiris_lrf_worker_parses_meter_responses_and_reports_errors(monkeypatch)
     def fake_send(command) -> str:
         return responses[command.host]
 
-    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
+    monkeypatch.setattr(_wiris_worker_io, "send_tcp_line", fake_send)
     worker = wiris_runtime_workers.WirisLrfPollWorker(
         (
             ("left", "10.0.0.11", 2240, 1.0),

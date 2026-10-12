@@ -1163,7 +1163,7 @@ def test_pixhawk_workspace_retries_automatic_cal_mag_readback_after_failure(monk
     )
     backend = SimpleNamespace(panel=panel)
     clock = [1000.0]
-    monkeypatch.setattr("Workstation.workspaces.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("Workstation.workspace_views.pixhawk.time.monotonic", lambda: clock[0])
     workspace = PixhawkWorkspace(
         backend, StatusModel(), lambda command_id: commands.append(command_id) or True
     )
@@ -1296,7 +1296,7 @@ def test_pixhawk_workspace_retries_incomplete_cal_mag_readback(monkeypatch) -> N
     )
     backend = SimpleNamespace(panel=panel)
     clock = [2000.0]
-    monkeypatch.setattr("Workstation.workspaces.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("Workstation.workspace_views.pixhawk.time.monotonic", lambda: clock[0])
     workspace = PixhawkWorkspace(
         backend, StatusModel(), lambda command_id: commands.append(command_id) or True
     )

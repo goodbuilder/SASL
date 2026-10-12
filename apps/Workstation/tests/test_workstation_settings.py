@@ -174,18 +174,18 @@ def test_save_settings_failure_leaves_existing_settings_file_intact(
     assert load_settings(path).calibration_zoom_level == 11
 
 def test_standalone_settings_wrappers_use_workstation_settings_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    from Workstation import standalone_gui
+    from Workstation import standalone_gui, panel_support
     from Workstation.runtime_paths import WORKSTATION_SETTINGS_PATH
 
     captured: dict[str, object] = {}
     sentinel = object()
     monkeypatch.setattr(
-        standalone_gui,
+        panel_support,
         "_load_shared_settings",
         lambda path: captured.__setitem__("load", path) or sentinel,
     )
     monkeypatch.setattr(
-        standalone_gui,
+        panel_support,
         "_save_shared_settings",
         lambda settings, path: captured.update(save=(settings, path)),
     )
@@ -734,7 +734,8 @@ def test_workstation_every_flat_app_setting_has_an_editable_surface() -> None:
         "drone_pixhawk_radio_usb_serial",
         "network_role_owned_entries",
     }
-    flat_fields = {field.name for field in fields(AppSettings)} - {"gnss_operation"}
+    # Nested connection preferences have their own Target reference editor.
+    flat_fields = {field.name for field in fields(AppSettings)} - {"gnss_operation", "target_reference"}
 
     assert flat_fields - system_keys == (
         set(measurement_aliases)

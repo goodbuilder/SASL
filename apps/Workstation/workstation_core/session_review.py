@@ -16,6 +16,7 @@ from datetime import date, datetime, timezone
 import json
 import math
 import os
+import pickle
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import tempfile
@@ -241,6 +242,27 @@ _PATH_COLUMNS = frozenset(
 _HASH_COLUMN_RE = re.compile(r"(?:^|_)(?:sha(?:256)?|hash)(?:$|_)", re.IGNORECASE)
 
 
+class ReplayableReviewRows(Sequence):
+    """Internal bounded rows with a stable operation-owned backing store.
+
+    Public ordinary sequences still receive their historical detached snapshot.
+    Storage callers must keep this backing store alive through workbook commit.
+    """
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __iter__(self):
+        yield from self.rows
+
+    def __getitem__(self, index):
+        value = self.rows[index]
+        return ReplayableReviewRows(value) if isinstance(index, slice) else value
+
+
 @dataclass(frozen=True)
 class MeasurementReview:
     """Finalized, operator-facing rows contributed by one measurement.
@@ -416,11 +438,16 @@ def _require_mapping(value: object, *, label: str) -> dict[str, object]:
     return {str(key): item for key, item in value.items()}
 
 
-def _require_rows(value: object, *, label: str) -> tuple[dict[str, object], ...]:
+def _require_rows(value: object, *, label: str) -> Sequence[Mapping[str, object]]:
     if value is None:
         return ()
     if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
         raise TypeError(f"{label} must be a sequence of mappings")
+    if isinstance(value, ReplayableReviewRows):
+        for index, row in enumerate(value):
+            if not isinstance(row, Mapping):
+                raise TypeError(f"{label}[{index}] must be a mapping")
+        return value
     rows: list[dict[str, object]] = []
     for index, row in enumerate(value):
         if not isinstance(row, Mapping):
@@ -439,8 +466,30 @@ def _write_workbook(
     generated_at_utc: str,
     max_rows_per_sheet: int,
 ) -> None:
-    rows_by_sheet = _collect_rows(measurements)
-    rows_by_method = _collect_method_rows(measurements)
+    from Workstation.workstation_core.session_storage.disk_index import DiskRowTable, disk_index
+
+    with disk_index(output.parent) as connection:
+        ordinal = 0
+
+        def row_factory():
+            nonlocal ordinal
+            ordinal += 1
+            return DiskRowTable(connection, f"review_table_{ordinal}")
+
+        rows_by_sheet = _collect_rows(measurements, row_factory=row_factory)
+        rows_by_method = _collect_method_rows(measurements, row_factory=row_factory, quality_connection=connection)
+        _write_collected_workbook(
+            output, session_root=session_root, session_id=session_id,
+            session_summary=session_summary, measurements=measurements,
+            generated_at_utc=generated_at_utc, max_rows_per_sheet=max_rows_per_sheet,
+            rows_by_sheet=rows_by_sheet, rows_by_method=rows_by_method,
+        )
+
+
+def _write_collected_workbook(
+    output, *, session_root, session_id, session_summary, measurements,
+    generated_at_utc, max_rows_per_sheet, rows_by_sheet, rows_by_method,
+):
     with xlsxwriter.Workbook(
         output,
         {
@@ -503,8 +552,9 @@ def _write_workbook(
 
 def _collect_rows(
     measurements: Sequence[MeasurementReview],
+    *, row_factory=list,
 ) -> dict[str, list[dict[str, object]]]:
-    result = {name: [] for name in BASE_SHEET_NAMES[2:]}
+    result = {name: row_factory() for name in BASE_SHEET_NAMES[2:]}
     for measurement in measurements:
         summary = dict(measurement.summary)
         _set_measurement_id(summary, measurement.measurement_id, label="summary")
@@ -535,6 +585,7 @@ def _collect_rows(
 
 def _collect_method_rows(
     measurements: Sequence[MeasurementReview],
+    *, row_factory=list, quality_connection=None,
 ) -> dict[str, list[dict[str, object]]]:
     """Build one derived review table for each canonical Measurement method.
 
@@ -543,13 +594,16 @@ def _collect_method_rows(
     use is explicit without fabricating readiness or candidate evidence.
     """
 
-    result = {method_id: [] for method_id in MEASUREMENT_METHOD_IDS}
+    result = {method_id: row_factory() for method_id in MEASUREMENT_METHOD_IDS}
     for measurement in measurements:
-        quality_by_pair = {
-            str(row.get("pair_id") or ""): dict(row)
-            for row in measurement.quality
-            if row.get("pair_id") not in (None, "")
-        }
+        if quality_connection is None:
+            quality_by_pair = {
+                str(row.get("pair_id") or ""): dict(row)
+                for row in measurement.quality
+                if row.get("pair_id") not in (None, "")
+            }
+        else:
+            quality_by_pair = _DiskQualityLookup(quality_connection, measurement.quality)
         for method_id, outcome_rows in measurement.method_results.items():
             if method_id not in result:
                 continue
@@ -652,6 +706,25 @@ def _collect_method_rows(
             _set_measurement_id(row, measurement.measurement_id, label="method result")
             result[method_id].append(row)
     return result
+
+
+class _DiskQualityLookup:
+    """Last quality row per pair, matching the historical dictionary join."""
+
+    def __init__(self, connection, rows):
+        self.connection = connection
+        connection.execute("CREATE TABLE IF NOT EXISTS review_quality (pair_id TEXT PRIMARY KEY, payload BLOB)")
+        connection.execute("DELETE FROM review_quality")
+        for row in rows:
+            if row.get("pair_id") not in (None, ""):
+                connection.execute(
+                    "INSERT OR REPLACE INTO review_quality VALUES (?, ?)",
+                    (str(row.get("pair_id") or ""), pickle.dumps(dict(row), protocol=pickle.HIGHEST_PROTOCOL)),
+                )
+
+    def get(self, pair_id, default=None):
+        value = self.connection.execute("SELECT payload FROM review_quality WHERE pair_id=?", (pair_id,)).fetchone()
+        return default if value is None else pickle.loads(value[0])
 
 
 def _set_measurement_id(

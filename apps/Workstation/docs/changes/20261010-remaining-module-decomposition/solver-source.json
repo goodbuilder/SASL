@@ -1,0 +1,23 @@
+{
+  "stage": "optical-solver-and-capture-feedback",
+  "head": "42b16e0305120c769aaa6483254d19c08fbf55bf",
+  "sources": {
+    "Workstation/calibration_controller.py": "1a03ae88fc9fbfb7d86860feccafb28a8138d9fd93ab2dc39dc59fd38ec6f592",
+    "Workstation/calibration_geometry_state.py": "b3176efe7fa40ca941a7eb40a1e8e541e8f54f368b433ad7d9a8807c46eb11c9",
+    "Workstation/calibration_workflow/__init__.py": "7b979b1a7c48cd881c3a8a059816d203a0ef8f661f0515b34df6f4a0517fc0c0",
+    "Workstation/calibration_workflow/capture_feedback.py": "e1a46e352358718a858b96f0eccbd604c7c2f827415151df7f851235a08a48af",
+    "Workstation/optical_pose/__init__.py": "222331089149fa52ac3ddc5ab8699e642d4e02d17340786bc2bd643482e29692",
+    "Workstation/optical_pose/auto_selection.py": "274599bdd293af9cc79f6555e7e301af8113510357a175991e794b12fb6569ce",
+    "Workstation/optical_pose/candidates.py": "bcf56bf20f4d77acd93933fb74f2a79dce9ee6b3cecb225763016cfc158f2243",
+    "Workstation/optical_pose/drone.py": "d72a1a9959aecec4abcc658106400c4207ada16f263257964b1ce3999da5c65b",
+    "Workstation/optical_pose/geometry_values.py": "4387ddd7385fa439ab8f7b357f6cddfeab4863605caeb2e171fdab0d69bd69b5",
+    "Workstation/optical_pose/horizon.py": "fdca812d66c503bbb27a7bac069be952f20d95bedb9646c164ab47a2329c9251",
+    "Workstation/optical_pose/mountain.py": "b0b117dc81706c61aaeeca9fddd384f0fc20e055a15d9057e04a9ee53e268a33",
+    "Workstation/optical_pose/observations.py": "6d5c9410c95b0653937634da578a45776b36a21880d8f9cdc67db922d42591a0",
+    "Workstation/optical_pose/policy.py": "ea661025f01f5e21b2a367ed6cf358222a5903aaedfedbfc97b539ea43ae7090",
+    "Workstation/optical_pose/terrain_solver.py": "57cbc6dcc82060e10e1f7b3208dc99da2b6abd98839b1891e5ad78d0b6001ec8",
+    "Workstation/optical_pose_controller.py": "d199b2ca56de41adc2110eba117bce99fd280b60891219e8af92b426533175d6",
+    "Workstation/tests/test_optical_solver_boundaries.py": "ae7763522a3659d31676b772ecdd6a87278746fefbade4f79e281d66897bb976",
+    "Workstation/workstation_core/active_geometry.py": "166d31ba251d8f6e624635e393f96906715d7e2309a85c7f3d9ad27ec9bdc81a"
+  }
+}

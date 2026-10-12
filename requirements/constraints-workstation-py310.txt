@@ -1,0 +1,22 @@
+# Linux / Python 3.10 Workstation validation profile.
+# Keep the previously exercised application stack where compatible;
+# align NumPy/pyqtgraph with the declared reference runtime.
+numpy==1.24.4
+opencv-python==4.9.0.80
+pyarrow==23.0.1
+XlsxWriter==3.2.9
+PyYAML==6.0.3
+pymavlink==2.4.49
+pyqtgraph==0.13.7
+PyOpenGL==3.1.10
+setuptools==79.0.1
+packaging==26.0
+torch==2.13.0
+ultralytics==8.4.82
+
+# Verified companions and optional coordinate-test dependencies.
+torchvision==0.28.0
+pyproj==3.7.1
+rasterio==1.4.4
+pytest==8.4.2
+cffi==2.1.1

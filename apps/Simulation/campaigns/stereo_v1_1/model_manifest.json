@@ -1,0 +1,15 @@
+{
+  "schema_version": "stereo_v1_1_yolo_asset_v1",
+  "model_filename": "yolov8n_uav.pt",
+  "sha256": "8a2204bf2ed7c09b9dbabeaa1c1e984ab482c10325e2387150e23d8daa3cb777",
+  "size_bytes": 6269475,
+  "class_name": "UAV",
+  "ultralytics_version": "8.4.127",
+  "confidence": 0.10,
+  "nms_iou": 0.70,
+  "inference_imgsz_px": 736,
+  "inference_max_det": 1,
+  "owned_path_from_repo_root": "apps/Simulation/.local/campaign_assets/sha256/8a2204bf2ed7c09b9dbabeaa1c1e984ab482c10325e2387150e23d8daa3cb777/yolov8n_uav.pt",
+  "runtime_alias_from_repo_root": "apps/Simulation/yolov8n_uav.pt",
+  "source_note": "Existing historical weight reused after SHA-256 verification; supply the same file when preparing another checkout. The binary is intentionally ignored by Git."
+}

@@ -1,0 +1,75 @@
+{
+  "source_sha256": "62bf4e2c2b92591de26bd85f1a6c74eda859a6349b22f9605af9a16ac5c7a0ba",
+  "protocol": 4,
+  "values": [
+    {
+      "name": "DetectionBox",
+      "fields": {
+        "x1": 1.0,
+        "y1": 3.0,
+        "x2": 21.0,
+        "y2": 43.0,
+        "confidence": 0.875,
+        "class_id": 2,
+        "class_name": "fixture"
+      },
+      "pickle_base64": "gASVtwAAAAAAAACMKFdvcmtzdGF0aW9uLndvcmtzdGF0aW9uX2NvcmUueW9sb19zdHJlYW2UjAxEZXRlY3Rpb25Cb3iUk5QpgZR9lCiMAngxlEc/8AAAAAAAAIwCeTGUR0AIAAAAAAAAjAJ4MpRHQDUAAAAAAACMAnkylEdARYAAAAAAAIwKY29uZmlkZW5jZZRHP+wAAAAAAACMCGNsYXNzX2lklEsCjApjbGFzc19uYW1llIwHZml4dHVyZZR1Yi4="
+    },
+    {
+      "name": "RtpFrameTiming",
+      "fields": {
+        "rtp_timestamp": 4294967280,
+        "rtp_ssrc": 123,
+        "rtp_marker_seq": 65535,
+        "rtp_pts_s": 1.125
+      },
+      "pickle_base64": "gASVlAAAAAAAAACMKFdvcmtzdGF0aW9uLndvcmtzdGF0aW9uX2NvcmUueW9sb19zdHJlYW2UjA5SdHBGcmFtZVRpbWluZ5STlCmBlH2UKIwNcnRwX3RpbWVzdGFtcJSKBfD///8AjAhydHBfc3NyY5RLe4wOcnRwX21hcmtlcl9zZXGUTf//jAlydHBfcHRzX3OURz/yAAAAAAAAdWIu"
+    },
+    {
+      "name": "RtpSequenceDiscontinuity",
+      "fields": {
+        "ssrc": 123,
+        "previous_sequence": 65535,
+        "sequence": 2,
+        "missing_packets": 2,
+        "observed_monotonic_s": 4.5,
+        "rtp_pts_ns": 1125000000
+      },
+      "pickle_base64": "gASVxAAAAAAAAACMKFdvcmtzdGF0aW9uLndvcmtzdGF0aW9uX2NvcmUueW9sb19zdHJlYW2UjBhSdHBTZXF1ZW5jZURpc2NvbnRpbnVpdHmUk5QpgZR9lCiMBHNzcmOUS3uMEXByZXZpb3VzX3NlcXVlbmNllE3//4wIc2VxdWVuY2WUSwKMD21pc3NpbmdfcGFja2V0c5RLAowUb2JzZXJ2ZWRfbW9ub3RvbmljX3OUR0ASAAAAAAAAjApydHBfcHRzX25zlEpAIw5DdWIu"
+    },
+    {
+      "name": "RtpSequenceRecovery",
+      "fields": {
+        "ssrc": 123,
+        "resume_pts_ns": 1125000000,
+        "observed_monotonic_s": 4.5,
+        "blocked_duration_s": 0.25,
+        "recovery_basis": "h264_idr"
+      },
+      "pickle_base64": "gASVxAAAAAAAAACMKFdvcmtzdGF0aW9uLndvcmtzdGF0aW9uX2NvcmUueW9sb19zdHJlYW2UjBNSdHBTZXF1ZW5jZVJlY292ZXJ5lJOUKYGUfZQojARzc3JjlEt7jA1yZXN1bWVfcHRzX25zlEpAIw5DjBRvYnNlcnZlZF9tb25vdG9uaWNfc5RHQBIAAAAAAACMEmJsb2NrZWRfZHVyYXRpb25fc5RHP9AAAAAAAACMDnJlY292ZXJ5X2Jhc2lzlIwIaDI2NF9pZHKUdWIu"
+    },
+    {
+      "name": "H264AccessUnitDiscontinuity",
+      "fields": {
+        "reason": "fixture",
+        "pts_ns": 123456789,
+        "observed_monotonic_s": 4.5
+      },
+      "pickle_base64": "gASVlQAAAAAAAACMKFdvcmtzdGF0aW9uLndvcmtzdGF0aW9uX2NvcmUueW9sb19zdHJlYW2UjBtIMjY0QWNjZXNzVW5pdERpc2NvbnRpbnVpdHmUk5QpgZR9lCiMBnJlYXNvbpSMB2ZpeHR1cmWUjAZwdHNfbnOUShXNWweMFG9ic2VydmVkX21vbm90b25pY19zlEdAEgAAAAAAAHViLg=="
+    },
+    {
+      "name": "RtcpSenderReportTiming",
+      "fields": {
+        "ssrc": 123,
+        "ntp_raw": 16831060939838062593,
+        "ntp_unix_s": 1700000000.25,
+        "rtp_timestamp": 4294967280,
+        "clock_rate_hz": 90000,
+        "received_monotonic_s": 4.5,
+        "received_wall_s": 1700000000.3,
+        "arrival_basis": "poll-detected"
+      },
+      "pickle_base64": "gASVCgEAAAAAAACMKFdvcmtzdGF0aW9uLndvcmtzdGF0aW9uX2NvcmUueW9sb19zdHJlYW2UjBZSdGNwU2VuZGVyUmVwb3J0VGltaW5nlJOUKYGUfZQojARzc3JjlEt7jAdudHBfcmF3lIoJAQAAAMDwk+kAjApudHBfdW5peF9zlEdB2VT8QBAAAIwNcnRwX3RpbWVzdGFtcJSKBfD///8AjA1jbG9ja19yYXRlX2h6lEqQXwEAjBRyZWNlaXZlZF9tb25vdG9uaWNfc5RHQBIAAAAAAACMD3JlY2VpdmVkX3dhbGxfc5RHQdlU/EATMzOMDWFycml2YWxfYmFzaXOUjA1wb2xsLWRldGVjdGVklHViLg=="
+    }
+  ]
+}

@@ -10,7 +10,7 @@ from Workstation.tests.test_alignment_live_rt import panel
 
 
 def test_live_updates_without_registration_and_preserves_candidate_selection(monkeypatch):
-    import Workstation.workspaces as module
+    import Workstation.workspace_views.optical_pose as module
     monkeypatch.setattr(module.time, 'monotonic', lambda:100.)
     p = panel()
     view = AlignmentWorkspace(SimpleNamespace(panel=p), StatusModel(), lambda:None)
@@ -42,7 +42,7 @@ def test_live_updates_without_registration_and_preserves_candidate_selection(mon
 
 
 def test_query_failure_retains_last_values_with_error_then_recovers(monkeypatch):
-    import Workstation.workspaces as module
+    import Workstation.workspace_views.optical_pose as module
     monkeypatch.setattr(module.time, 'monotonic', lambda:100.)
     p = panel()
     backend = SimpleNamespace(panel=p, alignment_live_rt_snapshot=lambda:alignment_live_rt_snapshot(p, now_s=100))
@@ -67,7 +67,7 @@ def test_query_failure_retains_last_values_with_error_then_recovers(monkeypatch)
 
 
 def test_baseline_setup_keeps_live_rows_and_return_keeps_readout(monkeypatch):
-    import Workstation.workspaces as module
+    import Workstation.workspace_views.optical_pose as module
     monkeypatch.setattr(module.time, 'monotonic', lambda:100.)
     p = panel()
     view = AlignmentWorkspace(SimpleNamespace(panel=p),StatusModel(),lambda:None)

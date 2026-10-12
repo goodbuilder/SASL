@@ -1,0 +1,6 @@
+[카메라] 왼쪽 스트림 상태: 중지됨
+[카메라] 오른쪽 스트림 상태: 중지됨
+{"phase": "write", "restored": true, "auto_connect": false, "callback_errors": []}
+[카메라] 왼쪽 스트림 상태: 중지됨
+[카메라] 오른쪽 스트림 상태: 중지됨
+{"phase": "read", "restored": true, "auto_connect": false, "callback_errors": []}

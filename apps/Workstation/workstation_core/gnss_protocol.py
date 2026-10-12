@@ -443,6 +443,7 @@ def preferred_gnss_base_serial_port(configured_port: str = "") -> str:
 
 
 def probe_gnss_base_serial_ports(candidates: Sequence[str], *, baud: int, timeout_s: float = 0.6) -> list[dict[str, object]]:
+    from .serial_endpoint_lease import acquire_serial_endpoint
     rows: list[dict[str, object]] = []
     try:
         import serial  # type: ignore[import-not-found]
@@ -467,7 +468,7 @@ def probe_gnss_base_serial_ports(candidates: Sequence[str], *, baud: int, timeou
         status = "no data"
         ubx_detected = False
         try:
-            with serial.Serial(port, int(baud), timeout=0.1) as serial_obj:
+            with acquire_serial_endpoint(port), serial.Serial(port, int(baud), timeout=0.1) as serial_obj:
                 deadline = time.monotonic() + max(0.1, float(timeout_s))
                 while time.monotonic() < deadline:
                     chunk = serial_obj.read(4096)

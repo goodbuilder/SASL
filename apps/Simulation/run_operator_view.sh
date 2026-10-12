@@ -56,6 +56,7 @@ SIM_SCENARIO_CONFIG="${SIM_SCENARIO_CONFIG:-}"
 SIM_EXPLICIT_NAMES=(
   CAMERA_BASELINE_M CAMERA_HEIGHT_M CAMERA_HORIZONTAL_FOV_RAD
   CAMERA_IMAGE_WIDTH_PX CAMERA_IMAGE_HEIGHT_PX CAMERA_UPDATE_RATE_HZ
+  SIM_GAZEBO_SEED
   OVERLAY_PUBLISH_HZ
   CAMERA_CLIP_NEAR_M CAMERA_CLIP_FAR_M
   CAM_L_MAG_NOISE_X_GAUSS CAM_L_MAG_NOISE_Y_GAUSS CAM_L_MAG_NOISE_Z_GAUSS
@@ -1234,6 +1235,7 @@ add_default_launch_arg horizontal_fov_rad "${CAMERA_HORIZONTAL_FOV_RAD:-0.154997
 add_default_launch_arg camera_image_width_px "${CAMERA_IMAGE_WIDTH_PX:-1280}" "${launch_input[@]}"
 add_default_launch_arg camera_image_height_px "${CAMERA_IMAGE_HEIGHT_PX:-720}" "${launch_input[@]}"
 add_default_launch_arg camera_update_rate_hz "${CAMERA_UPDATE_RATE_HZ:-20.0}" "${launch_input[@]}"
+add_optional_default_launch_arg gazebo_seed "${SIM_GAZEBO_SEED:-}" "${launch_input[@]}"
 add_default_launch_arg camera_clip_near_m "${CAMERA_CLIP_NEAR_M:-0.1}" "${launch_input[@]}"
 add_default_launch_arg camera_clip_far_m "${CAMERA_CLIP_FAR_M:-2500.0}" "${launch_input[@]}"
 add_default_launch_arg cam_l_mag_noise_x_gauss "${CAM_L_MAG_NOISE_X_GAUSS:-0.0}" "${launch_input[@]}"

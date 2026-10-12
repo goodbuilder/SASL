@@ -29,4 +29,19 @@
       <statustip>Show setup, stereo images, FRD trends, and raw diagnostics in separate tabs.</statustip>
     </qtgui>
   </class>
+  <class name="CampaignPanel" type="stereo_ground_sim.campaign_panel.CampaignPanel" base_class_type="rqt_gui_py::Plugin">
+    <description>
+      Human-operated controls for planning, running, resuming, and reprocessing the frozen stereo v1.1 campaign.
+    </description>
+    <qtgui>
+      <group>
+        <label>Simulation</label>
+        <icon type="theme">folder</icon>
+        <statustip>Simulation campaign tools.</statustip>
+      </group>
+      <label>Stereo Campaign</label>
+      <icon type="theme">media-playback-start</icon>
+      <statustip>Run the v1.1 stereo campaign from Simulation.env and review persisted progress.</statustip>
+    </qtgui>
+  </class>
 </library>

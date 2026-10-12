@@ -1,0 +1,118 @@
+<div id="sasl-v11-overview">
+  <h2>작업지시서 한눈에 보기</h2>
+  <div class="viz-controls" role="group" aria-label="설명 단계">
+    <button class="btn btn-primary" type="button" data-view="plan" aria-pressed="true">1 · 39회 구성</button>
+    <button class="btn" type="button" data-view="flight" aria-pressed="false">2 · 한 회의 비행</button>
+    <button class="btn" type="button" data-view="result" aria-pressed="false">3 · 결과 읽기</button>
+  </div>
+
+  <div data-panels aria-live="polite">
+    <section data-panel="plan">
+      <h3>카메라 자세 두 가지 × 지정 경로</h3>
+      <div class="sasl-v11-equations">
+        <div class="sasl-v11-equation">
+          <strong>G0</strong>
+          <span>카메라 좌·우 방위각 0°</span>
+          <span>P0 · P1 · P2 · P3 · P4 · V0</span>
+          <strong>6경로 × 5회 = 30회</strong>
+        </div>
+        <div class="sasl-v11-equation">
+          <strong>G1</strong>
+          <span>좌 +0.5° · 우 −0.5°</span>
+          <span>P0 · P4 · V0</span>
+          <strong>3경로 × 3회 = 9회</strong>
+        </div>
+      </div>
+      <hr>
+      <div class="viz-row" aria-label="경로의 역할">
+        <span><strong>P0</strong> 직선</span>
+        <span><strong>P1·P2</strong> 한쪽 곡선</span>
+        <span><strong>P3·P4</strong> S자</span>
+        <span><strong>V0</strong> 별도 평가 직선</span>
+      </div>
+      <p>합계 <strong>39개의 개별 실행 슬롯</strong>. G1의 P4는 미리 정한 대표 S자 경로다.</p>
+    </section>
+
+    <section data-panel="flight" hidden>
+      <h3>비행 한 번의 순서</h3>
+      <ol class="sasl-v11-phases">
+        <li><strong>시작점 진입</strong><span>드론이 지정 좌표까지 이동</span></li>
+        <li><strong>5초 안정</strong><span>속도·위치·방향 오차가 기준 충족</span></li>
+        <li><strong>과학 구간</strong><span>경로를 따라 비행 · 처음과 끝의 가감속 포함</span></li>
+        <li><strong>종료</strong><span>5초 정지한 뒤 착륙</span></li>
+      </ol>
+      <hr>
+      <div class="sasl-v11-coordinates">
+        <div><strong>P0 시작</strong><span>동쪽 0m · 북쪽 400m · 높이 145.6m</span></div>
+        <div><strong>V0 시작</strong><span>동쪽 0m · 북쪽 600m · 높이 218.4m</span></div>
+      </div>
+      <p>시작점 진입에 실패하면 원본 기록은 남지만 과학 구간은 시작되지 않는다.</p>
+    </section>
+
+    <section data-panel="result" hidden>
+      <h3>서로 다른 세 가지 완료 상태</h3>
+      <div class="sasl-v11-result">
+        <div>
+          <span>원본 기록·QC 유효</span><strong class="tabular-nums">39 / 39</strong>
+          <div class="progress" role="progressbar" aria-label="원본 기록 QC 유효" aria-valuenow="39" aria-valuemin="0" aria-valuemax="39"><div class="progress-bar" style="width:100%"></div></div>
+        </div>
+        <div>
+          <span>지정 경로의 과학 구간 완료</span><strong class="tabular-nums">32 / 39</strong>
+          <div class="progress" role="progressbar" aria-label="과학 구간 완료" aria-valuenow="32" aria-valuemin="0" aria-valuemax="39"><div class="progress-bar" style="width:82.05%"></div></div>
+        </div>
+        <div>
+          <span>교정·측위 성능 평가</span><strong>아직 수행하지 않음</strong>
+          <span class="text-small">A/B/C · RPY_IMU/YAW_ONLY 추정기 미구현</span>
+        </div>
+      </div>
+      <hr>
+      <div class="viz-row" aria-label="저장과 재처리 흐름">
+        <span>좌·우 원본 영상 + 50Hz GT + PX4</span>
+        <span aria-hidden="true">→</span>
+        <span>별도 파생 데이터</span>
+        <span aria-hidden="true">→</span>
+        <span>요약 XLSX</span>
+      </div>
+      <p>과학 구간 미완료 7회는 모두 V0 시작점 진입 실패다. 이 실행들도 원본과 실패 사유를 보존했다.</p>
+    </section>
+  </div>
+</div>
+<style>
+  #sasl-v11-overview [data-panel] { margin-block-start: 14px; }
+  #sasl-v11-overview [data-panel][hidden] { display: none; }
+  #sasl-v11-overview .sasl-v11-equations { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin-block: 14px; }
+  #sasl-v11-overview .sasl-v11-equation { display: grid; gap: 5px; border-inline-start: 4px solid var(--viz-series-1); padding-inline-start: 11px; }
+  #sasl-v11-overview .sasl-v11-equation + .sasl-v11-equation { border-inline-start-color: var(--viz-series-2); }
+  #sasl-v11-overview .sasl-v11-phases { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; list-style: none; padding: 0; margin-block: 16px; counter-reset: phase; }
+  #sasl-v11-overview .sasl-v11-phases li { display: grid; align-content: start; gap: 6px; padding-block-start: 8px; border-block-start: 3px solid var(--border); counter-increment: phase; }
+  #sasl-v11-overview .sasl-v11-phases li::before { content: counter(phase); color: var(--muted-foreground); }
+  #sasl-v11-overview .sasl-v11-phases li:nth-child(3) { border-block-start-color: var(--viz-series-1); }
+  #sasl-v11-overview .sasl-v11-coordinates { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 15px; }
+  #sasl-v11-overview .sasl-v11-coordinates div { display: grid; gap: 4px; }
+  #sasl-v11-overview .sasl-v11-result { display: grid; gap: 16px; margin-block: 16px; }
+  #sasl-v11-overview .sasl-v11-result > div { display: grid; gap: 5px; }
+  #sasl-v11-overview .sasl-v11-result strong { font-weight: 500; }
+  #sasl-v11-overview .sasl-v11-result .progress { max-width: 520px; }
+  #sasl-v11-overview p { margin-block: 12px 0; }
+  @media (max-width: 520px) {
+    #sasl-v11-overview .sasl-v11-equations, #sasl-v11-overview .sasl-v11-coordinates { grid-template-columns: 1fr; }
+    #sasl-v11-overview .sasl-v11-phases { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+</style>
+<script>
+(() => {
+  const root = document.getElementById('sasl-v11-overview');
+  const buttons = [...root.querySelectorAll('[data-view]')];
+  const panels = [...root.querySelectorAll('[data-panel]')];
+  function show(view) {
+    buttons.forEach(button => {
+      const selected = button.dataset.view === view;
+      button.setAttribute('aria-pressed', String(selected));
+      button.classList.toggle('btn-primary', selected);
+    });
+    panels.forEach(panel => { panel.hidden = panel.dataset.panel !== view; });
+  }
+  buttons.forEach(button => button.addEventListener('click', () => show(button.dataset.view)));
+  show('plan');
+})();
+</script>

@@ -9,6 +9,7 @@ tracked script/configuration to one user or to one dated checkout directory.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 import subprocess
 from collections.abc import Iterable
@@ -43,6 +44,26 @@ EXEMPT_EXACT = {
     "apps/Workstation/tests/test_portable_paths.py",
     "tools/check_portable_paths.py",
 }
+# Reviewed immutable provenance, not runtime setup instructions. Match both
+# path and bytes so edits/new files cannot acquire a historical exemption.
+# P1 records where its settings were observed; the remaining files preserve
+# previous executions/current-behavior observations, including failed runs.
+HISTORICAL_CONTENT_SHA256 = {
+    "apps/Workstation/Pixhawk/P1/workstation_endpoint.json":
+        "8827d4ad1af5fcf98981907d14838922aa3adb3c89941423aa06a3ae01e84ad3",
+    "apps/Workstation/docs/changes/20260829-calibration-app-receive-timing/current-behavior.md":
+        "240e1ebe311ca1ccc03ed22442cc56d465c7a185ba810c19be0c80c2572d8438",
+    "apps/Workstation/docs/changes/20260829-calibration-app-receive-timing/verification.md":
+        "e805a4a3e40b5932a4a38c4c9d2b86478a53f5dd686c6aac15231972cbda21ca",
+    "apps/Workstation/docs/changes/20260903-jsonl-csv-mirror/current-behavior.md":
+        "76b9041981761ec01ae0ab25ee4baa0e38664aaa720a9271317bab032c588aba",
+    "apps/Workstation/docs/changes/20260904-magnetometer-yaw-display/current-behavior.md":
+        "5fbbbbd313d912e3adea0541052566582a52560b4c4431d1cdd6a3f50d3a51ea",
+    "apps/Workstation/docs/changes/20260904-magnetometer-yaw-display/verification.md":
+        "e969ce802811990d2e9f1b3ffd427bfcdb2d82d65df2462616c003887c32c0dc",
+    "apps/Workstation/docs/changes/20260904-mountain-rt-ui-display/current-behavior.md":
+        "9057bae87da03a0d3824eb18a0b2e977d8d973e72102d349688799cf09da6260",
+}
 FORBIDDEN_PATTERNS = (
     ("POSIX user-home absolute path", re.compile(r"/(?:home|Users)/[^/\s'\"`]+/")),
     ("Windows user-home absolute path", re.compile(r"[A-Za-z]:\\Users\\[^\\\s'\"`]+\\")),
@@ -76,6 +97,9 @@ def is_exempt_path(path: str) -> bool:
 def scan_text(path: str, text: str) -> tuple[Violation, ...]:
     if is_exempt_path(path) or Path(path).suffix.lower() not in SCANNED_SUFFIXES:
         return ()
+    historical_hash = HISTORICAL_CONTENT_SHA256.get(path)
+    if historical_hash and hashlib.sha256(text.encode("utf-8")).hexdigest() == historical_hash:
+        return ()
     violations: list[Violation] = []
     for line_number, line in enumerate(text.splitlines(), start=1):
         for reason, pattern in FORBIDDEN_PATTERNS:
@@ -94,7 +118,8 @@ def repository_violations(
         if not path.is_file():
             continue
         try:
-            text = path.read_text(encoding="utf-8")
+            # Do not normalize CRLF before the immutable provenance hash check.
+            text = path.read_bytes().decode("utf-8")
         except UnicodeDecodeError:
             continue
         violations.extend(scan_text(relative, text))

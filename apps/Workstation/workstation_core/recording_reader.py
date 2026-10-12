@@ -156,43 +156,49 @@ def _resolve_inside(root: Path, relative_path: object) -> Path:
     return resolved
 
 
-def _read_verified_jsonl(
-    path: Path,
-    descriptor: Mapping[str, object],
-) -> tuple[dict[str, object], ...]:
+def _iter_verified_jsonl(path: Path, descriptor: Mapping[str, object]):
+    """Stream rows, checking the pinned artifact's bytes before and after use.
+
+    Consumers must exhaust the iterator before publishing a derived artifact.
+    The public reader still returns an eager immutable tuple for compatibility.
+    """
+    import hashlib
+
     expected_size = descriptor.get("size_bytes")
     if expected_size is None or int(expected_size) != path.stat().st_size:
         raise OSError("authoritative JSONL size does not match measurement manifest")
     expected_sha = str(descriptor.get("sha256") or "")
     if len(expected_sha) != 64 or sha256_file(path) != expected_sha:
         raise OSError("authoritative JSONL SHA-256 does not match measurement manifest")
-    payload = path.read_bytes()
-    if payload and not payload.endswith(b"\n"):
-        raise OSError("finalized authoritative JSONL has a torn final record")
-    rows: list[dict[str, object]] = []
+    digest = hashlib.sha256()
+    count = 0
+
     def reject_constant(value: str) -> None:
         raise ValueError(f"non-finite JSON constant: {value}")
 
-    for line_number, raw_line in enumerate(payload.splitlines(), start=1):
-        if not raw_line.strip():
-            raise OSError(f"blank authoritative JSONL row at line {line_number}")
-        try:
-            row = json.loads(
-                raw_line.decode("utf-8"),
-                parse_constant=reject_constant,
-            )
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-            raise OSError(
-                f"malformed authoritative JSONL row at line {line_number}"
-            ) from exc
-        if not isinstance(row, dict):
-            raise OSError(
-                f"authoritative JSONL row is not an object at line {line_number}"
-            )
-        rows.append(row)
-    if descriptor.get("row_count") is None or int(descriptor["row_count"]) != len(rows):
+    with path.open("rb") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            digest.update(raw_line)
+            if not raw_line.endswith(b"\n"):
+                raise OSError("finalized authoritative JSONL has a torn final record")
+            if not raw_line.strip():
+                raise OSError(f"blank authoritative JSONL row at line {line_number}")
+            try:
+                row = json.loads(raw_line.decode("utf-8"), parse_constant=reject_constant)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                raise OSError(f"malformed authoritative JSONL row at line {line_number}") from exc
+            if not isinstance(row, dict):
+                raise OSError(f"authoritative JSONL row is not an object at line {line_number}")
+            count += 1
+            yield row
+    if descriptor.get("row_count") is None or int(descriptor["row_count"]) != count:
         raise OSError("authoritative JSONL row count does not match measurement manifest")
-    return tuple(rows)
+    if digest.hexdigest() != expected_sha:
+        raise OSError("authoritative JSONL SHA-256 changed while reading")
+
+
+def _read_verified_jsonl(path: Path, descriptor: Mapping[str, object]) -> tuple[dict[str, object], ...]:
+    return tuple(_iter_verified_jsonl(path, descriptor))
 
 
 def _legacy_resource_path(
@@ -237,9 +243,11 @@ def _read_legacy_parquet(
         return tuple(dict(row) for row in pq.read_table(path).to_pylist())
 
 
-def read_measurement_stream(
+def _open_measurement_stream(
     measurement_root: Path | str,
     logical_role: str = "raw/stereo_measurements",
+    *,
+    streaming: bool = False,
 ) -> RecordingStream:
     """Read one logical stream, refusing fallback for declared authoritative JSONL."""
 
@@ -276,7 +284,7 @@ def read_measurement_stream(
         if descriptor.get("media_type") != "application/x-ndjson":
             raise OSError("declared canonical JSONL has the wrong media type")
         path = _resolve_inside(root, descriptor.get("relative_path"))
-        rows = _read_verified_jsonl(path, descriptor)
+        rows = _iter_verified_jsonl(path, descriptor) if streaming else _read_verified_jsonl(path, descriptor)
         return RecordingStream(role, path, rows, True, False, dict(descriptor))
     if is_jsonl_storage:
         raise OSError(f"v3 measurement manifest omits authoritative stream: {role}")
@@ -318,4 +326,18 @@ def read_measurement_stream(
     )
 
 
-__all__ = ["ROLE_SOURCES", "RecordingStream", "read_measurement_stream"]
+def read_measurement_stream(measurement_root: Path | str, logical_role: str = "raw/stereo_measurements") -> RecordingStream:
+    """Compatibility API: return fully verified immutable source rows."""
+    return _open_measurement_stream(measurement_root, logical_role)
+
+
+def iter_measurement_stream(measurement_root: Path | str, logical_role: str = "raw/stereo_measurements"):
+    """Internal derived-artifact path; exhaust to validate count/final digest.
+
+    Historical Parquet-only packages retain their existing compatibility reader.
+    Current canonical JSONL uses bounded iteration over the resolved generation.
+    """
+    yield from _open_measurement_stream(measurement_root, logical_role, streaming=True).rows
+
+
+__all__ = ["ROLE_SOURCES", "RecordingStream", "read_measurement_stream", "iter_measurement_stream"]

@@ -132,7 +132,7 @@ R4-B work.
 
 ## 20-case RFU attitude sweep
 
-Run `./run_auto_attitude_sweep.sh --plan-only --ordered --output-dir /tmp/<new>`
+Run `./run_auto_attitude_sweep.sh --legacy --plan-only --ordered --output-dir /tmp/<new>`
 first. The plan must report two trajectories, nine non-zero attitude
 conditions, 20 total cases, and eight waypoints per trajectory. Mission source
 points are baseline-center world-aligned RFU `(Right, Front, Up)`. They are

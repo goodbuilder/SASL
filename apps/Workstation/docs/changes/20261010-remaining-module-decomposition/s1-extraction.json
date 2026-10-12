@@ -1,0 +1,130 @@
+{
+  "source_before_sha256": "0e8a42b323830c964282d486d6fd6e173ff89b7fe196c7a0220cd2cbca0d66b9",
+  "unchanged_top_level_function_and_class_definitions": 83,
+  "moved_symbols": {
+    "types": [
+      "EulerAttitude",
+      "CameraExtrinsicState",
+      "RadioStatusState",
+      "MagSensorState",
+      "GpsSensorState",
+      "GnssRelativeState",
+      "CustomTopicSample",
+      "UsbMavlinkIdentity",
+      "MavlinkShellCommandResult"
+    ],
+    "decode": [
+      "parse_px4_sensor_mag_shell_output",
+      "parse_px4_vehicle_magnetometer_shell_device_id",
+      "magnetometer_value_units",
+      "magnetometer_value_to_gauss",
+      "quaternion_to_euler_deg",
+      "euler_rad_to_quaternion",
+      "camera_extrinsic_from_euler_rad",
+      "MAVLINK_MAG_STREAMS",
+      "MAVLINK_UI_IMU_STREAM_NAMES",
+      "MAVLINK_CAN_MAG_MESSAGE_TYPES",
+      "MAVLINK_MAG_SLOT_BY_MESSAGE",
+      "_finite_float",
+      "_nonfinite_numeric_reason",
+      "_optional_float",
+      "_optional_int",
+      "_optional_bool",
+      "_bounded_mavlink_id",
+      "mavlink_message_provenance",
+      "extract_field_path",
+      "_MAVLINK_OPTIONAL_TIMELINE_NUMERIC_SOURCE_FIELDS",
+      "_mavlink_nonfinite_source_reasons",
+      "_mavlink_optional_timeline_row",
+      "_scaled_mavlink_value",
+      "_scaled_mavlink_array_value",
+      "mavlink_graphable_fields_for_message",
+      "discover_mavlink_messages",
+      "_merge_gnss_relative_state",
+      "_gnss_relative_state_from_mavlink_gps_raw",
+      "_gnss_relative_state_from_mavlink_rtk",
+      "_gps_sensor_state_from_mavlink",
+      "_mag_sensor_state_from_mavlink",
+      "_can_mag_sensor_state_from_mavlink",
+      "_can_mag_sensor_state_from_debug_vect",
+      "_mavlink_scaled_degrees",
+      "_mavlink_scaled_millimetres",
+      "_mavlink_scaled_centimetres",
+      "_mavlink_scaled_dop",
+      "_mavlink_scaled_accuracy_mm",
+      "_mavlink_heading_cdeg",
+      "_mavlink_yaw_cdeg_to_rad",
+      "_mavlink_hdg_acc_deg_e5_to_rad"
+    ],
+    "timebase": [
+      "MAVLINK_BOOT_TIME_UINT32_MODULUS",
+      "MAVLINK_BOOT_TIME_UINT32_HALF_RANGE",
+      "MAVLINK_BOOT_TIME_REORDER_TOLERANCE_MS",
+      "MAVLINK_BOOT_TIME_REBOOT_REGRESSION_MS",
+      "MAVLINK_BOOT_TIME_REBOOT_CONFIRMATION_SAMPLES",
+      "MAVLINK_BOOT_TIME_REBOOT_CONFIRMATION_WINDOW_S",
+      "MAVLINK_BOOT_TIME_FORWARD_SLACK_MS",
+      "_MavlinkBootTimeSample",
+      "_MavlinkBootTimeRegressionCandidate",
+      "_MavlinkRemoteRebootEvidence",
+      "_MavlinkBootTimeObservation",
+      "_MavlinkBootTimeTracker"
+    ]
+  },
+  "verification": "AST bodies identical across extraction; imports and module headers changed",
+  "runtime_tests": "PASS: 2293 passed, 1 skipped in 261.11s; exit 0; 0 warnings",
+  "candidate_files": [
+    {
+      "path": "workstation_core/pixhawk_attitude.py",
+      "sha256": "7d71a818d9ff985164ec0b725eceb76fa61b0706d97a070630905afad0b2c7ce",
+      "lines": 2428
+    },
+    {
+      "path": "workstation_core/alignment_managers.py",
+      "sha256": "97cea30d45c39c907475ad80067dca40099f7e35e1b2d79113d2869404d30f1e",
+      "lines": 307
+    },
+    {
+      "path": "workstation_core/pixhawk_link/__init__.py",
+      "sha256": "bb82c9888b61d54b1167ac73025f598bbdd53e194448f62ffc62a79c22f96cb0",
+      "lines": 5
+    },
+    {
+      "path": "workstation_core/pixhawk_link/decode.py",
+      "sha256": "7747d87c71d070bca2d0d8b9c59c0e7894fd11040977e9d0a88e94c52f702e9f",
+      "lines": 878
+    },
+    {
+      "path": "workstation_core/pixhawk_link/timebase.py",
+      "sha256": "f7aa88764e92e64765c669d52e64d48daa4b5720a258739b874e887e1358d65b",
+      "lines": 208
+    },
+    {
+      "path": "workstation_core/pixhawk_link/types.py",
+      "sha256": "8ab1ccfa3bab364f29814d1e2bac68ffa3a61580add834f4bb81f6469402d421",
+      "lines": 191
+    },
+    {
+      "path": "tests/test_pixhawk_link_boundaries.py",
+      "sha256": "bc27f310193424ec97807e74dd86a562f75d4ed0e3f9e98548f4c8d0b382b5d8",
+      "lines": 241
+    },
+    {
+      "path": "tests/test_camera_time_sync_continuous.py",
+      "sha256": "2284e45e77b8829c8f4d4d018c09d7c3ad39418faf4ae561aba81b1584c1cd44",
+      "lines": 1794
+    },
+    {
+      "path": "tests/fixtures/pixhawk_link_legacy_types.json",
+      "sha256": "ade91af163c5dceb7cf61073c6277637b5d12d49983dcda09b900d75d7ead739",
+      "lines": 315
+    }
+  ],
+  "targeted_regression": "PASS: 211 passed in 8.50s",
+  "clock_fixture_regression": "PASS: 67 passed in 1.74s",
+  "unchanged_module_level_value_and_constant_definitions": 38,
+  "scope_status": "S1 data, decode and timebase separation complete; transport/commands and later stages not implemented",
+  "environment_limits": [
+    "Existing NVENC recovery test skipped because no supported NVENC device is available; no hardware certification"
+  ]
+}

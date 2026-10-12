@@ -1,0 +1,84 @@
+{
+  "status": "REFERENCE_GEOMETRY_PASS",
+  "not_a_gazebo_execution": true,
+  "checks": [
+    {
+      "rig": "G0",
+      "path": "P0",
+      "minimum_reference_point_edge_margin_px": 317.273
+    },
+    {
+      "rig": "G0",
+      "path": "P1",
+      "minimum_reference_point_edge_margin_px": 293.17
+    },
+    {
+      "rig": "G0",
+      "path": "P2",
+      "minimum_reference_point_edge_margin_px": 227.942
+    },
+    {
+      "rig": "G0",
+      "path": "P3",
+      "minimum_reference_point_edge_margin_px": 269.836
+    },
+    {
+      "rig": "G0",
+      "path": "P4",
+      "minimum_reference_point_edge_margin_px": 198.564
+    },
+    {
+      "rig": "G0",
+      "path": "V0",
+      "minimum_reference_point_edge_margin_px": 358.18
+    },
+    {
+      "rig": "G1",
+      "path": "P0",
+      "minimum_reference_point_edge_margin_px": 356.712
+    },
+    {
+      "rig": "G1",
+      "path": "P4",
+      "minimum_reference_point_edge_margin_px": 266.322
+    },
+    {
+      "rig": "G1",
+      "path": "V0",
+      "minimum_reference_point_edge_margin_px": 357.559
+    }
+  ],
+  "motion_checks": [
+    {
+      "path": "P0",
+      "max_reference_speed_mps": 5.0,
+      "max_reference_acceleration_mps2": 1.5707963267948963
+    },
+    {
+      "path": "P1",
+      "max_reference_speed_mps": 5.000000000000001,
+      "max_reference_acceleration_mps2": 1.5711300561854296
+    },
+    {
+      "path": "P2",
+      "max_reference_speed_mps": 5.000000000000001,
+      "max_reference_acceleration_mps2": 1.5721326450537931
+    },
+    {
+      "path": "P3",
+      "max_reference_speed_mps": 5.000000000000001,
+      "max_reference_acceleration_mps2": 1.5716324570881002
+    },
+    {
+      "path": "P4",
+      "max_reference_speed_mps": 5.000000000000001,
+      "max_reference_acceleration_mps2": 1.574299659871177
+    },
+    {
+      "path": "V0",
+      "max_reference_speed_mps": 5.0,
+      "max_reference_acceleration_mps2": 1.5707963267948963
+    }
+  ],
+  "limitation": "Reference-point geometry only. Verify actual mesh/bbox extent, dynamics, tracking and raw-image recording in student Gazebo."
+}

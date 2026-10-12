@@ -1,5 +1,11 @@
 # StereoWIRIS Workstation UI Implementation Plan
 
+> Current source ownership (2026-10-10): see [Architecture](../ARCHITECTURE.md). The copied
+> standalone owner described in the historical migration below has been decomposed into
+> explicit feature state/views/services and small composition/compatibility boundaries.
+> [The decomposition packet](../changes/20261010-god-module-decomposition/implementation-plan.md)
+> owns the current plan and verification; historical migration scope is not a current limitation.
+
 > Superseded for Measurement persistence/navigation on 2026-08-26. The active sessionless plan and
 > contracts are in `docs/changes/20260825-long-interval-measurement-workflow/`. Historical Session,
 > package, finalization, recovery, and workbook items below describe the retired implementation and
@@ -393,3 +399,7 @@ conditions are hardware/manual validation rather than a software full-suite fail
 ## 20. Governing Principle
 
 > Preserve the instrument while replacing the control panel.
+
+## 2026-10-10 Target reference discovery
+
+The scoped extension after god-module decomposition adds TargetReferenceView, TargetDiscoveryController and pure discovery/receive transport owners. The approved sequence, contract decisions, software evidence and field limits are tracked in [the Target reference packet](../changes/20261010-target-reference-discovery/implementation-plan.md). No Telemetry identity policy, rig geometry or Measurement admission change is part of this extension.

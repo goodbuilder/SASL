@@ -28,6 +28,8 @@ def readiness_panel(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         "singleShot",
         lambda delay_ms, callback: callbacks.append((int(delay_ms), callback)),
     )
+    timer_owner = panel.application.features["camera"].state.lifecycle_timers
+    monkeypatch.setattr(timer_owner, "_schedule", lambda delay, callback: standalone_gui.QtCore.QTimer.singleShot(delay, callback))
     panel.left_url_edit.setText("rtsp://left/visible")
     panel.right_url_edit.setText("rtsp://right/visible")
     panel.left_pane.stop = lambda *, wait=False: True

@@ -117,8 +117,8 @@ capture, FTP, and EXIF comparison remain Legacy-only.
 fixed JSONL/CSV stream table, writer/queue/drop state, data-folder access, Retry Storage, and a file-manager
 link to legacy recordings. A fixed second Files action row owns `Update Latest XLSX` and
 `Open Latest XLSX`; a fixed two-line status strip shows target/published generation, state, row
-count, and compact error while the tooltip retains full path/detail. Capture owns Target reference,
-HR/OZ events/import, and ULog tools. Data does not expose Session lifecycle, package completeness,
+count, and compact error while the tooltip retains full path/detail. Status also owns Target reference.
+Capture owns HR/OZ events/import and ULog tools. Data does not expose Session lifecycle, package completeness,
 legacy `review.xlsx`, or legacy catalog rows. The latest XLSX is a replaceable one-Measurement view,
 not a restored Review workspace.
 
@@ -252,7 +252,7 @@ P1/P2/Drone sysid separately, so a shared host NIC cannot be mistaken for a shar
 The bounded reason and static coordinate-contract hint
 remain visible without moving controls, focus, selection, scroll, docks, or splitters at the
 existing visible-workspace refresh cadence.
-Data Capture keeps Target reference connectivity, HR purpose/import events, and a PX4 ULog table.
+Data Status keeps Target reference connectivity; Data Capture keeps HR purpose/import events and a PX4 ULog table.
 UAM target telemetry is shown as deferred rather
 than erroneous; target Drone data is a separate receive-only source and never replaces P1/P2
 attitude, GNSS baseline, or nominal stereo geometry.
@@ -289,3 +289,7 @@ source-backed Overview, Camera, Pixhawk, Base GNSS, Measurement, Alignment, Cali
 Recording/Review/Export, and Advanced pages. The internal owner UI is not a user-visible
 fallback. 1366×768, 1600×900, and 1920×1080 offscreen construction was checked, while
 field data density and long-running finalization remain conditions.
+
+## Target reference connection controls
+
+The implemented sessionless location is Data → Status (the legacy Current tab), with TargetReferenceView composed into RecordingWorkspace. It uses the existing compact group/control/table vocabulary: platform/transport, endpoint/baud/SYS/COMP, UDP listen ports, Find Network/Find USB/Cancel, bounded candidate table, Use selected/Connect/Stop/Save, connection state and two fixed receive-status lines. UAM disables live controls while retaining stable group geometry. Long errors and endpoints have detail tooltips. In-place age updates preserve focus, selection and outer scrolling; a newly accepted search clears only its candidate selection.

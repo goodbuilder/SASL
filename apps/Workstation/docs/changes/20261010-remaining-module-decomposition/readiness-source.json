@@ -1,0 +1,11 @@
+{
+  "Workstation/camera_feature/state.py": "76e046ea7d46be8222fce5c9218253349bd81177f5ab8c9c327fd3637b50967b",
+  "Workstation/camera_runtime/__init__.py": "fe70a5903dc46a4bcf8842459c87f019c69d73038a5ba68ab9c846d268480d3e",
+  "Workstation/camera_runtime/readiness.py": "f945f3767a28783dd06e06d4efbf8bfc1af28afcbb076cd172e2473f4f4773e4",
+  "Workstation/camera_runtime/state.py": "fd5b2700c52ba16b9722cc5b852eaae6b0764808dc862da5bac608692ef712cf",
+  "Workstation/camera_stream_controller.py": "b5f77f5f359b2b90da43eba0d2388cc17cf53a7fff0bf9d3ea4cdd50b68f0f18",
+  "Workstation/panel_application.py": "20cf2db9b66c21400b43e4213fbdb7c95908ca32c41d670756c01f64fb10f743",
+  "Workstation/panel_camera.py": "19e970849c83286530cb47bf60fe7018fc8357ba5f610bdb1bf2035c39f5eb32",
+  "Workstation/panel_presentation.py": "ee3ac6f07165049d69cea1a1ee3c21a7d0c05615a3af4385b94023e94369b10f",
+  "Workstation/tests/test_stream_readiness_owner.py": "c1cf13a9ee66d5b8c98ff1f7254c07d96499b99b1776b27b7298a7c4b4d18307"
+}

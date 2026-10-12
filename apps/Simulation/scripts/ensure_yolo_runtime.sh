@@ -87,6 +87,17 @@ python_has_yolo_runtime() {
   "$python_bin" -c "import cv2, torch, ultralytics" >/dev/null 2>&1
 }
 
+python_has_campaign_analysis_runtime() {
+  local python_bin="$1"
+  "$python_bin" -c "import numpy, scipy, zstandard" >/dev/null 2>&1
+}
+
+install_campaign_analysis_runtime() {
+  local python_bin="$1"
+  "$python_bin" -m pip install --requirement \
+    "$ROOT_DIR/campaigns/stereo_v1_1/requirements-postprocess.txt" >&2
+}
+
 python_matches_torch_distribution() {
   local python_bin="$1"
   "$python_bin" - \
@@ -240,6 +251,13 @@ if [[ -x "${VENV_DIR}/bin/python" ]]; then
   configure_system_site_packages
   if python_has_yolo_runtime "${VENV_DIR}/bin/python" \
     && python_matches_torch_distribution "${VENV_DIR}/bin/python"; then
+    if ! python_has_campaign_analysis_runtime "${VENV_DIR}/bin/python"; then
+      install_campaign_analysis_runtime "${VENV_DIR}/bin/python"
+    fi
+    if ! python_has_campaign_analysis_runtime "${VENV_DIR}/bin/python"; then
+      printf '%s\n' "campaign postprocessing/analysis dependencies are unavailable in ${VENV_DIR}" >&2
+      exit 1
+    fi
     if python_matches_torch_backend "${VENV_DIR}/bin/python"; then
       report_backend_success "${VENV_DIR}/bin/python"
       printf '%s\n' "${VENV_DIR}/bin/python"
@@ -256,6 +274,7 @@ if [[ -n "$PREFERRED_PYTHON" ]]; then
     if [[ "$YOLO_VENV_ISOLATED" != true ]] \
       && python_has_yolo_runtime "$preferred_resolved" \
       && python_matches_torch_distribution "$preferred_resolved" \
+      && python_has_campaign_analysis_runtime "$preferred_resolved" \
       && python_matches_torch_backend "$preferred_resolved"; then
       report_backend_success "$preferred_resolved"
       printf '%s\n' "$preferred_resolved"
@@ -282,8 +301,16 @@ if ! python_has_yolo_runtime "$VENV_PYTHON" \
   install_yolo_runtime "$VENV_PYTHON"
 fi
 
+if ! python_has_campaign_analysis_runtime "$VENV_PYTHON"; then
+  install_campaign_analysis_runtime "$VENV_PYTHON"
+fi
+
 if python_has_yolo_runtime "$VENV_PYTHON" \
   && python_matches_torch_distribution "$VENV_PYTHON"; then
+  if ! python_has_campaign_analysis_runtime "$VENV_PYTHON"; then
+    printf '%s\n' "campaign postprocessing/analysis dependencies are unavailable in ${VENV_DIR}" >&2
+    exit 1
+  fi
   if python_matches_torch_backend "$VENV_PYTHON"; then
     report_backend_success "$VENV_PYTHON"
     printf '%s\n' "$VENV_PYTHON"

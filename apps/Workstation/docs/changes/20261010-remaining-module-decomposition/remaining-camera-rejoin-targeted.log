@@ -1,0 +1,9 @@
+........................................................................ [ 44%]
+..........................................s............................. [ 89%]
+.................                                                        [100%]
+=========================== short test summary info ============================
+SKIPPED [1] apps/Workstation/tests/test_camera_stream_recovery.py:285: NVENC unavailable: [h264_nvenc @ 0x57995e957480] OpenEncodeSessionEx failed: unsupported device (2): (no details)
+[h264_nvenc @ 0x57995e957480] No capable devices found
+Error initializing output stream 0:0 -- Error while opening encoder for output stream #0:0 - maybe incorrect parameters such as bit_rate, rate, width or height
+160 passed, 1 skipped in 19.52s
+

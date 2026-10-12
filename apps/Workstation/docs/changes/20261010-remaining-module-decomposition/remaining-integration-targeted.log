@@ -1,0 +1,44 @@
+........................................................................ [ 16%]
+..............F.....................F....FF............................. [ 33%]
+...F.................................................................... [ 50%]
+............................................................FFFFFFFFFFFF [ 66%]
+FFFF.........F.............F..........FF................................ [ 83%]
+...................F..F..FF.......................................F.....Fatal Python error: Segmentation fault
+
+Current thread 0x0000752e05f8d000 (most recent call first):
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/apps/Workstation/standalone_gui.py", line 73 in event
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/apps/Workstation/standalone_gui.py", line 40 in _drain_deferred_delete_shutdown
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/apps/Workstation/standalone_gui.py", line 62 in event
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/apps/Workstation/tests/conftest.py", line 108 in workstation_qapplication
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/_pytest/fixtures.py", line 939 in _teardown_yield_fixture
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/_pytest/fixtures.py", line 1058 in finish
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/_pytest/runner.py", line 546 in teardown_exact
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/_pytest/runner.py", line 193 in pytest_runtest_teardown
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/_pytest/runner.py", line 246 in <lambda>
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/_pytest/runner.py", line 344 in from_call
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/_pytest/runner.py", line 245 in call_and_report
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/_pytest/runner.py", line 141 in runtestprotocol
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/_pytest/runner.py", line 117 in pytest_runtest_protocol
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/_pytest/main.py", line 367 in pytest_runtestloop
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/_pytest/main.py", line 343 in _main
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/_pytest/main.py", line 289 in wrap_session
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/_pytest/main.py", line 336 in pytest_cmdline_main
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/_pytest/config/__init__.py", line 175 in main
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/_pytest/config/__init__.py", line 201 in console_main
+  File "/home/moontaehyung/\ubc14\ud0d5\ud654\uba74/SASL-20261009/.venv/lib/python3.10/site-packages/pytest/__main__.py", line 9 in <module>
+  File "/usr/lib/python3.10/runpy.py", line 86 in _run_code
+  File "/usr/lib/python3.10/runpy.py", line 196 in _run_module_as_main
+
+Extension modules: numpy.core._multiarray_umath, numpy.core._multiarray_tests, numpy.linalg._umath_linalg, numpy.fft._pocketfft_internal, numpy.random._common, numpy.random.bit_generator, numpy.random._bounded_integers, numpy.random._mt19937, numpy.random.mtrand, numpy.random._philox, numpy.random._pcg64, numpy.random._sfc64, numpy.random._generator, yaml._yaml, PyQt5.QtCore, PyQt5.QtGui, PyQt5.QtWidgets, PyQt5.QtTest, pyarrow.lib, pyarrow._parquet, pyarrow._fs, pyarrow._azurefs, pyarrow._hdfs, pyarrow._gcsfs, pyarrow._s3fs, scipy._lib._ccallback_c, scipy.sparse._sparsetools, scipy.sparse._csparsetools, scipy.sparse.csgraph._tools, scipy.sparse.csgraph._shortest_path, scipy.sparse.csgraph._traversal, scipy.sparse.csgraph._min_spanning_tree, scipy.sparse.csgraph._flow, scipy.sparse.csgraph._matching, scipy.sparse.csgraph._reordering, scipy.sparse.linalg._isolve._iterative, scipy.linalg._fblas, scipy.linalg._flapack, scipy.linalg._cythonized_array_utils, scipy.linalg._flinalg, scipy.linalg._solve_toeplitz, scipy.linalg._matfuncs_sqrtm_triu, scipy.linalg.cython_blas, scipy.linalg.cython_lapack, scipy.linalg._decomp_update, scipy.sparse.linalg._dsolve._superlu, scipy.sparse.linalg._eigen.arpack._arpack, scipy.optimize._minpack2, scipy.optimize._group_columns, scipy._lib.messagestream, scipy.optimize._trlib._trlib, numpy.linalg.lapack_lite, scipy.optimize._lbfgsb, _moduleTNC, scipy.optimize._moduleTNC, scipy.optimize._cobyla, scipy.optimize._slsqp, scipy.optimize._minpack, scipy.optimize._lsq.givens_elimination, scipy.optimize._zeros, scipy.optimize.__nnls, scipy.optimize._highs.cython.src._highs_wrapper, scipy.optimize._highs._highs_wrapper, scipy.optimize._highs.cython.src._highs_constants, scipy.optimize._highs._highs_constants, scipy.linalg._interpolative, scipy.optimize._bglu_dense, scipy.optimize._lsap_module, scipy.spatial._ckdtree, scipy.spatial._qhull, scipy.spatial._voronoi, scipy.spatial._distance_wrap, scipy.spatial._hausdorff, scipy.special._ufuncs_cxx, scipy.special._ufuncs, scipy.special._specfun, scipy.special._comb, scipy.special._ellip_harm_2, scipy.spatial.transform._rotation, PyQt5.QtSvg, _dbus_bindings, _dbus_glib_bindings, gi._gi, cairo._cairo, gi._gi_cairo (total: 85)

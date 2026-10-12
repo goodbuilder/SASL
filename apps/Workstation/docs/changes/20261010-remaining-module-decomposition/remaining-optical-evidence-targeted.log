@@ -1,0 +1,30 @@
+.........F...............................FF............................. [ 92%]
+......                                                                   [100%]
+=================================== FAILURES ===================================
+________ test_remaining_projection_modules_import_without_gui_or_facade ________
+apps/Workstation/tests/test_evidence_remaining_boundaries.py:293: in test_remaining_projection_modules_import_without_gui_or_facade
+    subprocess.run(
+/usr/lib/python3.10/subprocess.py:526: in run
+    raise CalledProcessError(retcode, process.args,
+E   subprocess.CalledProcessError: Command '['/home/moontaehyung/바탕화면/SASL-20261009/.venv/bin/python', '-I', '-B', '-c', "\nimport importlib.abc, sys\nsys.path[:0] = [sys.argv[1], sys.argv[2]]\nclass Guard(importlib.abc.MetaPathFinder):\n    def find_spec(self, fullname, path=None, target=None):\n        if fullname.startswith(('PyQt5', 'Workstation.panel_')) or fullname == 'Workstation.evidence':\n            raise AssertionError(fullname)\nsys.meta_path.insert(0, Guard())\nfrom Workstation.evidence_views import calibration, connections, geometry, gnss, magnetometers, recording, settings\nassert calibration.project_camera_intrinsics(None) == {'state': 'NO DATA'}\n", '/home/moontaehyung/바탕화면/SASL-20261009/apps', '/home/moontaehyung/바탕화면/SASL-20261009/common/python']' returned non-zero exit status 1.
+_ test_yaw90_solve_without_base_rt_freezes_inputs_and_saves_both_poses[solve_workstation_optical_pose_gnss_mountain] _
+apps/Workstation/tests/test_optical_pose_controller_integration.py:855: in test_yaw90_solve_without_base_rt_freezes_inputs_and_saves_both_poses
+    result = measure._measurement_intrinsics_result_for_method(status, left_gps=gps_l, right_gps=gps_r, pose_evidence_out=evidence)
+apps/Workstation/measurement/boundary.py:44: in invoke
+    return method(*args, **kwargs)
+apps/Workstation/measurement/geometry.py:470: in _measurement_intrinsics_result_for_method
+    from Workstation.optical_pose_controller import _pose_mapping
+E   ImportError: cannot import name '_pose_mapping' from 'Workstation.optical_pose_controller' (/home/moontaehyung/바탕화면/SASL-20261009/apps/Workstation/optical_pose_controller.py)
+_ test_yaw90_solve_without_base_rt_freezes_inputs_and_saves_both_poses[solve_workstation_optical_pose_cloud_rotation] _
+apps/Workstation/tests/test_optical_pose_controller_integration.py:855: in test_yaw90_solve_without_base_rt_freezes_inputs_and_saves_both_poses
+    result = measure._measurement_intrinsics_result_for_method(status, left_gps=gps_l, right_gps=gps_r, pose_evidence_out=evidence)
+apps/Workstation/measurement/boundary.py:44: in invoke
+    return method(*args, **kwargs)
+apps/Workstation/measurement/geometry.py:470: in _measurement_intrinsics_result_for_method
+    from Workstation.optical_pose_controller import _pose_mapping
+E   ImportError: cannot import name '_pose_mapping' from 'Workstation.optical_pose_controller' (/home/moontaehyung/바탕화면/SASL-20261009/apps/Workstation/optical_pose_controller.py)
+=========================== short test summary info ============================
+FAILED apps/Workstation/tests/test_evidence_remaining_boundaries.py::test_remaining_projection_modules_import_without_gui_or_facade
+FAILED apps/Workstation/tests/test_optical_pose_controller_integration.py::test_yaw90_solve_without_base_rt_freezes_inputs_and_saves_both_poses[solve_workstation_optical_pose_gnss_mountain]
+FAILED apps/Workstation/tests/test_optical_pose_controller_integration.py::test_yaw90_solve_without_base_rt_freezes_inputs_and_saves_both_poses[solve_workstation_optical_pose_cloud_rotation]
+3 failed, 75 passed in 5.39s

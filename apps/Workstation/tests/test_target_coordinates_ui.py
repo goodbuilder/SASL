@@ -25,7 +25,7 @@ def workspace():
 
 
 def test_live_values_update_together_and_clear_on_missing_or_empty(monkeypatch):
-    import Workstation.workspaces as module
+    import Workstation.workspace_views.measurement as module
     monkeypatch.setattr(module.time, "monotonic", lambda: 100.25)
     view, panel = workspace()
     panel.distance_history = [point()]
@@ -49,7 +49,7 @@ def test_live_values_update_together_and_clear_on_missing_or_empty(monkeypatch):
 
 
 def test_last_result_age_advances_and_inspector_has_geographic_units(monkeypatch):
-    import Workstation.workspaces as module
+    import Workstation.workspace_views.measurement as module
     monkeypatch.setattr(module.time, "monotonic", lambda: 145.)
     view, panel = workspace()
     panel.distance_history = [point()]

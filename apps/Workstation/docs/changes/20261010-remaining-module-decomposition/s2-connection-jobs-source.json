@@ -1,0 +1,47 @@
+{
+  "scope": "S2 connection job owner; remaining M7 controller boundaries still in progress",
+  "full_regression": {
+    "passed": 2303,
+    "skipped": 1,
+    "warnings": 0,
+    "seconds": 250.38,
+    "exit_code": 0
+  },
+  "files": [
+    {
+      "path": "device_runtime/__init__.py",
+      "sha256": "4bda06c146709487a99fa65c674b358f56158eb8e5191d29751b962ecb4555fb",
+      "lines": 1
+    },
+    {
+      "path": "device_runtime/connection_jobs.py",
+      "sha256": "ebc06884e3818c186581e4fc55873370712b80f5f49c8e32490499c1cf7fde8a",
+      "lines": 182
+    },
+    {
+      "path": "device_runtime/state.py",
+      "sha256": "9b33d2b673344bef24b4e37c9038033388c8b3404c6cf268d002cf42eb0d1301",
+      "lines": 24
+    },
+    {
+      "path": "device_runtime_controller.py",
+      "sha256": "d150dbd1d0f4f991ec16ad33408b96f6e7908a27397bde984e15a2109fb33a41",
+      "lines": 3840
+    },
+    {
+      "path": "panel_diagnostics.py",
+      "sha256": "461cecdcab13c58f4fdc3bd5b7d83402b070af151e23e718ee565942983cc609",
+      "lines": 1969
+    },
+    {
+      "path": "panel_feature_runtime.py",
+      "sha256": "cfcefe6265eb48f017a4ac2756a08e7771fd96e73c96375af8a8ebffa60e896d",
+      "lines": 76
+    },
+    {
+      "path": "tests/test_device_connection_jobs.py",
+      "sha256": "2df9e55976b741aed13079c17f3a8ffe0d2554fc483bbe0c0a032c29b228e426",
+      "lines": 166
+    }
+  ]
+}

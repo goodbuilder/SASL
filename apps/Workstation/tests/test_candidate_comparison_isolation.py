@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pyarrow.parquet as pq
 import pytest
 
-import Workstation.measurement_view_controller as measurement_module
+import Workstation.measurement.geometry as measurement_module
 from Workstation.measurement_view_controller import MeasurementViewController
 from Workstation.recording_controller import RecordingController
 from Workstation.workstation_core.calibration import (

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from Workstation.wiris_workers import io as _wiris_worker_io
+
 from Workstation.tests.workstation_test_support import (
     EvidenceAdapter,
     _FakeBackend,
@@ -980,7 +982,7 @@ def test_calibration_outlier_pair_exclusion_is_persisted_without_deleting_images
 ) -> None:
     from PyQt5 import QtGui
 
-    import Workstation.workspaces as workspaces_module
+    import Workstation.workspace_views.calibration as workspaces_module
     from Workstation.workspaces import CalibrationWorkspace
 
     root = tmp_path / "session"
@@ -1125,7 +1127,7 @@ def test_wiris_command_and_zoom_workers_keep_tcp_io_off_ui_path(monkeypatch) -> 
         sent.append(str(command.command))
         return "OK"
 
-    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
+    monkeypatch.setattr(_wiris_worker_io, "send_tcp_line", fake_send)
     command_results: list[object] = []
     command_worker = standalone_gui.WirisCommandWorker(
         (("left", "10.0.0.11", 5000, 1.0),),
@@ -2503,7 +2505,7 @@ def test_calibration_compute_requires_explicit_photo_session_selection(
 ) -> None:
     from PyQt5 import QtGui
 
-    from Workstation import workspaces
+    from Workstation.workspace_views import calibration as workspaces
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     root = tmp_path / "saved-calibration"
@@ -2593,7 +2595,7 @@ def test_calibration_pair_picker_sync_is_cached_until_capture_directory_changes(
 ) -> None:
     from PyQt5 import QtGui
 
-    import Workstation.workspaces as workspaces_module
+    import Workstation.workspace_views.calibration as workspaces_module
     from Workstation.workspaces import CalibrationWorkspace
 
     class CountingListWidget(QtWidgets.QListWidget):
@@ -2673,7 +2675,7 @@ def test_calibration_pair_picker_defaults_to_session_pairs_and_can_show_all(
 ) -> None:
     from PyQt5 import QtGui
 
-    import Workstation.workspaces as workspaces_module
+    import Workstation.workspace_views.calibration as workspaces_module
     from Workstation.workspaces import CalibrationWorkspace
 
     class FakeListWidget(QtWidgets.QListWidget):

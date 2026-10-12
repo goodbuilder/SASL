@@ -191,8 +191,12 @@ def _load_gnss_operation(value: object) -> GnssOperationConfig:
     return config
 
 
+from Workstation.workstation_core.target_discovery import TargetReferenceSettings
+
+
 @dataclass(frozen=True)
 class AppSettings:
+    target_reference: TargetReferenceSettings = TargetReferenceSettings()
     intrinsics_path: str = DEFAULT_INTRINSICS_PATH
     yolo_weights_path: str = DEFAULT_YOLO_WEIGHTS_PATH
     interface_name: str = "enx588694fce07e"
@@ -484,6 +488,7 @@ def load_settings(
         ),
     )
     settings = AppSettings(
+        target_reference=TargetReferenceSettings.from_mapping(payload.get("target_reference")),
         intrinsics_path=intrinsics_path,
         yolo_weights_path=yolo_weights_path,
         interface_name=str(payload.get("interface_name", AppSettings.interface_name)),
@@ -897,6 +902,7 @@ def save_settings(settings: AppSettings, path: str | Path = DEFAULT_SETTINGS_PAT
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     payload = dict(settings.__dict__)
     payload["gnss_operation"] = settings.gnss_operation.to_mapping()
+    payload["target_reference"] = settings.target_reference.to_mapping()
     # Write via a temp file + atomic replace so a write interrupted mid-way
     # (disk full, process killed, power loss) can never leave a half-written
     # settings file behind -- load_settings() has no error handling around

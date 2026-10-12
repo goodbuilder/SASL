@@ -1,0 +1,49 @@
+[
+  {
+    "view": "overview",
+    "same_size": true,
+    "changed_pixels": 0,
+    "total_pixels": 1229400,
+    "difference_bbox": null
+  },
+  {
+    "view": "camera",
+    "same_size": true,
+    "changed_pixels": 0,
+    "total_pixels": 1229400,
+    "difference_bbox": null
+  },
+  {
+    "view": "measurement",
+    "same_size": true,
+    "changed_pixels": 0,
+    "total_pixels": 1229400,
+    "difference_bbox": null
+  },
+  {
+    "view": "data",
+    "same_size": true,
+    "changed_pixels": 2089,
+    "total_pixels": 1229400,
+    "difference_bbox": [
+      1234,
+      536,
+      1366,
+      654
+    ]
+  },
+  {
+    "view": "calibration",
+    "same_size": true,
+    "changed_pixels": 0,
+    "total_pixels": 1229400,
+    "difference_bbox": null
+  },
+  {
+    "view": "advanced",
+    "same_size": true,
+    "changed_pixels": 0,
+    "total_pixels": 1229400,
+    "difference_bbox": null
+  }
+]

@@ -697,3 +697,9 @@ If measurement becomes unavailable during recording, preserve recording state, s
 ## 21. Summary
 
 > task continuity + persistent system awareness + direct diagnostics
+
+### Target reference discovery
+
+In Data → Status, select Drone, choose Find Network or Find USB, inspect the source and SYS/COMP, then Use selected and Connect target. Use selected edits only the draft. Save persists preferences separately. Candidate identity expires after30s and is revalidated at Connect. Manual endpoint input remains available; UAM stays DEFERRED without discovery.
+
+Observe heartbeat and GPS/ATTITUDE freshness separately. No heartbeat, no GPS, invalid fix, stale data, busy resource and identity mismatch retain distinct feedback. Stop before changing an active connection/platform. Discovery cancellation and Stop complete before another Target operation starts. No startup auto-connect or automatic retry occurs.

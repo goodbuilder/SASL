@@ -1,0 +1,4 @@
+SKIPPED [1] apps/Workstation/tests/test_camera_stream_recovery.py:282: NVENC unavailable: [h264_nvenc @ 0x59111ad7ea40] InitializeEncoder failed: invalid param (8): Frame Dimension less than the minimum supported value.
+Error initializing output stream 0:0 -- Error while opening encoder for output stream #0:0 - maybe incorrect parameters such as bit_rate, rate, width or height
+SKIPPED [1] apps/Workstation/tests/test_terrain.py:28: pyproj not installed
+2169 passed, 2 skipped, 1 warning in 228.43s (0:03:48)

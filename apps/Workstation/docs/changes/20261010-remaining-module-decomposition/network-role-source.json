@@ -1,0 +1,18 @@
+{
+  "stage": "network-role-runtime",
+  "head": "42b16e0305120c769aaa6483254d19c08fbf55bf",
+  "sources": {
+    "Workstation/app_lifecycle_controller.py": "c31a8dc4e60e785d87260c7684218242541b0ecd3a4ca77411f97321fc69a6b4",
+    "Workstation/camera_feature/__init__.py": "691fe84c2fd29c63f8a02c501c27e0dd526e8e5b0e66d108ba10bca6d84fde92",
+    "Workstation/camera_feature/state.py": "78662a74c41d90d9d62409e43b4da1a43af39bca3cc525ae8cb100fe14041330",
+    "Workstation/device_runtime/__init__.py": "4bda06c146709487a99fa65c674b358f56158eb8e5191d29751b962ecb4555fb",
+    "Workstation/device_runtime/connection_jobs.py": "ebc06884e3818c186581e4fc55873370712b80f5f49c8e32490499c1cf7fde8a",
+    "Workstation/device_runtime/network_roles.py": "2750af5e12ad4f415f60f283ada9dc123b30335c11e1a8024b528643b6a737c3",
+    "Workstation/device_runtime/state.py": "9b33d2b673344bef24b4e37c9038033388c8b3404c6cf268d002cf42eb0d1301",
+    "Workstation/device_runtime_controller.py": "ce16ad5676f65e86839ede96bd3e2095ee8d0c585abaee5b49e4caffae18c651",
+    "Workstation/panel_camera.py": "7b102d485c590b5484d568faab99a31cedee48d56efab3e4e4423150d1707783",
+    "Workstation/panel_contracts.py": "f46462cf983780145e874e64e3e13639ab174c9fcbedefbe5115f15d944e52f9",
+    "Workstation/tests/test_network_role_application.py": "bcdacd27bbc2be2c3bb5f3b6c73763459492391fe1d134f6de5e77c609a974a0",
+    "Workstation/tests/test_network_role_runtime.py": "1ec22e655d20704a1b12cc3ac7e4d21049486c8854f39292500c75b6a1bbf61f"
+  }
+}

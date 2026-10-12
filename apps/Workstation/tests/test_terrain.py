@@ -12,10 +12,18 @@ from Workstation.workstation_core.terrain import (
 )
 
 
-def test_missing_terrain_dependencies_fail_explicitly_without_affecting_raw_recording(tmp_path: Path) -> None:
-    if importlib.util.find_spec("rasterio") is not None and importlib.util.find_spec("pyproj") is not None:
-        pytest.skip("terrain dependencies are installed in this environment")
+@pytest.mark.parametrize("missing", ("rasterio", "pyproj"))
+def test_missing_terrain_dependencies_fail_explicitly_without_affecting_raw_recording(tmp_path: Path, monkeypatch, missing) -> None:
+    # Exercise the dependency failure even on fully provisioned test machines.
+    import builtins
+    original_import = builtins.__import__
 
+    def require_available(name, *args, **kwargs):
+        if name == missing:
+            raise ImportError(f"simulated missing optional dependency: {missing}")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", require_available)
     with pytest.raises(TerrainDependencyError, match="raw recording remains available"):
         inspect_geotiff(tmp_path / "missing.tif", vertical_datum="unknown")
 

@@ -1,0 +1,47 @@
+F............................................................            [100%]
+=================================== FAILURES ===================================
+_ test_one_pass_sources_preserve_raw_golden_axes_nulls_dynamic_fields_and_method_hashes _
+
+tmp_path = PosixPath('/tmp/pytest-of-moontaehyung/pytest-264/test_one_pass_sources_preserve0')
+
+    def test_one_pass_sources_preserve_raw_golden_axes_nulls_dynamic_fields_and_method_hashes(tmp_path):
+        root = tmp_path / "s" / "measurements" / "m000001"
+        raw = {
+            "pair_id": "golden", "baseline_center_forward_m": 17.0,
+            "baseline_center_right_m": -3.0, "baseline_center_down_m": 5.0,
+            "source_point_left_rdf_m": [2.0, 7.0, 19.0],
+            "world_ned_m": [41.0, -13.0, 23.0], "nullable": None,
+            "dynamic": {"정확한 값": [True, 9007199254740993]},
+        }
+        pair = OnePass((raw, {"pair_id": "late", "late_only": "retained"}))
+        cameras = {side: OnePass(({"sequence": 0, "source_utc_ns": 9007199254740993},)) for side in ("left", "right")}
+        px4 = {side: OnePass(({"sequence": 0, "velocity_n_m_s": 2.0, "velocity_e_m_s": -5.0, "velocity_d_m_s": 7.0},)) for side in ("right", "left", "drone")}
+        bundles = OnePass((_bundle(0), _bundle(1)))
+        saved = save_session_files(root, metadata={"session_id": "s", "measurement_id": "m000001"},
+                                   pair_rows=pair, camera_rows=cameras, px4_rows=px4,
+                                   method_evaluation_bundle_rows=bundles)
+        reopened = read_measurement_stream(root).rows
+        # This independent golden does not call the canonical identity/context writer.
+        expected = {**raw, "sample_index": 0, "session_elapsed_s": None,
+                    "measurement_id": "m000001", "measurement_package_id": "m000001"}
+        digest = hashlib.sha256(json.dumps(expected, ensure_ascii=False, sort_keys=True,
+                                          separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+        expected["terminal_record_id"] = "legacy:" + digest
+        context = {"schema_version": "workstation-geometry-context-v1", "context_kind": "legacy_terminal_static",
+                   "available_static_fields": {}, "dynamic_values_retained_only_in_terminal_row": True,
+                   "public_output_contract": {"frame": "baseline_center_frd", "axis_contract": "X=Front,Y=Right,Z=Down", "unit": "m"}}
+        gc = hashlib.sha256(json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+        expected.update(geometry_context_id="gc:" + gc, left_time_sync_epoch_id=None,
+                        right_time_sync_epoch_id=None, time_sync_epoch_id=None)
+>       assert reopened[0] == expected
+E       AssertionError: assert {'baseline_ce...740993]}, ...} == {'baseline_ce...740993]}, ...}
+E         
+E         Omitting 16 identical items, use -vv to show
+E         Differing items:
+E         {'terminal_record_id': 'legacy:0aa7b41618e7090f16ecd8489fd766e86378008227329bfaa4206de5d8f34cf2'} != {'terminal_record_id': 'legacy:cd7f89328f8bb68f86f062fe99bd0fc7b7f18fe6d9ed44cd023d55cdccdd2698'}
+E         Use -v to get more diff
+
+apps/Workstation/tests/test_session_storage_streaming.py:75: AssertionError
+=========================== short test summary info ============================
+FAILED apps/Workstation/tests/test_session_storage_streaming.py::test_one_pass_sources_preserve_raw_golden_axes_nulls_dynamic_fields_and_method_hashes
+1 failed, 60 passed in 6.21s

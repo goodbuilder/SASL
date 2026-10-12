@@ -1,0 +1,48 @@
+1366x900-scale1 exit 0
+[카메라] 왼쪽 스트림 상태: 중지됨
+[카메라] 오른쪽 스트림 상태: 중지됨
+{"profiles": [{"name": "uam", "window_size": [1366, 900], "target_geometry": [6, 6, 758, 448]}, {"name": "drone-empty", "window_size": [1366, 900], "target_geometry": [6, 6, 758, 448]}, {"name": "candidate-selected", "window_size": [1366, 900], "target_geometry": [6, 6, 758, 448]}, {"name": "heartbeat-no-gps", "window_size": [1366, 900], "target_geometry": [6, 6, 758, 448]}, {"name": "long-detail", "window_size": [1366, 900], "target_geometry": [6, 6, 758, 448]}], "scale": "1", "callback_errors": [], "rendering_limitations": ["RuntimeError: pyqtgraph.opengl: Requires >= OpenGL 2.1; Found b'4.5 (Compatibility Profile) Mesa 23.2.1-1ubuntu3.1~22.04.4'"], "shutdown": {"schema": "workstation-shutdown-resources-v1", "complete": true, "coordinator_step": "", "running_threads": [], "live_processes": [], "open_sockets": [], "shared_memory": []}}
+
+This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+Traceback (most recent call last):
+  File "/home/moontaehyung/.local/lib/python3.10/site-packages/pyqtgraph/opengl/GLViewWidget.py", line 115, in initializeGL
+    raise RuntimeError(
+RuntimeError: pyqtgraph.opengl: Requires >= OpenGL 2.1; Found b'4.5 (Compatibility Profile) Mesa 23.2.1-1ubuntu3.1~22.04.4'
+
+1600x980-scale1 exit 0
+[카메라] 왼쪽 스트림 상태: 중지됨
+[카메라] 오른쪽 스트림 상태: 중지됨
+{"profiles": [{"name": "uam", "window_size": [1600, 980], "target_geometry": [6, 6, 992, 448]}, {"name": "drone-empty", "window_size": [1600, 980], "target_geometry": [6, 6, 992, 448]}, {"name": "candidate-selected", "window_size": [1600, 980], "target_geometry": [6, 6, 992, 448]}, {"name": "heartbeat-no-gps", "window_size": [1600, 980], "target_geometry": [6, 6, 992, 448]}, {"name": "long-detail", "window_size": [1600, 980], "target_geometry": [6, 6, 992, 448]}], "scale": "1", "callback_errors": [], "rendering_limitations": ["RuntimeError: pyqtgraph.opengl: Requires >= OpenGL 2.1; Found b'4.5 (Compatibility Profile) Mesa 23.2.1-1ubuntu3.1~22.04.4'"], "shutdown": {"schema": "workstation-shutdown-resources-v1", "complete": true, "coordinator_step": "", "running_threads": [], "live_processes": [], "open_sockets": [], "shared_memory": []}}
+
+This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+Traceback (most recent call last):
+  File "/home/moontaehyung/.local/lib/python3.10/site-packages/pyqtgraph/opengl/GLViewWidget.py", line 115, in initializeGL
+    raise RuntimeError(
+RuntimeError: pyqtgraph.opengl: Requires >= OpenGL 2.1; Found b'4.5 (Compatibility Profile) Mesa 23.2.1-1ubuntu3.1~22.04.4'
+
+1366x900-scale1.5 exit 0
+[카메라] 왼쪽 스트림 상태: 중지됨
+[카메라] 오른쪽 스트림 상태: 중지됨
+{"profiles": [{"name": "uam", "window_size": [1366, 900], "target_geometry": [6, 6, 758, 448]}, {"name": "drone-empty", "window_size": [1366, 900], "target_geometry": [6, 6, 758, 448]}, {"name": "candidate-selected", "window_size": [1366, 900], "target_geometry": [6, 6, 758, 448]}, {"name": "heartbeat-no-gps", "window_size": [1366, 900], "target_geometry": [6, 6, 758, 448]}, {"name": "long-detail", "window_size": [1366, 900], "target_geometry": [6, 6, 758, 448]}], "scale": "1.5", "callback_errors": [], "rendering_limitations": ["RuntimeError: pyqtgraph.opengl: Requires >= OpenGL 2.1; Found b'4.5 (Compatibility Profile) Mesa 23.2.1-1ubuntu3.1~22.04.4'"], "shutdown": {"schema": "workstation-shutdown-resources-v1", "complete": true, "coordinator_step": "", "running_threads": [], "live_processes": [], "open_sockets": [], "shared_memory": []}}
+
+This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+Traceback (most recent call last):
+  File "/home/moontaehyung/.local/lib/python3.10/site-packages/pyqtgraph/opengl/GLViewWidget.py", line 115, in initializeGL
+    raise RuntimeError(
+RuntimeError: pyqtgraph.opengl: Requires >= OpenGL 2.1; Found b'4.5 (Compatibility Profile) Mesa 23.2.1-1ubuntu3.1~22.04.4'
+
+1600x980-scale1.5 exit 0
+[카메라] 왼쪽 스트림 상태: 중지됨
+[카메라] 오른쪽 스트림 상태: 중지됨
+{"profiles": [{"name": "uam", "window_size": [1600, 980], "target_geometry": [6, 6, 992, 448]}, {"name": "drone-empty", "window_size": [1600, 980], "target_geometry": [6, 6, 992, 448]}, {"name": "candidate-selected", "window_size": [1600, 980], "target_geometry": [6, 6, 992, 448]}, {"name": "heartbeat-no-gps", "window_size": [1600, 980], "target_geometry": [6, 6, 992, 448]}, {"name": "long-detail", "window_size": [1600, 980], "target_geometry": [6, 6, 992, 448]}], "scale": "1.5", "callback_errors": [], "rendering_limitations": ["RuntimeError: pyqtgraph.opengl: Requires >= OpenGL 2.1; Found b'4.5 (Compatibility Profile) Mesa 23.2.1-1ubuntu3.1~22.04.4'"], "shutdown": {"schema": "workstation-shutdown-resources-v1", "complete": true, "coordinator_step": "", "running_threads": [], "live_processes": [], "open_sockets": [], "shared_memory": []}}
+
+This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+Traceback (most recent call last):
+  File "/home/moontaehyung/.local/lib/python3.10/site-packages/pyqtgraph/opengl/GLViewWidget.py", line 115, in initializeGL
+    raise RuntimeError(
+RuntimeError: pyqtgraph.opengl: Requires >= OpenGL 2.1; Found b'4.5 (Compatibility Profile) Mesa 23.2.1-1ubuntu3.1~22.04.4'
+

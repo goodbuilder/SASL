@@ -1,0 +1,32 @@
+{
+  "captured_utc": "2026-10-10T15:39:59.798884+00:00",
+  "files": {
+    "apps/Workstation/tests/test_session_storage_streaming.py": "ee74968fcec24a726bb271544e57c50ad4ce95c1f5e3a2b2151c94b235afe324",
+    "apps/Workstation/tools/qualify_session_projection_memory.py": "dbbd1dfde53b022103efe6fe6ef9042bee88c7cf2b9cf9e6625525b3a56913b4",
+    "apps/Workstation/workstation_core/geometry_context.py": "ec5c2f2412faa57a7cb6deb6905e0f7faad9e95649ff420dc26d7b494d127013",
+    "apps/Workstation/workstation_core/recording_reader.py": "1c3902edcd4d0d40e8c70dace8261666e7648b69b27263e997c1c8a6c44f3e35",
+    "apps/Workstation/workstation_core/session_parquet.py": "aab422b9980fe668977868815e5a1695ffc74cc73688f73586a7f9ead8498bb3",
+    "apps/Workstation/workstation_core/session_review.py": "a084b135e0c275172a9a34081c0477017d2650d87f34855cb4134e04ab10f2dd",
+    "apps/Workstation/workstation_core/session_storage/__init__.py": "5999760de9dc53718058ee519048c237b046dee34668ed3789a9f1056e76c7d5",
+    "apps/Workstation/workstation_core/session_storage/canonical.py": "0fcbd6935a6e7de6edbf6ff115d7e0b218bfa5acdd8997d4721620468866214a",
+    "apps/Workstation/workstation_core/session_storage/disk_index.py": "9f2a617ec20d92e44bf1434ed5bdb2b434201d3b4274ffb9fb509ce7521e0aba",
+    "apps/Workstation/workstation_core/session_storage/finalize.py": "fdcad96b9899b84eafe0d5252e485ff1944fc822bf6699cdfd13b3db0d4deeb6",
+    "apps/Workstation/workstation_core/session_storage/generation.py": "586b7cdce45609794a8ea8822252a237d0f7604e1f6d2bd6ef04ceed9e5827c7",
+    "apps/Workstation/workstation_core/session_storage/indexed_records.py": "21ff625c90ee21df7fe86b5642f8970993ef2a74101aae5dc0c89599edfbc882",
+    "apps/Workstation/workstation_core/session_storage/legacy.py": "2eff711466e054db9721fee571bc7f290fc1647fee365cedaf28cecd5fa9bebb",
+    "apps/Workstation/workstation_core/session_storage/manifest.py": "68d1291cfb309551a3191a63506c53a44b2ff472c515036f8a0ecacaf776e6ae",
+    "apps/Workstation/workstation_core/session_storage/models.py": "b4a5921ec77da272a6cd14bfe703de90f2f605591098de1572e2b38e7f65136f",
+    "apps/Workstation/workstation_core/session_storage/paths.py": "cce04c6dbfc10cfec97608faea1ff6e064f264fb8e20b1cdeda8d96e2008df47",
+    "apps/Workstation/workstation_core/session_storage/projection.py": "f36817b31410a92d2cc883987267edd169f33032adcd32ea6e07209347e2c31a",
+    "apps/Workstation/workstation_core/session_storage/recovery.py": "d07632641a27b965aed10149c00e0adcb3026bda4595898c09e03314903f56ad",
+    "apps/Workstation/workstation_core/session_storage/review.py": "a5320dce1d5c64bd78ea3ac0300820614908e0068185e9e7d0bc2874431c99cf",
+    "apps/Workstation/workstation_core/session_storage/schema.py": "1691fffc9800bfe2eb045730ae934c6c2de4fc969bb61e4377e50103e860a5e9",
+    "apps/Workstation/workstation_core/session_storage/spool.py": "86b9d33b40af062ba814cb1933f499b96a5c0c4d5c7977c84e5a45cf68c5c119",
+    "apps/Workstation/workstation_core/session_storage/values.py": "21d22eb66a265d637298dc563c21607b1949659dfe9f162a6ffc14d67793ef48",
+    "apps/Workstation/workstation_core/session_storage/writers.py": "aa844f2899144ceb79f4065cbb089a640588f42d75132e91965321089779564d",
+    "apps/Workstation/workstation_core/time_sync_epoch.py": "80911b562ae778624cf73e7c3c74d2aced29d1a6c03505352cfaf50d2aeb3108"
+  },
+  "head": "42b16e0305120c769aaa6483254d19c08fbf55bf",
+  "scope": "M4 storage streaming production and independent fixtures; other agents own unrelated sources",
+  "test_addendum": "Disk method duplicate/order rejection and >int64 epoch lookup added after initial targeted run; production unchanged."
+}

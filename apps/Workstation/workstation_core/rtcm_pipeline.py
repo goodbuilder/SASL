@@ -33,6 +33,18 @@ RTCM_EVIDENCE_SCHEMA = "workstation-rtcm-byte-record-v1"
 RTCM_ALLOWED_TARGETS = frozenset({"left", "right", "drone"})
 
 
+@dataclass(frozen=True)
+class NtripSessionStats:
+    """Internal coalesced status, attributed to one admitted connection.
+
+    The stats keep their transport/time units. This envelope never wraps raw
+    RTCM payloads and is not part of the persisted evidence schema.
+    """
+
+    session_token: int
+    stats: object
+
+
 def _normalized_targets(values: tuple[str, ...] | list[str]) -> tuple[str, ...]:
     targets = tuple(dict.fromkeys(str(value).strip().lower() for value in values))
     invalid = tuple(value for value in targets if value not in RTCM_ALLOWED_TARGETS)

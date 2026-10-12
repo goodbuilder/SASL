@@ -1,0 +1,22 @@
+........................................................................ [ 16%]
+..............F......................................................... [ 32%]
+........................................................................ [ 49%]
+........................................................................ [ 65%]
+........................................................................ [ 82%]
+........................................................................ [ 98%]
+......                                                                   [100%]
+=================================== FAILURES ===================================
+______ test_real_feature_aliases_refer_to_one_runtime_state_and_inventory ______
+apps/Workstation/tests/test_gnss_runtime_boundaries.py:114: in test_real_feature_aliases_refer_to_one_runtime_state_and_inventory
+    assert getattr(panel, field) is getattr(owners[name].state, field)
+E   AssertionError: assert <Workstation.workstation_core.recording_session.SpoolRows object at 0x755ba316e260> is <Workstation.workstation_core.recording_session.SpoolRows object at 0x755ba316fb50>
+E    +  where <Workstation.workstation_core.recording_session.SpoolRows object at 0x755ba316e260> = getattr(<Workstation.standalone_gui.WirisStereoDistancePanel object at 0x755ba324d870>, 'gnss_base_recording_rows')
+E    +  and   <Workstation.workstation_core.recording_session.SpoolRows object at 0x755ba316fb50> = getattr(GnssEvidenceState(gnss_base_recording_rows=<Workstation.workstation_core.recording_session.SpoolRows object at 0x755ba316fb50>), 'gnss_base_recording_rows')
+E    +    where GnssEvidenceState(gnss_base_recording_rows=<Workstation.workstation_core.recording_session.SpoolRows object at 0x755ba316fb50>) = <Workstation.gnss_runtime.evidence.RtcmEvidenceRuntime object at 0x755ba3bc89d0>.state
+--------------------------- Captured stdout teardown ---------------------------
+[카메라] 왼쪽 스트림 상태: 중지됨
+[카메라] 오른쪽 스트림 상태: 중지됨
+=========================== short test summary info ============================
+FAILED apps/Workstation/tests/test_gnss_runtime_boundaries.py::test_real_feature_aliases_refer_to_one_runtime_state_and_inventory
+1 failed, 437 passed in 37.04s
+

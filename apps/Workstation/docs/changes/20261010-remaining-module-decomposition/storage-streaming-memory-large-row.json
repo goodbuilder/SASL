@@ -1,0 +1,39 @@
+{
+  "assessment": "Separate single-row size axis; expected memory remains proportional to an individual row, not an unlimited-row claim.",
+  "runs": [
+    {
+      "elapsed_s": 0.703,
+      "epoch_per_row": false,
+      "geometry_context_count": 1,
+      "method_bundles": false,
+      "payload_bytes": 1048576,
+      "peak_rss_mib": 91.789,
+      "review": "rebuilt and verified",
+      "rows_per_stream": 1,
+      "scope": "canonical source, disk indexes and Parquet; Excel only when include-review is true",
+      "spool_updates": false,
+      "strategy": "streaming-finalization",
+      "streams": 5,
+      "time_sync_epoch_count": 2,
+      "unbounded_inputs": "individual row size, metadata, dynamic schema fields and session measurement inventory",
+      "unique_contexts": false
+    },
+    {
+      "elapsed_s": 0.892,
+      "epoch_per_row": false,
+      "geometry_context_count": 1,
+      "method_bundles": false,
+      "payload_bytes": 4194304,
+      "peak_rss_mib": 125.32,
+      "review": "rebuilt and verified",
+      "rows_per_stream": 1,
+      "scope": "canonical source, disk indexes and Parquet; Excel only when include-review is true",
+      "spool_updates": false,
+      "strategy": "streaming-finalization",
+      "streams": 5,
+      "time_sync_epoch_count": 2,
+      "unbounded_inputs": "individual row size, metadata, dynamic schema fields and session measurement inventory",
+      "unique_contexts": false
+    }
+  ]
+}

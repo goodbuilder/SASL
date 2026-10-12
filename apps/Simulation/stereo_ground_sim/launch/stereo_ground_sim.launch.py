@@ -50,6 +50,23 @@ def _bool_config_default(context, name, default):
     )
 
 
+def _gazebo_args(context, world, gui_config):
+    """Keep the legacy default, with an explicit per-run Gazebo RNG seed."""
+    raw_seed = LaunchConfiguration("gazebo_seed").perform(context).strip()
+    seed_arg = ""
+    if raw_seed:
+        try:
+            seed = int(raw_seed)
+        except ValueError:
+            raise ValueError("gazebo_seed must be an unsigned 32-bit integer") from None
+        if not 0 <= seed <= 0xFFFFFFFF:
+            raise ValueError("gazebo_seed must be an unsigned 32-bit integer")
+        seed_arg = f" --seed {seed}"
+    if _bool_config(context, "gz_gui"):
+        return f"-r --gui-config {gui_config}{seed_arg} {world}"
+    return f"-r -s{seed_arg} {world}"
+
+
 def _camera_axis_values(context, camera, sensor, field, unit, default):
     return tuple(
         _float_config_default(
@@ -749,7 +766,7 @@ def _launch_setup(context, *args, **kwargs):
     )
     overlay_params_file = _write_overlay_node_params(context)
     gui_config = os.path.join(os.getcwd(), "config", "gazebo_operator.gui.config")
-    gz_args = f"-r --gui-config {gui_config} {world}" if _bool_config(context, "gz_gui") else f"-r -s {world}"
+    gz_args = _gazebo_args(context, world, gui_config)
     gz_version = LaunchConfiguration("gz_version")
     return [
         IncludeLaunchDescription(
@@ -935,6 +952,7 @@ def generate_launch_description():
             DeclareLaunchArgument("camera_image_width_px", default_value="1280"),
             DeclareLaunchArgument("camera_image_height_px", default_value="720"),
             DeclareLaunchArgument("camera_update_rate_hz", default_value="20.0"),
+            DeclareLaunchArgument("gazebo_seed", default_value=""),
             DeclareLaunchArgument("camera_clip_near_m", default_value="0.1"),
             DeclareLaunchArgument("camera_clip_far_m", default_value="2500.0"),
             DeclareLaunchArgument("cam_l_mag_noise_x_gauss", default_value="0.0"),

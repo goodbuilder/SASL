@@ -1,0 +1,40 @@
+{
+  "assessment": "measurement only; compare identical row size and review/index profile; no relaxed pass threshold",
+  "peak_rss_growth_mib": 6.086,
+  "runs": [
+    {
+      "elapsed_s": 18.716,
+      "epoch_per_row": false,
+      "geometry_context_count": 1,
+      "method_bundles": false,
+      "payload_bytes": 0,
+      "peak_rss_mib": 206.059,
+      "review": "rebuilt and verified",
+      "rows_per_stream": 10000,
+      "scope": "canonical source, disk indexes and Parquet; Excel only when include-review is true",
+      "spool_updates": false,
+      "strategy": "streaming-finalization",
+      "streams": 5,
+      "time_sync_epoch_count": 2,
+      "unbounded_inputs": "individual row size, metadata, dynamic schema fields and session measurement inventory",
+      "unique_contexts": false
+    },
+    {
+      "elapsed_s": 36.582,
+      "epoch_per_row": false,
+      "geometry_context_count": 1,
+      "method_bundles": false,
+      "payload_bytes": 0,
+      "peak_rss_mib": 212.145,
+      "review": "rebuilt and verified",
+      "rows_per_stream": 20000,
+      "scope": "canonical source, disk indexes and Parquet; Excel only when include-review is true",
+      "spool_updates": false,
+      "strategy": "streaming-finalization",
+      "streams": 5,
+      "time_sync_epoch_count": 2,
+      "unbounded_inputs": "individual row size, metadata, dynamic schema fields and session measurement inventory",
+      "unique_contexts": false
+    }
+  ]
+}

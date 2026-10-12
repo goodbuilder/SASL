@@ -1,9 +1,41 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Explicit calibration runner.  Each case restarts Gazebo/PX4 because the
-# physical optical pose is generated in the world SDF at launch.
+# Normal execution dispatches the configured manifest campaign. The
+# --legacy action below retains the older per-case optical-pose sweep.
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  cat <<'USAGE'
+Usage:
+  ./run_auto_attitude_sweep.sh
+  ./run_auto_attitude_sweep.sh --stereo-v1-1 [--config config/simulation.env]
+  ./run_auto_attitude_sweep.sh --legacy [legacy sweep options]
+
+Without a mode, run the configured manifest workbook action. The checked-in
+default is xlsx_plan, which validates and lists runs without starting SITL.
+Use xlsx_all in config/simulation.env to execute the manifest campaign after
+preflight. --stereo-v1-1 is a compatibility alias. --legacy selects the
+preserved optical attitude perturbation sweep.
+USAGE
+  exit 0
+fi
+
+# The normal entry is the configured XLSX campaign. The former OFAT sweep is
+# retained only behind an explicit --legacy action.
+case "${1:-}" in
+  --legacy)
+    shift
+    ;;
+  --stereo-v1-1)
+    shift
+    exec python3 "$ROOT_DIR/campaigns/stereo_v1_1/control_cli.py" "$@"
+    ;;
+  *)
+    exec python3 "$ROOT_DIR/campaigns/stereo_v1_1/control_cli.py" "$@"
+    ;;
+esac
+
 if REPO_ROOT="$(git -C "$ROOT_DIR" rev-parse --show-toplevel 2>/dev/null)"; then
   :
 else
@@ -56,7 +88,13 @@ load_sim_config_preserving_env "${SIM_EXPLICIT_NAMES[@]}"
 usage() {
   cat <<'USAGE'
 Usage:
-  ./run_auto_attitude_sweep.sh [options] -- [run_px4_waypoint_mission.sh options]
+  ./run_auto_attitude_sweep.sh
+  ./run_auto_attitude_sweep.sh --stereo-v1-1 --config config/simulation.env
+  ./run_auto_attitude_sweep.sh --legacy [options] -- [run_px4_waypoint_mission.sh options]
+
+No mode selects the configured manifest workbook action from Simulation.env.
+--stereo-v1-1 is a compatibility alias for the same campaign controller.
+--legacy selects the older attitude-perturbation sweep described below.
 
 Runs a deterministic, open-loop PX4 waypoint mission repeatedly. Every case
 flies the exact same shared waypoint path (generated once, up front, from the

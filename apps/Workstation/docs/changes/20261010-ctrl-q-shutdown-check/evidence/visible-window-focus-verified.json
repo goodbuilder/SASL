@@ -1,0 +1,10 @@
+{
+  "method": "X11 XTEST Ctrl+Q with actual X input focus and Qt activation settling",
+  "pid": 1693158,
+  "window": "0x2c00006",
+  "children_before": [],
+  "window_closed_s": null,
+  "process_exited_s": null,
+  "remaining_children": [],
+  "process_still_running": true
+}

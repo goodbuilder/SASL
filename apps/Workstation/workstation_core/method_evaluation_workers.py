@@ -171,6 +171,7 @@ class MethodEvaluationPoll:
 
     outcomes: tuple[MethodEvaluationOutcome, ...] = ()
     completed_bundles: tuple[MethodEvaluationBundle, ...] = ()
+    recovery_events: tuple[Mapping[str, object], ...] = ()
 
     @property
     def primary_outcomes(self) -> tuple[MethodEvaluationOutcome, ...]:
@@ -254,6 +255,7 @@ class _MethodEvaluationRuntime:
         self._closed = False
         self._started = False
         self._comparison_workers_started = False
+        self._unavailable_errors: dict[str, str] = {}
         if start_workers:
             self.start()
 
@@ -306,7 +308,13 @@ class _MethodEvaluationRuntime:
             args=(method_id, os.getpid(), input_queue, output_queue),
             daemon=True,
         )
-        process.start()
+        try:
+            process.start()
+        except Exception:
+            for channel in (input_queue, output_queue):
+                channel.cancel_join_thread()
+                channel.close()
+            raise
         self._slots[method_id] = _WorkerSlot(
             method_id=method_id,
             process=process,
@@ -314,6 +322,85 @@ class _MethodEvaluationRuntime:
             output_queue=output_queue,
             generation=generation,
         )
+        self._unavailable_errors.pop(method_id, None)
+
+    def status_rows(self) -> tuple[dict[str, object], ...]:
+        pending = {method: 0 for method in MEASUREMENT_METHOD_IDS}
+        for job in self._jobs.values():
+            for method in job.requests.keys() - job.outcomes.keys():
+                pending[method] += 1
+        rows = []
+        for method in MEASUREMENT_METHOD_IDS:
+            slot = self._slots.get(method)
+            request = None if slot is None else slot.current
+            state = (
+                "UNAVAILABLE" if method in self._unavailable_errors else
+                "DORMANT" if slot is None else
+                "RUNNING" if slot.started_monotonic_ns else
+                "DISPATCHED" if request is not None else "IDLE"
+            )
+            rows.append({
+                "method_id": method, "state": state,
+                "worker_generation": self._slot_generations[method],
+                "measurement_id": "" if request is None else request.measurement_id,
+                "pair_id": "" if request is None else request.pair_id,
+                "request_generation": None if request is None else request.request_generation,
+                "worker_started_monotonic_ns": 0 if slot is None else slot.started_monotonic_ns,
+                "dispatched_monotonic_ns": 0 if slot is None else slot.dispatched_monotonic_ns,
+                "pending_jobs": pending[method],
+                "error": self._unavailable_errors.get(method, ""),
+            })
+        return tuple(rows)
+
+    def restart_method(self, payload: Mapping[str, object]) -> dict[str, object]:
+        """Actor-only explicit recovery, guarded by the identity shown in UI."""
+        method = str(payload["method_id"])
+        result = {
+            "event_type": "method_worker_restart_result", **dict(payload),
+            "status": "REJECTED", "reason": "worker or request identity changed",
+            "recovery_started_monotonic_ns": time.monotonic_ns(),
+        }
+        slot = self._slots.get(method)
+        if self._closed or self._slot_generations[method] != payload["worker_generation"]:
+            return result
+        request = None if slot is None else slot.current
+        if slot is None:
+            if method not in self._unavailable_errors or payload["pair_id"]:
+                return result
+        elif request is None or (request.pair_id, request.request_generation) != (
+            payload["pair_id"], payload["request_generation"],
+        ):
+            return result
+        # Drain an already completed response before deciding to interrupt it.
+        if slot is not None:
+            self._drain_slot(slot)
+            if slot.current is not request:
+                result["reason"] = "request completed before recovery"
+                return result
+            try:
+                if not self._terminate_slot(slot):
+                    result.update(status="FAILED", reason="worker termination was not confirmed")
+                    return result
+            except Exception as exc:
+                result.update(status="FAILED", reason=f"worker termination failed: {exc}")
+                return result
+            self._finish_slot_with(slot, failed_outcome(
+                request, status="FAILED", reason="operator_restart: interrupted selected method worker",
+                worker_started_monotonic_ns=slot.started_monotonic_ns,
+            ))
+            self._slots.pop(method, None)
+        try:
+            self._start_slot(method)
+        except Exception as exc:
+            reason = f"worker replacement failed: {type(exc).__name__}: {exc}"
+            self._unavailable_errors[method] = reason
+            result.update(status="FAILED", reason=reason)
+        else:
+            result.update(status="RESTARTED", reason="selected worker replaced; queued work retained")
+        result["replacement_generation"] = self._slot_generations[method]
+        self._seal_completed_jobs()
+        self._dispatch_next(method)
+        return result
 
     def submit(
         self,
@@ -473,27 +560,30 @@ class _MethodEvaluationRuntime:
                 return
 
     @staticmethod
-    def _terminate_slot(slot: _WorkerSlot) -> None:
+    def _terminate_slot(slot: _WorkerSlot) -> bool:
         process = slot.process
-        try:
-            if process.is_alive():
-                process.terminate()
+        if process.is_alive():
+            process.terminate()
+        process.join(timeout=0.5)
+        if process.is_alive() and hasattr(process, "kill"):
+            process.kill()
             process.join(timeout=0.5)
-            if process.is_alive() and hasattr(process, "kill"):
-                process.kill()
-                process.join(timeout=0.5)
-        finally:
-            for channel in (slot.input_queue, slot.output_queue):
-                try:
-                    channel.cancel_join_thread()
-                    channel.close()
-                except (AttributeError, OSError, ValueError):
-                    pass
+        if process.is_alive():
+            return False
+        for channel in (slot.input_queue, slot.output_queue):
+            try:
+                channel.cancel_join_thread()
+                channel.close()
+            except (AttributeError, OSError, ValueError):
+                pass
+        return True
 
     def _restart_slot(self, method_id: str) -> None:
-        old = self._slots.pop(method_id, None)
+        old = self._slots.get(method_id)
         if old is not None:
-            self._terminate_slot(old)
+            if not self._terminate_slot(old):
+                return
+            self._slots.pop(method_id, None)
         if not self._closed and self._started:
             self._start_slot(method_id)
 
@@ -646,6 +736,11 @@ class MethodEvaluationCoordinator:
         self._close_requested = False
         self._closed_event = threading.Event()
         self._actor_error = ""
+        self._status_rows: tuple[dict[str, object], ...] = ()
+        self._status_published_ns = 0
+        self._restart_sequence = 0
+        self._restart_pending: dict[str, str] = {}
+        self._restart_results: dict[str, dict[str, object]] = {}
         self._actor = threading.Thread(
             target=self._run_actor,
             name="measurement-method-runtime",
@@ -680,6 +775,56 @@ class MethodEvaluationCoordinator:
     def worker_generations(self) -> dict[str, int]:
         with self._lock:
             return dict(self._worker_generations)
+
+    def status_snapshot(self) -> dict[str, object]:
+        """Pure cached read: never query/join a child on the caller's thread."""
+        now = time.monotonic_ns()
+        with self._lock:
+            rows = {str(row["method_id"]): dict(row) for row in self._status_rows}
+            for method in MEASUREMENT_METHOD_IDS:
+                row = rows.setdefault(method, {
+                    "method_id": method, "state": "DORMANT", "worker_generation": 0,
+                    "measurement_id": "", "pair_id": "", "request_generation": None,
+                    "pending_jobs": 0, "worker_started_monotonic_ns": 0,
+                    "dispatched_monotonic_ns": 0, "error": "",
+                })
+                start = int(row["worker_started_monotonic_ns"] or row["dispatched_monotonic_ns"] or 0)
+                row["elapsed_s"] = max(0.0, (now - start) / 1e9) if start else 0.0
+                row["restart_pending"] = method in self._restart_pending
+                row["last_restart"] = dict(self._restart_results.get(method, {}))
+            state = ("CLOSED" if self.closed else "CLOSING" if self._close_requested else
+                     "FAILED" if self._actor_error else "OPEN")
+            return {
+                "schema": "workstation-method-worker-status-v1", "state": state,
+                "error": self._actor_error, "published_monotonic_ns": self._status_published_ns,
+                "workers": list(rows.values()),
+            }
+
+    def restart_method(self, method_id: str, *, expected_worker_generation: int,
+                       expected_pair_id: str, expected_request_generation: int | None) -> dict[str, object]:
+        if method_id not in MEASUREMENT_METHOD_IDS:
+            raise ValueError(f"unsupported measurement method: {method_id}")
+        with self._lock:
+            if self._close_requested or self.closed:
+                return {"accepted": False, "reason": "method runtime is closing or closed"}
+            if method_id in self._restart_pending:
+                return {"accepted": False, "reason": "recovery already pending"}
+            row = next((row for row in self._status_rows if row["method_id"] == method_id), None)
+            if row is None or row["state"] not in {"DISPATCHED", "RUNNING", "UNAVAILABLE"} or (
+                row["worker_generation"], row["pair_id"], row["request_generation"]
+            ) != (expected_worker_generation, expected_pair_id, expected_request_generation):
+                return {"accepted": False, "reason": "worker or request identity changed"}
+            self._restart_sequence += 1
+            command_id = f"method-restart-{self._restart_sequence}"
+            payload = {
+                "command_id": command_id, "method_id": method_id,
+                "worker_generation": expected_worker_generation,
+                "pair_id": expected_pair_id, "request_generation": expected_request_generation,
+                "measurement_id": row["measurement_id"],
+            }
+            self._restart_pending[method_id] = command_id
+            self._commands.put(("restart", payload))
+            return {"accepted": True, "command_id": command_id, "reason": "recovery queued"}
 
     @property
     def closed(self) -> bool:
@@ -721,6 +866,7 @@ class MethodEvaluationCoordinator:
     def poll(self) -> MethodEvaluationPoll:
         outcomes: list[MethodEvaluationOutcome] = []
         bundles: list[MethodEvaluationBundle] = []
+        recovery_events: list[Mapping[str, object]] = []
         while True:
             try:
                 result = self._results.get_nowait()
@@ -728,9 +874,11 @@ class MethodEvaluationCoordinator:
                 break
             outcomes.extend(result.outcomes)
             bundles.extend(result.completed_bundles)
+            recovery_events.extend(result.recovery_events)
         return MethodEvaluationPoll(
             outcomes=tuple(outcomes),
             completed_bundles=tuple(bundles),
+            recovery_events=tuple(recovery_events),
         )
 
     def close(self) -> bool:
@@ -751,6 +899,10 @@ class MethodEvaluationCoordinator:
         with self._lock:
             if runtime is not None:
                 self._worker_generations = runtime.worker_generations
+                now = time.monotonic_ns()
+                if now - self._status_published_ns >= 100_000_000 or polled.outcomes:
+                    self._status_rows = runtime.status_rows()
+                    self._status_published_ns = now
             for outcome in polled.outcomes:
                 pending = self._pending_jobs.get((outcome.pair_id, outcome.request_generation))
                 if pending is not None:
@@ -837,6 +989,19 @@ class MethodEvaluationCoordinator:
                         break
                     if command == "start":
                         runtime.start()
+                        continue
+                    if command == "restart":
+                        if self._close_requested:
+                            result = {**payload, "event_type": "method_worker_restart_result",
+                                      "status": "REJECTED", "reason": "runtime closing"}
+                        else:
+                            result = runtime.restart_method(payload)
+                        with self._lock:
+                            method = str(payload["method_id"])
+                            self._restart_results[method] = dict(result)
+                            self._restart_pending.pop(method, None)
+                            self._status_published_ns = 0
+                        self._results.put(MethodEvaluationPoll(recovery_events=(result,)))
                         continue
                     if command == "submit":
                         requests, planned_methods = payload  # type: ignore[misc]

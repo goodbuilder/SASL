@@ -249,7 +249,9 @@ def test_start_and_stop_open_and_close_the_measurement_record_after_state_releas
 
     assert controller.request_measurement_stop()
 
-    assert observed_states == ["IDLE", "IDLE"]
+    # Start reserves admission before optional registry callbacks; Stop releases
+    # it before optional persistence. A reentrant Start cannot create two runs.
+    assert observed_states == ["STARTING", "IDLE"]
     assert calls[0][0] == "begin" and calls[0][1] == generation
     assert calls[0][2]["started_utc_ns"] == started_utc_ns
     assert calls[0][2]["calibration"] == {"profile_sha256": "c" * 64}
@@ -272,6 +274,38 @@ def test_start_never_retires_previous_measurement_workers() -> None:
     assert controller.begin_measurement_run()
 
     assert closed == []
+
+
+def test_registry_callback_cannot_reenter_start_or_create_a_second_run() -> None:
+    panel = _panel()
+    controller = MeasurementRunController(panel)
+    attempts = []
+
+    def begin(*_args, **_kwargs):
+        attempts.append(controller.begin_measurement_run())
+        return SimpleNamespace(file_prefix="one", counters={}, add_alignment_row=lambda row: None)
+
+    panel.measurement_registry = lambda: SimpleNamespace(begin=begin, stop=lambda *a, **k: None)
+    assert controller.begin_measurement_run()
+    assert attempts == [False]
+    assert controller.state == "RUNNING"
+
+
+def test_panel_projection_is_not_the_run_state_owner_and_adapters_share_service() -> None:
+    panel = _panel()
+    controller = MeasurementRunController(panel)
+    assert controller.begin_measurement_run()
+    generation = controller.measurement_run_snapshot()["generation"]
+    panel._measurement_run_state = "IDLE"
+    panel._measurement_run_generation = "foreign"
+    assert controller.state == "RUNNING"
+    assert controller.measurement_run_snapshot()["generation"] == generation
+    assert not controller.begin_measurement_run()
+    second_adapter = MeasurementRunController(panel)
+    assert second_adapter.run is controller.run
+    assert panel._measurement_run_generation == generation
+    assert second_adapter.request_measurement_stop()
+    assert controller.state == "IDLE"
 
 
 def test_persistence_exceptions_never_gate_start_stop_or_next_run() -> None:

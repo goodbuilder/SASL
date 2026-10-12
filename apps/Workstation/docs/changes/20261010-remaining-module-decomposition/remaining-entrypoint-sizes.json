@@ -1,0 +1,82 @@
+{
+  "note": "Line count is descriptive only; ownership and workflow tests determine completion. New cohesive owner modules are not included in the entrypoint totals.",
+  "baseline_entrypoint_lines": 55491,
+  "current_entrypoint_lines": 22194,
+  "targets": [
+    {
+      "path": "calibration_controller.py",
+      "baseline_lines": 5257,
+      "current_lines": 3380
+    },
+    {
+      "path": "camera_stream_controller.py",
+      "baseline_lines": 2076,
+      "current_lines": 1706
+    },
+    {
+      "path": "device_runtime_controller.py",
+      "baseline_lines": 3838,
+      "current_lines": 3648
+    },
+    {
+      "path": "evidence.py",
+      "baseline_lines": 4094,
+      "current_lines": 1219
+    },
+    {
+      "path": "gnss_runtime_controller.py",
+      "baseline_lines": 3445,
+      "current_lines": 2557
+    },
+    {
+      "path": "main_window.py",
+      "baseline_lines": 2413,
+      "current_lines": 1809
+    },
+    {
+      "path": "optical_pose_controller.py",
+      "baseline_lines": 5511,
+      "current_lines": 1763
+    },
+    {
+      "path": "panel_camera.py",
+      "baseline_lines": 3778,
+      "current_lines": 2414
+    },
+    {
+      "path": "wiris_runtime_workers.py",
+      "baseline_lines": 2612,
+      "current_lines": 54
+    },
+    {
+      "path": "workspace_views/calibration.py",
+      "baseline_lines": 4136,
+      "current_lines": 1196
+    },
+    {
+      "path": "workspace_views/optical_pose.py",
+      "baseline_lines": 2592,
+      "current_lines": 530
+    },
+    {
+      "path": "workspace_views/pixhawk.py",
+      "baseline_lines": 2543,
+      "current_lines": 426
+    },
+    {
+      "path": "workstation_core/pixhawk_attitude.py",
+      "baseline_lines": 3539,
+      "current_lines": 1090
+    },
+    {
+      "path": "workstation_core/recording_session.py",
+      "baseline_lines": 4435,
+      "current_lines": 181
+    },
+    {
+      "path": "workstation_core/yolo_stream.py",
+      "baseline_lines": 5222,
+      "current_lines": 221
+    }
+  ]
+}

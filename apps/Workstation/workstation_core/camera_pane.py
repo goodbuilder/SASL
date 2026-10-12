@@ -18,10 +18,8 @@ from Workstation.workstation_core.native_frame_ring import (
     SharedNativeFrameRing,
 )
 from Workstation.workstation_core.qimage_convert import qimage_from_bgr
-from Workstation.workstation_core.yolo_stream import (
-    DEFAULT_PREVIEW_DISPLAY_RATE_HZ,
-    YoloStreamWorker,
-)
+from Workstation.workstation_core.media_stream.policy import DEFAULT_PREVIEW_DISPLAY_RATE_HZ
+from Workstation.workstation_core.media_stream.supervisor import YoloStreamWorker
 
 
 DEFAULT_NATIVE_CALIBRATION_FRAME_MAX_AGE_S = 2.0

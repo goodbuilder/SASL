@@ -1,0 +1,66 @@
+{
+  "environment": "offscreen real panel and shell; hardware startup disabled; isolated network",
+  "views": [
+    {
+      "context": "overview",
+      "image": "overview.png",
+      "width": 1366,
+      "height": 900
+    },
+    {
+      "context": "devices.cameras",
+      "image": "camera.png",
+      "width": 1366,
+      "height": 900
+    },
+    {
+      "context": "processing.measurement",
+      "image": "measurement.png",
+      "width": 1366,
+      "height": 900
+    },
+    {
+      "context": "tasks.data",
+      "image": "data.png",
+      "width": 1366,
+      "height": 900
+    },
+    {
+      "context": "tasks.calibration",
+      "image": "calibration.png",
+      "width": 1366,
+      "height": 900
+    },
+    {
+      "context": "tasks.advanced",
+      "image": "advanced.png",
+      "width": 1366,
+      "height": 900
+    }
+  ],
+  "feature_count": 11,
+  "shutdown": {
+    "schema": "workstation-shutdown-resources-v1",
+    "complete": true,
+    "coordinator_step": "",
+    "running_threads": [],
+    "live_processes": [],
+    "open_sockets": [],
+    "shared_memory": []
+  },
+  "callback_errors": [],
+  "rendering_limitations": [],
+  "reviewed_views": [
+    "camera",
+    "calibration"
+  ],
+  "manual_review": "Camera and Calibration controls, preview panes, navigation, and status views rendered without missing sections or overlapping controls in the captured viewport. This is offscreen software UI evidence, not hardware qualification.",
+  "image_sha256": {
+    "advanced.png": "f87319f7f2e5c06c33581859975c6e0bad6c9d658ae0c5cdee0695bbcb67eec0",
+    "calibration.png": "9cfc12ed0495ecbe9591a6f96de76b6f9b8d032674811569750d056d0990f3ac",
+    "camera.png": "fb3ac5b94bd000eab3b2a773a6f3eb36b45d0b66455439a34013c04b232f3929",
+    "data.png": "ffb4c641431804b6a88712e9bfbea4044b63c94b1ce61e22b54ec0f3fa74ff7a",
+    "measurement.png": "f57379e2b8c84b32cbf48e3e9148fd643ef62bfca5d8498f6685161444bbba72",
+    "overview.png": "c8da475247b695576ceed56e22c60d997f5e9f7a5d931ecf143ae3a492b03290"
+  }
+}

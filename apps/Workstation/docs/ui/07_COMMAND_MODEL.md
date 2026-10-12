@@ -29,6 +29,11 @@ Session Save/Finalize command.
 Operate on selected object/workspace: camera connect/preview/capture, calibration capture/calculate/save, etc.
 
 `Data > Status` exposes `Open Latest Measurement XLSX`, `Rebuild Latest XLSX`, and `Retry Storage`.
+It also exposes `선택 계산 중단·재시작` for the displayed method-worker/request identity.
+This explicit action interrupts that current calculation as FAILED/operator_restart, replaces
+only its worker after confirmed exit, and preserves queued work and peer methods. A stale identity
+is rejected. Normal Measurement Stop does not trigger it. Acceptance and observed replacement are
+separate; see the [current Measurement contract](../MEASUREMENT_RUNTIME_CONTRACT.md).
 Open resolves the latest start-stamped workbook across run directories and legacy paths.
 Rebuild uses saved journal/raw input, never current settings, and runs in the background. It is
 rejected during Measurement, Manual recording, pending Method calculations or another workbook
@@ -240,3 +245,9 @@ Implementation note: `CommandRegistry` emits `invoked`, `accepted`, `completed`,
 `failed`. `accepted`/`completed` only mean the existing handler returned without an
 exception; asynchronous postconditions remain visible through `StatusModel` and the
 source-backed workspace/Inspector evidence.
+
+## Target reference commands
+
+Target discovery, candidate selection, connect, cancel, stop and Save use named target_reference backend operations. Search is single-flight and rejects active Target connections or competing device discovery; active rig/Telemetry/Base endpoints are protected. Cancellation invalidates eventual search results and releases resources before reuse.
+
+Use selected validates candidate generation and30s freshness and only updates draft fields. Connect rechecks fields and transport peer/heartbeat identity; another sender on the listening port cannot replace the selected peer. Manual Any is explicitly unpinned until the first verified heartbeat, after which the live peer and IDs are retained. Save is atomic and stores preferences only. UAM application opens no worker/socket. Target receive transports expose no MAVLink send API.

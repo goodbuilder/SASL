@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Regenerate the TYPE_CHECKING stub block for delegate-bound panel methods.
+"""Regenerate the external typing stub for delegate-bound panel methods.
 
-`WirisStereoDistancePanel` (in `standalone_gui.py`) exposes ~410 controller
+`WirisStereoDistancePanel` (in `standalone_gui.py`) exposes registered controller
 methods by binding them onto the class at import time via `setattr`
 (`bind_controller_delegates`, driven by `_CONTROLLER_DELEGATE_BINDINGS`).
 Static type checkers and IDEs can't see attributes attached that way, so this
-script generates a `TYPE_CHECKING`-guarded block of no-op method stubs -
+script generates a `TYPE_CHECKING`-guarded block in `standalone_gui.pyi` -
 inert at runtime, visible to tooling - between two sentinel comments in the
 class body.
 
@@ -34,21 +34,32 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_OPENGL", "software")
 os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
 
-TARGET_FILE = Path(__file__).resolve().parents[1] / "standalone_gui.py"
+TARGET_FILE = Path(__file__).resolve().parents[1] / "application" / "standalone_gui.pyi"
 BEGIN_MARKER = "    # BEGIN GENERATED PANEL DELEGATE STUBS - see tools/gen_panel_delegate_stubs.py"
 END_MARKER = "    # END GENERATED PANEL DELEGATE STUBS"
 _INDENT = " " * 8
 
 
 def render_stub_block() -> str:
-    from Workstation import standalone_gui
+    from Workstation.application import standalone_gui
+    from Workstation.panel.panel_contracts import FIELD_OWNERS, METHOD_OWNERS
+    from Workstation.measurement.state import MEASUREMENT_PANEL_FIELDS
+    from Workstation.recording.state import RECORDING_STATE_FIELDS
 
     seen: set[str] = set()
-    stub_lines: list[str] = []
+    stub_lines: list[str] = [
+        f"{_INDENT}{name}: Any"
+        for name in sorted(set(FIELD_OWNERS) | set(MEASUREMENT_PANEL_FIELDS) | set(RECORDING_STATE_FIELDS))
+    ]
     for binding in standalone_gui._CONTROLLER_DELEGATE_BINDINGS:
         for name in binding.method_names:
             if name in seen:
                 continue
+            seen.add(name)
+            stub_lines.append(f"{_INDENT}def {name}(self, *args: Any, **kwargs: Any) -> Any: ...")
+
+    for name in METHOD_OWNERS:
+        if name not in seen:
             seen.add(name)
             stub_lines.append(f"{_INDENT}def {name}(self, *args: Any, **kwargs: Any) -> Any: ...")
 
@@ -58,10 +69,10 @@ def render_stub_block() -> str:
         "    #",
         "    # These declarations are inert at runtime (TYPE_CHECKING is False when the",
         "    # module is imported); they exist only so IDEs/type checkers can see the",
-        "    # ~410 methods that `_CONTROLLER_DELEGATE_BINDINGS` attaches via setattr,",
+        "    # registered methods and named fields attached at the compatibility boundary,",
         "    # which are otherwise invisible to static analysis. Do not hand-edit -",
         "    # regenerate with `python3 tools/gen_panel_delegate_stubs.py` after",
-        "    # changing any `*_METHODS` registry.",
+        "    # changing any controller registry or panel field/method contract.",
         "    if TYPE_CHECKING:",
         body,
         END_MARKER,

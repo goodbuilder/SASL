@@ -1,0 +1,83 @@
+{
+  "profiles": [
+    {
+      "name": "uam",
+      "window_size": [
+        1366,
+        900
+      ],
+      "target_geometry": [
+        6,
+        6,
+        758,
+        448
+      ]
+    },
+    {
+      "name": "drone-empty",
+      "window_size": [
+        1366,
+        900
+      ],
+      "target_geometry": [
+        6,
+        6,
+        758,
+        448
+      ]
+    },
+    {
+      "name": "candidate-selected",
+      "window_size": [
+        1366,
+        900
+      ],
+      "target_geometry": [
+        6,
+        6,
+        758,
+        448
+      ]
+    },
+    {
+      "name": "heartbeat-no-gps",
+      "window_size": [
+        1366,
+        900
+      ],
+      "target_geometry": [
+        6,
+        6,
+        758,
+        448
+      ]
+    },
+    {
+      "name": "long-detail",
+      "window_size": [
+        1366,
+        900
+      ],
+      "target_geometry": [
+        6,
+        6,
+        758,
+        448
+      ]
+    }
+  ],
+  "scale": "1",
+  "callback_errors": [],
+  "rendering_limitations": [
+    "RuntimeError: pyqtgraph.opengl: Requires >= OpenGL 2.1; Found b'4.5 (Compatibility Profile) Mesa 23.2.1-1ubuntu3.1~22.04.4'"
+  ],
+  "shutdown": {
+    "schema": "workstation-shutdown-resources-v1",
+    "complete": true,
+    "coordinator_step": "",
+    "running_threads": [],
+    "live_processes": [],
+    "open_sockets": [],
+    "shared_memory": []
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "keys": {},
+  "groups": {
+    "mainwindow": {
+      "keys": {},
+      "groups": {}
+    },
+    "pluginmanager": {
+      "keys": {
+        "running-plugins": {
+          "repr": "{'stereo_ground_sim/CampaignPanel': [1]}",
+          "type": "repr"
+        }
+      },
+      "groups": {}
+    },
+    "plugin__stereo_ground_sim__CampaignPanel__1": {
+      "keys": {},
+      "groups": {}
+    }
+  }
+}

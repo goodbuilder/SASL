@@ -171,7 +171,7 @@ during export or rebuild.
 | --- | --- | --- | --- |
 | `events` | `events.jsonl` | yes | transient run, command, and producer events |
 | `measurements` | `measurements.jsonl` | yes | representative `pixhawk_rtk_live` `VALID`/`ESTIMATED` terminal results accepted while the run is `RUNNING` |
-| `method_evaluations` | `method_evaluations.jsonl` | yes | atomic nine-method inputs/outcomes and late-result markers |
+| `method_evaluations` | `method_evaluations.jsonl` | yes | atomic submitted-method inputs/outcomes and late-result markers |
 | `method_results` | `method_results.jsonl` | yes | one thin row per method outcome (status, reasons, F/R/D/Range, ray diagnostics, disparity, timing) — the readable projection of `method_evaluations` |
 | `camera.left/right` | `camera_left/right.jsonl` | no | GUI-delivered camera observations |
 | `px4.left/right/drone` | `px4_left/right/drone.jsonl` | no | P1, P2, and Target telemetry records |
@@ -261,16 +261,16 @@ rows stay JSONL-only. Legacy session Parquet/review output is unchanged.
 `measurements.jsonl` row before projecting it into the current table, distance history, plot, or UI
 banner. The enqueue attempt/result is observed before those projections; a rejected enqueue may
 still be shown as degraded evidence. The primary worker is spawned and dispatched first. Its
-terminal outcome, including the one-second primary timeout, releases startup of the seven
-comparison workers. This acceptance is
-independent of the completed nine-method bundle.
+terminal outcome releases startup of the nine comparison workers. Started calculations have
+no compute deadline; only a missing start acknowledgement has a 30-second startup guard. This acceptance is
+independent of the completed submitted-method bundle.
 
 Primary `BLOCKED`, `FAILED`, `TIMEOUT`, and `BACKPRESSURE_BLOCKED` outcomes do not create
 `measurements.jsonl` rows. They remain explicit outcomes in `method_evaluations.jsonl` alongside all
 comparison results. A later method-evaluation bundle never promotes a comparison result or changes
 an already accepted representative result. If the early priority enqueue was rejected while the run
 is still `RUNNING`, an independent primary-persistence owner retries the same already-built row; a
-saved nine-method bundle does not cancel that retry. The row carries an owner-epoch/index lease,
+saved submitted-method bundle does not cancel that retry. The row carries an owner-epoch/index lease,
 so clear/rebind/index reuse retires the owner instead of overwriting another row. An unavailable
 owner falls back to direct priority persistence. After Stop, retry writes a compact
 `late_primary_measurement_outcome` with the canonical primary outcome and original generation,
@@ -292,12 +292,10 @@ representative row and cannot update the distance UI; its method outcome may sti
 late method-evaluation evidence. "Before the UI" and "immediate" mean successful bounded priority
 enqueue. They do not mean that the writer has completed `write`, flush, or `fsync`.
 
-Primary admission and comparison backlog have separate 20-pair limits. When comparison backlog is
-full but a primary slot remains, the pair is admitted to the primary worker and its seven comparison
-outcomes are synthesized as `BACKPRESSURE_BLOCKED`. Only a full primary queue rejects the complete
-pair with primary backpressure.
+Each method has its own 20-pair pending limit. Saturation creates `BACKPRESSURE_BLOCKED` only
+for that method; other submitted methods retain their own admission decisions.
 
-A nine-method bundle is committed, counted, and exposed as complete only after its priority
+A submitted-method bundle is committed, counted, and exposed as complete only after its priority
 enqueue is admitted. A rejected append to the active `LiveDataRows` owner remains a pending logical
 row and retries that same index. If the run stops before admission, the retry stays with the original
 row owner while its lease remains valid and is rewritten with `late=true` and the then-current
@@ -416,15 +414,19 @@ some present is `PARTIAL`, and none present is `FAILED`. It records size and wri
 integrity claim. `source_media_integrity_verified` remains a separate fact. Hash/probe/decode review
 is outside Measurement admission and the next-run lifecycle.
 
-## Nine-method evaluation
+## Registered-method evaluation
 
-The nine stable method IDs remain `pixhawk_rtk_live`, `pixhawk_rp_gps_baseline_yaw`,
+The ten stable method IDs are `pixhawk_rtk_live`, `pixhawk_rp_gps_baseline_yaw`,
 `checkerboard_stereo`, `horizon_hybrid`, `mountain_gnss`, `drone_rtk_rotation_hybrid`,
-`drone_rtk_multiview`, `terrain_pnp`, and `combined_hybrid`.
+`drone_rtk_multiview`, `terrain_pnp`, `combined_hybrid`, and `cloud_gnss`.
 
 `pixhawk_rtk_live` remains the representative result. Missing structural inputs produce BLOCKED,
-solver exceptions produce FAILED, deadline expiry produces TIMEOUT, and a full method work queue
-produces BACKPRESSURE_BLOCKED. Primary timeout is one second and releases comparison-worker startup.
+solver exceptions or explicit operator interruption produce FAILED, and a full method queue produces
+BACKPRESSURE_BLOCKED. No new compute TIMEOUT is emitted; legacy TIMEOUT remains readable.
+Explicit recovery records `method_worker_restart_result` in the original run's `events` stream,
+with command/method/worker/pair/request identities, RESTARTED/REJECTED/FAILED, and a reason.
+Accepted recovery is not completion evidence. A confirmed replacement adds replacement_generation;
+the interrupted outcome retains FAILED and operator_restart in existing reason fields.
 Only a `RUNNING` primary `VALID`/`ESTIMATED` outcome enters
 `measurements.jsonl`; every other primary status and every comparison status remains in
 `method_evaluations.jsonl`. Comparison outcomes never replace the representative result and are not
@@ -548,3 +550,10 @@ assumption and baseline source. The existing attitude reuse/quality warnings
 remain authoritative. Absolute GNSS position is not required for this addition.
 The separate GNSS antenna-midpoint-to-Drone stream retains its own coordinate
 contract and is not substituted for these camera-derived target results.
+
+## In-memory ownership and compatibility
+
+Pair/request/outcome/bundle mappings own recursively immutable JSON data. Serialization returns
+detached ordinary dict/list values. Input or exported-payload mutation cannot change canonical
+bytes/hashes; no saved schema, numeric value, coordinate frame, axis order, unit or clock basis changes.
+See [Measurement runtime contract](MEASUREMENT_RUNTIME_CONTRACT.md) for current lifecycle semantics.

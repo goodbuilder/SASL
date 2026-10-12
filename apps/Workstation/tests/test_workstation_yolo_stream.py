@@ -64,7 +64,12 @@ def test_permanent_tolerant_policy_relaxes_only_decoded_suppression() -> None:
 def test_decoded_backends_capture_app_time_at_their_receipt_boundary() -> None:
     from Workstation.workstation_core import yolo_stream
 
-    source = Path(yolo_stream.__file__).read_text(encoding="utf-8")
+    import inspect
+    source = "\n".join(inspect.getsource(function) for function in (
+        yolo_stream._run_gstreamer_stream_once,
+        yolo_stream._run_opencv_stream,
+        yolo_stream._run_pyav_stream,
+    ))
 
     gst_receipt = source.index('sample = sink.emit("try-pull-sample", 200_000_000)')
     gst_capture = source.index("app_receive_monotonic_sample()", gst_receipt)

@@ -1,0 +1,87 @@
+{
+  "scope": "S1 transport and command ownership; continuing S2 next",
+  "full_regression": {
+    "passed": 2298,
+    "skipped": 1,
+    "warnings": 0,
+    "seconds": 247.34,
+    "exit_code": 0
+  },
+  "files": [
+    {
+      "path": "workstation_core/pixhawk_attitude.py",
+      "sha256": "031bc17dc076f4775b40529e1a31adab68683908af4e7d0bf0e1e7ddc7aaf74c",
+      "lines": 1090
+    },
+    {
+      "path": "workstation_core/pixhawk_link/__init__.py",
+      "sha256": "bb82c9888b61d54b1167ac73025f598bbdd53e194448f62ffc62a79c22f96cb0",
+      "lines": 5
+    },
+    {
+      "path": "workstation_core/pixhawk_link/commands.py",
+      "sha256": "24d1df3e4d3af0f13b64c64a6c2bf0df75e80fd28621619b920ca01839974295",
+      "lines": 196
+    },
+    {
+      "path": "workstation_core/pixhawk_link/decode.py",
+      "sha256": "7747d87c71d070bca2d0d8b9c59c0e7894fd11040977e9d0a88e94c52f702e9f",
+      "lines": 878
+    },
+    {
+      "path": "workstation_core/pixhawk_link/endpoints.py",
+      "sha256": "fcba3842786302705a30528a6791e1cd51dd9054eca209c8ae5edeb6a7f991d2",
+      "lines": 220
+    },
+    {
+      "path": "workstation_core/pixhawk_link/policy.py",
+      "sha256": "f7a43f05ec93242dab420630d8d5106cb11a85924f29369fd1877113fd44b7f8",
+      "lines": 137
+    },
+    {
+      "path": "workstation_core/pixhawk_link/timebase.py",
+      "sha256": "f7aa88764e92e64765c669d52e64d48daa4b5720a258739b874e887e1358d65b",
+      "lines": 208
+    },
+    {
+      "path": "workstation_core/pixhawk_link/transport.py",
+      "sha256": "d86d931ea32fd13feca9c9522f2cbd42409141f919756bd5f9e33fdeb68be608",
+      "lines": 736
+    },
+    {
+      "path": "workstation_core/pixhawk_link/types.py",
+      "sha256": "8ab1ccfa3bab364f29814d1e2bac68ffa3a61580add834f4bb81f6469402d421",
+      "lines": 191
+    },
+    {
+      "path": "workstation_core/pixhawk_link/wire_commands.py",
+      "sha256": "96127c28359144963b3e91d9d95a55d3e8f43be107858b3cc872b09651c9ec58",
+      "lines": 441
+    },
+    {
+      "path": "panel_application.py",
+      "sha256": "87457e38a3478cb0f34a33fc75d2db111304cd62ad326facdb8f11c728f91962",
+      "lines": 214
+    },
+    {
+      "path": "tests/test_panel_composition.py",
+      "sha256": "8aebfca963b7b135c4605c859c110a47d6f522633d78aaab3c417f386aa66c63",
+      "lines": 364
+    },
+    {
+      "path": "tests/test_pixhawk_link_boundaries.py",
+      "sha256": "6da7e14841877e222f29b69e9fdfc58bee6bcd3208b3316370b51d86dc21b787",
+      "lines": 385
+    },
+    {
+      "path": "tests/test_workstation_pixhawk_gnss.py",
+      "sha256": "0d9bc5da9776c7881d9233bdda2df25c3dd8c4bbc349da3856cb59e548fd1133",
+      "lines": 4780
+    },
+    {
+      "path": "tests/test_mavlink_liveness.py",
+      "sha256": "19a83f61bc49da29d2a5df569df56fed82976b1835dd9c89423fdc94689283f5",
+      "lines": 1277
+    }
+  ]
+}

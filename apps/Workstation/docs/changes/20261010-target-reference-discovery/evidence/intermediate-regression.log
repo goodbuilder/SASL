@@ -1,0 +1,52 @@
+........................................................................ [  3%]
+........................................................................ [  6%]
+........................................................................ [  9%]
+..................................s..................................... [ 12%]
+........................................................................ [ 15%]
+........................................................................ [ 19%]
+........................................................................ [ 22%]
+........................................................................ [ 25%]
+........................................................................ [ 28%]
+........................................................................ [ 31%]
+........................................................................ [ 34%]
+........................................................................ [ 38%]
+........................................................................ [ 41%]
+........................................................................ [ 44%]
+........................................................................ [ 47%]
+........................................................................ [ 50%]
+........................................................................ [ 53%]
+........................................................................ [ 57%]
+........................................................................ [ 60%]
+........................................................................ [ 63%]
+........................................................................ [ 66%]
+........................................................................ [ 69%]
+.........F.............................................................. [ 73%]
+..............................s......................................... [ 76%]
+........................................................................ [ 79%]
+........................................................................ [ 82%]
+........................................................................ [ 85%]
+........................................................................ [ 88%]
+........................................................................ [ 92%]
+........................................................................ [ 95%]
+........................................................................ [ 98%]
+...................................                                      [100%]
+=================================== FAILURES ===================================
+________ test_workstation_settings_snapshot_merges_in_memory_overrides _________
+apps/Workstation/tests/test_stage5_extracted_methods.py:272: in test_workstation_settings_snapshot_merges_in_memory_overrides
+    snapshot = WorkstationSettingsController(panel).workstation_settings_snapshot()
+apps/Workstation/settings_controller.py:87: in workstation_settings_snapshot
+    snapshot["target_reference"] = panel.settings.target_reference.to_mapping()
+E   AttributeError: 'types.SimpleNamespace' object has no attribute 'target_reference'
+=============================== warnings summary ===============================
+apps/Workstation/tests/test_optical_pose_controller_integration.py::test_yaw90_solve_without_base_rt_freezes_inputs_and_saves_both_poses[solve_workstation_optical_pose_gnss_mountain]
+  /usr/lib/python3/dist-packages/scipy/__init__.py:146: UserWarning: A NumPy version >=1.17.3 and <1.25.0 is required for this version of SciPy (detected version 1.26.4
+    warnings.warn(f"A NumPy version >={np_minversion} and <{np_maxversion}"
+
+-- Docs: https://docs.pytest.org/en/stable/warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] apps/Workstation/tests/test_camera_stream_recovery.py:282: NVENC unavailable: [h264_nvenc @ 0x622e26120a40] OpenEncodeSessionEx failed: unsupported device (2): (no details)
+[h264_nvenc @ 0x622e26120a40] No capable devices found
+Error initializing output stream 0:0 -- Error while opening encoder for output stream #0:0 - maybe incorrect parameters such as bit_rate, rate, width or height
+SKIPPED [1] apps/Workstation/tests/test_terrain.py:28: pyproj not installed
+FAILED apps/Workstation/tests/test_stage5_extracted_methods.py::test_workstation_settings_snapshot_merges_in_memory_overrides
+1 failed, 2264 passed, 2 skipped, 1 warning in 246.47s (0:04:06)

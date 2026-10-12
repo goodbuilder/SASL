@@ -7,6 +7,8 @@ import math
 from dataclasses import asdict, dataclass
 from typing import Any, Iterable
 
+from Workstation.workstation_core.immutable_json import thaw_json
+
 from Workstation.workstation_core.coordinate_contract import (
     BASELINE_TRANSLATION_FRAME,
     BODY_FRAME,
@@ -182,7 +184,7 @@ def _validate_rotation_matrix(
 
 def _canonical_json_bytes(payload: Any) -> bytes:
     return json.dumps(
-        payload,
+        thaw_json(payload),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,

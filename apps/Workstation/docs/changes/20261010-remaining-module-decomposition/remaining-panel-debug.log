@@ -1,0 +1,22 @@
+F
+=================================== FAILURES ===================================
+____ test_panel_has_one_feature_owner_per_value_and_no_cross_instance_state ____
+apps/Workstation/tests/test_panel_composition.py:33: in test_panel_has_one_feature_owner_per_value_and_no_cross_instance_state
+    first, second = panels(), panels()
+apps/Workstation/tests/test_panel_composition.py:22: in create
+    panel = standalone_gui.WirisStereoDistancePanel(app_root=tmp_path / str(len(created)))
+apps/Workstation/standalone_gui.py:22: in __init__
+    self.application.initialize(
+apps/Workstation/panel_application.py:186: in initialize
+    build_panel_views(self)
+apps/Workstation/panel_view_composition.py:52: in build_panel_views
+    application.features['presentation'].build_presentation_finish()
+apps/Workstation/panel_presentation.py:1444: in build_presentation_finish
+    self._install_tooltips()
+apps/Workstation/panel_presentation.py:427: in _install_tooltips
+    self.detect_pc_ip_button: "선택한 인터페이스의 활성 NetworkManager 연결에서 카메라망 IP를 찾아 PC IP 입력칸에 채웁니다.",
+E   AttributeError: 'PresentationFeature' object has no attribute 'detect_pc_ip_button'. Did you mean: 'detect_rtsp_button'?
+=========================== short test summary info ============================
+FAILED apps/Workstation/tests/test_panel_composition.py::test_panel_has_one_feature_owner_per_value_and_no_cross_instance_state
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+1 failed in 2.10s

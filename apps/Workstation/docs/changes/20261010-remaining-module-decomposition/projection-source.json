@@ -1,0 +1,51 @@
+{
+  "full_regression": {
+    "passed": 2326,
+    "skipped": 1,
+    "warnings": 0,
+    "seconds": 247.82,
+    "exit_code": 0
+  },
+  "files": [
+    {
+      "path": "evidence.py",
+      "sha256": "248c6a33caa19ee61a39225b1a64bb136580ac342bc333551204e73e6bd1b575"
+    },
+    {
+      "path": "evidence_views/__init__.py",
+      "sha256": "d91d5e455ecf0769da4bc579f2767b9e8a7e9248168005889d32f1c9d0f0bd29"
+    },
+    {
+      "path": "evidence_views/snapshot.py",
+      "sha256": "8e1003e9068b902f5daa0df2b12e4fc1e18d69624e09b29908b9fe20463edcbc"
+    },
+    {
+      "path": "evidence_views/telemetry.py",
+      "sha256": "e1270675b25ff7462324b6710b487b7496e925106e86e8b949cb42f63e02a3c7"
+    },
+    {
+      "path": "evidence_views/values.py",
+      "sha256": "300d5457e330af09248bba684516a3bf7c7f6f84a5a87c6d95ea9419a2f13526"
+    },
+    {
+      "path": "workstation_core/session_storage/finalize.py",
+      "sha256": "deb16afe207075a787fc5352c116642bd2532d369ab7a75f4f0906dfbd2ec3c4"
+    },
+    {
+      "path": "workstation_core/session_storage/projection.py",
+      "sha256": "f36817b31410a92d2cc883987267edd169f33032adcd32ea6e07209347e2c31a"
+    },
+    {
+      "path": "tests/test_evidence_projection_boundaries.py",
+      "sha256": "eaf9ab125484c3bc8128a33ce32082106eb53abbd8e6e524b5dd0ea90d304e4d"
+    },
+    {
+      "path": "tests/test_session_storage_boundaries.py",
+      "sha256": "7d43bc2615719a43071c2e91622eb0d48e53e0b0cadf199c775465337942e19b"
+    },
+    {
+      "path": "tools/qualify_session_projection_memory.py",
+      "sha256": "19c74a028b66a9e1f85af662aa67aa95cf61a865170e2eae0613775006c5165e"
+    }
+  ]
+}

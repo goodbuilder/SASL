@@ -1,0 +1,497 @@
+{
+  "schema_version": "stereo_calibration_campaign_v1_1",
+  "document_version": "1.1",
+  "created_date_kst": "2026-10-05",
+  "revision": {
+    "from_version": "1.0",
+    "main_change": "RPY_IMU is primary; YAW_ONLY is baseline; camera centers fixed to measured RTK values",
+    "flight_manifest_unchanged": true,
+    "new_gazebo_runs_due_to_this_revision": 0
+  },
+  "purpose": "first paper on attitude calibration and practical flight-path selection; data collection protocol, not an executed simulation",
+  "status": "SPECIFICATION_NOT_EXECUTED",
+  "canonical_configuration": "03_experiment_spec.json",
+  "planned_runs": 39,
+  "core_runs": 30,
+  "physical_pose_runs": 9,
+  "scope": {
+    "current_glide_slope_deg": 20,
+    "angle_sweep": false,
+    "helicopter_2p5km_rendering_included": false,
+    "offsite_gazebo_runs_executed_by_package_author": false,
+    "reprocessing_does_not_add_gazebo_runs": true
+  },
+  "coordinates": {
+    "world": "ENU aligned research frame",
+    "origin": "landing pad reference at (0,0,0)",
+    "axes": {
+      "x": "right/east",
+      "y": "forward/north away from pad",
+      "z": "up"
+    },
+    "camera_optical": "RDF: x right, y down, z forward",
+    "rotation_matrix": "R_WC maps optical column vectors to world",
+    "projection": "p_C = transpose(R_WC) @ (p_W - C_W); u=fx*p_C.x/p_C.z+cx; v=fy*p_C.y/p_C.z+cy",
+    "heading_positive": "clockwise about world up when viewed from above, from +Y toward +X",
+    "heading_formula": "R_WC(psi) = Rz_world(-psi) @ R_WC_nominal; radians in trigonometric functions",
+    "full_attitude_formula": "R_WC(phi,theta,psi) = Rz_world(-psi) @ R_WC_nominal @ Rx_optical(theta) @ Rz_optical(phi)",
+    "full_attitude_parameters": "phi = optical-forward roll; theta = elevation correction relative to nominal 20deg; psi = world heading. Do not substitute an undocumented library Euler order.",
+    "R_WC_nominal": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        0.3420201433256687,
+        0.9396926207859084
+      ],
+      [
+        0,
+        -0.9396926207859084,
+        0.3420201433256687
+      ]
+    ],
+    "quaternion_storage_order": "xyzw",
+    "px4_local_mapping": "must discover and record world-to-PX4-local transform; origin may be vehicle spawn, not landing pad",
+    "glide_definition": "z_ref = D*tan(20deg), D=y; nominal vertical approach profile, not instantaneous 3D velocity angle during lateral motion"
+  },
+  "camera": {
+    "left_center_world_m": [
+      -12.5,
+      0,
+      0.1
+    ],
+    "right_center_world_m": [
+      12.5,
+      0,
+      0.1
+    ],
+    "baseline_m": 25,
+    "image_width_px": 1280,
+    "image_height_px": 720,
+    "fx_px": 8241.646774127139,
+    "fy_px": 8241.646774127139,
+    "cx_px": 640,
+    "cy_px": 360,
+    "distortion_model": "none",
+    "horizontal_fov_rad": 0.154997710698,
+    "image_rate_hz": 20,
+    "yolo_target_hz": 20,
+    "yolo_imgsz": 736,
+    "yolo_weights": "reuse existing file; record actual path and SHA256",
+    "detector_confidence_nms_thresholds": "discover existing settings and freeze before main campaign",
+    "physical_pose_groups": {
+      "G0": {
+        "heading_left_deg": 0,
+        "heading_right_deg": 0
+      },
+      "G1": {
+        "heading_left_deg": 0.5,
+        "heading_right_deg": -0.5
+      }
+    },
+    "physical_pose_requirement": "rotate rendered optical pose while holding optical centers fixed; verify actual Gazebo transforms, do not alter only estimator values"
+  },
+  "vehicle": {
+    "model_id": "x500_2m",
+    "actual_dimensions_m": null,
+    "dimensions_action": "measure/read existing SDF meshes; do not infer dimensions from model name",
+    "reference_link": "vehicle_reference_link",
+    "reference_definition_action": "verify rigid transform to base_link and GNSS antenna in student repository",
+    "synthetic_rtk_reference": "same declared vehicle reference point as trajectory and GT; explicitly label simulated observation",
+    "gnss_lever_arm_m": null,
+    "lever_arm_action": "record actual existing model transform; unknown is null, not silently zero",
+    "command_heading_deg_clockwise_from_north": 180,
+    "roll_pitch": "determined by flight dynamics, never clamp to zero"
+  },
+  "trajectories": {
+    "P0": {
+      "role": "calibration",
+      "shape": "straight",
+      "amplitude_m": 0,
+      "D_start_m": 400,
+      "D_end_m": 300
+    },
+    "P1": {
+      "role": "calibration",
+      "shape": "bow",
+      "amplitude_m": 3,
+      "D_start_m": 400,
+      "D_end_m": 300
+    },
+    "P2": {
+      "role": "calibration",
+      "shape": "bow",
+      "amplitude_m": 6,
+      "D_start_m": 400,
+      "D_end_m": 300
+    },
+    "P3": {
+      "role": "calibration",
+      "shape": "single_s",
+      "amplitude_m": 3,
+      "D_start_m": 400,
+      "D_end_m": 300
+    },
+    "P4": {
+      "role": "calibration",
+      "shape": "single_s",
+      "amplitude_m": 6,
+      "D_start_m": 400,
+      "D_end_m": 300
+    },
+    "V0": {
+      "role": "final_evaluation",
+      "shape": "straight",
+      "amplitude_m": 0,
+      "D_start_m": 600,
+      "D_end_m": 400
+    }
+  },
+  "trajectory_equations": {
+    "s_domain": [
+      0,
+      1
+    ],
+    "D": "D_start + (D_end-D_start)*s",
+    "z": "D*tan(20deg)",
+    "straight_x": "0",
+    "bow_x": "A*sin(pi*s)^2",
+    "single_s_x": "A*sin(2*pi*s)^3",
+    "samples_are_not_hover_waypoints": true,
+    "reference_generator": "05_generate_reference.py"
+  },
+  "motion": {
+    "reference_update_hz": 50,
+    "cruise_speed_3d_mps": 5,
+    "speed_ramp_s": 5,
+    "speed_profile": "half-cosine acceleration for tr seconds, constant-speed cruise, half-cosine deceleration for tr seconds",
+    "length_parameterization": "arc length along 3D trajectory; not fixed s_dot",
+    "total_time_formula": "T=L/v+tr, requiring L>=v*tr",
+    "settle_before_science_s": 5,
+    "settle_speed_max_mps": 0.3,
+    "settle_position_error_max_m": 0.5,
+    "settle_heading_error_max_deg": 3,
+    "settle_timeout_s": 120,
+    "postscience_hold_s": 5,
+    "intermediate_holds": false,
+    "main_window": "science_start through science_end at reference duration T; acceleration/deceleration included; record dynamic early termination as performance outcome",
+    "tracking_warning_p95_m": 1,
+    "preflight_desired_acceleration_limit_mps2": 3
+  },
+  "environment": {
+    "world_lighting_background": "freeze existing world configuration and record hashes",
+    "weather": "no new sweep",
+    "wind": "keep existing setting, log it; do not silently add wind to force diversity",
+    "rng_policy": "reset each execution; request manifest seed; record which actual stochastic components accept it",
+    "rng_unsupported_policy": "label seed_effective=false; do not claim independent Monte Carlo flight trials; raw duplicate check required"
+  },
+  "capture": {
+    "reference_gt_rate_hz_min": 50,
+    "reference_gt_rate_hz_preferred": 100,
+    "pair_time_tolerance_s": 0.001,
+    "time_domain": "Gazebo simulation time, with simulation epoch",
+    "pair_policy": "unique source-frame pairs; no reusing a source frame in multiple nominal pairs; save unmatched observations",
+    "interpolation": "positions linear at image time; orientation shortest-path quaternion SLERP; no extrapolation; max bracketing gap 0.04s",
+    "raw_image_storage": "lossless camera images in rosbag2 or equivalent lossless stream with frame-to-timestamp mapping",
+    "overlays": "optional visualization only, not a substitute for raw images",
+    "detection_failures": "retain all image records with explicit detection status and null coordinates; never encode missing bbox as (0,0)",
+    "ideal_projection": "diagnostic channel from synchronized GT and true camera pose; never pass to actual-YOLO estimator"
+  },
+  "calibration_contract": {
+    "primary_variant": "RPY_IMU",
+    "baseline_variant": "YAW_ONLY",
+    "camera_centers": {
+      "optimized": false,
+      "main_value": "fixed measured RTK optical-center coordinates, after known antenna-to-optical-center lever-arm transform",
+      "synthetic_measurement": "C_meas_i = C_true_i + e_i; e_i sampled once per camera/MC trial and shared across calibration paths and V0 in the same rig/repetition/trial",
+      "sigma_xyz_m": [
+        0.02,
+        0.02,
+        0.04
+      ],
+      "covariance_use": "store and propagate in Monte Carlo; not a position optimization prior or permission to move camera centers",
+      "unknown_lever_arm": "record null and limitation; do not label antenna coordinates as optical center without a transform"
+    },
+    "variants": {
+      "RPY_IMU": {
+        "role": "primary",
+        "camera_dof_per_camera": 3,
+        "camera_dof_stereo_pair": 6,
+        "estimated_parameters_per_camera": [
+          "phi_roll",
+          "theta_pitch_correction",
+          "psi_heading"
+        ],
+        "roll_pitch": "estimated with finite camera-mounted IMU priors, not locked",
+        "camera_translation_optimized": false
+      },
+      "YAW_ONLY": {
+        "role": "baseline",
+        "camera_dof_per_camera": 1,
+        "camera_dof_stereo_pair": 2,
+        "estimated_parameters_per_camera": [
+          "psi_heading"
+        ],
+        "roll_pitch": "fixed at the same measured IMU prior means used to initialize RPY_IMU; never replace by true angles in this baseline",
+        "camera_translation_optimized": false
+      },
+      "YAW_IDEAL": {
+        "role": "idealized_diagnostic_only",
+        "camera_dof_stereo_pair": 2,
+        "roll_pitch": "fixed true angles",
+        "camera_centers": "fixed true centers",
+        "main_comparison": false
+      }
+    },
+    "imu_prior": {
+      "sensor": "camera-mounted IMU; not drone body attitude",
+      "mean": "noisy camera roll/pitch measurement, in the declared optical attitude parameterization",
+      "main_sigma_deg": 0.02,
+      "stress_sigma_deg": 0.05,
+      "ideal_sigma_deg": 0,
+      "noise_policy": "independent Gaussian roll/pitch measurement error, sampled once per camera/trial and held across calibration and evaluation; explicitly simulated",
+      "units": "internal angles in radians, covariance in radians squared",
+      "cost": "sum_i r_i.T @ inv(Sigma_IMU_i) @ r_i, r_i=[wrap(phi_i-mu_phi_i), theta_i-mu_theta_i]",
+      "zero_sigma_policy": "only an explicitly labeled idealized fixed-angle control; never invert zero covariance or call it the main RPY_IMU experiment",
+      "mount_transform": "record IMU-to-optical rotation; convert measured angles and covariance consistently"
+    },
+    "yaw_prior": {
+      "main_regularization": "none",
+      "use": "initialization only; Y0..Y6 are fixed initial biases, not exact prior standard deviations",
+      "rank_deficiency_policy": "report conditioning, failure or prior dependence; do not silently add GT yaw or a true-pose constraint"
+    },
+    "comparison_matrix": {
+      "methods": [
+        "A_rtk_independent",
+        "B_rtk_joint",
+        "C_no_drone_rtk_joint"
+      ],
+      "variants": [
+        "RPY_IMU",
+        "YAW_ONLY"
+      ],
+      "paired_inputs": "same initial camera attitude, camera RTK coordinates, IMU observations, image samples and random draws; same drone RTK observations for A/B only",
+      "latent_points": "B/C may estimate drone positions; their trajectory unknowns are additional to camera attitude DOFs and never camera translation variables"
+    },
+    "derived_trial_files": [
+      "sensor_observations.json",
+      "trial_config.json",
+      "calibration_results.json",
+      "evaluation_results.json"
+    ],
+    "result_fields": [
+      "method",
+      "attitude_variant",
+      "camera_dof",
+      "latent_dof",
+      "fixed_camera_centers_world_m",
+      "imu_prior_means_rad",
+      "imu_prior_covariance_rad2",
+      "initial_R_WC",
+      "estimated_R_WC",
+      "estimated_phi_theta_psi_rad",
+      "attitude_covariance_rad2",
+      "conditioning",
+      "convergence_status",
+      "calibration_run_id",
+      "evaluation_run_id",
+      "mc_seed"
+    ]
+  },
+  "reprocessing": {
+    "yaw_bias_cases_deg": [
+      {
+        "id": "Y0",
+        "bias_left_deg": 0,
+        "bias_right_deg": 0
+      },
+      {
+        "id": "Y1",
+        "bias_left_deg": 0,
+        "bias_right_deg": 0.5
+      },
+      {
+        "id": "Y2",
+        "bias_left_deg": 0,
+        "bias_right_deg": -0.5
+      },
+      {
+        "id": "Y3",
+        "bias_left_deg": 0.5,
+        "bias_right_deg": 0.5
+      },
+      {
+        "id": "Y4",
+        "bias_left_deg": -0.5,
+        "bias_right_deg": -0.5
+      },
+      {
+        "id": "Y5",
+        "bias_left_deg": 0.5,
+        "bias_right_deg": -0.5
+      },
+      {
+        "id": "Y6",
+        "bias_left_deg": -0.5,
+        "bias_right_deg": 0.5
+      }
+    ],
+    "yaw_extension_abs_deg": [
+      0.1,
+      1.0
+    ],
+    "bias_definition": "reported initial heading minus true heading; constant for a calibration/evaluation trial, not white noise at every frame",
+    "roll_pitch_bias_sigma_deg": [
+      0,
+      0.02,
+      0.05
+    ],
+    "rotation_perturbation": "R_hat_WC = Rz_world(-b_yaw) @ R_true_WC @ Rx_optical(b_pitch) @ Rz_optical(b_roll)",
+    "roll_pitch_note": "pitch about optical right, roll about optical forward; this formula defines order, not implicit Euler addition",
+    "rtk_sigma_xyz_m": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        0.02,
+        0.02,
+        0.04
+      ],
+      [
+        0.1,
+        0.1,
+        0.2
+      ]
+    ],
+    "rtk_noise_model": "baseline iid Gaussian is explicitly idealized; extra shared-ENU bias trial N(0,diag(0.02^2,0.02^2,0.04^2)) drawn once and fixed across calibration/test; same drone RTK realization for A and B",
+    "rtk_sample_rate_hz": 10,
+    "pixel_iid_sigma_px": [
+      0,
+      0.5,
+      1.0
+    ],
+    "pixel_noise_policy": "synthetic point branch only for base pixel-noise sweep; actual YOLO branch uses actual detections without mandatory extra noise",
+    "camera_position_sigma_xyz_m": [
+      0.02,
+      0.02,
+      0.04
+    ],
+    "camera_position_bias_policy": "main uses measured, biased camera coordinates; draw once per camera/trial and share across paths/methods/calibration/evaluation; never optimize positions",
+    "timestamp_offsets_s": [
+      0,
+      0.02,
+      -0.02,
+      0.05,
+      -0.05
+    ],
+    "timestamp_offset_definition": "reported timestamp = true exposure/sample timestamp + offset; no content edits",
+    "timing_tests": "shift drone RTK only, or right camera only, in separate tests; shift observed record timestamps before pairing, never GT truth",
+    "mc_repeats": 100,
+    "full_factorial": false,
+    "matched_sample_comparison_n": 200,
+    "matched_sample_policy": "report all-data performance plus an additional 200-pair time-stratified comparison; if fewer than 200 valid pairs, flag unmet sample count, do not duplicate frames or discard the run",
+    "methods": [
+      "M0_sensor_only",
+      "A_rtk_independent",
+      "B_rtk_joint",
+      "C_no_drone_rtk_joint",
+      "ORACLE_true_camera_pose"
+    ],
+    "main_control": "G0, Y0..Y6, RPY_IMU primary versus YAW_ONLY baseline for A/B/C; fixed measured camera RTK centers; camera IMU sigma 0.02deg; drone RTK sigma xyz (0.02,0.02,0.04)m for A/B",
+    "ideal_control": "YAW_IDEAL with true camera centers/roll/pitch and ideal drone RTK is a separate diagnostic; it does not replace the main noisy comparison",
+    "offline_stages": [
+      "validate geometry and idealized estimator behavior",
+      "run paired main RPY_IMU versus YAW_ONLY comparisons on G0",
+      "run G1 with nominal zero initial heading and the same noisy position/IMU policy",
+      "extend one factor at a time on P0 and a path selected without V0 outcomes"
+    ],
+    "G1_primary_initial_heading_deg": {
+      "left": 0,
+      "right": 0
+    },
+    "G1_primary_bias_vs_truth_deg": {
+      "left": -0.5,
+      "right": 0.5
+    },
+    "G1_no_double_injection": "primary G1 starts at nominal zero heading; do not add Y6 again",
+    "data_separation": "truth used only by simulated-sensor producer and evaluator; estimators see an explicit input allowlist",
+    "C_prior_policy": "fixed measured camera RTK centers; same finite camera IMU priors in RPY_IMU or fixed IMU means in YAW_ONLY; no main yaw penalty; never use drone RTK/GT or commanded reference trajectory as known 3D points",
+    "B_joint_requirement": "shared latent drone points and RTK uncertainty; two independent objectives concatenated are not a new joint method"
+  },
+  "split_policy": {
+    "development": "G0 calibration flights only, plus geometric synthetic validation; select algorithm/settings without V0 errors",
+    "final_test": "all V0 flights locked until algorithms, hyperparameters and path selection are frozen",
+    "G1_P4": "predeclared representative S path, not claimed optimal; no adaptive substitution using final test results",
+    "evaluation_pairing": "same rig group and repetition; evaluate each calibration path on corresponding V0, reuse same test flight across methods",
+    "evaluation_calibration_frozen": "fix camera centers and calibrated rotations before V0; use V0 images only for drone position estimation, never recalibrate on V0",
+    "selection_target_error_m": null,
+    "selection_policy": "until a numeric requirement is supplied report accuracy/time tradeoff and predict error from calibration uncertainty; no invented pass threshold",
+    "limitation": "39 runs do not alone prove global path optimality, sensor-spec realism or field/helicopter performance"
+  },
+  "validity": {
+    "labels": [
+      "PLANNED",
+      "RUNNING",
+      "VALID",
+      "VALID_WITH_WARNINGS",
+      "INFRASTRUCTURE_FAILED",
+      "PROTOCOL_DEVIATION"
+    ],
+    "success_not_required": [
+      "low position RMSE",
+      "successful calibration convergence",
+      "high YOLO detection rate"
+    ],
+    "retry_allowed": "recorder failure, missing required streams, corrupt files, wrong fixed config, or infrastructure-caused launch/flight interruption; retain original attempt",
+    "retry_rule": "same run_id and requested seed, increment attempt_id; fix shared cause before continuing; two failed technical attempts trigger root-cause report",
+    "performance_failures": "keep and report detection/estimation/flight-control/dynamics failures when recording is intact; no rerun merely because performance is poor",
+    "protocol_revisions": "version and hash all changes; do not pool pre-change and post-change trials as identical"
+  },
+  "required_run_files": [
+    "run_manifest.json",
+    "effective_config.json",
+    "checksums.sha256",
+    "events.jsonl",
+    "flight_reference.json",
+    "flight_state.jsonl",
+    "camera_truth.json",
+    "observations_left.jsonl",
+    "observations_right.jsonl",
+    "paired_observations.jsonl",
+    "ground_truth.jsonl",
+    "image_index.jsonl",
+    "raw_images_or_lossless_bag",
+    "runtime.log",
+    "qc_report.json"
+  ],
+  "required_observation_fields": [
+    "run_id",
+    "attempt_id",
+    "simulation_epoch",
+    "camera_id",
+    "frame_id",
+    "image_timestamp_ns",
+    "receive_timestamp_ns",
+    "inference_end_timestamp_ns",
+    "detection_status",
+    "bbox_xyxy_px",
+    "bbox_center_uv_px",
+    "confidence",
+    "image_width_px",
+    "image_height_px",
+    "original_image_reference",
+    "yolo_weights_sha256"
+  ],
+  "sources": {
+    "existing_run": "run11-final initial 122 cases plus supporting execution metadata",
+    "existing_git_commit_reference_only": "6e428ca564f345a482b4035bf8fa459cd6d47956",
+    "historical_repository_path_hint": "/home/moon/Desktop/SASL-20260821",
+    "student_local_repo": "discover; never assume historical path still exists",
+    "existing_oracle_field": "correction_source=gazebo_observed_optical_pose; not a fitted calibration result"
+  }
+}

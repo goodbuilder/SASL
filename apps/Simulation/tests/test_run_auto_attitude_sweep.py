@@ -8,7 +8,7 @@ RUNNER = ROOT / "run_auto_attitude_sweep.sh"
 
 def test_auto_attitude_sweep_help_is_available_without_ros_runtime():
     result = subprocess.run(
-        [str(RUNNER), "--help"],
+        [str(RUNNER), "--legacy", "--help"],
         cwd=ROOT,
         check=True,
         capture_output=True,

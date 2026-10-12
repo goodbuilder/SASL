@@ -1,0 +1,36 @@
+{
+  "status": "PACKAGE_VALIDATION_PASS",
+  "document_version": "1.1",
+  "date_kst": "2026-10-05",
+  "student_gazebo_executed": false,
+  "calibration_estimators_implemented_or_tested_here": false,
+  "human_guide_pages": 9,
+  "pdf_visual_review": "all 9 rendered pages inspected; no clipping or overflow",
+  "planned_runs": 39,
+  "group_counts": {
+    "G0": 30,
+    "G1": 9
+  },
+  "manifest_byte_identical_to_v1_0": true,
+  "rendering_and_flight_configuration_unchanged": true,
+  "reference_generator_byte_identical_to_v1_0": true,
+  "reference_outputs_byte_identical_to_v1_0": true,
+  "additional_flights_due_to_revision": 0,
+  "primary_variant": "RPY_IMU",
+  "baseline_variant": "YAW_ONLY",
+  "camera_attitude_dofs": {
+    "RPY_IMU": 6,
+    "YAW_ONLY": 2
+  },
+  "camera_positions_optimized": false,
+  "all_run_ids_present_in_guide": true,
+  "python_reference_generator_executed_successfully": true,
+  "minimum_ideal_reference_point_margin_px": 198.564,
+  "maximum_reference_acceleration_mps2": 1.574299659871177,
+  "limits": [
+    "document/specification consistency and reference geometry only",
+    "student source code not inspected",
+    "actual mesh visibility, PX4 tracking and recorder require student-computer verification",
+    "calibration convergence, uncertainty and measurement accuracy not experimentally verified"
+  ]
+}

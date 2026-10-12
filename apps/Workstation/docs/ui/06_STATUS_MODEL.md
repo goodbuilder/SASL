@@ -7,6 +7,13 @@
 
 > Command is intent. Status is evidence.
 
+Measurement Run state is owned by the Qt-free `MeasurementRunService`; the UI reads its projection.
+`Data > Status > Method 계산 상태` exposes cached method execution state, elapsed time, pending
+work and original Run/Pair. Elapsed time alone does not establish failure. A recovery request is
+pending until the actor reports RESTARTED, REJECTED or FAILED. RESTARTED means process replacement,
+not successful completion of a subsequent calculation. See the
+[current Measurement contract](../MEASUREMENT_RUNTIME_CONTRACT.md).
+
 ## 2. Status Dimensions
 
 Potential independent dimensions:
@@ -374,3 +381,9 @@ Implementation note: `BackendStatusAdapter` is the aggregate status projection a
 `EvidenceAdapter` supplies detailed read-only values. A command being accepted does not
 make a device live, a recording saved, or a measurement valid; the corresponding source
 status and age/clock evidence must confirm it.
+
+## Target reference status additions
+
+Search state is independent: IDLE/SEARCHING/CANCELLING/FOUND/EMPTY/PARTIAL/CANCELLED/FAILED. Device presence without a heartbeat is NO HEARTBEAT; unsupported zero IDs are not verified. Candidate observation is distinct from a connected target.
+
+The existing Target controller phase/stream_state remain authoritative for connection. Async Stop has a separate STOPPING operation. HEARTBEAT/GPS_RAW_INT/GPS2_RAW/ATTITUDE use host-monotonic receive age: UNKNOWN without evidence, STALE after3s, otherwise VALID/INVALID according to the packet fields and GPS fix. RTK_FIXED/RTK_FLOAT describe the reported fix alongside age. No target status is promoted to calibration truth or a new Measurement admission gate.

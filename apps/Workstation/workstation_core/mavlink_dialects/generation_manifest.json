@@ -1,0 +1,56 @@
+{
+  "schema": "workstation-mavlink-reproduction-v1",
+  "provenance": {
+    "px4_commit": "7b1e54889d5bf8120f843fd88760ab4b6e2825f5",
+    "mavlink_commit": "51a47ee9aed1216532f2eefbfe8d260a2e3cabcc",
+    "bundled_pymavlink_commit": "5977f44504f01715a44bed44a4601e6c12cef92d",
+    "unpatched_common_git_blob": "4b37e5eb5a2df16927fb6e70ad803bf7f79dfa7d",
+    "patch": "../../firmware/patches/px4-v1.17-sasl-can-mag-mavlink-dialect.patch",
+    "patch_sha256": "a076fea2dd3a743d9622d8ff7daf980ca68444b8c4ccb1fb8088c206302f8104"
+  },
+  "generator": {
+    "distribution": "pymavlink",
+    "version": "2.4.49",
+    "language": "Python",
+    "wire_protocol": "2.0",
+    "validate": true,
+    "strict_units": false,
+    "files": {
+      "mavgen.py": "bebf0e5293b9e810ac6f6c3e2c861f9623379699e13bf57d226ae085bddf2cb5",
+      "mavgen_python.py": "fed7e3617b9d525270938a41bcf9e96dd4a566f76fa11af1665bc3db378671f0",
+      "mavparse.py": "51a8e249149c217a08695a7ff40ccb7b8489f23a9987da4d898abc7d8a24b937",
+      "mavcrc.py": "aedadc06433a01392675034c4056b9fe9962b25dc8c56a5f21856bfd678cfcfd",
+      "mavtemplate.py": "79f2745a31f3fb1965ecbc27b4407472ed371f0a277bdc46ead83b7ec8bfc2de"
+    }
+  },
+  "inputs": {
+    "COPYING": "81133ba4d3343a0e627dd0d9582134f956bc9dc82322d369c561249cc2910224",
+    "common.xml": "9bb59df5b2fd3e08217eb475fb99099ab1dd826e7a04fa8257bc38272250ad1e",
+    "mavschema.xsd": "35b23e9eaa6821beb115141fef037540b0d15fc60871f110974cef8bf611e355",
+    "minimal.xml": "7bbf84456396089cf4dd9661ebe94e48a81009c047e826ed2778b4b9be60145c",
+    "standard.xml": "1c92c50e0a4d4cc29e4125dff33b16062e1e285a6271292fb3a4266576487e65"
+  },
+  "generated": {
+    "filename": "sasl_can_mag_dialect.py",
+    "sha256": "7ed861c4d01a48e1c972cd1936b4410e29f209f1e428178f704564868f4ea2ba",
+    "message_count": 235
+  },
+  "private_message_contract": {
+    "id": 180,
+    "name": "SASL_CAN_MAG",
+    "crc_extra": 233,
+    "magnetic_frame": "raw sensor frame",
+    "magnetic_axes": [
+      "xmag",
+      "ymag",
+      "zmag"
+    ],
+    "magnetic_units": "Gauss",
+    "sample_time_field": "time_usec",
+    "sample_time_units": "us since system boot",
+    "can_port": {
+      "1": "CAN1",
+      "2": "CAN2"
+    }
+  }
+}

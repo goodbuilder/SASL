@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from Workstation.wiris_workers import io as _wiris_worker_io
+from Workstation.wiris_workers import policy as _wiris_worker_policy
+from Workstation.wiris_workers import clock as _wiris_clock_owner
+
 from types import SimpleNamespace
 from collections import deque
 import threading
@@ -41,7 +45,7 @@ def test_stus_field_latency_hiws_probe_remains_usable_and_bounded(monkeypatch) -
     monkeypatch.setattr(wiris_runtime_workers.time, "perf_counter", lambda: next(perf_counter_values))
     probe_timeouts: list[float] = []
     monkeypatch.setattr(
-        wiris_runtime_workers,
+        _wiris_worker_io,
         "send_tcp_line",
         lambda command: probe_timeouts.append(float(command.timeout_s)) or "OK",
     )
@@ -73,7 +77,7 @@ def test_stus_hiws_probe_retries_empty_responses_and_accepts_measured_three_seco
         lambda: next(perf_counter_values),
     )
     monkeypatch.setattr(
-        wiris_runtime_workers,
+        _wiris_worker_io,
         "send_tcp_line",
         lambda command: timeouts.append(float(command.timeout_s)) or next(responses),
     )
@@ -92,7 +96,7 @@ def test_stus_hiws_probe_retries_empty_responses_and_accepts_measured_three_seco
     assert probe["median_s"] == pytest.approx(2.49)
     assert len(timeouts) == 4
     assert worker._stus_compensation_s(probe["median_s"]) == pytest.approx(1.247)
-    assert worker._stus_compensation_s(3.9) < wiris_runtime_workers.WIRIS_STUS_MAX_ABSOLUTE_COMPENSATION_S
+    assert worker._stus_compensation_s(3.9) < _wiris_worker_policy.WIRIS_STUS_MAX_ABSOLUTE_COMPENSATION_S
 
 
 def test_stus_hiws_preflight_observes_left_and_right_in_parallel(monkeypatch) -> None:
@@ -117,7 +121,7 @@ def test_stus_hiws_preflight_observes_left_and_right_in_parallel(monkeypatch) ->
         "_measure_control_rtt",
         fake_probe,
     )
-    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", lambda _command: "OK")
+    monkeypatch.setattr(_wiris_worker_io, "send_tcp_line", lambda _command: "OK")
     completed: list[object] = []
     worker = wiris_runtime_workers.WirisClockCommandWorker(
         (
@@ -158,7 +162,7 @@ def test_stus_field_apply_latency_uses_dedicated_bounded_response_timeout(monkey
         },
     )
     monkeypatch.setattr(
-        wiris_runtime_workers,
+        _wiris_worker_io,
         "send_tcp_line",
         lambda command: command_timeouts.append(float(command.timeout_s)) or "OK",
     )
@@ -201,7 +205,7 @@ def test_stus_response_timeout_is_terminal_and_right_remains_untouched(monkeypat
         command_timeouts.append(float(command.timeout_s))
         raise TimeoutError("camera STUS response timeout")
 
-    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", timeout_send)
+    monkeypatch.setattr(_wiris_worker_io, "send_tcp_line", timeout_send)
     completed: list[object] = []
     worker = wiris_runtime_workers.WirisClockCommandWorker(
         (
@@ -445,7 +449,7 @@ def test_stus_both_is_left_ack_then_right_even_if_targets_arrive_reversed(monkey
         calls.append((str(command.host), str(command.command)))
         return "OK"
 
-    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
+    monkeypatch.setattr(_wiris_worker_io, "send_tcp_line", fake_send)
     def fake_probe(self, *, host: str, **_kwargs):
         probe_hosts.append(host)
         return {
@@ -487,7 +491,7 @@ def test_stus_both_does_not_send_right_when_left_ack_is_not_ok(monkeypatch) -> N
         calls.append(str(command.host))
         return "ERR rejected"
 
-    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
+    monkeypatch.setattr(_wiris_worker_io, "send_tcp_line", fake_send)
     def fake_probe(self, *, host: str, **_kwargs):
         probe_hosts.append(host)
         return {
@@ -528,7 +532,7 @@ def test_stus_closed_loop_attempt_still_skips_right_after_left_failure(monkeypat
         calls.append((str(command.host), str(command.command)))
         return "OK" if str(command.command) == "HIWS" else "ERR rejected"
 
-    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
+    monkeypatch.setattr(_wiris_worker_io, "send_tcp_line", fake_send)
     monkeypatch.setattr(
         wiris_runtime_workers.WirisClockCommandWorker,
         "_measure_control_rtt",
@@ -591,7 +595,7 @@ def test_stus_preflight_side_failure_causes_zero_clock_mutations(monkeypatch) ->
         fake_probe,
     )
     monkeypatch.setattr(
-        wiris_runtime_workers,
+        _wiris_worker_io,
         "send_tcp_line",
         lambda command: mutations.append(str(command.command)) or "OK",
     )
@@ -635,7 +639,7 @@ def test_stus_direct_cancellation_after_left_io_prevents_right_mutation(monkeypa
         worker.cancel()
         return "OK"
 
-    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
+    monkeypatch.setattr(_wiris_worker_io, "send_tcp_line", fake_send)
     failures: list[str] = []
     completed: list[object] = []
     worker = wiris_runtime_workers.WirisClockCommandWorker(
@@ -666,12 +670,20 @@ def test_stus_direct_cancellation_after_left_io_prevents_right_mutation(monkeypa
 def test_stus_post_io_deadline_preserves_left_ack_and_skips_right(monkeypatch) -> None:
     from Workstation import wiris_runtime_workers
 
-    monotonic_values = iter((99.9, 100.1))
+    real_monotonic = time.monotonic
+    now_s = [99.9]
     mutations: list[str] = []
+    # The stdlib time module is shared with live measurement writer threads.
+    # Replace only this worker module's clock, and advance it at the I/O
+    # boundary rather than depending on a fixed number of clock reads.
     monkeypatch.setattr(
-        wiris_runtime_workers.time,
-        "monotonic",
-        lambda: next(monotonic_values),
+        _wiris_clock_owner,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: now_s[0],
+            time=time.time,
+            perf_counter=time.perf_counter,
+        ),
     )
     monkeypatch.setattr(
         wiris_runtime_workers.WirisClockCommandWorker,
@@ -684,11 +696,13 @@ def test_stus_post_io_deadline_preserves_left_ack_and_skips_right(monkeypatch) -
             "warnings": ["high latency"],
         },
     )
-    monkeypatch.setattr(
-        wiris_runtime_workers,
-        "send_tcp_line",
-        lambda command: mutations.append(str(command.host)) or "OK",
-    )
+
+    def fake_send(command) -> str:
+        mutations.append(str(command.host))
+        now_s[0] = 100.1
+        return "OK"
+
+    monkeypatch.setattr(_wiris_worker_io, "send_tcp_line", fake_send)
     completed: list[object] = []
     worker = wiris_runtime_workers.WirisClockCommandWorker(
         (
@@ -702,6 +716,7 @@ def test_stus_post_io_deadline_preserves_left_ack_and_skips_right(monkeypatch) -
 
     worker.run()
 
+    assert time.monotonic is real_monotonic
     assert mutations == ["10.0.0.231"]
     assert completed[0]["results"]["left"]["ack_ok"] is True
     assert (

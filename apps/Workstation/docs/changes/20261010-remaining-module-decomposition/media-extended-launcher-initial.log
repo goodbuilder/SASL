@@ -1,0 +1,20 @@
+Traceback (most recent call last):
+  File "/tmp/run_media_extended_qualification.py", line 25, in <module>
+    result = qualification.run_qualification(duration_s=180.0, gui_stall_s=2.0, evidence_period_s=2.0)
+  File "/home/moontaehyung/바탕화면/SASL-20261009/apps/Workstation/qualify_camera_backpressure.py", line 433, in run_qualification
+    process.start()
+  File "/usr/lib/python3.10/multiprocessing/process.py", line 121, in start
+    self._popen = self._Popen(self)
+  File "/usr/lib/python3.10/multiprocessing/context.py", line 288, in _Popen
+    return Popen(process_obj)
+  File "/usr/lib/python3.10/multiprocessing/popen_spawn_posix.py", line 32, in __init__
+    super().__init__(process_obj)
+  File "/usr/lib/python3.10/multiprocessing/popen_fork.py", line 19, in __init__
+    self._launch(process_obj)
+  File "/usr/lib/python3.10/multiprocessing/popen_spawn_posix.py", line 47, in _launch
+    reduction.dump(process_obj, fp)
+  File "/usr/lib/python3.10/multiprocessing/reduction.py", line 60, in dump
+    ForkingPickler(file, protocol).dump(obj)
+_pickle.PicklingError: Can't pickle <class 'Workstation.workstation_core.yolo_stream._BoundedProcessOutputQueue'>: import of module 'Workstation.workstation_core.yolo_stream' failed
+/usr/lib/python3.10/multiprocessing/resource_tracker.py:224: UserWarning: resource_tracker: There appear to be 1 leaked shared_memory objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '

@@ -1,0 +1,26 @@
+{
+  "baseline_ref": "42b16e0",
+  "note": "Source/test/CI hashes after final path-byte guard; full runtime regression plus targeted final gate regression.",
+  "sha256": {
+    ".github/workflows/quality.yml": "19c5ded7be2bc23a2f45058f88ae664615f9640ad7924e874a9a43e1987df418",
+    "apps/Workstation/camera_stream_controller.py": "f56c0a95d63d8924364e35fbb286987acc01d5cdd5df882c52f56877ffa56dc0",
+    "apps/Workstation/measurement_run_controller.py": "7b81f4d6ca8d4982611642cca99dc4690af62935d2484140fa34f5e961d8fc5d",
+    "apps/Workstation/measurement_view_controller.py": "57d66cf8ba13834f41367214f14de8098a20eb49af1b09526c868e71ec792f00",
+    "apps/Workstation/method_worker_pane.py": "758fccec54579d86334304b4c21181d186bf41149f01c261d2173e3a6a1c5328",
+    "apps/Workstation/standalone_backend.py": "502bad6dcf6b5599eb43c9358166f42fd54a37d5d99cdbed5b825d570c56f515",
+    "apps/Workstation/tests/test_camera_stream_recovery.py": "f3e27e5b25afd13076b0083efb2f19c79b38d5e4a17c128e32b5072115e3e9e6",
+    "apps/Workstation/tests/test_measurement_run_controller.py": "5bfeb3d9bf79f36515561fac0880c4b298c8f90f7c800c197404d762388abeb2",
+    "apps/Workstation/tests/test_measurement_run_service.py": "d338f013cb514131bd83126a92a6d7ce62fe5d102c4488041a0d4af233169a21",
+    "apps/Workstation/tests/test_method_payload_immutability.py": "8dcd56e6e8ba81233de38c4cecda127901897f211565a94028b2f80a50f195b7",
+    "apps/Workstation/tests/test_method_worker_recovery.py": "7465fea1ea782ec35dc3557fae407246313e4e50751e95f6ab9befa4199c5def",
+    "apps/Workstation/tests/test_method_worker_recovery_ui.py": "02538073ff7059cf7bb5ab42075b956df13c7ab454a6473d607a32e7c6490718",
+    "apps/Workstation/tests/test_quality_workflow.py": "f3b642d6f1e404711e97ca912374e2c3e0317c7f69f2fc2e2bbc59f663ee0260",
+    "apps/Workstation/workspaces.py": "e39ca0f9ff8a1ce15a7dded6bd768052aa6f308cf47cc6a1f58ecae68a16c895",
+    "apps/Workstation/workstation_core/immutable_json.py": "ad2b01d4e764dd7bad0de8b2ef46cf53dd01a0ba179becda9ec43d703d695b7b",
+    "apps/Workstation/workstation_core/measurement_attempt.py": "7b2e4592cc3d5b4c96486f99f4dbebd66ea91c93bbe90e3ca4eed4bdba94677a",
+    "apps/Workstation/workstation_core/measurement_run.py": "cc92763b83f1f34a2ea9422a47e7159d93649005e82d65ff967acedadc694a7a",
+    "apps/Workstation/workstation_core/method_evaluation.py": "60414676e28ebc09543da8172c89ac992390bcb9b7a39a6abf3416e7eef65a75",
+    "apps/Workstation/workstation_core/method_evaluation_workers.py": "36ddad95a52837acafe2411e11961f74bb896391361919ac29d321f035a696af",
+    "tools/check_portable_paths.py": "3d6715c7d66905d66e11d315d9c834842538ab811bb2db1aa134fb6ac356ba07"
+  }
+}

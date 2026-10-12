@@ -1,0 +1,2 @@
+# This is the default manifest campaign input and must be available in a checkout.
+!/config/campaign/v1_1/sweep_manifest_v1_1.xlsx

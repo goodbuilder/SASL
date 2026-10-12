@@ -110,6 +110,14 @@ apps/Workstation/calibration/
 *.pptx
 *.xlsx
 *.xls
+# Human-readable parameter workbook example is a source config artifact.
+!apps/Simulation/config/campaign/v1_1/multi_flight_parameters_example.xlsx
+!apps/Simulation/config/campaign/v1_1/multi_flight_parameters_per_run_matrix_example.xlsx
+!apps/Simulation/config/campaign/v1_1/multi_flight_parameters_self_contained_example.xlsx
+!apps/Simulation/config/campaign/v1_1/multi_flight_parameters_numeric_example.xlsx
+!apps/Simulation/config/campaign/v1_1/multi_flight_parameters_v1_1_numeric.xlsx
+!apps/Simulation/config/campaign/v1_1/multi_flight_parameters_v1_1_numeric_v3.xlsx
+!apps/Simulation/config/campaign/v1_1/multi_flight_parameters_v1_1_numeric.xlsx
 
 # OS/editor noise
 .DS_Store

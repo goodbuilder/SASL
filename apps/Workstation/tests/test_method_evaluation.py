@@ -1609,7 +1609,7 @@ def test_pending_primary_retry_budget_rotates_one_key_per_tick() -> None:
 def test_pending_primary_ownership_is_bounded_with_explicit_overflow_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from Workstation import measurement_view_controller as measurement_module
+    from Workstation.measurement import limits as measurement_module
 
     monkeypatch.setattr(measurement_module, "PERSISTENCE_PENDING_MAX_COUNT", 2)
     monkeypatch.setattr(
@@ -1674,7 +1674,7 @@ def test_pending_primary_ownership_is_bounded_with_explicit_overflow_status(
 def test_pending_primary_single_record_byte_overflow_is_explicit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from Workstation import measurement_view_controller as measurement_module
+    from Workstation.measurement import limits as measurement_module
 
     monkeypatch.setattr(measurement_module, "PERSISTENCE_PENDING_MAX_COUNT", 10)
     monkeypatch.setattr(measurement_module, "PERSISTENCE_PENDING_MAX_BYTES", 1)
@@ -1706,7 +1706,7 @@ def test_pending_primary_single_record_byte_overflow_is_explicit(
 def test_pending_bundle_ownership_and_retry_work_are_bounded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from Workstation import measurement_view_controller as measurement_module
+    from Workstation.measurement import limits as measurement_module
 
     monkeypatch.setattr(measurement_module, "PERSISTENCE_PENDING_MAX_COUNT", 2)
     monkeypatch.setattr(
@@ -1780,7 +1780,7 @@ def test_pending_bundle_ownership_and_retry_work_are_bounded(
 def test_shutdown_terminalizes_permanently_rejected_pending_after_close_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from Workstation import measurement_view_controller as measurement_module
+    from Workstation.measurement import limits as measurement_module
 
     monkeypatch.setattr(
         measurement_module,
@@ -2577,7 +2577,7 @@ def test_context_manager_starts_deferred_workers_once() -> None:
 def test_gui_bundle_commit_reuses_worker_geometry_without_recalculation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from Workstation import measurement_view_controller
+    from Workstation.workstation_core import measurement_controller as measurement_geometry
 
     attempt = _pixhawk_fallback_attempt()
     base = evaluate_method_request(
@@ -2614,7 +2614,7 @@ def test_gui_bundle_commit_reuses_worker_geometry_without_recalculation(
         _set_distance_text=lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
-        measurement_view_controller,
+        measurement_geometry,
         "calculate_measurement_geometry",
         lambda _attempt: (_ for _ in ()).throw(AssertionError("GUI recalculation forbidden")),
     )

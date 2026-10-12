@@ -1,0 +1,123 @@
+{
+  "scope": "Planning only; application source unchanged by this task",
+  "observed_date": "2026-10-10",
+  "head": "42b16e0305120c769aaa6483254d19c08fbf55bf",
+  "baseline_kind": "working tree including pre-existing modified and untracked files; HEAD alone is insufficient",
+  "path_base": "apps/Workstation relative to SASL repository root",
+  "line_count": "physical lines including comments and blanks",
+  "target_count": 15,
+  "targets": [
+    {
+      "path": "calibration_controller.py",
+      "sha256": "852899339f26bf29a05e22be43229e76980e57a2d6bb921f522975b33515c88a",
+      "lines": 5257,
+      "functions_including_nested": 148,
+      "max_function_lines": 257
+    },
+    {
+      "path": "camera_stream_controller.py",
+      "sha256": "f56c0a95d63d8924364e35fbb286987acc01d5cdd5df882c52f56877ffa56dc0",
+      "lines": 2076,
+      "functions_including_nested": 50,
+      "max_function_lines": 158
+    },
+    {
+      "path": "device_runtime_controller.py",
+      "sha256": "d9b391eb53e58d4324ec20cd4784d5ec0a03cfb1240d771f03e6a8dd151914ab",
+      "lines": 3838,
+      "functions_including_nested": 149,
+      "max_function_lines": 100
+    },
+    {
+      "path": "evidence.py",
+      "sha256": "2c8c19bc43ea3003cbd4457f5aa7cd1249afb4f67aca62758c3526646d8ff2dc",
+      "lines": 4094,
+      "functions_including_nested": 71,
+      "max_function_lines": 382
+    },
+    {
+      "path": "gnss_runtime_controller.py",
+      "sha256": "a60a6424e3677d686d5321401f2b7d4a08c035ba15088fed836e42bde7e53f41",
+      "lines": 3445,
+      "functions_including_nested": 109,
+      "max_function_lines": 186
+    },
+    {
+      "path": "main_window.py",
+      "sha256": "bed8cdc1c2b05b09617e74fa99efbd30dde2d8977aa8180602b793c4489f9058",
+      "lines": 2413,
+      "functions_including_nested": 122,
+      "max_function_lines": 729
+    },
+    {
+      "path": "optical_pose_controller.py",
+      "sha256": "641c44feefc0aa0495c2be9615b787e93017ed750d2dca0e4f4fd490d43a09a7",
+      "lines": 5511,
+      "functions_including_nested": 125,
+      "max_function_lines": 305
+    },
+    {
+      "path": "panel_camera.py",
+      "sha256": "e547dae636476975772faef0ab4b68ef8fa6eb30ca6c97086c8c1aa20e95a117",
+      "lines": 3778,
+      "functions_including_nested": 112,
+      "max_function_lines": 468
+    },
+    {
+      "path": "wiris_runtime_workers.py",
+      "sha256": "104d4a59fafccc132ce572e654f414164ec09a3013b21406d42688a978426ea8",
+      "lines": 2612,
+      "functions_including_nested": 83,
+      "max_function_lines": 356
+    },
+    {
+      "path": "workspace_views/calibration.py",
+      "sha256": "a7606753188c8017e021c154c01de8458fc6deec5596567dee8b2c197128b247",
+      "lines": 4136,
+      "functions_including_nested": 125,
+      "max_function_lines": 457
+    },
+    {
+      "path": "workspace_views/optical_pose.py",
+      "sha256": "adc81c5339dca457cbcc8aaebd6ebcafb81bd270df810955d13c5d0c5082baa1",
+      "lines": 2592,
+      "functions_including_nested": 83,
+      "max_function_lines": 722
+    },
+    {
+      "path": "workspace_views/pixhawk.py",
+      "sha256": "0690747e3293265ec65d0f97f6816010e4e9430fb5363a0af1569f5013b2aa94",
+      "lines": 2543,
+      "functions_including_nested": 58,
+      "max_function_lines": 611
+    },
+    {
+      "path": "workstation_core/pixhawk_attitude.py",
+      "sha256": "0e8a42b323830c964282d486d6fd6e173ff89b7fe196c7a0220cd2cbca0d66b9",
+      "lines": 3539,
+      "functions_including_nested": 126,
+      "max_function_lines": 177
+    },
+    {
+      "path": "workstation_core/recording_session.py",
+      "sha256": "a2c9a1d12ed55dab3cef3ae6bbbdfbbbdb4e07b68381c6908a835476eba55c30",
+      "lines": 4435,
+      "functions_including_nested": 128,
+      "max_function_lines": 452
+    },
+    {
+      "path": "workstation_core/yolo_stream.py",
+      "sha256": "62bf4e2c2b92591de26bd85f1a6c74eda859a6349b22f9605af9a16ac5c7a0ba",
+      "lines": 5222,
+      "functions_including_nested": 165,
+      "max_function_lines": 739
+    }
+  ],
+  "generated_code": {
+    "path": "workstation_core/mavlink_dialects/sasl_can_mag_dialect.py",
+    "sha256": "7ed861c4d01a48e1c972cd1936b4410e29f209f1e428178f704564868f4ea2ba",
+    "lines": 27064,
+    "generated": true
+  },
+  "runtime_tests": "NOT_RUN"
+}

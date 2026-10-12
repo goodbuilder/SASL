@@ -9,10 +9,8 @@ from typing import Protocol
 
 from PyQt5 import QtCore
 
-from Workstation.workstation_core.yolo_stream import (
-    GstRtpTimingTracker,
-    normalize_rtsp_transport,
-)
+from Workstation.workstation_core.media_stream.rtp_timing import GstRtpTimingTracker
+from Workstation.workstation_core.media_stream.configuration import normalize_rtsp_transport
 
 
 class ClockProbe(Protocol):

@@ -97,9 +97,11 @@ generation and uses exactly what you gave run_mission.sh instead.
 
 All other options are passed to run_mission.sh, including --quick and mission limits.
 
-For offline attitude-error calibration, use ./run_auto_attitude_sweep.sh. It
-restarts the simulation for each physical optical-RDF attitude case and uses
-the explicit research recorder; normal Auto uses its automatic Full recorder.
+For the v1.1 manifest campaign, use ./run_auto_attitude_sweep.sh; the default
+action validates its campaign XLSX without starting SITL. The former physical
+optical-RDF attitude perturbation sweep is available as
+./run_auto_attitude_sweep.sh --legacy. Normal Auto keeps its automatic Full
+recorder.
 USAGE
 }
 

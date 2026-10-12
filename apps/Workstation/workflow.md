@@ -1,6 +1,6 @@
 # Workstation 표준 작업 순서
 
-이 문서는 2026-08-31 기준 현장 운용 순서다. 가장 중요한 원칙은 저장 완결성보다 **지금 가능한 측정을 실행하는 것**이다.
+이 문서는 2026-10-09 기준 현장 운용 순서다. 가장 중요한 원칙은 저장 완결성보다 **지금 가능한 측정을 실행하는 것**이다.
 
 운용용 Measurement Session은 없다. 새 측정을 위해 폴더를 열거나 닫고, 저장을 확정하거나, 완결성을 복구할 필요가 없다. 과거의 `OPEN`/`RECOVERABLE` 디렉터리와 저장 오류는 `측정 시작`을 비활성화하지 않는다.
 
@@ -42,7 +42,7 @@ export SASL_WORKSTATION_DATA_ROOT=/absolute/path/to/workstation_data
 | Measurement 영상 | `YYYYMMDD_HHMMSS[-NN]_left.mp4`, `..._right.mp4` (동일 Start prefix) |
 | 실행/장치/캡처 이벤트 | `events.jsonl`, `capture_events.jsonl` |
 | 측정 결과 | `measurements.jsonl` |
-| 8개 방법 평가 | `method_evaluations.jsonl` |
+| 준비된 측정 방법 평가 | `method_evaluations.jsonl` |
 | 좌·우 카메라 | `camera_left.jsonl`, `camera_right.jsonl` |
 | P1/P2/Target PX4 | `px4_left.jsonl`, `px4_right.jsonl`, `px4_drone.jsonl` |
 | Base GNSS | `gnss_base.jsonl` |
@@ -116,10 +116,10 @@ IDLE → QUEUED(필요 시) → STARTING → RUNNING → STOPPING → IDLE
   bundle로 append되고, 개별 결과는 도착 즉시 워크북에 반영된다.
 - 여기서 즉시 저장은 비동기 priority enqueue를 뜻한다. 해당 시점에 디스크
   write/flush/`fsync`까지 완료됐다는 뜻은 아니다.
-- 8-method bundle은 enqueue가 승인된 뒤에만 commit/count한다. 활성 행 enqueue가 거부되면
+- 제출된 방법의 bundle은 enqueue가 승인된 뒤에만 commit/count한다. 활성 행 enqueue가 거부되면
   같은 owner-epoch/index lease의 행을 재시도하고, 그 사이 Stop되면 `late=true`로 기록한다.
   owner가 clear/rebind/close되어 lease가 무효가 되면 새 행을 덮지 않고 direct writer로 넘긴다.
-- RUNNING 중 도착한 primary 대표 행 enqueue가 거부되면 8-method bundle 저장 여부와
+- RUNNING 중 도착한 primary 대표 행 enqueue가 거부되면 제출된 방법의 bundle 저장 여부와
   무관하게 background 재시도를 유지한다. Stop/다음 run 이후에는 원래 generation의
   `late_primary_measurement_outcome`만 저장하며 새 run의 표·카운터·그래프·거리 UI는 건드리지 않는다.
 - Data store가 `CLOSING` 또는 `CLOSED`면 새 enqueue를 거부하고 drop/error 증거를
@@ -176,6 +176,18 @@ Stop 시점에 계산 중이던 Method는 계속 실행되며, 그 결과는 나
 
 `FAILED`인 stream은 `Retry Storage`로 재시도할 수 있다. 재시도는 향후 append를 위한 것이며 누락된 과거 행을 재생성하지 않는다. 어떤 상태도 `측정 시작`을 막지 않는다.
 
+## 계산 작업 상태 확인과 복구
+
+`Data > Status > Method 계산 상태`에서 방법을 선택하고 상태·경과 시간·대기 수를 확인한다.
+Run/Pair 식별자는 상태 tooltip에서 확인한다. 경과 시간은 무응답의 증거가 아니며 자동 계산
+제한 시간은 없다. 운영자가 중단을 결정한 경우 `선택 계산 중단·재시작`을 누른다.
+
+표시된 worker/요청 식별자가 실제 소유자와 같을 때만 현재 계산을 `FAILED/operator_restart`로
+기록하고 해당 worker를 교체한다. 대기 계산·다른 방법·관측은 계속한다. 요청 접수와 교체
+완료는 별도 표시이며, 선택이 오래됐으면 거부한다. 교체 실패 후에는 같은 화면에서 다시
+요청할 수 있다. 결과와 복구 event는 원래 Run에 귀속한다. 일반 `측정 종료`는 이 작업을
+자동 실행하지 않는다.
+
 ## 9. 기존 데이터
 
 `recordings/<id>/`, `recordings/sessions/<id>/`의 기존 파일은 삭제·복구·변환하지 않는다. `Data > Status > Open Legacy Recordings Folder`로 file manager에서만 수동 확인한다. 기존 `OPEN`/`RECOVERABLE`은 새 Measurement에 영향을 주지 않는다.
@@ -195,3 +207,11 @@ C_right_in_left = -R^T T
 ```
 
 `T_left_to_right_m`와 `C_right_in_left`를 같은 값의 별칭으로 취급하지 않는다. 후처리할 때도 생산자가 기록한 frame/unit/timestamp 계약을 유지한다.
+
+## Target reference 연결
+
+Data → Status → Target reference에서 Drone을 선택한다. Find Network는 PC 수신 포트의 MAVLink를 관찰하고, Find USB는 선택 baud로 직렬 장치의 heartbeat를 기다린다. 기체 측 송신 설정이 없으면 신원 확인이 되지 않을 수 있다. 후보의 출처·SYS/COMP를 확인한 뒤 Use selected로 초안을 채우고 Connect target을 누른다. 후보의30초 유효기간과 실제 연결 시 신원을 다시 검사한다. 같은 SYS/COMP라도 선택한 UDP peer가 다르면 수신하지 않는다.
+
+heartbeat, GPS1/GPS2와 ATTITUDE의 수신 나이·유효성을 구분한다. GPS가 없거나 STALE이면 해당 상태가 그대로 표시된다. Stop 완료 후 연결 대상을 바꿀 수 있다. 탐색 취소 후에는 worker가 종료된 다음 재탐색한다. Save는 연결 선호값만 저장하며 재시작 자동 연결은 없다.
+
+UAM은 외부 사후 RTK를 기다리는 DEFERRED 상태로 적용한다. Target은 MAVLink 수신 전용이다. Telemetry/P1/P2 연결·RTCM 경로와 독립적이며, Target source가 camera RDF 또는 calibration truth로 자동 변환되지 않는다.

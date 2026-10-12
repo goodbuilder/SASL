@@ -1,0 +1,15 @@
+{
+  "source_manifest": "remaining-completion-source-2.json",
+  "python_file_count": 649,
+  "changed_after_test": [],
+  "added_after_test": [],
+  "passed": 2696,
+  "skipped": 1,
+  "failed": 0,
+  "warnings": 0,
+  "duration_s": 327.64,
+  "exit_code": 0,
+  "skip_reason": "NVENC unsupported by available device",
+  "coordinate_suite": "StereoWIRIS coordinate contract, stereo_geometry_common, triangulation plus Workstation tests",
+  "log": "remaining-completion-full-regression-2.log"
+}

@@ -1,0 +1,120 @@
+{
+  "before_sha256": "104d4a59fafccc132ce572e654f414164ec09a3013b21406d42688a978426ea8",
+  "class_owners": {
+    "clock": [
+      "WirisClockCommandWorker"
+    ],
+    "network": [
+      "WirisStipWorker",
+      "WirisRtspEnableWorker"
+    ],
+    "capture": [
+      "WirisPnPPhotoCaptureWorker",
+      "WirisOZPhotoCaptureWorker"
+    ],
+    "ftp": [
+      "WirisOzFtpSyncWorker",
+      "WirisFtpBatchDeleteWorker"
+    ],
+    "commands": [
+      "WirisCommandWorker",
+      "WirisImageFormatWorker",
+      "WirisLrfPollWorker",
+      "WirisZoomWorker"
+    ],
+    "probe": [
+      "RtspStreamCheckWorker"
+    ]
+  },
+  "wire_effect_names": [
+    "apply_interface_address",
+    "check_tcp_port",
+    "discover_host_interface_candidates",
+    "interface_has_address",
+    "interface_link_exists",
+    "resolve_nm_interface_address",
+    "send_tcp_line"
+  ],
+  "policy_names": [
+    "RTSP_ENABLE_SETTLE_DELAY_MS",
+    "RTSP_ENABLE_PORT_WAIT_INTERVAL_MS",
+    "RTSP_ENABLE_PORT_WAIT_MAX_ATTEMPTS",
+    "ENCODER_PROFILE_COMMAND_SETTLE_MS",
+    "ENCODER_PROFILE_READBACK_RETRY_INTERVAL_MS",
+    "ENCODER_PROFILE_READBACK_MAX_ATTEMPTS",
+    "WIRIS_STUS_RTT_PROBE_COMMAND",
+    "WIRIS_STUS_RTT_PROBE_COUNT",
+    "WIRIS_STUS_MIN_VALID_RTT_PROBES",
+    "WIRIS_STUS_HIGH_RTT_WARNING_S",
+    "WIRIS_STUS_MAX_VALID_RTT_S",
+    "WIRIS_STUS_PARSE_MARGIN_S",
+    "WIRIS_STUS_MAX_ABSOLUTE_COMPENSATION_S",
+    "WIRIS_STUS_MAX_ATTEMPTS",
+    "WIRIS_STUS_MAX_OPERATION_S",
+    "WIRIS_STUS_RESPONSE_TIMEOUT_S",
+    "WIRIS_LRF_COMMAND",
+    "_LRF_NUMBER_RE",
+    "_wait_for_peer_or_continue",
+    "_abort_barrier",
+    "parse_lrf_distance"
+  ],
+  "class_body_check": "All 12 class ASTs unchanged after normalization of explicit io/policy prefixes",
+  "runtime_tests": "PASS: 2315 passed, 1 skipped, 0 warnings, 257.36s, exit 0",
+  "candidate_files": [
+    {
+      "path": "wiris_runtime_workers.py",
+      "sha256": "6979af1214f638aba3f849371fbee37fee9999e0a22652fde24c434c866fc0a7",
+      "lines": 54
+    },
+    {
+      "path": "wiris_workers/__init__.py",
+      "sha256": "ca86557d922b9a30d3b5005d113d52b56ddc7bb061a05c53acdbc80d1690a889",
+      "lines": 1
+    },
+    {
+      "path": "wiris_workers/capture.py",
+      "sha256": "ddd83e7d63edf6c2984300ace37f6ae791c0e29b0b6e50c49e346b68ad55bdc0",
+      "lines": 721
+    },
+    {
+      "path": "wiris_workers/clock.py",
+      "sha256": "7892973974af2135dccc93142b8e84cf4cc2ff99f1249b7cea502ba9e5b520c9",
+      "lines": 580
+    },
+    {
+      "path": "wiris_workers/commands.py",
+      "sha256": "c430ab6b50535801eabecef1392ffa000487c3ab511a7b5da1ec314c0f0bceae",
+      "lines": 353
+    },
+    {
+      "path": "wiris_workers/ftp.py",
+      "sha256": "5777a4d11dee8cc9876128f909f18258972a8f557790358826a78d6d8f62869f",
+      "lines": 249
+    },
+    {
+      "path": "wiris_workers/io.py",
+      "sha256": "93c79aa702ec3d7031e9882a9a81f25b6cce329fc73caa009eb521fa44b23872",
+      "lines": 7
+    },
+    {
+      "path": "wiris_workers/network.py",
+      "sha256": "31f9ac0f61a5276375e687e98106bc0ccb0344562094798ff93f76c9f2a0ec51",
+      "lines": 427
+    },
+    {
+      "path": "wiris_workers/policy.py",
+      "sha256": "ea26047d470961f7dc8ea8659e73188ccfb3da236c20384095efb0687b5aa9e5",
+      "lines": 114
+    },
+    {
+      "path": "wiris_workers/probe.py",
+      "sha256": "96220163166a98033bd2457b547bc2c50cfbdf45fcb7e46bee4ac66882754603",
+      "lines": 268
+    },
+    {
+      "path": "tests/test_wiris_worker_boundaries.py",
+      "sha256": "6789ab879375ea03d46a9d4e2374bb0b78127e8c9d3e37e4cb60c3b80eeebfca",
+      "lines": 87
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+# After apps/Simulation/scripts/ensure_yolo_runtime.sh prepares the isolated
+# version-pinned YOLO environment. SciPy powers the truth-isolated attitude
+# solver; zstandard reads lossless rosbag2 image streams. ROS message support
+# comes from sourcing /opt/ros/humble/setup.bash.
+zstandard==0.25.0
+scipy==1.15.3

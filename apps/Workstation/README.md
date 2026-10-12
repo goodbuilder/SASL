@@ -1,5 +1,36 @@
 # SASL StereoWIRIS Workstation
 
+Current code ownership and feature boundaries are documented in [Architecture](docs/ARCHITECTURE.md).
+The four former god-module entrypoints are composition/compatibility boundaries; screens, panel
+features, recording services and measurement services have explicit owners and contracts.
+
+The [remaining-module follow-up](docs/changes/20261010-remaining-module-decomposition/status-audit.md)
+has completed its fixed software decomposition scope: the 15 targets have explicit responsibility,
+state and resource owners, and the generated MAVLink dialect has reproducible repository inputs.
+The final isolated regression passed **2,696 tests with 1 unsupported-NVENC skip**, zero failures
+and zero warnings. Its 649 Python source hashes and the delegate stub were checked after execution;
+see the [verification ledger](docs/changes/20261010-remaining-module-decomposition/verification.md).
+
+Calibration, Optical Pose and Pixhawk screens have component-owned widgets and selection state.
+Capture/profile application, device administration, GNSS correction/evidence, and camera
+recovery/rejoin/Stop have explicit runtime owners. Session finalization streams canonical rows
+through temporary disk indexes; recording review uses bounded asynchronous queries. Existing
+operator commands, confirmation gates, source identities, coordinate contracts and saved schemas
+remain governing contracts. Hardware operation and memory qualification limits are separate from
+software regression completion.
+
+A separate 180-second synthetic media run passed its 22 unchanged checks. Its parent-process RSS
+was 36.508 → 45.965 MiB, peak 50.922 MiB; this is not whole-process-tree or GPU qualification.
+Storage scaling measurements and the preserved earlier 20-second failures are recorded with
+source artifacts in the linked verification entry.
+
+Current Measurement lifecycle, method-worker recovery, and evidence ownership are specified in
+[Measurement runtime contract](docs/MEASUREMENT_RUNTIME_CONTRACT.md). Follow
+[the operator workflow](workflow.md) for operation and [the recording schema](docs/RECORDING_SCHEMA.md)
+for saved fields. The dated Change Log describes historical changes, not current requirements.
+The [2026-10-09 RCA correction plan and verification](docs/changes/20261009-rca-reliability-remediation/change-brief.md)
+records the before/after behavior and measured effects.
+
 ### 2026-09-08: Target geographic coordinates in Measurement records
 
 Measurement results additionally store `target_latitude_deg`, `target_longitude_deg`,
@@ -91,9 +122,9 @@ explicit waiting/non-selected state. The hidden `Δyaw°` remains `PX4−RAW` wr
 `[-180°,180°)`. The same page also exposes independent P1/P2 `MAG Priority /
 active selection` controls for `BOARD`, `CAN1`, `CAN2`, `GPS1_MAG`, and `GPS2_MAG`. `Apply & Verify`
 requires Disarm, verifies the CAL_MAG PARAM readback, then waits for a post-apply
-`vehicle_magnetometer.device_id` and fresh ATTITUDE. A live-Pixhawk Measurement is blocked until
-each required side reaches `ACTIVE VERIFIED`; non-live-Pixhawk methods retain their existing gate.
-The Advanced PX4 MAG controls remain as a fallback.
+`vehicle_magnetometer.device_id` and fresh ATTITUDE. `ACTIVE VERIFIED` confirms the requested
+selection; an unverified required side is recorded as advisory evidence and does not block
+Measurement Start. The Advanced PX4 MAG controls remain as a fallback.
 
 Measurement remains an observation interval rather than a package-completion transaction. There is
 still no storage/completeness gate before a Measurement can start. For a selected method that
@@ -375,10 +406,13 @@ in a `GnssBaselineCenter` sheet.
 
 The target role is applied and read back before the moved role is removed from its old NIC. If
 Camera/Pixhawk is already healthy, Workstation stops only owners on the source/target NICs,
-reconnects the previously active set on the selected NIC, and requires a new decoded Camera frame
-or expected-system Pixhawk HEARTBEAT+ATTITUDE before saving. Other NICs continue. Failure restores
-the previous network/owner state where possible and reports any incomplete rollback. An active
-Measurement/recording/save/finalization rejects the change before any stop or host mutation.
+saves the applied host role, and leaves Pixhawk disconnected until an explicit `Connect`.
+Other NICs continue. NetworkManager apply failures restore the previous OS snapshots where possible
+and report any incomplete rollback. `APPLIED · SAVE FAILED` means the host change succeeded but
+publishing or saving its settings failed: review the error, then retry `Save` before reconnecting.
+It does not mean the OS change was rolled back. The operation uses the address/endpoint settings
+captured when accepted, and stays busy until its worker has exited. An active Measurement,
+recording, save or finalization rejects the change before any stop or host mutation.
 
 At runtime Workstation identifies itself on both Ethernet links as MAVLink GCS `255/190`. Connect
 immediately seeds each configured peer with one GCS heartbeat to break PX4's pre-identity broadcast
@@ -472,22 +506,23 @@ For an ordinary run:
    `Latest XLSX · READY` and use `Open Latest XLSX`; for authoritative or multi-run analysis, join
    the type-owned records using their per-row timestamps and transient generation identity.
 
-Every matched pair is still evaluated independently by Pixhawk, Checkerboard, Horizon, Mountain,
-Drone Rotation, Drone Multi-view, Terrain, and Combined against the frozen inputs for that run.
+Each matched pair submits the ready subset of the ten registered methods against the frozen
+inputs for that run. Unready methods remain explicit not-attempted workbook entries.
 The representative result remains `Pixhawk attitude + GPS/RTK`; another method is not promoted
 when the primary method is blocked or fails. While that Measurement is still `RUNNING`, a terminal
 `pixhawk_rtk_live` `VALID` or `ESTIMATED` outcome is priority-enqueued to `measurements.jsonl`
 before the table, history, plot, or distance banner is updated. The primary worker starts and
-publishes first; comparison workers start only after that primary becomes terminal, including its
-one-second timeout. It does not wait for any comparison method or the eight-method bundle.
+publishes first; comparison workers start after a terminal primary outcome. There is no compute
+deadline after a start acknowledgement. A worker that never acknowledges start has a 30-second
+startup guard. A successful primary does not wait for comparison completion.
 If that primary enqueue is rejected, it keeps independent background retry ownership even after the
-eight-method bundle is saved. The UI remains `EVIDENCE DEGRADED` until admission. If Stop or the
+submitted-method bundle is saved. The UI remains `EVIDENCE DEGRADED` until admission. If Stop or the
 next run wins first, the retry switches to a compact `late_primary_measurement_outcome` record in
 `measurements.jsonl` and never projects into the new run's table, counters, history, plot, or banner.
 Primary `BLOCKED`, `FAILED`, `TIMEOUT`, and `BACKPRESSURE_BLOCKED` outcomes remain only in
 `method_evaluations.jsonl`. Here "immediate" means bounded asynchronous priority enqueue, not a
 synchronous write or `fsync`. No automatic Parquet or legacy Session `review.xlsx` is produced;
-the distinct latest-only XLSX is a non-authoritative post-stop projection.
+each run's XLSX is a derived projection updated at checkpoints, Stop and late completion.
 
 Manual recording remains under `Advanced > Files`. It uses the same fixed structured streams and
 timestamped binary paths. Starting Measurement stops Manual record and does not resume it after the
@@ -532,7 +567,7 @@ MeasurementAttempt or an official distance result.
 Blocked-method semantics are explicit across canonical recording and derived review. A present
 `measurement_method_id` key is authoritative even when its value is empty. A legacy
 `measurement_geometry_kind=unresolved` row with no method remains excluded from every `M_*` sheet;
-new BLOCKED/TIMEOUT/FAILED per-method outcomes stay in their own method sheet. Only a row whose
+new BLOCKED/FAILED/BACKPRESSURE_BLOCKED per-method outcomes stay in their own method sheet. Only a row whose
 method key is truly absent under the legacy paired-frame v1/v2 schemas may migrate the bounded
 legacy aliases `pixhawk`, `checkerboard`, or `calibration`.
 
@@ -556,6 +591,11 @@ exact profile fails closed and is never replaced by another convenient file. Onl
 configured path is the calibration root's missing `intrinsics.json` alias may startup fall back to
 that root's `intrinsics_zoom_XX.json`, under the same zoom check. A missing explicit external path
 never falls through to unrelated storage bytes.
+
+When settings are saved, a persisted `intrinsics_path` that no longer names a file is cleared and
+logged instead of making settings save fail. This lets normal application shutdown complete while
+keeping a stale or non-reopenable asset path out of persistent settings. Startup still applies the
+strict profile-selection rules above.
 
 That startup rule chooses which profile may be applied; it is separate from runtime K,D readiness.
 After a profile is active, later missing/stale/mismatched zoom, serial, or stabilization evidence
@@ -706,6 +746,12 @@ RTCM frame has been observed yet, and `RTCM_ACTIVE` means fresh parsed RTCM is a
 also shows chunk/byte counters, receive rate, last chunk age, RTCM message types, and reconnect
 count. The compact `NTRIP` status-bar indicator keeps the same state visible from other pages.
 
+`Stop NTRIP` rejects queued connection/status events from that session. A new Start waits
+for the previous network thread to exit; late events or counters from the previous connection
+cannot reactivate it or validate the new session's password. Normal reconnects within one
+active session retain the captured credentials. RTCM evidence already admitted to the data
+plane still follows its existing drain and recording rules.
+
 For `SYSTEM_CENTER` GGA, both selected P1/P2 GNSS positions must have arrived within the last
 10.0 seconds and their application-receive timestamps may differ by at most 3000 ms. Exact boundary
 values are accepted. These relaxed limits apply only to the NTRIP center-position hint; Measurement
@@ -759,6 +805,8 @@ Horizon/Mountain image analysis is running. Both automatic-selection buttons are
 the run, duplicate clicks and other optical-pose mutations are ignored until completion, and a
 result is committed only if its frozen frame IDs and SHA-256 identities still match the current
 burst. The status strip shows `RUNNING`, `LOW_CONFIDENCE`, or the failure reason.
+Closing the window waits for the analysis thread to exit. If a stop attempt times out,
+the window keeps waiting and retains the worker so it can finish cleanup.
 
 `Auto-select Mountain` biases SIFT/ORB matches toward the ridge using a per-frame sky/ground
 classifier, and it also measures whether that classifier found a separable ground class at all:
@@ -811,7 +859,7 @@ Horizon uses its frozen observed Roll/Pitch plus pair-frozen Pixhawk Yaw and GNS
 single-target Drone Rotation Draft re-solves Yaw against pair-frozen Pixhawk Roll/Pitch;
 two-or-more-target Drone Rotation keeps its solved full R and adds pair-frozen GNSS Translation.
 Mountain, Multi-view, Terrain, and Combined Drafts must already be full 6-DOF and fail closed
-instead of borrowing arbitrary live axes. All eight method attempts for a pair share the same
+instead of borrowing arbitrary live axes. All submitted method attempts for a pair share the same
 left/right detections, telemetry snapshots, native-frame file identities, and capture-sync basis.
 
 The Measurement `DOF fill for` selector exposes every currently available method. For each Left
@@ -822,20 +870,15 @@ current Measurement, and lock when Detection starts. Method-defining observation
 Roll/Pitch, Drone Rotation Yaw, and every DOF of full Mountain/Multi-view/Terrain/Combined methods)
 cannot be replaced by a fallback merely to make an invalid candidate look ready.
 
-Runtime evaluation uses one dedicated persistent process for
-`pixhawk_rtk_live` and seven independent persistent comparison processes. OpenCV/NumPy/BLAS child
-thread counts are capped at one. Comparison timeouts start only after that method worker reports
-actual execution start: Checkerboard 3 s, Horizon 1 s, Mountain 3 s, Drone Rotation 3 s, Drone
-Multi-view 5 s, Terrain PnP 10 s, and Combined 3 s. A timeout or crash terminates and recreates only
-that method process. The primary process is spawned and dispatched before comparison processes; a
-terminal primary outcome or its one-second timeout releases comparison startup. Primary and
-comparison backlog use independent 20-pair limits. A full comparison backlog therefore marks only
-that newly admitted pair's seven comparison outcomes `BACKPRESSURE_BLOCKED`; its primary remains
-admitted unless the separate primary queue itself is full. A `VALID` or `ESTIMATED` primary outcome
-received while the run is `RUNNING` is priority-enqueued to `measurements.jsonl` before any
-table/history/plot/banner projection.
-All eight terminal outcomes are still written later in canonical method order to
-`method_evaluations.jsonl`; that comparison bundle is independent of the already-enqueued primary
+Runtime evaluation uses one persistent process per registered method: the primary
+`pixhawk_rtk_live` process and nine comparison processes, started lazily after a primary terminal
+outcome. OpenCV/NumPy/BLAS child thread counts remain capped at one. Every method has an independent
+20-pair pending limit; only the saturated method returns `BACKPRESSURE_BLOCKED`. Slow calculations
+continue across Measurement Stop and subsequent runs. A crashed process is replaced; an active
+calculation has no automatic timeout. `TIMEOUT` is retained only when reading historical records.
+A `VALID` or `ESTIMATED` primary outcome received while its run is `RUNNING` is priority-enqueued
+before its table/history/plot/banner projection. Submitted terminal outcomes form a canonical
+method-order bundle; that bundle is independent of the already-enqueued primary
 row. A bundle is committed and counted only after its enqueue is admitted. A rejected active-row
 append remains pending and retries the same logical row; if Stop wins before retry, that retry is
 labelled `late=true`. Row admission carries an owner-epoch/index lease, so clear, rebind, close, or
@@ -1059,7 +1102,7 @@ Its candidate rows are transient and read-only. The selected URL keeps the exist
   `BLOCKED`/`FAILED`/`TIMEOUT`/`BACKPRESSURE_BLOCKED` outcomes are retained in
   `method_evaluations.jsonl` rather than creating a representative measurement row. Successful
   rows carry the method-evaluation pair/generation/snapshot IDs plus the primary outcome hash so
-  they can be joined to the later eight-method bundle without relying on positional row order.
+  they can be joined to the later submitted-method bundle without relying on positional row order.
 - `MeasurementDataStore` has explicit `OPEN → CLOSING → CLOSED` lifecycle evidence. Enqueue is
   accepted only in `OPEN`; a `CLOSING`/`CLOSED` request is rejected, counted as dropped, and cannot
   strand a new priority/bulk item after shutdown has begun. `Retry Storage` uses the same
@@ -1092,7 +1135,7 @@ Its candidate rows are transient and read-only. The selected URL keeps the exist
   | --- | --- |
   | run/capture events | `events_<timestamp>.jsonl`, `capture_events_<timestamp>.jsonl` |
   | primary pair results | `measurements_<timestamp>.jsonl` |
-  | eight-method bundles/outcomes | `method_evaluations_<timestamp>.jsonl` |
+  | submitted-method bundles/outcomes | `method_evaluations_<timestamp>.jsonl` |
   | camera observations | `camera_left_<timestamp>.jsonl`, `camera_right_<timestamp>.jsonl` |
   | rig and target PX4 | `px4_left_<timestamp>.jsonl`, `px4_right_<timestamp>.jsonl`, `px4_drone_<timestamp>.jsonl` |
   | Base GNSS | `gnss_base_<timestamp>.jsonl` |
@@ -1147,7 +1190,7 @@ Its candidate rows are transient and read-only. The selected URL keeps the exist
   the file manager. Old manifests, Parquet, and `review.xlsx` remain untouched and no new legacy
   instance is generated. The root-level latest-only workbook does not inspect or convert them.
 - `measurement-method-snapshot-v1` still supplies the live Measurement view. Runtime
-  `method_capabilities` remains instance-driven while `method_catalog` lists all eight method IDs;
+  `method_capabilities` remains instance-driven while `method_catalog` lists all ten method IDs;
   missing inputs become explicit BLOCKED outcomes rather than invented pose data.
 - YOLO detector weights remain runtime-owned under the Workstation data root and are not copied into
   Measurement data.
@@ -1571,12 +1614,12 @@ Its candidate rows are transient and read-only. The selected URL keeps the exist
   failure cannot hold the next run open. Drone RTK Multi-view `BLOCKED` samples stay in audit evidence
   but are not considered collected; only `READY` samples clear the target editor when the next
   Frozen burst arrives.
-- The Measurement view displays all eight frozen/live source values independently. Missing method
+- The Measurement view displays the registered methods’ frozen/live source values independently. Missing method
   instances remain visible as blocked catalog rows, while each pair persists one atomic bundle with
   method ID, instance ID, component sources, geometry hash, status, warnings, and worker timing for
   every method. That later comparison bundle does not gate or rewrite a successful representative
-  row already priority-enqueued while the run was `RUNNING`. No automatic workbook or Parquet
-  materialization follows run stop.
+  row already priority-enqueued while the run was `RUNNING`. The run workbook is updated
+  asynchronously at checkpoints, Stop, and late completion; Parquet is not materialized.
 - Calibration quality and evidence preservation are separate. `WARNING` and `FAIL` calculation
   attempts are saved under `attempts/` without changing active aliases or settings. `WARNING`
   requires confirmation before Apply and `FAIL` cannot be applied. Any applied PASS/confirmed
@@ -1612,6 +1655,9 @@ Its candidate rows are transient and read-only. The selected URL keeps the exist
 - NTRIP, RTCM pipeline, and Base GNSS worker results that update status labels, logs, tables, or
   evidence projections are always queued onto the Qt GUI thread. Direct cross-thread connections
   are limited to documented lock/queue adapters that never access widgets.
+- Pixhawk Shell/PARAM results apply only to the connection on which the request started.
+  Replacing or disconnecting that connection discards its late readback; Stop retains the
+  running worker until it actually exits. Different sides retain their existing concurrency.
 - Shutdown stops NTRIP and Base producers first, drains RTCM ingress, waits for every
   Pixhawk injection outcome (or records the exact unconfirmed sequences after the bounded timeout),
   and only then disconnects MAVLink/runtime workers. Window close remains non-blocking and retryable
@@ -1823,7 +1869,7 @@ Its candidate rows are transient and read-only. The selected URL keeps the exist
   `measurement_geometry_sha256`; a UI-latest sample can never be substituted after the pair is
   frozen.
 - If no method is ready, the matched detections and native frame references are still retained and
-  all eight method streams receive explicit BLOCKED outcomes. No fake R,t is created and the primary
+  the workbook retains explicit not-attempted states for methods without ready inputs. No fake R,t is created and the primary
   result remains blocked instead of falling back to a comparison method.
 - Candidate review keeps left/right observability separate. The common Apply/Combine axis is
   enabled only when both camera sides observed that axis; one-sided evidence remains visible in
@@ -1926,7 +1972,7 @@ written or `fsync`ed.
 Workaround: when a representative distance row is required, wait until the Pixhawk attitude +
 GNSS/RTK distance appears in the Measurement UI before pressing `측정 종료`, then confirm the
 `measurements` stream in `Data > Status` if durable storage timing matters. There is no need to wait
-for unused comparison methods or the completed nine-method bundle. If `Data > Status` reports the
+for unused comparison methods or the completed submitted-method bundle. If `Data > Status` reports the
 store as `CLOSING` or `CLOSED`, no new result can enter that store; start a normal new run with an
 `OPEN` store rather than treating a late enqueue rejection as a saved result.
 
@@ -1970,6 +2016,12 @@ gates.
 Resetting `이번 촬영` does not create a new AutoCapture directory. Stop→Start in the same Workstation
 process continues writing to the current capture set, so use the photo selector/exclusions or begin
 a separately owned calibration set when a physically isolated dataset is required.
+
+Stopping Auto lets an already-started capture finish saving and report its result, while leaving
+the stopped Auto pair count unchanged. Closing Workstation waits for that result and cleanup,
+and prevents the next queued FTP capture from starting. FTP synchronization retains a photo pair
+in its queue until capture startup is accepted, so a busy worker or rejected start does not silently
+discard that pair.
 
 ### Previous Measurement data is not migrated automatically
 
@@ -2074,16 +2126,15 @@ receipt as `HOST_RECEIVE_PROXY` and never precision-qualifies exposure from rece
 checkerboard stationary; true simultaneous exposure still requires verified exposure timestamps or
 qualified hardware triggering.
 
-The seven comparison processes deliberately run concurrently while Pixhawk/RTK has its own worker.
-On a CPU- or storage-constrained workstation, simultaneous OpenCV startup, native-PNG writes, and
-Terrain/Multi-view solves can increase evaluation duration, trigger method-local timeouts, or fill
-the 20-pair queue even though queue wait itself is not counted against timeout. Diagnose this from
-`queue_wait_ms`, `evaluation_duration_ms`, per-method TIMEOUT counts, process restart events, and
-`BACKPRESSURE_BLOCKED` outcomes. First reduce Detection/pair production or remove unrelated CPU/I/O
-load; do not raise BLAS/OpenCV child thread counts. If repeatable contention remains on qualified
-hardware, treat a bounded-concurrency or sequential diagnostic mode as a reviewed architecture
-change and rerun lifecycle, timeout, and throughput tests before deployment. Never hide the symptom
-by silently dropping a method or increasing the queue beyond 20.
+The nine comparison processes run concurrently while Pixhawk/RTK has its own worker. CPU or
+storage contention can lengthen queue/evaluation time or fill a method's 20-pair limit. Diagnose
+`queue_wait_ms`, `evaluation_duration_ms`, `BACKPRESSURE_BLOCKED`, and `Data > Status > Method 계산 상태`.
+Elapsed time is observational and never establishes a dead worker. After inspecting the selected
+method/run/pair, `선택 계산 중단·재시작` interrupts that current calculation as `FAILED` and replaces
+only its worker. Queued jobs and other methods continue. A stale selection is rejected; queued
+recovery is distinct from a confirmed replacement. If replacement fails, the same surface exposes
+an explicit retry. Normal Measurement Stop keeps its existing non-cancelling behavior.
+
 
 The 2026-08-25 check used Stock Stable PX4 v1.17 on both boards. Direct PX4 shell readback showed
 one Ethernet UDP instance per board (`14550` for system ID 1 and `14551` for system ID 2),
@@ -2426,6 +2477,26 @@ live on the panel at solve time -- a later live-GPS change cannot silently retar
 frozen Mountain image.
 
 ## Change Log
+
+- 2026-10-11: Fixed moved-module compatibility detection so recording callbacks no longer bind
+  back to their own panel delegates. Clearing a missing persisted intrinsic path during settings
+  save also prevents a stale asset reference from holding application shutdown open.
+
+- 2026-10-10: Decomposed the four god modules into workspace, panel, recording and measurement
+  owners. Preserved named compatibility APIs, single state/resource ownership, Qt affinity,
+  generation/lease contracts and canonical coordinates. Frozen geometry now captures method
+  selection/configuration before resolution. Added architecture gates and loopback-only isolated
+  regression tooling; see [the plan](docs/changes/20261010-god-module-decomposition/implementation-plan.md)
+  and [the result and validation report](docs/changes/20261010-god-module-decomposition/report.md).
+
+Historical entries below retain the behavior at their stated date. Current contracts above and
+`docs/MEASUREMENT_RUNTIME_CONTRACT.md` supersede retired timeout/MAG-admission descriptions.
+
+- 2026-10-09: Fixed nested measurement payload ownership and detached JSON exports; separated Run
+  state into a Qt-free owner with STARTING reservation before optional I/O; added method execution
+  status and explicit identity-guarded worker recovery; repaired CI targets and content-bound
+  historical path classification. See the linked RCA packet for evidence and remaining limits.
+
 
 - 2026-09-08: Added `05_그래프` with twelve native Method-comparison charts for camera FRD,
   horizontal FRD and WGS84 results. The summary links to the charts; missing values retain
@@ -3415,3 +3486,38 @@ for those observations. ATTITUDE orientation and GPS lat/lon/MSL-alt contracts a
 The application sends interval requests; successful transmission is not an ACK/readback
 claim. Link loss can prevent application. Reconnect reapplies the profile. RF coexistence
 and USB supply effects remain separate unresolved limits from the measured investigation.
+
+## Target reference discovery and connection
+
+Data → Status → Target reference provides separate receive-only target-aircraft connectivity. Select Drone, then Find Network or Find USB. Network discovery listens for MAVLink already arriving on the configured PC UDP ports (default14570 and14550–14559); it does not scan subnets or configure the aircraft transmitter. USB/Radio discovery listens at the selected baud. Devices without a heartbeat remain visibly unverified.
+
+Select an observed candidate and press Use selected to fill the draft endpoint and SYS/COMP, then Connect target to acquire the transport and verify identity again. UDP candidates retain their observed peer address/port through this handoff. Candidate evidence expires after30s. SYS/COMP0 are not auto-converted into verified identities; manual Any retains its explicit wildcard meaning. A valid heartbeat identifies the sender's reported IDs, not a cryptographic aircraft identity.
+
+Target uses an exclusive UDP bind and serial device lease/exclusion. App-owned P1/P2/Telemetry and Base GNSS endpoints are rejected as busy. Discovery is single-flight, cancellable, bounded to16 UDP ports,8 serial devices and128 candidates. It never sends GCS heartbeat, stream requests, parameters, RTCM, flight or logger commands. A quiet target must be configured externally to transmit. Serial open can affect DTR/RTS depending on hardware; physical-device qualification remains required.
+
+Connection status is separate from host-monotonic HEARTBEAT/GPS1/GPS2/ATTITUDE ages. Fresh valid GPS and RTK fix are shown independently; heartbeat alone does not establish GPS readiness. Samples older than3s show STALE. Existing Measurement admission and coordinate contracts are preserved.
+
+Save persists only Target connection preferences in Workstation-owned settings. It does not connect. Restart restores preferences with no active connection or discovered identity. Device paths under /dev are intentionally machine-local and may need reselection on another computer. UAM uses Set UAM deferred with no live transport or discovery. Stop runs asynchronously; app shutdown cancels discovery and joins Target resources.
+
+Target reference and the active Telemetry workspace remain independent sources. Optional lifecycle metadata records expected/verified UDP peer; telemetry coordinate fields and existing evidence formats remain compatible. Implementation and software/field evidence are in [the Target discovery packet](docs/changes/20261010-target-reference-discovery/verification.md).
+
+## Reproducible validation environment
+
+From the repository root on Ubuntu22.04 / Python3.10:
+
+```bash
+tools/setup_workstation_test_env.sh
+apps/Workstation/tools/run_isolated_tests.sh -q -ra --tb=short
+```
+
+The setup creates the ignored repository .venv with system-site-packages for Ubuntu GI/Qt, installs declared dev/runtime dependencies with requirements/constraints-workstation-py310.txt, and disables user-site/ambient ROS Python paths. The test runner requires this environment (or an explicit executable SASL_TEST_PYTHON override) and uses only loopback networking. It no longer silently falls back to an incompatible system/user package stack.
+
+requirements/optional-terrain.txt declares rasterio and pyproj for GeoTIFF/WGS84/ECEF/local-NED validation. Dev setup includes them; runtime-only installations can install that file separately. The missing-dependency test injects ImportError to retain failure-path coverage even when the packages are installed. Raw recording continues to be independent of optional terrain imports.
+
+If nvidia-smi reports Driver/library version mismatch after a driver update, compare the loaded module with the installed module. Follow the [Ubuntu NVIDIA troubleshooting guide](https://ubuntu.com/server/docs/how-to/graphics/install-nvidia-drivers/#driver-library-version-mismatch-error); reboot after saving active work to activate the installed driver. NVENC is only accepted after this command executes its real lossless-recording test without skipping:
+
+```bash
+python3 tools/check_workstation_nvenc.py
+```
+
+The check fails when driver initialization or the GPU test is unavailable. A passed CPU/coordinate suite does not stand in for this hardware result. See docs/changes/20261010-runtime-validation-environment/verification.md for this machine's repair evidence.

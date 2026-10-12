@@ -433,8 +433,8 @@ def main(argv: list[str] | None = None) -> int:
 
     from PyQt5 import QtWidgets
 
-    from .main_window import WorkstationMainWindow
-    from .standalone_gui import _configure_gl_surface_format
+    from Workstation.application.main_window import WorkstationMainWindow
+    from Workstation.application.standalone_gui import _configure_gl_surface_format
 
     _configure_gl_surface_format()
     app = QtWidgets.QApplication([sys.argv[0], *qt_args])

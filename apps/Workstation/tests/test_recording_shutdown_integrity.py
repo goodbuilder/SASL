@@ -107,7 +107,7 @@ def test_recording_start_exception_rolls_back_every_activated_state_and_new_rows
         or True,
     )
     monkeypatch.setattr(
-        panel,
+        controller.owners.metadata,
         "_record_px4_mag_status_snapshot",
         lambda: None,
     )
@@ -124,7 +124,7 @@ def test_recording_start_exception_rolls_back_every_activated_state_and_new_rows
         ),
     )
     monkeypatch.setattr(
-        panel,
+        controller.owners.presentation,
         "_refresh_recording_table",
         lambda: (_ for _ in ()).throw(RuntimeError("injected start failure")),
     )

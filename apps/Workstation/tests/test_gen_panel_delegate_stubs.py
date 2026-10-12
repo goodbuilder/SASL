@@ -20,6 +20,6 @@ _spec.loader.exec_module(_gen_module)
 
 def test_stub_block_matches_registered_delegate_bindings():
     assert _gen_module.regenerate(check=True), (
-        "standalone_gui.py's generated delegate stub block is stale; "
+        "standalone_gui.pyi's generated compatibility block is stale; "
         "run `python3 tools/gen_panel_delegate_stubs.py` to regenerate it."
     )

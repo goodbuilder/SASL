@@ -1,0 +1,26 @@
+SASL operator execution runtime
+PASS python.executable: canonical interpreter: /home/moontaehyung/바탕화면/SASL-20261009/.venv/bin/python
+PASS python.system_site_packages: official venv exposes Ubuntu system packages
+PASS python.distributions: root runtime distributions installed (15) with declared versions
+PASS runtime.executable.gst-inspect-1.0: gst-inspect-1.0: /usr/bin/gst-inspect-1.0
+PASS runtime.executable.ffmpeg: ffmpeg: /usr/bin/ffmpeg
+PASS gstreamer.introspection: gi, Gst 1.0, and GstRtp 1.0 are available
+PASS gstreamer.element.rtspsrc: rtspsrc: factory find/make ok
+PASS gstreamer.element.rtph264depay: rtph264depay: factory find/make ok
+PASS gstreamer.element.h264parse: h264parse: factory find/make ok
+PASS gstreamer.element.queue: queue: factory find/make ok
+PASS gstreamer.element.videoconvert: videoconvert: factory find/make ok
+PASS gstreamer.element.appsink: appsink: factory find/make ok
+PASS gstreamer.element.avdec_h264: avdec_h264: factory find/make ok
+PASS gstreamer.element.mp4mux: mp4mux: factory find/make ok
+PASS gstreamer.element.filesink: filesink: factory find/make ok
+WARN gstreamer.element.nvh264dec: optional nvh264dec: factory not found
+  Ubuntu package: gstreamer1.0-plugins-bad
+WARN nvidia.driver: NVIDIA driver unavailable: Failed to initialize NVML: Driver/library version mismatch
+NVML library version: 595.99
+  Recovery: Run: nvidia-smi -q | rg 'Driver Version|GPU Recovery Action'
+  Recovery: Repair/reboot the NVIDIA host state, then rerun this check until cuInit(0) passes.
+WARN decoder.selection: nvh264dec element, NVIDIA driver unavailable; Auto selected avdec_h264
+selected decoder: auto
+effective decoder: avdec_h264
+missing elements: none

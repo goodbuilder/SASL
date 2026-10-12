@@ -578,6 +578,7 @@ def test_operational_connection_declares_gcs_source_identity(monkeypatch) -> Non
     from pymavlink import mavutil
 
     from Workstation.workstation_core import pixhawk_attitude
+    from Workstation.workstation_core.pixhawk_link import endpoints
 
     clock = {"value": 0.0}
     monkeypatch.setattr(pixhawk_attitude.time, "monotonic", lambda: clock["value"])
@@ -590,8 +591,8 @@ def test_operational_connection_declares_gcs_source_identity(monkeypatch) -> Non
         return connection
 
     monkeypatch.setattr(mavutil, "mavlink_connection", connection_factory)
-    monkeypatch.setattr(pixhawk_attitude, "_assert_mavlink_udpin_available", lambda _url: None)
-    monkeypatch.setattr(pixhawk_attitude, "_disable_mavlink_udpin_reuse", lambda *_args: None)
+    monkeypatch.setattr(endpoints, "_assert_mavlink_udpin_available", lambda _url: None)
+    monkeypatch.setattr(endpoints, "_disable_mavlink_udpin_reuse", lambda *_args: None)
     subscriber = pixhawk_attitude.DualPixhawkMavlinkSubscriber(
         left_url="udpin:0.0.0.0:14550",
         right_url="",

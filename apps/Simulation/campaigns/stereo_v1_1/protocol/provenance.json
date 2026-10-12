@@ -1,0 +1,16 @@
+{
+  "document_version": "1.1",
+  "source": "user-provided protocol package dated 2026-10-05",
+  "copied_without_byte_changes": false,
+  "localization_note": "Only sources.historical_repository_path_hint in the spec was replaced by a non-path warning; numerical and execution fields are unchanged.",
+  "source_files_sha256": {
+    "03_experiment_spec.json": "529eec747d27767a52b5e3bc88abe9c1355f5a9f3ad4c9aa01200fb0e5ab5408",
+    "04_run_manifest.json": "499621b6741b487b9ef01b0359df3f2075cd10fef1afa7fd3d25668bdc330e92",
+    "05_generate_reference.py": "a2eb8101383f516424c482f78d69b416d28a0f4fb934b94d8c073735f974f038"
+  },
+  "files_sha256": {
+    "03_experiment_spec.json": "cc97d02fe19453efd72aabcdf06d06d0babde691bac14226044e2bcd92561ff8",
+    "04_run_manifest.json": "499621b6741b487b9ef01b0359df3f2075cd10fef1afa7fd3d25668bdc330e92",
+    "05_generate_reference.py": "a2eb8101383f516424c482f78d69b416d28a0f4fb934b94d8c073735f974f038"
+  }
+}

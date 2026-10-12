@@ -1,6 +1,10 @@
 """Workstation camera regression tests."""
 
 from __future__ import annotations
+from Workstation.workstation_core.media_stream import gstreamer_backend as gstreamer_runtime
+
+from Workstation.wiris_workers import io as _wiris_worker_io
+from Workstation.wiris_workers import policy as _wiris_worker_policy
 
 from Workstation.tests.workstation_test_support import (
     _FakeBackend,
@@ -264,8 +268,8 @@ def test_gstreamer_rtsp_worker_retries_transient_sdp_failure(monkeypatch: pytest
         attempts.append(len(attempts) + 1)
         return len(attempts) >= 2
 
-    monkeypatch.setattr(yolo_stream, "_run_gstreamer_stream_once", fake_run_once)
-    monkeypatch.setattr(yolo_stream, "GST_RTSP_RECONNECT_DELAYS_S", (0.001,))
+    monkeypatch.setattr(gstreamer_runtime, "_run_gstreamer_stream_once", fake_run_once)
+    monkeypatch.setattr(gstreamer_runtime, "GST_RTSP_RECONNECT_DELAYS_S", (0.001,))
 
     yolo_stream._run_gstreamer_stream(
         {},
@@ -287,7 +291,7 @@ def test_camera_auto_detect_result_records_full_control_scan_mode(
     from Workstation import standalone_gui
 
     emitted: list[dict[str, object]] = []
-    monkeypatch.setattr(standalone_gui, "discover_host_interface_candidates", lambda: [])
+    monkeypatch.setattr("Workstation.panel_camera_workers.discover_host_interface_candidates", lambda: [])
     worker = standalone_gui.CameraAutoDetectWorker(
         mode="auto_connect",
         full_control_scan=full_control_scan,
@@ -1005,7 +1009,7 @@ def test_wiris_control_probe_worker_keeps_socket_checks_off_ui_path(monkeypatch)
         calls.append((host, port, timeout))
         return host == "10.0.0.11"
 
-    monkeypatch.setattr(standalone_gui, "check_tcp_port", fake_check)
+    monkeypatch.setattr("Workstation.panel_camera_workers.check_tcp_port", fake_check)
     results: list[object] = []
     worker = standalone_gui.WirisControlCheckWorker(
         (("left", "10.0.0.11", 5000), ("right", "", 5001)),
@@ -1029,10 +1033,10 @@ def test_wiris_rtsp_reactivation_skips_redundant_seth_for_enabled_camera(monkeyp
         sent.append((command.host, command.command))
         return "TRUE" if command.command == "GETH" else "OK"
 
-    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
-    monkeypatch.setattr(wiris_runtime_workers, "check_tcp_port", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(wiris_runtime_workers, "RTSP_ENABLE_SETTLE_DELAY_MS", 0)
-    monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_COMMAND_SETTLE_MS", 0)
+    monkeypatch.setattr(_wiris_worker_io, "send_tcp_line", fake_send)
+    monkeypatch.setattr(_wiris_worker_io, "check_tcp_port", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(_wiris_worker_policy, "RTSP_ENABLE_SETTLE_DELAY_MS", 0)
+    monkeypatch.setattr(_wiris_worker_policy, "ENCODER_PROFILE_COMMAND_SETTLE_MS", 0)
 
     results: list[object] = []
     worker = wiris_runtime_workers.WirisRtspEnableWorker(
@@ -1066,10 +1070,10 @@ def test_wiris_rtsp_enable_ignores_stale_persisted_encoder_profile(monkeypatch) 
         sent.append(command.command)
         return {"GETH": "TRUE"}[command.command]
 
-    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
-    monkeypatch.setattr(wiris_runtime_workers, "check_tcp_port", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(wiris_runtime_workers, "RTSP_ENABLE_SETTLE_DELAY_MS", 0)
-    monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_COMMAND_SETTLE_MS", 0)
+    monkeypatch.setattr(_wiris_worker_io, "send_tcp_line", fake_send)
+    monkeypatch.setattr(_wiris_worker_io, "check_tcp_port", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(_wiris_worker_policy, "RTSP_ENABLE_SETTLE_DELAY_MS", 0)
+    monkeypatch.setattr(_wiris_worker_policy, "ENCODER_PROFILE_COMMAND_SETTLE_MS", 0)
     results: list[object] = []
     worker = wiris_runtime_workers.WirisRtspEnableWorker(
         hosts={"left": "10.0.0.11"},
@@ -1108,9 +1112,9 @@ def test_wiris_rtsp_enable_sends_seth_only_when_disabled_without_encoder_mutatio
         sent.append(command.command)
         return "FALSE" if command.command == "GETH" else "OK"
 
-    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
-    monkeypatch.setattr(wiris_runtime_workers, "check_tcp_port", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(wiris_runtime_workers, "RTSP_ENABLE_SETTLE_DELAY_MS", 0)
+    monkeypatch.setattr(_wiris_worker_io, "send_tcp_line", fake_send)
+    monkeypatch.setattr(_wiris_worker_io, "check_tcp_port", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(_wiris_worker_policy, "RTSP_ENABLE_SETTLE_DELAY_MS", 0)
     results: list[object] = []
     worker = wiris_runtime_workers.WirisRtspEnableWorker(
         hosts={"left": "10.0.0.11"},
@@ -1146,8 +1150,8 @@ def test_explicit_encoder_profile_helper_applies_only_changed_fields(monkeypatch
             return "OK"
         return next(readbacks[command.command])
 
-    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
-    monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_COMMAND_SETTLE_MS", 0)
+    monkeypatch.setattr(_wiris_worker_io, "send_tcp_line", fake_send)
+    monkeypatch.setattr(_wiris_worker_policy, "ENCODER_PROFILE_COMMAND_SETTLE_MS", 0)
     worker = wiris_runtime_workers.WirisRtspEnableWorker(
         hosts={"left": "10.0.0.11"},
         candidate_ports={"left": [2240]},
@@ -1195,10 +1199,10 @@ def test_explicit_encoder_profile_helper_retries_transient_initial_readback_rese
             "GEIR VISIBLE": "1",
         }[command.command]
 
-    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
-    monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_COMMAND_SETTLE_MS", 0)
-    monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_READBACK_RETRY_INTERVAL_MS", 0)
-    monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_READBACK_MAX_ATTEMPTS", 1)
+    monkeypatch.setattr(_wiris_worker_io, "send_tcp_line", fake_send)
+    monkeypatch.setattr(_wiris_worker_policy, "ENCODER_PROFILE_COMMAND_SETTLE_MS", 0)
+    monkeypatch.setattr(_wiris_worker_policy, "ENCODER_PROFILE_READBACK_RETRY_INTERVAL_MS", 0)
+    monkeypatch.setattr(_wiris_worker_policy, "ENCODER_PROFILE_READBACK_MAX_ATTEMPTS", 1)
     worker = wiris_runtime_workers.WirisRtspEnableWorker(
         hosts={"left": "10.0.0.11"},
         candidate_ports={"left": [2240]},
@@ -1233,10 +1237,10 @@ def test_explicit_encoder_profile_helper_fails_closed_on_readback_mismatch(monke
         }
         return expected[command.command]
 
-    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
-    monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_COMMAND_SETTLE_MS", 0)
-    monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_READBACK_MAX_ATTEMPTS", 0)
-    monkeypatch.setattr(wiris_runtime_workers, "ENCODER_PROFILE_READBACK_RETRY_INTERVAL_MS", 0)
+    monkeypatch.setattr(_wiris_worker_io, "send_tcp_line", fake_send)
+    monkeypatch.setattr(_wiris_worker_policy, "ENCODER_PROFILE_COMMAND_SETTLE_MS", 0)
+    monkeypatch.setattr(_wiris_worker_policy, "ENCODER_PROFILE_READBACK_MAX_ATTEMPTS", 0)
+    monkeypatch.setattr(_wiris_worker_policy, "ENCODER_PROFILE_READBACK_RETRY_INTERVAL_MS", 0)
     worker = wiris_runtime_workers.WirisRtspEnableWorker(
         hosts={"left": "10.0.0.11"},
         candidate_ports={"left": [2240]},
@@ -1359,7 +1363,7 @@ def test_wiris_zoom_reports_control_contention_as_busy_not_camera_failure(
     from Workstation.workstation_core.wiris_zoom import WirisControlBusyError
 
     monkeypatch.setattr(
-        wiris_runtime_workers,
+        _wiris_worker_io,
         "send_tcp_line",
         lambda _command: (_ for _ in ()).throw(WirisControlBusyError("busy sentinel")),
     )
@@ -1383,7 +1387,7 @@ def test_wiris_both_command_continues_healthy_side_when_peer_fails_before_barrie
 
     sent: list[str] = []
     monkeypatch.setattr(
-        wiris_runtime_workers,
+        _wiris_worker_io,
         "send_tcp_line",
         lambda command: sent.append(command.host) or "OK",
     )
@@ -1437,8 +1441,42 @@ def test_camera_network_discovery_worker_keeps_nm_queries_off_ui_path(monkeypatc
     assert results[0]["connection_name"] == "camera-profile"
 
 
-def test_camera_network_discovery_projects_host_interface_into_candidate_rows() -> None:
-    from Workstation import standalone_gui
+@pytest.fixture
+def camera_candidate_projection():
+    from PyQt5 import QtCore
+    from Workstation.camera_feature.candidates import CameraCandidateState, CameraCandidateView
+
+    hosts = []
+
+    def attach(panel):
+        host = QtWidgets.QWidget()
+        hosts.append(host)
+        state = CameraCandidateState()
+        view = CameraCandidateView(
+            state, apply_nic=lambda: False, apply_side=lambda side: None, log=panel._log, parent=host,
+        )
+
+        def set_rows(rows):
+            view._set_camera_candidate_table_rows(rows)
+            panel._camera_candidate_rows = state.rows
+
+        def project(*args):
+            view._set_camera_candidate_rows(*args)
+            panel._camera_candidate_rows = state.rows
+
+        set_rows(panel._camera_candidate_rows)
+        panel._set_camera_candidate_table_rows = set_rows
+        panel._set_camera_candidate_rows = project
+        return view
+
+    yield attach
+    for host in hosts:
+        host.deleteLater()
+        QtWidgets.QApplication.instance().sendPostedEvents(host, QtCore.QEvent.DeferredDelete)
+    QtWidgets.QApplication.instance().processEvents()
+
+
+def test_camera_network_discovery_projects_host_interface_into_candidate_rows(camera_candidate_projection) -> None:
     from Workstation.device_runtime_controller import DeviceRuntimeController
 
     _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -1465,12 +1503,7 @@ def test_camera_network_discovery_projects_host_interface_into_candidate_rows() 
         panel.host_address_edit.setText(str(selected.address))
 
     panel._apply_host_interface_candidates = apply_host_interface_candidates
-    panel._set_camera_candidate_table_rows = lambda rows: setattr(
-        panel, "_camera_candidate_rows", list(rows)
-    )
-    panel._set_camera_candidate_rows = lambda *args: (
-        standalone_gui.WirisStereoDistancePanel._set_camera_candidate_rows(panel, *args)
-    )
+    camera_candidate_projection(panel)
 
     DeviceRuntimeController(panel)._apply_camera_network_discovery(
         {
@@ -1495,8 +1528,7 @@ def test_camera_network_discovery_projects_host_interface_into_candidate_rows() 
     ]
 
 
-def test_camera_network_discovery_zero_result_clears_stale_candidate_rows() -> None:
-    from Workstation import standalone_gui
+def test_camera_network_discovery_zero_result_clears_stale_candidate_rows(camera_candidate_projection) -> None:
     from Workstation.device_runtime_controller import DeviceRuntimeController
 
     _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -1512,12 +1544,7 @@ def test_camera_network_discovery_zero_result_clears_stale_candidate_rows() -> N
         _refresh_operation_header=lambda: None,
         _apply_host_interface_candidates=lambda _candidates: None,
     )
-    panel._set_camera_candidate_table_rows = lambda rows: setattr(
-        panel, "_camera_candidate_rows", list(rows)
-    )
-    panel._set_camera_candidate_rows = lambda *args: (
-        standalone_gui.WirisStereoDistancePanel._set_camera_candidate_rows(panel, *args)
-    )
+    camera_candidate_projection(panel)
 
     DeviceRuntimeController(panel)._apply_camera_network_discovery(
         {
@@ -1542,7 +1569,7 @@ def test_wiris_clock_worker_keeps_stus_and_gdti_io_off_ui_path(monkeypatch) -> N
         sent.append(str(command.command))
         return "OK" if command.command.startswith("STUS ") else "2026/08/09 12:00:00"
 
-    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
+    monkeypatch.setattr(_wiris_worker_io, "send_tcp_line", fake_send)
     monkeypatch.setattr(
         standalone_gui.WirisClockCommandWorker,
         "_measure_control_rtt",
@@ -1836,16 +1863,16 @@ def test_wiris_stip_worker_keeps_interface_and_tcp_io_off_ui_path(monkeypatch) -
     interface = SimpleNamespace(name="enx-camera", address="10.0.0.1/24")
     candidate = SimpleNamespace(interface=interface, neighbor_hosts=())
     sent: list[str] = []
-    monkeypatch.setattr(wiris_runtime_workers, "interface_link_exists", lambda _name: False)
-    monkeypatch.setattr(wiris_runtime_workers, "discover_host_interface_candidates", lambda **_kwargs: [candidate])
-    monkeypatch.setattr(wiris_runtime_workers, "resolve_nm_interface_address", lambda _name, _hints: None)
-    monkeypatch.setattr(wiris_runtime_workers, "interface_has_address", lambda _name, _address: True)
+    monkeypatch.setattr(_wiris_worker_io, "interface_link_exists", lambda _name: False)
+    monkeypatch.setattr(_wiris_worker_io, "discover_host_interface_candidates", lambda **_kwargs: [candidate])
+    monkeypatch.setattr(_wiris_worker_io, "resolve_nm_interface_address", lambda _name, _hints: None)
+    monkeypatch.setattr(_wiris_worker_io, "interface_has_address", lambda _name, _address: True)
 
     def fake_send(command) -> str:
         sent.append(str(command.command))
         return "OK"
 
-    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
+    monkeypatch.setattr(_wiris_worker_io, "send_tcp_line", fake_send)
     results: list[object] = []
     worker = standalone_gui.WirisStipWorker(
         interface_name="enx-camera",
@@ -1877,7 +1904,7 @@ def test_wiris_command_worker_reports_partial_timeout_without_ui_join(monkeypatc
             raise TimeoutError("right camera timeout")
         return "OK"
 
-    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
+    monkeypatch.setattr(_wiris_worker_io, "send_tcp_line", fake_send)
     results: list[object] = []
     worker = standalone_gui.WirisCommandWorker(
         (
@@ -1894,7 +1921,7 @@ def test_wiris_command_worker_reports_partial_timeout_without_ui_join(monkeypatc
     assert results[0]["statuses"]["right"] == "실패: right camera timeout"
 
 def test_workstation_uses_explicit_camera_coordinate_label() -> None:
-    source = (Path(__file__).resolve().parents[2] / "Workstation" / "standalone_gui.py").read_text(
+    source = (Path(__file__).resolve().parents[2] / "Workstation" / "panel_alignment.py").read_text(
         encoding="utf-8"
     )
     assert "OpenCV optical RDF" in source
@@ -1916,6 +1943,8 @@ def test_camera_mode_switch_restarts_after_workers_stop_without_blocking(
         "singleShot",
         lambda _delay_ms, callback: callbacks.append(callback),
     )
+    timer_owner = panel.application.features["camera"].state.lifecycle_timers
+    monkeypatch.setattr(timer_owner, "_schedule", lambda delay, callback: standalone_gui.QtCore.QTimer.singleShot(delay, callback))
     stopped = {"value": False}
     starts: list[tuple[str, bool]] = []
     panel.left_pane.stop = lambda *, wait=False: stopped["value"]
@@ -1975,6 +2004,8 @@ def test_camera_disconnect_watchdog_retries_wedged_stop_until_it_exits(
         "singleShot",
         lambda _delay_ms, callback: callbacks.append(callback),
     )
+    timer_owner = panel.application.features["camera"].state.lifecycle_timers
+    monkeypatch.setattr(timer_owner, "_schedule", lambda delay, callback: standalone_gui.QtCore.QTimer.singleShot(delay, callback))
     stopped = {"value": False}
     panel.left_pane.stop = lambda *, wait=False: stopped["value"]
     panel.right_pane.stop = lambda *, wait=False: stopped["value"]
@@ -2019,6 +2050,8 @@ def test_camera_start_cancels_stale_disconnect_watchdog(
         "singleShot",
         lambda _delay_ms, callback: callbacks.append(callback),
     )
+    timer_owner = panel.application.features["camera"].state.lifecycle_timers
+    monkeypatch.setattr(timer_owner, "_schedule", lambda delay, callback: standalone_gui.QtCore.QTimer.singleShot(delay, callback))
     panel.left_pane.stop = lambda *, wait=False: False
     panel.right_pane.stop = lambda *, wait=False: False
 
@@ -2217,7 +2250,7 @@ def test_advanced_camera_control_sends_through_actual_panel_owner(monkeypatch) -
         sent.append((command.host, command.port, command.command))
         return "OK"
 
-    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
+    monkeypatch.setattr(_wiris_worker_io, "send_tcp_line", fake_send)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     window = WorkstationMainWindow()
     try:

@@ -1,0 +1,3 @@
+Failed to initialize NVML: Driver/library version mismatch
+NVML library version: 595.99
+FAIL: NVIDIA driver is not ready; no NVENC pass is claimed.

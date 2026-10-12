@@ -15,9 +15,8 @@ from Workstation.workstation_core.baseline_alignment import (
     baseline_from_gps,
     evaluate_baseline_quality,
 )
-from Workstation.workstation_core.pixhawk_attitude import (
-    CameraExtrinsicState,
-    MagSensorState,
+from Workstation.workstation_core.pixhawk_link.types import CameraExtrinsicState, MagSensorState
+from Workstation.workstation_core.pixhawk_link.decode import (
     magnetometer_value_to_gauss,
     magnetometer_value_units,
 )

@@ -1,0 +1,109 @@
+{
+  "checkpoints": {
+    "0": {
+      "elapsed_s": 0.0,
+      "rss_bytes": 38281216
+    },
+    "1": {
+      "elapsed_s": 1.061604,
+      "rss_bytes": 42668032
+    },
+    "10": {
+      "elapsed_s": 10.162462,
+      "rss_bytes": 49434624
+    },
+    "120": {
+      "elapsed_s": 119.49541,
+      "rss_bytes": 53121024
+    },
+    "150": {
+      "elapsed_s": 149.954821,
+      "rss_bytes": 53133312
+    },
+    "179": {
+      "elapsed_s": 179.37085,
+      "rss_bytes": 53395456
+    },
+    "180": {
+      "elapsed_s": 180.106789,
+      "rss_bytes": 48197632
+    },
+    "20": {
+      "elapsed_s": 20.321098,
+      "rss_bytes": 51019776
+    },
+    "30": {
+      "elapsed_s": 30.461483,
+      "rss_bytes": 51351552
+    },
+    "60": {
+      "elapsed_s": 59.812286,
+      "rss_bytes": 52539392
+    },
+    "90": {
+      "elapsed_s": 90.146095,
+      "rss_bytes": 53116928
+    }
+  },
+  "descriptive_windows_not_acceptance_gates": {
+    "0-30s": {
+      "first_to_last_growth_bytes": 13070336,
+      "maximum_bytes": 51351552,
+      "median_bytes": 50290688,
+      "minimum_bytes": 38281216,
+      "sample_count": 31
+    },
+    "120-150s": {
+      "first_to_last_growth_bytes": 12288,
+      "maximum_bytes": 53133312,
+      "median_bytes": 53129216.0,
+      "minimum_bytes": 53121024,
+      "sample_count": 30
+    },
+    "150-180s": {
+      "first_to_last_growth_bytes": 262144,
+      "maximum_bytes": 53395456,
+      "median_bytes": 53133312,
+      "minimum_bytes": 53133312,
+      "sample_count": 29
+    },
+    "30-60s": {
+      "first_to_last_growth_bytes": 1187840,
+      "maximum_bytes": 52539392,
+      "median_bytes": 51884032.0,
+      "minimum_bytes": 51351552,
+      "sample_count": 30
+    },
+    "60-90s": {
+      "first_to_last_growth_bytes": 577536,
+      "maximum_bytes": 53116928,
+      "median_bytes": 52809728,
+      "minimum_bytes": 52539392,
+      "sample_count": 29
+    },
+    "90-120s": {
+      "first_to_last_growth_bytes": 4096,
+      "maximum_bytes": 53121024,
+      "median_bytes": 53121024.0,
+      "minimum_bytes": 53116928,
+      "sample_count": 30
+    }
+  },
+  "gate_entire_interval_slope_bytes_per_hour": 198210727.1574361,
+  "passed": true,
+  "prior_20_second_results": "media-baseline.json and media-after.json remain FAIL and unchanged; this is a separate current-source 180 second run.",
+  "rss_elapsed_s": 180.10678893097793,
+  "sample_count": 180,
+  "scope": "Parent-process RSS; original startup and cleanup samples retained. Descriptive windows do not replace or relax any gate.",
+  "thresholds_unchanged": {
+    "max_rss_growth_bytes": 134217728,
+    "max_rss_high_water_bytes": 536870912,
+    "max_rss_slope_bytes_per_hour": 268435456,
+    "max_stop_latency_s": 0.5,
+    "minimum_saved_pairs": 80,
+    "minimum_saved_ratio": 0.9,
+    "rss_sample_interval_s": 1.0,
+    "theoretical_saved_pairs": 89,
+    "writer_shutdown_timeout_s": 5.0
+  }
+}

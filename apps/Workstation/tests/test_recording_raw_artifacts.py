@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+from Workstation.workstation_core.session_storage import canonical as _session_canonical
+
+from Workstation.workstation_core.session_storage import generation as _session_generation
+from Workstation.workstation_core.session_storage import manifest as _session_manifest
+from Workstation.workstation_core.session_storage import review as _session_review
+
 import hashlib
 import json
 import math
@@ -400,7 +406,7 @@ def test_jsonl_fault_preserves_spools_and_previous_generation(
     def fail_jsonl(*_args, **_kwargs):
         raise OSError(f"injected {fault_target} fault")
 
-    monkeypatch.setattr(recording_session, fault_target, fail_jsonl)
+    monkeypatch.setattr(_session_canonical, fault_target, fail_jsonl)
     with pytest.raises(OSError, match=fault_target):
         save_session_files(
             output_dir,
@@ -495,7 +501,7 @@ def test_review_failure_does_not_invalidate_verified_parquet(
     def fail_review(*_args, **_kwargs):
         raise OSError("review generation fault")
 
-    monkeypatch.setattr(recording_session, "_rebuild_session_review", fail_review)
+    monkeypatch.setattr(_session_review, "_rebuild_session_review", fail_review)
     saved = save_session_files(
         output_dir,
         metadata={"session_id": "report-failure"},
@@ -673,7 +679,7 @@ def test_publish_failure_keeps_old_data_and_retry_spool(
     def fail_publish(*_args, **_kwargs) -> None:
         raise OSError("current pointer fault")
 
-    monkeypatch.setattr(recording_session, "_publish_v2_generation", fail_publish)
+    monkeypatch.setattr(_session_generation, "_publish_v2_generation", fail_publish)
     with pytest.raises(OSError, match="current pointer fault"):
         save_session_files(
             output_dir,
@@ -716,7 +722,7 @@ def test_published_generation_validation_failure_rolls_back_and_keeps_spool(
         raise OSError("injected published validation fault")
 
     monkeypatch.setattr(
-        recording_session,
+        _session_generation,
         "_validate_published_v2_generation",
         fail_published_validation,
     )
@@ -761,7 +767,7 @@ def test_generation_manifest_failure_keeps_previous_manifest_data_and_spool(
             raise OSError("injected generation manifest fault")
         original_write(path, payload)
 
-    monkeypatch.setattr(recording_session, "_write_manifest", fail_generation_manifest)
+    monkeypatch.setattr(_session_manifest, "_write_manifest", fail_generation_manifest)
     with pytest.raises(OSError, match="generation manifest fault"):
         save_session_files(
             output_dir,

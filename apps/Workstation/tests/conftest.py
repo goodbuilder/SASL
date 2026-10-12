@@ -107,3 +107,63 @@ def workstation_qapplication() -> object:
             pass
     application.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
     application.processEvents()
+
+
+@pytest.fixture(autouse=True)
+def block_unmocked_external_test_network(monkeypatch):
+    """A missed device fake must not issue commands to a real deployment.
+
+    Local socket protocol tests remain available. Hardware-only runs must opt
+    in explicitly with WORKSTATION_ALLOW_EXTERNAL_TEST_NETWORK=1.
+    """
+    if (os.environ.get("WORKSTATION_ALLOW_EXTERNAL_TEST_NETWORK") == "1"
+            and os.environ.get("WORKSTATION_FORBID_EXTERNAL_NETWORK") != "1"):
+        yield
+        return
+    import ipaddress
+    import socket
+
+    def local_address(address):
+        if not isinstance(address, tuple):
+            return True  # Unix-domain paths are local.
+        host = str(address[0]).split("%", 1)[0]
+        if host == "localhost":
+            return True
+        try:
+            parsed = ipaddress.ip_address(host)
+            return parsed.is_loopback or parsed.is_unspecified
+        except ValueError:
+            return False
+
+    original_connect = socket.socket.connect
+    original_connect_ex = socket.socket.connect_ex
+    original_sendto = socket.socket.sendto
+    attempts: list[str] = []
+
+    def reject(kind, address):
+        message = f"Unmocked external {kind} in Workstation test: {address!r}"
+        attempts.append(message)
+        raise RuntimeError(message)
+
+    def connect(sock, address):
+        if not local_address(address):
+            reject("socket", address)
+        return original_connect(sock, address)
+
+    def connect_ex(sock, address):
+        if not local_address(address):
+            reject("socket", address)
+        return original_connect_ex(sock, address)
+
+    def sendto(sock, data, *args):
+        if args and not local_address(args[-1]):
+            reject("datagram", args[-1])
+        return original_sendto(sock, data, *args)
+
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", connect_ex)
+    monkeypatch.setattr(socket.socket, "sendto", sendto)
+    yield
+    # Worker code may legitimately convert exceptions into failure evidence;
+    # that must not hide an escaped fake from the regression result.
+    assert not attempts, "\n".join(attempts)

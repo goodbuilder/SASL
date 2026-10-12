@@ -1,0 +1,18 @@
+{
+  "head": "42b16e0305120c769aaa6483254d19c08fbf55bf",
+  "note": "Dirty worktree baseline; prior RCA/decomposition changes included",
+  "sha256": {
+    "workspace_views/recording.py": "64b0fa87381d94542fc064c0a22d70218b958dfa586b3d48f3b8df1ee8d48047",
+    "workspace_views/telemetry.py": "200f2f4112aeedccb660954f8e00e845f21240373c4d5bba8b87c1a47e50e889",
+    "target_drone_controller.py": "22c3a8299cf9cdab7ac7548641888c5aff865b08586380cfca19d013462fd514",
+    "drone_telemetry_controller.py": "63fc69abe687cc58a865480a89d85686ad9e720eff62f7175c45382f823db0e7",
+    "workstation_core/target_drone_stream.py": "9d9b6973f53f1d49c19b585108447eb6cba24d7d4ecf0444d1b1ad70bdc18fab",
+    "workstation_core/drone_network_discovery.py": "d6d55bb2d3be7fcc1be98af50f7c027b2bb080260294057fd6efdd8f90f8317e",
+    "workstation_core/pixhawk_attitude.py": "b176ed972bf4f86e2a924d4eeadc6e970e7623d2b8b137843d35bb8a4905317c",
+    "workstation_core/mavlink_sources.py": "d8034ae90f3b6a6b2ddd2ed3b9a1466234661365df351fdb856a15a35911cfa2",
+    "workstation_core/settings.py": "821f7418d2148bd6c409036a68c4b4736aef3c4faa9c20bc317deb41f2e522d6",
+    "standalone_backend.py": "fc9ff115398051f9e3e2c696a24b663d03011f8379f7f9f4bd657618320eaff7",
+    "app_lifecycle_controller.py": "c5cbbaedb1d8260d25178af4ec782ae22e7ee4b2f87f1c6dd964c1eed48918a2",
+    "device_runtime_workers.py": "878a43098732fbd94b2bf2dc48ac6f754e5efc8adcad432f7518be0d114f993a"
+  }
+}

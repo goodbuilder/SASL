@@ -1,0 +1,55 @@
+{
+  "environment": "offscreen real panel and shell; hardware startup disabled; isolated network",
+  "views": [
+    {
+      "context": "overview",
+      "image": "overview.png",
+      "width": 1366,
+      "height": 900
+    },
+    {
+      "context": "devices.cameras",
+      "image": "camera.png",
+      "width": 1366,
+      "height": 900
+    },
+    {
+      "context": "processing.measurement",
+      "image": "measurement.png",
+      "width": 1366,
+      "height": 900
+    },
+    {
+      "context": "tasks.data",
+      "image": "data.png",
+      "width": 1366,
+      "height": 900
+    },
+    {
+      "context": "tasks.calibration",
+      "image": "calibration.png",
+      "width": 1366,
+      "height": 900
+    },
+    {
+      "context": "tasks.advanced",
+      "image": "advanced.png",
+      "width": 1366,
+      "height": 900
+    }
+  ],
+  "feature_count": 11,
+  "shutdown": {
+    "schema": "workstation-shutdown-resources-v1",
+    "complete": true,
+    "coordinator_step": "",
+    "running_threads": [],
+    "live_processes": [],
+    "open_sockets": [],
+    "shared_memory": []
+  },
+  "callback_errors": [],
+  "rendering_limitations": [
+    "RuntimeError: pyqtgraph.opengl: Requires >= OpenGL 2.1; Found b'4.5 (Compatibility Profile) Mesa 23.2.1-1ubuntu3.1~22.04.4'"
+  ]
+}

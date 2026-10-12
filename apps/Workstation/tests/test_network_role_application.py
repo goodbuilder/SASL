@@ -515,6 +515,7 @@ def test_controller_stops_only_active_owners_on_affected_nics(monkeypatch) -> No
     controller = DeviceRuntimeController(panel)
     monkeypatch.setattr(controller, "_confirm_network_role_assignment", lambda *_args: True)
     monkeypatch.setattr(controller, "_network_role_requests", lambda *_args, **_kwargs: ())
+    monkeypatch.setattr(controller, "_network_role_requirements_for", network_role_requirements)
     monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda *_args: None)
 
     accepted = controller.request_network_role_assignment(

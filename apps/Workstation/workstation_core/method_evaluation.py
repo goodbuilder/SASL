@@ -18,6 +18,8 @@ import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
+from Workstation.workstation_core.immutable_json import freeze_json, thaw_json
+
 from Workstation.workstation_core.measurement_attempt import MeasurementAttempt
 from Workstation.workstation_core.measurement_controller import (
     MeasurementGeometryResult,
@@ -73,12 +75,11 @@ METHOD_RESULT_RELATIVE_PATHS: Mapping[str, str] = {
 
 def _canonical_bytes(payload: Mapping[str, object]) -> bytes:
     return json.dumps(
-        payload,
+        thaw_json(payload),
         ensure_ascii=False,
         allow_nan=False,
         sort_keys=True,
         separators=(",", ":"),
-        default=str,
     ).encode("utf-8")
 
 
@@ -146,17 +147,14 @@ class FrozenMeasurementPairSnapshot:
             raise ValueError("frozen pair sequence must be non-negative")
         _non_negative_ns(self.created_monotonic_ns, name="created_monotonic_ns")
         _non_negative_ns(self.created_unix_ns, name="created_unix_ns")
-        for payload in (
-            self.left_detection,
-            self.right_detection,
-            self.left_attitude,
-            self.right_attitude,
-            self.left_gps,
-            self.right_gps,
-            self.native_frames,
-            self.capture_sync,
+        for name in (
+            "left_detection", "right_detection", "left_attitude", "right_attitude",
+            "left_gps", "right_gps", "native_frames", "capture_sync",
         ):
+            payload = getattr(self, name)
             _reject_binary_payload(payload)
+            object.__setattr__(self, name, freeze_json(payload))
+        object.__setattr__(self, "reused_inputs", tuple(self.reused_inputs))
 
     def canonical_payload(self) -> dict[str, object]:
         return {
@@ -167,14 +165,14 @@ class FrozenMeasurementPairSnapshot:
             "created_monotonic_ns": int(self.created_monotonic_ns),
             "created_unix_ns": int(self.created_unix_ns),
             "timestamp_basis": self.timestamp_basis,
-            "left_detection": dict(self.left_detection),
-            "right_detection": dict(self.right_detection),
-            "left_attitude": None if self.left_attitude is None else dict(self.left_attitude),
-            "right_attitude": None if self.right_attitude is None else dict(self.right_attitude),
-            "left_gps": None if self.left_gps is None else dict(self.left_gps),
-            "right_gps": None if self.right_gps is None else dict(self.right_gps),
-            "native_frames": dict(self.native_frames),
-            "capture_sync": dict(self.capture_sync),
+            "left_detection": thaw_json(self.left_detection),
+            "right_detection": thaw_json(self.right_detection),
+            "left_attitude": thaw_json(self.left_attitude),
+            "right_attitude": thaw_json(self.right_attitude),
+            "left_gps": thaw_json(self.left_gps),
+            "right_gps": thaw_json(self.right_gps),
+            "native_frames": thaw_json(self.native_frames),
+            "capture_sync": thaw_json(self.capture_sync),
             "reused_inputs": list(self.reused_inputs),
         }
 
@@ -224,6 +222,10 @@ class MethodEvaluationRequest:
     schema: str = METHOD_EVALUATION_REQUEST_SCHEMA
 
     def __post_init__(self) -> None:
+        for name in ("snapshot_payload", "attempt_payload"):
+            object.__setattr__(self, name, freeze_json(getattr(self, name)))
+        for name in ("blocked_reasons", "reused_inputs"):
+            object.__setattr__(self, name, tuple(getattr(self, name)))
         if self.schema != METHOD_EVALUATION_REQUEST_SCHEMA:
             raise ValueError("unsupported method evaluation request schema")
         if not str(self.measurement_id):
@@ -256,10 +258,8 @@ class MethodEvaluationRequest:
             "request_generation": int(self.request_generation),
             "method_id": self.method_id,
             "method_instance_id": self.method_instance_id,
-            "snapshot_payload": dict(self.snapshot_payload),
-            "attempt_payload": (
-                None if self.attempt_payload is None else dict(self.attempt_payload)
-            ),
+            "snapshot_payload": thaw_json(self.snapshot_payload),
+            "attempt_payload": thaw_json(self.attempt_payload),
             "blocked_reasons": list(self.blocked_reasons),
             "reused_inputs": list(self.reused_inputs),
             "enqueued_monotonic_ns": int(self.enqueued_monotonic_ns),
@@ -309,6 +309,10 @@ class MethodEvaluationOutcome:
     schema: str = METHOD_EVALUATION_SCHEMA
 
     def __post_init__(self) -> None:
+        for name in ("attempt_payload", "result"):
+            object.__setattr__(self, name, freeze_json(getattr(self, name)))
+        for name in ("reasons", "warnings", "reused_inputs"):
+            object.__setattr__(self, name, tuple(getattr(self, name)))
         if self.schema != METHOD_EVALUATION_SCHEMA:
             raise ValueError("unsupported method evaluation schema")
         if self.method_id not in MEASUREMENT_METHOD_IDS:
@@ -372,9 +376,9 @@ class MethodEvaluationOutcome:
             "method_instance_id": self.method_instance_id,
             "status": self.status,
             "attempt_sha256": self.attempt_sha256,
-            "attempt_payload": dict(self.attempt_payload),
+            "attempt_payload": thaw_json(self.attempt_payload),
             "geometry_sha256": self.geometry_sha256,
-            "result": dict(self.result),
+            "result": thaw_json(self.result),
             "reasons": list(self.reasons),
             "warnings": list(self.warnings),
             "enqueued_monotonic_ns": int(self.enqueued_monotonic_ns),
@@ -455,6 +459,8 @@ class MethodEvaluationBundle:
     schema: str = METHOD_EVALUATION_BUNDLE_SCHEMA
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "snapshot_payload", freeze_json(self.snapshot_payload))
+        object.__setattr__(self, "outcomes", tuple(self.outcomes))
         if self.schema != METHOD_EVALUATION_BUNDLE_SCHEMA:
             raise ValueError("unsupported method evaluation bundle schema")
         if len(str(self.snapshot_sha256)) != 64 or any(
@@ -473,7 +479,7 @@ class MethodEvaluationBundle:
         object.__setattr__(
             self,
             "planned_methods",
-            {str(key): str(value) for key, value in dict(self.planned_methods).items()},
+            freeze_json({str(key): str(value) for key, value in self.planned_methods.items()}),
         )
         for outcome in self.outcomes:
             if (
@@ -512,7 +518,7 @@ class MethodEvaluationBundle:
             "primary_outcome_sha256": "" if primary is None else primary.canonical_sha256(),
             "submitted_method_ids": list(self.submitted_method_ids),
             "planned_methods": dict(self.planned_methods),
-            "snapshot_payload": dict(self.snapshot_payload),
+            "snapshot_payload": thaw_json(self.snapshot_payload),
             "outcomes": [outcome.to_record() for outcome in self.outcomes],
         }
 

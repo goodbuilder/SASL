@@ -1,4 +1,5 @@
 from __future__ import annotations
+from Workstation.workstation_core.media_stream import gstreamer_backend as gstreamer_runtime
 
 from types import SimpleNamespace
 from types import ModuleType
@@ -285,9 +286,9 @@ def test_bus_error_routing_only_marks_decoder_health_for_fallback(
         blocked_duration_s=lambda **_kwargs: 0.0,
         has_recent_rtp_input=lambda **_kwargs: True,
     )
-    monkeypatch.setattr(yolo_stream, "GstRtpTimingTracker", lambda *_a, **_k: tracker)
+    monkeypatch.setattr(gstreamer_runtime, "GstRtpTimingTracker", lambda *_a, **_k: tracker)
     monkeypatch.setattr(
-        yolo_stream,
+        gstreamer_runtime,
         "_launch_gst_pipeline",
         lambda *_a, **_k: (
             Pipeline(),
@@ -303,7 +304,7 @@ def test_bus_error_routing_only_marks_decoder_health_for_fallback(
         "record_video_path": "/tmp/sentinel.mp4" if source_name == "filesink0" else "",
     }
 
-    assert not yolo_stream._run_gstreamer_stream_once(
+    assert not gstreamer_runtime._run_gstreamer_stream_once(
         config,
         OutputQueue(),
         threading.Event(),

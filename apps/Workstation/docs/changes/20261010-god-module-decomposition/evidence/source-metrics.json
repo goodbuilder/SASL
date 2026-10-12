@@ -1,0 +1,41 @@
+{
+  "targets": {
+    "standalone_gui.py": {
+      "before_lines": 13702,
+      "after_lines": 319
+    },
+    "workspaces.py": {
+      "before_lines": 17551,
+      "after_lines": 147
+    },
+    "recording_controller.py": {
+      "before_lines": 8676,
+      "after_lines": 65
+    },
+    "measurement_view_controller.py": {
+      "before_lines": 6677,
+      "after_lines": 631
+    }
+  },
+  "target_total": {
+    "before": 46606,
+    "after": 1162
+  },
+  "application_python": {
+    "excludes": [
+      "tests/",
+      "tools/",
+      "workstation_core/mavlink_dialects/"
+    ],
+    "before": 166402,
+    "after": 176640
+  },
+  "application_and_tools_python": {
+    "excludes": [
+      "tests/",
+      "workstation_core/mavlink_dialects/"
+    ],
+    "before": 168102,
+    "after": 178469
+  }
+}

@@ -864,6 +864,34 @@ def test_shutdown_auxiliary_gate_includes_active_oz_capture_thread() -> None:
     assert "oz_photo_capture_thread" in checked
 
 
+def test_shutdown_waits_for_all_query_and_capture_owners_before_generic_clear():
+    from Workstation.app_lifecycle_controller import AppLifecycleController
+
+    calls = []
+    def owner(label, result):
+        return SimpleNamespace(request_shutdown=lambda: calls.append(label) or result)
+    ftp = owner("ftp", False)
+    panel = SimpleNamespace(
+        application=SimpleNamespace(
+            features={"calibration": SimpleNamespace(state=SimpleNamespace(ftp_transactions=ftp))},
+            evidence_query_runtimes=[owner("query1", False), owner("query2", True)],
+        ),
+        _optical_pose_controller_owner=owner("optical", False),
+        _calibration_workflow_controller_owner=owner("calibration", True),
+        stop_auto_calibration_capture=lambda: True,
+        _stop_calibration_preview_worker=lambda **kwargs: True,
+        stop_wiris_lrf_polling=lambda **kwargs: True,
+        _shutdown_stop_thread=lambda name: True,
+    )
+    lifecycle = AppLifecycleController(panel)
+    assert not lifecycle._shutdown_stop_auxiliary_workers()
+    assert calls == ["query1", "query2", "optical", "calibration", "ftp"]
+    sentinel = object()
+    panel.calibration_wiris_ftp_thread = sentinel
+    assert not lifecycle._shutdown_stop_thread("calibration_wiris_ftp_thread")
+    assert panel.calibration_wiris_ftp_thread is sentinel
+
+
 def test_forced_shutdown_does_not_close_data_store_or_claim_success_for_stuck_child(
     monkeypatch,
 ) -> None:

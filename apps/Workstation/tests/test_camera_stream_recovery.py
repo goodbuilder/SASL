@@ -1,4 +1,5 @@
 from __future__ import annotations
+from Workstation.workstation_core.media_stream import gstreamer_backend as gstreamer_runtime
 
 import inspect
 import pytest
@@ -64,12 +65,12 @@ def test_gstreamer_no_frame_watchdog_reopens_a_silent_pipeline(monkeypatch) -> N
             pipeline_states.append(state)
 
     monkeypatch.setattr(
-        yolo_stream,
+        gstreamer_runtime,
         "GstRtpTimingTracker",
         lambda *_args, **_kwargs: _idle_integrity_tracker(),
     )
     monkeypatch.setattr(
-        yolo_stream,
+        gstreamer_runtime,
         "_launch_gst_pipeline",
         lambda *_args, **_kwargs: (Pipeline(), SilentSink(), EmptyBus(), "fake-decoder"),
     )
@@ -79,7 +80,7 @@ def test_gstreamer_no_frame_watchdog_reopens_a_silent_pipeline(monkeypatch) -> N
     fallback_stop.start()
     try:
         started_s = time.monotonic()
-        recovered = yolo_stream._run_gstreamer_stream_once(
+        recovered = gstreamer_runtime._run_gstreamer_stream_once(
             {
                 "url": "rtsp://camera.invalid/visible",
                 "rtsp_latency_ms": 100,
@@ -246,6 +247,8 @@ def test_decoded_nv12_recorder_finalizes_synthetic_lossless_mp4(tmp_path) -> Non
     Gst.init(None)
     if not Path("/dev/nvidia0").exists():
         pytest.skip("NVIDIA device unavailable")
+    # Probe the same dimensions exercised by the recorder below.
+    probe_width, probe_height = 160, 64
     nvenc_probe = subprocess.run(
         [
             "ffmpeg",
@@ -257,7 +260,7 @@ def test_decoded_nv12_recorder_finalizes_synthetic_lossless_mp4(tmp_path) -> Non
             "-pix_fmt",
             "nv12",
             "-video_size",
-            "16x16",
+            f"{probe_width}x{probe_height}",
             "-framerate",
             "1",
             "-i",
@@ -270,7 +273,7 @@ def test_decoded_nv12_recorder_finalizes_synthetic_lossless_mp4(tmp_path) -> Non
             "null",
             "-",
         ],
-        input=bytes(16 * 16 * 3 // 2),
+        input=bytes(probe_width * probe_height * 3 // 2),
         check=False,
         capture_output=True,
         timeout=10.0,
@@ -963,8 +966,8 @@ def test_gstreamer_reconnect_does_not_exhaust_a_lifetime_retry_budget(monkeypatc
             stop_event.set()
         return False
 
-    monkeypatch.setattr(yolo_stream, "_run_gstreamer_stream_once", fail_until_stopped)
-    monkeypatch.setattr(yolo_stream, "GST_RTSP_RECONNECT_DELAYS_S", (0.0, 0.0))
+    monkeypatch.setattr(gstreamer_runtime, "_run_gstreamer_stream_once", fail_until_stopped)
+    monkeypatch.setattr(gstreamer_runtime, "GST_RTSP_RECONNECT_DELAYS_S", (0.0, 0.0))
 
     yolo_stream._run_gstreamer_stream(
         {"rtsp_reconnect_policy": yolo_stream.RTSP_RECONNECT_AUTOMATIC},
@@ -997,7 +1000,7 @@ def test_manual_reconnect_policy_runs_one_gstreamer_session(monkeypatch) -> None
         attempts.append(1)
         return False
 
-    monkeypatch.setattr(yolo_stream, "_run_gstreamer_stream_once", fail_once)
+    monkeypatch.setattr(gstreamer_runtime, "_run_gstreamer_stream_once", fail_once)
 
     yolo_stream._run_gstreamer_stream(
         {"rtsp_reconnect_policy": yolo_stream.RTSP_RECONNECT_MANUAL},
@@ -1080,14 +1083,14 @@ def test_zero_idr_integrity_timeout_is_single_session_without_reconnect_storm() 
         def put(self, message: object) -> None:
             messages.append(message)
 
-    original = yolo_stream._run_gstreamer_stream_once
+    original = gstreamer_runtime._run_gstreamer_stream_once
     try:
         def fail_integrity(*_args: object) -> bool:
             attempts.append(1)
             config["_integrity_manual_reconnect_required"] = True
             return False
 
-        yolo_stream._run_gstreamer_stream_once = fail_integrity
+        gstreamer_runtime._run_gstreamer_stream_once = fail_integrity
         yolo_stream._run_gstreamer_stream(
             config,
             OutputQueue(),
@@ -1097,7 +1100,7 @@ def test_zero_idr_integrity_timeout_is_single_session_without_reconnect_storm() 
             False,
         )
     finally:
-        yolo_stream._run_gstreamer_stream_once = original
+        gstreamer_runtime._run_gstreamer_stream_once = original
 
     assert attempts == [1]
     assert any(
@@ -1109,6 +1112,7 @@ def test_zero_idr_integrity_timeout_is_single_session_without_reconnect_storm() 
 
 def test_live_integrity_terminal_retires_only_failed_side_and_updates_truth() -> None:
     from Workstation.camera_stream_controller import CameraStreamLifecycleController
+    from Workstation.measurement_run_controller import MeasurementRunController
 
     stops: list[tuple[str, bool]] = []
     labels: list[str] = []
@@ -1125,15 +1129,6 @@ def test_live_integrity_terminal_retires_only_failed_side_and_updates_truth() ->
             stop=lambda *, wait=False, side=side: stops.append((side, wait)) or False,
         )
 
-    class MeasurementOwner:
-        state = "RUNNING"
-
-        def _set_state(self, state: str, detail: str, error: str = "") -> None:
-            self.state = state
-            self.detail = detail
-            self.error = error
-
-    measurement_owner = MeasurementOwner()
     panel = SimpleNamespace(
         _camera_start_readiness=None,
         _camera_integrity_unavailable_sides=set(),
@@ -1157,8 +1152,6 @@ def test_live_integrity_terminal_retires_only_failed_side_and_updates_truth() ->
         ),
         camera_connected=True,
         yolo_enabled=True,
-        _measurement_run_active_sides=("left", "right"),
-        _measurement_run_controller_owner=measurement_owner,
         _clear_measurement_pair_display=lambda: refreshes.append("pair"),
         _refresh_distance=lambda: refreshes.append("distance"),
         camera_connection_label=SimpleNamespace(setText=labels.append),
@@ -1168,6 +1161,14 @@ def test_live_integrity_terminal_retires_only_failed_side_and_updates_truth() ->
         _refresh_operation_header=lambda: refreshes.append("header"),
     )
 
+    # Exercise the real source -> Run owner handoff, not a fake private-state
+    # writer. Active sides must be derived from confirmed source evidence.
+    measurement_owner = MeasurementRunController(panel)
+    panel._measurement_run_controller_owner = measurement_owner
+    panel.measurement_source_transition = measurement_owner.measurement_source_transition
+    assert measurement_owner.begin_measurement_run()
+    assert measurement_owner.confirm_measurement_running(("left", "right"))
+    refreshes.clear()
     controller = CameraStreamLifecycleController(panel)
     controller._camera_stream_start_status(
         "right",
@@ -1181,7 +1182,7 @@ def test_live_integrity_terminal_retires_only_failed_side_and_updates_truth() ->
     assert panel.yolo_enabled is True
     assert panel._measurement_run_active_sides == ("left",)
     assert measurement_owner.state == "RUNNING"
-    assert "left only" in measurement_owner.detail
+    assert measurement_owner.measurement_run_snapshot()["sources"]["camera.right"]["state"] == "UNAVAILABLE"
     assert panel.active_stream_decoders == {"left": "nvh264dec", "right": None}
     assert panel.camera_frame_times == {"left": [1.0], "right": []}
     assert panel.camera_frame_metadata == {"left": {"frame": 1}, "right": {}}
@@ -1228,7 +1229,36 @@ def test_live_integrity_terminal_retires_only_failed_side_and_updates_truth() ->
     assert labels[-1] == "camera LIVE: left/right current frame verified"
 
 
-def test_manual_rtsp_reactivation_stays_pending_until_new_idr_frame() -> None:
+@pytest.fixture
+def reactivation_owners():
+    from PyQt5 import QtCore, QtWidgets
+    from Workstation.camera_feature.control import CameraControlRuntime
+    from Workstation.camera_runtime.recovery import StreamRecovery
+
+    hosts = []
+
+    def attach(panel):
+        host = QtWidgets.QWidget()
+        hosts.append(host)
+        control = CameraControlRuntime(host, thread_parent=host)
+        for name in (
+            "_rtsp_reactivation_side", "_rtsp_reactivation_enable_detection",
+            "_rtsp_reactivation_stop_generation", "_rtsp_reactivation_generation",
+        ):
+            setattr(control, name, getattr(panel, name))
+        recovery = StreamRecovery()
+        recovery._camera_integrity_unavailable_sides = panel._camera_integrity_unavailable_sides
+        recovery._measurement_camera_rejoin_expected_generations = panel._measurement_camera_rejoin_expected_generations
+        panel.state = SimpleNamespace(control_jobs=control, recovery=recovery)
+
+    yield attach
+    for host in hosts:
+        host.deleteLater()
+        QtWidgets.QApplication.instance().sendPostedEvents(host, QtCore.QEvent.DeferredDelete)
+    QtWidgets.QApplication.instance().processEvents()
+
+
+def test_manual_rtsp_reactivation_stays_pending_until_new_idr_frame(reactivation_owners) -> None:
     from Workstation.standalone_gui import WirisStereoDistancePanel
 
     labels: list[str] = []
@@ -1277,6 +1307,7 @@ def test_manual_rtsp_reactivation_stays_pending_until_new_idr_frame() -> None:
         yolo_enabled=False,
     )
 
+    reactivation_owners(panel)
     WirisStereoDistancePanel._finish_camera_rtsp_reactivation(
         panel,
         True,
@@ -1298,6 +1329,7 @@ def test_manual_rtsp_reactivation_stays_pending_until_new_idr_frame() -> None:
 
 def test_measurement_camera_rejoin_retries_recording_and_uses_new_segment(
     tmp_path: Path,
+    reactivation_owners,
 ) -> None:
     from Workstation.standalone_gui import WirisStereoDistancePanel
 
@@ -1370,6 +1402,7 @@ def test_measurement_camera_rejoin_retries_recording_and_uses_new_segment(
         yolo_enabled=False,
     )
 
+    reactivation_owners(panel)
     WirisStereoDistancePanel._finish_camera_rtsp_reactivation(panel, True)
 
     assert starts == [

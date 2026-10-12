@@ -9,6 +9,8 @@ from types import SimpleNamespace
 
 from PyQt5 import QtCore, QtWidgets
 
+import pytest
+
 from Workstation.device_runtime_workers import PixhawkRtcmInjectionWorker
 from Workstation.device_runtime_controller import DeviceRuntimeController
 from Workstation.gnss_runtime_controller import GnssRuntimeController
@@ -1044,35 +1046,107 @@ def test_evidence_close_is_linearized_with_concurrent_ingress(tmp_path) -> None:
     assert len(drained) == 1 and drained[0]["valid"] is True
 
 
-def test_pixhawk_worker_is_replaced_when_subscriber_identity_changes() -> None:
+@contextmanager
+def _pixhawk_replacement_runtime(monkeypatch):
+    """Track every created thread before assertions and always cancel restarts."""
+    from Workstation.gnss_runtime import corrections as correction_module
+
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     panel = QtCore.QObject()
-    subscriber_a = _Subscriber()
-    subscriber_b = _Subscriber()
-    panel.mavlink_pixhawk = subscriber_a
+    panel.mavlink_pixhawk = _Subscriber()
     panel.pixhawk_rtcm_thread = None
     panel.pixhawk_rtcm_worker = None
     panel.rtcm_pipeline_worker = None
     panel._refresh_gnss_base_rtcm_stats = lambda: None
     panel._maybe_activate_gnss_fixed_base = lambda: None
     panel._refresh_gnss_operation_readiness = lambda: None
-    controller = GnssRuntimeController(panel)
-    controller._ensure_rtcm_pipeline = lambda: None
-    controller._wire_rtcm_pipeline_injection_worker = lambda _worker: None
-    panel._clear_pixhawk_rtcm_worker = controller._clear_pixhawk_rtcm_worker
+    threads = []
+    base_thread_type = QtCore.QThread
 
-    threads: list[QtCore.QThread] = []
-    try:
+    class TrackedThread(base_thread_type):
+        def __init__(self, parent):
+            super().__init__(parent)
+            self.defer_retirement = False
+            self.retirement_requested = False
+            self.finished_observed = threading.Event()
+            self.finished.connect(self.finished_observed.set, QtCore.Qt.DirectConnection)
+            threads.append(self)
+
+        def quit(self):
+            self.retirement_requested = True
+            if not self.defer_retirement:
+                super().quit()
+
+        def release_retirement(self):
+            self.defer_retirement = False
+            super().quit()
+
+    # Patch only the correction owner's Qt namespace. The explicit injected
+    # factory is replaced as well, so all successors remain tracked while the
+    # shared application Qt namespace and other live objects stay unchanged.
+    correction_qt = SimpleNamespace(**{**vars(QtCore), "QThread": TrackedThread})
+    with monkeypatch.context() as scoped_patch:
+        scoped_patch.setattr(correction_module, "QtCore", correction_qt)
+        controller = GnssRuntimeController(panel)
+        owner = controller._correction_runtime()
+        owner.thread_factory = correction_module.QtCore.QThread
+        owner._ensure_rtcm_pipeline = lambda: None
+        owner._wire_rtcm_pipeline_injection_worker = lambda _worker: None
+        panel._clear_pixhawk_rtcm_worker = controller._clear_pixhawk_rtcm_worker
+        runtime = SimpleNamespace(app=app, panel=panel, controller=controller, threads=threads)
+        try:
+            yield runtime
+        finally:
+            # A queued finished callback must not create an untracked successor
+            # while cleanup handles an earlier failed assertion.
+            panel._pixhawk_rtcm_restart_pending = None
+            panel.mavlink_pixhawk = None
+            unjoined = []
+            for thread in tuple(threads):
+                try:
+                    base_thread_type.quit(thread)
+                    if not thread.wait(1000):
+                        unjoined.append(thread)
+                except RuntimeError:
+                    # finished -> deleteLater may already have deleted the C++
+                    # wrapper. Continue cleaning the remaining live threads.
+                    assert thread.finished_observed.is_set()
+            app.processEvents()
+            assert not unjoined
+            assert all(thread.finished_observed.is_set() for thread in threads)
+            assert panel._pixhawk_rtcm_restart_pending is None
+            panel.deleteLater()
+            QtCore.QCoreApplication.sendPostedEvents(panel, QtCore.QEvent.DeferredDelete)
+
+
+@pytest.mark.parametrize("retirement", ("immediate", "pending"))
+def test_pixhawk_worker_is_replaced_when_subscriber_identity_changes(monkeypatch, retirement) -> None:
+    with _pixhawk_replacement_runtime(monkeypatch) as runtime:
+        app, panel, controller = runtime.app, runtime.panel, runtime.controller
         first = controller._ensure_pixhawk_rtcm_worker()
         first_thread = panel.pixhawk_rtcm_thread
         assert first is not None and first_thread is not None
-        threads.append(first_thread)
+        if retirement == "immediate":
+            # Exercise the already-finished case before the timed admission
+            # call; production never needs to wait for this predecessor.
+            first_thread.quit()
+            assert first_thread.wait(1000)
+        else:
+            # Hold a real QThread alive until after admission returns so the
+            # asynchronous path does not depend on OS scheduling luck.
+            first_thread.defer_retirement = True
 
+        subscriber_b = _Subscriber()
         panel.mavlink_pixhawk = subscriber_b
         replacement_started_s = time.monotonic()
         second = controller._ensure_pixhawk_rtcm_worker()
-        assert second is None
         assert time.monotonic() - replacement_started_s < 0.05
+        if retirement == "pending":
+            assert second is None
+            assert first_thread.retirement_requested is True
+            first_thread.release_retirement()
+        else:
+            assert second is not None and second is not first
         deadline_s = time.monotonic() + 2.0
         while time.monotonic() < deadline_s:
             app.processEvents()
@@ -1082,21 +1156,46 @@ def test_pixhawk_worker_is_replaced_when_subscriber_identity_changes() -> None:
             time.sleep(0.005)
         second_thread = panel.pixhawk_rtcm_thread
         assert second is not None and second_thread is not None
-        threads.append(second_thread)
-
         assert second is not first
         assert second.subscriber is subscriber_b
         assert second_thread is not first_thread
-        assert not first_thread.isRunning()
+        assert first_thread.finished_observed.is_set()
         controller._clear_pixhawk_rtcm_worker(first_thread, first)
         assert panel.pixhawk_rtcm_thread is second_thread
         assert panel.pixhawk_rtcm_worker is second
-    finally:
-        for thread in dict.fromkeys(threads):
-            if thread.isRunning():
-                thread.quit()
-                thread.wait(1000)
-        app.processEvents()
+
+        # Force the retired wrapper's deferred deletion now. Cleanup must still
+        # join the successor even though calling isRunning on the old wrapper
+        # is no longer valid.
+        try:
+            QtCore.QCoreApplication.sendPostedEvents(first_thread, QtCore.QEvent.DeferredDelete)
+        except RuntimeError:
+            pass  # It was already deleted by a legitimate event-loop ordering.
+
+
+@pytest.mark.parametrize("retirement", ("immediate", "pending"))
+def test_pixhawk_replacement_assertion_failure_cleans_every_created_thread(monkeypatch, retirement):
+    runtime = None
+    with pytest.raises(AssertionError, match="injected assertion before replacement checks"):
+        with _pixhawk_replacement_runtime(monkeypatch) as runtime:
+            panel, controller = runtime.panel, runtime.controller
+            controller._ensure_pixhawk_rtcm_worker()
+            first_thread = panel.pixhawk_rtcm_thread
+            if retirement == "immediate":
+                first_thread.quit()
+                assert first_thread.wait(1000)
+            else:
+                first_thread.defer_retirement = True
+            panel.mavlink_pixhawk = _Subscriber()
+            controller._ensure_pixhawk_rtcm_worker()
+            raise AssertionError("injected assertion before replacement checks")
+    assert runtime is not None
+    assert all(thread.finished_observed.is_set() for thread in runtime.threads)
+    # The full-suite symptom surfaced much later when AST parsing triggered
+    # cyclic GC. Collect this fixture's cycles now, with no live QThreads left.
+    import gc
+    del runtime
+    gc.collect()
 
 
 def test_full_pixhawk_disconnect_retires_subscriber_bound_rtcm_worker() -> None:

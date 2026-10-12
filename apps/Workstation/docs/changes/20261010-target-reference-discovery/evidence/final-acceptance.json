@@ -1,0 +1,33 @@
+{
+  "status": "software_acceptance_pass",
+  "source_inventory_sha256": "59d307b6ca45e611a6c68c211478c9e45fa49c06b50b241235e1b8d9aab46065",
+  "active_source_files": 437,
+  "source_changed_after_final_run": [],
+  "regression": {
+    "passed": 2266,
+    "skipped": 2,
+    "warnings": 1,
+    "seconds": 266.14,
+    "exit_code": 0,
+    "log": "evidence/final-regression.log"
+  },
+  "visual": {
+    "profiles": 4,
+    "screenshots": 20,
+    "unexpected_callbacks": 0,
+    "shutdown_complete": true
+  },
+  "restart": {
+    "fresh_processes": 2,
+    "preferences_restored": true,
+    "auto_connect": false
+  },
+  "limits": [
+    "physical USB/radio DTR/RTS and real network qualification not performed",
+    "official launcher environment is not provisioned in this checkout",
+    "NVENC unavailable in test namespace",
+    "optional pyproj absent",
+    "system NumPy/SciPy version warning",
+    "offscreen OpenGL capability limitation retained"
+  ]
+}

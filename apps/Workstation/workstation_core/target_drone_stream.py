@@ -493,6 +493,7 @@ class TargetDroneReceiver:
         spool_fsync_every_rows: int = 1,
         spool: Any | None = None,
         mavutil_module: Any | None = None,
+        expected_peer: tuple[str, int] | None = None,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
         utc_ns: Callable[[], int] = time.time_ns,
         on_record: Callable[[TargetDroneTelemetryRecord], None] | None = None,
@@ -524,6 +525,9 @@ class TargetDroneReceiver:
             )
         )
         self._mavutil_module = mavutil_module
+        self._expected_peer = expected_peer
+        self._cancel_start = threading.Event()
+        self._observed_ns: dict[str, int] = {}
         self._monotonic_ns = monotonic_ns
         self._utc_ns = utc_ns
         self._on_record = on_record
@@ -609,21 +613,34 @@ class TargetDroneReceiver:
                 self.spool.append(
                     self._lifecycle_row(
                         "connection_attempt",
+                        expected_peer=self._expected_peer,
                         expected_source_system=self.config.expected_system_id,
                         expected_source_component=self.config.expected_component_id,
                         mutation_policy="recv_only",
                     )
                 )
-                mavutil = self._mavutil()
-                connection = mavutil.mavlink_connection(
-                    self.config.endpoint,
-                    baud=self.config.baudrate,
-                    autoreconnect=False,
-                    robust_parsing=True,
-                )
+                self._observed_ns.clear()
+                if self._mavutil_module is not None:
+                    # Explicit injected protocol adapter used by existing embedders/tests.
+                    connection = self._mavutil().mavlink_connection(
+                        self.config.endpoint, baud=self.config.baudrate,
+                        autoreconnect=False, robust_parsing=True,
+                    )
+                else:
+                    from .target_transport import ReceiveOnlyConnection
+                    connection = ReceiveOnlyConnection(
+                        self.config.endpoint, baud=self.config.baudrate,
+                        expected_peer=self._expected_peer,
+                        expected_system_id=self.config.expected_system_id,
+                        expected_component_id=self.config.expected_component_id,
+                        cancel=self._cancel_start,
+                    )
                 self._connection = connection
                 heartbeat = connection.wait_heartbeat(timeout=self.heartbeat_timeout_s)
                 if heartbeat is None:
+                    if (getattr(connection, "rejected_identity_count", 0)
+                            or getattr(connection, "rejected_peer_count", 0)):
+                        raise HeartbeatIdentityError("Target heartbeat identity/peer mismatch; reselect the aircraft")
                     raise HeartbeatTimeoutError("target-drone heartbeat timed out")
                 source_system, source_component = _message_identity(heartbeat)
                 if source_system is None or source_component is None:
@@ -642,9 +659,11 @@ class TargetDroneReceiver:
                 with self._state_lock:
                     self._verified_source_system = source_system
                     self._verified_source_component = source_component
+                    self._observed_ns["HEARTBEAT"] = int(self._monotonic_ns())
                 self.spool.append(
                     self._lifecycle_row(
                         "heartbeat_verified",
+                        verified_peer=getattr(connection, "peer", None),
                         verified_source_system=source_system,
                         verified_source_component=source_component,
                     )
@@ -710,6 +729,20 @@ class TargetDroneReceiver:
 
     def _handle_message(self, message: Any) -> bool:
         message_type = _message_type(message)
+        peer = getattr(message, "_target_peer", None)
+        selected_peer = getattr(self._connection, "peer", None)
+        if selected_peer is not None and peer != selected_peer:
+            with self._state_lock:
+                self._rejected_cross_source_count += 1
+            return False
+        if message_type == "HEARTBEAT":
+            if _message_identity(message) == (self._verified_source_system, self._verified_source_component):
+                with self._state_lock:
+                    self._observed_ns["HEARTBEAT"] = int(self._monotonic_ns())
+            else:
+                with self._state_lock:
+                    self._rejected_cross_source_count += 1
+            return False
         if message_type not in _ALLOWED_MESSAGE_IDS:
             with self._state_lock:
                 self._ignored_message_count += 1
@@ -752,6 +785,7 @@ class TargetDroneReceiver:
         self.spool.append(record.to_json_dict())
         with self._state_lock:
             self._accepted_message_count += 1
+            self._observed_ns[message_type] = received_monotonic_ns
             if message_type == "ATTITUDE":
                 self._last_attitude = record
             elif record.sensor_slot is not None:
@@ -938,6 +972,39 @@ class TargetDroneReceiver:
                 self._set_state(TargetDroneStreamState.STOPPED)
             return self.snapshot()
 
+    def reception_status(self) -> dict[str, Any]:
+        """Host reception ages; no frame conversion or truth promotion."""
+        with self._state_lock:
+            now = int(self._monotonic_ns())
+            result = {}
+            for name in ("HEARTBEAT", "GPS_RAW_INT", "GPS2_RAW", "ATTITUDE"):
+                stamp = self._observed_ns.get(name)
+                age = None if stamp is None else max(0.0, (now - stamp) / 1e9)
+                record = self._last_attitude if name == "ATTITUDE" else self._last_gps.get(
+                    "GPS1" if name == "GPS_RAW_INT" else "GPS2"
+                )
+                valid = name == "HEARTBEAT"
+                fix, rtk = None, "UNKNOWN"
+                if record is not None:
+                    fields = record.fields
+                    if name == "ATTITUDE":
+                        valid = all(fields.get(key) is not None for key in (
+                            "roll_rad_body_frd_to_world_ned", "pitch_rad_body_frd_to_world_ned", "yaw_rad_body_frd_to_world_ned"))
+                    elif name != "HEARTBEAT":
+                        fix = fields.get("fix_type")
+                        lat, lon = fields.get("latitude_deg_wgs84"), fields.get("longitude_deg_wgs84")
+                        valid = (fix is not None and fix >= 3 and lat is not None and lon is not None
+                                 and -90 <= lat <= 90 and -180 <= lon <= 180)
+                        rtk = str(fields.get("rtk_fix_label", "UNKNOWN"))
+                state = "UNKNOWN" if age is None else "STALE" if age > 3.0 else "VALID" if valid else "INVALID"
+                result[name] = {"age_s": age, "state": state, "fix_type": fix, "rtk": rtk}
+            connection = self._connection
+            return {"samples": result, "clock": "host_monotonic",
+                    "peer": getattr(connection, "peer", None),
+                    "rejected_peer_count": getattr(connection, "rejected_peer_count", 0),
+                    "rejected_initial_identity_count": getattr(connection, "rejected_identity_count", 0),
+                    "packet_overflow": getattr(connection, "dropped", 0)}
+
     def snapshot(self) -> TargetDroneStreamSnapshot:
         with self._state_lock:
             return TargetDroneStreamSnapshot(
@@ -995,6 +1062,7 @@ class TargetDroneWorker:
         if self.is_alive:
             return self.receiver.state
         self._stop_event.clear()
+        self.receiver._cancel_start.clear()
         self._worker_error = None
         self._thread = threading.Thread(
             target=self._run,
@@ -1025,6 +1093,7 @@ class TargetDroneWorker:
 
     def request_stop(self) -> None:
         self._stop_event.set()
+        self.receiver._cancel_start.set()
 
     def stop(self, *, timeout_s: float | None = None) -> TargetDroneStreamSnapshot:
         self.request_stop()

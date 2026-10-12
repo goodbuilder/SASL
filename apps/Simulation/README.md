@@ -8,6 +8,157 @@ profile identifiers such as `stereo_ground_sim`, `stereo_distance_node`, and
 `/stereo/*` remain compatibility identifiers; historical experiment records
 may retain the former StereoDistance wording.
 
+## Human-operated stereo campaign v1.1
+
+### Purpose
+
+The workbook-driven campaign treats the XLSX manifest as the source of truth
+for its ordered run list, fixed settings, per-run values and evidence contract.
+Each run produces original capture evidence plus separately stored derived
+observations and QC.
+
+### Current Run Flow
+
+The campaign does not require an LLM. Edit the literal `STEREO_V1_1_*` block
+near the top of `config/simulation.env`, launch `./run_stereo_campaign_rqt.sh` from
+`apps/Simulation`, press **Refresh Simulation.env**, then press **Run
+configured action**. The checked-in sweep default is `STEREO_V1_1_ACTION=xlsx_plan`,
+which validates and displays the configured campaign without starting SITL. Set
+`development` for a non-counted pilot, `all` to collect the
+39 raw slots, or `all_results` to run preflight, collect/QC all 39 slots, and
+produce the offline analysis. `resume` continues valid incomplete work and
+starts analysis when all 39 slots pass source QC. `reprocess` analyzes an
+existing 39-run dataset without starting SITL. `preflight`, `qc`, and the
+separate `legacy_sweep` action are also available.
+
+### Inputs/Outputs and Interfaces
+
+For workbook-driven multi-flight runs, the default input is
+`config/campaign/v1_1/sweep_manifest_v1_1.xlsx`. Set `STEREO_V1_1_WORKBOOK` to another
+repo-relative manifest XLSX when needed and choose `xlsx_plan`, `xlsx_all`, or
+`xlsx_resume`. `xlsx_plan` validates the workbook and displays the manifest order,
+requested seeds, run-variable values, and plan-stage requirements without starting
+SITL. `xlsx_all` runs every manifest row serially after preflight. `xlsx_resume`
+continues from the immutable workbook copy stored in the campaign output.
+
+The manifest workbook has twelve sheets: `Guide`, `Campaign`, `ParameterCatalog`,
+`Parameters`, `RunManifest`, `RunParameters`, `Requirements`, `ArtifactContract`,
+`ObservationContract`, `OfflinePlan`, `ChangeNotes`, and `EnvironmentContract`.
+`RunManifest` is the
+explicit run list and order; the runner does not create a factor cross-product.
+`xlsx_all` writes under `recordings/stereo_v1_1/<output_id>`: `run_status.json`
+tracks the 39 slots, `manifest_actual.json` records attempts and seeds, raw
+captures live under `원본_실행별/`, and YOLO/GT derivatives live under
+`파생_재처리/`.
+
+### Operational Rules
+
+`Parameters.scope` classifies each supported setting as `campaign_fixed` or
+`run_variable`. A fixed setting has one `campaign_value`. A run-variable setting
+has exactly one `RunParameters` value for every manifest row. Scope assignments
+can change for each work instruction; the parser checks that resolved values
+belong to the supported runtime catalog. `Campaign.seed_policy=manifest_required`
+applies each row's `seed_requested`. A technical retry uses the same seed and a
+new attempt ID. Attempt evidence records Gazebo CLI forwarding and leaves
+unverified PX4 RNG behavior and repeat independence explicit.
+`Vehicle.model_id` and `Vehicle.reference_link` are explicit campaign-fixed
+settings. The current capture pipeline supports `x500_2m` with
+`vehicle_reference_link` and rejects different values before execution.
+Unmeasured mesh dimensions and GNSS lever arms remain explicit nulls in the
+handoff requirements; they are not inferred from the model name or set to zero.
+
+Plan-stage `Requirements` are evaluated by `xlsx_plan`. Required
+`ArtifactContract` rows and `ObservationContract` fields feed per-run QC.
+Other requirements and `OfflinePlan` rows are frozen with the campaign for
+manual or downstream analysis review. `EnvironmentContract` pins the source
+and installed `stereo_ground_drone.sdf` hashes, world name, lighting/background,
+weather and wind declaration. XLSX preflight checks both copies, verifies the
+declared world and no-wind condition, and records the parsed lighting and
+atmosphere snapshot. The current world has an adiabatic atmosphere and no
+explicit wind element or wind plugin. `OfflinePlan.trial_count` is handoff
+metadata; `xlsx_*` actions do not run offline analysis and ignore
+`STEREO_V1_1_MC_TRIALS`. The fixed-protocol `resume`, `all_results` and
+`reprocess` actions use that environment value when they launch analysis.
+
+### Known Limitations and Workarounds
+
+The current runner keeps the world environment campaign-fixed; per-run world
+or wind changes need a runtime binding before they can be declared in XLSX.
+The existing 39-run source does not have reliable per-run evidence to
+reconstruct its historical lighting or wind conditions. The numeric v2 and v3 workbooks remain readable when explicitly selected; v3's
+`Defaults` and sparse-override sheets do not carry manifest seeds. Use a fresh
+output ID for `xlsx_all`; `xlsx_resume` uses that same output ID and frozen
+workbook.
+
+The current verified handoff workbook is
+`recordings/stereo_v1_1/manifest_sweep_handoff_20261011/요약_결과/전체_실험_요약.xlsx`.
+It reuses the read-only 39-run source at `../../../SASL_39회_시뮬레이션_20261009`
+and the released analysis version `analysis_ec9526f32496`; it does not launch
+additional Gazebo runs.
+
+The Campaign RQT's configured-action button dispatches v1.1 through the existing
+`run_auto_attitude_sweep.sh --stereo-v1-1` compatibility entry point. Calling
+`run_auto_attitude_sweep.sh` without a mode now uses the manifest workbook and its
+configured `xlsx_*` action. The former OFAT sweep is available through
+`run_auto_attitude_sweep.sh --legacy [options]`. The main flight-monitor RQT keeps
+its existing mission and monitoring roles.
+
+The RQT launcher verifies the repo-pinned `px4_msgs` source and builds its ROS
+overlay when the install is missing. This build is separate from the YOLO
+runtime preparation button.
+
+The normal results action produces A/B/C calibration with `RPY_IMU` and
+`YAW_ONLY`, the separately labeled `YAW_IDEAL` and ORACLE diagnostics, a
+100-trial representative Monte Carlo, the staged one-factor sensitivity
+matrix, a G0 covariance-based path ranking, a freeze record, and matching V0
+evaluation after that freeze. Outputs live below the selected output ID;
+versioned results are under `analysis_versions/<analysis-id>/`, with
+`analysis_latest.json` as the handoff pointer. The protocol's matched-200
+comparison stays explicitly unmet when a run has fewer than 200 unique
+time-stratified pairs.
+
+Use **Prepare pinned YOLO runtime** once when the isolated `.venv` selected by
+`STEREO_V1_1_YOLO_PYTHON` is absent. For a new checkout, the configured
+repo-relative `STEREO_V1_1_PX4_DIR` must contain the pinned PX4 v1.17.0 source
+and SITL binary; on the current machine the controller can transiently find
+an adjacent exact-tag checkout without saving its absolute path. For an
+existing campaign outside this checkout, set `STEREO_V1_1_ACTION=reprocess`,
+point `STEREO_V1_1_INPUT_ROOT` to its campaign root (a path relative to the
+SASL repository root), keep `STEREO_V1_1_OUTPUT_BASE=repo`, and choose an
+output ID for a separate derived-results folder. On this machine the existing
+39-run source can be selected with
+`STEREO_V1_1_INPUT_ROOT=../SASL_39회_시뮬레이션_20261009`. Alternatively,
+set `STEREO_V1_1_INPUT_ROOT=data_root` and configure
+`SASL_WORKSTATION_DATA_ROOT` to the campaign root. Reprocessing reads and QC
+checks the source while writing versioned results under the selected output.
+The source root must contain its 39-slot status, attempt files, and campaign
+manifests. Keep output IDs unique for new collections.
+
+The checked-in sweep default is `xlsx_plan`; it does not run offline analysis.
+`STEREO_V1_1_MC_TRIALS=100` applies only when the fixed-protocol `resume`,
+`all_results` or `reprocess` action starts analysis. A shorter trial count is
+only for development verification and must not be reported as the full Monte
+Carlo result. The legacy 20-case attitude sweep remains an independent action
+and is not a substitute for the 39-slot protocol.
+
+When resuming a campaign, QC may revalidate the same preserved attempt without
+another flight only if its saved protocol errors are exactly
+`workbook_run_manifest_vehicle_model_id_mismatch` and
+`workbook_run_manifest_vehicle_reference_link_mismatch`, and fresh QC passes.
+The original report is retained as `qc_report_pre_revalidation.json`; the
+updated report, runner result, attempt checksums and campaign `changes_log.jsonl`
+record the correction. Any other protocol deviation still stops the campaign.
+For a campaign that cannot use CUDA, set `YOLO_DEVICE=cpu` and
+`YOLO_TORCH_BACKEND=auto` in that campaign's output-local `simulation.env`; this
+keeps the checked-in machine defaults and pinned model/runtime unchanged.
+
+### Change Log
+
+- 2026-10-11 — Workbook QC now reads model and reference link from
+  `parameters.Vehicle`. Resume can revalidate the existing attempt for the
+  known false-positive check only, preserving the original QC and recording
+  the correction in the campaign audit log.
+
 ## Observation modes (S2-I1)
 
 In `bbox_yolo`, camera subscription and model loading require a positive
@@ -32,6 +183,195 @@ The existing Gazebo target/model domain mismatch for `bbox_yolo` remains a
 separate limitation; ideal correspondence is not evidence that YOLO detects
 the target.
 
+## Stereo campaign v1.1 physical optical pose
+
+### Purpose
+
+`config/campaign/v1_1/G0.env` and `G1.env` freeze the two rendered camera
+pose groups in the supplied 39-run protocol. G0 is the nominal 20-degree
+elevation with both north-to-east headings at zero. G1 keeps the same optical
+centers and elevation but sets left heading +0.5 degree and right heading
+-0.5 degree. Camera centers are world ENU `(-12.5,0,0.1)` and `(12.5,0,0.1)` m.
+
+### Current run flow and interfaces
+
+The existing config loader accepts either file through
+`SIM_SCENARIO_CONFIG=config/campaign/v1_1/G0.env` or `.../G1.env` when starting
+`run_operator_view.sh`. These profiles override the local optical RDF pose
+inputs after `simulation.env`; they leave camera PX4 body attitude separate.
+The frozen protocol source, 39-run manifest, and reference generator are copied
+into `campaigns/stereo_v1_1/protocol/` so this experiment can be planned from
+a notebook clone without the untracked handoff folder. The manifest and
+generator are byte-identical to the supplied files. The spec differs only in
+one historical checkout-path hint, replaced by a non-path warning for
+portability; `protocol/provenance.json` records source and active hashes. From
+`apps/Simulation`, `python3 campaigns/stereo_v1_1/plan_campaign.py` validates
+the 39 slots without starting Gazebo/PX4 or writing results. Add `--output-dir
+recordings/stereo_v1_1/<new-id>` to write one `campaign_plan.json` into a new,
+ignored campaign directory. The planner rejects paths in the old sweep tree
+and refuses to overwrite an existing directory. The plan command alone makes
+no flight or result claim. `campaign_status.py --output-root <new-output-root>`
+initializes the 39 status slots once; preserve its files after that.
+
+The separate `campaign_run.py` uses those slots and runs one Gazebo/PX4 SITL
+stack at a time. Verified commands from the repository root are:
+
+```bash
+python3 apps/Simulation/campaigns/stereo_v1_1/campaign_run.py plan --output-root <output-root>
+python3 apps/Simulation/campaigns/stereo_v1_1/campaign_run.py run --output-root <output-root> --run-id G0-P0-R01
+python3 apps/Simulation/campaigns/stereo_v1_1/campaign_run.py all --output-root <output-root>
+python3 apps/Simulation/campaigns/stereo_v1_1/campaign_run.py resume --output-root <output-root>
+python3 apps/Simulation/campaigns/stereo_v1_1/campaign_run.py qc --output-root <output-root>
+```
+
+`run --development` keeps a test flight outside the 39 slots. `all` follows
+the four prescribed pilot IDs and the remaining manifest order. `resume`
+rechecks valid attempts from disk and reconciles a stopped `RUNNING` attempt
+as a preserved technical failure if it lacks completed QC; a subsequent
+attempt uses the same seed. `all` and `resume` stop at the first failed slot
+for cause investigation. Do not run either while another SITL session is
+active. The existing sweep command remains separate.
+
+The `--legacy` mode keeps the older OFAT waypoint experiment. With no campaign
+profile or caller optical overrides, `./run_auto_attitude_sweep.sh --legacy
+--plan-only` produces center/zigzag, nine perturbation conditions and 20 cases
+with the base config's 8-degree pitch. To run that experiment, clear
+`SIM_SCENARIO_CONFIG` and explicit `CAM_*` overrides, create a fresh old-sweep
+output directory, and validate its plan before a real run.
+
+The v1.1 `yolov8n_uav.pt` weight is pinned by
+`campaigns/stereo_v1_1/model_manifest.json` (SHA-256
+`8a2204bf2ed7c09b9dbabeaa1c1e984ab482c10325e2387150e23d8daa3cb777`).
+The binary remains ignored by Git. On a new checkout, supply the same weight
+file and run `python3 campaigns/stereo_v1_1/import_yolo_weights.py --source
+<weight-file>` from this directory; `--check` verifies the owned
+content-addressed copy and the runtime alias. The pinned isolated runtime is
+Ultralytics 8.4.127 with confidence 0.10, IoU 0.70 and image size 736; CUDA
+inference of the original source frames passed the development run and four
+formal pilot slots.
+
+### Operational rules and known limitations
+
+At zero optical roll and 20-degree local optical pitch, the existing
+`R_Down(yaw) @ R_Right(pitch)` composition produces the protocol's
+`Rz_world(-psi) @ R_WC_nominal` for the G0/G1 heading values. The generated
+SDF optical-link pose and fixed optical centers are checked in
+`tests/test_v1_1_camera_pose_profiles.py` against the protocol matrix.
+Explicit caller environment values and launch arguments take precedence over
+the profile; the campaign runner sets and hashes its effective profile for
+each attempt. It also passes the manifest seed to `gz sim --seed`. The
+physical sensor/noise effect and independence of repetition streams remain
+unverified, so QC marks that limitation on each run.
+The 2026-10-09 headless readback did confirm all four G0/G1 optical poses
+against the protocol matrix, and a checked PX4 v1.17.0 SITL emitted target,
+left and right attitude messages. See
+`docs/changes/20261008-stereo-campaign-v1-1/px4_camera_preflight.md`.
+The same smoke showed that PX4 local NED origin must be measured at science
+start: its stationary world-up origin was near 1 m after estimator resets,
+while the configured model spawn Z was 6 m. Do not use configured spawn Z as
+the local-NED origin. Horizontal and vertical sign mapping passed moving
+flight checks.
+`campaigns/stereo_v1_1/trajectory_contract.py` now defines the required
+position/velocity mapping from world ENU `[east,north,up]` to PX4 local NED
+`[north,east,down]`, the observed-origin calculation, north-to-east-positive
+heading in radians, and interpolation within the 50 Hz science reference.
+It rejects extrapolation outside science time. This pure contract is tested;
+`campaign_setpoints.py` sends local-NED position/velocity/yaw with the heading
+field active, unlike the older waypoint sender. The field order and MAVLink
+type masks have targeted tests. `flight_gates.py` requires at least 20
+fresh, same-epoch origin observations without PX4 estimator resets, then
+checks the prescribed five continuous seconds of speed/position/heading
+stability with bounded sample gaps. `flight_controller.py` now uses the ROS
+observer and PX4 MAVLink to perform entry, science, post-science hold and
+landing without teleporting the drone. A separate DEVELOPMENT G0-P0 run
+completed the entire capture, YOLO, GT alignment and QC chain. Its image-time
+GT tracking P95 was 3.96 m, above the protocol's 1 m warning threshold;
+the warning does not delete the run. Development data is not a 39-slot result.
+`capture_streams.py` records the two original `sensor_msgs/Image` streams in
+separate lossless zstd-message-compressed sqlite3 rosbag2 directories. It
+waits until each image topic is actually subscribed before signaling readiness.
+`state_recorder.py` writes Gazebo 50 Hz reference-link pose, `/clock`, PX4
+local NED/body attitude and camera-pose diagnostics to separate append-only
+JSONL files. Development attempts a01–a03 preserved rosbag2 shutdown failures
+for combined state topics; the split format qualified with 201 original frames
+per eye and 50.0 Hz GT. The first full development flight's state recorder
+misclassified a requested SIGINT as a failure; a separate live retest now
+closes normally. None of these are one of the 39 campaign flights.
+`bag_index.py` retains every source image, forms one-to-one ≤1 ms pairs and
+marks unmatched frames. `postprocess_detections.py` uses the pinned YOLO model
+and explicit original-pixel letterbox inverse in a new derived directory;
+`requirements-postprocess.txt` adds the zstd reader to the isolated runtime.
+`qc_attempt.py` rejects missing/failed source artifacts, false-zero missing
+bboxes and model-hash mismatches. `align_gt.py` aligns original exposure
+stamps to 50 Hz world-ENU GT by linear position interpolation and XYZW
+shortest-path SLERP, flagging extrapolation or gaps of at least 40 ms. It
+does not reveal V0 tracking metrics before method freeze. All 39 formal
+slots passed source QC with warnings on 2026-10-09; 32 completed the science
+phase and seven V0 runs failed to reach its start. The A/B/C RPY_IMU/YAW_ONLY
+offline estimators and post-freeze V0 evaluation are implemented in
+`campaigns/stereo_v1_1/analyze_campaign.py`; method-specific convergence and
+failure results are stored under `analysis_versions/`, not written into raw
+`corrected` fields. The seven saved V0 entry failures remain performance
+outcomes with intact raw data, not fabricated successful validation flights.
+The topic-to-field and coordinate mapping is in
+`docs/changes/20261008-stereo-campaign-v1-1/schema_mapping.md`.
+
+### v1.1 capture method and acceptance
+
+Method: serial PX4 SITL tracking of the manifest's 50 Hz world-ENU reference,
+with original left/right `Image` bags, independent 50 Hz GT/PX4 state JSONL,
+then pinned offline YOLO and image-time GT alignment. Purpose: provide
+reusable evidence for camera RPY calibration and route comparison. Inputs are
+the frozen v1.1 geometry/paths, G0 or G1 rendered camera pose, observed
+world-ENU↔PX4-local-NED origin, manifest seed and pinned detector. Outputs
+are immutable run/attempt raw streams and separate derived observations.
+Structural pass requires required files, expected clocks/frames, unbroken
+science GT alignment, source-frame identity, ≤1 ms unique stereo pairing,
+original-pixel bboxes and matching hashes. Tracking P95 >1 m, missing
+detections or a genuine control/flight failure remain recorded performance
+outcomes rather than deletion rules. The current seed path reaches Gazebo's
+CLI, but repeat independence is not established. RPY_IMU and YAW_ONLY
+estimator results are a separate offline method status.
+
+After all 39 raw slots pass QC, `python3
+apps/Simulation/campaigns/stereo_v1_1/generate_sensor_observations.py
+--output-root <output-root>` creates one offline synthetic camera RTK/IMU
+observation per rig/repetition/trial and copies the same observation bytes to
+each matching run's `파생_재처리/<run>/<attempt>/sensors/trial_000/` directory.
+Method `CAMERA_RTK_IMU_SYNTHETIC_MAIN` uses the Gazebo optical-center truth
+only inside this generator, draws fixed world-ENU position errors with sigma
+`(0.02,0.02,0.04)` m and finite optical roll/pitch errors with sigma
+`0.02°`, then writes measured values and covariance in m²/rad². Truth source
+hashes go to a separate generator-provenance file; an estimator may consume
+only the measured camera fields and shared key. The output is a simulated
+sensor input, not physical RTK/IMU data or a calibration result. Pass criteria
+are byte-identical measured observations across paths of one rig/repetition/
+trial, finite positive covariance, correct axes and absence of GT values in
+the estimator payload. The physical antenna lever arm remains unknown and is
+not silently set to zero.
+
+`audit_repetition_sequences.py --output-root <output-root>` compares the
+ordered original pixel hashes of both eyes and the world-ENU/XYZW GT pose
+series within each physical group/path. The 39-run audit found no completely
+identical repetition pair. That check only detects exact duplicates; it does
+not establish independent sensor/PX4 randomness. The seven V0 entry failures
+also have copied PX4 ULogs under their derived `diagnostics/` directories,
+with hashes and a separate diagnostic manifest. PX4 local NED height in those
+logs is not a world-ENU altitude or an RTK target position.
+
+### Change log
+
+- 2026-10-08: Added isolated G0/G1 optical pose profiles and generated-SDF
+  matrix tests, a frozen protocol snapshot and a separate plan-only tool.
+  The base `simulation.env` and old sweep entry point were left as found.
+- 2026-10-09: Verified the PX4 v1.17.0 SITL build, G0/G1 Gazebo optical
+  readback, and three-instance attitude transport; added a hash-checked local
+  model import, explicit ENU-to-local-NED reference contract and campaign
+  setpoint field mapping. Qualified split raw-image bags and GT/PX4 JSONL,
+  completed a development P0 controller flight and pinned-version offline
+  YOLO replay, and added attempt QC. Recorded the observed local-NED origin
+  mismatch as a flight preflight gate.
+
 ## PX4 Auto attitude calibration sweep
 
 ### Purpose
@@ -42,12 +382,15 @@ from rqt with `Save CSV` or `Save MP4`.
 
 ### Current run flow
 
-The current deterministic campaign is launched with
-`./run_auto_attitude_sweep.sh --ordered --keep-going`. It runs two shared
+The preserved legacy deterministic campaign is launched with
+`./run_auto_attitude_sweep.sh --legacy --ordered --keep-going`. It runs two shared
 trajectories (`center`, `zigzag`). Each trajectory has one zero-error baseline
 and nine right-camera optical-RDF OFAT cases: roll, pitch, and yaw offsets
 `0.2,0.5,1.0` degrees. The default campaign therefore has exactly 20 cases.
 RViz and `rqt_gui` remain visible; the Gazebo 3D GUI is not opened.
+The v1.1 manifest campaign is the default action of the same entry point.
+`--stereo-v1-1` remains a compatibility alias; `--legacy` selects this older
+OFAT workflow.
 
 ### Inputs, outputs, and interfaces
 
@@ -194,7 +537,7 @@ following bounded smoke uses the six currently dual-visible center points,
 the solved velocity-only guidance, and one right-camera pitch perturbation:
 
 ```bash
-SWEEP_MIN_OVERLAY_HZ=10 ./run_auto_attitude_sweep.sh \
+SWEEP_MIN_OVERLAY_HZ=10 ./run_auto_attitude_sweep.sh --legacy \
   --axes pitch --values-deg 0.2 --repetitions 1 \
   --trajectories center --waypoint-count 6 \
   --waypoints-rfu-m '0,415,154;0,365,137;0,315,121;0,265,104;0,215,88;0,165,71' \
@@ -6499,6 +6842,15 @@ Debug = telemetry.csv + left_overlay.mp4 + right_overlay.mp4 + rosbag/
 
 ## 변경 이력
 
+- 2026-10-11: manifest XLSX에 월드·조명/배경·날씨·바람 계약을 추가하고 preflight가 source/install SDF 해시와 런타임 월드 이름을 확인하게 했습니다. Monte Carlo 반복 횟수는 분석 액션에서만 읽고 `xlsx_*` 비행 액션과 분리했습니다.
+- 2026-10-11: 기본 sweep을 manifest XLSX 캠페인 계획으로 전환했습니다.
+  `Parameters`에서 캠페인 고정/회차별 범위를 지정하고, `RunManifest`의
+  순서와 seed를 적용합니다. 구형 OFAT sweep은 `--legacy`로 선택합니다.
+
+- 2026-10-10: 기존 `run_auto_attitude_sweep.sh`에 명시적인
+  `--stereo-v1-1` 모드를 연결했습니다. RQT 캠페인 버튼은 이 진입점을
+  사용하며, 옵션 없이 호출하는 기존 자세 스윕 동작은 유지됩니다.
+
 - 2026-08-31: Gazebo world ENU 자기장을 sensor FLU에서 PX4 body FRD로
   전달하는 경계를 수정했습니다. repo-owned helper가 PX4 v1.17.0
   GZBridge를 `(x,-y,-z)`로 안전하게 준비하고 build stamp로 stale binary를
@@ -6827,7 +7179,7 @@ python3 apps/Simulation/scripts/check_non_alias_selector_deployment_readiness.py
   baseline/pitch 0.2° 2-case PASS입니다.
 ### Sweep runtime workaround
 
-`run_auto_attitude_sweep.sh` keeps rqt/RViz and the optional
+The legacy `run_auto_attitude_sweep.sh --legacy` mode keeps rqt/RViz and the optional
 `detection_overlay_node` enabled so the full operator recorder writes its
 required left/right MP4 artifacts. The strict campaign requests 20 Hz
 camera/YOLO/overlay rates on the fail-closed CUDA runtime; normal operator

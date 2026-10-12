@@ -109,7 +109,7 @@ def test_compute_photo_table_displays_left_and_right_times_and_refreshes_for_met
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    import Workstation.workspaces as workspaces_module
+    import Workstation.workspace_views.calibration as workspaces_module
 
     _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     left, right = _write_pair(tmp_path)
@@ -162,7 +162,7 @@ def test_compute_photo_table_marks_timing_rejected_pair_as_intrinsics_only(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    import Workstation.workspaces as workspaces_module
+    import Workstation.workspace_views.calibration as workspaces_module
 
     _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     _write_pair(tmp_path)
