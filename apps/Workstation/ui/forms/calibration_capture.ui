@@ -1,0 +1,795 @@
+<ui version="4.0">
+  <class>Form</class>
+  <widget class="QGroupBox" name="group">
+    <property name="title">
+      <string>Capture while viewing</string>
+    </property>
+    <property name="minimumSize">
+      <size>
+        <width>0</width>
+        <height>0</height>
+      </size>
+    </property>
+    <property name="maximumSize">
+      <size>
+        <width>16777215</width>
+        <height>16777215</height>
+      </size>
+    </property>
+    <layout class="QVBoxLayout" name="formLayout">
+      <property name="leftMargin">
+        <number>6</number>
+      </property>
+      <property name="topMargin">
+        <number>6</number>
+      </property>
+      <property name="rightMargin">
+        <number>6</number>
+      </property>
+      <property name="bottomMargin">
+        <number>6</number>
+      </property>
+      <property name="spacing">
+        <number>6</number>
+      </property>
+      <item>
+        <layout class="QGridLayout" name="actions">
+          <property name="leftMargin">
+            <number>0</number>
+          </property>
+          <property name="topMargin">
+            <number>0</number>
+          </property>
+          <property name="rightMargin">
+            <number>0</number>
+          </property>
+          <property name="bottomMargin">
+            <number>0</number>
+          </property>
+          <property name="spacing">
+            <number>-1</number>
+          </property>
+          <item row="0" column="0" rowspan="1" colspan="1">
+            <widget class="QPushButton" name="camera_buttons_camera_toggle">
+              <property name="commandId" stdset="0">
+                <string>camera.toggle</string>
+              </property>
+              <property name="text">
+                <string>Preview</string>
+              </property>
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+            </widget>
+          </item>
+          <item row="0" column="1" rowspan="1" colspan="1">
+            <widget class="QPushButton" name="capture_primary_button">
+              <property name="commandId" stdset="0">
+                <string>calibration.capture_images</string>
+              </property>
+              <property name="text">
+                <string>Capture Live Pair</string>
+              </property>
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+            </widget>
+          </item>
+          <item row="0" column="2" rowspan="1" colspan="1">
+            <widget class="QPushButton" name="item1">
+              <property name="commandId" stdset="0">
+                <string>calibration.auto_capture</string>
+              </property>
+              <property name="text">
+                <string>Start auto capture</string>
+              </property>
+              <property name="toolTip">
+                <string>Capture checkerboards only from exact NAL1 non-delta native FrameKeys. Expired keys wait for the next candidate; pairs over Max Live pair Δt remain per-camera K,D inputs and are excluded from stereo R,t.</string>
+              </property>
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+            </widget>
+          </item>
+          <item row="0" column="3" rowspan="1" colspan="1">
+            <widget class="QPushButton" name="item2">
+              <property name="commandId" stdset="0">
+                <string>calibration.capture_images_wiris_ftp</string>
+              </property>
+              <property name="text">
+                <string>Capture HR Still (FTP)</string>
+              </property>
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+            </widget>
+          </item>
+          <item row="1" column="0" rowspan="1" colspan="1">
+            <widget class="QPushButton" name="item3">
+              <property name="commandId" stdset="0">
+                <string>calibration.capture_images_wiris_ftp_oz</string>
+              </property>
+              <property name="text">
+                <string>Capture OZ Still (FTP)</string>
+              </property>
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+            </widget>
+          </item>
+          <item row="1" column="1" rowspan="1" colspan="1">
+            <widget class="QPushButton" name="item4">
+              <property name="commandId" stdset="0">
+                <string>calibration.capture_images_wiris_oz_capture_only</string>
+              </property>
+              <property name="text">
+                <string>OZ 촬영</string>
+              </property>
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+            </widget>
+          </item>
+          <item row="1" column="2" rowspan="1" colspan="1">
+            <widget class="QPushButton" name="button">
+              <property name="commandId" stdset="0">
+                <string>calibration.sync_images_wiris_oz_ftp</string>
+              </property>
+              <property name="text">
+                <string>FTP 자동 전송</string>
+              </property>
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+            </widget>
+          </item>
+        </layout>
+      </item>
+      <item>
+        <layout class="QHBoxLayout" name="pair_timing">
+          <property name="leftMargin">
+            <number>0</number>
+          </property>
+          <property name="topMargin">
+            <number>0</number>
+          </property>
+          <property name="rightMargin">
+            <number>0</number>
+          </property>
+          <property name="bottomMargin">
+            <number>0</number>
+          </property>
+          <property name="spacing">
+            <number>6</number>
+          </property>
+          <item>
+            <widget class="QLabel" name="pair_timing_label">
+              <property name="text">
+                <string>Max Live pair Δt</string>
+              </property>
+              <property name="toolTip">
+                <string>Maximum absolute left/right timing difference accepted for a calibration stereo pair. Live capture uses same-host decoded-frame app-receive monotonic timestamps; FTP capture uses the synchronized CPTR host-dispatch proxy. Neither host proxy proves exposure simultaneity. Captures over the limit remain available per camera for K,D only.</string>
+              </property>
+              <property name="wordWrap">
+                <bool>false</bool>
+              </property>
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+            </widget>
+          </item>
+          <item>
+            <widget class="QDoubleSpinBox" name="setup_widgets_pair_max_delta_ms">
+              <property name="toolTip">
+                <string>Maximum absolute left/right timing difference accepted for a calibration stereo pair. Live capture uses same-host decoded-frame app-receive monotonic timestamps; FTP capture uses the synchronized CPTR host-dispatch proxy. Neither host proxy proves exposure simultaneity. Captures over the limit remain available per camera for K,D only.</string>
+              </property>
+              <property name="suffix">
+                <string> ms</string>
+              </property>
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+              <property name="minimum">
+                <double>0.0</double>
+              </property>
+              <property name="maximum">
+                <double>1000.0</double>
+              </property>
+              <property name="value">
+                <double>100.0</double>
+              </property>
+              <property name="singleStep">
+                <double>5.0</double>
+              </property>
+              <property name="decimals">
+                <number>1</number>
+              </property>
+            </widget>
+          </item>
+          <item>
+            <widget class="QLabel" name="item5">
+              <property name="text">
+                <string>Live: app-receive proxy · FTP: CPTR dispatch proxy · exposure unverified</string>
+              </property>
+              <property name="wordWrap">
+                <bool>false</bool>
+              </property>
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+            </widget>
+          </item>
+          <item>
+            <spacer name="item6">
+              <property name="orientation">
+                <enum>Qt::Horizontal</enum>
+              </property>
+              <property name="sizeHint">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+            </spacer>
+          </item>
+        </layout>
+      </item>
+      <item>
+        <widget class="QLabel" name="capture_summary_label">
+          <property name="text">
+            <string>L: WAITING · R: WAITING · Pair: --</string>
+          </property>
+          <property name="wordWrap">
+            <bool>true</bool>
+          </property>
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+        </widget>
+      </item>
+      <item>
+        <widget class="QGroupBox" name="auto_capture_settings_group">
+          <property name="title">
+            <string>Auto capture settings</string>
+          </property>
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+          <layout class="QVBoxLayout" name="auto_group_layout">
+            <property name="leftMargin">
+              <number>9</number>
+            </property>
+            <property name="topMargin">
+              <number>9</number>
+            </property>
+            <property name="rightMargin">
+              <number>9</number>
+            </property>
+            <property name="bottomMargin">
+              <number>9</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item>
+              <widget class="QWidget" name="auto_capture_settings_content">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <layout class="QGridLayout" name="auto_layout">
+                  <property name="leftMargin">
+                    <number>6</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>4</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>6</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>4</number>
+                  </property>
+                  <property name="spacing">
+                    <number>6</number>
+                  </property>
+                  <item row="0" column="0" rowspan="1" colspan="1">
+                    <widget class="QLabel" name="item7">
+                      <property name="text">
+                        <string>Interval</string>
+                      </property>
+                      <property name="wordWrap">
+                        <bool>false</bool>
+                      </property>
+                      <property name="minimumSize">
+                        <size>
+                          <width>0</width>
+                          <height>0</height>
+                        </size>
+                      </property>
+                      <property name="maximumSize">
+                        <size>
+                          <width>16777215</width>
+                          <height>16777215</height>
+                        </size>
+                      </property>
+                    </widget>
+                  </item>
+                  <item row="0" column="1" rowspan="1" colspan="1">
+                    <widget class="QDoubleSpinBox" name="setup_widgets_auto_interval_s">
+                      <property name="suffix">
+                        <string> s</string>
+                      </property>
+                      <property name="minimumSize">
+                        <size>
+                          <width>0</width>
+                          <height>0</height>
+                        </size>
+                      </property>
+                      <property name="maximumSize">
+                        <size>
+                          <width>16777215</width>
+                          <height>16777215</height>
+                        </size>
+                      </property>
+                      <property name="minimum">
+                        <double>0.1</double>
+                      </property>
+                      <property name="maximum">
+                        <double>10.0</double>
+                      </property>
+                      <property name="value">
+                        <double>1.0</double>
+                      </property>
+                      <property name="singleStep">
+                        <double>0.1</double>
+                      </property>
+                      <property name="decimals">
+                        <number>1</number>
+                      </property>
+                    </widget>
+                  </item>
+                </layout>
+              </widget>
+            </item>
+          </layout>
+          <property name="checkable">
+            <bool>true</bool>
+          </property>
+          <property name="checked">
+            <bool>false</bool>
+          </property>
+        </widget>
+      </item>
+      <item>
+        <widget class="QGroupBox" name="capture_response_outer_group">
+          <property name="title">
+            <string>Capture command / response</string>
+          </property>
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+          <layout class="QVBoxLayout" name="response_layout">
+            <property name="leftMargin">
+              <number>9</number>
+            </property>
+            <property name="topMargin">
+              <number>9</number>
+            </property>
+            <property name="rightMargin">
+              <number>9</number>
+            </property>
+            <property name="bottomMargin">
+              <number>9</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item>
+              <widget class="QGroupBox" name="capture_response_content">
+                <property name="title">
+                  <string>Capture command / response</string>
+                </property>
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <layout class="QVBoxLayout" name="item8">
+                  <property name="leftMargin">
+                    <number>6</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>6</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>6</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>6</number>
+                  </property>
+                  <property name="spacing">
+                    <number>5</number>
+                  </property>
+                  <item>
+                    <layout class="QHBoxLayout" name="item9">
+                      <property name="leftMargin">
+                        <number>0</number>
+                      </property>
+                      <property name="topMargin">
+                        <number>0</number>
+                      </property>
+                      <property name="rightMargin">
+                        <number>0</number>
+                      </property>
+                      <property name="bottomMargin">
+                        <number>0</number>
+                      </property>
+                      <property name="spacing">
+                        <number>6</number>
+                      </property>
+                      <item>
+                        <widget class="QGroupBox" name="item10">
+                          <property name="title">
+                            <string>Left camera</string>
+                          </property>
+                          <property name="minimumSize">
+                            <size>
+                              <width>0</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                          <property name="maximumSize">
+                            <size>
+                              <width>16777215</width>
+                              <height>16777215</height>
+                            </size>
+                          </property>
+                          <layout class="QVBoxLayout" name="item11">
+                            <property name="leftMargin">
+                              <number>5</number>
+                            </property>
+                            <property name="topMargin">
+                              <number>5</number>
+                            </property>
+                            <property name="rightMargin">
+                              <number>5</number>
+                            </property>
+                            <property name="bottomMargin">
+                              <number>5</number>
+                            </property>
+                            <property name="spacing">
+                              <number>6</number>
+                            </property>
+                            <item>
+                              <widget class="QLabel" name="calibration_capture_response_status_left">
+                                <property name="text">
+                                  <string>대기</string>
+                                </property>
+                                <property name="wordWrap">
+                                  <bool>true</bool>
+                                </property>
+                                <property name="minimumSize">
+                                  <size>
+                                    <width>0</width>
+                                    <height>0</height>
+                                  </size>
+                                </property>
+                                <property name="maximumSize">
+                                  <size>
+                                    <width>16777215</width>
+                                    <height>16777215</height>
+                                  </size>
+                                </property>
+                              </widget>
+                            </item>
+                            <item>
+                              <widget class="QPlainTextEdit" name="calibration_capture_response_edits_left">
+                                <property name="placeholderText">
+                                  <string>이 카메라의 capture 명령과 응답이 표시됩니다.</string>
+                                </property>
+                                <property name="minimumSize">
+                                  <size>
+                                    <width>0</width>
+                                    <height>92</height>
+                                  </size>
+                                </property>
+                                <property name="maximumSize">
+                                  <size>
+                                    <width>16777215</width>
+                                    <height>16777215</height>
+                                  </size>
+                                </property>
+                                <property name="readOnly">
+                                  <bool>true</bool>
+                                </property>
+                              </widget>
+                            </item>
+                          </layout>
+                        </widget>
+                      </item>
+                      <item>
+                        <widget class="QGroupBox" name="item12">
+                          <property name="title">
+                            <string>Right camera</string>
+                          </property>
+                          <property name="minimumSize">
+                            <size>
+                              <width>0</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                          <property name="maximumSize">
+                            <size>
+                              <width>16777215</width>
+                              <height>16777215</height>
+                            </size>
+                          </property>
+                          <layout class="QVBoxLayout" name="item13">
+                            <property name="leftMargin">
+                              <number>5</number>
+                            </property>
+                            <property name="topMargin">
+                              <number>5</number>
+                            </property>
+                            <property name="rightMargin">
+                              <number>5</number>
+                            </property>
+                            <property name="bottomMargin">
+                              <number>5</number>
+                            </property>
+                            <property name="spacing">
+                              <number>6</number>
+                            </property>
+                            <item>
+                              <widget class="QLabel" name="calibration_capture_response_status_right">
+                                <property name="text">
+                                  <string>대기</string>
+                                </property>
+                                <property name="wordWrap">
+                                  <bool>true</bool>
+                                </property>
+                                <property name="minimumSize">
+                                  <size>
+                                    <width>0</width>
+                                    <height>0</height>
+                                  </size>
+                                </property>
+                                <property name="maximumSize">
+                                  <size>
+                                    <width>16777215</width>
+                                    <height>16777215</height>
+                                  </size>
+                                </property>
+                              </widget>
+                            </item>
+                            <item>
+                              <widget class="QPlainTextEdit" name="calibration_capture_response_edits_right">
+                                <property name="placeholderText">
+                                  <string>이 카메라의 capture 명령과 응답이 표시됩니다.</string>
+                                </property>
+                                <property name="minimumSize">
+                                  <size>
+                                    <width>0</width>
+                                    <height>92</height>
+                                  </size>
+                                </property>
+                                <property name="maximumSize">
+                                  <size>
+                                    <width>16777215</width>
+                                    <height>16777215</height>
+                                  </size>
+                                </property>
+                                <property name="readOnly">
+                                  <bool>true</bool>
+                                </property>
+                              </widget>
+                            </item>
+                          </layout>
+                        </widget>
+                      </item>
+                    </layout>
+                  </item>
+                  <item>
+                    <layout class="QHBoxLayout" name="item14">
+                      <property name="leftMargin">
+                        <number>0</number>
+                      </property>
+                      <property name="topMargin">
+                        <number>0</number>
+                      </property>
+                      <property name="rightMargin">
+                        <number>0</number>
+                      </property>
+                      <property name="bottomMargin">
+                        <number>0</number>
+                      </property>
+                      <property name="spacing">
+                        <number>5</number>
+                      </property>
+                      <item>
+                        <spacer name="item15">
+                          <property name="orientation">
+                            <enum>Qt::Horizontal</enum>
+                          </property>
+                          <property name="sizeHint">
+                            <size>
+                              <width>0</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                        </spacer>
+                      </item>
+                      <item>
+                        <widget class="QPushButton" name="item16">
+                          <property name="text">
+                            <string>Clear capture responses</string>
+                          </property>
+                          <property name="minimumSize">
+                            <size>
+                              <width>0</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                          <property name="maximumSize">
+                            <size>
+                              <width>16777215</width>
+                              <height>16777215</height>
+                            </size>
+                          </property>
+                          <property name="captureClear" stdset="0">
+                            <bool>true</bool>
+                          </property>
+                        </widget>
+                      </item>
+                    </layout>
+                  </item>
+                </layout>
+              </widget>
+            </item>
+          </layout>
+          <property name="checkable">
+            <bool>true</bool>
+          </property>
+          <property name="checked">
+            <bool>false</bool>
+          </property>
+        </widget>
+      </item>
+    </layout>
+  </widget>
+  <resources />
+  <connections />
+</ui>

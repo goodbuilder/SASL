@@ -216,13 +216,15 @@
       Semantic Ground Truth reference only.  This is an SDF frame, not a
       mass-bearing link: source_gazebo_entity=base_link,
       published_reference_name=vehicle_reference_link,
-      reference_definition=project_defined_vehicle_reference_at_base_link_origin,
-      reference_offset_parent_m=[0.0, 0.0, 0.0],
+      reference_definition=project_defined_vehicle_reference_at_visual_height_midpoint_v1,
+      reference_offset_parent_m=[0.0, 0.0, -0.35910692405],
       reference_offset_parent_rpy_rad=[0.0, 0.0, 0.0].
+      base_link FLU visual Z bounds [-1.0265138481, 0.3083] m;
+      reference Z is their midpoint, with X/Y and orientation unchanged.
       The adapter still reads base_link when SceneBroadcaster omits frames.
     -->
     <frame name="vehicle_reference_link" attached_to="base_link">
-      <pose>0 0 0 0 0 0</pose>
+      <pose>0 0 -0.35910692405 0 0 0</pose>
     </frame>
     <link name="rotor_0">
       <gravity>false</gravity>

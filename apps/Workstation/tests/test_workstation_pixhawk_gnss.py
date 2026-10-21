@@ -162,6 +162,70 @@ def test_common_param_receive_loop_preserves_integer_bits_and_unmatched_message(
     assert unmatched[0].get_type() == "ATTITUDE"
 
 
+def test_param_set_retries_missing_ack_but_not_received_value_mismatch() -> None:
+    from Workstation.workstation_core.pixhawk_link import wire_commands
+
+    class Message:
+        def __init__(self, message_type: str, **values) -> None:
+            self._message_type = message_type
+            self.__dict__.update(values)
+
+        def get_type(self) -> str:
+            return self._message_type
+
+    class Mav:
+        def __init__(self) -> None:
+            self.sets: list[tuple[object, ...]] = []
+
+        def param_set_send(self, *args: object) -> None:
+            self.sets.append(args)
+
+    class Connection:
+        target_system = 1
+        target_component = 1
+        mavlink = SimpleNamespace(MAV_PARAM_TYPE_INT32=6)
+
+        def __init__(self, *, ack_after_sets: int, ack_value: int = 75) -> None:
+            self.mav = Mav()
+            self.ack_after_sets = ack_after_sets
+            self.ack_value = ack_value
+
+        def recv_match(self, **_kwargs):
+            if len(self.mav.sets) < self.ack_after_sets:
+                return None
+            if self.ack_after_sets < 0:
+                return None
+            if getattr(self, "ack_sent", False):
+                return None
+            self.ack_sent = True
+            return Message(
+                "PARAM_VALUE",
+                param_id="CAL_MAG1_PRIO",
+                param_value=wire_commands._mavlink_int_to_param_float(self.ack_value),
+                param_type=6,
+            )
+
+    retried = Connection(ack_after_sets=2)
+    retry_attempts: list[int] = []
+    assert wire_commands._mavlink_set_param_int(
+        retried, "CAL_MAG1_PRIO", 75, timeout_s=0.002, on_retry=retry_attempts.append
+    ) == 75
+    assert len(retried.mav.sets) == 2
+    assert retry_attempts == [2]
+
+    mismatch = Connection(ack_after_sets=1, ack_value=50)
+    assert wire_commands._mavlink_set_param_int(
+        mismatch, "CAL_MAG1_PRIO", 75, timeout_s=0.01
+    ) == 50
+    assert len(mismatch.mav.sets) == 1
+
+    no_ack = Connection(ack_after_sets=-1)
+    assert wire_commands._mavlink_set_param_int(
+        no_ack, "CAL_MAG1_PRIO", 75, timeout_s=0.001
+    ) is None
+    assert len(no_ack.mav.sets) == 3
+
+
 def test_duplicate_raw_mavlink_packet_is_ignored_before_signal_delivery() -> None:
     from Workstation.workstation_core.pixhawk_attitude import DualPixhawkMavlinkSubscriber
 
@@ -3090,6 +3154,89 @@ def test_pixhawk_shell_and_parameter_workers_use_exclusive_command_path() -> Non
     combined_worker.run()
     assert combined_results[0]["mag_status"].params["CAL_MAG0_XOFF"] == pytest.approx(0.125)
     assert "CAL_ACC0_XOFF" in combined_results[0]["attitude_status"].params
+
+
+def test_mag_apply_worker_blocks_known_v117_voter_gap_before_any_write() -> None:
+    from Workstation.device_runtime_workers import PixhawkParameterWorker
+
+    params = {
+        "UAVCAN_ENABLE": 2,
+        "UAVCAN_SUB_MAG": 1,
+        "CAL_MAG0_ID": 4395041,
+        "CAL_MAG0_PRIO": 0,
+        "CAL_MAG1_ID": 396809,
+        "CAL_MAG1_PRIO": 0,
+        "CAL_MAG2_ID": 8944899,
+        "CAL_MAG2_PRIO": 100,
+        "CAL_MAG3_ID": 8944387,
+        "CAL_MAG3_PRIO": 0,
+    }
+
+    class FakeSubscriber:
+        def __init__(self) -> None:
+            self.set_calls: list[tuple[str, int]] = []
+
+        def read_param(self, _camera: str, name: str, *, timeout_s: float):
+            return params.get(name)
+
+        def set_param_int(self, _camera: str, name: str, value: int, *, timeout_s: float):
+            self.set_calls.append((name, value))
+            params[name] = value
+            return value
+
+    subscriber = FakeSubscriber()
+    errors: list[str] = []
+    worker = PixhawkParameterWorker(
+        subscriber,
+        camera="left",
+        operation="mag_apply",
+        priorities={"CAL_MAG0": 0, "CAL_MAG1": 0, "CAL_MAG2": 100, "CAL_MAG3": 0},
+        instance_device_ids={0: 4395041, 1: 396809, 2: 8944899, 3: 8944387},
+    )
+    worker.failed.connect(errors.append)
+    worker.run()
+
+    assert subscriber.set_calls == []
+    assert errors and "voter gap" in errors[0]
+    assert "i1/CAL_MAG1" in errors[0]
+
+
+def test_mag_apply_worker_checks_fresh_final_priority_readback() -> None:
+    from Workstation.device_runtime_workers import PixhawkParameterWorker
+
+    params = {
+        "UAVCAN_ENABLE": 2,
+        "UAVCAN_SUB_MAG": 1,
+        "CAL_MAG0_ID": 4395041,
+        "CAL_MAG0_PRIO": 1,
+    }
+
+    class FakeSubscriber:
+        def __init__(self) -> None:
+            self.set_calls: list[tuple[str, int]] = []
+
+        def read_param(self, _camera: str, name: str, *, timeout_s: float):
+            return params.get(name)
+
+        def set_param_int(self, _camera: str, name: str, value: int, *, timeout_s: float):
+            # Simulate a stale final PARAM_REQUEST_READ after a matching set ACK.
+            self.set_calls.append((name, value))
+            return value
+
+    subscriber = FakeSubscriber()
+    errors: list[str] = []
+    worker = PixhawkParameterWorker(
+        subscriber,
+        camera="left",
+        operation="mag_apply",
+        priorities={"CAL_MAG0": 100},
+    )
+    worker.failed.connect(errors.append)
+    worker.run()
+
+    assert subscriber.set_calls == [("CAL_MAG0_PRIO", 100)]
+    assert errors and "final PARAM readback mismatch" in errors[0]
+
 
 def test_pixhawk_connection_and_stream_setup_workers_keep_transport_io_off_ui_path() -> None:
     from Workstation import standalone_gui

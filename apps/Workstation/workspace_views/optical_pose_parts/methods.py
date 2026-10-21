@@ -5,11 +5,9 @@ Solver eligibility remains backend-owned; local text is an affordance projection
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Callable, Sequence
 from PyQt5 import QtCore, QtWidgets
-from Workstation.ui.components import EngineeringValue
+from .layouts import load_component_form, bind_component_form
 
-from .layouts import _CurrentPageTabWidget
 
 
 class MethodControls(QtCore.QObject):
@@ -21,195 +19,17 @@ class MethodControls(QtCore.QObject):
         for callback in (make_solver_button, create_combine_button, populate_combine_page):
             if not callable(callback):
                 raise TypeError("Method controls require explicit button and combine-content ports")
-        command_button = make_solver_button
-        method_buttons = {}
-
-        def make_solver_button(command_id, label):
-            button = command_button(command_id, label)
-            method_buttons[command_id] = button
-            return button
-
-        readiness_group = QtWidgets.QGroupBox("Readiness")
-        self.readiness_group = readiness_group
-        readiness_layout = QtWidgets.QGridLayout(readiness_group)
-        readiness_layout.setContentsMargins(6, 6, 6, 6)
-        self.readiness_values: dict[str, EngineeringValue] = {}
-        for index, (key, label) in enumerate(
-            (
-                ("state", "Pose state"),
-                ("operating_zoom", "Operating zoom L/R"),
-                ("intrinsics", "Exact K,D"),
-                ("base_extrinsics", "Base R,t"),
-                ("mountain_uv", "Mountain u,v"),
-                ("terrain", "Terrain GeoTIFF"),
-                ("target_reference", "Target reference"),
-                ("yaw90_reference", "Mountain/Cloud 기준"),
-            )
-        ):
-            value = EngineeringValue(label)
-            value.set_value("--", source="optical pose owner snapshot")
-            self.readiness_values[key] = value
-            readiness_layout.addWidget(value, index // 2, index % 2)
-        multiview_button = make_solver_button(
-            "alignment.pose.solve_drone_rtk_multiview",
-            "Solve Drone RTK Multi-view R,t",
+        load_component_form("optical_pose_readiness.ui", self, "methods")
+        self.method_tabs = load_component_form(
+            "optical_pose_methods.ui", self, "methods", make_solver_button
         )
-        multiview_button.setToolTip(
-            "Use at least four READY Frozen target pairs accumulated since the last Alignment Reset, together "
-            "with their capture-time Drone RTK positions, to solve full 6-DOF R,t for both cameras."
-        )
-        workflow_note = QtWidgets.QLabel(
-            "Each solver below creates an independent candidate and shares the same review/apply path."
-        )
-        workflow_note.setObjectName("compactContract")
-        workflow_note.setWordWrap(True)
-        readiness_layout.addWidget(workflow_note, 4, 0, 1, 2)
-
-        self.method_tabs = _CurrentPageTabWidget()
-        self.method_tabs.setObjectName("alignmentOperationTabs")
-        self.method_information_labels: dict[str, QtWidgets.QLabel] = {}
-        self.method_detail_labels: dict[str, QtWidgets.QLabel] = {}
-        method_contracts = {
-            "Horizon": "Observed: Roll/Pitch · Measurement fill: Yaw=pair-frozen Pixhawk, t=pair-frozen GNSS",
-            "Mountain + GNSS": "Observed: relative R from paired u,v · t: frozen GNSS baseline · no terrain height",
-            "Terrain PnP": "Observed: full 6-DOF · requires GeoTIFF vertical datum and matched 2D/3D points",
-            "Drone Rotation": "1 target: Yaw · 2+ targets: Roll/Pitch/Yaw · Measurement t: pair-frozen GNSS",
-            "Drone Multi-view": "Observed: full 6-DOF R,t · requires at least four READY accumulated Frozen target pairs",
-            "Combine": "Compose only non-overlapping axes observable on both camera sides with shared prior/K,D",
-        }
-        method_details = {
-            "Horizon": "Evidence: horizon point count, model fit, Roll/Pitch sensitivity, prior Yaw/Translation source",
-            "Mountain + GNSS": "Evidence: paired point count, inliers/outliers, Sampson residual, GNSS baseline, lever-arm status",
-            "Terrain PnP": "Evidence: GeoTIFF/vertical datum, 2D↔3D counts, reprojection error, depth ratio, rank/condition",
-            "Drone Rotation": "Evidence: target count, Yaw/full-R mode, Drone/P1/P2 RTK state, sync delta, angular residual",
-            "Drone Multi-view": "Evidence: JSON hash, per-side observation count, timestamp verification, 3D spread, full-rank status",
-            "Combine": "Evidence: selected candidates, per-side observability, DOF ownership, overlap and shared-prior checks",
-        }
-
-        def add_method_tab(
-            tab_label: str,
-            description: str,
-            buttons: Sequence[QtWidgets.QWidget],
-            content: Callable[[QtWidgets.QVBoxLayout], None] | None = None,
-        ) -> None:
-            page = QtWidgets.QWidget()
-            page_layout = QtWidgets.QVBoxLayout(page)
-            page_layout.setContentsMargins(6, 6, 6, 6)
-            note = QtWidgets.QLabel(description)
-            note.setObjectName("compactContract")
-            note.setWordWrap(True)
-            page_layout.addWidget(note)
-            contract_label = QtWidgets.QLabel(method_contracts.get(tab_label, ""))
-            contract_label.setObjectName("compactContract")
-            contract_label.setWordWrap(True)
-            page_layout.addWidget(contract_label)
-            information_label = QtWidgets.QLabel("Solve readiness: waiting for owner snapshot")
-            information_label.setObjectName("statusStrip")
-            information_label.setWordWrap(True)
-            self.method_information_labels[tab_label] = information_label
-            page_layout.addWidget(information_label)
-            detail_label = QtWidgets.QLabel(method_details.get(tab_label, ""))
-            detail_label.setObjectName("compactContract")
-            detail_label.setWordWrap(True)
-            self.method_detail_labels[tab_label] = detail_label
-            page_layout.addWidget(detail_label)
-            if content is not None:
-                content(page_layout)
-            action_layout = QtWidgets.QHBoxLayout()
-            for button in buttons:
-                action_layout.addWidget(button)
-            action_layout.addStretch(1)
-            page_layout.addLayout(action_layout)
-            page_layout.addStretch(1)
-            index = self.method_tabs.addTab(page, tab_label)
-            self.method_tabs.setTabToolTip(index, description)
-
-        add_method_tab(
-            "Horizon",
-            "Two horizon points constrain Roll/Pitch only. Yaw and camera position remain at the prior pose.",
-            (make_solver_button("alignment.pose.solve_horizon", "Solve Horizon Roll/Pitch"),),
-        )
-
-        def build_mountain_content(page_layout: QtWidgets.QVBoxLayout) -> None:
-            self.mountain_hide_auto_lines_checkbox = QtWidgets.QCheckBox("Hide Auto-select connecting lines")
-            self.mountain_hide_auto_lines_checkbox.setObjectName("mountainHideAutoSuggestionLines")
-            self.mountain_hide_auto_lines_checkbox.setChecked(True)
-            self.mountain_hide_auto_lines_checkbox.setToolTip(
-                "Hide only the line joining Mountain Auto-select points. Right-click an "
-                "automatic point to exclude its corresponding left/right pair from the overlay "
-                "and from the accepted solver input."
-            )
-            self.mountain_hide_auto_lines_checkbox.toggled.connect(self.mountain_lines_changed.emit)
-            page_layout.addWidget(self.mountain_hide_auto_lines_checkbox)
-
-        add_method_tab(
-            "Mountain + GNSS",
-            "Click corresponding Mountain features in the same order on both frames. Uses paired u,v and the numeric GNSS baseline; no GeoTIFF or terrain height.",
-            (
-                make_solver_button("alignment.pose.solve_gnss_mountain", "Solve GNSS + Mountain R,t"),
-                make_solver_button("alignment.pose.solve_cloud_rotation", "Solve Cloud rotation"),
-            ),
-            content=build_mountain_content,
-        )
+        # The candidate owner retains Combine state and callback lifecycle.
+        create_combine_button()
+        combine_page = self.method_tabs.widget(self.method_tabs.count() - 1)
+        populate_combine_page(combine_page.layout())
+        bind_component_form(combine_page, self, "methods")
+        self.mountain_hide_auto_lines_checkbox.toggled.connect(self.mountain_lines_changed.emit)
         self.mountain_lines_changed.emit(True)
-
-        def build_terrain_content(page_layout: QtWidgets.QVBoxLayout) -> None:
-            terrain_note = QtWidgets.QLabel(
-                "Uses the same Ridge points as Mountain + GNSS -- switch to Ridge mode on that "
-                'tab to click them. "Solve Terrain PnP" will prompt for a correspondences JSON '
-                "matching each side's clicked points 1:1 with object_points_ned_m; see the "
-                "Readiness card above for GeoTIFF/vertical-datum status."
-            )
-            terrain_note.setObjectName("compactContract")
-            terrain_note.setWordWrap(True)
-            page_layout.addWidget(terrain_note)
-
-        add_method_tab(
-            "Terrain PnP",
-            "Full 6-DOF pose from 2D/3D correspondences against an imported GeoTIFF -- the only "
-            "method that does not inherit any axis from the prior pose when it succeeds.",
-            (
-                make_solver_button("alignment.pose.import_terrain", "Import GeoTIFF"),
-                make_solver_button("alignment.pose.solve_terrain", "Solve Terrain PnP"),
-            ),
-            content=build_terrain_content,
-        )
-        add_method_tab(
-            "Drone Rotation",
-            "One synchronized target constrains Yaw; two or more non-degenerate target/ray observations "
-            "constrain Roll/Pitch/Yaw. Missing Translation is supplied by live GNSS in Measurement.",
-            (make_solver_button("alignment.pose.solve_drone_yaw", "Solve Drone RTK Rotation"),),
-        )
-        add_method_tab(
-            "Drone Multi-view",
-            "Accumulate at least four synchronized Frozen target pairs in Drone Rotation, then solve "
-            "full six-DOF camera pose without a separate JSON file. Translation is solved from the "
-            "observations instead of inherited from live GNSS.",
-            (multiview_button,),
-        )
-        combine_button = create_combine_button()
-
-        add_method_tab(
-            "Combine",
-            "Compose explicitly selected non-overlapping candidate axes into one immutable candidate.",
-            (combine_button,),
-            content=populate_combine_page,
-        )
-        method_buttons["alignment.pose.solve_horizon"].setToolTip(
-            "Automatically fit Roll/Pitch from the manually marked horizon line. The horizon cannot observe Yaw."
-        )
-        method_buttons["alignment.pose.solve_gnss_mountain"].setToolTip(
-            "Build metric R,t from at least four same-order paired Mountain u,v clicks "
-            "on frozen left/right frames and the numeric left/right GNSS baseline. "
-            "No GeoTIFF or terrain height is used. Fix quality is recorded as evidence, "
-            "not used as a hard gate. Assumes camera optical center equals GNSS antenna."
-        )
-        method_buttons["alignment.pose.solve_cloud_rotation"].setToolTip(
-            "Rotation-only solve from the same paired Ridge points treated as far-field "
-            "sky/cloud correspondences (Auto-select Cloud). Translation is never applied by "
-            "this candidate; the Cloud measurement method fills N/E/D from live GNSS. Both "
-            "frozen frames must be simultaneous within the burst pairing tolerance."
-        )
         self.destroyed.connect(self.readiness_group.deleteLater)
         self.destroyed.connect(self.method_tabs.deleteLater)
 

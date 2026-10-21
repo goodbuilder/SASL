@@ -28,6 +28,11 @@ tooltip. Combo rows, Apply buttons, and the outer workspace scroll position rema
 
 ## Focus, selection, scroll, table-column, dock/splitter, and window stability
 
+Follow-up: readback must not change a dirty combo's selection or steal focus. The Designer form
+reserves draft/warning rows with short one-line summaries; detailed priorities and guard conditions
+remain in tooltips. Live updates therefore do not move the other side's controls or alter workspace
+scroll position. Discard is a local edit reset, not a device command.
+
 ## Accessibility, font scaling, DPI, locale, theme, and target-size checks
 
 The preview is text-readable and does not rely on color alone: labels explicitly say `Candidate`

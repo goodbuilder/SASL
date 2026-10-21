@@ -46,3 +46,26 @@ def test_exact_one_millisecond_pair_is_inclusive():
     pairs = pair_frames(left, right)
     assert len(pairs) == 1
     assert pairs[0]["pair_delta_ns"] == 1_000_000
+
+
+def test_camera_info_index_reads_recorded_calibration(tmp_path):
+    import sqlite3
+    from rclpy.serialization import serialize_message
+    from sensor_msgs.msg import CameraInfo
+    from campaigns.stereo_v1_1.bag_index import read_camera_info
+    bag = tmp_path / "raw_images_or_lossless_bag" / "left"
+    bag.mkdir(parents=True)
+    (bag / "metadata.yaml").write_text("rosbag2_bagfile_information: {}\n")
+    msg = CameraInfo()
+    msg.width, msg.height = 64, 48
+    msg.k = [100., 0., 32., 0., 100., 24., 0., 0., 1.]
+    msg.header.frame_id = "left_optical"
+    with sqlite3.connect(bag / "left_0.db3") as con:
+        con.execute("CREATE TABLE topics(id INTEGER, name TEXT, type TEXT)")
+        con.execute("CREATE TABLE messages(topic_id INTEGER, data BLOB)")
+        con.execute("INSERT INTO topics VALUES(1, '/left_camera/camera_info', 'sensor_msgs/msg/CameraInfo')")
+        con.execute("INSERT INTO messages VALUES(1, ?)", (serialize_message(msg),))
+    info = read_camera_info(tmp_path, "left")
+    assert info["message_count"] == 1
+    assert info["variants"][0]["k"] == list(msg.k)
+    assert info["variants"][0]["width"] == 64

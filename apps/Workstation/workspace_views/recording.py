@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Callable
 from PyQt5 import QtCore, QtGui, QtWidgets
+from Workstation.ui.designer import load_form
 from Workstation.ui.method_worker_pane import MethodWorkerRecoveryPane
 from Workstation.workstation_core.theme import ERROR_TEXT, PANEL_BORDER, SUCCESS_TEXT
 from Workstation.ui.components import EngineeringValue, StatusIndicator, WorkspaceHeader
@@ -57,9 +58,7 @@ class RecordingWorkspace(QtWidgets.QWidget):
         self._artifact_query_request = None
         self._query_disposed = False
         self._catalog_query_failed = False
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        load_form("recording_workspace.ui", self)
         self.header = WorkspaceHeader(
             "Data" if self._sessionless else "Sessions",
             (
@@ -68,24 +67,10 @@ class RecordingWorkspace(QtWidgets.QWidget):
                 else "Current session, evidence completeness, and saved review"
             ),
         )
-        layout.addWidget(self.header)
-
-        self.tabs = QtWidgets.QTabWidget()
-        self.tabs.setObjectName("sessionsTabs")
+        self.headerLayout.addWidget(self.header)
+        self.tabs = self.sessionsTabs
         self._tab_ids = ("current", "evidence", "review")
-        tab_layouts: dict[str, QtWidgets.QVBoxLayout] = {}
-        for tab_id, title in zip(
-            self._tab_ids,
-            ("Current", "Evidence", "Review"),
-        ):
-            page = QtWidgets.QWidget()
-            page.setObjectName(f"sessions{title}Tab")
-            page_layout = QtWidgets.QVBoxLayout(page)
-            page_layout.setContentsMargins(6, 6, 6, 6)
-            page_layout.setSpacing(6)
-            tab_layouts[tab_id] = page_layout
-            self.tabs.addTab(page, title)
-        layout.addWidget(self.tabs, 1)
+        tab_layouts = {"current": self.currentLayout, "evidence": self.evidenceLayout, "review": self.reviewLayout}
         self._tab_layouts = tab_layouts
 
         self.current_session = SessionWorkspace(
@@ -101,72 +86,36 @@ class RecordingWorkspace(QtWidgets.QWidget):
         if self._sessionless:
             self.current_session.hide()
 
-        measurements_group = QtWidgets.QGroupBox("Measurements")
-        measurements_layout = QtWidgets.QVBoxLayout(measurements_group)
-        measurements_layout.setContentsMargins(6, 6, 6, 6)
+        measurements_group = QtWidgets.QGroupBox()
+        load_form("recording_measurements.ui", measurements_group)
         self.measurements_model = _table_model(
             self,
             ("#", "Measurement", "State", "Evidence", "Revision"),
         )
-        self.measurements_table = QtWidgets.QTableView()
+        self.measurements_table = measurements_group.sessionsMeasurementTable
         self.measurements_table.setObjectName("sessionsMeasurementTable")
         self.measurements_table.setModel(self.measurements_model)
-        self.measurements_table.setEditTriggers(
-            QtWidgets.QAbstractItemView.NoEditTriggers
-        )
-        self.measurements_table.setSelectionBehavior(
-            QtWidgets.QAbstractItemView.SelectRows
-        )
-        self.measurements_table.verticalHeader().setVisible(False)
-        self.measurements_table.horizontalHeader().setStretchLastSection(True)
-        self.measurements_table.setMaximumHeight(180)
-        measurements_layout.addWidget(self.measurements_table)
         self.measurements_group = measurements_group
         tab_layouts["current"].addWidget(measurements_group)
         if self._sessionless:
             measurements_group.hide()
 
-        package_group = QtWidgets.QGroupBox("Evidence package")
-        package_group.setObjectName("measurementPackageDetails")
-        package_layout = QtWidgets.QVBoxLayout(package_group)
-        package_layout.setContentsMargins(6, 6, 6, 6)
-        package_layout.setSpacing(5)
-        package_summary_layout = QtWidgets.QGridLayout()
-        package_summary_layout.setContentsMargins(0, 0, 0, 0)
-        self.package_state_label = QtWidgets.QLabel("State: IDLE")
-        self.package_state_label.setObjectName("measurementPackageDetailsState")
-        self.package_completeness_label = QtWidgets.QLabel("Evidence: PENDING")
-        self.package_completeness_label.setObjectName("measurementPackageDetailsCompleteness")
-        self.package_verification_label = QtWidgets.QLabel("Verification: NOT RUN")
-        self.package_verification_label.setObjectName("measurementPackageDetailsVerification")
-        self.package_revision_label = QtWidgets.QLabel("Revision: --")
-        self.package_revision_label.setObjectName("measurementPackageDetailsRevision")
-        for index, label in enumerate(
-            (
-                self.package_state_label,
-                self.package_completeness_label,
-                self.package_verification_label,
-                self.package_revision_label,
-            )
-        ):
-            label.setWordWrap(True)
+        package_group = QtWidgets.QGroupBox()
+        load_form("recording_package.ui", package_group)
+        self.package_state_label = package_group.measurementPackageDetailsState
+        self.package_completeness_label = package_group.measurementPackageDetailsCompleteness
+        self.package_verification_label = package_group.measurementPackageDetailsVerification
+        self.package_revision_label = package_group.measurementPackageDetailsRevision
+        for label in (self.package_state_label, self.package_completeness_label, self.package_verification_label, self.package_revision_label):
             label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-            package_summary_layout.addWidget(label, index // 2, index % 2)
-        package_layout.addLayout(package_summary_layout)
 
         self.package_source_model = _table_model(
             self,
             ("Source", "Expected", "State / active range", "Detail"),
         )
-        self.package_source_table = QtWidgets.QTableView()
+        self.package_source_table = package_group.measurementPackageSourceExpectations
         self.package_source_table.setObjectName("measurementPackageSourceExpectations")
         self.package_source_table.setModel(self.package_source_model)
-        self.package_source_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.package_source_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.package_source_table.verticalHeader().setVisible(False)
-        self.package_source_table.horizontalHeader().setStretchLastSection(True)
-        self.package_source_table.setMaximumHeight(125)
-        package_layout.addWidget(self.package_source_table)
 
         self.package_artifact_model = _table_model(
             self,
@@ -181,35 +130,16 @@ class RecordingWorkspace(QtWidgets.QWidget):
                 "Missing / failed reason",
             ),
         )
-        self.package_artifact_table = QtWidgets.QTableView()
+        self.package_artifact_table = package_group.measurementPackageRequiredArtifacts
         self.package_artifact_table.setObjectName("measurementPackageRequiredArtifacts")
         self.package_artifact_table.setModel(self.package_artifact_model)
-        self.package_artifact_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.package_artifact_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.package_artifact_table.verticalHeader().setVisible(False)
-        self.package_artifact_table.horizontalHeader().setStretchLastSection(True)
-        self.package_artifact_table.setMaximumHeight(170)
-        package_layout.addWidget(self.package_artifact_table)
-
-        package_actions = QtWidgets.QHBoxLayout()
-        self.verify_package_button = QtWidgets.QPushButton("Verify package")
-        self.verify_package_button.setObjectName("measurementPackageVerify")
+        self.verify_package_button = package_group.measurementPackageVerify
         self.verify_package_button.setProperty("commandId", "session.verify_package")
         self.verify_package_button.clicked.connect(self._verify_measurement_package)
-        package_actions.addWidget(self.verify_package_button)
-        self.create_revision_button = QtWidgets.QPushButton("Create Revision")
-        self.create_revision_button.setObjectName("measurementPackageCreateRevision")
+        self.create_revision_button = package_group.measurementPackageCreateRevision
         self.create_revision_button.setProperty("commandId", "session.create_revision")
-        self.create_revision_button.setToolTip(
-            "Create a new append-only revision; the sealed revision remains unchanged."
-        )
         self.create_revision_button.clicked.connect(self._begin_measurement_revision)
-        package_actions.addWidget(self.create_revision_button)
-        self.package_action_status_label = QtWidgets.QLabel("Package actions: ready")
-        self.package_action_status_label.setObjectName("measurementPackageActionStatus")
-        self.package_action_status_label.setWordWrap(True)
-        package_actions.addWidget(self.package_action_status_label, 1)
-        package_layout.addLayout(package_actions)
+        self.package_action_status_label = package_group.measurementPackageActionStatus
         self.package_group = package_group
         tab_layouts["evidence"].addWidget(package_group)
         if self._sessionless:
@@ -267,8 +197,9 @@ class RecordingWorkspace(QtWidgets.QWidget):
         protocol_layout.addLayout(protocol_checks_layout)
         self.preflight_group = protocol_group
 
-        session_group = QtWidgets.QGroupBox("Capture evidence")
-        session_layout = QtWidgets.QGridLayout(session_group)
+        session_group = QtWidgets.QGroupBox()
+        load_form("recording_capture.ui", session_group)
+        session_layout = session_group.valuesLayout
         self.session_values: dict[str, EngineeringValue] = {}
         capture_fields = (
             (
@@ -291,132 +222,67 @@ class RecordingWorkspace(QtWidgets.QWidget):
             value = EngineeringValue(label)
             self.session_values[key] = value
             session_layout.addWidget(value, index // 2, index % 2)
-        hr_capture_controls = QtWidgets.QHBoxLayout()
-        hr_capture_controls.setContentsMargins(0, 0, 0, 0)
-        hr_capture_controls.addWidget(QtWidgets.QLabel("HR purpose"))
-        self.pnp_capture_purpose_combo = QtWidgets.QComboBox()
-        self.pnp_capture_purpose_combo.setObjectName("hrCapturePurpose")
-        self.pnp_capture_purpose_combo.addItem("Pre", "pre")
-        self.pnp_capture_purpose_combo.addItem("Post", "post")
-        self.pnp_capture_purpose_combo.addItem("Checkpoint", "checkpoint")
-        self.pnp_capture_purpose_combo.addItem("Unspecified", "unspecified")
-        hr_capture_controls.addWidget(self.pnp_capture_purpose_combo)
-        self.pnp_capture_button = QtWidgets.QPushButton("Capture HR Still")
+        self.pnp_capture_purpose_combo = session_group.hrCapturePurpose
+        for label, value in (("Pre", "pre"), ("Post", "post"), ("Checkpoint", "checkpoint"), ("Unspecified", "unspecified")):
+            self.pnp_capture_purpose_combo.addItem(label, value)
+        self.pnp_capture_button = session_group.captureHr
         self.pnp_capture_button.setProperty("commandId", "recording.hr.capture")
-        self.pnp_capture_button.setToolTip(
-            "Sends SIHR TRUE, CPTR, and ICPT to both cameras. Photos remain in camera "
-            "internal storage. The chosen Pre/Post/Checkpoint purpose is recorded with "
-            "the capture event; image import is a later, explicit evidence action."
-        )
         self.pnp_capture_button.clicked.connect(self._capture_pnp_hr_pair)
-        hr_capture_controls.addWidget(self.pnp_capture_button)
-        self.oz_capture_button = QtWidgets.QPushButton("Capture OZ Still")
+        self.oz_capture_button = session_group.captureOz
         self.oz_capture_button.setProperty("commandId", "recording.oz.capture")
-        self.oz_capture_button.setToolTip(
-            "Sends SIVI TRUE, CPTR, and ICPT to both cameras for a separate visible/OZ "
-            "still. It is stored on the camera independently from the recorded RTSP video."
-        )
         self.oz_capture_button.clicked.connect(self._capture_pnp_oz_pair)
-        hr_capture_controls.addWidget(self.oz_capture_button)
-        hr_capture_controls.addStretch(1)
-        session_layout.addLayout(hr_capture_controls, 3, 0, 1, 2)
-        self.pnp_capture_status_label = QtWidgets.QLabel(
-            "Capture HR Still: camera-internal storage · select event, then import exact left/right files"
-        )
+        self.pnp_capture_status_label = session_group.hrStatus
         self.pnp_capture_status_label.setObjectName("compactContract")
-        self.pnp_capture_status_label.setWordWrap(True)
-        session_layout.addWidget(self.pnp_capture_status_label, 4, 0, 1, 2)
-        self.oz_capture_status_label = QtWidgets.QLabel(
-            "Capture OZ Still: camera-internal FHD still · separate from recorded RTSP video"
-        )
+        self.oz_capture_status_label = session_group.ozStatus
         self.oz_capture_status_label.setObjectName("compactContract")
-        self.oz_capture_status_label.setWordWrap(True)
-        session_layout.addWidget(self.oz_capture_status_label, 5, 0, 1, 2)
         self.hr_capture_model = _table_model(
             self,
             ("Capture event", "Purpose", "State", "Left HR", "Right HR"),
         )
-        self.hr_capture_table = QtWidgets.QTableView()
+        self.hr_capture_table = session_group.hrCaptureEventTable
         self.hr_capture_table.setObjectName("hrCaptureEventTable")
         self.hr_capture_table.setModel(self.hr_capture_model)
-        self.hr_capture_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.hr_capture_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.hr_capture_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.hr_capture_table.verticalHeader().setVisible(False)
-        self.hr_capture_table.horizontalHeader().setStretchLastSection(True)
-        self.hr_capture_table.setMaximumHeight(112)
         self.hr_capture_table.selectionModel().selectionChanged.connect(
             self._refresh_hr_import_actions
         )
-        session_layout.addWidget(self.hr_capture_table, 6, 0, 1, 2)
-        hr_import_actions = QtWidgets.QHBoxLayout()
-        self.hr_import_left_button = QtWidgets.QPushButton("Import selected Left HR")
-        self.hr_import_left_button.setProperty("commandId", "recording.hr.import")
-        self.hr_import_left_button.clicked.connect(
-            lambda _checked=False: self._import_selected_hr("left")
-        )
-        self.hr_import_right_button = QtWidgets.QPushButton("Import selected Right HR")
-        self.hr_import_right_button.setProperty("commandId", "recording.hr.import")
-        self.hr_import_right_button.clicked.connect(
-            lambda _checked=False: self._import_selected_hr("right")
-        )
-        hr_import_actions.addWidget(self.hr_import_left_button)
-        hr_import_actions.addWidget(self.hr_import_right_button)
-        hr_import_actions.addStretch(1)
-        session_layout.addLayout(hr_import_actions, 7, 0, 1, 2)
+        self.hr_import_left_button = session_group.importLeft
+        self.hr_import_right_button = session_group.importRight
+        for side, button in (("left", self.hr_import_left_button), ("right", self.hr_import_right_button)):
+            button.setProperty("commandId", "recording.hr.import")
+            button.clicked.connect(lambda _checked=False, side=side: self._import_selected_hr(side))
         self._refresh_hr_import_actions()
         self.capture_evidence_group = session_group
         tab_layouts["evidence"].addWidget(session_group)
 
-        ulog_group = QtWidgets.QGroupBox("PX4 ULog evidence")
-        ulog_layout = QtWidgets.QGridLayout(ulog_group)
-        self.ulog_source_combo = QtWidgets.QComboBox()
-        self.ulog_source_combo.addItem("P1 / Left", "p1")
-        self.ulog_source_combo.addItem("P2 / Right", "p2")
-        self.ulog_source_combo.addItem("Target Drone", "target")
-        self.ulog_ownership_combo = QtWidgets.QComboBox()
-        self.ulog_ownership_combo.addItem("Ownership unknown", "UNKNOWN")
-        self.ulog_ownership_combo.addItem("Workstation-owned claim", "WORKSTATION")
-        self.ulog_ownership_combo.addItem("External logger", "EXTERNAL")
-        self.ulog_import_button = QtWidgets.QPushButton("Import ULog")
+        ulog_group = QtWidgets.QGroupBox()
+        load_form("recording_ulog.ui", ulog_group)
+        self.ulog_source_combo = ulog_group.source
+        for label, value in (("P1 / Left", "p1"), ("P2 / Right", "p2"), ("Target Drone", "target")):
+            self.ulog_source_combo.addItem(label, value)
+        self.ulog_ownership_combo = ulog_group.ownership
+        for label, value in (("Ownership unknown", "UNKNOWN"), ("Workstation-owned claim", "WORKSTATION"), ("External logger", "EXTERNAL")):
+            self.ulog_ownership_combo.addItem(label, value)
+        self.ulog_import_button = ulog_group.importButton
         self.ulog_import_button.setProperty("commandId", "recording.ulog.import")
         self.ulog_import_button.clicked.connect(self._import_ulog)
-        self.ulog_status_label = QtWidgets.QLabel(
-            "No ULog imported · automatic capture requires verified logger ACK/status ownership"
-        )
+        self.ulog_status_label = ulog_group.status
         self.ulog_status_label.setObjectName("compactContract")
-        self.ulog_status_label.setWordWrap(True)
-        ulog_layout.addWidget(QtWidgets.QLabel("Source"), 0, 0)
-        ulog_layout.addWidget(self.ulog_source_combo, 0, 1)
-        ulog_layout.addWidget(QtWidgets.QLabel("Provenance"), 0, 2)
-        ulog_layout.addWidget(self.ulog_ownership_combo, 0, 3)
-        ulog_layout.addWidget(self.ulog_import_button, 0, 4)
-        ulog_layout.addWidget(self.ulog_status_label, 1, 0, 1, 5)
-        self.ulog_model = _table_model(
-            self,
-            ("Source", "Acquisition", "Ownership", "Bytes", "SHA-256", "Path"),
-        )
-        self.ulog_table = QtWidgets.QTableView()
-        self.ulog_table.setObjectName("ulogEvidenceTable")
+        self.ulog_model = _table_model(self, ("Source", "Acquisition", "Ownership", "Bytes", "SHA-256", "Path"))
+        self.ulog_table = ulog_group.ulogEvidenceTable
         self.ulog_table.setModel(self.ulog_model)
-        self.ulog_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.ulog_table.verticalHeader().setVisible(False)
-        self.ulog_table.setMaximumHeight(120)
-        self.ulog_table.horizontalHeader().setStretchLastSection(True)
-        ulog_layout.addWidget(self.ulog_table, 2, 0, 1, 5)
         tab_layouts["evidence"].addWidget(ulog_group)
 
-        data_group = QtWidgets.QGroupBox("Files")
-        data_layout = QtWidgets.QVBoxLayout(data_group)
+        data_group = QtWidgets.QGroupBox()
+        load_form("recording_files.ui", data_group)
+        data_layout = data_group.layout()
         self.count_values: dict[str, EngineeringValue] = {}
-        count_layout = QtWidgets.QGridLayout()
+        count_layout = data_group.countLayout
         for index, (key, label) in enumerate(
             (("pairs", "Pairs"), ("camera_left", "CAM L rows"), ("camera_right", "CAM R rows"), ("px4_left", "P1 rows"), ("px4_right", "P2 rows"), ("gnss_base", "GNSS rows"))
         ):
             value = EngineeringValue(label)
             self.count_values[key] = value
             count_layout.addWidget(value, index // 3, index % 3)
-        data_layout.addLayout(count_layout)
         self.artifact_model = _table_model(
             self,
             (
@@ -435,74 +301,27 @@ class RecordingWorkspace(QtWidgets.QWidget):
                 else ("File", "Path", "Kind")
             ),
         )
-        self.artifact_table = QtWidgets.QTableView()
+        self.artifact_table = data_group.table
         self.artifact_table.setModel(self.artifact_model)
-        self.artifact_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.artifact_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.artifact_table.verticalHeader().setVisible(False)
-        self.artifact_table.setMaximumHeight(150)
-        self.artifact_table.horizontalHeader().setStretchLastSection(True)
-        data_layout.addWidget(self.artifact_table)
         if self._sessionless:
-            data_actions = QtWidgets.QGridLayout()
-            data_actions.setContentsMargins(0, 0, 0, 0)
-            data_actions.setHorizontalSpacing(6)
-            data_actions.setVerticalSpacing(4)
-            self.open_data_folder_button = QtWidgets.QPushButton("Open Data Folder")
-            self.open_data_folder_button.setObjectName("dataWorkspaceOpenRoot")
+            data_actions = QtWidgets.QWidget()
+            load_form("recording_storage_actions.ui", data_actions)
+            self.open_data_folder_button = data_actions.dataWorkspaceOpenRoot
+            self.open_legacy_recordings_button = data_actions.dataWorkspaceOpenLegacy
+            self.retry_storage_button = data_actions.dataWorkspaceRetryStorage
+            self.open_measurement_workbook_button = data_actions.dataWorkspaceOpenMeasurementWorkbook
+            self.rebuild_measurement_workbook_button = data_actions.dataWorkspaceRebuildMeasurementWorkbook
             self.open_data_folder_button.clicked.connect(self._open_data_folder)
-            self.open_legacy_recordings_button = QtWidgets.QPushButton(
-                "Open Legacy Recordings Folder"
-            )
-            self.open_legacy_recordings_button.setObjectName("dataWorkspaceOpenLegacy")
-            self.open_legacy_recordings_button.clicked.connect(
-                self._open_legacy_recordings_folder
-            )
-            self.retry_storage_button = QtWidgets.QPushButton("Retry Storage")
-            self.retry_storage_button.setObjectName("dataWorkspaceRetryStorage")
+            self.open_legacy_recordings_button.clicked.connect(self._open_legacy_recordings_folder)
             self.retry_storage_button.clicked.connect(self._retry_data_storage)
-            self.open_measurement_workbook_button = QtWidgets.QPushButton(
-                "Open Latest Measurement XLSX"
-            )
-            self.open_measurement_workbook_button.setObjectName(
-                "dataWorkspaceOpenMeasurementWorkbook"
-            )
-            self.open_measurement_workbook_button.setAccessibleName(
-                "Open latest Measurement workbook"
-            )
-            self.open_measurement_workbook_button.setToolTip(
-                "Open the newest <start time>_measurement.xlsx in the data folder "
-                "with the system spreadsheet application. Each Measurement "
-                "(Start to Stop) has its own workbook."
-            )
-            self.open_measurement_workbook_button.clicked.connect(
-                self._open_measurement_workbook
-            )
-            data_actions.addWidget(self.open_data_folder_button, 0, 0)
-            data_actions.addWidget(self.open_legacy_recordings_button, 0, 1)
-            data_actions.addWidget(self.retry_storage_button, 0, 2)
-            data_actions.addWidget(self.open_measurement_workbook_button, 1, 0)
-            self.rebuild_measurement_workbook_button = QtWidgets.QPushButton("Rebuild Latest XLSX")
-            self.rebuild_measurement_workbook_button.setObjectName("dataWorkspaceRebuildMeasurementWorkbook")
-            self.rebuild_measurement_workbook_button.setToolTip("Rebuild the latest Measurement workbook from its saved JSONL/CSV inputs.")
+            self.open_measurement_workbook_button.clicked.connect(self._open_measurement_workbook)
             self.rebuild_measurement_workbook_button.clicked.connect(self._rebuild_measurement_workbook)
-            data_actions.addWidget(self.rebuild_measurement_workbook_button, 1, 1)
-            data_actions.setColumnStretch(3, 1)
-            data_layout.addLayout(data_actions)
-            self.measurement_workbook_status_label = QtWidgets.QLabel(
-                "Measurement XLSX · IDLE"
-            )
+            self.measurement_workbook_status_label = data_actions.workbookStatus
             self.measurement_workbook_status_label.setObjectName("statusStrip")
-            self.measurement_workbook_status_label.setTextInteractionFlags(
-                QtCore.Qt.TextSelectableByMouse
-            )
-            self.measurement_workbook_status_label.setWordWrap(True)
-            status_height = (
-                self.measurement_workbook_status_label.fontMetrics().lineSpacing() * 2 + 8
-            )
-            self.measurement_workbook_status_label.setMinimumHeight(status_height)
-            self.measurement_workbook_status_label.setMaximumHeight(status_height)
-            data_layout.addWidget(self.measurement_workbook_status_label)
+            self.measurement_workbook_status_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            status_height = self.measurement_workbook_status_label.fontMetrics().lineSpacing() * 2 + 8
+            self.measurement_workbook_status_label.setFixedHeight(status_height)
+            data_layout.addWidget(data_actions)
             self.method_worker_pane = MethodWorkerRecoveryPane(
                 getattr(self.backend, "measurement_worker_snapshot", None),
                 getattr(self.backend, "restart_measurement_method_worker", None),
@@ -510,75 +329,43 @@ class RecordingWorkspace(QtWidgets.QWidget):
             data_layout.addWidget(self.method_worker_pane)
         tab_layouts["current"].addWidget(data_group)
 
-        review_group = QtWidgets.QGroupBox("Review")
-        review_layout = QtWidgets.QVBoxLayout(review_group)
-        review_layout.setContentsMargins(6, 6, 6, 6)
-        review_layout.setSpacing(5)
-        selector_layout = QtWidgets.QGridLayout()
-        selector_layout.setHorizontalSpacing(8)
-        selector_layout.setColumnStretch(1, 1)
-        self.session_selector = QtWidgets.QComboBox()
-        self.session_selector.setObjectName("sessionReviewSelector")
+        review_group = QtWidgets.QGroupBox()
+        load_form("recording_review.ui", review_group)
+        self.session_selector = review_group.sessionReviewSelector
         self.session_selector.currentIndexChanged.connect(lambda _index: self._refresh_review_artifacts())
-        self.refresh_sessions_button = QtWidgets.QPushButton("Refresh")
-        self.refresh_sessions_button.clicked.connect(
-            lambda _checked=False: self.refresh_sessions(force=True)
-        )
-        self.open_session_button = QtWidgets.QPushButton("Open folder")
+        self.refresh_sessions_button = review_group.sessionReviewSelectorAction
+        self.refresh_sessions_button.clicked.connect(lambda _checked=False: self.refresh_sessions(force=True))
+        self.open_session_button = review_group.sessionReviewSelectorOpen
         self.open_session_button.clicked.connect(self._open_selected_session)
-        selector_layout.addWidget(QtWidgets.QLabel("Session"), 0, 0)
-        selector_layout.addWidget(self.session_selector, 0, 1)
-        selector_layout.addWidget(self.refresh_sessions_button, 0, 2)
-        selector_layout.addWidget(self.open_session_button, 0, 3)
-        self.artifact_selector = QtWidgets.QComboBox()
-        self.artifact_selector.setObjectName("sessionArtifactSelector")
+        self.artifact_selector = review_group.sessionArtifactSelector
         self.artifact_selector.currentIndexChanged.connect(lambda _index: self._preview_selected_artifact())
-        self.preview_artifact_button = QtWidgets.QPushButton("Preview")
+        self.preview_artifact_button = review_group.sessionArtifactSelectorAction
         self.preview_artifact_button.clicked.connect(self._preview_selected_artifact)
-        self.open_artifact_button = QtWidgets.QPushButton("Open file")
+        self.open_artifact_button = review_group.sessionArtifactSelectorOpen
         self.open_artifact_button.clicked.connect(self._open_selected_artifact)
-        selector_layout.addWidget(QtWidgets.QLabel("Artifact"), 1, 0)
-        selector_layout.addWidget(self.artifact_selector, 1, 1)
-        selector_layout.addWidget(self.preview_artifact_button, 1, 2)
-        selector_layout.addWidget(self.open_artifact_button, 1, 3)
-        review_layout.addLayout(selector_layout)
-        self.review_status_label = QtWidgets.QLabel(
-            "Read-only review"
-        )
+        self.review_status_label = review_group.status
         self.review_status_label.setObjectName("statusStrip")
-        self.review_status_label.setWordWrap(True)
-        self.review_status_label.setToolTip(
-            "Saved fields and timestamps are unchanged; no NED/ENU conversion is applied."
-        )
-        review_layout.addWidget(self.review_status_label)
         self.review_model = QtGui.QStandardItemModel(0, 0, self)
-        self.review_table = QtWidgets.QTableView()
+        self.review_table = review_group.table
         self.review_table.setModel(self.review_model)
-        self.review_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.review_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.review_table.verticalHeader().setVisible(False)
-        self.review_table.setMaximumHeight(230)
-        self.review_table.horizontalHeader().setStretchLastSection(True)
-        review_layout.addWidget(self.review_table)
         self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
         tab_layouts["review"].addWidget(review_group)
 
-        self.contract_label = QtWidgets.QLabel(
-            "Time: per-record UTC/source clock" if self._sessionless else "Time: recording clock"
-        )
+        contract_footer = QtWidgets.QWidget()
+        load_form("recording_contract.ui", contract_footer)
+        self.contract_label = contract_footer.contract_label
+        if self._sessionless:
+            self.contract_label.setText("Time: per-record UTC/source clock")
         self.contract_label.setToolTip(
             "Every record retains its own UTC, monotonic, and source-clock evidence."
-            if self._sessionless
-            else "Session IDs use wall time; samples retain the recording time axis."
+            if self._sessionless else "Session IDs use wall time; samples retain the recording time axis."
         )
         self.contract_label.setObjectName("compactContract")
-        tab_layouts["evidence"].addWidget(self.contract_label)
-        button = QtWidgets.QPushButton("Advanced files")
-        button.setToolTip(
-            "Open playback, export, and media review tools."
-        )
-        button.clicked.connect(open_advanced)
-        tab_layouts["review"].addWidget(button, alignment=QtCore.Qt.AlignRight)
+        tab_layouts["evidence"].addWidget(contract_footer)
+        advanced_footer = QtWidgets.QWidget()
+        load_form("recording_advanced.ui", advanced_footer)
+        advanced_footer.advanced_button.clicked.connect(open_advanced)
+        tab_layouts["review"].addWidget(advanced_footer, alignment=QtCore.Qt.AlignRight)
         for tab_layout in tab_layouts.values():
             tab_layout.addStretch(1)
         self.tabs.currentChanged.connect(self._inspect_current_tab)

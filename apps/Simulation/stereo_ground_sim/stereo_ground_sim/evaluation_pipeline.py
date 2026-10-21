@@ -9,7 +9,7 @@ import math
 
 from stereo_ground_sim.coordinate_frames import (
     SOURCE_GAZEBO_ENTITY,
-    VEHICLE_REFERENCE_DEFINITION,
+    vehicle_reference_definition,
     VEHICLE_REFERENCE_LINK,
 )
 
@@ -33,7 +33,7 @@ def vector_error(metrics, prefix, gt_baseline):
     return math.sqrt(sum(value * value for value in errors)), errors[0]
 
 
-def evaluation_metadata(pair, alignment, gt_baseline, metrics):
+def evaluation_metadata(pair, alignment, gt_baseline, metrics, *, target_model_name="x500_15m"):
     def errors(prefix):
         if gt_baseline is None:
             return (None, None, None, None, None)
@@ -91,7 +91,7 @@ def evaluation_metadata(pair, alignment, gt_baseline, metrics):
         "gt_source": "gazebo_vehicle_reference_link_world_pose",
         "gt_source_entity": SOURCE_GAZEBO_ENTITY,
         "gt_reference_name": VEHICLE_REFERENCE_LINK,
-        "gt_reference_definition": VEHICLE_REFERENCE_DEFINITION,
+        "gt_reference_definition": vehicle_reference_definition(target_model_name),
         "gt_fallback_used": False,
         **diagnostic_metadata,
     }

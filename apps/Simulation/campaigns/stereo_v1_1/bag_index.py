@@ -21,7 +21,7 @@ import numpy as np
 import yaml
 import zstandard
 from rclpy.serialization import deserialize_message
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image
 
 
 PAIR_TOLERANCE_NS = 1_000_000
@@ -110,6 +110,100 @@ def read_images(attempt_dir: Path, side: str) -> list[dict]:
     return records
 
 
+def read_raw_state(attempt_dir: Path) -> list[dict]:
+    """Deserialize the authoritative raw bag, preserving simulation ns/epoch.
+
+    GT position is world ENU, quaternion XYZW. Clock/header stamps are never
+    substituted with rosbag receive time; static camera diagnostics retain the
+    last received simulation clock solely as reception context.
+    """
+    from geometry_msgs.msg import PoseStamped
+    from rosgraph_msgs.msg import Clock
+    from std_msgs.msg import String
+    bag = attempt_dir / "raw_images_or_lossless_bag" / "state"
+    metadata = yaml.safe_load((bag / "metadata.yaml").read_text(encoding="utf-8"))
+    info = metadata["rosbag2_bagfile_information"]
+    compression = info.get("compression_format") or ""
+    if compression and (compression != "zstd" or str(info.get("compression_mode")).upper() != "MESSAGE"):
+        raise ValueError("unsupported state bag compression")
+    decoder = zstandard.ZstdDecompressor() if compression else None
+    rows, epoch, last_clock = [], 0, None
+    types = {"rosgraph_msgs/msg/Clock": Clock, "geometry_msgs/msg/PoseStamped": PoseStamped,
+             "std_msgs/msg/String": String}
+    for db in _bag_files(bag):
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as con:
+            if con.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise ValueError("state bag SQLite integrity failure")
+            topics = {i: (name, kind) for i, name, kind in con.execute("SELECT id,name,type FROM topics")}
+            for message_id, topic_id, receive_ns, serialized in con.execute(
+                    "SELECT id,topic_id,timestamp,data FROM messages ORDER BY timestamp,id"):
+                topic, kind = topics[topic_id]
+                if kind not in types:
+                    raise ValueError(f"unsupported raw-state message type: {kind}")
+                msg = deserialize_message(decoder.decompress(serialized) if decoder else serialized, types[kind])
+                stamp = last_clock
+                fields = {}
+                if topic == "/clock":
+                    stamp = int(msg.clock.sec)*1_000_000_000 + int(msg.clock.nanosec)
+                    if last_clock is not None and stamp < last_clock:
+                        epoch += 1
+                    last_clock = stamp
+                elif topic == "/simulation/ground_truth/vehicle_reference_link":
+                    stamp = int(msg.header.stamp.sec)*1_000_000_000 + int(msg.header.stamp.nanosec)
+                    position = [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z]
+                    q = [msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z, msg.pose.orientation.w]
+                    if (msg.header.frame_id != "gazebo_world_enu"
+                            or not all(math.isfinite(v) for v in position+q)
+                            or abs(sum(v*v for v in q)-1) > 0.002):
+                        raise ValueError("raw GT ENU/XYZW pose contract invalid")
+                    fields = {"position_world_enu_m": position, "orientation_world_from_reference_xyzw": q}
+                elif topic.startswith("/simulation/camera_pose_diagnostics/"):
+                    payload = json.loads(msg.data)
+                    if not isinstance(payload, dict):
+                        raise ValueError("camera diagnostic payload is not an object")
+                    # The complete immutable payload remains in the raw bag.
+                    fields = {"diagnostic_payload_valid": True}
+                else:
+                    raise ValueError(f"unexpected raw state topic: {topic}")
+                rows.append({"topic": topic, "simulation_epoch": epoch,
+                             "simulation_timestamp_ns": stamp, "receive_timestamp_ns": receive_ns,
+                             "original_reference": f"raw_images_or_lossless_bag/state/{db.name}#message_id={message_id}",
+                             **fields})
+    return rows
+
+
+def read_camera_info(attempt_dir: Path, side: str) -> dict:
+    """Summarize recorded optical RDF CameraInfo; K is row-major pixel units.
+
+    No world/body conversion is performed. Missing metadata is explicit so old
+    captures remain readable while v1.2 QC can reject missing camera contracts.
+    """
+    bag = attempt_dir / "raw_images_or_lossless_bag" / side
+    metadata = yaml.safe_load((bag / "metadata.yaml").read_text(encoding="utf-8"))
+    info = metadata["rosbag2_bagfile_information"]
+    decoder = zstandard.ZstdDecompressor() if info.get("compression_format") == "zstd" else None
+    variants = {}
+    count = 0
+    for db in _bag_files(bag):
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as connection:
+            topic = connection.execute("SELECT id,type FROM topics WHERE name=?",
+                                       (f"/{side}_camera/camera_info",)).fetchone()
+            if topic is None:
+                continue
+            if topic[1] != "sensor_msgs/msg/CameraInfo":
+                raise ValueError("CameraInfo topic has an incorrect ROS type")
+            for (serialized,) in connection.execute("SELECT data FROM messages WHERE topic_id=?", (topic[0],)):
+                msg = deserialize_message(decoder.decompress(serialized) if decoder else serialized, CameraInfo)
+                value = {"width": int(msg.width), "height": int(msg.height),
+                         "k": [float(x) for x in msg.k], "d": [float(x) for x in msg.d],
+                         "distortion_model": str(msg.distortion_model),
+                         "frame_id": str(msg.header.frame_id)}
+                variants[json.dumps(value, sort_keys=True, allow_nan=False)] = value
+                count += 1
+    return {"message_count": count, "variants": list(variants.values()),
+            "axis_contract": "opencv_optical_rdf:right,down,forward; K row-major pixels"}
+
+
 def pair_frames(left: list[dict], right: list[dict], tolerance_ns: int = PAIR_TOLERANCE_NS) -> list[dict]:
     """Pair each source frame at most once within one epoch and ≤tolerance."""
     if tolerance_ns < 0:
@@ -185,6 +279,11 @@ def index_attempt(attempt_dir: Path, run_id: str, attempt_id: str,
     capture = json.loads((attempt_dir / "raw_capture_summary.json").read_text(encoding="utf-8"))
     if capture["status"] != "CAPTURE_COMPLETE":
         raise ValueError("raw capture was not finalized successfully")
+    if capture.get("protocol_version") == "1.2":
+        raw_state = read_raw_state(attempt_dir)
+        with (attempt_dir / "raw_state_index.jsonl").open("x", encoding="utf-8") as handle:
+            for row in raw_state:
+                handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
     left = read_images(attempt_dir, "left")
     right = read_images(attempt_dir, "right")
     pairs = pair_frames(left, right, tolerance_ns=pair_tolerance_ns)
@@ -211,6 +310,7 @@ def index_attempt(attempt_dir: Path, run_id: str, attempt_id: str,
         "maximum_abs_pair_delta_ns": max((abs(pair["pair_delta_ns"]) for pair in pairs), default=None),
         "left": _stats(left),
         "right": _stats(right),
+        "camera_info": {side: read_camera_info(attempt_dir, side) for side in ("left", "right")},
         "detection_processing_status": "NOT_RUN",
     }
     (attempt_dir / "image_index_summary.json").write_text(

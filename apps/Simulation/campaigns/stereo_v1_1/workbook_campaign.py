@@ -295,42 +295,90 @@ def _manifest_table_rows(archive: zipfile.ZipFile, sheet_targets: list[tuple[str
 
 def _verify_current_protocol_manifest(campaign: dict, runs: list[dict],
                                      parameter_rows: dict, run_parameters: dict) -> None:
-    """Pin the supplied v1.1 student instruction's explicit 39-run ordering."""
-    if campaign["protocol_id"] != "stereo_calibration_campaign_v1_1":
-        return
-    manifest_path = SIM_ROOT / "작업지시서" / "04_run_manifest.json"
-    if not manifest_path.is_file():
-        raise ValueError("the v1.1 instruction run manifest is missing")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-    expected = manifest.get("runs", [])
-    if len(expected) != len(runs):
-        raise ValueError("workbook run count differs from the v1.1 instruction manifest")
-    fields = ("sequence", "run_id", "attempt_id", "rig_group", "path_id", "repetition",
-              "seed_requested", "role")
+    """Validate code-owned scientific contracts, without reopening provenance files.
+
+    Positions are ENU metres, optical rays RDF; heading is clockwise north to
+    east. PX4 mount angles belong to body FRD/NED and are separate from optics.
+    v1.1 and v1.2 share the rotated-block 39-slot design and seed assignment.
+    """
+    protocol = campaign["protocol_id"]
+    if protocol not in ("stereo_calibration_campaign_v1_1", "stereo_calibration_campaign_v1_2"):
+        raise ValueError(f"unsupported campaign protocol_id {protocol!r}")
+    version = "1.2" if protocol.endswith("v1_2") else "1.1"
+    expected = []
+    for rig, paths, repeats in (("G0", ("P0", "P1", "P2", "P3", "P4", "V0"), 5),
+                                ("G1", ("P0", "P4", "V0"), 3)):
+        for repetition in range(1, repeats + 1):
+            offset = repetition - 1
+            for path in paths[offset:] + paths[:offset]:
+                sequence = len(expected) + 1
+                evaluation = path == "V0"
+                expected.append(dict(sequence=sequence, run_id=f"{rig}-{path}-R{repetition:02d}",
+                    attempt_id="a01", rig_group=rig, path_id=path, repetition=repetition,
+                    seed_requested=2026100500 + sequence,
+                    role="final_evaluation" if evaluation else "calibration",
+                    data_split="locked_final_test" if evaluation else "development_calibration",
+                    use_for_calibration=not evaluation, use_for_final_evaluation=evaluation,
+                    reset_before_run=True))
+    if len(runs) != 39:
+        raise ValueError("workbook run count differs from the 39-slot instruction contract")
+    if campaign["seed_policy"] != "manifest_required":
+        raise ValueError("instruction protocol requires manifest_required seed_policy")
     for actual, source in zip(runs, expected):
-        for field in fields:
-            if actual[field] != source[field]:
-                raise ValueError(
-                    f"RunManifest:{actual['sequence']} {field} differs from the v1.1 instruction"
-                )
-        if actual["data_split"] != source["planned_data_split"]:
-            raise ValueError(
-                f"RunManifest:{actual['sequence']} data_split differs from the v1.1 instruction"
-            )
-        if actual["use_for_calibration"] != (source["role"] == "calibration"):
-            raise ValueError(f"RunManifest:{actual['sequence']} calibration role flag is inconsistent")
-        if actual["use_for_final_evaluation"] != (source["role"] == "final_evaluation"):
-            raise ValueError(f"RunManifest:{actual['sequence']} final-evaluation role flag is inconsistent")
-        for side in ("left", "right"):
-            parameter_id = f"RenderedCameraPose.{side}_heading_deg"
+        for field, value in source.items():
+            if actual[field] != value:
+                raise ValueError(f"RunManifest:{actual['sequence']} {field} differs from the v{version} instruction")
+
+        def require_value(parameter_id, expected_value):
             definition = parameter_rows[parameter_id]
-            actual_heading = (definition["campaign_value"] if definition["scope"] == "campaign_fixed"
-                              else run_parameters[actual["run_id"]][parameter_id])
-            if not _close(actual_heading, source["true_camera_heading_deg"][side]):
-                raise ValueError(f"RunManifest:{actual['sequence']} {side} rendered heading differs from instruction")
-    source_hash = sha256_file(manifest_path)
-    if campaign["source_manifest_sha256"] != source_hash:
-        raise ValueError("Campaign source_manifest_sha256 differs from the instruction manifest")
+            value = (definition["campaign_value"] if definition["scope"] == "campaign_fixed"
+                     else run_parameters[actual["run_id"]][parameter_id])
+            matches = value == expected_value if isinstance(expected_value, str) else _close(value, expected_value)
+            if not matches:
+                raise ValueError(f"RunManifest:{actual['sequence']} {parameter_id} differs from v{version} instruction ({expected_value})")
+
+        for side, heading in (("left", 0.5), ("right", -0.5)):
+            require_value(f"RenderedCameraPose.{side}_heading_deg", heading if source["rig_group"] == "G1" else 0)
+        path = source["path_id"]
+        for field, value in dict(north_start_m=600 if path == "V0" else 400,
+                                 north_end_m=400 if path == "V0" else 300,
+                                 bow_amplitude_m={"P1": 3, "P2": 6}.get(path, 0),
+                                 s_amplitude_m={"P3": 3, "P4": 6}.get(path, 0),
+                                 glide_angle_deg=20).items():
+            require_value(f"Path.{field}", value)
+        if version == "1.2":
+            fixed = {
+                "CameraModel.far_clip_m": 1000, "CameraModel.image_width_px": 1280,
+                "CameraModel.image_height_px": 720, "CameraModel.horizontal_fov_rad": 0.154997710698,
+                "CameraModel.fx_px": 8241.646774127139, "CameraModel.fy_px": 8241.646774127139,
+                "CameraModel.cx_px": 640, "CameraModel.cy_px": 360, "CameraModel.camera_rate_hz": 20,
+                "Motion.reference_update_hz": 50, "Motion.setpoint_hz": 50,
+                "Motion.cruise_speed_mps": 5, "Motion.heading_deg": 180,
+                "Motion.ramp_up_s": 5, "Motion.ramp_down_s": 5,
+                "Motion.acceleration_limit_mps2": 3, "Motion.tracking_warning_p95_m": 1,
+                "CameraGeometry.baseline_m": 25,
+                "CameraGeometry.left_east_m": -12.5, "CameraGeometry.right_east_m": 12.5,
+                "CameraGeometry.left_north_m": 0, "CameraGeometry.right_north_m": 0,
+                "CameraGeometry.left_up_m": 0.1, "CameraGeometry.right_up_m": 0.1,
+                "Entry.science_start_position_error_m": 0.5,
+                "Entry.science_start_speed_mps": 0.3,
+                "Entry.science_start_heading_error_deg": 3,
+                "Entry.science_start_stable_s": 5,
+                "Entry.science_start_readiness_timeout_s": 120,
+                "Entry.postscience_hold_s": 5,
+                "Capture.min_gt_rate_hz": 50, "Capture.preferred_gt_rate_hz": 100,
+                "Capture.pair_tolerance_s": 0.001, "Capture.max_gt_bracketing_gap_s": 0.04,
+                "Capture.yolo_target_hz": 20, "Capture.yolo_imgsz_px": 736,
+                "Vehicle.model_id": "x500_2m", "Vehicle.reference_link": "vehicle_reference_link",
+            }
+            for side in ("left", "right"):
+                fixed.update({f"RenderedCameraPose.{side}_roll_deg": 0,
+                              f"RenderedCameraPose.{side}_pitch_deg": 20,
+                              f"CameraPX4Mount.{side}_mount_roll_deg": 0,
+                              f"CameraPX4Mount.{side}_mount_pitch_deg": 20,
+                              f"CameraPX4Mount.{side}_mount_yaw_deg": 0})
+            for parameter_id, value in fixed.items():
+                require_value(parameter_id, value)
 
 
 def _read_manifest_workbook(source: Path, archive: zipfile.ZipFile,
@@ -370,7 +418,7 @@ def _read_manifest_workbook(source: Path, archive: zipfile.ZipFile,
     )
     if campaign["expected_run_count"] <= 0 or campaign["expected_run_count"] > 999:
         raise ValueError("Campaign expected_run_count must be from 1 to 999")
-    if not isinstance(campaign["source_manifest_sha256"], str) or len(campaign["source_manifest_sha256"]) != 64:
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", campaign["source_manifest_sha256"]):
         raise ValueError("Campaign source_manifest_sha256 must be a 64-character SHA256")
 
     observed_catalog = []
@@ -1190,6 +1238,11 @@ def scenario_environment(parameters: dict, sequence: int) -> dict[str, str]:
         "PX4_ATTITUDE_MAX_AGE_S": mount["px4_attitude_max_age_s"],
         "PX4_ATTITUDE_PAIR_SKEW_S": mount["px4_attitude_pair_skew_s"],
     }
+    # The per-camera optical angles above are absolute from the level RDF rig.
+    # Neutralize inherited common/relative perturbations to avoid double rotation.
+    for kind in ("COMMON", "RELATIVE"):
+        for axis in ("ROLL", "PITCH", "YAW"):
+            values[f"{kind}_OPTICAL_{axis}_ERROR_DEG"] = 0.0
     for side_name, side_env in (("Left", "L"), ("Right", "R")):
         mag = parameters[f"Magnetometer{side_name}"]
         gyro = parameters[f"Gyroscope{side_name}"]
@@ -1357,6 +1410,8 @@ def build_workbook_plan(path: Path | str) -> dict:
             "use_for_calibration": manifest["use_for_calibration"] if manifest else bool(runs["use_for_calibration"]),
             "use_for_final_evaluation": manifest["use_for_final_evaluation"] if manifest else bool(runs["use_for_final_evaluation"]),
             "reset_before_run": manifest["reset_before_run"] if manifest else True,
+            "protocol_version": ("1.2" if workbook.get("campaign", {}).get("protocol_id") ==
+                                 "stereo_calibration_campaign_v1_2" else "1.1"),
             "workbook_sha256": workbook["sha256"],
             "workbook_schema_version": workbook["schema_version"],
             "parameter_sources": workbook["parameter_sources"][sequence],
@@ -1471,7 +1526,7 @@ def execute_campaign(action: str, workbook_path: Path, output_root: Path) -> dic
         plan = _load_frozen_plan(output_root)
 
     from campaigns.stereo_v1_1.campaign_run import (
-        _audit_valid, _existing_sitl_processes, _lock, _reconcile_interrupted, _run_one,
+        PILOT_IDS, _audit_valid, _existing_sitl_processes, _lock, _reconcile_interrupted, _run_one,
     )
 
     environment_report = output_root / "environment_report.json"
@@ -1480,6 +1535,13 @@ def execute_campaign(action: str, workbook_path: Path, output_root: Path) -> dic
     if json.loads(environment_report.read_text(encoding="utf-8")).get("status") != "PREFLIGHT_PASS":
         raise ValueError("campaign preflight is not passing; workbook flights are blocked")
     rows = plan["planned_runs"]
+    if (plan.get("campaign") or {}).get("protocol_id") == "stereo_calibration_campaign_v1_2":
+        # Pilot slots are actual campaign slots, not extra flights. Preserve their
+        # immutable sequence/seed IDs while checking readiness before the rest.
+        by_id = {row["run_id"]: row for row in rows}
+        rows = [by_id[run_id] for run_id in PILOT_IDS] + [
+            row for row in rows if row["run_id"] not in PILOT_IDS
+        ]
     with _lock(output_root):
         if _existing_sitl_processes():
             raise RuntimeError("Gazebo/PX4 process remains active; stop it before workbook campaign execution")

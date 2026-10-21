@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Sequence
 from PyQt5 import QtCore, QtGui, QtWidgets
+from Workstation.ui.designer import load_form
 from Workstation.workstation_core.settings import DEFAULT_CALIBRATION_ROOT
 from Workstation.workstation_core.calibration_selection import (
     CALIBRATION_IMAGE_SUFFIXES, CALIBRATION_SELECTION_SCHEMA,
@@ -67,31 +68,18 @@ class CalibrationInputPicker(QtCore.QObject):
         self._calibration_pair_picker_thumbnail_paths = []
 
     def _build_calibration_session_group(self) -> QtWidgets.QGroupBox:
-        group = QtWidgets.QGroupBox("Calibration session")
-        layout = QtWidgets.QGridLayout(group)
-        layout.setHorizontalSpacing(8)
-        self.calibration_session_combo = QtWidgets.QComboBox()
-        self.calibration_session_combo.setObjectName("calibrationSessionSelector")
-        self.calibration_session_combo.currentIndexChanged.connect(
-            self._on_calibration_session_selected
-        )
-        self.calibration_session_refresh_button = QtWidgets.QPushButton("Refresh sessions")
-        self.calibration_session_refresh_button.clicked.connect(
-            lambda _checked=False: self._refresh_calibration_session_selector(force=True)
-        )
-        self.calibration_session_path_label = QtWidgets.QLabel("No saved session selected")
-        self.calibration_session_path_label.setObjectName("statusStrip")
+        group = load_form('calibration_session.ui', QtWidgets.QGroupBox())
+        self.calibration_session_combo = group.calibration_session_combo
+        self.calibration_session_combo.setObjectName('calibrationSessionSelector')
+        self.calibration_session_combo.currentIndexChanged.connect(self._on_calibration_session_selected)
+        self.calibration_session_refresh_button = group.calibration_session_refresh_button
+        self.calibration_session_refresh_button.clicked.connect(lambda _checked=False: self._refresh_calibration_session_selector(force=True))
+        self.calibration_session_path_label = group.calibration_session_path_label
+        self.calibration_session_path_label.setObjectName('statusStrip')
         self.calibration_session_path_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        self.calibration_session_result_label = QtWidgets.QLabel(
-            "Results: beside the selected left/right photo set"
-        )
-        self.calibration_session_result_label.setObjectName("compactContract")
+        self.calibration_session_result_label = group.calibration_session_result_label
+        self.calibration_session_result_label.setObjectName('compactContract')
         self.calibration_session_result_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        layout.addWidget(QtWidgets.QLabel("Photo set"), 0, 0)
-        layout.addWidget(self.calibration_session_combo, 0, 1)
-        layout.addWidget(self.calibration_session_refresh_button, 0, 2)
-        layout.addWidget(self.calibration_session_path_label, 1, 0, 1, 3)
-        layout.addWidget(self.calibration_session_result_label, 2, 0, 1, 3)
         self._refresh_calibration_session_selector(force=True)
         return group
 
@@ -269,47 +257,18 @@ class CalibrationInputPicker(QtCore.QObject):
 
 
     def _build_calibration_file_selection_group(self) -> QtWidgets.QGroupBox:
-        group = QtWidgets.QGroupBox("계산에 사용할 사진")
-        layout = QtWidgets.QVBoxLayout(group)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(5)
-
-        controls = QtWidgets.QGridLayout()
-        controls.setHorizontalSpacing(8)
-        controls.setVerticalSpacing(5)
-        self.calibration_left_files_button = QtWidgets.QPushButton("Left 사진 선택…")
-        self.calibration_right_files_button = QtWidgets.QPushButton("Right 사진 선택…")
-        self.calibration_clear_files_button = QtWidgets.QPushButton("선택 초기화")
-        self.calibration_left_files_button.clicked.connect(
-            lambda _checked=False: self._choose_calibration_files("left")
-        )
-        self.calibration_right_files_button.clicked.connect(
-            lambda _checked=False: self._choose_calibration_files("right")
-        )
-        self.calibration_clear_files_button.clicked.connect(
-            self._clear_calibration_file_selection
-        )
-        self.calibration_file_selection_summary = QtWidgets.QLabel(
-            "파일창에서 좌/우 사진을 각각 선택하세요."
-        )
-        self.calibration_file_selection_summary.setObjectName("statusStrip")
-        self.calibration_file_selection_summary.setWordWrap(True)
-        controls.addWidget(self.calibration_left_files_button, 0, 0)
-        controls.addWidget(self.calibration_right_files_button, 0, 1)
-        controls.addWidget(self.calibration_clear_files_button, 0, 2)
-        controls.addWidget(self.calibration_file_selection_summary, 1, 0, 1, 3)
-        layout.addLayout(controls)
-
-        self.calibration_selected_files_table = QtWidgets.QTableWidget(0, 6)
-        self.calibration_selected_files_table.setObjectName("calibrationSelectedFilesTable")
-        self.calibration_selected_files_table.setHorizontalHeaderLabels(
-            ("#", "Left", "Right", "Left 정보", "Right 정보", "Pair")
-        )
-        self.calibration_selected_files_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.calibration_selected_files_table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        group = load_form('calibration_files.ui', QtWidgets.QGroupBox())
+        self.calibration_left_files_button = group.calibration_left_files_button
+        self.calibration_right_files_button = group.calibration_right_files_button
+        self.calibration_clear_files_button = group.calibration_clear_files_button
+        self.calibration_left_files_button.clicked.connect(lambda _checked=False: self._choose_calibration_files('left'))
+        self.calibration_right_files_button.clicked.connect(lambda _checked=False: self._choose_calibration_files('right'))
+        self.calibration_clear_files_button.clicked.connect(self._clear_calibration_file_selection)
+        self.calibration_file_selection_summary = group.calibration_file_selection_summary
+        self.calibration_file_selection_summary.setObjectName('statusStrip')
+        self.calibration_selected_files_table = group.calibration_selected_files_table
+        self.calibration_selected_files_table.setObjectName('calibrationSelectedFilesTable')
         self.calibration_selected_files_table.verticalHeader().setVisible(False)
-        self.calibration_selected_files_table.setMinimumHeight(100)
-        self.calibration_selected_files_table.setMaximumHeight(230)
         header = self.calibration_selected_files_table.horizontalHeader()
         header.setStretchLastSection(True)
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
@@ -317,17 +276,8 @@ class CalibrationInputPicker(QtCore.QObject):
         header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
         header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
-        layout.addWidget(self.calibration_selected_files_table)
-
-        hint = QtWidgets.QLabel(
-            "intrinsic은 좌/우 목록을 각각 사용하고, Checkerboard R,t는 같은 행의 좌/우 파일을 pair로 사용합니다. "
-            "사진 정보의 시각은 exact RTCP/NTP frame → app capture record/request → legacy file mtime "
-            "순으로 표시하며 출처를 함께 적습니다. 선택 목록은 세션 폴더의 "
-            "calibration_pair_selection.json에 저장됩니다."
-        )
-        hint.setObjectName("compactContract")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+        hint = group.hint
+        hint.setObjectName('compactContract')
         self._calibration_file_picker_signature = None
         return group
 
@@ -670,43 +620,16 @@ class CalibrationInputPicker(QtCore.QObject):
 
 
     def _build_calibration_pair_picker_group(self) -> QtWidgets.QGroupBox:
-        group = QtWidgets.QGroupBox("계산용 사진 선택")
-        layout = QtWidgets.QVBoxLayout(group)
-        self.calibration_manual_selection_checkbox = QtWidgets.QCheckBox("수동 선택 사용")
-        self.calibration_manual_selection_checkbox.setToolTip(
-            "끄면 기존처럼 균등 분산 자동 선택을 사용합니다. 켜면 아래에서 체크한 쌍만 계산에 사용합니다."
-        )
-        self.calibration_manual_selection_checkbox.toggled.connect(
-            self._on_calibration_pair_selection_changed
-        )
-        layout.addWidget(self.calibration_manual_selection_checkbox)
-        filter_row = QtWidgets.QHBoxLayout()
-        self.calibration_show_all_pairs_checkbox = QtWidgets.QCheckBox("전체 사진 보기")
-        self.calibration_show_all_pairs_checkbox.setToolTip(
-            "기본값은 Workstation 실행 이후 저장된 pair만 표시합니다. "
-            "켜면 calibration root의 기존 pair까지 모두 표시합니다."
-        )
-        self.calibration_show_all_pairs_checkbox.toggled.connect(
-            self._handle_calibration_pair_picker_filter_changed
-        )
-        filter_row.addWidget(self.calibration_show_all_pairs_checkbox)
-        self.calibration_pair_picker_summary = QtWidgets.QLabel("앱 실행 후 캡처 대기")
-        self.calibration_pair_picker_summary.setObjectName("statusStrip")
-        filter_row.addWidget(self.calibration_pair_picker_summary, 1)
-        layout.addLayout(filter_row)
-        self.calibration_pair_picker_list = QtWidgets.QListWidget()
-        self.calibration_pair_picker_list.setObjectName("calibrationPairPickerList")
-        self.calibration_pair_picker_list.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
-        self.calibration_pair_picker_list.setIconSize(QtCore.QSize(64, 36))
-        self.calibration_pair_picker_list.setMinimumHeight(90)
-        self.calibration_pair_picker_list.setMaximumHeight(220)
-        self.calibration_pair_picker_list.setToolTip(
-            "체크된 쌍만(수동 선택 사용 시) Run calibration / Calculate R,t 에 사용됩니다."
-        )
-        self.calibration_pair_picker_list.itemChanged.connect(
-            self._on_calibration_pair_selection_changed
-        )
-        layout.addWidget(self.calibration_pair_picker_list)
+        group = load_form('calibration_pair_picker.ui', QtWidgets.QGroupBox())
+        self.calibration_manual_selection_checkbox = group.calibration_manual_selection_checkbox
+        self.calibration_manual_selection_checkbox.toggled.connect(self._on_calibration_pair_selection_changed)
+        self.calibration_show_all_pairs_checkbox = group.calibration_show_all_pairs_checkbox
+        self.calibration_show_all_pairs_checkbox.toggled.connect(self._handle_calibration_pair_picker_filter_changed)
+        self.calibration_pair_picker_summary = group.calibration_pair_picker_summary
+        self.calibration_pair_picker_summary.setObjectName('statusStrip')
+        self.calibration_pair_picker_list = group.calibration_pair_picker_list
+        self.calibration_pair_picker_list.setObjectName('calibrationPairPickerList')
+        self.calibration_pair_picker_list.itemChanged.connect(self._on_calibration_pair_selection_changed)
         self._calibration_pair_picker_root: Path | None = None
         return group
 

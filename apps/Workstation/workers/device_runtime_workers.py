@@ -7,7 +7,7 @@ workstation app. StereoWIRIS app code is intentionally not imported.
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from ipaddress import IPv4Address
 import os
 from pathlib import Path
@@ -62,6 +62,7 @@ from Workstation.workstation_core.px4_mag_manager import (
     RM3100_BACKUP_IDS,
     RM3100_PRIMARY_IDS,
     build_mag_status,
+    build_mag_selection_preview,
     mag_priority_slot_from_key,
     mag_priority_slot_key,
 )
@@ -1409,6 +1410,7 @@ class PixhawkParameterWorker(QtCore.QObject):
         actual_selected_device_id: int | None = None,
         armed: bool = False,
         priorities: dict[str, int] | None = None,
+        instance_device_ids: Mapping[int, int] | None = None,
     ) -> None:
         super().__init__()
         self.subscriber = subscriber
@@ -1417,6 +1419,10 @@ class PixhawkParameterWorker(QtCore.QObject):
         self.actual_selected_device_id = actual_selected_device_id
         self.armed = bool(armed)
         self.priorities = {str(key): int(value) for key, value in dict(priorities or {}).items()}
+        self.instance_device_ids = {
+            int(instance): int(device_id)
+            for instance, device_id in dict(instance_device_ids or {}).items()
+        }
 
     # A Radio PARAM_REQUEST_READ is a single MAVLink frame each way. On a
     # shared 57600 telemetry link one lost frame otherwise leaves ``None`` in
@@ -1491,7 +1497,27 @@ class PixhawkParameterWorker(QtCore.QObject):
             actual_selected_device_id=self.actual_selected_device_id,
             armed=self.armed,
         )
+        if self.instance_device_ids:
+            preview = build_mag_selection_preview(
+                params,
+                self.instance_device_ids,
+                requested_priorities=self.priorities,
+                actual_selected_device_id=self.actual_selected_device_id,
+            )
+            if preview.priority_voter_gap_instances:
+                slots_by_instance = {candidate.instance: candidate.cal_slot for candidate in preview.candidates}
+                gap_text = ", ".join(
+                    f"i{instance}/CAL_MAG{slots_by_instance[instance]}"
+                    if slots_by_instance.get(instance) is not None
+                    else f"i{instance}"
+                    for instance in preview.priority_voter_gap_instances
+                )
+                raise RuntimeError(
+                    "PX4 v1.17 voter gap: lower sensor_mag instance(s) "
+                    f"{gap_text} are disabled. Set unused MAG priorities to Min (1) before Apply."
+                )
         applied: list[str] = []
+        expected_by_param: dict[str, int] = {}
         missing = set(self.priorities)
         slot_priorities: dict[int, int] = {}
         role_priorities: dict[str, int] = {}
@@ -1518,12 +1544,25 @@ class PixhawkParameterWorker(QtCore.QObject):
             _raise_if_pixhawk_worker_interrupted(f"PARAM set {name}")
             actual = self.subscriber.set_param_int(self.camera, name, expected, timeout_s=2.0)
             if actual != expected:
-                raise RuntimeError(f"{name} readback mismatch: expected={expected}, actual={actual}")
+                partial = ", ".join(applied) or "none"
+                raise RuntimeError(
+                    f"{name} readback mismatch: expected={expected}, actual={actual}; "
+                    f"previous slots applied={partial}"
+                )
+            expected_by_param[name] = expected
             identity = role or f"ID={slot.device_id if slot.device_id is not None else 'N/A'}"
             applied.append(f"{slot_key}({identity}):{name}={expected}")
         if not applied:
             raise RuntimeError("적용 가능한 BOARD/CAN/GPS MAG 슬롯을 찾지 못했습니다.")
         after_params = self._read_mag_priority_params()
+        for name, expected in expected_by_param.items():
+            actual = after_params.get(name)
+            if actual is None or int(actual) != expected:
+                partial = ", ".join(applied) or "none"
+                raise RuntimeError(
+                    f"{name} final PARAM readback mismatch: expected={expected}, actual={actual}; "
+                    f"slots acknowledged={partial}"
+                )
         status = build_mag_status(
             after_params,
             actual_selected_device_id=self.actual_selected_device_id,

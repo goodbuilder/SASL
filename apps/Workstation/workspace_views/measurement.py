@@ -7,12 +7,12 @@ import time
 from collections.abc import Mapping
 from typing import Callable
 from PyQt5 import QtCore, QtGui, QtWidgets
+from Workstation.ui.designer import load_form
 from Workstation.workstation_core.coordinate_contract import MEASUREMENT_AXIS_CONTRACT, MEASUREMENT_FRAME
 from Workstation.ui.components import EngineeringValue, WorkspaceHeader
 from Workstation.application.status_model import RuntimeStatus, StatusModel, StatusSeverity
 from .camera_preview import CameraPreview, _preview_pair_height
 from .shared import (
-    _command_button,
     _compact_text,
     _display_number,
     _evidence,
@@ -59,92 +59,41 @@ class MeasurementWorkspace(QtWidgets.QWidget):
                 True,
             )
         )
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-        layout.addWidget(WorkspaceHeader("Measurement"))
-
-        run_group = QtWidgets.QGroupBox("Run")
-        run_layout = QtWidgets.QHBoxLayout(run_group)
-        run_layout.setContentsMargins(6, 6, 6, 6)
-        run_layout.setSpacing(6)
-        self.control_buttons: dict[str, QtWidgets.QPushButton] = {}
-        preview_button = _command_button("Preview", "camera.toggle", invoke_command)
-        self.control_buttons["camera.toggle"] = preview_button
-        run_layout.addWidget(preview_button)
-        detection_button = _command_button("측정 시작", "detection.toggle", invoke_command)
-        detection_button.setToolTip(
-            "Request Measurement start/stop at any lifecycle state. Unsafe requests are "
-            "reported by the runtime without disabling this control."
-        )
-        self.control_buttons["detection.toggle"] = detection_button
-        run_layout.addWidget(detection_button)
-        self.finalize_session_button = QtWidgets.QPushButton("Retry Save")
-        self.finalize_session_button.setObjectName("measurementPackageFinalize")
+        load_form("measurement_workspace.ui", self)
+        layout = self.pageLayout
+        self.headerLayout.addWidget(WorkspaceHeader("Measurement"))
+        self.control_buttons = {"camera.toggle": self.previewButton, "detection.toggle": self.detectionButton}
+        for command_id, button in self.control_buttons.items():
+            button.setProperty("commandId", command_id)
+            button.setEnabled(invoke_command is not None)
+            if invoke_command is not None:
+                button.clicked.connect(lambda _checked=False, command=command_id: invoke_command(command))
+        self.finalize_session_button = self.measurementPackageFinalize
         self.finalize_session_button.setProperty("commandId", "session.finalize")
-        self.finalize_session_button.setToolTip(
-            "Retry automatic persistence/sealing after a recoverable save failure."
-        )
         self.finalize_session_button.clicked.connect(self._finalize_measurement_package)
-        run_layout.addWidget(self.finalize_session_button)
         if self._sessionless:
             self.finalize_session_button.hide()
-        package_status_layout = QtWidgets.QVBoxLayout()
-        package_status_layout.setContentsMargins(0, 0, 0, 0)
-        package_status_layout.setSpacing(2)
-        self.session_status_label = QtWidgets.QLabel(
-            "Measurement: IDLE" if self._sessionless else "Session: IDLE"
-        )
-        self.session_status_label.setObjectName("measurementPackageLifecycle")
+        self.session_status_label = self.measurementPackageLifecycle
+        self.measurement_status_label = self.measurementPackageCurrent
+        self.session_step_label = self.measurementPackageStep
+        self.evidence_summary_label = self.measurementPackageEvidence
+        if self._sessionless:
+            self.session_status_label.setText("Measurement: IDLE")
+            self.measurement_status_label.setText("Recording: IDLE")
+            self.session_step_label.setText("Next: 측정 시작")
+            self.evidence_summary_label.setText("Storage: OK")
         self.session_status_label.setToolTip(
-            "Transient run state; stored data never owns Measurement admission."
-            if self._sessionless
+            "Transient run state; stored data never owns Measurement admission." if self._sessionless
             else "Create the parent Session in Sessions > Current before measuring."
         )
-        package_status_layout.addWidget(self.session_status_label)
-        self.measurement_status_label = QtWidgets.QLabel(
-            "Recording: IDLE" if self._sessionless else "Measurement: NONE"
-        )
-        self.measurement_status_label.setObjectName("measurementPackageCurrent")
-        self.measurement_status_label.setToolTip("No active Measurement.")
-        package_status_layout.addWidget(self.measurement_status_label)
-        self.session_step_label = QtWidgets.QLabel(
-            "Next: 측정 시작" if self._sessionless else "Next: Sessions > Current"
-        )
-        self.session_step_label.setObjectName("measurementPackageStep")
         self.session_step_label.setToolTip(
-            "Workflow: 측정 시작 → available inputs → 측정 종료 → immediately ready"
-            if self._sessionless
+            "Workflow: 측정 시작 → available inputs → 측정 종료 → immediately ready" if self._sessionless
             else "Workflow: Sessions > Current → 측정 시작 → 측정 종료 → automatic save"
         )
-        package_status_layout.addWidget(self.session_step_label)
-        self.evidence_summary_label = QtWidgets.QLabel(
-            "Storage: OK" if self._sessionless else "Evidence: PENDING"
-        )
-        self.evidence_summary_label.setObjectName("measurementPackageEvidence")
-        package_status_layout.addWidget(self.evidence_summary_label)
-        for status_label in (
-            self.session_status_label,
-            self.measurement_status_label,
-            self.session_step_label,
-            self.evidence_summary_label,
-        ):
-            status_label.setMinimumWidth(0)
-            status_label.setWordWrap(False)
-            status_label.setSizePolicy(
-                QtWidgets.QSizePolicy.Ignored,
-                QtWidgets.QSizePolicy.Preferred,
-            )
-        run_layout.addLayout(package_status_layout, 1)
-        run_layout.addStretch(1)
-        layout.addWidget(run_group)
 
-        upstream_group = QtWidgets.QGroupBox("Inputs")
-        upstream_layout = QtWidgets.QVBoxLayout(upstream_group)
-        upstream_layout.setContentsMargins(6, 6, 6, 6)
-        upstream_layout.setSpacing(4)
-        self.preview_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        self.preview_splitter.setChildrenCollapsible(False)
+        upstream_group = QtWidgets.QGroupBox()
+        load_form("measurement_inputs.ui", upstream_group)
+        self.preview_splitter = upstream_group.previewSplitter
         self.preview_row = self.preview_splitter
         preview_row = self.preview_splitter
         self.previews = {
@@ -156,26 +105,9 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             preview.setMinimumHeight(280)
             preview.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
             preview_row.addWidget(preview)
-        preview_row.setMinimumHeight(280)
-        preview_row.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         preview_row.setStretchFactor(0, 1)
         preview_row.setStretchFactor(1, 1)
-        upstream_layout.addWidget(preview_row)
-        self.distance_timing_contract = QtWidgets.QLabel(
-            "Timing: Settings preferred · fallback APP RECEIVE · |Δ|≤100 ms"
-        )
-        self.distance_timing_contract.setObjectName("compactContract")
-        self.distance_timing_contract.setWordWrap(False)
-        self.distance_timing_contract.setMinimumWidth(0)
-        self.distance_timing_contract.setSizePolicy(
-            QtWidgets.QSizePolicy.Ignored,
-            QtWidgets.QSizePolicy.Preferred,
-        )
-        self.distance_timing_contract.setToolTip(
-            "App receive is the default. RTCP/NTP preferred selects pairs only with VERIFIED, "
-            "current same-epoch evidence; any timing fault falls back to exact app receive."
-        )
-        upstream_layout.addWidget(self.distance_timing_contract)
+        self.distance_timing_contract = upstream_group.compactContract
         self.upstream_values: dict[str, EngineeringValue] = {}
         upstream_fields = (
             ("camera.left", "CAM L"),
@@ -186,100 +118,39 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             ("recording", "Recording"),
             ("fps", "Decoded FPS"),
         )
-        facts_layout = QtWidgets.QGridLayout()
-        facts_layout.setContentsMargins(0, 0, 0, 0)
-        facts_layout.setHorizontalSpacing(8)
-        facts_layout.setVerticalSpacing(4)
+        facts_layout = upstream_group.factsLayout
         for index, (key, label) in enumerate(upstream_fields):
             value = EngineeringValue(label)
             self.upstream_values[key] = value
             value.activated.connect(lambda key=key: self._inspect_upstream(key))
             facts_layout.addWidget(value, index // 4, index % 4)
-        upstream_layout.addLayout(facts_layout)
-        details = QtWidgets.QWidget()
-        details_layout = QtWidgets.QVBoxLayout(details)
-        details_layout.setContentsMargins(0, 0, 0, 0)
-        details_layout.setSpacing(6)
+        details = self.details
+        details_layout = self.detailsLayout
         self.upstream_group = upstream_group
-        self.details = details
         # Inputs must be part of the same page flow as the result/settings
         # content.  Keeping it as the first child of the details page lets the
         # outer Measurement workspace scroll move the whole page together.
         details_layout.addWidget(upstream_group)
 
-        method_group = QtWidgets.QGroupBox("Measurement method")
-        method_layout = QtWidgets.QGridLayout(method_group)
-        method_layout.setContentsMargins(6, 6, 6, 6)
-        method_layout.setHorizontalSpacing(8)
-        self.measurement_method_combo = QtWidgets.QComboBox()
-        self.measurement_method_combo.setObjectName("measurementMethodCombo")
-        self.measurement_method_combo.setToolTip(
-            "현재 exact K,D와 필요한 live/candidate 입력이 모두 준비된 방식만 표시합니다. "
-            "선택 방식이 준비 상태를 잃으면 이 Measurement가 생성될 때 고정된 fallback "
-            "순서로 자동 전환합니다."
-        )
-        self.measurement_method_combo.currentIndexChanged.connect(
-            self._measurement_method_selected
-        )
-        self.measurement_method_status = QtWidgets.QLabel("준비된 측정 방식 확인 중")
+        method_group = QtWidgets.QGroupBox()
+        load_form("measurement_method.ui", method_group)
+        self.measurement_method_combo = method_group.measurementMethodCombo
+        self.measurement_method_combo.currentIndexChanged.connect(self._measurement_method_selected)
+        self.measurement_method_status = method_group.methodStatus
         self.measurement_method_status.setObjectName("statusStrip")
-        self.measurement_method_status.setWordWrap(True)
-        method_layout.addWidget(QtWidgets.QLabel("Ready method"), 0, 0)
-        method_layout.addWidget(self.measurement_method_combo, 0, 1)
-        method_layout.addWidget(self.measurement_method_status, 1, 0, 1, 2)
-        self.measurement_fill_method_combo = QtWidgets.QComboBox()
-        self.measurement_fill_method_combo.setObjectName("measurementFillMethodCombo")
-        self.measurement_fill_method_combo.setToolTip(
-            "방식이 직접 제공하는 축은 OWN으로 잠깁니다. 미관측 회전축은 PX4, "
-            "미관측 이동축은 GNSS 토글로 이 Measurement에서만 채웁니다."
-        )
-        self.measurement_fill_method_combo.currentIndexChanged.connect(
-            self._measurement_fill_method_changed
-        )
-        method_layout.addWidget(QtWidgets.QLabel("DOF fill for"), 2, 0)
-        method_layout.addWidget(self.measurement_fill_method_combo, 2, 1)
-        fill_widget = QtWidgets.QWidget()
-        fill_layout = QtWidgets.QGridLayout(fill_widget)
-        fill_layout.setContentsMargins(0, 0, 0, 0)
-        fill_layout.setHorizontalSpacing(6)
-        fill_layout.setVerticalSpacing(3)
-        dof_columns = (
-            ("roll_deg", "Roll"),
-            ("pitch_deg", "Pitch"),
-            ("yaw_deg", "Yaw"),
-            ("north_m", "North"),
-            ("east_m", "East"),
-            ("down_m", "Down"),
-        )
-        for column, (_dof, label) in enumerate(dof_columns, start=1):
-            fill_layout.addWidget(QtWidgets.QLabel(label), 0, column)
-        self.measurement_fill_buttons: dict[str, QtWidgets.QPushButton] = {}
-        for row, side in enumerate(("left", "right"), start=1):
-            fill_layout.addWidget(QtWidgets.QLabel(side.title()), row, 0)
-            for column, (dof, _label) in enumerate(dof_columns, start=1):
+        self.measurement_fill_method_combo = method_group.measurementFillMethodCombo
+        self.measurement_fill_method_combo.currentIndexChanged.connect(self._measurement_fill_method_changed)
+        self.measurement_fill_buttons = {}
+        # Translation components retain NED metres; orientation components retain degrees.
+        for side in ("left", "right"):
+            for dof in ("roll_deg", "pitch_deg", "yaw_deg", "north_m", "east_m", "down_m"):
                 component = f"{side}.{dof}"
-                button = QtWidgets.QPushButton("--")
-                button.setCheckable(True)
-                button.setObjectName(
-                    "measurementFill" + side.title() + "".join(part.title() for part in dof.split("_"))
-                )
+                button = getattr(method_group, "measurementFill" + side.title() + "".join(part.title() for part in dof.split("_")))
                 button.setProperty("component", component)
-                button.toggled.connect(
-                    lambda checked, component=component: self._measurement_fill_toggled(
-                        component,
-                        checked,
-                    )
-                )
+                button.toggled.connect(lambda checked, component=component: self._measurement_fill_toggled(component, checked))
                 self.measurement_fill_buttons[component] = button
-                fill_layout.addWidget(button, row, column)
-        self.measurement_fill_status = QtWidgets.QLabel(
-            "Pre 증거로 Measurement 초안이 준비된 경우 측정 시작 전에 fill source를 조정할 수 있습니다."
-        )
+        self.measurement_fill_status = method_group.fillStatus
         self.measurement_fill_status.setObjectName("statusStrip")
-        self.measurement_fill_status.setWordWrap(True)
-        method_layout.addWidget(fill_widget, 3, 0, 1, 2)
-        method_layout.addWidget(self.measurement_fill_status, 4, 0, 1, 2)
-        method_layout.setColumnStretch(1, 1)
         details_layout.addWidget(method_group)
 
         from Workstation.measurement.measurement_comparison import MeasurementComparisonPane
@@ -361,33 +232,18 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         target_layout.addWidget(self.target_coordinate_status, 2, 0, 1, 2)
         details_layout.addWidget(self.target_coordinates_group)
 
-        comparison_group = QtWidgets.QGroupBox("Extrinsics 분석 미리보기 (F/R/D/Rg)")
-        comparison_layout = QtWidgets.QVBoxLayout(comparison_group)
-        comparison_layout.setContentsMargins(6, 6, 6, 6)
-        comparison_note = QtWidgets.QLabel(
-            "동일 좌/우 검출 픽셀에 대해 각 외부 파라미터 소스로 계산한 결과 미리보기 · "
-            "이 표는 분석 미리보기입니다. 위 Method 비교 표는 실제 pair별 계산 기록을 표시합니다."
-        )
-        comparison_note.setObjectName("statusStrip")
-        comparison_note.setWordWrap(True)
-        comparison_layout.addWidget(comparison_note)
+        comparison_group = QtWidgets.QGroupBox()
+        load_form("measurement_comparison.ui", comparison_group)
+        comparison_group.note.setObjectName("statusStrip")
         self.geometry_comparison_model = _table_model(
             self, ("Method", "Forward m", "Right m", "Down m", "Range m", "Status")
         )
-        self.geometry_comparison_table = QtWidgets.QTableView()
+        self.geometry_comparison_table = comparison_group.table
         self.geometry_comparison_table.setModel(self.geometry_comparison_model)
-        self.geometry_comparison_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.geometry_comparison_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.geometry_comparison_table.verticalHeader().setVisible(False)
-        self.geometry_comparison_table.horizontalHeader().setStretchLastSection(True)
-        self.geometry_comparison_table.setMaximumHeight(220)
-        comparison_layout.addWidget(self.geometry_comparison_table)
         details_layout.addWidget(comparison_group)
 
-        settings_group = QtWidgets.QGroupBox("Settings")
-        settings_layout = QtWidgets.QVBoxLayout(settings_group)
-        settings_layout.setContentsMargins(6, 6, 6, 6)
-        settings_layout.setSpacing(5)
+        settings_group = QtWidgets.QGroupBox()
+        load_form("measurement_settings.ui", settings_group)
         settings = _evidence(self.backend).measurement_settings()
         self.settings_widgets: dict[str, QtWidgets.QWidget] = {}
 
@@ -395,7 +251,7 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             key: str,
             items: tuple[tuple[str, str], ...],
         ) -> QtWidgets.QComboBox:
-            widget = QtWidgets.QComboBox()
+            widget = getattr(settings_group, key)
             for label, value in items:
                 widget.addItem(label, value)
             current = str(settings.get(key) or "")
@@ -411,121 +267,52 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             decimals: int,
             suffix: str,
         ) -> QtWidgets.QDoubleSpinBox:
-            widget = QtWidgets.QDoubleSpinBox()
-            widget.setRange(minimum, maximum)
-            widget.setDecimals(decimals)
+            widget = getattr(settings_group, key)
             widget.setValue(float(settings.get(key) if settings.get(key) is not None else minimum))
-            widget.setSuffix(suffix)
             self.settings_widgets[key] = widget
             return widget
 
         def toggle(key: str, label: str) -> QtWidgets.QPushButton:
-            widget = QtWidgets.QPushButton(label)
-            widget.setCheckable(True)
+            widget = getattr(settings_group, key)
             widget.setChecked(bool(settings.get(key, False)))
             widget.setProperty("role", "toggle")
             self.settings_widgets[key] = widget
             return widget
 
         def text_edit(key: str, placeholder: str = "") -> QtWidgets.QLineEdit:
-            widget = QtWidgets.QLineEdit(str(settings.get(key) or ""))
-            if placeholder:
-                widget.setPlaceholderText(placeholder)
+            widget = getattr(settings_group, key)
+            widget.setText(str(settings.get(key) or ""))
             self.settings_widgets[key] = widget
             return widget
 
-        geometry_form = QtWidgets.QGridLayout()
-        geometry_form.setHorizontalSpacing(8)
-        geometry_form.setVerticalSpacing(5)
-        geometry_form.setColumnStretch(1, 1)
-        geometry_form.setColumnStretch(3, 1)
-        geometry_fields = (
-            (
-                "Confidence",
-                double_spin("yolo_confidence", 0.01, 1.0, 3, ""),
-            ),
-            (
-                "IoU",
-                double_spin("yolo_iou", 0.01, 1.0, 3, ""),
-            ),
-            (
-                "P1 GNSS source",
-                combo(
-                    "pixhawk_left_gnss_source",
-                    (("GPS1", "GPS1"), ("GPS2", "GPS2")),
-                ),
-            ),
-            (
-                "P2 GNSS source",
-                combo(
-                    "pixhawk_right_gnss_source",
-                    (("GPS1", "GPS1"), ("GPS2", "GPS2")),
-                ),
-            ),
-        )
-        for index, (label, widget) in enumerate(geometry_fields):
-            row = index // 2
-            column = (index % 2) * 2
-            geometry_form.addWidget(QtWidgets.QLabel(label), row, column)
-            geometry_form.addWidget(widget, row, column + 1)
-        settings_layout.addLayout(geometry_form)
-        gate_group = QtWidgets.QGroupBox("Pair gates")
-        gate_form = QtWidgets.QGridLayout(gate_group)
-        gate_form.setHorizontalSpacing(8)
-        gate_form.setVerticalSpacing(5)
-        gate_form.setColumnStretch(1, 1)
-        gate_form.setColumnStretch(4, 1)
-        gate_form.addWidget(toggle("class_gate_enabled", "Class gate"), 0, 0)
-        gate_form.addWidget(text_edit("class_gate", "class id or name"), 0, 1, 1, 2)
+        double_spin("yolo_confidence", 0.01, 1.0, 3, "")
+        double_spin("yolo_iou", 0.01, 1.0, 3, "")
+        for key in ("pixhawk_left_gnss_source", "pixhawk_right_gnss_source"):
+            combo(key, (("GPS1", "GPS1"), ("GPS2", "GPS2")))
+        toggle("class_gate_enabled", "Class gate")
+        text_edit("class_gate", "class id or name")
         matching_toggle = toggle("matching_gate_enabled", "Time matching")
         matching_toggle.setChecked(True)
         matching_toggle.setEnabled(False)
-        gate_form.addWidget(matching_toggle, 1, 0)
-        time_basis_combo = combo(
-            "time_basis",
-            (
-                ("App receive (default)", "app_receive_monotonic"),
-                ("RTCP/NTP preferred · fallback App receive", "camera_rtcp"),
-            ),
-        )
-        time_basis_combo.setEnabled(True)
-        time_basis_combo.setToolTip(
-            "RTCP/NTP is used only while Clock and current frame timing are usable; "
-            "otherwise live distance uses exact app-receive monotonic time."
-        )
-        gate_form.addWidget(time_basis_combo, 1, 1)
+        time_basis_combo = combo("time_basis", (
+            ("App receive (default)", "app_receive_monotonic"),
+            ("RTCP/NTP preferred · fallback App receive", "camera_rtcp"),
+        ))
         time_delta_toggle = toggle("time_delta_gate_enabled", "Max Δt")
         time_delta_toggle.setChecked(True)
         time_delta_toggle.setEnabled(False)
-        gate_form.addWidget(time_delta_toggle, 1, 2)
         app_delta_spin = double_spin("max_pair_delta_s", 0.0, 0.100, 3, " s")
-        if app_delta_spin.value() > 0.100:
-            app_delta_spin.setValue(0.100)
-        app_delta_spin.setToolTip(
-            "Authoritative app-receive pair limit; values may be stricter than 100 ms."
-        )
-        gate_form.addWidget(app_delta_spin, 1, 3)
-        gate_form.addWidget(toggle("vertical_delta_gate_enabled", "Vertical Δ"), 1, 4)
-        gate_form.addWidget(double_spin("max_vertical_delta_px", 0.0, 5000.0, 1, " px"), 1, 5)
-        settings_layout.addWidget(gate_group)
-
-        self.measurement_settings_status = QtWidgets.QLabel(
-            "Apply updates idle preview now; an active Measurement keeps timing until the next run. Save persists."
-        )
+        toggle("vertical_delta_gate_enabled", "Vertical Δ")
+        double_spin("max_vertical_delta_px", 0.0, 5000.0, 1, " px")
+        self.measurement_settings_status = settings_group.status
         self.measurement_settings_status.setObjectName("statusStrip")
-        self.measurement_settings_status.setWordWrap(True)
-        settings_layout.addWidget(self.measurement_settings_status)
-        settings_actions = QtWidgets.QHBoxLayout()
-        self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
-        for command_id, label in (
-            ("measurement.apply_settings", "Apply"),
-            ("measurement.save_settings", "Save"),
-        ):
-            button = _command_button(label, command_id, invoke_command)
+        self.operation_buttons = {}
+        for command_id, button in (("measurement.apply_settings", settings_group.apply), ("measurement.save_settings", settings_group.save)):
+            button.setProperty("commandId", command_id)
+            button.setEnabled(invoke_command is not None)
+            if invoke_command is not None:
+                button.clicked.connect(lambda _checked=False, command=command_id: invoke_command(command))
             self.operation_buttons[command_id] = button
-            settings_actions.addWidget(button)
-        settings_actions.addStretch(1)
-        settings_layout.addLayout(settings_actions)
         details_layout.addWidget(settings_group)
 
         self.history_model = QtGui.QStandardItemModel(0, 5, self)
@@ -542,30 +329,18 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         self.history.clicked.connect(self._inspect_history_row)
         details_layout.addWidget(self.history, 1)
 
-        self.session_details_group = QtWidgets.QGroupBox(
-            "Data" if self._sessionless else "Session Details"
-        )
-        session_details_layout = QtWidgets.QHBoxLayout(self.session_details_group)
-        session_details_layout.setContentsMargins(6, 6, 6, 6)
-        session_details_label = QtWidgets.QLabel(
-            "Open type-owned paths, capture tools, ULogs, and live writer health."
-            if self._sessionless
-            else "Review measurement packages, captures, ULogs, media, and saved-file evidence."
-        )
+        self.session_details_group = QtWidgets.QGroupBox()
+        load_form("measurement_session_details.ui", self.session_details_group)
+        session_details_label = self.session_details_group.description
         session_details_label.setObjectName("compactContract")
-        session_details_label.setWordWrap(True)
-        session_details_layout.addWidget(session_details_label, 1)
-        self.session_details_button = QtWidgets.QPushButton(
-            "Open Data" if self._sessionless else "Open Session Details"
-        )
-        self.session_details_button.setObjectName("measurementSessionDetails")
-        self.session_details_button.setToolTip(
-            "Open optional evidence, capture, ULog, and saved-file review tools."
-        )
+        self.session_details_button = self.session_details_group.measurementSessionDetails
+        if self._sessionless:
+            self.session_details_group.setTitle("Data")
+            session_details_label.setText("Open type-owned paths, capture tools, ULogs, and live writer health.")
+            self.session_details_button.setText("Open Data")
         self.session_details_button.setEnabled(open_session_details is not None)
         if open_session_details is not None:
             self.session_details_button.clicked.connect(open_session_details)
-        session_details_layout.addWidget(self.session_details_button)
         details_layout.addWidget(self.session_details_group)
         layout.addWidget(details, 1)
         self._connect_panes()

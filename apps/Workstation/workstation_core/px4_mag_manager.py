@@ -200,7 +200,7 @@ class MagSelectionCandidate:
 
 @dataclass(frozen=True)
 class MagSelectionPreview:
-    """Read-only prediction; it is not evidence that PX4 actually selected the candidate."""
+    """Read-only prediction and known v1.17 voter-gap warning, not active evidence."""
 
     instance_map: tuple[tuple[int, int], ...]
     candidates: tuple[MagSelectionCandidate, ...]
@@ -212,6 +212,8 @@ class MagSelectionPreview:
     actual_role: str | None
     out_of_range_device_ids: tuple[int, ...]
     priority_tie: bool
+    priority_voter_gap_instances: tuple[int, ...] = ()
+    priority_voter_gap_unknown_instances: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -352,6 +354,8 @@ def build_mag_selection_preview(
     ``VehicleMagnetometer`` consumes only instances 0..3; instance 4 remains
     visible in the topology map but is excluded from the candidate preview.
     Health/confidence tie-breaking is left to the actual active-device readback.
+    A priority-0 sensor at a known lower instance is reported when it can leave
+    a higher-priority v1.17 candidate at a sparse voter index.
     """
 
     role_overrides: dict[str, int] = {}
@@ -407,6 +411,29 @@ def build_mag_selection_preview(
     best_priority = max((candidate.priority for candidate in eligible), default=None)
     best = [candidate for candidate in eligible if candidate.priority == best_priority]
     selected = min(best, key=lambda candidate: candidate.instance) if best else None
+    voter_gap_instances = tuple(
+        sorted(
+            {
+                candidate.instance
+                for winner in best
+                if winner.instance > 1
+                for candidate in candidates
+                if 0 < candidate.instance < winner.instance and candidate.priority <= 0
+            }
+        )
+    )
+    known_instances = {candidate.instance for candidate in candidates}
+    voter_gap_unknown_instances = tuple(
+        sorted(
+            {
+                instance
+                for winner in best
+                if winner.instance > 1
+                for instance in range(1, winner.instance)
+                if instance not in known_instances
+            }
+        )
+    )
     active_role = mag_role_for_device_id(actual_selected_device_id)
     return MagSelectionPreview(
         instance_map=normalized_instances,
@@ -421,6 +448,8 @@ def build_mag_selection_preview(
             candidate.device_id for candidate in candidates if not candidate.stock_selector_range
         ),
         priority_tie=len(best) > 1,
+        priority_voter_gap_instances=voter_gap_instances,
+        priority_voter_gap_unknown_instances=voter_gap_unknown_instances,
     )
 
 

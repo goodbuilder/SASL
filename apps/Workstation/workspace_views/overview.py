@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from Workstation.ui.designer import load_form
 from PyQt5 import QtCore, QtWidgets
 from Workstation.workstation_core.coordinate_contract import MEASUREMENT_AXIS_CONTRACT, MEASUREMENT_FRAME
 from Workstation.workstation_core.measurement_methods import MEASUREMENT_METHOD_IDS, MEASUREMENT_METHOD_LABELS
-from Workstation.ui.components import EngineeringValue, StatusIndicator, WorkspaceHeader
+from Workstation.ui.components import EngineeringValue, StatusIndicator
 from Workstation.application.status_model import RuntimeStatus, StatusModel
 from .shared import _compact_text
 
@@ -18,81 +19,36 @@ class OverviewWorkspace(QtWidgets.QWidget):
         super().__init__(parent)
         self.backend = backend
         self.status_model = status_model
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-        layout.addWidget(WorkspaceHeader("Overview", "Connect → verify → measure → auto-save"))
-
-        status_group = QtWidgets.QGroupBox("Status")
-        status_layout = QtWidgets.QGridLayout(status_group)
-        status_layout.setContentsMargins(6, 6, 6, 6)
-        status_layout.setSpacing(5)
+        load_form("overview.ui", self)
+        for widget in self.findChildren(QtWidgets.QWidget):
+            if widget.property("styleObjectName"):
+                widget.setObjectName(widget.property("styleObjectName"))
         self.indicators: dict[str, StatusIndicator] = {}
-        for index, (key, label) in enumerate(
-            (
-                ("camera.left", "CAM L"),
-                ("camera.right", "CAM R"),
-                ("pixhawk.left", "P1"),
-                ("pixhawk.right", "P2"),
-                ("gnss.base", "BASE"),
-                ("detection", "DET"),
-                ("measurement", "MEAS"),
-                ("recording", "REC"),
-            )
-        ):
-            indicator = StatusIndicator(label)
+        for key in ("camera.left", "camera.right", "pixhawk.left", "pixhawk.right",
+                    "gnss.base", "detection", "measurement", "recording"):
+            slot = getattr(self, "indicators_" + key.replace(".", "_") + "Slot")
+            indicator = StatusIndicator(slot.property("runtimeLabel"))
+            slot.layout().addWidget(indicator)
             self.indicators[key] = indicator
-            status_layout.addWidget(indicator, index // 2, index % 2)
-        layout.addWidget(status_group)
-
-        evidence_group = QtWidgets.QGroupBox("Latest result")
-        evidence_layout = QtWidgets.QGridLayout(evidence_group)
-        evidence_layout.setContentsMargins(8, 8, 8, 8)
-        self.session_value = EngineeringValue("Storage")
-        self.measurement_value = EngineeringValue("Result")
-        self.contract_value = EngineeringValue("Output")
-        evidence_layout.addWidget(self.session_value, 0, 0)
-        evidence_layout.addWidget(self.measurement_value, 1, 0)
-        evidence_layout.addWidget(self.contract_value, 2, 0)
-        evidence_layout.setColumnStretch(0, 1)
-        layout.addWidget(evidence_group)
-
-        methods_group = QtWidgets.QGroupBox("Measurement methods · read-only")
-        methods_layout = QtWidgets.QGridLayout(methods_group)
-        methods_layout.setContentsMargins(6, 6, 6, 6)
-        methods_layout.setSpacing(5)
-        self.measurement_method_cards: dict[str, QtWidgets.QPushButton] = {}
-        for index, method_id in enumerate(MEASUREMENT_METHOD_IDS):
-            card = QtWidgets.QPushButton(
-                f"{MEASUREMENT_METHOD_LABELS[method_id]}\nBLOCKED · V0 / B0 / F0"
-            )
-            card.setObjectName(f"overviewMethodCard_{method_id}")
-            card.setProperty("navigationOnly", True)
-            card.setMinimumHeight(54)
-            card.setStyleSheet("text-align:left; padding:6px;")
+        for name in ("session_value", "measurement_value", "contract_value"):
+            slot = getattr(self, name + "Slot")
+            value = EngineeringValue(slot.property("runtimeLabel"))
+            slot.layout().addWidget(value)
+            setattr(self, name, value)
+        self.measurement_method_cards = {
+            method_id: getattr(self, "measurement_method_cards_" + method_id)
+            for method_id in MEASUREMENT_METHOD_IDS
+        }
+        for card in self.measurement_method_cards.values():
             card.clicked.connect(
-                lambda _checked=False: self.open_context.emit(
-                    "processing.measurement"
-                )
+                lambda _checked=False: self.open_context.emit("processing.measurement")
             )
-            self.measurement_method_cards[method_id] = card
-            methods_layout.addWidget(card, index // 2, index % 2)
-        layout.addWidget(methods_group)
-
-        actions = QtWidgets.QHBoxLayout()
-        camera_button = QtWidgets.QPushButton("Connect cameras")
-        camera_button.clicked.connect(lambda: self.open_context.emit("devices.cameras"))
-        measurement_button = QtWidgets.QPushButton("Measure")
-        measurement_button.clicked.connect(lambda: self.open_context.emit("processing.measurement"))
-        diagnostics_button = QtWidgets.QPushButton("Diagnostics")
-        diagnostics_button.clicked.connect(lambda: self.open_context.emit("diagnostics.system"))
-        actions.addWidget(camera_button)
-        actions.addWidget(measurement_button)
-        actions.addWidget(diagnostics_button)
-        actions.addStretch(1)
-        layout.addLayout(actions)
-
-        layout.addStretch(1)
+        for button in self.findChildren(QtWidgets.QPushButton):
+            context = button.property("contextId")
+            if context:
+                button.clicked.connect(
+                    lambda _checked=False, target=context: self.open_context.emit(target)
+                )
 
     def refresh(self, snapshot: dict[str, RuntimeStatus]) -> None:
         for key, indicator in self.indicators.items():

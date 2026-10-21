@@ -8,7 +8,164 @@ profile identifiers such as `stereo_ground_sim`, `stereo_distance_node`, and
 `/stereo/*` remain compatibility identifiers; historical experiment records
 may retain the former StereoDistance wording.
 
-## Human-operated stereo campaign v1.1
+## v1.2 XLSX raw collection
+
+The existing `config/campaign/v1_1/sweep_manifest_v1_1.xlsx` now declares
+`stereo_calibration_campaign_v1_2`. Its filename is retained for the existing
+sweep/RQT selection. It is the only operator-supplied campaign-condition input;
+no separate instruction manifest JSON is opened. The parser validates the 39
+IDs, seeds, splits, path equations and camera conditions against the supported
+protocol. The old `source_manifest_sha256` field is historical provenance only.
+
+Run from `apps/Simulation`, after the normal ROS workspace setup:
+
+```bash
+./run_auto_attitude_sweep.sh
+./run_auto_attitude_sweep.sh --config config/campaign/paper1_v1_2.env
+```
+
+The first command uses the checked-in `xlsx_plan` default and does not fly. The
+second selects `xlsx_all`, performs static/live no-flight preflight, and starts
+the 39 raw slots under `recordings/stereo_v1_1/paper1_v1_2_001`. The four prescribed
+pilot IDs run first, then the remaining rows; their original IDs/seeds stay fixed
+and they count toward the 39. No per-run manual env edits are needed. A non-valid
+QC stops the campaign. For a technical recovery, set the dedicated config's action
+to `xlsx_resume` and retain its output ID; the frozen workbook and prior attempts
+are preserved. Do not reuse an old v1.1 output ID for this revised protocol.
+
+The workbook fixes clip far to 1000 m, optical pitch to 20 degrees, separate
+camera PX4 mount pitch to 20 degrees, and reference/setpoint rates to 50 Hz.
+World reference arrays are ENU `[east,north,up]`; control arrays are PX4 local NED
+`[north,east,down]` about a measured origin. Camera rays use optical RDF and
+`R_WC` maps them to world ENU. Optical angles do not substitute for body attitude.
+
+v1.2 bags preserve images, CameraInfo, `/clock`, vehicle-reference GT and both
+camera-pose diagnostics; the existing JSONL state logs remain available. QC checks
+recorded intrinsics/dimensions, unique science frames, coverage and measured camera
+rate, including absent streams and gaps. The acquisition method uses simulation ns
+and epoch, one endpoint-frame allowance, and a 1.5 nominal-period gap allowance for
+sampling jitter; it does not lower the requested FPS to match a slow source. A
+recorded dynamics abort is assessed over its science prefix and retained as a
+performance outcome. Low detection success alone is not a retry reason.
+`raw_state_index.jsonl` is an additional required v1.2 generated artifact: QC
+deserializes the raw state bag and checks its own GT rate, image-time GT brackets
+and clock coverage independently of the separate recorder JSONL. Timing QC also
+recomputes cadence from raw send records, including an aborted science prefix.
+
+`science_setpoint_timing.jsonl` records actual sends; `controller_result.json`
+reports host cadence, unique simulation cadence, clock duplicates/resets, RTF and
+science coverage. The 50 Hz acceptance criterion requires an observed reference
+update in every complete 20 ms interval anchored at `science_start`; only the
+incomplete final interval is optional. Duplicate/keepalive/burst messages cannot
+fill missing intervals. Maximum gaps above 30 ms are retained as jitter warnings,
+not an extra protocol requirement. Reference updates are dispatched from actual `/clock` callbacks; the
+independent host watchdog keeps the last setpoint alive during pauses. Keepalive
+messages are labeled and do not count as new reference updates. There is no replay
+of fabricated intermediate timestamps to fill missed steps. Callback receipt age
+is recorded; this is sender evidence, not proof of PX4 actuation latency.
+v1.2 keeps the original held NED position/yaw stream active while waiting for
+arm replies and between retries. Admission requires the target's actual ARMED
+heartbeat and PX4 custom main mode 6 (OFFBOARD), with the custom-mode flag and
+PX4 autopilot identity. ACK acceptance alone does not admit flight. Raw mode
+fields are used because the installed pymavlink display formatter can label a
+valid PX4 OFFBOARD heartbeat UNKNOWN. Per-attempt `px4_console.target`,
+`px4_console.camera-left` and `px4_console.camera-right` preserve native startup
+and health logs; `events.jsonl` retains arm ACKs, STATUSTEXT, heartbeat fields and
+host send-gap evidence. Startup event headers refer to their associated flight
+snapshot; use the explicit host receipt times and nested clock evidence for the
+admission observation time.
+
+For v1.2, native Gazebo control-service discovery completes before arming.
+After normal start-point stabilization, the controller pauses physics and advances
+at most five existing 4 ms physics steps per request. It issues the next request
+only after the actual ROS clock reaches the target and that reference is sent.
+Physics step size, trajectory and gains are unchanged; host stalls extend wall
+time rather than skipping source-time reference slots. No ambiguous step request
+is retried. Native control-service ACKs alone cannot pass readiness: no-flight
+preflight independently observes pause, 20/20/4 ms advances, unchanged coordinate
+generation and resumed clock progression. The controller process uses the installed
+Gazebo Python bindings with the pure-Python protobuf backend. Before transit,
+v1.2 first verifies a 10 m vertical rise in local NED and world ENU while limiting
+horizontal drift; this startup procedure does not change the science reference.
+
+Failed checks do not automatically relax the protocol. Preflight storage
+estimation includes configured entry/readiness/landing bounds and a reserve.
+The legacy landing-status receipt is not proof of ground contact. Structured
+logs use `landing_status_received` with `physical_landing_verified=false`;
+science completion and the 5 s final hold are separate from clean owned-process
+shutdown and recorder flush. Earlier `landing_confirmed` events from this legacy
+helper must not be used as landing truth.
+
+This command's completion scope is raw collection, QC and handoff. `OfflinePlan`
+remains downstream-analysis metadata: `xlsx_all` does not run calibration or open
+V0 positioning errors. Report raw collection, estimator implementation and final
+evaluation separately; see the v1.2 audit and subsequent implementation evidence
+in [the verification ledger](docs/changes/20261011-manifest-sweep/verification.md).
+
+The offline `IMAGE_HUBER_GAUSSIAN_SENSOR_PRIORS` objective estimates camera
+attitudes with fixed measured optical centers. It assumes declared Gaussian
+camera-IMU and drone-RTK covariance: whitened IMU residuals and B's shared-latent
+RTK residuals retain quadratic penalties, including B's inner point fit. Only
+image residuals use Huber (standardized threshold 1.345); A still propagates RTK
+covariance into each camera's image covariance. C receives no drone RTK or truth.
+Angles/covariance are rad/rad², positions world ENU metres, and rays optical RDF.
+Fit-component observability reports data-only and IMU-included rank, condition,
+and singular values at the same fitted pose. For B/C this is profiled attitude
+information, not full latent-state rank; YAW_ONLY still fixes measured IMU angles.
+Acceptance checks require quadratic sensor tails, robust image tails, consistent
+B inner/outer RTK terms and distinguishable prior-induced rank lifting. Solver
+success/full rank is reported separately from accuracy; no RMSE pass threshold
+is invented. These source changes require fresh offline results before any
+claim about the current campaign's calibration or V0 accuracy.
+
+Immutable per-case JSON and checksums own offline results. The analyzer keeps
+thin case indexes, expires current run/trial inputs and retains one V0 attempt's
+static GT/pair inputs. `--workers` defaults to 1; larger values use bounded spawn
+workers for calibration. Each main worker owns one run/MC-trial and all its yaw
+and sample scopes; each sensitivity worker owns one scenario/run/MC-trial and
+both `all_data`/`matched_200` scopes from one shared immutable input realization.
+The OFAT extension retains all chosen repetitions and all 100 MC trials in both
+scopes; fewer than 200 pairs is explicitly unmet. Scope-specific files live in
+`sensitivities/<scenario>/<run>/trial_NNN/<scope>`, and evaluation, Y0 baselines,
+CSV rows and summary groups keep those scopes separate. One coordinator generates shared camera observations, collects the original ordered
+index, selects the G0 path, freezes, evaluates V0 and exports. Its output-root
+lock excludes another coordinator. Errors cancel queued work and join active
+workers before propagating; no freeze follows a failed calibration stage.
+Worker BLAS/OpenMP limits are inherited before imports. Worker count is recorded
+in the manifest/version identity; resume with the same execution configuration.
+
+Inputs generated inside the dedicated analysis root use hash-verified hardlinks;
+all required paths, bytes and checksums remain available. External/raw inputs are
+copied independently. Generated inputs must stay immutable, and a cross-device
+link error stops instead of silently consuming copy capacity. Use link-aware
+archiving/copying to retain physical-space savings. CSV and summaries stream case
+files; XLSX uses two checked passes, but its temporary XML/ZIP storage must also
+fit. `calibration_run_index_v2` includes case paths and result hashes. Require
+actual G0 serial/parallel parity, restart, RSS/time/storage measurements and a
+full-matrix capacity reserve before launching the complete 100-MC matrix.
+
+The matched-200 comparison selects 200 distinct original pairs closest to fixed
+uniform-time bin centers, minimizing total absolute time displacement with an
+ordered assignment. A temporal gap is reported with the selected gaps and target
+displacements; it does not cancel a feasible 200-pair comparison. Fewer than 200
+valid unique pairs is unmet. Duplicate/reused frames, mixed epochs and malformed
+timestamps are input errors. The selected mask is reused across methods and
+variants; no frame is copied to fill a gap. MC case counts, source flight counts,
+nonconvergence and missing-input outcomes are reported separately. Attitude
+correlations carry explicit axis order and undefined/null entries for fixed or
+unidentified directions.
+
+After offline analysis is actually complete, the read-only contract auditor is
+`python3 campaigns/stereo_v1_1/audit_v12_analysis_results.py --output-root <analysis-output>
+--source-root <raw-campaign> --report <new-report.json>` (one command). It verifies
+freeze/source hashes before opening evaluation artifacts, then checks the full
+100-trial matrix, method/variant controls, declared result fields and sensitivity
+coverage. Explicit nonconvergence and unmet matched-200 cases remain outcomes;
+there is no accuracy threshold. Missing analysis/freeze is PENDING, not PASS.
+The report is exclusively created outside immutable analysis/raw directories.
+This audit complements, and does not replace, the raw 39-slot QC.
+
+## Earlier campaign v1.1 and compatible controls
 
 ### Purpose
 
@@ -64,8 +221,49 @@ unverified PX4 RNG behavior and repeat independence explicit.
 `Vehicle.model_id` and `Vehicle.reference_link` are explicit campaign-fixed
 settings. The current capture pipeline supports `x500_2m` with
 `vehicle_reference_link` and rejects different values before execution.
-Unmeasured mesh dimensions and GNSS lever arms remain explicit nulls in the
-handoff requirements; they are not inferred from the model name or set to zero.
+The native Gazebo mesh loader and SDF geometry give a model-local visual rest
+bounding envelope of about 2.4856 × 2.4856 × 1.3348 m; the full rotor-sweep
+conservative envelope is about 2.4874 × 2.4874 × 1.3348 m. These are source-geometry
+bounds, not in-flight visible dimensions. Source and installed mesh/SDF hashes
+match; the measurement, component bounds and reproducible source are in
+[the geometry evidence](recordings/stereo_v1_1/paper1_v1_2_001/source_evidence/vehicle_geometry_v12_001/geometry_report.json).
+The `x500_2m` semantic vehicle reference now uses
+`project_defined_vehicle_reference_at_visual_height_midpoint_v1`:
+`base_link` FLU `[forward,left,up]` translation `[0,0,-0.35910692405]` m,
+identity rotation. The visual Z bounds are `[-1.0265138481, 0.3083]` m;
+their midpoint is the reference Z, with X/Y unchanged. This fixed body-attached
+point is the midpoint of the upright visual height, not a mass center, image
+bounding-box center, or a recomputed world AABB center during flight.
+
+Method/purpose: place the evaluation reference halfway between the visual top
+and bottom. Inputs are the checked-in SDF/DAE geometry and the Gazebo base-link
+world pose. The adapter publishes `p_W_ref = p_W_base + R_W_base * offset_base`
+in world ENU `[east,north,up]` metres, preserving the simulation stamp and XYZW
+orientation. It applies the offset once, before GT interpolation; RViz mesh
+placement remains at the base-link pose. Acceptance checks compare the SDF
+reference against the mesh-derived midpoint and exercise level, 90-degree
+pitch/roll and metadata recording for both supported models.
+This only changes the evaluation/Simulation-oracle reference, not runtime
+measurement inputs, flight dynamics, mesh geometry, or PX4/GPS origin.
+
+`x500_15m` uses the same height-midpoint definition with its own FLU offset
+`[0,0,-2.297088218875]` m. Its visual Z bounds are
+`[-6.19487643775,1.6007]` m (height `7.79557643775` m), giving equal
+`3.897788218875` m distances above and below the reference. These are current
+SDF/DAE dimensions, not dimensions inferred from the model name. Its navsat
+remains at base_link, `+2.297088218875` m above the new reference in local FLU.
+The former zero-offset qualification anchor remains historical and cannot
+certify this new reference; its frozen hashes/provenance are not rewritten.
+
+New `ground_truth.jsonl` rows record the definition and FLU offset. Older
+recordings and their frozen SDF hashes retain the base-link-origin definition;
+do not relabel or mix them with midpoint-reference runs without an explicit
+attitude-aware conversion. Restart/rebuild the Simulation overlay for new
+runs. Historical geometry evidence linked above predates this frame change;
+its visual bounds remain applicable, its reference definition and SDF hash do not.
+The declared simulated navsat stays at base_link, so its reference-relative
+translation is now `[0,0,+0.35910692405]` m in FLU. The physical GNSS antenna
+lever arm remains unknown/null.
 
 Plan-stage `Requirements` are evaluated by `xlsx_plan`. Required
 `ArtifactContract` rows and `ObservationContract` fields feed per-run QC.
@@ -109,13 +307,25 @@ runtime preparation button.
 
 The normal results action produces A/B/C calibration with `RPY_IMU` and
 `YAW_ONLY`, the separately labeled `YAW_IDEAL` and ORACLE diagnostics, a
-100-trial representative Monte Carlo, the staged one-factor sensitivity
-matrix, a G0 covariance-based path ranking, a freeze record, and matching V0
+100-trial Monte Carlo on every calibration run/yaw case/sample scope, the staged
+one-factor sensitivity matrix on every G0 P0/selected-path repetition with the
+same 100 MC trials, a G0 covariance-based path ranking, a freeze record, and matching V0
 evaluation after that freeze. Outputs live below the selected output ID;
 versioned results are under `analysis_versions/<analysis-id>/`, with
 `analysis_latest.json` as the handoff pointer. The protocol's matched-200
 comparison stays explicitly unmet when a run has fewer than 200 unique
 time-stratified pairs.
+
+Campaign analysis also independently fits the same A/B/C variants from a
+camera-RTK GPS yaw90 initialization. Each new analysis writes two separate
+workbooks, `existing_yaw_results.xlsx` and `gps_yaw90_results.xlsx`, containing
+each source's M0, corrections and frozen V0 evaluations. Original CSV names
+retain original-yaw results; the added family uses `gps_yaw90_*.csv` and its
+own `GPS_YAW90` JSON case directories. This does not change the operator
+recorder's `session_*.xlsx`. The synthetic campaign uses nominal north only
+to select the GPS baseline's 180-degree branch, not measured Pixhawk yaw.
+See [GPS yaw90 analysis contract](campaigns/stereo_v1_1/GPS_YAW90_ANALYSIS.md)
+for frames, assumptions, input provenance and sensitivity-study scope.
 
 Use **Prepare pinned YOLO runtime** once when the isolated `.venv` selected by
 `STEREO_V1_1_YOLO_PYTHON` is absent. For a new checkout, the configured
@@ -313,6 +523,8 @@ offline estimators and post-freeze V0 evaluation are implemented in
 failure results are stored under `analysis_versions/`, not written into raw
 `corrected` fields. The seven saved V0 entry failures remain performance
 outcomes with intact raw data, not fabricated successful validation flights.
+For a new V0 recording evaluated against the frozen MC100 calibration outputs,
+see `campaigns/stereo_v1_1/V0_REEVALUATION.md`.
 The topic-to-field and coordinate mapping is in
 `docs/changes/20261008-stereo-campaign-v1-1/schema_mapping.md`.
 
@@ -358,6 +570,23 @@ not establish independent sensor/PX4 randomness. The seven V0 entry failures
 also have copied PX4 ULogs under their derived `diagnostics/` directories,
 with hashes and a separate diagnostic manifest. PX4 local NED height in those
 logs is not a world-ENU altitude or an RTK target position.
+
+### v1.2 summary workbook graphs
+
+After regenerating the human summary workbook, run
+`apps/Simulation/campaigns/stereo_v1_1/refresh_summary_graphs.sh` to recreate
+the `05_그래프` charts. The default target is
+`recordings/stereo_v1_1/paper1_v1_2_001/stereo_v1_2_summary.xlsx`; pass another
+workbook path when the rerun writes to a new output directory. The helper is
+idempotent, preserves the existing charts and tables, and adds flight-cost and
+tracking, observation-quality, calibration, method-comparison and accuracy–time
+views. It does not chart execution/failure status from `01_실행현황`. The
+diagnostic `C_no_drone_rtk_joint` route comparison uses a log10 RMSE axis to
+keep its large outliers visible; raw RMSE remains in the adjacent table.
+
+The helper uses the local Codex spreadsheet runtime. Set
+`CODEX_PRIMARY_NODE_MODULES` to that runtime's `node_modules` directory if it
+is installed outside the default cache location.
 
 ### Change log
 
@@ -707,9 +936,11 @@ that first added the sidecar; it is deliberately not stored inside the
 sidecar, which avoids commit self-reference. `evaluation_code_sha` is the
 current clean HEAD and must be a descendant of that immutable anchor commit.
 
-Ground Truth uses the project-defined alternative semantic reference
+Historical F1 qualification used the project-defined alternative semantic reference
 `vehicle_reference_link`: a zero translation and zero RPY offset from the
-`x500_15m` model's `base_link`, sourced only from Gazebo World ENU. Missing
+`x500_15m` model's `base_link`, sourced only from Gazebo World ENU. This frozen
+origin contract predates the current height-midpoint reference and does not
+qualify new midpoint runs. Missing
 Gazebo data fails closed; PX4 poses are not a fallback. Comparison output is
 meters in the fixed `baseline_center_frd` frame whose origin is the nominal
 left/right optical-center midpoint and whose axes are Forward, Right, Down.
@@ -856,7 +1087,7 @@ machine-readable하게 기록한다. `session.xlsx`, `progress.json`, `manifest.
 - resolution / FPS: visible 1280x720 @ 20 Hz (50,000,000 ns frame interval)
 - horizontal FOV: 0.154997710698 rad, WIRIS Enterprise optical zoom 8x 기준 약 8.88 deg
 - distortion: off
-- target drone: 약 폭 15 m, 높이 10 m 대형 쿼드콥터 형상
+- target drone: `x500_15m`, 약 폭 15 m, visual 높이 7.795576 m 대형 쿼드콥터 형상
 - target motion: QGC/PX4 조종 관찰용. 시작 위치는 카메라 전방 +Y 약 2000 m입니다.
 - viewer: 단일 `rqt_gui` 운용 창, 선택적으로 RViz2
 
@@ -868,9 +1099,11 @@ machine-readable하게 기록한다. `session.xlsx`, `progress.json`, `manifest.
 `/simulation/ground_truth/vehicle_reference_link`
 (`geometry_msgs/msg/PoseStamped`, `header.frame_id=gazebo_world_enu`)로
 발행한다. 공개 semantic reference 이름은 `vehicle_reference_link`이고 정의는
-`project_defined_vehicle_reference_at_base_link_origin`이며, parent는
-`base_link`, parent-relative translation은 `[0, 0, 0] m`, rotation은
-identity이다. 이 frame은 mass-bearing link가 아니다.
+두 모델 모두 `project_defined_vehicle_reference_at_visual_height_midpoint_v1`이다.
+`x500_15m`의 translation은 `[0,0,-2.297088218875]` m,
+`x500_2m`은 `[0,0,-0.35910692405]` m이다. 두 모델 모두 parent는 `base_link`,
+translation 축은 FLU `[forward,left,up]`, rotation은 identity이며 mass-bearing
+link가 아니다. adapter는 모델별 오프셋을 기체 자세로 회전하여 world ENU에 더한다.
 
 현재 SceneBroadcaster의 `Pose_V` JSON에서는 root `base_link` pose가 모델
 relative로 생략될 수 있으므로, adapter는 같은 payload의 `x500_15m` model
@@ -6818,7 +7051,7 @@ X500 또는 IRIS 모델로 시각 형상을 바꾸는 것은 가능하지만, �
 2000 m 장거리 카메라 영상에서는 얇은 텍스처 면이나 큰 배율의 얇은 프로펠러 메시가 픽셀 경계에서 깜빡이는 것처럼 보일 수 있습니다.
 `x500_15m` 모델은 이 영향을 줄이기 위해 본체 위 로고 텍스처 plane을 제거하고, 네 개의 얇은 프로펠러 STL 시각 요소를 어두운 원통형 로터 디스크로 바꿨습니다.
 본체, 암, 모터 형상은 유지하므로 타겟은 여전히 X500 기반 드론 형상입니다.
-Z축 비교의 Ground Truth 기준점은 `vehicle_reference_link`이며, `base_link` 원점에 project-defined zero offset(`[0, 0, 0]` m, identity RPY)으로 정의합니다. 이 semantic reference는 mesh centroid, mass center, visual/collision AABB center가 아니며 이전 estimator-derived Z offset을 사용하지 않습니다. 출력 비교 frame은 nominal zero-error rig에서 한 번 구성한 `baseline_center_frd`입니다. 기본 `DRONE_SPAWN_Z_M=5.56`은 PX4/Gazebo mission spawn 설정이며 reference offset을 의미하지 않습니다.
+Z축 비교의 Ground Truth 기준점은 `vehicle_reference_link`입니다. `x500_15m`은 base_link FLU `[0,0,-2.297088218875]` m, `x500_2m`은 `[0,0,-0.35910692405]` m로 각각 외형 높이 중앙이며 둘 다 identity RPY입니다. 이 기준점은 질량중심이나 영상 bbox 중심이 아니며, 자세에 따라 달라지는 월드 AABB 중심을 재계산하지 않습니다. 출력 비교 frame은 nominal zero-error rig에서 한 번 구성한 `baseline_center_frd`입니다. 기본 `DRONE_SPAWN_Z_M=5.56`은 PX4/Gazebo mission spawn 설정이며 reference offset을 의미하지 않습니다.
 
 ## QGroundControl
 
@@ -6827,7 +7060,7 @@ PX4는 이미 world 안에 있는 15 m급 `x500_15m` 타겟에 붙고, QGC는 PX
 
 PX4 없는 operator-view 실행은 지원하지 않습니다. `PX4_DIR` 또는 `--px4-dir DIR`로
 유효한 PX4-Autopilot checkout을 지정해야 하며, 찾지 못하면 실행 전에 종료합니다.
-Ground Truth adapter는 Gazebo `gz.msgs.Pose_V` 토픽(`/world/stereo_ground_drone/pose/info`)에서 `name == "base_link"`인 entity의 simulation stamp와 world ENU pose를 읽어 `/simulation/ground_truth/vehicle_reference_link` (`geometry_msgs/msg/PoseStamped`, `frame_id=gazebo_world_enu`)로 발행합니다. `base_link` pose에 zero transform을 적용한 semantic reference가 `vehicle_reference_link`이며, distance node가 이를 고정 `baseline_center_frd`로 변환합니다. pose 토픽을 읽지 못하면 GT unavailable로 표시하고 model-origin, PX4, 계획 거리값으로 fallback하지 않습니다.
+Ground Truth adapter는 Gazebo `gz.msgs.Pose_V` 토픽(`/world/stereo_ground_drone/pose/info`)에서 `name == "base_link"`인 entity의 simulation stamp와 world ENU pose를 읽어 `/simulation/ground_truth/vehicle_reference_link` (`geometry_msgs/msg/PoseStamped`, `frame_id=gazebo_world_enu`)로 발행합니다. `base_link` world pose에 위 모델별 FLU 오프셋을 자세에 맞게 회전·가산한 semantic reference가 `vehicle_reference_link`이며, distance node가 이를 고정 `baseline_center_frd`로 변환합니다. pose 토픽을 읽지 못하면 GT unavailable로 표시하고 model-origin, PX4, 계획 거리값으로 fallback하지 않습니다.
 반복 가능한 접근 실험이 필요하면 QGC mission 또는 PX4용 MAVLink/offboard 명령을 사용합니다.
 
 ## 기록 프리셋
@@ -7190,3 +7423,39 @@ Gazebo GT/UAM GPS/Operational Ray records remain enabled. During Stop/Auto compl
 before stopping the ROS launch tree so accepted rows are flushed before the
 next case. The sweep uses `SIGTERM` (not background-shell `SIGINT`) to enter
 that finalization path immediately after Auto completes.
+
+### Controller timing development diagnosis
+
+`campaigns/stereo_v1_1/campaign_run.py run --development --frozen-workbook
+--run-id G0-P3-R01 --output-root <campaign-root>` selects the existing frozen XLSX
+parameters and seed, writes under `개발시험/runner_<run>_<attempt>`, and does not
+advance or requalify the 39 campaign slots. Use the same ROS and campaign runtime
+environment as the configured sweep. `--frozen-workbook` is restricted to selected runs; omit `--development` for a
+main attempt using the frozen XLSX source. Main validity/retry guards still apply.
+The legacy selected-run input remains unchanged.
+
+v1.2 main and development controllers enable `--timing-diagnostics`: in-memory bounded callback
+records are persisted after observer shutdown as `controller_timing_diagnostics.jsonl`
+and a summary with dropped/producer-error counts. Missing records invalidate a
+complete causal reconstruction. Method `buffered_controller_callback_trace` measures
+ROS simulation timestamps and host monotonic receipt/lock intervals; it does not
+change scheduling, queue depth, state validity, ENU/NED conversion, or QC gates.
+No synthetic historical commands are sent. Instrumentation can itself affect timing,
+so a clean diagnostic run alone does not prove the original fault repaired.
+
+### v1.2 launch clearance and nonstart classification
+
+The v1.2 controller first holds observed launch local N/E and rises vertically
+10m before horizontal transit. Local NED and independent SITL ENU rise must both
+be10±0.5m, local horizontal drift<=1m and speed<=1m/s for1simulationsecond, with
+observations no more than0.2s apart. The60s launch deadline is contained within
+the frozen overall entry timeout. This engineering startup stage does not change
+the reference path, camera geometry, science gains or acceptance thresholds.
+`--protocol-version 1.2` enables it; workbook runners pass that frozen version.
+
+Before science_start, arm/entry execution failures are infrastructure failures,
+not counted reference trials. In-science dynamic/tracking failures remain recorded
+performance outcomes. The audited `invalidate_pre_science_attempt` operation can
+correct the prior false-valid classification only with intact original hashes and
+fresh failure QC; originalQC/runner/checksum snapshots and raw records are retained.
+No result-quality rerun is authorized by this correction.

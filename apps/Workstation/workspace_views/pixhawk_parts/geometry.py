@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from PyQt5 import QtCore, QtWidgets
+from Workstation.ui.designer import load_form
 from Workstation.ui.components import EngineeringValue
 from ..shared import _compact_text, _display_number, _live_inspection, _sync_table_rows, _table_model
 
@@ -18,21 +19,14 @@ class GeometryView(QtCore.QObject):
         if not callable(read_geometry):
             raise TypeError("Geometry view requires its projection reader")
         self._read_geometry = read_geometry
-        drone_geometry_group = QtWidgets.QGroupBox("Drone Pixhawk geometry · F/R/D/Rg")
-        drone_geometry_layout = QtWidgets.QVBoxLayout(drone_geometry_group)
-        drone_geometry_layout.setContentsMargins(8, 8, 8, 8)
-        drone_geometry_layout.setSpacing(5)
-        drone_geometry_hint = QtWidgets.QLabel(
-            "Dr = Drone Pixhawk · Dr from reference means reference→Dr · F/R/D/Rg = Forward/Right/Down/Range (m)"
-        )
-        drone_geometry_hint.setObjectName("statusStrip")
-        drone_geometry_hint.setWordWrap(True)
-        drone_geometry_layout.addWidget(drone_geometry_hint)
+        drone_geometry_group = load_form("pixhawk_geometry.ui", QtWidgets.QGroupBox())
+        drone_geometry_group.geometryHint.setObjectName("statusStrip")
+        drone_geometry_group.angleTitle.setObjectName("compactContract")
         self.drone_geometry_model = _table_model(
             self,
             ("State", "Vector", "F (m)", "R (m)", "D (m)", "Rg (m)", "Frame", "Age"),
         )
-        self.drone_geometry_table = QtWidgets.QTableView()
+        self.drone_geometry_table = drone_geometry_group.drone_geometry_table
         self.drone_geometry_table.setModel(self.drone_geometry_model)
         self.drone_geometry_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.drone_geometry_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
@@ -52,15 +46,7 @@ class GeometryView(QtCore.QObject):
         geometry_header.setSectionResizeMode(6, QtWidgets.QHeaderView.Stretch)
         geometry_header.setSectionResizeMode(7, QtWidgets.QHeaderView.ResizeToContents)
         self.drone_geometry_table.clicked.connect(self._inspect_drone_geometry_vector)
-        drone_geometry_layout.addWidget(self.drone_geometry_table)
-
-        drone_angle_title = QtWidgets.QLabel("Horizontal triangle angles (F/R only)")
-        drone_angle_title.setObjectName("compactContract")
-        drone_geometry_layout.addWidget(drone_angle_title)
-        angle_layout = QtWidgets.QGridLayout()
-        angle_layout.setContentsMargins(0, 0, 0, 0)
-        angle_layout.setHorizontalSpacing(12)
-        angle_layout.setVerticalSpacing(3)
+        angle_layout = drone_geometry_group.angleLayout
         self.drone_geometry_angle_values: dict[str, EngineeringValue] = {}
         for column, (key, label) in enumerate((("dr_p1_p2", "∠Dr-P1-P2"), ("dr_p2_p1", "∠Dr-P2-P1"))):
             value = EngineeringValue(label)
@@ -69,19 +55,13 @@ class GeometryView(QtCore.QObject):
             self.drone_geometry_angle_values[key] = value
             angle_layout.addWidget(value, 0, column)
             angle_layout.setColumnStretch(column, 1)
-        drone_geometry_layout.addLayout(angle_layout)
-        self.drone_geometry_status_label = QtWidgets.QLabel("WAITING · geometry evidence 대기 중")
+        self.drone_geometry_status_label = drone_geometry_group.drone_geometry_status_label
         self.drone_geometry_status_label.setObjectName("statusStrip")
         self.drone_geometry_status_label.setFixedHeight(32)
         self.drone_geometry_status_label.setWordWrap(False)
-        drone_geometry_layout.addWidget(self.drone_geometry_status_label)
-        self.drone_geometry_contract_label = QtWidgets.QLabel(
-            "Angles: ∠Dr-P1-P2 / ∠Dr-P2-P1 · horizontal North/East only · unsigned internal angle"
-        )
+        self.drone_geometry_contract_label = drone_geometry_group.drone_geometry_contract_label
         self.drone_geometry_contract_label.setObjectName("compactContract")
-        self.drone_geometry_contract_label.setWordWrap(True)
         self.drone_geometry_contract_label.setFixedHeight(32)
-        drone_geometry_layout.addWidget(self.drone_geometry_contract_label)
         self.drone_geometry_group = drone_geometry_group
         self.group = drone_geometry_group
         if isinstance(parent, QtWidgets.QWidget):

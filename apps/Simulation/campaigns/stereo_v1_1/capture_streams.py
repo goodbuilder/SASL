@@ -29,6 +29,11 @@ REQUIRED_NONEMPTY_TOPICS = {
     "left": "/left_camera/image",
     "right": "/right_camera/image",
 }
+V12_STATE_TOPICS = (
+    "/clock", "/simulation/ground_truth/vehicle_reference_link",
+    "/simulation/camera_pose_diagnostics/left",
+    "/simulation/camera_pose_diagnostics/right",
+)
 STOP = False
 
 
@@ -109,12 +114,18 @@ def _stop_owned(processes: dict[str, subprocess.Popen]) -> dict[str, int]:
     return codes
 
 
-def capture(attempt_dir: Path, duration_s: float | None = None, compression: str = "zstd") -> dict:
+def capture(attempt_dir: Path, duration_s: float | None = None, compression: str = "zstd",
+            protocol_version: str = "1.1") -> dict:
     if compression not in ("none", "zstd"):
         raise ValueError("compression must be none or zstd")
     attempt_dir = attempt_dir.resolve()
     if not attempt_dir.is_dir():
         raise ValueError("attempt directory must already exist")
+    if protocol_version not in ("1.1", "1.2"):
+        raise ValueError("unsupported capture protocol version")
+    topics_by_stream = dict(STREAM_TOPICS)
+    if protocol_version == "1.2":
+        topics_by_stream["state"] = V12_STATE_TOPICS
     raw_root = attempt_dir / "raw_images_or_lossless_bag"
     raw_root.mkdir(exist_ok=False)
     processes: dict[str, subprocess.Popen] = {}
@@ -122,7 +133,7 @@ def capture(attempt_dir: Path, duration_s: float | None = None, compression: str
     started = time.monotonic()
     reason = None
     try:
-        for stream, topics in STREAM_TOPICS.items():
+        for stream, topics in topics_by_stream.items():
             process, handle = _start_bag(stream, topics, raw_root, attempt_dir, compression)
             processes[stream] = process
             handles.append(handle)
@@ -133,15 +144,15 @@ def capture(attempt_dir: Path, duration_s: float | None = None, compression: str
             if failed:
                 raise RuntimeError(f"bag recorder exited before readiness: {failed}")
             if all(_subscribed(attempt_dir / f"capture_{name}.log", topics)
-                   for name, topics in STREAM_TOPICS.items()):
+                   for name, topics in topics_by_stream.items()):
                 break
             time.sleep(0.1)
         else:
             raise RuntimeError("bag subscriptions were not ready within 20 seconds")
         ready_at = time.monotonic()
         ready = {
-            "status": "CAPTURE_RUNNING", "streams": list(STREAM_TOPICS),
-            "topics": {name: list(topics) for name, topics in STREAM_TOPICS.items()},
+            "status": "CAPTURE_RUNNING", "streams": list(topics_by_stream),
+            "topics": {name: list(topics) for name, topics in topics_by_stream.items()},
             "capture_mode": "short_test" if duration_s is not None else "campaign_attempt",
             "compression": compression,
         }
@@ -163,7 +174,7 @@ def capture(attempt_dir: Path, duration_s: float | None = None, compression: str
             handle.close()
 
     streams = {}
-    for stream in STREAM_TOPICS:
+    for stream in topics_by_stream:
         bag_dir = raw_root / stream
         metadata_path = bag_dir / "metadata.yaml"
         counts = metadata_counts(metadata_path) if metadata_path.is_file() else {}
@@ -180,8 +191,11 @@ def capture(attempt_dir: Path, duration_s: float | None = None, compression: str
             ],
             "exit_code": exit_codes.get(stream),
         }
-        if counts.get(REQUIRED_NONEMPTY_TOPICS[stream], 0) <= 0:
-            reason = reason or f"no required {stream} messages recorded"
+        required_topics = (topics_by_stream[stream] if protocol_version == "1.2"
+                           else (REQUIRED_NONEMPTY_TOPICS[stream],))
+        for topic in required_topics:
+            if counts.get(topic, 0) <= 0:
+                reason = reason or f"no required messages recorded: {topic}"
         if exit_codes.get(stream) not in (0, 130):
             reason = reason or f"{stream} recorder exit code {exit_codes.get(stream)}"
     result = {
@@ -191,6 +205,7 @@ def capture(attempt_dir: Path, duration_s: float | None = None, compression: str
         "duration_wall_s": time.monotonic() - started,
         "capture_mode": "short_test" if duration_s is not None else "campaign_attempt",
         "compression": compression,
+        "protocol_version": protocol_version,
         "streams": streams,
     }
     result_path = attempt_dir / "raw_capture_summary.json"
@@ -207,14 +222,15 @@ def main() -> int:
     parser.add_argument("--attempt-dir", type=Path, required=True)
     parser.add_argument("--duration-s", type=float)
     parser.add_argument("--compression", choices=("none", "zstd"), default="zstd")
+    parser.add_argument("--protocol-version", choices=("1.1", "1.2"), default="1.1")
     args = parser.parse_args()
     if args.duration_s is not None and args.duration_s < 5:
         parser.error("short capture duration must be at least 5 seconds")
     signal.signal(signal.SIGINT, _request_stop)
     signal.signal(signal.SIGTERM, _request_stop)
-    result = capture(args.attempt_dir, args.duration_s, args.compression)
+    result = capture(args.attempt_dir, args.duration_s, args.compression, args.protocol_version)
     print(json.dumps({"status": result["status"], "failure_reason": result["failure_reason"],
-                      "message_counts": {k: v["topic_counts"].get(REQUIRED_NONEMPTY_TOPICS[k], 0)
+                      "message_counts": {k: v["topic_counts"]
                                          for k, v in result["streams"].items()}}, ensure_ascii=False))
     return 0 if result["status"] == "CAPTURE_COMPLETE" else 1
 

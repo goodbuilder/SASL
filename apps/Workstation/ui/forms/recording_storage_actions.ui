@@ -1,0 +1,76 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>recordingStorageActions</class>
+ <widget class="QWidget" name="recordingStorageActions">
+  <layout class="QGridLayout" name="actionsLayout">
+   <item row="0" column="0">
+    <widget class="QPushButton" name="dataWorkspaceOpenRoot">
+     <property name="text">
+      <string>Open Data Folder</string>
+     </property>
+    </widget>
+   </item>
+   <item row="0" column="1">
+    <widget class="QPushButton" name="dataWorkspaceOpenLegacy">
+     <property name="text">
+      <string>Open Legacy Recordings Folder</string>
+     </property>
+    </widget>
+   </item>
+   <item row="0" column="2">
+    <widget class="QPushButton" name="dataWorkspaceRetryStorage">
+     <property name="text">
+      <string>Retry Storage</string>
+     </property>
+    </widget>
+   </item>
+   <item row="1" column="0">
+    <widget class="QPushButton" name="dataWorkspaceOpenMeasurementWorkbook">
+     <property name="text">
+      <string>Open Latest Measurement XLSX</string>
+     </property>
+     <property name="accessibleName">
+      <string>Open latest Measurement workbook</string>
+     </property>
+     <property name="toolTip">
+      <string>Open the newest &lt;start time&gt;_measurement.xlsx in the data folder with the system spreadsheet application. Each Measurement (Start to Stop) has its own workbook.</string>
+     </property>
+    </widget>
+   </item>
+   <item row="1" column="1">
+    <widget class="QPushButton" name="dataWorkspaceRebuildMeasurementWorkbook">
+     <property name="text">
+      <string>Rebuild Latest XLSX</string>
+     </property>
+     <property name="toolTip">
+      <string>Rebuild the latest Measurement workbook from its saved JSONL/CSV inputs.</string>
+     </property>
+    </widget>
+   </item>
+   <item row="2" column="0" rowspan="1" colspan="3">
+    <widget class="QLabel" name="workbookStatus">
+     <property name="text">
+      <string>Measurement XLSX · IDLE</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <property name="leftMargin">
+    <number>0</number>
+   </property>
+   <property name="topMargin">
+    <number>0</number>
+   </property>
+   <property name="rightMargin">
+    <number>0</number>
+   </property>
+   <property name="bottomMargin">
+    <number>0</number>
+   </property>
+  </layout>
+ </widget>
+ <resources />
+ <connections />
+</ui>

@@ -1,0 +1,157 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>OpticalPoseForm</class>
+ <widget class="QGroupBox" name="auto_group">
+  <property name="componentBindings" stdset="0">
+   <string>[["suggestions", "auto_group", null]]</string>
+  </property>
+  <property name="styleObjectName" stdset="0">
+   <string>opticalPoseAutoSuggestionGroup</string>
+  </property>
+  <property name="title">
+   <string>Automatic point suggestion · review required</string>
+  </property>
+  <layout class="QGridLayout" name="QGridLayout_2">
+   <property name="leftMargin">
+    <number>6</number>
+   </property>
+   <property name="topMargin">
+    <number>6</number>
+   </property>
+   <property name="rightMargin">
+    <number>6</number>
+   </property>
+   <property name="bottomMargin">
+    <number>6</number>
+   </property>
+   <property name="spacing">
+    <number>5</number>
+   </property>
+   <item row="0" column="0" rowspan="1" colspan="1">
+    <widget class="QPushButton" name="auto_select_buttons_alignment_pose_auto_select_horizon">
+     <property name="componentBindings" stdset="0">
+      <string>[["suggestions", "auto_select_buttons", "alignment.pose.auto_select_horizon"]]</string>
+     </property>
+     <property name="toolTip">
+      <string>Analyze the frozen native left/right frames and draw a separate suggestion overlay. No Horizon/Mountain solver runs until the suggestion is explicitly accepted.</string>
+     </property>
+     <property name="text">
+      <string>Auto-select Horizon</string>
+     </property>
+     <property name="commandId" stdset="0">
+      <string>alignment.pose.auto_select_horizon</string>
+     </property>
+     <property name="solverButton" stdset="0">
+      <bool>true</bool>
+     </property>
+     <property name="commandRegistrationOrder" stdset="0">
+      <number>3</number>
+     </property>
+    </widget>
+   </item>
+   <item row="0" column="1" rowspan="1" colspan="1">
+    <widget class="QPushButton" name="auto_select_buttons_alignment_pose_auto_select_mountain">
+     <property name="componentBindings" stdset="0">
+      <string>[["suggestions", "auto_select_buttons", "alignment.pose.auto_select_mountain"]]</string>
+     </property>
+     <property name="toolTip">
+      <string>Analyze the frozen native left/right frames and draw a separate suggestion overlay. No Horizon/Mountain solver runs until the suggestion is explicitly accepted.</string>
+     </property>
+     <property name="text">
+      <string>Auto-select Mountain</string>
+     </property>
+     <property name="commandId" stdset="0">
+      <string>alignment.pose.auto_select_mountain</string>
+     </property>
+     <property name="solverButton" stdset="0">
+      <bool>true</bool>
+     </property>
+     <property name="commandRegistrationOrder" stdset="0">
+      <number>4</number>
+     </property>
+    </widget>
+   </item>
+   <item row="0" column="2" rowspan="1" colspan="1">
+    <widget class="QPushButton" name="auto_select_buttons_alignment_pose_auto_select_cloud">
+     <property name="componentBindings" stdset="0">
+      <string>[["suggestions", "auto_select_buttons", "alignment.pose.auto_select_cloud"]]</string>
+     </property>
+     <property name="toolTip">
+      <string>Match far-field sky/cloud texture on the frozen native left/right frames with no ridge bias. The points feed the rotation-only Cloud solve; translation always comes from live GNSS. Both frames must be simultaneous.</string>
+     </property>
+     <property name="text">
+      <string>Auto-select Cloud</string>
+     </property>
+     <property name="commandId" stdset="0">
+      <string>alignment.pose.auto_select_cloud</string>
+     </property>
+     <property name="solverButton" stdset="0">
+      <bool>true</bool>
+     </property>
+     <property name="commandRegistrationOrder" stdset="0">
+      <number>5</number>
+     </property>
+    </widget>
+   </item>
+   <item row="0" column="3" rowspan="1" colspan="1">
+    <widget class="QPushButton" name="use_suggestion_button">
+     <property name="componentBindings" stdset="0">
+      <string>[["suggestions", "use_suggestion_button", null]]</string>
+     </property>
+     <property name="toolTip">
+      <string>Copy the currently displayed suggestion into the manual annotation buffer. Horizon/Mountain detector quality is advisory, but current-frame native points must remain structurally usable. Horizon requires two separated endpoints per side; Mountain requires paired distributed points after exclusions.</string>
+     </property>
+     <property name="enabled">
+      <bool>false</bool>
+     </property>
+     <property name="text">
+      <string>Use suggestion</string>
+     </property>
+     <property name="commandId" stdset="0">
+      <string>alignment.pose.use_suggestion</string>
+     </property>
+     <property name="solverButton" stdset="0">
+      <bool>true</bool>
+     </property>
+     <property name="commandRegistrationOrder" stdset="0">
+      <number>6</number>
+     </property>
+    </widget>
+   </item>
+   <item row="1" column="0" rowspan="1" colspan="4">
+    <widget class="QLabel" name="auto_suggestion_status_label">
+     <property name="componentBindings" stdset="0">
+      <string>[["suggestions", "auto_suggestion_status_label", null]]</string>
+     </property>
+     <property name="styleObjectName" stdset="0">
+      <string>statusStrip</string>
+     </property>
+     <property name="text">
+      <string>No automatic suggestion</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item row="2" column="0" rowspan="1" colspan="3">
+    <widget class="QLabel" name="auto_suggestion_metrics_label">
+     <property name="componentBindings" stdset="0">
+      <string>[["suggestions", "auto_suggestion_metrics_label", null]]</string>
+     </property>
+     <property name="styleObjectName" stdset="0">
+      <string>compactContract</string>
+     </property>
+     <property name="text">
+      <string>Confidence / inliers / residual / detector: --</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <resources />
+ <connections />
+</ui>

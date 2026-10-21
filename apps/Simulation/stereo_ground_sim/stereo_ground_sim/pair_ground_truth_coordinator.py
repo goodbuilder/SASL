@@ -10,7 +10,7 @@ import time
 
 from stereo_ground_sim.coordinate_frames import (
     SOURCE_GAZEBO_ENTITY,
-    VEHICLE_REFERENCE_DEFINITION,
+    vehicle_reference_definition,
     VEHICLE_REFERENCE_LINK,
     WORLD_FRAME,
     ground_truth_world_to_baseline,
@@ -534,7 +534,9 @@ class PairGroundTruthCoordinator:
                 "ground_truth_source": "gazebo_vehicle_reference_link_world_pose",
                 "source_gazebo_entity": SOURCE_GAZEBO_ENTITY,
                 "published_reference_name": VEHICLE_REFERENCE_LINK,
-                "reference_definition": VEHICLE_REFERENCE_DEFINITION,
+                "reference_definition": vehicle_reference_definition(
+                    getattr(self.node, "target_model_name", "x500_15m")
+                ),
                 "ground_truth_world_enu_m": record.position_world_enu_m,
                 "ground_truth_stamp_ns": record.stamp_ns,
             }

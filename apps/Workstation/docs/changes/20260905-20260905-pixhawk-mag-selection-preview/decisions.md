@@ -18,3 +18,18 @@ Append accepted decisions chronologically. Supersede entries rather than deletin
   order only as a tie-breaker.
 - This preserves the existing Shell polling contract and makes UI active verification align with
   the direct PX4 topic readback without changing priority semantics.
+
+## 2026-10-12 — Preserve edits and prevent known v1.17 voter gaps
+
+- User approved the follow-up fix after the RCA and concrete proposal.
+- Priority combos are staged editor state owned by `MagnetometerView`; periodic PARAM readback
+  cannot overwrite dirty slots. Explicit Discard restores the latest confirmed values.
+- Retry PARAM_SET only on a missing acknowledgement (three total attempts); a mismatched
+  acknowledgement is a definitive mismatch. After an apply failure, stale readback is removed
+  so a subsequent fresh read can reconcile partial writes.
+- A confirmed PX4 v1.17 sparse-voter gap blocks Apply before the first write and names the lower
+  disabled instances. Filler values are not silently rewritten. If topology is unavailable,
+  retain existing Apply gates and show that the guard could not be evaluated.
+- Apply remains runtime-only. No automatic `param save`, reboot, physical hardware operation, or
+  firmware patch is in scope. The earlier “do not block topology” decision remains for CAN2/out-
+  of-range topology; it is superseded only for the proven v1.17 voter-gap condition.

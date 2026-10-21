@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from Workstation.workspace_views.camera_preview import CameraPreview
+from Workstation.ui.designer import load_form
 
 
 def number(value: object, *, signed: bool = False, digits: int = 2) -> str:
@@ -39,116 +40,60 @@ class BaselineYaw90Pane(QtWidgets.QWidget):
         self._preview_fit_timer.setSingleShot(True)
         self._preview_fit_timer.setInterval(0)
         self._preview_fit_timer.timeout.connect(self._fit_previews)
-        self.setMinimumWidth(0)
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(5)
-        actions = QtWidgets.QHBoxLayout()
-        self.preview_button = QtWidgets.QPushButton("Preview")
-        self.preview_button.setProperty("commandId", "camera.toggle")
+        load_form("baseline_yaw90.ui", self)
+        for widget in self.findChildren(QtWidgets.QWidget):
+            legacy_name = widget.property("legacyObjectName")
+            if legacy_name:
+                widget.setObjectName(str(legacy_name))
         self.preview_button.setEnabled(callable(invoke_command))
         self.preview_button.clicked.connect(lambda: invoke_command("camera.toggle"))
-        actions.addWidget(self.preview_button)
-        self.center_line_checkbox = QtWidgets.QCheckBox("Center line")
-        self.center_line_checkbox.setObjectName("baselineYaw90CenterLine")
-        actions.addWidget(self.center_line_checkbox)
-        actions.addStretch(1)
-        self.measurement_button = QtWidgets.QPushButton("Measurement로 이동")
         self.measurement_button.clicked.connect(self.open_measurement.emit)
-        actions.addWidget(self.measurement_button)
-        layout.addLayout(actions)
-        self.status = QtWidgets.QLabel("WAITING")
-        self.status.setObjectName("statusStrip")
-        self.status.setFixedHeight(24)
-        self.status.setMinimumWidth(0)
-        layout.addWidget(self.status)
-        pair = QtWidgets.QHBoxLayout()
         self.previews = {}
         for side in ("left", "right"):
+            slot = getattr(self, "previews_" + side)
             preview = CameraPreview(
                 side, crop_to_fill=False, lock_chrome_height=True, wheel_zoom=True
             )
             preview.setMinimumWidth(0)
             preview.setFixedHeight(230)
             preview.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
+            # Replace the Designer slot directly: an extra QWidget/layout layer
+            # delays size-hint propagation when the viewport first becomes visible.
+            self.layout().replaceWidget(slot, preview)
+            slot.hide()
+            slot.deleteLater()
             self.previews[side] = preview
-            pair.addWidget(preview, 1)
-        layout.addLayout(pair)
         self.center_line_checkbox.toggled.connect(self._center_line_toggled)
-        tables = QtWidgets.QHBoxLayout()
-        self.attitude_table = self._table(("장치", "Roll°", "Pitch°", "State", "Age s"), 2)
-        self.angle_table = self._table(("GNSS 방위·각도", "값°", "State", "Age s"), 3)
-        self.attitude_table.setObjectName("baselineYaw90AttitudeTable")
-        self.angle_table.setObjectName("baselineYaw90AngleTable")
+        for table in (self.attitude_table, self.angle_table, self.reference_table):
+            self._configure_table(table)
         for table, widths in ((self.attitude_table, (62, 62, 92, 56)), (self.angle_table, (66, 92, 56))):
             for column, width in enumerate(widths, start=1):
                 table.horizontalHeader().resizeSection(column, width)
-        tables.addWidget(self.attitude_table, 4)
-        tables.addWidget(self.angle_table, 5)
-        layout.addLayout(tables)
         self.attitude_table.clicked.connect(lambda index: self._inspect("attitudes", index.row()))
         self.angle_table.clicked.connect(lambda index: self._inspect("angles", index.row()))
-        self.branch_status = QtWidgets.QLabel("Yaw preview: WAITING")
-        self.branch_status.setObjectName("statusStrip")
-        self.branch_status.setMinimumWidth(0)
-        self.branch_status.setFixedHeight(24)
-        layout.addWidget(self.branch_status)
-        settings = QtWidgets.QHBoxLayout()
-        self.reverse_checkbox = QtWidgets.QCheckBox("Reverse baseline yaw branch")
-        self.reverse_checkbox.setObjectName("baselineYaw90Reverse")
         self.reverse_checkbox.toggled.connect(self._edited)
-        settings.addWidget(self.reverse_checkbox)
-        self.apply_button = QtWidgets.QPushButton("Apply")
-        self.save_button = QtWidgets.QPushButton("Save")
         self.apply_button.clicked.connect(lambda: self._apply(False))
         self.save_button.clicked.connect(lambda: self._apply(True))
-        settings.addWidget(self.apply_button)
-        settings.addWidget(self.save_button)
-        self.settings_status = QtWidgets.QLabel("")
-        self.settings_status.setMinimumWidth(0)
-        settings.addWidget(self.settings_status, 1)
-        layout.addLayout(settings)
-        self.reference_toggle = QtWidgets.QToolButton()
-        self.reference_toggle.setText("중앙점 기준 참고 정보")
-        self.reference_toggle.setCheckable(True)
-        layout.addWidget(self.reference_toggle, 0, QtCore.Qt.AlignLeft)
-        self.reference_table = self._table(("GNSS 중앙점 기준", "값", "State"), 6)
         self.reference_table.hide()
         self.reference_toggle.toggled.connect(self.reference_table.setVisible)
-        layout.addWidget(self.reference_table)
-        self.contract = QtWidgets.QLabel(
-            "Azimuth: North=0°, clockwise · ∠Dr–P1–P2 / ∠Dr–P2–P1: horizontal GNSS internal angles. "
-            "근거리 Drone 동시 조준은 공통·평행 yaw 정렬 완료를 뜻하지 않습니다."
-        )
-        self.contract.setObjectName("compactContract")
-        self.contract.setWordWrap(True)
-        layout.addWidget(self.contract)
         connector = getattr(backend, "connect_baseline_yaw90_preview", None)
         if callable(connector):
             connector(self)
         self.apply_snapshot({})
 
     @staticmethod
-    def _table(headers, rows):
-        table = QtWidgets.QTableWidget(rows, len(headers))
-        table.setHorizontalHeaderLabels(headers)
-        table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        table.verticalHeader().hide()
+    def _configure_table(table):
+        """Initialize dynamic cells and header sizing on the Designer table."""
         table.verticalHeader().setDefaultSectionSize(24)
         table.horizontalHeader().setFixedHeight(28)
-        table.setFixedHeight(30 + 24 * rows)
-        table.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         header = table.horizontalHeader()
         header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
-        for col in range(1, len(headers)):
+        for col in range(1, table.columnCount()):
             header.resizeSection(col, 74)
-        for row in range(rows):
-            for col in range(len(headers)):
+        for row in range(table.rowCount()):
+            for col in range(table.columnCount()):
                 table.setItem(row, col, QtWidgets.QTableWidgetItem("--"))
-        return table
 
     @staticmethod
     def _row(table, index, values, detail):

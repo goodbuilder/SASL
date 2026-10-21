@@ -1,0 +1,45 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>measurementSessionDetails</class>
+ <widget class="QGroupBox" name="measurementSessionDetailsGroup">
+  <property name="title">
+   <string>Session Details</string>
+  </property>
+  <layout class="QHBoxLayout" name="measurementSessionDetailsLayout">
+   <item>
+    <widget class="QLabel" name="description">
+     <property name="text">
+      <string>Review measurement packages, captures, ULogs, media, and saved-file evidence.</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QPushButton" name="measurementSessionDetails">
+     <property name="text">
+      <string>Open Session Details</string>
+     </property>
+     <property name="toolTip">
+      <string>Open optional evidence, capture, ULog, and saved-file review tools.</string>
+     </property>
+    </widget>
+   </item>
+   <property name="leftMargin">
+    <number>6</number>
+   </property>
+   <property name="topMargin">
+    <number>6</number>
+   </property>
+   <property name="rightMargin">
+    <number>6</number>
+   </property>
+   <property name="bottomMargin">
+    <number>6</number>
+   </property>
+  </layout>
+ </widget>
+ <resources />
+ <connections />
+</ui>

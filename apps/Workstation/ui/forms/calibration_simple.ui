@@ -1,0 +1,620 @@
+<ui version="4.0">
+  <class>simpleCalibrationTabs</class>
+  <widget class="QTabWidget" name="simpleCalibrationTabs">
+    <property name="documentMode">
+      <bool>true</bool>
+    </property>
+    <widget class="QWidget" name="capture_page">
+      <attribute name="title">
+        <string>촬영</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="capture_layout">
+        <property name="leftMargin">
+          <number>8</number>
+        </property>
+        <property name="topMargin">
+          <number>8</number>
+        </property>
+        <property name="rightMargin">
+          <number>8</number>
+        </property>
+        <property name="bottomMargin">
+          <number>8</number>
+        </property>
+        <property name="spacing">
+          <number>6</number>
+        </property>
+        <item>
+          <widget class="QLabel" name="capture_title">
+            <property name="text">
+              <string>1. 운용 줌을 확인하고 보드를 상·하·좌·우, 거리와 기울기를 바꿔 촬영하세요.</string>
+            </property>
+            <property name="wordWrap">
+              <bool>true</bool>
+            </property>
+          </widget>
+        </item>
+        <item>
+          <layout class="QHBoxLayout" name="zoomRow">
+            <property name="leftMargin">
+              <number>0</number>
+            </property>
+            <property name="topMargin">
+              <number>0</number>
+            </property>
+            <property name="rightMargin">
+              <number>0</number>
+            </property>
+            <property name="bottomMargin">
+              <number>0</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item>
+              <widget class="QLabel" name="zoomLabel">
+                <property name="text">
+                  <string>줌 index</string>
+                </property>
+              </widget>
+            </item>
+            <item>
+              <widget class="QSpinBox" name="simple_zoom_spin">
+                <property name="maximum">
+                  <number>100</number>
+                </property>
+                <property name="value">
+                  <number>1</number>
+                </property>
+              </widget>
+            </item>
+            <item>
+              <widget class="QPushButton" name="simple_set_zoom">
+                <property name="text">
+                  <string>좌우 줌 적용</string>
+                </property>
+              </widget>
+            </item>
+            <item>
+              <widget class="QPushButton" name="simple_query_zoom">
+                <property name="text">
+                  <string>줌 확인</string>
+                </property>
+              </widget>
+            </item>
+          </layout>
+        </item>
+        <item>
+          <widget class="QLabel" name="simple_calibration_zoom_status">
+            <property name="text">
+              <string>left=unknown, right=unknown</string>
+            </property>
+            <property name="wordWrap">
+              <bool>true</bool>
+            </property>
+          </widget>
+        </item>
+        <item>
+          <layout class="QHBoxLayout" name="board_status_row">
+            <property name="leftMargin">
+              <number>0</number>
+            </property>
+            <property name="topMargin">
+              <number>0</number>
+            </property>
+            <property name="rightMargin">
+              <number>0</number>
+            </property>
+            <property name="bottomMargin">
+              <number>0</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+          </layout>
+        </item>
+        <item>
+          <layout class="QGridLayout" name="capture_actions">
+            <property name="leftMargin">
+              <number>0</number>
+            </property>
+            <property name="topMargin">
+              <number>0</number>
+            </property>
+            <property name="rightMargin">
+              <number>0</number>
+            </property>
+            <property name="bottomMargin">
+              <number>0</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item row="0" column="0">
+              <widget class="QPushButton" name="capture_command0">
+                <property name="text">
+                  <string>미리보기</string>
+                </property>
+                <property name="commandId" stdset="0">
+                  <string>camera.toggle</string>
+                </property>
+                <property name="minimumSize">
+                  <size>
+                    <width>150</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+              </widget>
+            </item>
+            <item row="0" column="1">
+              <widget class="QPushButton" name="capture_command1">
+                <property name="text">
+                  <string>Live pair 캡처</string>
+                </property>
+                <property name="commandId" stdset="0">
+                  <string>calibration.capture_images</string>
+                </property>
+                <property name="minimumSize">
+                  <size>
+                    <width>150</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+              </widget>
+            </item>
+            <item row="1" column="0">
+              <widget class="QPushButton" name="capture_command2">
+                <property name="text">
+                  <string>OZ 촬영 + 가져오기</string>
+                </property>
+                <property name="commandId" stdset="0">
+                  <string>calibration.capture_images_wiris_ftp_oz</string>
+                </property>
+                <property name="minimumSize">
+                  <size>
+                    <width>150</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+              </widget>
+            </item>
+            <item row="1" column="1">
+              <widget class="QPushButton" name="capture_command3">
+                <property name="text">
+                  <string>자동 캡처</string>
+                </property>
+                <property name="commandId" stdset="0">
+                  <string>calibration.auto_capture</string>
+                </property>
+                <property name="minimumSize">
+                  <size>
+                    <width>150</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+              </widget>
+            </item>
+          </layout>
+        </item>
+        <item>
+          <widget class="QWidget" name="simple_calibration_run_statusHost">
+            <layout class="QVBoxLayout" name="simple_calibration_run_statusLayout">
+              <property name="leftMargin">
+                <number>0</number>
+              </property>
+              <property name="topMargin">
+                <number>0</number>
+              </property>
+              <property name="rightMargin">
+                <number>0</number>
+              </property>
+              <property name="bottomMargin">
+                <number>0</number>
+              </property>
+              <property name="spacing">
+                <number>6</number>
+              </property>
+            </layout>
+          </widget>
+        </item>
+        <item>
+          <widget class="QWidget" name="simple_calibration_set_statusHost">
+            <layout class="QVBoxLayout" name="simple_calibration_set_statusLayout">
+              <property name="leftMargin">
+                <number>0</number>
+              </property>
+              <property name="topMargin">
+                <number>0</number>
+              </property>
+              <property name="rightMargin">
+                <number>0</number>
+              </property>
+              <property name="bottomMargin">
+                <number>0</number>
+              </property>
+              <property name="spacing">
+                <number>6</number>
+              </property>
+            </layout>
+          </widget>
+        </item>
+        <item>
+          <widget class="QWidget" name="simple_calibration_capture_statusHost">
+            <layout class="QVBoxLayout" name="simple_calibration_capture_statusLayout">
+              <property name="leftMargin">
+                <number>0</number>
+              </property>
+              <property name="topMargin">
+                <number>0</number>
+              </property>
+              <property name="rightMargin">
+                <number>0</number>
+              </property>
+              <property name="bottomMargin">
+                <number>0</number>
+              </property>
+              <property name="spacing">
+                <number>6</number>
+              </property>
+            </layout>
+          </widget>
+        </item>
+        <item>
+          <widget class="QWidget" name="previewHost">
+            <layout class="QVBoxLayout" name="previewLayout">
+              <property name="leftMargin">
+                <number>0</number>
+              </property>
+              <property name="topMargin">
+                <number>0</number>
+              </property>
+              <property name="rightMargin">
+                <number>0</number>
+              </property>
+              <property name="bottomMargin">
+                <number>0</number>
+              </property>
+              <property name="spacing">
+                <number>6</number>
+              </property>
+            </layout>
+          </widget>
+        </item>
+      </layout>
+    </widget>
+    <widget class="QWidget" name="compute_page">
+      <attribute name="title">
+        <string>계산·적용</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="compute_layout">
+        <property name="leftMargin">
+          <number>8</number>
+        </property>
+        <property name="topMargin">
+          <number>8</number>
+        </property>
+        <property name="rightMargin">
+          <number>8</number>
+        </property>
+        <property name="bottomMargin">
+          <number>8</number>
+        </property>
+        <property name="spacing">
+          <number>6</number>
+        </property>
+        <item>
+          <widget class="QLabel" name="compute_title">
+            <property name="text">
+              <string>2. 전체 사진으로 K,D를 계산하고 품질 통과 후 필요하면 stereo R,t를 계산하세요.</string>
+            </property>
+            <property name="wordWrap">
+              <bool>true</bool>
+            </property>
+          </widget>
+        </item>
+        <item>
+          <layout class="QGridLayout" name="compute_actions">
+            <property name="leftMargin">
+              <number>0</number>
+            </property>
+            <property name="topMargin">
+              <number>0</number>
+            </property>
+            <property name="rightMargin">
+              <number>0</number>
+            </property>
+            <property name="bottomMargin">
+              <number>0</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item row="0" column="0">
+              <widget class="QPushButton" name="compute_command0">
+                <property name="text">
+                  <string>K,D 계산</string>
+                </property>
+                <property name="commandId" stdset="0">
+                  <string>calibration.run_intrinsic</string>
+                </property>
+                <property name="minimumSize">
+                  <size>
+                    <width>150</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+              </widget>
+            </item>
+            <item row="0" column="1">
+              <widget class="QPushButton" name="compute_command1">
+                <property name="text">
+                  <string>K,D 저장</string>
+                </property>
+                <property name="commandId" stdset="0">
+                  <string>calibration.save_intrinsics</string>
+                </property>
+                <property name="minimumSize">
+                  <size>
+                    <width>150</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+              </widget>
+            </item>
+            <item row="1" column="0">
+              <widget class="QPushButton" name="compute_command2">
+                <property name="text">
+                  <string>R,t 계산</string>
+                </property>
+                <property name="commandId" stdset="0">
+                  <string>calibration.run_extrinsics</string>
+                </property>
+                <property name="minimumSize">
+                  <size>
+                    <width>150</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+              </widget>
+            </item>
+            <item row="1" column="1">
+              <widget class="QPushButton" name="compute_command3">
+                <property name="text">
+                  <string>R,t 저장</string>
+                </property>
+                <property name="commandId" stdset="0">
+                  <string>calibration.save_extrinsics</string>
+                </property>
+                <property name="minimumSize">
+                  <size>
+                    <width>150</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+              </widget>
+            </item>
+            <item row="2" column="0">
+              <widget class="QPushButton" name="compute_command4">
+                <property name="text">
+                  <string>검증된 bundle 적용</string>
+                </property>
+                <property name="commandId" stdset="0">
+                  <string>calibration.apply_bundle</string>
+                </property>
+                <property name="minimumSize">
+                  <size>
+                    <width>150</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+              </widget>
+            </item>
+          </layout>
+        </item>
+        <item>
+          <widget class="QLabel" name="simple_calibration_quality_status">
+            <property name="text">
+              <string />
+            </property>
+            <property name="wordWrap">
+              <bool>true</bool>
+            </property>
+          </widget>
+        </item>
+        <item>
+          <widget class="QLabel" name="compute_note">
+            <property name="text">
+              <string>FAIL은 저장·적용을 차단하고, WARNING은 고급 캘리브레이션에서 사유 검토와 명시적 승인이 필요합니다.</string>
+            </property>
+            <property name="wordWrap">
+              <bool>true</bool>
+            </property>
+          </widget>
+        </item>
+      </layout>
+    </widget>
+    <widget class="QWidget" name="profile_page">
+      <attribute name="title">
+        <string>프로파일</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="profile_layout">
+        <property name="leftMargin">
+          <number>8</number>
+        </property>
+        <property name="topMargin">
+          <number>8</number>
+        </property>
+        <property name="rightMargin">
+          <number>8</number>
+        </property>
+        <property name="bottomMargin">
+          <number>8</number>
+        </property>
+        <property name="spacing">
+          <number>6</number>
+        </property>
+        <item>
+          <widget class="QLabel" name="profile_title">
+            <property name="text">
+              <string>3. 현재 줌·해상도와 일치하는 K,D와 호환되는 R,t만 불러와 적용합니다.</string>
+            </property>
+            <property name="wordWrap">
+              <bool>true</bool>
+            </property>
+          </widget>
+        </item>
+        <item>
+          <layout class="QGridLayout" name="profile_actions">
+            <property name="leftMargin">
+              <number>0</number>
+            </property>
+            <property name="topMargin">
+              <number>0</number>
+            </property>
+            <property name="rightMargin">
+              <number>0</number>
+            </property>
+            <property name="bottomMargin">
+              <number>0</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item row="0" column="0">
+              <widget class="QPushButton" name="profile_command0">
+                <property name="text">
+                  <string>K,D 불러오기</string>
+                </property>
+                <property name="commandId" stdset="0">
+                  <string>calibration.load_intrinsics</string>
+                </property>
+                <property name="minimumSize">
+                  <size>
+                    <width>150</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+              </widget>
+            </item>
+            <item row="0" column="1">
+              <widget class="QPushButton" name="profile_command1">
+                <property name="text">
+                  <string>R,t 불러오기</string>
+                </property>
+                <property name="commandId" stdset="0">
+                  <string>calibration.load_extrinsics</string>
+                </property>
+                <property name="minimumSize">
+                  <size>
+                    <width>150</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+              </widget>
+            </item>
+            <item row="1" column="0">
+              <widget class="QPushButton" name="profile_command2">
+                <property name="text">
+                  <string>검증된 bundle 적용</string>
+                </property>
+                <property name="commandId" stdset="0">
+                  <string>calibration.apply_bundle</string>
+                </property>
+                <property name="minimumSize">
+                  <size>
+                    <width>150</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+              </widget>
+            </item>
+          </layout>
+        </item>
+        <item>
+          <widget class="QLabel" name="simple_calibration_profile_status">
+            <property name="text">
+              <string />
+            </property>
+            <property name="wordWrap">
+              <bool>true</bool>
+            </property>
+          </widget>
+        </item>
+      </layout>
+    </widget>
+  </widget>
+  <resources />
+  <connections />
+</ui>

@@ -1,0 +1,206 @@
+<ui version="4.0">
+  <class>Form</class>
+  <widget class="QGroupBox" name="calibration_quality_group">
+    <property name="title">
+      <string>Calibration quality gate</string>
+    </property>
+    <property name="minimumSize">
+      <size>
+        <width>0</width>
+        <height>0</height>
+      </size>
+    </property>
+    <property name="maximumSize">
+      <size>
+        <width>16777215</width>
+        <height>16777215</height>
+      </size>
+    </property>
+    <layout class="QVBoxLayout" name="formLayout">
+      <property name="leftMargin">
+        <number>6</number>
+      </property>
+      <property name="topMargin">
+        <number>6</number>
+      </property>
+      <property name="rightMargin">
+        <number>6</number>
+      </property>
+      <property name="bottomMargin">
+        <number>6</number>
+      </property>
+      <property name="spacing">
+        <number>5</number>
+      </property>
+      <item>
+        <layout class="QGridLayout" name="values_layout">
+          <property name="leftMargin">
+            <number>0</number>
+          </property>
+          <property name="topMargin">
+            <number>0</number>
+          </property>
+          <property name="rightMargin">
+            <number>0</number>
+          </property>
+          <property name="bottomMargin">
+            <number>0</number>
+          </property>
+          <property name="spacing">
+            <number>-1</number>
+          </property>
+          <item row="0" column="0" rowspan="1" colspan="1">
+            <widget class="QWidget" name="calibration_quality_values_state" />
+          </item>
+          <item row="0" column="1" rowspan="1" colspan="1">
+            <widget class="QWidget" name="calibration_quality_values_effective_pose_count" />
+          </item>
+          <item row="1" column="0" rowspan="1" colspan="1">
+            <widget class="QWidget" name="calibration_quality_values_coverage" />
+          </item>
+          <item row="1" column="1" rowspan="1" colspan="1">
+            <widget class="QWidget" name="calibration_quality_values_principal_offsets" />
+          </item>
+          <item row="2" column="0" rowspan="1" colspan="1">
+            <widget class="QWidget" name="calibration_quality_values_subset_stability" />
+          </item>
+          <item row="2" column="1" rowspan="1" colspan="1">
+            <widget class="QWidget" name="calibration_quality_values_uncertainty" />
+          </item>
+          <item row="3" column="0" rowspan="1" colspan="1">
+            <widget class="QWidget" name="calibration_quality_values_reasons" />
+          </item>
+          <item row="3" column="1" rowspan="1" colspan="1">
+            <widget class="QWidget" name="calibration_quality_values_source" />
+          </item>
+        </layout>
+      </item>
+      <item>
+        <widget class="QLabel" name="coverage_label">
+          <property name="text">
+            <string>Board-center occupancy (source-provided 3×3 grid; no UI geometry recomputation)</string>
+          </property>
+          <property name="wordWrap">
+            <bool>true</bool>
+          </property>
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+        </widget>
+      </item>
+      <item>
+        <widget class="QTableWidget" name="calibration_center_coverage_table">
+          <property name="wordWrap">
+            <bool>true</bool>
+          </property>
+          <property name="alternatingRowColors">
+            <bool>false</bool>
+          </property>
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>126</height>
+            </size>
+          </property>
+          <property name="selectionMode">
+            <enum>QAbstractItemView::NoSelection</enum>
+          </property>
+          <property name="editTriggers">
+            <set>QAbstractItemView::NoEditTriggers</set>
+          </property>
+          <column>
+            <property name="text">
+              <string>Left</string>
+            </property>
+          </column>
+          <column>
+            <property name="text">
+              <string>Center</string>
+            </property>
+          </column>
+          <column>
+            <property name="text">
+              <string>Right</string>
+            </property>
+          </column>
+          <row>
+            <property name="text">
+              <string>Top</string>
+            </property>
+          </row>
+          <row>
+            <property name="text">
+              <string>Middle</string>
+            </property>
+          </row>
+          <row>
+            <property name="text">
+              <string>Bottom</string>
+            </property>
+          </row>
+        </widget>
+      </item>
+      <item>
+        <widget class="QCheckBox" name="calibration_quality_warning_checkbox">
+          <property name="text">
+            <string>I reviewed this WARNING and explicitly allow Save / Apply for this result</string>
+          </property>
+          <property name="toolTip">
+            <string>Confirmation applies only to the currently displayed source-backed quality snapshot.</string>
+          </property>
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+        </widget>
+      </item>
+      <item>
+        <widget class="QLabel" name="calibration_quality_gate_label">
+          <property name="text">
+            <string>UNVERIFIED · legacy result has no quality snapshot; existing Save / Apply behavior is preserved.</string>
+          </property>
+          <property name="wordWrap">
+            <bool>true</bool>
+          </property>
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+        </widget>
+      </item>
+    </layout>
+  </widget>
+  <resources />
+  <connections />
+</ui>

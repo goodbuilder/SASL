@@ -14,9 +14,13 @@ def test_pixhawk_board_transport_offers_usb_and_writes_the_usb_endpoint() -> Non
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     backend = _FakeBackend()
     applied: list[tuple[str, str, int]] = []
-    backend.set_pixhawk_transport = lambda role, transport: applied.append(
-        ("transport", role, transport)
-    )
+    def set_transport(role, transport):
+        applied.append(("transport", role, transport))
+        # The real setter commits the selection before the status poll reads
+        # it back. A record-only fake races the polling timer in long suites.
+        setattr(backend.panel, f"{role}_pixhawk_transport", transport)
+
+    backend.set_pixhawk_transport = set_transport
     backend.configure_pixhawk_usb = lambda role, device, baud: applied.append(
         ("usb", role, device, baud)
     )
@@ -37,7 +41,9 @@ def test_pixhawk_board_transport_offers_usb_and_writes_the_usb_endpoint() -> Non
 
     combo = pixhawk.transport_combos["left"]
     combo.setCurrentIndex(combo.findData("usb"))
+    window.status_adapter.refresh()
     app.processEvents()
+    assert combo.currentData() == "usb"
     assert ("transport", "left", "usb") in applied
     # USB is a serial transport, so the device/baud row stays editable.
     assert pixhawk.radio_device_edits["left"].isEnabled()

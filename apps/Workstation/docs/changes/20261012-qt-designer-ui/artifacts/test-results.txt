@@ -1,0 +1,11 @@
+Final full regression:
+./tools/run_isolated_tests.sh -q -o faulthandler_timeout=45 --tb=short
+2793 passed, 1 skipped in 771.47s (0:12:51)
+Process exit code: 0
+Skipped NVENC fixture: CUDA_ERROR_UNKNOWN at cuInit(0).
+
+Final focused Designer/workspace/viewport/navigation/boundary: 237 passed in47.67s.
+Final broader lifecycle/Baseline/Calibration/USB/device-boundary/camera: 253 passed in97.54s.
+Final real-shell capture:57 images,0 callback errors,0 rendering limitations, clean shutdown.
+python3 tools/check_portable_paths.py: PASS.
+git diff --check: PASS.

@@ -1,0 +1,32 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>recordingAdvanced</class>
+ <widget class="QWidget" name="recordingAdvanced">
+  <layout class="QHBoxLayout" name="advancedLayout">
+   <item>
+    <widget class="QPushButton" name="advanced_button">
+     <property name="text">
+      <string>Advanced files</string>
+     </property>
+     <property name="toolTip">
+      <string>Open playback, export, and media review tools.</string>
+     </property>
+    </widget>
+   </item>
+   <property name="leftMargin">
+    <number>0</number>
+   </property>
+   <property name="topMargin">
+    <number>0</number>
+   </property>
+   <property name="rightMargin">
+    <number>0</number>
+   </property>
+   <property name="bottomMargin">
+    <number>0</number>
+   </property>
+  </layout>
+ </widget>
+ <resources />
+ <connections />
+</ui>

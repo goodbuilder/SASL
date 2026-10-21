@@ -1,0 +1,139 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>cameraImageFormat</class>
+ <widget class="QGroupBox" name="cameraImageFormat">
+  <property name="title">
+   <string>Image Format</string>
+  </property>
+  <layout class="QVBoxLayout" name="cameraImageFormatLayout">
+   <item>
+    <widget class="QWidget" name="statusHost">
+     <layout class="QGridLayout" name="statusLayout">
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QWidget" name="toggleHost">
+     <layout class="QHBoxLayout" name="toggleLayout">
+      <item>
+       <widget class="QCheckBox" name="SIRJ">
+        <property name="text">
+         <string>Radiometric</string>
+        </property>
+        <property name="toolTip">
+         <string>체크: 양쪽 카메라에 SIRJ TRUE 전송. 해제: 양쪽에 SIRJ FALSE 전송.</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QCheckBox" name="SISR">
+        <property name="text">
+         <string>Super-res</string>
+        </property>
+        <property name="toolTip">
+         <string>체크: 양쪽 카메라에 SISR TRUE 전송. 해제: 양쪽에 SISR FALSE 전송.</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QCheckBox" name="SIHR">
+        <property name="text">
+         <string>HR</string>
+        </property>
+        <property name="toolTip">
+         <string>체크: 양쪽 카메라에 SIHR TRUE 전송. 해제: 양쪽에 SIHR FALSE 전송.</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QCheckBox" name="SIVI">
+        <property name="text">
+         <string>Visible (OZ)</string>
+        </property>
+        <property name="toolTip">
+         <string>체크: 양쪽 카메라에 SIVI TRUE 전송. 해제: 양쪽에 SIVI FALSE 전송.</string>
+        </property>
+       </widget>
+      </item>
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QWidget" name="actionsHost">
+     <layout class="QHBoxLayout" name="actionsLayout">
+      <item>
+       <widget class="QPushButton" name="refresh">
+        <property name="text">
+         <string>새로고침</string>
+        </property>
+        <property name="toolTip">
+         <string>좌우 GIVI/GIRJ/GISR/GIHR/GILC 상태를 다시 조회합니다.</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="preset">
+        <property name="text">
+         <string>OZ 전용 초기화</string>
+        </property>
+        <property name="toolTip">
+         <string>SIRJ FALSE, SISR FALSE, SIHR FALSE, SIVI TRUE를 양쪽 카메라에 전송합니다.</string>
+        </property>
+       </widget>
+      </item>
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+     </layout>
+    </widget>
+   </item>
+   <property name="leftMargin">
+    <number>6</number>
+   </property>
+   <property name="topMargin">
+    <number>6</number>
+   </property>
+   <property name="rightMargin">
+    <number>6</number>
+   </property>
+   <property name="bottomMargin">
+    <number>6</number>
+   </property>
+  </layout>
+ </widget>
+ <resources />
+ <connections />
+</ui>

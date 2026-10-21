@@ -1,0 +1,123 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>recordingReview</class>
+ <widget class="QGroupBox" name="recordingReview">
+  <property name="title">
+   <string>Review</string>
+  </property>
+  <layout class="QVBoxLayout" name="recordingReviewLayout">
+   <item>
+    <widget class="QWidget" name="selectors">
+     <layout class="QGridLayout" name="selectorLayout">
+      <item row="0" column="0">
+       <widget class="QLabel" name="sessionReviewSelectorLabel">
+        <property name="text">
+         <string>Session</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <widget class="QComboBox" name="sessionReviewSelector" />
+      </item>
+      <item row="0" column="2">
+       <widget class="QPushButton" name="sessionReviewSelectorAction">
+        <property name="text">
+         <string>Refresh</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="3">
+       <widget class="QPushButton" name="sessionReviewSelectorOpen">
+        <property name="text">
+         <string>Open folder</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0">
+       <widget class="QLabel" name="sessionArtifactSelectorLabel">
+        <property name="text">
+         <string>Artifact</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="QComboBox" name="sessionArtifactSelector" />
+      </item>
+      <item row="1" column="2">
+       <widget class="QPushButton" name="sessionArtifactSelectorAction">
+        <property name="text">
+         <string>Preview</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="3">
+       <widget class="QPushButton" name="sessionArtifactSelectorOpen">
+        <property name="text">
+         <string>Open file</string>
+        </property>
+       </widget>
+      </item>
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="status">
+     <property name="text">
+      <string>Read-only review</string>
+     </property>
+     <property name="toolTip">
+      <string>Saved fields and timestamps are unchanged; no NED/ENU conversion is applied.</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QTableView" name="table">
+     <property name="editTriggers">
+      <enum>QAbstractItemView::NoEditTriggers</enum>
+     </property>
+     <property name="selectionBehavior">
+      <enum>QAbstractItemView::SelectRows</enum>
+     </property>
+     <property name="maximumHeight">
+      <number>230</number>
+     </property>
+     <attribute name="verticalHeaderVisible">
+      <bool>false</bool>
+     </attribute>
+     <attribute name="horizontalHeaderStretchLastSection">
+      <bool>true</bool>
+     </attribute>
+    </widget>
+   </item>
+   <property name="leftMargin">
+    <number>6</number>
+   </property>
+   <property name="topMargin">
+    <number>6</number>
+   </property>
+   <property name="rightMargin">
+    <number>6</number>
+   </property>
+   <property name="bottomMargin">
+    <number>6</number>
+   </property>
+  </layout>
+ </widget>
+ <resources />
+ <connections />
+</ui>

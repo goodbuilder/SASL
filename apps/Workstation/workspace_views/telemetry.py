@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Callable
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtGui, QtWidgets
 from Workstation.workstation_core.settings import PIXHAWK_SERIAL_TRANSPORTS, normalize_pixhawk_transport
-from Workstation.ui.components import WorkspaceHeader
+from Workstation.ui.designer import load_form
 from Workstation.application.status_model import RuntimeStatus
-from .shared import _command_button, _display_number, _sync_table_rows, _table_model
+from .shared import _display_number, _sync_table_rows, _table_model
 
 
 class TelemetryWorkspace(QtWidgets.QWidget):
@@ -27,194 +27,71 @@ class TelemetryWorkspace(QtWidgets.QWidget):
         self._last_snapshot: dict[str, object] = {}
         defaults = self._settings_snapshot()
 
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-        layout.addWidget(WorkspaceHeader("Telemetry"))
-
-        connection_group = QtWidgets.QGroupBox("Drone Pixhawk MAVLink")
-        connection_form = QtWidgets.QGridLayout(connection_group)
-        connection_form.setColumnStretch(1, 1)
-        self.endpoint_edit = QtWidgets.QLineEdit(
-            str(defaults.get("drone_telemetry_url", "udpin:0.0.0.0:14552") or "")
-        )
-        self.endpoint_edit.setPlaceholderText("udpin:0.0.0.0:14552 / serial / tcp")
+        load_form("telemetry.ui", self)
+        for widget in self.findChildren(QtWidgets.QWidget):
+            legacy_name = widget.property("legacyObjectName")
+            if legacy_name:
+                widget.setObjectName(str(legacy_name))
+        self.operation_buttons = {
+            'telemetry.discover_usb': self.operation_buttons_telemetry_discover_usb,
+            'telemetry.discover_network': self.operation_buttons_telemetry_discover_network,
+            'telemetry.apply': self.operation_buttons_telemetry_apply,
+            'telemetry.connect': self.operation_buttons_telemetry_connect,
+            'telemetry.disconnect': self.operation_buttons_telemetry_disconnect,
+            'telemetry.save_settings': self.operation_buttons_telemetry_save_settings,
+            'telemetry.use_network_candidate': self.operation_buttons_telemetry_use_network_candidate,
+        }
+        self.rtcm_values = {
+            'route': self.rtcm_values_route,
+            'frames': self.rtcm_values_frames,
+            'bytes': self.rtcm_values_bytes,
+            'packets': self.rtcm_values_packets,
+            'fail': self.rtcm_values_fail,
+            'age': self.rtcm_values_age,
+        }
+        self.disparity_values = {
+            'state': self.disparity_values_state,
+            'baseline': self.disparity_values_baseline,
+            'focal': self.disparity_values_focal,
+            'target': self.disparity_values_target,
+            'disparity': self.disparity_values_disparity,
+            'reason': self.disparity_values_reason,
+        }
+        for command_id, button in self.operation_buttons.items():
+            button.setEnabled(invoke_command is not None)
+            if invoke_command is not None:
+                button.clicked.connect(
+                    lambda _checked=False, command=command_id: invoke_command(command)
+                )
+        self.endpoint_edit.setText(str(defaults.get("drone_telemetry_url", "udpin:0.0.0.0:14552") or ""))
         self._endpoint_dirty = False
         self.endpoint_edit.textEdited.connect(lambda _text: setattr(self, "_endpoint_dirty", True))
-        # This workspace owns the Drone "drone" MAVLink side outright, so the
-        # transport selector lives here rather than on the Pixhawk workspace.
-        self.transport_combo = QtWidgets.QComboBox()
-        self.transport_combo.addItem("Drone Telemetry Radio", "radio")
-        self.transport_combo.addItem("Ethernet", "ethernet")
-        self.transport_combo.addItem("USB", "usb")
+        for label, value in (("Drone Telemetry Radio", "radio"), ("Ethernet", "ethernet"), ("USB", "usb")):
+            self.transport_combo.addItem(label, value)
         transport = normalize_pixhawk_transport(defaults.get("drone_pixhawk_transport"))
         self.transport_combo.setCurrentIndex(max(0, self.transport_combo.findData(transport)))
-        # An operator's transport choice is only pushed to the backend on
-        # Configure/Connect/Save, so refresh() must not snap the combo back to
-        # the backend's last-applied transport in the meantime.
         self._transport_dirty = False
         self.transport_combo.currentIndexChanged.connect(self._on_transport_changed)
-        self.serial_device_edit = QtWidgets.QLineEdit(
-            str(
-                defaults.get(
-                    "drone_pixhawk_bootstrap_url"
-                    if transport == "usb"
-                    else "drone_pixhawk_radio_device",
-                    "",
-                )
-                or ""
-            )
-        )
-        self.serial_device_edit.setPlaceholderText("/dev/serial/by-id/...")
-        self.baud_spin = QtWidgets.QSpinBox()
-        self.baud_spin.setRange(1_200, 4_000_000)
-        self.baud_spin.setSingleStep(9_600)
+        self.serial_device_edit.setText(str(defaults.get(
+            "drone_pixhawk_bootstrap_url" if transport == "usb" else "drone_pixhawk_radio_device", ""
+        ) or ""))
         self.baud_spin.setValue(int(defaults.get("drone_telemetry_baud", 57_600) or 57_600))
-        self.rtcm_source_combo = QtWidgets.QComboBox()
-        self.rtcm_source_combo.addItem("Base GNSS", "base")
-        self.rtcm_source_combo.addItem("Network NTRIP", "ntrip")
-        rtcm_source = str(defaults.get("drone_telemetry_rtcm_source", "base") or "").strip().lower()
-        source_index = self.rtcm_source_combo.findData(rtcm_source)
-        self.rtcm_source_combo.setCurrentIndex(max(0, source_index))
-        self.forward_rtcm_checkbox = QtWidgets.QCheckBox("Forward selected RTCM source to this Pixhawk")
+        for label, value in (("Base GNSS", "base"), ("Network NTRIP", "ntrip")):
+            self.rtcm_source_combo.addItem(label, value)
+        source = str(defaults.get("drone_telemetry_rtcm_source", "base") or "").strip().lower()
+        self.rtcm_source_combo.setCurrentIndex(max(0, self.rtcm_source_combo.findData(source)))
         self.forward_rtcm_checkbox.setChecked(bool(defaults.get("drone_telemetry_rtcm_forward", True)))
-        connection_form.addWidget(QtWidgets.QLabel("Transport"), 0, 0)
-        connection_form.addWidget(self.transport_combo, 0, 1)
-        connection_form.addWidget(QtWidgets.QLabel("MAVLink URL"), 1, 0)
-        connection_form.addWidget(self.endpoint_edit, 1, 1, 1, 3)
-        connection_form.addWidget(QtWidgets.QLabel("Serial device"), 2, 0)
-        connection_form.addWidget(self.serial_device_edit, 2, 1, 1, 3)
-        connection_form.addWidget(QtWidgets.QLabel("Baud"), 3, 0)
-        connection_form.addWidget(self.baud_spin, 3, 1)
-        connection_form.addWidget(QtWidgets.QLabel("RTCM source"), 4, 0)
-        connection_form.addWidget(self.rtcm_source_combo, 4, 1)
-        connection_form.addWidget(self.forward_rtcm_checkbox, 4, 2, 1, 2)
-        actions = QtWidgets.QHBoxLayout()
-        self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
-        for command_id, label in (
-            ("telemetry.discover_usb", "Find USB"),
-            ("telemetry.discover_network", "Find Network"),
-            ("telemetry.apply", "Apply"),
-            ("telemetry.connect", "Connect"),
-            ("telemetry.disconnect", "Disconnect"),
-            ("telemetry.save_settings", "Save"),
-        ):
-            button = _command_button(label, command_id, invoke_command)
-            self.operation_buttons[command_id] = button
-            actions.addWidget(button)
-        actions.addStretch(1)
-        connection_form.addLayout(actions, 5, 0, 1, 4)
-        self.connection_status = QtWidgets.QLabel("DISCONNECTED")
-        self.connection_status.setObjectName("statusStrip")
-        self.connection_status.setWordWrap(True)
-        connection_form.addWidget(self.connection_status, 6, 0, 1, 4)
-        layout.addWidget(connection_group)
-
-        discovery_group = QtWidgets.QGroupBox("Drone network candidates")
-        discovery_layout = QtWidgets.QVBoxLayout(discovery_group)
         self.network_candidate_model = _table_model(
             self, ("State", "NIC", "Source IP", "UDP port", "System ID", "Heartbeats")
         )
-        self.network_candidate_table = QtWidgets.QTableView()
         self.network_candidate_table.setModel(self.network_candidate_model)
-        self.network_candidate_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.network_candidate_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.network_candidate_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.network_candidate_table.verticalHeader().setVisible(False)
-        self.network_candidate_table.setFixedHeight(92)
-        self.network_candidate_table.horizontalHeader().setStretchLastSection(True)
-        discovery_layout.addWidget(self.network_candidate_table)
-        discovery_actions = QtWidgets.QHBoxLayout()
-        self.network_discovery_status = QtWidgets.QLabel("IDLE")
-        self.network_discovery_status.setObjectName("statusStrip")
-        self.network_discovery_status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        discovery_actions.addWidget(self.network_discovery_status, 1)
-        use_button = _command_button(
-            "Use selected", "telemetry.use_network_candidate", invoke_command
-        )
-        self.operation_buttons["telemetry.use_network_candidate"] = use_button
-        discovery_actions.addWidget(use_button)
-        discovery_layout.addLayout(discovery_actions)
-        layout.addWidget(discovery_group)
         self._network_candidate_ids: list[str] = []
         self._network_candidate_signature: tuple[tuple[object, ...], ...] = ()
         self._refresh_transport_fields()
-
-        position_group = QtWidgets.QGroupBox("Live position")
-        position_layout = QtWidgets.QVBoxLayout(position_group)
         self.position_model = _table_model(
-            self,
-            ("Source", "State", "Fix", "RTK", "Latitude", "Longitude", "Alt m", "Sats", "Age"),
+            self, ("Source", "State", "Fix", "RTK", "Latitude", "Longitude", "Alt m", "Sats", "Age")
         )
-        self.position_table = QtWidgets.QTableView()
         self.position_table.setModel(self.position_model)
-        self.position_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.position_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.position_table.verticalHeader().setVisible(False)
-        self.position_table.setMaximumHeight(150)
-        self.position_table.horizontalHeader().setStretchLastSection(True)
-        position_layout.addWidget(self.position_table)
-        position_hint = QtWidgets.QLabel(
-            "GPS_RAW_INT/GPS2_RAW position remains WGS84 latitude/longitude with MAVLink MSL altitude; "
-            "no camera-frame conversion is applied."
-        )
-        position_hint.setObjectName("statusStrip")
-        position_hint.setWordWrap(True)
-        position_layout.addWidget(position_hint)
-        layout.addWidget(position_group)
-
-        rtcm_group = QtWidgets.QGroupBox("RTCM delivery")
-        rtcm_form = QtWidgets.QGridLayout(rtcm_group)
-        self.rtcm_values: dict[str, QtWidgets.QLabel] = {}
-        for row, (key, title) in enumerate(
-            (
-                ("route", "Route"),
-                ("frames", "Frames"),
-                ("bytes", "Bytes"),
-                ("packets", "MAVLink packets"),
-                ("fail", "Failures"),
-                ("age", "Last delivery age"),
-            )
-        ):
-            label = QtWidgets.QLabel("--")
-            label.setObjectName("statusStrip")
-            label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-            self.rtcm_values[key] = label
-            rtcm_form.addWidget(QtWidgets.QLabel(title), row // 3, (row % 3) * 2)
-            rtcm_form.addWidget(label, row // 3, (row % 3) * 2 + 1)
-        layout.addWidget(rtcm_group)
-        self.rtcm_group = rtcm_group
-
-        disparity_group = QtWidgets.QGroupBox("Ideal disparity from three GNSS positions + zoom")
-        disparity_form = QtWidgets.QGridLayout(disparity_group)
-        self.disparity_values: dict[str, QtWidgets.QLabel] = {}
-        for row, (key, title) in enumerate(
-            (
-                ("state", "State"),
-                ("baseline", "Live GPS baseline"),
-                ("focal", "Focal length"),
-                ("target", "GNSS target range"),
-                ("disparity", "Ideal disparity"),
-                ("reason", "Reason"),
-            )
-        ):
-            label = QtWidgets.QLabel("--")
-            label.setObjectName("statusStrip")
-            label.setWordWrap(True)
-            label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-            self.disparity_values[key] = label
-            disparity_form.addWidget(QtWidgets.QLabel(title), row, 0)
-            disparity_form.addWidget(label, row, 1)
-        assumption = QtWidgets.QLabel(
-            "Model: B = distance(P1 GNSS, P2 GNSS), Z = distance(P1/P2 baseline midpoint, Drone GNSS), "
-            "fx = active WIRIS zoom focal length, d = fx·B/Z. This is a theoretical reference value; "
-            "it is not the observed YOLO/image disparity and does not estimate target bearing or pose."
-        )
-        assumption.setObjectName("compactContract")
-        assumption.setWordWrap(True)
-        disparity_form.addWidget(assumption, 6, 0, 1, 2)
-        layout.addWidget(disparity_group)
-        layout.addStretch(1)
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802 - Qt API.
         super().resizeEvent(event)

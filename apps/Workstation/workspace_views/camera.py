@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Callable
 from PyQt5 import QtCore, QtGui, QtWidgets
+from Workstation.ui.designer import load_form
 from Workstation.workstation_core.network import candidate_network_role_labels
 from Workstation.workstation_core.runtime_camera_status import (
     decoder_presentation,
@@ -16,7 +17,6 @@ from .camera_preview import CameraPreview, _balance_preview_pair, _preview_pair_
 from .network_helpers import _apply_network_role_discovery_status, _network_role_column_text
 from .shared import (
     _append_table_row,
-    _command_button,
     _display_class,
     _display_number,
     _evidence,
@@ -48,41 +48,20 @@ class CameraWorkspace(QtWidgets.QWidget):
         self.status_model = status_model
         self.setMinimumWidth(0)
         self.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Expanding)
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-        layout.addWidget(WorkspaceHeader("Cameras"))
+        load_form("camera_workspace.ui", self)
+        self.headerLayout.addWidget(WorkspaceHeader("Cameras"))
 
         # Keep the live pair usable even when the camera workspace also shows
         # discovery, detection, and mapping controls.  Those controls have
         # sizeable layout hints and previously squeezed this splitter down to
         # a narrow strip on typical workstation displays.
-        self.workspace_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        self.workspace_splitter.setChildrenCollapsible(False)
-        self.workspace_splitter.setSizePolicy(
-            QtWidgets.QSizePolicy.Expanding,
-            QtWidgets.QSizePolicy.Expanding,
-        )
-        self.preview_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        self.preview_splitter.setChildrenCollapsible(False)
         self.preview_splitter.setMinimumHeight(320)
-        self.preview_splitter.setSizePolicy(
-            QtWidgets.QSizePolicy.Expanding,
-            QtWidgets.QSizePolicy.Expanding,
-        )
         self.previews = {side: CameraPreview(side) for side in ("left", "right")}
         self.preview_splitter.addWidget(self.previews["left"])
         self.preview_splitter.addWidget(self.previews["right"])
         self.preview_splitter.setStretchFactor(0, 1)
         self.preview_splitter.setStretchFactor(1, 1)
-        self.workspace_splitter.addWidget(self.preview_splitter)
-
-        details = QtWidgets.QWidget()
-        details_layout = QtWidgets.QVBoxLayout(details)
-        details_layout.setContentsMargins(0, 0, 0, 0)
-        details_layout.setSpacing(6)
-        facts = QtWidgets.QGroupBox("Status")
-        facts_layout = QtWidgets.QGridLayout(facts)
+        facts_layout = self.facts.layout()
         self.camera_values = {}
         for col, (key, label) in enumerate((("camera.left", "CAM L"), ("camera.right", "CAM R"), ("fps", "Decoded FPS"), ("detection", "Detection"))):
             value = EngineeringValue(label)
@@ -93,12 +72,9 @@ class CameraWorkspace(QtWidgets.QWidget):
             value = EngineeringValue(f"Decoder {side.upper()}")
             self.decoder_values[side] = value
             facts_layout.addWidget(value, 1, col)
-        details_layout.addWidget(facts)
 
-        stream_metrics_group = QtWidgets.QGroupBox("RTP / decode")
-        stream_metrics_layout = QtWidgets.QVBoxLayout(stream_metrics_group)
-        stream_metrics_layout.setContentsMargins(6, 6, 6, 6)
-        stream_metrics_layout.setSpacing(2)
+        stream_metrics_group = self.stream_metrics_group
+        stream_metrics_layout = stream_metrics_group.layout()
         self.stream_metric_labels: dict[str, QtWidgets.QLabel] = {}
         for side in ("left", "right"):
             label = QtWidgets.QLabel(format_camera_input_metrics(side, {}))
@@ -111,18 +87,8 @@ class CameraWorkspace(QtWidgets.QWidget):
             label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
             self.stream_metric_labels[side] = label
             stream_metrics_layout.addWidget(label)
-        stream_metrics_group.setToolTip(
-            "GStreamer worker의 최근 5초 rolling rate입니다. "
-            "RTP missing은 sequence gap으로 추정한 누락 패킷 수입니다."
-        )
         self.stream_metrics_group = stream_metrics_group
-        details_layout.addWidget(stream_metrics_group)
-
-        detection_group = QtWidgets.QGroupBox("Detection")
-        detection_layout = QtWidgets.QVBoxLayout(detection_group)
-        detection_layout.setContentsMargins(6, 6, 6, 6)
-        config_layout = QtWidgets.QGridLayout()
-        config_layout.setContentsMargins(0, 0, 0, 0)
+        config_layout = self.configLayout
         self.detection_config_values: dict[str, EngineeringValue] = {}
         for index, (key, label) in enumerate(
             (
@@ -137,117 +103,70 @@ class CameraWorkspace(QtWidgets.QWidget):
             value = EngineeringValue(label)
             self.detection_config_values[key] = value
             config_layout.addWidget(value, index // 3, index % 3)
-        detection_layout.addLayout(config_layout)
         self.target_model = _table_model(
             self,
             ("Camera", "State", "Class", "Conf", "bbox_px [x1,y1,x2,y2]", "Detection t", "Age"),
         )
-        self.target_table = QtWidgets.QTableView()
         self.target_table.setModel(self.target_model)
-        self.target_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.target_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.target_table.verticalHeader().setVisible(False)
-        self.target_table.setMaximumHeight(118)
-        self.target_table.horizontalHeader().setStretchLastSection(True)
-        detection_layout.addWidget(self.target_table)
-        details_layout.addWidget(detection_group)
 
-        operations_group = QtWidgets.QGroupBox("Connect")
-        operations_layout = QtWidgets.QGridLayout(operations_group)
-        operations_layout.setContentsMargins(6, 6, 6, 6)
+        operations_group = QtWidgets.QGroupBox()
+        load_form("camera_connect.ui", operations_group)
         self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
-        for index, (command_id, label) in enumerate(
-            (
-                ("camera.discover_host_ip", "Find network"),
-                ("camera.toggle", "Preview"),
-                ("camera.auto_connect", "Connect cameras"),
-                ("camera.check_control", "Check control"),
-                ("camera.enable_rtsp", "Enable stream"),
-                ("camera.check_rtsp", "Check video"),
-            )
-        ):
-            button = _command_button(label, command_id, invoke_command)
+        for index, command_id in enumerate((
+            "camera.discover_host_ip", "camera.toggle", "camera.auto_connect",
+            "camera.check_control", "camera.enable_rtsp", "camera.check_rtsp",
+        )):
+            button = getattr(operations_group, f"operation{index}")
+            button.setProperty("commandId", command_id)
+            button.setEnabled(invoke_command is not None)
+            if invoke_command is not None:
+                button.clicked.connect(lambda _checked=False, command=command_id: invoke_command(command))
             self.operation_buttons[command_id] = button
-            operations_layout.addWidget(button, index // 3, index % 3)
-        details_layout.addWidget(operations_group)
+        self.connectHostLayout.addWidget(operations_group)
 
-        candidates_group = QtWidgets.QGroupBox("Discovered endpoints")
-        candidates_layout = QtWidgets.QVBoxLayout(candidates_group)
+        candidates_group = QtWidgets.QGroupBox()
+        load_form("camera_candidates.ui", candidates_group)
         self.discovery_status = EngineeringValue("Discovery")
-        candidates_layout.addWidget(self.discovery_status)
+        candidates_group.discoveryLayout.addWidget(self.discovery_status)
         self.candidate_model = _table_model(
             self,
             ("Kind", "Address", "Port", "Status", "Interface", "Host IP", "Assigned"),
         )
-        self.candidate_table = QtWidgets.QTableView()
+        self.candidate_table = candidates_group.table
         self.candidate_table.setModel(self.candidate_model)
-        self.candidate_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.candidate_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.candidate_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.candidate_table.verticalHeader().setVisible(False)
-        self.candidate_table.setMaximumHeight(120)
-        self.candidate_table.horizontalHeader().setStretchLastSection(True)
         self.candidate_table.selectionModel().selectionChanged.connect(self._refresh_candidate_actions)
         self.candidate_table.clicked.connect(self._inspect_candidate_row)
-        candidates_layout.addWidget(self.candidate_table)
-        candidate_actions = QtWidgets.QHBoxLayout()
-        self.candidate_buttons: dict[str, QtWidgets.QPushButton] = {}
-        for target, label in (("nic", "Assign Camera NIC"), ("left", "Assign CAM L"), ("right", "Assign CAM R")):
-            button = QtWidgets.QPushButton(label)
-            button.setEnabled(False)
+        self.candidate_buttons = {}
+        for target in ("nic", "left", "right"):
+            button = getattr(candidates_group, target)
             button.clicked.connect(lambda _checked=False, target=target: self._apply_candidate(target))
             self.candidate_buttons[target] = button
-            candidate_actions.addWidget(button)
-        candidate_actions.addStretch(1)
-        candidates_layout.addLayout(candidate_actions)
-        self.candidate_feedback = QtWidgets.QLabel("")
+        self.candidate_feedback = candidates_group.feedback
         self.candidate_feedback.setObjectName("statusStrip")
-        self.candidate_feedback.setWordWrap(True)
-        candidates_layout.addWidget(self.candidate_feedback)
-        details_layout.addWidget(candidates_group)
+        self.candidatesHostLayout.addWidget(candidates_group)
         self._candidate_signature: tuple[tuple[object, ...], ...] = ()
         self._recording_locked = False
         self._network_role_locked = False
 
-        mapping_group = QtWidgets.QGroupBox("Mapping")
-        mapping_layout = QtWidgets.QHBoxLayout(mapping_group)
-        mapping_layout.setContentsMargins(6, 6, 6, 6)
-        for command_id, label, tooltip in (
-            ("camera.swap", "Swap L/R", "Swap the current Left/Right camera mapping."),
-            ("camera.save_settings", "Save", "Save the current camera settings."),
-            (
-                "camera.reactivate_left",
-                "Reactivate CAM L",
-                "Safely send SETH TRUE for the left camera, verify frames, and reconnect its preview.",
-            ),
-            (
-                "camera.reactivate_right",
-                "Reactivate CAM R",
-                "Safely send SETH TRUE for the right camera, verify frames, and reconnect its preview.",
-            ),
-            ("advanced.open", "Advanced", "Open Workstation advanced diagnostics and tools."),
-        ):
-            button = _command_button(label, command_id, invoke_command)
-            button.setToolTip(tooltip)
+        mapping_group = QtWidgets.QGroupBox()
+        load_form("camera_mapping.ui", mapping_group)
+        for index, command_id in enumerate((
+            "camera.swap", "camera.save_settings", "camera.reactivate_left",
+            "camera.reactivate_right", "advanced.open",
+        )):
+            button = getattr(mapping_group, f"mapping{index}")
+            button.setProperty("commandId", command_id)
+            button.setEnabled(invoke_command is not None)
+            if invoke_command is not None:
+                button.clicked.connect(lambda _checked=False, command=command_id: invoke_command(command))
             self.operation_buttons[command_id] = button
-            mapping_layout.addWidget(button)
-        mapping_layout.addStretch(1)
-        details_layout.addWidget(mapping_group)
+        self.mappingHostLayout.addWidget(mapping_group)
 
-        details_layout.addWidget(self._build_image_format_group(invoke_command))
-        details_layout.addStretch(1)
-
-        self.details_scroll = QtWidgets.QScrollArea()
-        self.details_scroll.setWidgetResizable(True)
-        self.details_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        self.details_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        self.details_scroll.setWidget(details)
-        self.details_scroll.setMinimumHeight(120)
-        self.workspace_splitter.addWidget(self.details_scroll)
+        self.formatHostLayout.addWidget(self._build_image_format_group(invoke_command))
+        self.detailsLayout.addStretch(1)
         self.workspace_splitter.setStretchFactor(0, 3)
         self.workspace_splitter.setStretchFactor(1, 1)
         self.workspace_splitter.setSizes([600, 240])
-        layout.addWidget(self.workspace_splitter, 1)
         self._connect_panes()
 
     # -- Image Format group ---------------------------------------------
@@ -270,52 +189,31 @@ class CameraWorkspace(QtWidgets.QWidget):
     def _build_image_format_group(
         self, invoke_command: Callable[[str], bool] | None
     ) -> QtWidgets.QGroupBox:
-        group = QtWidgets.QGroupBox("Image Format")
-        layout = QtWidgets.QVBoxLayout(group)
-
-        status_layout = QtWidgets.QGridLayout()
-        status_layout.setHorizontalSpacing(10)
+        group = QtWidgets.QGroupBox()
+        load_form("camera_image_format.ui", group)
         self.image_format_values: dict[str, EngineeringValue] = {}
         get_commands = tuple(get_cmd for _set_cmd, get_cmd, _label in self.IMAGE_FORMAT_TOGGLES) + ("GILC",)
         for row, side in enumerate(("left", "right")):
             for col, get_cmd in enumerate(get_commands):
                 value = EngineeringValue(f"{side.title()} {get_cmd}")
                 self.image_format_values[f"{side}_{get_cmd}"] = value
-                status_layout.addWidget(value, row, col)
-        layout.addLayout(status_layout)
-
-        toggle_layout = QtWidgets.QHBoxLayout()
-        self.image_format_checkboxes: dict[str, QtWidgets.QCheckBox] = {}
-        for set_cmd, _get_cmd, label in self.IMAGE_FORMAT_TOGGLES:
-            checkbox = QtWidgets.QCheckBox(label)
-            checkbox.setToolTip(
-                f"체크: 양쪽 카메라에 {set_cmd} TRUE 전송. 해제: 양쪽에 {set_cmd} FALSE 전송."
-            )
+                group.statusLayout.addWidget(value, row, col)
+        self.image_format_checkboxes = {}
+        for set_cmd, _get_cmd, _label in self.IMAGE_FORMAT_TOGGLES:
+            checkbox = getattr(group, set_cmd)
             checkbox.toggled.connect(
                 lambda checked, set_cmd=set_cmd: self._on_image_format_checkbox_toggled(set_cmd, checked)
             )
             self.image_format_checkboxes[set_cmd] = checkbox
-            toggle_layout.addWidget(checkbox)
-        toggle_layout.addStretch(1)
-        layout.addLayout(toggle_layout)
-
-        actions_layout = QtWidgets.QHBoxLayout()
-        refresh_button = _command_button(
-            "새로고침", "camera.refresh_image_format_status", invoke_command
-        )
-        refresh_button.setToolTip("좌우 GIVI/GIRJ/GISR/GIHR/GILC 상태를 다시 조회합니다.")
-        self.operation_buttons["camera.refresh_image_format_status"] = refresh_button
-        actions_layout.addWidget(refresh_button)
-        preset_button = _command_button(
-            "OZ 전용 초기화", "camera.apply_oz_only_image_format", invoke_command
-        )
-        preset_button.setToolTip(
-            "SIRJ FALSE, SISR FALSE, SIHR FALSE, SIVI TRUE를 양쪽 카메라에 전송합니다."
-        )
-        self.operation_buttons["camera.apply_oz_only_image_format"] = preset_button
-        actions_layout.addWidget(preset_button)
-        actions_layout.addStretch(1)
-        layout.addLayout(actions_layout)
+        for button, command_id in (
+            (group.refresh, "camera.refresh_image_format_status"),
+            (group.preset, "camera.apply_oz_only_image_format"),
+        ):
+            button.setProperty("commandId", command_id)
+            button.setEnabled(invoke_command is not None)
+            if invoke_command is not None:
+                button.clicked.connect(lambda _checked=False, command=command_id: invoke_command(command))
+            self.operation_buttons[command_id] = button
         return group
 
     def _on_image_format_checkbox_toggled(self, set_command: str, checked: bool) -> None:

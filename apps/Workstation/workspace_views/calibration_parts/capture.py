@@ -10,6 +10,7 @@ import math
 import time
 from collections.abc import Mapping
 from PyQt5 import QtCore, QtGui, QtWidgets
+from Workstation.ui.designer import load_form
 from Workstation.ui.components import StatusIndicator
 from Workstation.application.status_model import RuntimeStatus, StatusSeverity
 from ..shared import _command_button
@@ -36,234 +37,66 @@ class CalibrationCaptureSurface(QtCore.QObject):
         self.camera_buttons = {}
         self.invoke_command = None
         self._calibration_capture_log_lines = {"left": [], "right": []}
-        zoom_group = QtWidgets.QGroupBox("Actual zoom readback")
-        zoom_layout = QtWidgets.QHBoxLayout(zoom_group)
-        self.zoom_level_spin = QtWidgets.QSpinBox()
-        # This control carries the WIRIS zoom *index*, not the optical ratio:
-        # index 0 is the nominal 1.0x position and index 1 is nominal 1.2x.
-        self.zoom_level_spin.setRange(0, 100)
-        self.zoom_level_spin.setValue(1)
-        self.zoom_level_spin.setToolTip(
-            "WIRIS zoom index (index 0 = nominal 1.0x; index 1 = nominal 1.2x)."
-        )
-        self.zoom_set_button = QtWidgets.QPushButton("Set both")
-        self.zoom_in_button = QtWidgets.QPushButton("Zoom-in")
-        self.zoom_out_button = QtWidgets.QPushButton("Zoom-out")
-        self.zoom_query_button = QtWidgets.QPushButton("GZVV")
-        self.zoom_readback_label = QtWidgets.QLabel(
-            "left=unknown, right=unknown"
-        )
+        self.zoom_group = load_form("calibration_zoom.ui", QtWidgets.QGroupBox())
+        for name in ("zoom_level_spin", "zoom_set_button", "zoom_in_button", "zoom_out_button", "zoom_query_button", "zoom_readback_label"):
+            setattr(self, name, getattr(self.zoom_group, name))
+        # The numeric value remains a WIRIS zoom index, not an optical ratio.
         self.zoom_readback_label.setObjectName("statusStrip")
-        self.zoom_readback_label.setWordWrap(True)
-        self.zoom_set_button.clicked.connect(
-            lambda: self._send_calibration_zoom(
-                "set", self.zoom_level_spin.value()
-            )
-        )
-        self.zoom_query_button.clicked.connect(
-            lambda: self._send_calibration_zoom("query", None)
-        )
-        self.zoom_in_button.clicked.connect(
-            lambda: self._send_calibration_zoom("in", None)
-        )
-        self.zoom_out_button.clicked.connect(
-            lambda: self._send_calibration_zoom("out", None)
-        )
-        self.zoom_in_button.setToolTip(
-            "Send WIRIS SZIN to both cameras, then refresh the GZVV readback."
-        )
-        self.zoom_out_button.setToolTip(
-            "Send WIRIS SZOT to both cameras, then refresh the GZVV readback."
-        )
-        zoom_layout.addWidget(QtWidgets.QLabel("Index"))
-        zoom_layout.addWidget(self.zoom_level_spin)
-        zoom_layout.addWidget(self.zoom_set_button)
-        zoom_layout.addWidget(self.zoom_in_button)
-        zoom_layout.addWidget(self.zoom_out_button)
-        zoom_layout.addWidget(self.zoom_query_button)
-        zoom_layout.addWidget(self.zoom_readback_label, 1)
-        self.zoom_group = zoom_group
+        self.zoom_set_button.clicked.connect(lambda: self._send_calibration_zoom("set", self.zoom_level_spin.value()))
+        self.zoom_query_button.clicked.connect(lambda: self._send_calibration_zoom("query", None))
+        self.zoom_in_button.clicked.connect(lambda: self._send_calibration_zoom("in", None))
+        self.zoom_out_button.clicked.connect(lambda: self._send_calibration_zoom("out", None))
 
 
     def _build_simple_calibration_tabs(self, quality_text="", profile_text="") -> QtWidgets.QTabWidget:
-        """Build the StereoWIRIS-style primary capture-to-apply workflow.
-
-        This is intentionally a thin command surface.  The authoritative
-        calculation, quality, zoom, native-raster, persistence, and Apply
-        gates remain owned by the existing Workstation controllers exposed in
-        the advanced surface below it.
-        """
-
-        tabs = QtWidgets.QTabWidget()
-        tabs.setObjectName("simpleCalibrationTabs")
-        tabs.setDocumentMode(True)
-        self.simple_calibration_buttons: dict[str, list[QtWidgets.QPushButton]] = {}
-
-        def command_button(command_id: str, label: str) -> QtWidgets.QPushButton:
-            button = _command_button(label, command_id, self.invoke_command)
-            button.setMinimumWidth(150)
-            button.setSizePolicy(
-                QtWidgets.QSizePolicy.Expanding,
-                QtWidgets.QSizePolicy.Fixed,
-            )
-            self.simple_calibration_buttons.setdefault(command_id, []).append(button)
-            self.commands.primary.setdefault(command_id, button)
-            self.commands.instances.setdefault(command_id, []).append(button)
-            return button
-
-        capture_page = QtWidgets.QWidget()
-        capture_layout = QtWidgets.QVBoxLayout(capture_page)
-        capture_layout.setContentsMargins(8, 8, 8, 8)
-        capture_layout.setSpacing(6)
-        capture_title = QtWidgets.QLabel(
-            "1. 운용 줌을 확인하고 보드를 상·하·좌·우, 거리와 기울기를 바꿔 촬영하세요."
-        )
-        capture_title.setObjectName("compactContract")
-        capture_title.setWordWrap(True)
-        capture_layout.addWidget(capture_title)
-        zoom_row = QtWidgets.QHBoxLayout()
-        zoom_row.addWidget(QtWidgets.QLabel("줌 index"))
-        simple_zoom_spin = QtWidgets.QSpinBox()
+        """Bind the Designer capture-to-apply surface to existing command owners."""
+        tabs = load_form("calibration_simple.ui", QtWidgets.QTabWidget())
+        self.simple_calibration_buttons = {}
+        for button in tabs.findChildren(QtWidgets.QPushButton):
+            command = button.property("commandId")
+            if not command:
+                continue
+            button.setEnabled(self.invoke_command is not None)
+            if self.invoke_command is not None:
+                button.clicked.connect(lambda _checked=False, command=command: self.invoke_command(command))
+            self.simple_calibration_buttons.setdefault(command, []).append(button)
+            self.commands.primary.setdefault(command, button)
+            self.commands.instances.setdefault(command, []).append(button)
+        simple_zoom_spin = tabs.simple_zoom_spin
         simple_zoom_spin.setObjectName("simpleCalibrationZoomIndex")
         simple_zoom_spin.setRange(self.zoom_level_spin.minimum(), self.zoom_level_spin.maximum())
         simple_zoom_spin.setValue(self.zoom_level_spin.value())
         simple_zoom_spin.valueChanged.connect(self.zoom_level_spin.setValue)
         self.zoom_level_spin.valueChanged.connect(simple_zoom_spin.setValue)
-        zoom_row.addWidget(simple_zoom_spin)
-        simple_set_zoom = QtWidgets.QPushButton("좌우 줌 적용")
-        simple_set_zoom.clicked.connect(
-            lambda: self._send_calibration_zoom("set", simple_zoom_spin.value())
-        )
-        simple_query_zoom = QtWidgets.QPushButton("줌 확인")
-        simple_query_zoom.clicked.connect(
-            lambda: self._send_calibration_zoom("query", None)
-        )
-        zoom_row.addWidget(simple_set_zoom)
-        zoom_row.addWidget(simple_query_zoom)
-        zoom_row.addStretch(1)
-        capture_layout.addLayout(zoom_row)
-        simple_zoom_status = QtWidgets.QLabel(self.zoom_readback_label.text())
-        simple_zoom_status.setObjectName("simpleCalibrationZoomStatus")
-        simple_zoom_status.setWordWrap(True)
-        self.simple_calibration_zoom_status = simple_zoom_status
-        capture_layout.addWidget(simple_zoom_status)
-
-        simple_preview_splitter = self.preview.build_simple_previews(capture_page)
-
-        board_status_row = QtWidgets.QHBoxLayout()
-        board_status_row.setSpacing(6)
-        self.simple_calibration_board_indicators: dict[str, StatusIndicator] = {}
+        tabs.simple_set_zoom.clicked.connect(lambda: self._send_calibration_zoom("set", simple_zoom_spin.value()))
+        tabs.simple_query_zoom.clicked.connect(lambda: self._send_calibration_zoom("query", None))
+        self.simple_calibration_zoom_status = tabs.simple_calibration_zoom_status
+        self.simple_calibration_zoom_status.setObjectName("simpleCalibrationZoomStatus")
+        self.simple_calibration_zoom_status.setText(self.zoom_readback_label.text())
+        self.simple_calibration_board_indicators = {}
         for side, label in (("left", "보드 L"), ("right", "보드 R")):
             indicator = StatusIndicator(label, compact=True)
-            indicator.setSizePolicy(
-                QtWidgets.QSizePolicy.Expanding,
-                QtWidgets.QSizePolicy.Fixed,
-            )
+            indicator.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
             self.simple_calibration_board_indicators[side] = indicator
-            board_status_row.addWidget(indicator, 1)
-        capture_layout.addLayout(board_status_row)
-
-        capture_actions = QtWidgets.QGridLayout()
-        for index, (command_id, label) in enumerate(
-            (
-                ("camera.toggle", "미리보기"),
-                ("calibration.capture_images", "Live pair 캡처"),
-                ("calibration.capture_images_wiris_ftp_oz", "OZ 촬영 + 가져오기"),
-                ("calibration.auto_capture", "자동 캡처"),
-            )
+            tabs.board_status_row.addWidget(indicator, 1)
+        for name, object_name, text in (
+            ("simple_calibration_run_status", "simpleCalibrationRunStatus", "이번 촬영: 검사 0 · Stereo 저장 0 · K,D 전용 0 · 실패 0"),
+            ("simple_calibration_set_status", "simpleCalibrationSetStatus", "현재 캡처 세트: L 0/20 · R 0/20 · Stereo 저장 후보 0 · K,D 전용 L0/R0"),
+            ("simple_calibration_capture_status", "simpleCalibrationCaptureStatus", f"최근 상태: {self.capture_summary_label.text()}"),
         ):
-            capture_actions.addWidget(command_button(command_id, label), index // 2, index % 2)
-        capture_layout.addLayout(capture_actions)
-
-        simple_run_status = _ElidedStatusLabel(
-            "이번 촬영: 검사 0 · Stereo 저장 0 · K,D 전용 0 · 실패 0"
-        )
-        simple_run_status.setObjectName("simpleCalibrationRunStatus")
-        self.simple_calibration_run_status = simple_run_status
-        capture_layout.addWidget(simple_run_status)
-
-        simple_set_status = _ElidedStatusLabel(
-            "현재 캡처 세트: L 0/20 · R 0/20 · Stereo 저장 후보 0 · K,D 전용 L0/R0"
-        )
-        simple_set_status.setObjectName("simpleCalibrationSetStatus")
-        self.simple_calibration_set_status = simple_set_status
-        capture_layout.addWidget(simple_set_status)
-
-        simple_capture_status = _ElidedStatusLabel(
-            f"최근 상태: {self.capture_summary_label.text()}"
-        )
-        simple_capture_status.setObjectName("simpleCalibrationCaptureStatus")
-        self.simple_calibration_capture_status = simple_capture_status
-        capture_layout.addWidget(simple_capture_status)
-        capture_layout.addWidget(simple_preview_splitter)
-        capture_layout.addStretch(1)
-        tabs.addTab(capture_page, "촬영")
-
-        compute_page = QtWidgets.QWidget()
-        compute_layout = QtWidgets.QVBoxLayout(compute_page)
-        compute_layout.setContentsMargins(8, 8, 8, 8)
-        compute_layout.setSpacing(8)
-        compute_title = QtWidgets.QLabel(
-            "2. 전체 사진으로 K,D를 계산하고 품질 통과 후 필요하면 stereo R,t를 계산하세요."
-        )
-        compute_title.setObjectName("compactContract")
-        compute_title.setWordWrap(True)
-        compute_layout.addWidget(compute_title)
-        compute_actions = QtWidgets.QGridLayout()
-        for index, (command_id, label) in enumerate(
-            (
-                ("calibration.run_intrinsic", "K,D 계산"),
-                ("calibration.save_intrinsics", "K,D 저장"),
-                ("calibration.run_extrinsics", "R,t 계산"),
-                ("calibration.save_extrinsics", "R,t 저장"),
-                ("calibration.apply_bundle", "검증된 bundle 적용"),
-            )
-        ):
-            compute_actions.addWidget(command_button(command_id, label), index // 2, index % 2)
-        compute_layout.addLayout(compute_actions)
-        simple_quality_status = QtWidgets.QLabel(quality_text)
-        simple_quality_status.setObjectName("simpleCalibrationQualityStatus")
-        simple_quality_status.setWordWrap(True)
-        self.simple_calibration_quality_status = simple_quality_status
-        compute_layout.addWidget(simple_quality_status)
-        compute_note = QtWidgets.QLabel(
-            "FAIL은 저장·적용을 차단하고, WARNING은 고급 캘리브레이션에서 사유 검토와 명시적 승인이 필요합니다."
-        )
-        compute_note.setObjectName("compactContract")
-        compute_note.setWordWrap(True)
-        compute_layout.addWidget(compute_note)
-        compute_layout.addStretch(1)
-        tabs.addTab(compute_page, "계산·적용")
-
-        profile_page = QtWidgets.QWidget()
-        profile_layout = QtWidgets.QVBoxLayout(profile_page)
-        profile_layout.setContentsMargins(8, 8, 8, 8)
-        profile_layout.setSpacing(8)
-        profile_title = QtWidgets.QLabel(
-            "3. 현재 줌·해상도와 일치하는 K,D와 호환되는 R,t만 불러와 적용합니다."
-        )
-        profile_title.setObjectName("compactContract")
-        profile_title.setWordWrap(True)
-        profile_layout.addWidget(profile_title)
-        profile_actions = QtWidgets.QGridLayout()
-        for index, (command_id, label) in enumerate(
-            (
-                ("calibration.load_intrinsics", "K,D 불러오기"),
-                ("calibration.load_extrinsics", "R,t 불러오기"),
-                ("calibration.apply_bundle", "검증된 bundle 적용"),
-            )
-        ):
-            profile_actions.addWidget(command_button(command_id, label), index // 2, index % 2)
-        profile_layout.addLayout(profile_actions)
-        simple_profile_status = QtWidgets.QLabel(
-            profile_text
-        )
-        simple_profile_status.setObjectName("simpleCalibrationProfileStatus")
-        simple_profile_status.setWordWrap(True)
-        self.simple_calibration_profile_status = simple_profile_status
-        profile_layout.addWidget(simple_profile_status)
-        profile_layout.addStretch(1)
-        tabs.addTab(profile_page, "프로파일")
+            label = _ElidedStatusLabel(text)
+            label.setObjectName(object_name)
+            setattr(self, name, label)
+            getattr(tabs, name + "Layout").addWidget(label)
+        tabs.previewLayout.addWidget(self.preview.build_simple_previews(tabs.capture_page))
+        self.simple_calibration_quality_status = tabs.simple_calibration_quality_status
+        self.simple_calibration_quality_status.setObjectName("simpleCalibrationQualityStatus")
+        self.simple_calibration_quality_status.setText(quality_text)
+        self.simple_calibration_profile_status = tabs.simple_calibration_profile_status
+        self.simple_calibration_profile_status.setObjectName("simpleCalibrationProfileStatus")
+        self.simple_calibration_profile_status.setText(profile_text)
+        for label in (tabs.capture_title, tabs.compute_title, tabs.profile_title, tabs.compute_note):
+            label.setObjectName("compactContract")
         return tabs
 
 
@@ -471,163 +304,62 @@ class CalibrationCaptureSurface(QtCore.QObject):
 
 
     def _build_shared_capture_surface(self) -> QtWidgets.QGroupBox:
-        group = QtWidgets.QGroupBox("Capture while viewing")
+        group = load_form("calibration_capture.ui", QtWidgets.QGroupBox())
         group.setObjectName("calibrationSharedCaptureSurface")
-        layout = QtWidgets.QVBoxLayout(group)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(6)
-
-        actions = QtWidgets.QGridLayout()
-        actions.setHorizontalSpacing(6)
-        actions.setVerticalSpacing(5)
-        capture_actions = (
-            ("camera.toggle", "Preview"),
-            ("calibration.capture_images", "Capture Live Pair"),
-            ("calibration.auto_capture", "Start auto capture"),
-            ("calibration.capture_images_wiris_ftp", "Capture HR Still (FTP)"),
-            ("calibration.capture_images_wiris_ftp_oz", "Capture OZ Still (FTP)"),
-            ("calibration.capture_images_wiris_oz_capture_only", "OZ 촬영"),
-            ("calibration.sync_images_wiris_oz_ftp", "FTP 자동 전송"),
-        )
-        for index, (command_id, label) in enumerate(capture_actions):
-            if command_id == "camera.toggle":
-                button = _command_button(label, command_id, self.invoke_command)
-                self.camera_buttons[command_id] = button
+        for button in group.findChildren(QtWidgets.QPushButton):
+            command = button.property("commandId")
+            if not command:
+                continue
+            button.setEnabled(self.invoke_command is not None)
+            if self.invoke_command is not None:
+                button.clicked.connect(lambda _checked=False, command=command: self.invoke_command(command))
+            if command == "camera.toggle":
+                self.camera_buttons[command] = button
             else:
-                button = self._register_capture_button(command_id, label)
-                if command_id == "calibration.auto_capture":
-                    button.setToolTip(
-                        "Capture checkerboards only from exact NAL1 non-delta native "
-                        "FrameKeys. Expired keys wait for the next candidate; pairs over "
-                        "Max Live pair Δt remain per-camera K,D inputs and are excluded "
-                        "from stereo R,t."
-                    )
-            actions.addWidget(button, index // 4, index % 4)
-            if command_id == "calibration.capture_images":
+                self.commands.primary[command] = button
+                self.commands.instances.setdefault(command, []).append(button)
+            if command == "calibration.capture_images":
                 self.capture_primary_button = button
                 font = button.font()
                 font.setBold(True)
                 button.setFont(font)
-        layout.addLayout(actions)
-
-        pair_timing = QtWidgets.QHBoxLayout()
-        pair_timing_label = QtWidgets.QLabel("Max Live pair Δt")
-        pair_timing_label.setToolTip(
-            "Maximum absolute left/right timing difference accepted for a calibration "
-            "stereo pair. Live capture uses same-host decoded-frame app-receive monotonic "
-            "timestamps; FTP capture uses the synchronized CPTR host-dispatch proxy. "
-            "Neither host proxy proves exposure simultaneity. Captures over the limit "
-            "remain available per camera for K,D only."
-        )
-        pair_max_delta = QtWidgets.QDoubleSpinBox()
-        pair_max_delta.setObjectName("calibrationPairMaxDeltaMs")
-        pair_max_delta.setRange(0.0, 1000.0)
-        pair_max_delta.setSingleStep(5.0)
-        pair_max_delta.setDecimals(1)
-        initial_pair_max_delta = self._initial_calibration_setup.get(
-            "pair_max_delta_ms"
-        )
-        pair_max_delta.setValue(
-            100.0
-            if initial_pair_max_delta is None
-            else float(initial_pair_max_delta)
-        )
-        pair_max_delta.setSuffix(" ms")
-        pair_max_delta.setToolTip(pair_timing_label.toolTip())
-        self.setup_widgets["pair_max_delta_ms"] = pair_max_delta
-        pair_timing.addWidget(pair_timing_label)
-        pair_timing.addWidget(pair_max_delta)
-        pair_timing.addWidget(
-            QtWidgets.QLabel(
-                "Live: app-receive proxy · FTP: CPTR dispatch proxy · exposure unverified"
-            )
-        )
-        pair_timing.addStretch(1)
-        layout.addLayout(pair_timing)
-
-        self.capture_summary_label = QtWidgets.QLabel(
-            "L: WAITING · R: WAITING · Pair: --"
-        )
+        for key in ("pair_max_delta_ms", "auto_interval_s"):
+            control = getattr(group, f"setup_widgets_{key}")
+            self.setup_widgets[key] = control
+            value = self._initial_calibration_setup.get(key)
+            if value is not None:
+                control.setValue(float(value) if key == "pair_max_delta_ms" else float(value or 1.0))
+        self.setup_widgets["pair_max_delta_ms"].setObjectName("calibrationPairMaxDeltaMs")
+        self.capture_summary_label = group.capture_summary_label
         self.capture_summary_label.setObjectName("statusStrip")
-        self.capture_summary_label.setWordWrap(True)
-        layout.addWidget(self.capture_summary_label)
         self._capture_summary_states = {"left": "WAITING", "right": "WAITING"}
         self._capture_pair_text = "--"
-
-        auto_group = QtWidgets.QGroupBox("Auto capture settings")
-        self.auto_capture_settings_group = auto_group
-        auto_group.setCheckable(True)
-        auto_group.setChecked(False)
-        auto_content = QtWidgets.QWidget()
-        self.auto_capture_settings_content = auto_content
-        auto_layout = QtWidgets.QGridLayout(auto_content)
-        auto_layout.setContentsMargins(6, 4, 6, 4)
-        auto_interval = QtWidgets.QDoubleSpinBox()
-        auto_interval.setRange(0.1, 10.0)
-        auto_interval.setSingleStep(0.1)
-        auto_interval.setDecimals(1)
-        auto_interval.setSuffix(" s")
-        auto_interval.setValue(
-            float(self._initial_calibration_setup.get("auto_interval_s") or 1.0)
-        )
-        self.setup_widgets["auto_interval_s"] = auto_interval
-        auto_layout.addWidget(QtWidgets.QLabel("Interval"), 0, 0)
-        auto_layout.addWidget(auto_interval, 0, 1)
-        auto_group_layout = QtWidgets.QVBoxLayout(auto_group)
-        auto_group_layout.addWidget(auto_content)
-        auto_content.setVisible(False)
-        auto_group.toggled.connect(auto_content.setVisible)
-        layout.addWidget(auto_group)
-
-        response_group = QtWidgets.QGroupBox("Capture command / response")
-        self.capture_response_outer_group = response_group
-        response_group.setCheckable(True)
-        response_group.setChecked(False)
-        response_content = self._build_calibration_capture_response_group()
-        self.capture_response_content = response_content
-        response_layout = QtWidgets.QVBoxLayout(response_group)
-        response_layout.addWidget(response_content)
-        response_content.setVisible(False)
-        response_group.toggled.connect(response_content.setVisible)
-        layout.addWidget(response_group)
+        for name in ("auto_capture_settings_group", "auto_capture_settings_content", "capture_response_outer_group", "capture_response_content"):
+            setattr(self, name, getattr(group, name))
+        for outer, inner in ((self.auto_capture_settings_group, self.auto_capture_settings_content), (self.capture_response_outer_group, self.capture_response_content)):
+            inner.setVisible(False)
+            outer.toggled.connect(inner.setVisible)
+        self._bind_capture_response(group)
         return group
 
+    def _bind_capture_response(self, group):
+        self.calibration_capture_response_edits = {}
+        self.calibration_capture_response_status = {}
+        for side in ("left", "right"):
+            status = getattr(group, f"calibration_capture_response_status_{side}")
+            status.setObjectName("statusStrip")
+            self.calibration_capture_response_status[side] = status
+            log = getattr(group, f"calibration_capture_response_edits_{side}")
+            log.setMaximumBlockCount(160)
+            self.calibration_capture_response_edits[side] = log
+        for button in group.findChildren(QtWidgets.QPushButton):
+            if button.property("captureClear"):
+                button.clicked.connect(self._clear_calibration_capture_response_logs)
 
     def _build_calibration_capture_response_group(self) -> QtWidgets.QGroupBox:
         """Show the raw capture lifecycle separately for the two cameras."""
-
-        group = QtWidgets.QGroupBox("Capture command / response")
-        layout = QtWidgets.QVBoxLayout(group)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(5)
-        split = QtWidgets.QHBoxLayout()
-        split.setSpacing(6)
-        self.calibration_capture_response_edits: dict[str, QtWidgets.QPlainTextEdit] = {}
-        self.calibration_capture_response_status: dict[str, QtWidgets.QLabel] = {}
-        for side, title in (("left", "Left camera"), ("right", "Right camera")):
-            side_group = QtWidgets.QGroupBox(title)
-            side_layout = QtWidgets.QVBoxLayout(side_group)
-            side_layout.setContentsMargins(5, 5, 5, 5)
-            status = QtWidgets.QLabel("대기")
-            status.setObjectName("statusStrip")
-            status.setWordWrap(True)
-            log = QtWidgets.QPlainTextEdit()
-            log.setReadOnly(True)
-            log.setMaximumBlockCount(160)
-            log.setMinimumHeight(92)
-            log.setPlaceholderText("이 카메라의 capture 명령과 응답이 표시됩니다.")
-            self.calibration_capture_response_status[side] = status
-            self.calibration_capture_response_edits[side] = log
-            side_layout.addWidget(status)
-            side_layout.addWidget(log)
-            split.addWidget(side_group, 1)
-        layout.addLayout(split)
-        actions = QtWidgets.QHBoxLayout()
-        actions.addStretch(1)
-        clear_button = QtWidgets.QPushButton("Clear capture responses")
-        clear_button.clicked.connect(self._clear_calibration_capture_response_logs)
-        actions.addWidget(clear_button)
-        layout.addLayout(actions)
+        group = load_form("calibration_capture_response.ui", QtWidgets.QGroupBox())
+        self._bind_capture_response(group)
         return group
 
 

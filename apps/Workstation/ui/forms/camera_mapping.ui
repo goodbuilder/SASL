@@ -1,0 +1,75 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>cameraMapping</class>
+ <widget class="QGroupBox" name="cameraMapping">
+  <property name="title">
+   <string>Mapping</string>
+  </property>
+  <layout class="QHBoxLayout" name="cameraMappingLayout">
+   <item>
+    <widget class="QPushButton" name="mapping0">
+     <property name="text">
+      <string>Swap L/R</string>
+     </property>
+     <property name="toolTip">
+      <string>Swap the current Left/Right camera mapping.</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QPushButton" name="mapping1">
+     <property name="text">
+      <string>Save</string>
+     </property>
+     <property name="toolTip">
+      <string>Save the current camera settings.</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QPushButton" name="mapping2">
+     <property name="text">
+      <string>Reactivate CAM L</string>
+     </property>
+     <property name="toolTip">
+      <string>Safely send SETH TRUE for the left camera, verify frames, and reconnect its preview.</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QPushButton" name="mapping3">
+     <property name="text">
+      <string>Reactivate CAM R</string>
+     </property>
+     <property name="toolTip">
+      <string>Safely send SETH TRUE for the right camera, verify frames, and reconnect its preview.</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QPushButton" name="mapping4">
+     <property name="text">
+      <string>Advanced</string>
+     </property>
+     <property name="toolTip">
+      <string>Open Workstation advanced diagnostics and tools.</string>
+     </property>
+    </widget>
+   </item>
+   <property name="leftMargin">
+    <number>6</number>
+   </property>
+   <property name="topMargin">
+    <number>6</number>
+   </property>
+   <property name="rightMargin">
+    <number>6</number>
+   </property>
+   <property name="bottomMargin">
+    <number>6</number>
+   </property>
+  </layout>
+ </widget>
+ <resources />
+ <connections />
+</ui>

@@ -3458,6 +3458,14 @@ class DeviceRuntimeController:
         manager = self.panel.px4_mag_managers.get(camera) if hasattr(self.panel, "px4_mag_managers") else None
         actual_selected = self.panel.latest_vehicle_mag_device_ids.get(camera)
         armed = bool(getattr(manager, "armed", False))
+        instance_device_ids: dict[int, int] = {}
+        if operation == "mag_apply":
+            topology_store = getattr(self.panel, "latest_sensor_mag_instances", {})
+            topology = topology_store.get(camera, {}) if isinstance(topology_store, Mapping) else {}
+            for instance, state in dict(topology or {}).items():
+                device_id = state.get("device_id") if isinstance(state, Mapping) else getattr(state, "device_id", None)
+                if device_id is not None:
+                    instance_device_ids[int(instance)] = int(device_id)
         job = None
         try:
             accepts_result = self._maintenance_result_guard(subscriber, camera)
@@ -3466,6 +3474,7 @@ class DeviceRuntimeController:
                 worker_factory=lambda: PixhawkParameterWorker(
                     subscriber, camera=camera, operation=operation,
                     actual_selected_device_id=actual_selected, armed=armed, priorities=priorities,
+                    instance_device_ids=instance_device_ids,
                 ),
                 completed=self._apply_owned_pixhawk_parameter_worker_result,
                 failed=lambda error: self._owned_pixhawk_parameter_worker_failed(camera, operation, error),
@@ -3584,6 +3593,7 @@ class DeviceRuntimeController:
         if operation == "calibration_refresh":
             self.panel._px4_calibration_parameter_error[camera] = str(error)
         if operation == "mag_apply":
+            voter_gap_block = "voter gap" in str(error).lower()
             targets = getattr(self.panel, "_px4_mag_verification_targets", None)
             if not isinstance(targets, dict):
                 targets = {}
@@ -3593,10 +3603,34 @@ class DeviceRuntimeController:
                 "started_s": time.monotonic(),
                 "error": str(error),
             }
+            if voter_gap_block:
+                show_block = getattr(self.panel, "_show_px4_mag_priority_blocked", None)
+                if callable(show_block):
+                    show_block(camera, str(error))
+            else:
+                invalidate = getattr(self.panel, "_invalidate_px4_mag_readback_after_apply_failure", None)
+                if callable(invalidate):
+                    invalidate(camera, str(error))
+                else:
+                    cache = getattr(self.panel, "_px4_mag_status_cache", None)
+                    if isinstance(cache, dict):
+                        cache.pop(camera, None)
         self.panel._log(
             f"[픽스호크] {camera_label_ko(camera)} PARAM 작업 실패 ({operation}): {error}"
         )
-        if operation == "mag_refresh" or operation == "mag_apply":
+        if operation == "mag_apply":
+            voter_gap_block = "voter gap" in str(error).lower()
+            self.panel._set_px4_mag_manager_button_state(
+                camera,
+                refresh_enabled=True,
+                actions_enabled=voter_gap_block,
+                tooltip=(
+                    "lower MAG filler를 Min (1) 이상으로 설정하세요."
+                    if voter_gap_block
+                    else "Refresh MAG로 실제 PARAM readback을 다시 확인하세요."
+                ),
+            )
+        elif operation == "mag_refresh":
             self.panel._set_px4_mag_manager_button_state(
                 camera,
                 refresh_enabled=True,

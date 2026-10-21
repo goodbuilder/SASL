@@ -1,0 +1,44 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>recordingMeasurements</class>
+ <widget class="QGroupBox" name="recordingMeasurements">
+  <property name="title">
+   <string>Measurements</string>
+  </property>
+  <layout class="QVBoxLayout" name="recordingMeasurementsLayout">
+   <item>
+    <widget class="QTableView" name="sessionsMeasurementTable">
+     <property name="editTriggers">
+      <enum>QAbstractItemView::NoEditTriggers</enum>
+     </property>
+     <property name="selectionBehavior">
+      <enum>QAbstractItemView::SelectRows</enum>
+     </property>
+     <property name="maximumHeight">
+      <number>180</number>
+     </property>
+     <attribute name="verticalHeaderVisible">
+      <bool>false</bool>
+     </attribute>
+     <attribute name="horizontalHeaderStretchLastSection">
+      <bool>true</bool>
+     </attribute>
+    </widget>
+   </item>
+   <property name="leftMargin">
+    <number>6</number>
+   </property>
+   <property name="topMargin">
+    <number>6</number>
+   </property>
+   <property name="rightMargin">
+    <number>6</number>
+   </property>
+   <property name="bottomMargin">
+    <number>6</number>
+   </property>
+  </layout>
+ </widget>
+ <resources />
+ <connections />
+</ui>

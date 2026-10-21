@@ -1,0 +1,474 @@
+{
+  "environment": "offscreen real panel and shell; hardware startup disabled; isolated network",
+  "views": [
+    {
+      "context": "overview",
+      "image": "overview-1366x900.png",
+      "width": 1366,
+      "height": 900,
+      "viewport_width": 790,
+      "viewport_height": 585
+    },
+    {
+      "context": "devices.cameras",
+      "image": "camera-1366x900.png",
+      "width": 1366,
+      "height": 900,
+      "viewport_width": 804,
+      "viewport_height": 585
+    },
+    {
+      "context": "processing.measurement",
+      "image": "measurement-1366x900.png",
+      "width": 1366,
+      "height": 900,
+      "viewport_width": 790,
+      "viewport_height": 585
+    },
+    {
+      "context": "tasks.data",
+      "image": "data-1366x900.png",
+      "width": 1366,
+      "height": 900,
+      "viewport_width": 790,
+      "viewport_height": 585
+    },
+    {
+      "context": "tasks.calibration",
+      "image": "calibration-1366x900.png",
+      "width": 1366,
+      "height": 900,
+      "viewport_width": 790,
+      "viewport_height": 585
+    },
+    {
+      "context": "tasks.advanced",
+      "image": "advanced-1366x900.png",
+      "width": 1366,
+      "height": 900,
+      "viewport_width": 790,
+      "viewport_height": 585
+    },
+    {
+      "context": "processing.experiment",
+      "image": "protocol-1366x900.png",
+      "width": 1366,
+      "height": 900,
+      "viewport_width": 790,
+      "viewport_height": 585
+    },
+    {
+      "context": "devices.time",
+      "image": "time-1366x900.png",
+      "width": 1366,
+      "height": 900,
+      "viewport_width": 790,
+      "viewport_height": 585
+    },
+    {
+      "context": "devices.telemetry",
+      "image": "telemetry-1366x900.png",
+      "width": 1366,
+      "height": 900,
+      "viewport_width": 790,
+      "viewport_height": 585
+    },
+    {
+      "context": "devices.gnss",
+      "image": "base_gnss-1366x900.png",
+      "width": 1366,
+      "height": 900,
+      "viewport_width": 790,
+      "viewport_height": 585
+    },
+    {
+      "context": "devices.pixhawk",
+      "image": "pixhawk-1366x900.png",
+      "width": 1366,
+      "height": 900,
+      "viewport_width": 790,
+      "viewport_height": 585
+    },
+    {
+      "context": "processing.alignment",
+      "image": "alignment-1366x900.png",
+      "width": 1366,
+      "height": 900,
+      "viewport_width": 790,
+      "viewport_height": 585
+    },
+    {
+      "context": "tasks.settings",
+      "image": "settings-1366x900.png",
+      "width": 1366,
+      "height": 900,
+      "viewport_width": 804,
+      "viewport_height": 585
+    },
+    {
+      "context": "overview",
+      "image": "overview-1366x768.png",
+      "width": 1366,
+      "height": 768,
+      "viewport_width": 790,
+      "viewport_height": 453
+    },
+    {
+      "context": "devices.cameras",
+      "image": "camera-1366x768.png",
+      "width": 1366,
+      "height": 768,
+      "viewport_width": 790,
+      "viewport_height": 453
+    },
+    {
+      "context": "processing.measurement",
+      "image": "measurement-1366x768.png",
+      "width": 1366,
+      "height": 768,
+      "viewport_width": 790,
+      "viewport_height": 453
+    },
+    {
+      "context": "tasks.data",
+      "image": "data-1366x768.png",
+      "width": 1366,
+      "height": 768,
+      "viewport_width": 790,
+      "viewport_height": 453
+    },
+    {
+      "context": "tasks.calibration",
+      "image": "calibration-1366x768.png",
+      "width": 1366,
+      "height": 768,
+      "viewport_width": 790,
+      "viewport_height": 453
+    },
+    {
+      "context": "tasks.advanced",
+      "image": "advanced-1366x768.png",
+      "width": 1366,
+      "height": 768,
+      "viewport_width": 790,
+      "viewport_height": 453
+    },
+    {
+      "context": "processing.experiment",
+      "image": "protocol-1366x768.png",
+      "width": 1366,
+      "height": 768,
+      "viewport_width": 790,
+      "viewport_height": 453
+    },
+    {
+      "context": "devices.time",
+      "image": "time-1366x768.png",
+      "width": 1366,
+      "height": 768,
+      "viewport_width": 790,
+      "viewport_height": 453
+    },
+    {
+      "context": "devices.telemetry",
+      "image": "telemetry-1366x768.png",
+      "width": 1366,
+      "height": 768,
+      "viewport_width": 790,
+      "viewport_height": 453
+    },
+    {
+      "context": "devices.gnss",
+      "image": "base_gnss-1366x768.png",
+      "width": 1366,
+      "height": 768,
+      "viewport_width": 790,
+      "viewport_height": 453
+    },
+    {
+      "context": "devices.pixhawk",
+      "image": "pixhawk-1366x768.png",
+      "width": 1366,
+      "height": 768,
+      "viewport_width": 790,
+      "viewport_height": 453
+    },
+    {
+      "context": "processing.alignment",
+      "image": "alignment-1366x768.png",
+      "width": 1366,
+      "height": 768,
+      "viewport_width": 790,
+      "viewport_height": 453
+    },
+    {
+      "context": "tasks.settings",
+      "image": "settings-1366x768.png",
+      "width": 1366,
+      "height": 768,
+      "viewport_width": 804,
+      "viewport_height": 453
+    },
+    {
+      "context": "overview",
+      "image": "overview-1920x1080.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1344,
+      "viewport_height": 765
+    },
+    {
+      "context": "devices.cameras",
+      "image": "camera-1920x1080.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1358,
+      "viewport_height": 765
+    },
+    {
+      "context": "processing.measurement",
+      "image": "measurement-1920x1080.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1344,
+      "viewport_height": 765
+    },
+    {
+      "context": "tasks.data",
+      "image": "data-1920x1080.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1344,
+      "viewport_height": 765
+    },
+    {
+      "context": "tasks.calibration",
+      "image": "calibration-1920x1080.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1358,
+      "viewport_height": 765
+    },
+    {
+      "context": "tasks.advanced",
+      "image": "advanced-1920x1080.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1344,
+      "viewport_height": 765
+    },
+    {
+      "context": "processing.experiment",
+      "image": "protocol-1920x1080.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1344,
+      "viewport_height": 765
+    },
+    {
+      "context": "devices.time",
+      "image": "time-1920x1080.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1358,
+      "viewport_height": 765
+    },
+    {
+      "context": "devices.telemetry",
+      "image": "telemetry-1920x1080.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1344,
+      "viewport_height": 765
+    },
+    {
+      "context": "devices.gnss",
+      "image": "base_gnss-1920x1080.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1344,
+      "viewport_height": 765
+    },
+    {
+      "context": "devices.pixhawk",
+      "image": "pixhawk-1920x1080.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1344,
+      "viewport_height": 765
+    },
+    {
+      "context": "processing.alignment",
+      "image": "alignment-1920x1080.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1344,
+      "viewport_height": 765
+    },
+    {
+      "context": "tasks.settings",
+      "image": "settings-1920x1080.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1358,
+      "viewport_height": 765
+    },
+    {
+      "context": "tasks.settings",
+      "image": "settings-tab-0.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1358,
+      "viewport_height": 765
+    },
+    {
+      "context": "tasks.settings",
+      "image": "settings-tab-1.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1358,
+      "viewport_height": 765
+    },
+    {
+      "context": "tasks.settings",
+      "image": "settings-tab-2.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1358,
+      "viewport_height": 765
+    },
+    {
+      "context": "tasks.settings",
+      "image": "settings-tab-3.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1358,
+      "viewport_height": 765
+    },
+    {
+      "context": "tasks.settings",
+      "image": "settings-tab-4.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1358,
+      "viewport_height": 765
+    },
+    {
+      "context": "tasks.settings",
+      "image": "settings-tab-5.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1358,
+      "viewport_height": 765
+    },
+    {
+      "context": "tasks.settings",
+      "image": "settings-tab-6.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1358,
+      "viewport_height": 765
+    },
+    {
+      "context": "tasks.advanced",
+      "image": "advanced-tab-0.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1344,
+      "viewport_height": 765
+    },
+    {
+      "context": "tasks.advanced",
+      "image": "advanced-tab-1.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1344,
+      "viewport_height": 765
+    },
+    {
+      "context": "tasks.advanced",
+      "image": "advanced-tab-2.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1344,
+      "viewport_height": 765
+    },
+    {
+      "context": "tasks.advanced",
+      "image": "advanced-tab-3.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1344,
+      "viewport_height": 765
+    },
+    {
+      "context": "processing.alignment",
+      "image": "alignment-tab-0.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1344,
+      "viewport_height": 765
+    },
+    {
+      "context": "processing.alignment",
+      "image": "alignment-tab-1.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1344,
+      "viewport_height": 765
+    },
+    {
+      "context": "processing.alignment",
+      "image": "alignment-tab-2.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1344,
+      "viewport_height": 765
+    },
+    {
+      "context": "processing.alignment",
+      "image": "alignment-tab-3.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1344,
+      "viewport_height": 765
+    },
+    {
+      "context": "processing.alignment",
+      "image": "alignment-tab-4.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1344,
+      "viewport_height": 765
+    },
+    {
+      "context": "processing.alignment",
+      "image": "alignment-tab-5.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1344,
+      "viewport_height": 765
+    },
+    {
+      "context": "processing.alignment",
+      "image": "alignment-tab-6.png",
+      "width": 1920,
+      "height": 1080,
+      "viewport_width": 1344,
+      "viewport_height": 765
+    }
+  ],
+  "feature_count": 11,
+  "shutdown": {
+    "schema": "workstation-shutdown-resources-v1",
+    "complete": true,
+    "coordinator_step": "",
+    "running_threads": [],
+    "live_processes": [],
+    "open_sockets": [],
+    "shared_memory": []
+  },
+  "callback_errors": [],
+  "rendering_limitations": [],
+  "artifact_note": "Final source after direct-parent fixes. Full 57-capture set: /tmp/workstation-designer-final-v2. Representative PNGs retained here; regenerate with tools/capture_refactor_views.py --designer-coverage in isolated netns."
+}

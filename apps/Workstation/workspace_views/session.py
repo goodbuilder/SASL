@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Callable
 from PyQt5 import QtCore, QtWidgets
+from Workstation.ui.designer import load_form
 from Workstation.ui.components import WorkspaceHeader
 from Workstation.application.status_model import RuntimeStatus, StatusModel
 
@@ -31,105 +32,36 @@ class SessionWorkspace(QtWidgets.QWidget):
         self.begin_session_action = begin_session_action
         self._can_open_measurement = open_measurement is not None
         self._can_open_review = open_review is not None
-        layout = QtWidgets.QVBoxLayout(self)
+        load_form("recording_session.ui", self)
+        layout = self.pageLayout
         layout.setContentsMargins(*(0, 0, 0, 0) if embedded else (8, 8, 8, 8))
-        layout.setSpacing(6)
-        if not embedded:
-            layout.addWidget(
-                WorkspaceHeader(
-                    "Session",
-                    "Create one timestamped folder, then keep this run's outputs together",
-                )
-            )
-
-        self.lifecycle_group = QtWidgets.QGroupBox("Session folder")
-        lifecycle_layout = QtWidgets.QVBoxLayout(self.lifecycle_group)
-        lifecycle_layout.setContentsMargins(10, 10, 10, 10)
-        lifecycle_layout.setSpacing(8)
-
-        action_row = QtWidgets.QHBoxLayout()
-        action_row.setSpacing(8)
-        self.start_session_button = QtWidgets.QPushButton("Create Session Folder")
-        self.start_session_button.setObjectName("sessionWorkspaceOpen")
+        if embedded:
+            self.headerHost.hide()
+        else:
+            self.headerLayout.addWidget(WorkspaceHeader(
+                "Session", "Create one timestamped folder, then keep this run's outputs together"
+            ))
+        self.start_session_button = self.sessionWorkspaceOpen
+        self.close_session_button = self.sessionWorkspaceClose
         self.start_session_button.setCursor(QtCore.Qt.PointingHandCursor)
-        self.start_session_button.setSizePolicy(
-            QtWidgets.QSizePolicy.Maximum,
-            QtWidgets.QSizePolicy.Fixed,
-        )
-        self.start_session_button.setToolTip(
-            "Create recordings/YYYYMMDD_HHMMSS_nanoseconds and route subsequent outputs into it."
-        )
         self.start_session_button.clicked.connect(self._begin_measurement_session)
-        self.close_session_button = QtWidgets.QPushButton("Close Session")
-        self.close_session_button.setObjectName("sessionWorkspaceClose")
-        self.close_session_button.setSizePolicy(
-            QtWidgets.QSizePolicy.Maximum,
-            QtWidgets.QSizePolicy.Fixed,
-        )
-        self.close_session_button.setToolTip(
-            "Stop active Detection, save and seal the current Measurement, then close the Session."
-        )
         self.close_session_button.clicked.connect(self._close_measurement_session)
-        action_row.addWidget(self.start_session_button)
-        action_row.addWidget(self.close_session_button)
-        action_row.addStretch(1)
-        lifecycle_layout.addLayout(action_row)
-
-        folder_form = QtWidgets.QFormLayout()
-        folder_form.setContentsMargins(0, 0, 0, 0)
-        folder_form.setHorizontalSpacing(12)
-        folder_form.setVerticalSpacing(6)
-        self.session_status_label = QtWidgets.QLabel("No session folder")
-        self.session_status_label.setObjectName("sessionWorkspaceLifecycle")
-        self.session_status_label.setWordWrap(True)
-        self.folder_name_label = QtWidgets.QLabel("—")
-        self.folder_name_label.setObjectName("sessionWorkspaceFolderName")
-        self.folder_name_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        self.folder_name_label.setWordWrap(True)
-        self.folder_created_label = QtWidgets.QLabel("—")
-        self.folder_created_label.setObjectName("sessionWorkspaceCreated")
-        self.folder_created_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        self.folder_path_label = QtWidgets.QLabel("—")
-        self.folder_path_label.setObjectName("sessionWorkspaceFolderPath")
-        self.folder_path_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        self.folder_path_label.setWordWrap(True)
-        folder_form.addRow("State", self.session_status_label)
-        folder_form.addRow("Folder name", self.folder_name_label)
-        folder_form.addRow("Created", self.folder_created_label)
-        folder_form.addRow("Storage path", self.folder_path_label)
-        lifecycle_layout.addLayout(folder_form)
-
-        self.storage_rule_label = QtWidgets.QLabel(
-            "Outputs created after this folder opens are stored beneath it. "
-            "Calibration, Alignment, Measurement, and Recording remain responsible for their own files."
-        )
+        self.session_status_label = self.sessionWorkspaceLifecycle
+        self.folder_name_label = self.sessionWorkspaceFolderName
+        self.folder_created_label = self.sessionWorkspaceCreated
+        self.folder_path_label = self.sessionWorkspaceFolderPath
+        for label in (self.folder_name_label, self.folder_created_label, self.folder_path_label):
+            label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         self.storage_rule_label.setObjectName("compactContract")
-        self.storage_rule_label.setWordWrap(True)
-        lifecycle_layout.addWidget(self.storage_rule_label)
-        self.action_feedback_label = QtWidgets.QLabel("")
-        self.action_feedback_label.setObjectName("sessionWorkspaceFeedback")
+        self.action_feedback_label = self.sessionWorkspaceFeedback
         self.action_feedback_label.setProperty("severity", "info")
-        self.action_feedback_label.setWordWrap(True)
         self.action_feedback_label.hide()
-        lifecycle_layout.addWidget(self.action_feedback_label)
-        layout.addWidget(self.lifecycle_group)
-
-        self.navigation_group = QtWidgets.QGroupBox("Continue")
-        navigation_row = QtWidgets.QHBoxLayout(self.navigation_group)
-        navigation_row.setContentsMargins(10, 10, 10, 10)
-        navigation_row.setSpacing(8)
-        self.open_measurement_button = QtWidgets.QPushButton("Continue to Measurement")
         self.open_measurement_button.setEnabled(self._can_open_measurement)
+        self.open_review_button.setEnabled(self._can_open_review)
         if open_measurement is not None:
             self.open_measurement_button.clicked.connect(open_measurement)
-        self.open_review_button = QtWidgets.QPushButton("Review Stored Files")
-        self.open_review_button.setEnabled(self._can_open_review)
         if open_review is not None:
             self.open_review_button.clicked.connect(open_review)
-        navigation_row.addWidget(self.open_measurement_button)
-        navigation_row.addWidget(self.open_review_button)
-        navigation_row.addStretch(1)
-        layout.addWidget(self.navigation_group)
         if not embedded:
             layout.addStretch(1)
 

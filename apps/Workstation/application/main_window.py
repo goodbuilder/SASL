@@ -20,6 +20,7 @@ import time
 from collections.abc import Mapping
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+from Workstation.ui.designer import load_form
 
 from Workstation.workstation_core.theme import (
     APP_BG,
@@ -120,15 +121,12 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("StereoWIRIS Workstation")
-        self.setObjectName("workstationMainWindow")
         self.setWindowFlags(
             self.windowFlags()
             | QtCore.Qt.WindowMinimizeButtonHint
             | QtCore.Qt.WindowMaximizeButtonHint
             | QtCore.Qt.WindowCloseButtonHint
         )
-        self.resize(1600, 980)
         self.backend = backend or create_standalone_backend(
             auto_start=auto_start,
             auto_start_pixhawk=auto_start_pixhawk,
@@ -300,48 +298,36 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         register_device_completion(self.commands)
 
     def _build_shell(self) -> None:
-        self.navigation_dock = QtWidgets.QDockWidget("Navigation", self)
-        self.navigation_dock.setObjectName("navigationDock")
+        load_form("main_window.ui", self)
+        self.navigation_dock = self.navigationDock
+        self.inspector_dock = self.inspectorDock
+        self.diagnostics_dock = self.diagnosticsDock
+        self.workspace_host = self.workspaceHost
+        # Designer placeholders are replaced by their existing runtime owners.
+        for dock in (self.navigation_dock, self.inspector_dock, self.diagnostics_dock):
+            dock.widget().deleteLater()
         self.navigation = NavigationTree(self.navigation_dock)
         self.navigation_dock.setWidget(self.navigation)
         self.navigation_dock.visibilityChanged.connect(
             self._on_navigation_visibility_changed
         )
-        self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, self.navigation_dock)
         self.resizeDocks([self.navigation_dock], [240], QtCore.Qt.Horizontal)
 
-        self.inspector_dock = QtWidgets.QDockWidget("Inspector", self)
-        self.inspector_dock.setObjectName("inspectorDock")
-        self.inspector_dock.setMinimumWidth(240)
-        self.inspector_dock.setMaximumWidth(360)
         self.inspector = InspectorWidget(
             self.backend,
             lambda: self._select_context("tasks.advanced"),
         )
         self.inspector_scroll = self._scroll_container(self.inspector, "inspectorScroll", self.inspector_dock)
         self.inspector_dock.setWidget(self.inspector_scroll)
-        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self.inspector_dock)
         self.resizeDocks([self.inspector_dock], [310], QtCore.Qt.Horizontal)
 
-        self.diagnostics_dock = QtWidgets.QDockWidget("Diagnostics", self)
-        self.diagnostics_dock.setObjectName("diagnosticsDock")
-        self.diagnostics_dock.setMinimumHeight(120)
-        self.diagnostics_dock.setMaximumHeight(280)
         self.diagnostics = DiagnosticsContent(self.backend, self.status_adapter.model, self.diagnostics_dock)
         self.diagnostics_dock.setWidget(self.diagnostics)
-        self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, self.diagnostics_dock)
         self.resizeDocks([self.diagnostics_dock], [210], QtCore.Qt.Vertical)
 
-        self.workspace_host = QtWidgets.QStackedWidget(self)
-        self.workspace_host.setObjectName("workspaceHost")
-        self.setCentralWidget(self.workspace_host)
         self.navigation.context_changed.connect(self._select_context)
 
-        toolbar = QtWidgets.QToolBar("Primary", self)
-        toolbar.setObjectName("primaryToolbar")
-        toolbar.setMovable(False)
-        toolbar.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
-        self.addToolBar(QtCore.Qt.TopToolBarArea, toolbar)
+        toolbar = self.primaryToolbar
         toolbar.addAction(self.commands.action("camera.toggle"))
         toolbar.addAction(self.commands.action("detection.toggle"))
         toolbar.addSeparator()
@@ -371,13 +357,13 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self.statusBar().setSizeGripEnabled(True)
 
     def _build_menus(self) -> None:
-        file_menu = self.menuBar().addMenu("File")
+        file_menu = self.fileMenu
         file_menu.addAction("Quit", self.close, "Ctrl+Q")
-        view_menu = self.menuBar().addMenu("View")
+        view_menu = self.viewMenu
         view_menu.addAction(self.navigation_dock.toggleViewAction())
         view_menu.addAction(self.inspector_dock.toggleViewAction())
         view_menu.addAction(self.diagnostics_dock.toggleViewAction())
-        device_menu = self.menuBar().addMenu("Device")
+        device_menu = self.deviceMenu
         device_menu.addAction(self.commands.action("camera.toggle"))
         device_menu.addAction(self.commands.action("camera.auto_connect"))
         device_menu.addAction(self.commands.action("pixhawk.connect_mavlink"))
@@ -387,13 +373,13 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         device_menu.addAction(self.commands.action("pixhawk.recover_eth_mavlink.p2"))
         device_menu.addAction(self.commands.action("pixhawk.discover_usb"))
         device_menu.addAction(self.commands.action("pixhawk.discover_mavlink_candidates"))
-        measurement_menu = self.menuBar().addMenu("Run")
+        measurement_menu = self.runMenu
         measurement_menu.addAction(self.commands.action("detection.toggle"))
-        tools_menu = self.menuBar().addMenu("Tools")
+        tools_menu = self.toolsMenu
         tools_menu.addAction(self.commands.action("advanced.open"))
         tools_menu.addAction(self.commands.action("settings.apply"))
         tools_menu.addAction(self.commands.action("settings.save"))
-        diagnostics_menu = self.menuBar().addMenu("Diagnostics")
+        diagnostics_menu = self.diagnosticsMenu
         diagnostics_menu.addAction(self.diagnostics_dock.toggleViewAction())
 
     def _build_workspaces(self) -> None:

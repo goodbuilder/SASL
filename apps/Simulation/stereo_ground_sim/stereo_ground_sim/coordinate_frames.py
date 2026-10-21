@@ -35,10 +35,43 @@ R_ENU_FROM_NED: Matrix3 = (
 WORLD_FRAME = "gazebo_world_enu"
 BASELINE_CENTER_FRD_FRAME = "baseline_center_frd"
 VEHICLE_REFERENCE_LINK = "vehicle_reference_link"
-VEHICLE_REFERENCE_DEFINITION = "project_defined_vehicle_reference_at_base_link_origin"
+# Default x500_15m contract; model-specific consumers use the helpers below.
+VEHICLE_REFERENCE_DEFINITION = "project_defined_vehicle_reference_at_visual_height_midpoint_v1"
 SOURCE_GAZEBO_ENTITY = "base_link"
-REFERENCE_OFFSET_PARENT_M: Vector3 = (0.0, 0.0, 0.0)
+REFERENCE_OFFSET_PARENT_M: Vector3 = (0.0, 0.0, -2.297088218875)
 REFERENCE_OFFSET_PARENT_RPY_RAD: Vector3 = (0.0, 0.0, 0.0)
+
+
+def vehicle_reference_definition(model_name: str) -> str:
+    if model_name in ("x500_2m", "x500_15m"):
+        return VEHICLE_REFERENCE_DEFINITION
+    raise ValueError(f"unknown vehicle reference model: {model_name!r}")
+
+
+def vehicle_reference_offset_parent_m(model_name: str) -> Vector3:
+    """Reference translation in base_link FLU [forward,left,up], metres.
+
+    x500_2m visual Z bounds: [-1.0265138481, 0.3083] m, including
+    scaled landing mesh and rotor hubs. x500_15m bounds are
+    [-6.19487643775, 1.6007] m. Keep X/Y and orientation unchanged.
+    This is a fixed body-attached point, not an in-flight world AABB center.
+    """
+    vehicle_reference_definition(model_name)  # Reject unregistered contracts.
+    if model_name == "x500_2m":
+        return (0.0, 0.0, -0.35910692405)
+    return REFERENCE_OFFSET_PARENT_M
+
+
+def vehicle_reference_offset_world_enu_m(model_name: str, orientation_xyzw: Sequence[float]) -> Vector3:
+    """Rotate base_link-to-reference FLU offset into world ENU; no translation.
+
+    Orientation is world_from_base_link XYZW (also world_from_reference,
+    since the reference rotation is identity), never PX4 FRD-to-NED.
+    """
+    return _mat_vec(
+        rotation_world_from_quaternion_xyzw(orientation_xyzw),
+        vehicle_reference_offset_parent_m(model_name),
+    )
 
 
 def _finite_vector(values: Sequence[float], name: str) -> Vector3:
@@ -757,4 +790,7 @@ __all__ = [
     "sdf_link_rpy_from_px4_frd_error",
     "sdf_pose_rpy_from_camera_pose",
     "validate_rotation_matrix",
+    "vehicle_reference_definition",
+    "vehicle_reference_offset_parent_m",
+    "vehicle_reference_offset_world_enu_m",
 ]

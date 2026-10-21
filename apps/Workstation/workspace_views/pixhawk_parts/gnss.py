@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from PyQt5 import QtCore, QtWidgets
-from Workstation.ui.components import EngineeringValue
+from .designer import load_pixhawk_form
 from ..shared import _display_number, _live_inspection, _sync_table_rows, _table_model
 
 import math
-from Workstation.ui.telemetry_plots import BaselineYawAlignmentPlot
 from Workstation.workstation_core.settings import normalize_pixhawk_gnss_source
 from .formatting import _display_compass_deg, _display_signed_deg
 
@@ -25,130 +24,36 @@ class GnssView(QtCore.QObject):
         self._set_source = set_source
         self._read_baseline = read_baseline
         self._read_yaw = read_yaw
-        receiver_group = QtWidgets.QGroupBox("P1/P2 GNSS receivers")
-        receiver_layout = QtWidgets.QVBoxLayout(receiver_group)
-        self.receiver_model = _table_model(
-            self,
-            (
-                "Receiver",
-                "Fix number",
-                "RTK state",
-                "Satellites",
-                "Altitude MSL m",
-                "Altitude ellipsoid m",
-                "HDOP/VDOP",
-                "H/V acc m",
-                "Age",
-            ),
-        )
-        self.receiver_table = QtWidgets.QTableView()
+        self._designer_form = load_pixhawk_form("pixhawk_gnss.ui")
+        form = self._designer_form
+        self.receiver_table = form.receiver_table
+        self.receiver_group = form.receiver_group
+        self.baseline_values = {'north_m': form.baseline_values_north_m, 'east_m': form.baseline_values_east_m, 'down_m': form.baseline_values_down_m, 'length_m': form.baseline_values_length_m, 'p1_body_frd_forward_m': form.baseline_values_p1_body_frd_forward_m, 'p1_body_frd_right_m': form.baseline_values_p1_body_frd_right_m, 'p1_body_frd_down_m': form.baseline_values_p1_body_frd_down_m, 'state': form.baseline_values_state}
+        self.baseline_group = form.baseline_group
+        self.baseline_yaw_status_label = form.baseline_yaw_status_label
+        self.baseline_yaw_values = {'baseline_azimuth': form.baseline_yaw_values_baseline_azimuth, 'p2_minus_p1': form.baseline_yaw_values_p2_minus_p1, 'p1_yaw': form.baseline_yaw_values_p1_yaw, 'baseline_p1': form.baseline_yaw_values_baseline_p1, 'p2_yaw': form.baseline_yaw_values_p2_yaw, 'baseline_p2': form.baseline_yaw_values_baseline_p2}
+        self.baseline_yaw_evidence_label = form.baseline_yaw_evidence_label
+        self.baseline_yaw_contract_label = form.baseline_yaw_contract_label
+        self.baseline_yaw_plot = form.baseline_yaw_plot
+        self.baseline_yaw_group = form.baseline_yaw_group
+        self.gnss_source_combos = {'left': form.gnss_source_combos_left, 'right': form.gnss_source_combos_right}
+        self.gnss_source_summary = form.gnss_source_summary
+        self.gnss_source_group = form.gnss_source_group
+        self.receiver_model = _table_model(self, ('Receiver', 'Fix number', 'RTK state', 'Satellites', 'Altitude MSL m', 'Altitude ellipsoid m', 'HDOP/VDOP', 'H/V acc m', 'Age'))
         self.receiver_table.setModel(self.receiver_model)
-        self.receiver_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.receiver_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.receiver_table.verticalHeader().setVisible(False)
-        self.receiver_table.setMaximumHeight(190)
-        self.receiver_table.horizontalHeader().setStretchLastSection(True)
+        header = form.receiver_table.horizontalHeader()
+        for column, (width, mode) in enumerate(((104, 0), (104, 0), (104, 0), (104, 0), (104, 0), (104, 0), (104, 0), (104, 0), (104, 0))):
+            header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode(mode))
+            header.resizeSection(column, width)
         self.receiver_table.clicked.connect(self._inspect_receiver_row)
-        receiver_layout.addWidget(self.receiver_table)
-        self.receiver_group = receiver_group
         self._receiver_row_keys: tuple[tuple[str, str], ...] = ()
-
-        baseline_group = QtWidgets.QGroupBox("P1→P2 baseline")
-        baseline_layout = QtWidgets.QGridLayout(baseline_group)
-        self.baseline_values: dict[str, EngineeringValue] = {}
-        baseline_fields = (
-            ("north_m", "NED North"),
-            ("east_m", "NED East"),
-            ("down_m", "NED Down"),
-            ("length_m", "Length"),
-            ("p1_body_frd_forward_m", "FRD Forward"),
-            ("p1_body_frd_right_m", "FRD Right"),
-            ("p1_body_frd_down_m", "FRD Down"),
-            ("state", "Quality"),
-        )
-        for index, (key, label) in enumerate(baseline_fields):
-            value = EngineeringValue(label)
-            self.baseline_values[key] = value
+        for key, value in self.baseline_values.items():
             value.activated.connect(lambda key=key: self._inspect_baseline_value(key))
-            baseline_layout.addWidget(value, index // 4, index % 4)
-        self.baseline_group = baseline_group
-
-        baseline_yaw_group = QtWidgets.QGroupBox("P1→P2 baseline / Pixhawk yaw")
-        baseline_yaw_group_layout = QtWidgets.QHBoxLayout(baseline_yaw_group)
-        baseline_yaw_group_layout.setContentsMargins(8, 8, 8, 8)
-        baseline_yaw_group_layout.setSpacing(8)
-        summary = QtWidgets.QWidget()
-        summary.setMinimumWidth(330)
-        summary.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
-        summary_layout = QtWidgets.QVBoxLayout(summary)
-        summary_layout.setContentsMargins(0, 0, 0, 0)
-        summary_layout.setSpacing(4)
-        self.baseline_yaw_status_label = QtWidgets.QLabel("WAITING · Baseline WAITING · P1 WAITING · P2 WAITING")
-        self.baseline_yaw_status_label.setObjectName("statusStrip")
-        self.baseline_yaw_status_label.setFixedHeight(24)
-        summary_layout.addWidget(self.baseline_yaw_status_label)
-        values_grid = QtWidgets.QGridLayout()
-        values_grid.setContentsMargins(0, 0, 0, 0)
-        values_grid.setHorizontalSpacing(8)
-        values_grid.setVerticalSpacing(3)
-        self.baseline_yaw_values: dict[str, EngineeringValue] = {}
-        baseline_yaw_fields = (
-            ("baseline_azimuth", "Baseline azimuth", 0, 0),
-            ("p2_minus_p1", "P2−P1 yaw", 0, 1),
-            ("p1_yaw", "P1 yaw", 1, 0),
-            ("baseline_p1", "Baseline−P1", 1, 1),
-            ("p2_yaw", "P2 yaw", 2, 0),
-            ("baseline_p2", "Baseline−P2", 2, 1),
-        )
-        for key, label_text, row, column in baseline_yaw_fields:
-            value = EngineeringValue(label_text)
-            reserve_width = value.value.fontMetrics().horizontalAdvance("-180.00")
-            value.value.setMinimumWidth(reserve_width)
+        for key, value in self.baseline_yaw_values.items():
+            value.value.setMinimumWidth(value.value.fontMetrics().horizontalAdvance("-180.00"))
             value.activated.connect(lambda key=key: self._inspect_baseline_yaw_value(key))
-            self.baseline_yaw_values[key] = value
-            values_grid.addWidget(value, row, column)
-            values_grid.setColumnStretch(column, 1)
-        summary_layout.addLayout(values_grid)
-        self.baseline_yaw_evidence_label = QtWidgets.QLabel("P1/P2 selected GNSS and P1/P2 ATTITUDE evidence waiting")
-        self.baseline_yaw_evidence_label.setObjectName("statusStrip")
-        self.baseline_yaw_evidence_label.setWordWrap(True)
-        self.baseline_yaw_evidence_label.setFixedHeight(42)
-        summary_layout.addWidget(self.baseline_yaw_evidence_label)
-        self.baseline_yaw_contract_label = QtWidgets.QLabel(
-            "Baseline−Pn = wrap180(azimuth(P1→P2) − Pn yaw), Pn=P1/P2 · + right/CW · horizontal NED"
-        )
-        self.baseline_yaw_contract_label.setObjectName("compactContract")
-        self.baseline_yaw_contract_label.setWordWrap(True)
-        self.baseline_yaw_contract_label.setFixedHeight(36)
-        summary_layout.addWidget(self.baseline_yaw_contract_label)
-        self.baseline_yaw_plot = BaselineYawAlignmentPlot()
-        baseline_yaw_group_layout.addWidget(summary, 1)
-        baseline_yaw_group_layout.addWidget(self.baseline_yaw_plot, 1)
-        self.baseline_yaw_group = baseline_yaw_group
-        self.baseline_yaw_group = baseline_yaw_group
-
-        gnss_source_group = QtWidgets.QGroupBox("GNSS used for Pixhawk calculation")
-        gnss_source_layout = QtWidgets.QGridLayout(gnss_source_group)
-        gnss_source_hint = QtWidgets.QLabel(
-            "P1/P2의 GPS1·GPS2는 동시에 표시됩니다. 아래 선택값이 P1→P2 baseline과 측정 계산에 사용됩니다."
-        )
-        gnss_source_hint.setObjectName("statusStrip")
-        gnss_source_hint.setWordWrap(True)
-        gnss_source_layout.addWidget(gnss_source_hint, 0, 0, 1, 4)
-        self.gnss_source_combos: dict[str, QtWidgets.QComboBox] = {}
-        for column, (side, label) in enumerate((("left", "P1 antenna"), ("right", "P2 antenna"))):
-            gnss_source_layout.addWidget(QtWidgets.QLabel(label), 1, column * 2)
-            combo = QtWidgets.QComboBox()
-            combo.addItem("GPS1", "GPS1")
-            combo.addItem("GPS2", "GPS2")
+        for side, combo in self.gnss_source_combos.items():
             combo.currentIndexChanged.connect(lambda _index, side=side: self._set_gnss_source_from_workspace(side))
-            self.gnss_source_combos[side] = combo
-            gnss_source_layout.addWidget(combo, 1, column * 2 + 1)
-        self.gnss_source_summary = QtWidgets.QLabel("계산 source: P1 GPS1 → P2 GPS1")
-        self.gnss_source_summary.setObjectName("statusStrip")
-        self.gnss_source_summary.setWordWrap(True)
-        gnss_source_layout.addWidget(self.gnss_source_summary, 2, 0, 1, 4)
-        self.gnss_source_group = gnss_source_group
         if isinstance(parent, QtWidgets.QWidget):
             for group in (self.receiver_group, self.baseline_group, self.baseline_yaw_group, self.gnss_source_group):
                 group.setParent(parent)

@@ -1,0 +1,370 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>OpticalPoseForm</class>
+ <widget class="_FrozenPreviewGroup" name="preview_group">
+  <property name="componentBindings" stdset="0">
+   <string>[["annotations", "preview_group", null]]</string>
+  </property>
+  <property name="title">
+   <string>Frozen native reference burst + annotations</string>
+  </property>
+  <layout class="QVBoxLayout" name="QVBoxLayout_8" stretch="0,1">
+   <property name="leftMargin">
+    <number>6</number>
+   </property>
+   <property name="topMargin">
+    <number>6</number>
+   </property>
+   <property name="rightMargin">
+    <number>6</number>
+   </property>
+   <property name="bottomMargin">
+    <number>6</number>
+   </property>
+   <property name="spacing">
+    <number>5</number>
+   </property>
+   <item>
+    <layout class="QHBoxLayout" name="QHBoxLayout_7" stretch="0,0,0,0,0,0,0,1">
+     <property name="leftMargin">
+      <number>0</number>
+     </property>
+     <property name="topMargin">
+      <number>0</number>
+     </property>
+     <property name="rightMargin">
+      <number>0</number>
+     </property>
+     <property name="bottomMargin">
+      <number>0</number>
+     </property>
+     <property name="spacing">
+      <number>5</number>
+     </property>
+     <item>
+      <widget class="QLabel" name="QLabel">
+       <property name="text">
+        <string>Annotation</string>
+       </property>
+       <property name="wordWrap">
+        <bool>false</bool>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QComboBox" name="annotation_mode_combo">
+       <property name="componentBindings" stdset="0">
+        <string>[["annotations", "annotation_mode_combo", null]]</string>
+       </property>
+       <property name="styleObjectName" stdset="0">
+        <string>opticalPoseAnnotationMode</string>
+       </property>
+       <property name="toolTip">
+        <string>Click the frozen native image to add points. Mark two points on the visible horizon in the frozen native image. The Horizon solver estimates Roll/Pitch only; Yaw and camera position remain at the prior pose.</string>
+       </property>
+       <property name="optionValues" stdset="0">
+        <string>["horizon", "ridge", "target"]</string>
+       </property>
+       <item>
+        <property name="text">
+         <string>Horizon (2 points)</string>
+        </property>
+       </item>
+       <item>
+        <property name="text">
+         <string>Mountain ridge (polyline)</string>
+        </property>
+       </item>
+       <item>
+        <property name="text">
+         <string>Drone target (1 point)</string>
+        </property>
+       </item>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="annotation_clear_button">
+       <property name="componentBindings" stdset="0">
+        <string>[["annotations", "annotation_clear_button", null]]</string>
+       </property>
+       <property name="styleObjectName" stdset="0">
+        <string>opticalPoseAnnotationClear</string>
+       </property>
+       <property name="toolTip">
+        <string>Clear the selected horizon/ridge/target points from both frozen frames.</string>
+       </property>
+       <property name="text">
+        <string>Clear</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="capture_frozen_burst_button">
+       <property name="componentBindings" stdset="0">
+        <string>[["annotations", "capture_frozen_burst_button", null]]</string>
+       </property>
+       <property name="toolTip">
+        <string>Capture the newest decoded native left/right frames from the live RTSP streams, then use the same immutable pair across all R,t methods. Raw RTP packets are not captured.</string>
+       </property>
+       <property name="text">
+        <string>Capture Live Pair</string>
+       </property>
+       <property name="commandId" stdset="0">
+        <string>alignment.pose.capture_burst</string>
+       </property>
+       <property name="solverButton" stdset="0">
+        <bool>true</bool>
+       </property>
+       <property name="commandRegistrationOrder" stdset="0">
+        <number>0</number>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="capture_frozen_burst_wiris_ftp_button">
+       <property name="componentBindings" stdset="0">
+        <string>[["annotations", "capture_frozen_burst_wiris_ftp_button", null]]</string>
+       </property>
+       <property name="toolTip">
+        <string>Trigger a WIRIS HR still on both cameras and download it via FTP instead of the live RTSP feed, then store it under the same immutable-pair contract.</string>
+       </property>
+       <property name="text">
+        <string>Capture HR Still (FTP)</string>
+       </property>
+       <property name="commandId" stdset="0">
+        <string>alignment.pose.capture_burst_wiris_ftp</string>
+       </property>
+       <property name="solverButton" stdset="0">
+        <bool>true</bool>
+       </property>
+       <property name="commandRegistrationOrder" stdset="0">
+        <number>1</number>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="capture_frozen_burst_wiris_ftp_oz_button">
+       <property name="componentBindings" stdset="0">
+        <string>[["annotations", "capture_frozen_burst_wiris_ftp_oz_button", null]]</string>
+       </property>
+       <property name="toolTip">
+        <string>Same as Capture HR Still (FTP), using the lower-resolution operating-zoom still (SIVI) instead of the HR still.</string>
+       </property>
+       <property name="text">
+        <string>Capture OZ Still (FTP)</string>
+       </property>
+       <property name="commandId" stdset="0">
+        <string>alignment.pose.capture_burst_wiris_ftp_oz</string>
+       </property>
+       <property name="solverButton" stdset="0">
+        <bool>true</bool>
+       </property>
+       <property name="commandRegistrationOrder" stdset="0">
+        <number>2</number>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="import_frozen_burst_button">
+       <property name="componentBindings" stdset="0">
+        <string>[["annotations", "import_frozen_burst_button", null]]</string>
+       </property>
+       <property name="styleObjectName" stdset="0">
+        <string>opticalPoseImportBurst</string>
+       </property>
+       <property name="toolTip">
+        <string>Load left/right images from disk instead of a live capture -- reuse an FTP-downloaded HR/OZ still, or feed local test imagery for offline accuracy evaluation. The same immutable-frame contract as Capture Live Pair applies.</string>
+       </property>
+       <property name="text">
+        <string>Import Pair</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <spacer name="spacer_93">
+       <property name="orientation">
+        <enum>Qt::Horizontal</enum>
+       </property>
+       <property name="sizeHint">
+        <size>
+         <width>0</width>
+         <height>0</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <layout class="QVBoxLayout" name="frozen_preview_layout" stretch="1,1">
+     <property name="leftMargin">
+      <number>0</number>
+     </property>
+     <property name="topMargin">
+      <number>0</number>
+     </property>
+     <property name="rightMargin">
+      <number>0</number>
+     </property>
+     <property name="bottomMargin">
+      <number>0</number>
+     </property>
+     <property name="spacing">
+      <number>6</number>
+     </property>
+     <item>
+      <widget class="_FrozenPreviewColumn" name="frozen_preview_panels_0">
+       <property name="componentBindings" stdset="0">
+        <string>[["annotations", "frozen_preview_panels", 0]]</string>
+       </property>
+       <layout class="QVBoxLayout" name="QVBoxLayout_9" stretch="0,0">
+        <property name="leftMargin">
+         <number>0</number>
+        </property>
+        <property name="topMargin">
+         <number>0</number>
+        </property>
+        <property name="rightMargin">
+         <number>0</number>
+        </property>
+        <property name="bottomMargin">
+         <number>0</number>
+        </property>
+        <property name="spacing">
+         <number>3</number>
+        </property>
+        <item>
+         <widget class="FrozenAnnotationView" name="annotation_views_left">
+          <property name="componentBindings" stdset="0">
+           <string>[["annotations", "annotation_views", "left"]]</string>
+          </property>
+          <property name="styleObjectName" stdset="0">
+           <string>opticalPoseAnnotationLeft</string>
+          </property>
+          <property name="toolTip">
+           <string>Frozen native pixels only. Coordinates are OpenCV image pixels (u right, v down); the display is fixed 16:9 and center-crops only for presentation; saved points never change. Hover shows the exact native pixel under the pointer. Scroll over the image to zoom around the cursor; native coordinates remain unchanged.</string>
+          </property>
+          <property name="minimumSize">
+           <size>
+            <width>240</width>
+            <height>135</height>
+           </size>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="frozen_preview_labels_left">
+          <property name="componentBindings" stdset="0">
+           <string>[["annotations", "frozen_preview_labels", "left"]]</string>
+          </property>
+          <property name="styleObjectName" stdset="0">
+           <string>opticalPoseFrozenLeft</string>
+          </property>
+          <property name="text">
+           <string>Left: NO FROZEN BURST</string>
+          </property>
+          <property name="wordWrap">
+           <bool>true</bool>
+          </property>
+          <property name="alignment">
+           <set>Qt::AlignCenter</set>
+          </property>
+          <property name="frameShape">
+           <enum>QFrame::StyledPanel</enum>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </widget>
+     </item>
+     <item>
+      <widget class="_FrozenPreviewColumn" name="frozen_preview_panels_1">
+       <property name="componentBindings" stdset="0">
+        <string>[["annotations", "frozen_preview_panels", 1]]</string>
+       </property>
+       <layout class="QVBoxLayout" name="QVBoxLayout_10" stretch="0,0">
+        <property name="leftMargin">
+         <number>0</number>
+        </property>
+        <property name="topMargin">
+         <number>0</number>
+        </property>
+        <property name="rightMargin">
+         <number>0</number>
+        </property>
+        <property name="bottomMargin">
+         <number>0</number>
+        </property>
+        <property name="spacing">
+         <number>3</number>
+        </property>
+        <item>
+         <widget class="FrozenAnnotationView" name="annotation_views_right">
+          <property name="componentBindings" stdset="0">
+           <string>[["annotations", "annotation_views", "right"]]</string>
+          </property>
+          <property name="styleObjectName" stdset="0">
+           <string>opticalPoseAnnotationRight</string>
+          </property>
+          <property name="toolTip">
+           <string>Frozen native pixels only. Coordinates are OpenCV image pixels (u right, v down); the display is fixed 16:9 and center-crops only for presentation; saved points never change. Hover shows the exact native pixel under the pointer. Scroll over the image to zoom around the cursor; native coordinates remain unchanged.</string>
+          </property>
+          <property name="minimumSize">
+           <size>
+            <width>240</width>
+            <height>135</height>
+           </size>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="frozen_preview_labels_right">
+          <property name="componentBindings" stdset="0">
+           <string>[["annotations", "frozen_preview_labels", "right"]]</string>
+          </property>
+          <property name="styleObjectName" stdset="0">
+           <string>opticalPoseFrozenRight</string>
+          </property>
+          <property name="text">
+           <string>Right: NO FROZEN BURST</string>
+          </property>
+          <property name="wordWrap">
+           <bool>true</bool>
+          </property>
+          <property name="alignment">
+           <set>Qt::AlignCenter</set>
+          </property>
+          <property name="frameShape">
+           <enum>QFrame::StyledPanel</enum>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </widget>
+     </item>
+    </layout>
+   </item>
+  </layout>
+ </widget>
+ <customwidgets>
+  <customwidget>
+   <class>_FrozenPreviewGroup</class>
+   <extends>QGroupBox</extends>
+   <header>Workstation.workspace_views.optical_pose_parts.layouts</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>_FrozenPreviewColumn</class>
+   <extends>QWidget</extends>
+   <header>Workstation.workspace_views.optical_pose_parts.layouts</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>FrozenAnnotationView</class>
+   <extends>QWidget</extends>
+   <header>Workstation.workspace_views.optical_pose_parts.layouts</header>
+  </customwidget>
+ </customwidgets>
+ <resources />
+ <connections />
+</ui>

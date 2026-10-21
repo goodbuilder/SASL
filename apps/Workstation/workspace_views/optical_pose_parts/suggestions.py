@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from PyQt5 import QtCore, QtWidgets
+from .layouts import load_component_form
 from Workstation.ui.annotation_image_view import AnnotationMode
 
 from Workstation.workstation_core.optical_pose_auto_select import (
@@ -34,54 +35,7 @@ class SuggestionReview(QtCore.QObject):
         self._accepted_annotation_snapshots: dict[str, dict[str, object]] = {}
         self._auto_suggestion_provenance = "NONE"
         self._auto_suggestion_error_active = False
-        auto_group = QtWidgets.QGroupBox("Automatic point suggestion · review required")
-        self.auto_group = auto_group
-        auto_group.setObjectName("opticalPoseAutoSuggestionGroup")
-        auto_layout = QtWidgets.QGridLayout(auto_group)
-        auto_layout.setContentsMargins(6, 6, 6, 6)
-        auto_layout.setSpacing(5)
-        self.auto_select_buttons: dict[str, QtWidgets.QPushButton] = {}
-        for column, (command_id, label) in enumerate(
-            (
-                ("alignment.pose.auto_select_horizon", "Auto-select Horizon"),
-                ("alignment.pose.auto_select_mountain", "Auto-select Mountain"),
-                ("alignment.pose.auto_select_cloud", "Auto-select Cloud"),
-            )
-        ):
-            button = make_solver_button(command_id, label)
-            if command_id.endswith("cloud"):
-                button.setToolTip(
-                    "Match far-field sky/cloud texture on the frozen native left/right frames with no "
-                    "ridge bias. The points feed the rotation-only Cloud solve; translation always "
-                    "comes from live GNSS. Both frames must be simultaneous."
-                )
-            else:
-                button.setToolTip(
-                    "Analyze the frozen native left/right frames and draw a separate suggestion overlay. "
-                    "No Horizon/Mountain solver runs until the suggestion is explicitly accepted."
-                )
-            self.auto_select_buttons[command_id] = button
-            auto_layout.addWidget(button, 0, column)
-        self.use_suggestion_button = make_solver_button(
-            "alignment.pose.use_suggestion",
-            "Use suggestion",
-        )
-        self.use_suggestion_button.setEnabled(False)
-        self.use_suggestion_button.setToolTip(
-            "Copy the currently displayed suggestion into the manual annotation buffer. "
-            "Horizon/Mountain detector quality is advisory, but current-frame native points must "
-            "remain structurally usable. Horizon requires two separated endpoints per side; "
-            "Mountain requires paired distributed points after exclusions."
-        )
-        auto_layout.addWidget(self.use_suggestion_button, 0, 3)
-        self.auto_suggestion_status_label = QtWidgets.QLabel("No automatic suggestion")
-        self.auto_suggestion_status_label.setObjectName("statusStrip")
-        self.auto_suggestion_status_label.setWordWrap(True)
-        auto_layout.addWidget(self.auto_suggestion_status_label, 1, 0, 1, 4)
-        self.auto_suggestion_metrics_label = QtWidgets.QLabel("Confidence / inliers / residual / detector: --")
-        self.auto_suggestion_metrics_label.setObjectName("compactContract")
-        self.auto_suggestion_metrics_label.setWordWrap(True)
-        auto_layout.addWidget(self.auto_suggestion_metrics_label, 2, 0, 1, 3)
+        load_component_form("optical_pose_suggestions.ui", self, "suggestions", make_solver_button)
 
         annotations.annotation_changed.connect(self._on_annotation_changed)
         annotations.suggestion_point_clicked.connect(self._on_suggestion_point_right_clicked)

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtCore, QtWidgets
 from Workstation.application.status_model import RuntimeStatus
-from ..shared import _command_button, _display_number, _live_inspection, _sync_table_rows, _table_model
+from .designer import load_pixhawk_form
+from ..shared import _display_number, _live_inspection, _sync_table_rows, _table_model
 
 import math
 from Workstation.workstation_core.px4_calibration_groups import PX4_CALIBRATION_GROUPS
@@ -20,7 +21,7 @@ from Workstation.workstation_core.px4_mag_manager import (
     mag_priority_slot_key,
     mag_priority_display,
 )
-from ..px4_widgets import _build_px4_priority_combo, _px4_priority_combo_value, _set_px4_priority_combo_value
+from ..px4_widgets import _px4_priority_combo_value, _set_px4_priority_combo_value
 from .contracts import MagnetometerInputs
 from .formatting import (
     _display_signed_deg,
@@ -62,113 +63,87 @@ class MagnetometerView(QtCore.QObject):
         self._invoke_command = invoke_command
         self._invoke_command_available = invoke_command is not None
         self._recording_locked = False
-        magnetometer_group = QtWidgets.QGroupBox("Magnetometer by CAL_MAG slot")
-        magnetometer_layout = QtWidgets.QVBoxLayout(magnetometer_group)
-        magnetometer_hint = QtWidgets.QLabel(
-            "CAL_MAG0..3 순서 · Device ID로 실제 센서 sample 연결 · "
-            "RAW yaw=atan2(-y,x) · Corrected yaw=CAL_MAG 보정값 · "
-            "PX4 yaw=편각 보정 ATTITUDE 추정값"
-        )
-        magnetometer_hint.setObjectName("statusStrip")
-        magnetometer_hint.setWordWrap(True)
-        magnetometer_layout.addWidget(magnetometer_hint)
-        self.magnetometer_model = _table_model(
-            self,
-            (
-                "Pixhawk",
-                "CAL_MAG",
-                "Sensor",
-                "Device ID",
-                "State",
-                "xmag",
-                "ymag",
-                "zmag",
-                "Norm",
-                "RAW yaw°",
-                "Corrected yaw°",
-                "PX4 yaw°",
-                "Δyaw°",
-                "Priority",
-                "Unit",
-                "Age",
-                "Topic",
-            ),
-        )
-        self.magnetometer_table = QtWidgets.QTableView()
+        self._designer_form = load_pixhawk_form("pixhawk_magnetometers.ui")
+        form = self._designer_form
+        self.magnetometer_table = form.magnetometer_table
+        self.magnetometer_group = form.magnetometer_group
+        self.mag_priority_combos = {
+            side: {key: getattr(form, f"mag_priority_combos_{side}_{key}") for key in MAG_PRIORITY_KEYS}
+            for side in ("left", "right")
+        }
+        for collection in (
+            "mag_priority_status_labels", "mag_priority_draft_labels", "mag_priority_preview_labels",
+            "mag_priority_warning_labels", "mag_priority_refresh_buttons", "mag_priority_discard_buttons",
+            "mag_priority_apply_buttons", "px4_parameter_status_labels", "px4_parameter_refresh_buttons",
+        ):
+            setattr(self, collection, {side: getattr(form, f"{collection}_{side}") for side in ("left", "right")})
+        for collection in ("px4_parameter_tables", "px4_parameter_group_status_labels", "px4_parameter_reset_buttons"):
+            setattr(self, collection, {
+                side: {group.key: getattr(form, f"{collection}_{side}_{group.key}") for group in PX4_CALIBRATION_GROUPS}
+                for side in ("left", "right")
+            })
+        self.mag_priority_group = form.mag_priority_group
+        self.can_magnetometer_table = form.can_magnetometer_table
+        self.can_magnetometer_group = form.can_magnetometer_group
+        self.parameter_group = form.parameter_group
+        self.magnetometer_model = _table_model(self, ('Pixhawk', 'CAL_MAG', 'Sensor', 'Device ID', 'State', 'xmag', 'ymag', 'zmag', 'Norm', 'RAW yaw°', 'Corrected yaw°', 'PX4 yaw°', 'Δyaw°', 'Priority', 'Unit', 'Age', 'Topic'))
         self.magnetometer_table.setModel(self.magnetometer_model)
-        self.magnetometer_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.magnetometer_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.magnetometer_table.verticalHeader().setVisible(False)
-        # P1/P2 each expose the four configured CAL_MAG slots. Keep all
-        # eight rows visible so the table does not acquire an inner scrollbar.
-        self.magnetometer_table.setMinimumHeight(300)
-        self.magnetometer_table.setMaximumHeight(300)
-        self.magnetometer_table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
-        magnetometer_header = self.magnetometer_table.horizontalHeader()
-        magnetometer_header.setStretchLastSection(False)
-        magnetometer_header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
-        for column, width in enumerate((72, 76, 190, 100, 72, 72, 72, 72, 72, 88, 96, 88, 88, 88, 52, 72, 190)):
-            magnetometer_header.resizeSection(column, width)
-        magnetometer_header.setSectionHidden(10, False)
-        magnetometer_header.setSectionHidden(11, False)
-        magnetometer_header.setSectionHidden(12, True)
-        self.magnetometer_table.clicked.connect(self._inspect_magnetometer_row)
-        magnetometer_layout.addWidget(self.magnetometer_table)
-        self.magnetometer_group = magnetometer_group
-
-        self._build_mag_priority_group()
-
-        can_magnetometer_group = QtWidgets.QGroupBox("CAN magnetometer (dedicated MAVLink)")
-        can_magnetometer_layout = QtWidgets.QVBoxLayout(can_magnetometer_group)
-        can_magnetometer_hint = QtWidgets.QLabel(
-            "CAN1/CAN2 값은 PX4 DEBUG_VECT CAN_MAG 호환 메시지가 수신될 때만 표시 · "
-            "RAW yaw=센서축 진단값 · Corrected yaw=CAL_MAG 보정값 · "
-            "PX4 yaw=편각 보정 ATTITUDE 추정값"
-        )
-        can_magnetometer_hint.setObjectName("statusStrip")
-        can_magnetometer_hint.setWordWrap(True)
-        can_magnetometer_layout.addWidget(can_magnetometer_hint)
-        self.can_magnetometer_model = _table_model(
-            self,
-            (
-                "Pixhawk",
-                "CAN port",
-                "Node ID",
-                "Device ID",
-                "State",
-                "xmag",
-                "ymag",
-                "zmag",
-                "Norm",
-                "RAW yaw°",
-                "Corrected yaw°",
-                "PX4 yaw°",
-                "Δyaw°",
-                "Unit",
-                "Age",
-                "Topic",
-            ),
-        )
-        self.can_magnetometer_table = QtWidgets.QTableView()
+        header = form.magnetometer_table.horizontalHeader()
+        for column, (width, mode) in enumerate(((72, 0), (76, 0), (190, 0), (100, 0), (72, 0), (72, 0), (72, 0), (72, 0), (72, 0), (88, 0), (96, 0), (88, 0), (88, 0), (88, 0), (52, 0), (72, 0), (190, 0))):
+            header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode(mode))
+            header.resizeSection(column, width)
+        for column in (12,):
+            header.setSectionHidden(column, True)
+        self.can_magnetometer_model = _table_model(self, ('Pixhawk', 'CAN port', 'Node ID', 'Device ID', 'State', 'xmag', 'ymag', 'zmag', 'Norm', 'RAW yaw°', 'Corrected yaw°', 'PX4 yaw°', 'Δyaw°', 'Unit', 'Age', 'Topic'))
         self.can_magnetometer_table.setModel(self.can_magnetometer_model)
-        self.can_magnetometer_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.can_magnetometer_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.can_magnetometer_table.verticalHeader().setVisible(False)
-        self.can_magnetometer_table.setMaximumHeight(160)
-        self.can_magnetometer_table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
-        can_magnetometer_header = self.can_magnetometer_table.horizontalHeader()
-        can_magnetometer_header.setStretchLastSection(False)
-        can_magnetometer_header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
-        for column, width in enumerate((72, 72, 72, 112, 72, 72, 72, 72, 72, 88, 96, 88, 88, 52, 72, 220)):
-            can_magnetometer_header.resizeSection(column, width)
-        can_magnetometer_header.setSectionHidden(10, False)
-        can_magnetometer_header.setSectionHidden(11, False)
-        can_magnetometer_header.setSectionHidden(12, True)
+        header = form.can_magnetometer_table.horizontalHeader()
+        for column, (width, mode) in enumerate(((72, 0), (72, 0), (72, 0), (112, 0), (72, 0), (72, 0), (72, 0), (72, 0), (72, 0), (88, 0), (96, 0), (88, 0), (88, 0), (52, 0), (72, 0), (220, 0))):
+            header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode(mode))
+            header.resizeSection(column, width)
+        for column in (12,):
+            header.setSectionHidden(column, True)
+        self.px4_parameter_models = {"left": {}, "right": {}}
+        for side, tables in self.px4_parameter_tables.items():
+            for key, table in tables.items():
+                model = _table_model(self, ("Parameter", "Current", "Reset target", "Contract"))
+                self.px4_parameter_models[side][key] = model
+                table.setModel(model)
+                for column in range(3):
+                    table.horizontalHeader().setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeToContents)
+        self.px4_parameter_group_models = self.px4_parameter_models
+        self._mag_status_auto_refresh_attempts: dict[str, tuple[int, float]] = {}
+        self._board_rotation_auto_refresh_attempts: dict[str, tuple[int, float]] = {}
+        self._mag_priority_dirty: dict[str, set[str]] = {"left": set(), "right": set()}
+        self._mag_priority_apply_pending = {"left": False, "right": False}
+        self._mag_priority_voter_gap_instances: dict[str, tuple[int, ...]] = {"left": (), "right": ()}
+        self._mag_priority_voter_gap_unknown_instances: dict[str, tuple[int, ...]] = {"left": (), "right": ()}
+        self.magnetometer_table.clicked.connect(self._inspect_magnetometer_row)
         self.can_magnetometer_table.clicked.connect(self._inspect_can_magnetometer_row)
-        can_magnetometer_layout.addWidget(self.can_magnetometer_table)
-        self.can_magnetometer_group = can_magnetometer_group
-
-        self._build_px4_parameter_group()
+        for button in form.findChildren(QtWidgets.QPushButton):
+            command = button.property("commandId")
+            if command:
+                button.setEnabled(invoke_command is not None)
+                if invoke_command is not None:
+                    if str(command).startswith("pixhawk.mag.apply."):
+                        side = "left" if str(command).endswith(".p1") else "right"
+                        button.clicked.connect(
+                            lambda _checked=False, side=side, command=command: self._invoke_mag_priority_apply(side, command)
+                        )
+                    else:
+                        button.clicked.connect(lambda _checked=False, command=command: invoke_command(command))
+        for side, combos in self.mag_priority_combos.items():
+            self.mag_priority_discard_buttons[side].clicked.connect(
+                lambda _checked=False, side=side: self._discard_mag_priority_draft(side)
+            )
+            for slot_key, combo in combos.items():
+                combo.currentIndexChanged.connect(
+                    lambda _index, combo=combo: combo.setToolTip(
+                        f"PX4 priority: {mag_priority_display(combo.currentData())}"
+                    )
+                )
+                combo.currentIndexChanged.connect(
+                    lambda _index, side=side, slot_key=slot_key: self._on_mag_priority_combo_changed(side, slot_key)
+                )
         if isinstance(parent, QtWidgets.QWidget):
             for group in (
                 self.magnetometer_group,
@@ -192,78 +167,112 @@ class MagnetometerView(QtCore.QObject):
             return "GPS2_MAG"
         return None
 
-    def _build_mag_priority_group(self) -> None:
-        group = QtWidgets.QGroupBox("MAG Priority / active selection")
-        group_layout = QtWidgets.QVBoxLayout(group)
-        # side -> (attempt count, monotonic time of the last automatic request).
-        self._mag_status_auto_refresh_attempts: dict[str, tuple[int, float]] = {}
-        self._board_rotation_auto_refresh_attempts: dict[str, tuple[int, float]] = {}
-        hint = QtWidgets.QLabel(
-            "P1/P2는 독립적으로 적용됩니다. CAL_MAGn_PRIO를 직접 수정하며, "
-            "Apply 후 PARAM readback, 실제 active device ID, fresh ATTITUDE가 모두 확인되어야 "
-            "ACTIVE VERIFIED가 됩니다."
+
+    def _invoke_mag_priority_apply(self, side: str, command_id: str) -> bool:
+        if self._invoke_command is None:
+            return False
+        self._mag_priority_apply_pending[side] = True
+        self._set_mag_priority_side_busy(side, True)
+        started = bool(self._invoke_command(command_id))
+        if not started:
+            self._mag_priority_apply_pending[side] = False
+            self._set_mag_priority_side_busy(side, False)
+        return started
+
+    def _set_mag_priority_side_busy(self, side: str, busy: bool) -> None:
+        for combo in self.mag_priority_combos.get(side, {}).values():
+            combo.setEnabled(not busy)
+        for buttons in (
+            self.mag_priority_refresh_buttons,
+            self.mag_priority_discard_buttons,
+            self.mag_priority_apply_buttons,
+        ):
+            button = buttons.get(side)
+            if button is not None:
+                button.setEnabled(not busy)
+
+    @staticmethod
+    def _priority_readback(status: object, slot_key: str) -> int | None:
+        text = str(slot_key)
+        if not text.startswith("CAL_MAG"):
+            return None
+        try:
+            slot_number = int(text[len("CAL_MAG"):])
+        except (TypeError, ValueError):
+            return None
+        for slot in getattr(status, "slots", ()) or ():
+            if getattr(slot, "slot", None) == slot_number:
+                value = getattr(slot, "priority", None)
+                return None if value is None else int(value)
+        params = getattr(status, "params", {})
+        if isinstance(params, Mapping):
+            value = params.get(f"CAL_MAG{slot_number}_PRIO")
+            return None if value is None else int(value)
+        return None
+
+    @staticmethod
+    def _set_priority_from_readback(combo: QtWidgets.QComboBox, value: int | float | None) -> None:
+        # Programmatic readback must not be mistaken for an operator edit.
+        previous = combo.blockSignals(True)
+        try:
+            _set_px4_priority_combo_value(combo, value)
+        finally:
+            combo.blockSignals(previous)
+
+    def _on_mag_priority_combo_changed(self, side: str, slot_key: str) -> None:
+        combo = self.mag_priority_combos.get(side, {}).get(slot_key)
+        if combo is None:
+            return
+        inputs = self._read_inputs()
+        status = inputs.status_cache.get(side) if isinstance(inputs.status_cache, Mapping) else None
+        actual = self._priority_readback(status, slot_key) if status is not None else None
+        dirty = self._mag_priority_dirty.setdefault(side, set())
+        if actual is not None and actual == _px4_priority_combo_value(combo):
+            dirty.discard(slot_key)
+        else:
+            dirty.add(slot_key)
+        self._refresh_mag_priority_preview(side)
+        self._render_mag_priority_draft_status(side)
+
+    def _render_mag_priority_draft_status(self, side: str) -> None:
+        label = self.mag_priority_draft_labels.get(side)
+        if label is None:
+            return
+        dirty = self._mag_priority_dirty.get(side, set())
+        if not dirty:
+            label.setText(" ")
+            label.setToolTip("미적용 Priority 편집 없음")
+            return
+        rendered = ", ".join(
+            f"{key}={_px4_priority_combo_value(self.mag_priority_combos[side][key])}"
+            for key in MAG_PRIORITY_KEYS
+            if key in dirty
         )
-        hint.setObjectName("statusStrip")
-        hint.setWordWrap(True)
-        group_layout.addWidget(hint)
-        cards = QtWidgets.QHBoxLayout()
-        self.mag_priority_combos: dict[str, dict[str, QtWidgets.QComboBox]] = {}
-        self.mag_priority_status_labels: dict[str, QtWidgets.QLabel] = {}
-        self.mag_priority_preview_labels: dict[str, QtWidgets.QLabel] = {}
-        self.mag_priority_refresh_buttons: dict[str, QtWidgets.QPushButton] = {}
-        self.mag_priority_apply_buttons: dict[str, QtWidgets.QPushButton] = {}
-        defaults = {key: 0 for key in MAG_PRIORITY_KEYS}
-        for side, label, code in (("left", "P1", "p1"), ("right", "P2", "p2")):
-            card = QtWidgets.QGroupBox(label)
-            card_layout = QtWidgets.QGridLayout(card)
-            card_layout.setContentsMargins(6, 6, 6, 6)
-            controls = QtWidgets.QHBoxLayout()
-            refresh = _command_button(
-                "Refresh MAG",
-                f"pixhawk.mag.refresh.{code}",
-                self._invoke_command,
-            )
-            apply = _command_button(
-                "Apply & Verify",
-                f"pixhawk.mag.apply.{code}",
-                self._invoke_command,
-            )
-            refresh.setToolTip("이 side의 CAL_MAG Priority를 다시 읽습니다.")
-            apply.setToolTip("이 side만 Priority를 적용하고 실제 active MAG/ATTITUDE를 검증합니다.")
-            controls.addWidget(refresh)
-            controls.addWidget(apply)
-            controls.addStretch(1)
-            card_layout.addLayout(controls, 0, 0, 1, 2)
-            self.mag_priority_refresh_buttons[side] = refresh
-            self.mag_priority_apply_buttons[side] = apply
-            combos: dict[str, QtWidgets.QComboBox] = {}
-            for row, slot_key in enumerate(MAG_PRIORITY_KEYS, start=1):
-                combo = _build_px4_priority_combo(defaults[slot_key])
-                combo.setAccessibleName(f"{label} {slot_key} priority")
-                combo.setToolTip(f"{slot_key}_PRIO 값을 설정합니다. 센서 identity는 {slot_key}_ID에서 읽습니다.")
-                card_layout.addWidget(QtWidgets.QLabel(slot_key), row, 0)
-                card_layout.addWidget(combo, row, 1)
-                combos[slot_key] = combo
-            self.mag_priority_combos[side] = combos
-            for role, combo in combos.items():
-                combo.currentIndexChanged.connect(lambda _index, side=side: self._refresh_mag_priority_preview(side))
-            status = QtWidgets.QLabel("PARAM readback 대기 중")
-            status.setObjectName("statusStrip")
-            status.setWordWrap(True)
-            status.setMinimumHeight(42)
-            card_layout.addWidget(status, 6, 0, 1, 2)
-            self.mag_priority_status_labels[side] = status
-            preview = QtWidgets.QLabel("Selection preview: topology readback 대기 중")
-            preview.setObjectName("statusStrip")
-            preview.setWordWrap(True)
-            preview.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-            preview.setMinimumHeight(58)
-            preview.setMaximumHeight(92)
-            card_layout.addWidget(preview, 7, 0, 1, 2)
-            self.mag_priority_preview_labels[side] = preview
-            cards.addWidget(card, 1)
-        group_layout.addLayout(cards)
-        self.mag_priority_group = group
+        label.setText(f"Draft pending Apply · {len(dirty)} slot(s)")
+        label.setToolTip(f"Apply to send: {rendered}")
+
+    def _discard_mag_priority_draft(self, side: str) -> None:
+        inputs = self._read_inputs()
+        status = inputs.status_cache.get(side) if isinstance(inputs.status_cache, Mapping) else None
+        if status is None:
+            label = self.mag_priority_status_labels.get(side)
+            if label is not None:
+                side_label = "P1" if side == "left" else "P2"
+                label.setText(f"{side_label}: PARAM readback required before Discard")
+            return
+        controls = self.mag_priority_combos.get(side, {})
+        discarded: set[str] = set()
+        for slot_key, combo in controls.items():
+            value = self._priority_readback(status, slot_key)
+            if value is None:
+                continue
+            self._set_priority_from_readback(combo, value)
+            discarded.add(slot_key)
+        if not discarded:
+            return
+        self._mag_priority_dirty.setdefault(side, set()).difference_update(discarded)
+        self._refresh_mag_priority_preview(side)
+        self._refresh_mag_priority_group({})
 
     def mag_priority_payload(self, side: str) -> dict[str, int]:
         controls = self.mag_priority_combos.get(str(side), {})
@@ -278,12 +287,27 @@ class MagnetometerView(QtCore.QObject):
         if label is None:
             return
         state, preview = self._read_preview(str(side), self.mag_priority_payload(str(side)))
+        warning = self.mag_priority_warning_labels.get(str(side))
         if state == "TOPOLOGY WAITING":
+            self._mag_priority_voter_gap_instances[str(side)] = ()
+            self._mag_priority_voter_gap_unknown_instances[str(side)] = ()
             label.setText("Selection preview: topology readback 대기 중")
+            if warning is not None:
+                warning.setText("Gap check waiting for topology")
+                warning.setToolTip("Topology readback이 없어 PX4 v1.17 voter gap을 검사하지 못했습니다.")
             return
         if state == "PARAM WAITING":
+            self._mag_priority_voter_gap_instances[str(side)] = ()
+            self._mag_priority_voter_gap_unknown_instances[str(side)] = ()
             label.setText("Selection preview: CAL_MAG PARAM readback 대기 중")
+            if warning is not None:
+                warning.setText("Gap check waiting for CAL_MAG PARAM")
+                warning.setToolTip("CAL_MAG ID/priority readback이 없어 PX4 v1.17 voter gap을 검사하지 못했습니다.")
             return
+        voter_gaps = tuple(getattr(preview, "priority_voter_gap_instances", ()) or ())
+        self._mag_priority_voter_gap_instances[str(side)] = voter_gaps
+        unknown_gaps = tuple(getattr(preview, "priority_voter_gap_unknown_instances", ()) or ())
+        self._mag_priority_voter_gap_unknown_instances[str(side)] = unknown_gaps
         topology_text = " · ".join(
             f"i{candidate.instance}:{candidate.role} id={candidate.device_id} "
             f"CAL_MAG{candidate.cal_slot if candidate.cal_slot is not None else '-'}"
@@ -314,6 +338,30 @@ class MagnetometerView(QtCore.QObject):
             else f"{self._mag_preview_role_label(preview.actual_role)} id={preview.actual_device_id}"
         )
         label.setText(f"Topology: {topology_text}\nPriority candidate: {candidate_text}\nActual PX4: {actual_text}")
+        if warning is not None:
+            if voter_gaps:
+                slots_by_instance = {candidate.instance: candidate.cal_slot for candidate in preview.candidates}
+                instances = ", ".join(
+                    f"i{instance}/MAG{slots_by_instance[instance]}"
+                    if slots_by_instance.get(instance) is not None
+                    else f"i{instance}"
+                    for instance in voter_gaps
+                )
+                warning.setText(f"PX4 1.17 gap: {instances} off; set Min (1)")
+                warning.setToolTip(
+                    "활성 후보보다 낮은 sensor_mag instance가 priority 0입니다. "
+                    "해당 MAG를 Min (1) 이상으로 설정하면 voter index가 유지됩니다."
+                )
+            elif unknown_gaps:
+                instances = ", ".join(f"i{instance}" for instance in unknown_gaps)
+                warning.setText(f"Gap check incomplete: {instances}; refresh topology")
+                warning.setToolTip(
+                    "후보보다 낮은 sensor_mag instance readback이 없습니다. "
+                    "Topology refresh 후 voter guard를 다시 확인하세요. Apply는 기존 gates로 진행합니다."
+                )
+            else:
+                warning.setText("PX4 1.17 voter gap: none detected")
+                warning.setToolTip("현재 topology와 staged priority에서 알려진 sparse-voter gap이 없습니다.")
 
     @staticmethod
     def _board_rotation_known(side: str, attitude_cache: object, rotation_cache: object) -> bool:
@@ -402,27 +450,21 @@ class MagnetometerView(QtCore.QObject):
                     logger = self._log
                     if callable(logger):
                         logger(f"[PX4 MAG] {label} SENS_BOARD_ROT 자동 readback 요청 ({attempts + 1}/{max_attempts})")
+            active_operation = side in parameter_threads
+            if self._mag_priority_apply_pending.get(side) and not active_operation:
+                self._mag_priority_apply_pending[side] = False
+            busy = active_operation or self._mag_priority_apply_pending.get(side, False)
             if status is not None:
-                slots_data = getattr(status, "slots", ()) or ()
-                if slots_data:
-                    for slot in slots_data:
-                        slot_key = mag_priority_slot_key(getattr(slot, "slot", -1))
-                        if slot_key in controls:
-                            _set_px4_priority_combo_value(controls[slot_key], getattr(slot, "priority", None))
-                else:
-                    # ``status.slots`` is derived from ``status.params`` (see
-                    # build_mag_status). When only the raw params are available
-                    # (e.g. before the slots readback lands) fall back to the
-                    # same CAL_MAGn_PRIO source so the combos still reflect the
-                    # live PX4 state instead of staying at their placeholder 0.
-                    params = getattr(status, "params", {})
-                    if isinstance(params, Mapping):
-                        for slot_number in MAG_SLOTS:
-                            slot_key = mag_priority_slot_key(slot_number)
-                            if slot_key in controls:
-                                _set_px4_priority_combo_value(
-                                    controls[slot_key], params.get(f"CAL_MAG{slot_number}_PRIO")
-                                )
+                for slot_key, combo in controls.items():
+                    actual_priority = self._priority_readback(status, slot_key)
+                    if actual_priority is None:
+                        continue
+                    dirty = self._mag_priority_dirty.setdefault(side, set())
+                    if slot_key in dirty:
+                        if busy or _px4_priority_combo_value(combo) != actual_priority:
+                            continue
+                        dirty.discard(slot_key)
+                    self._set_priority_from_readback(combo, actual_priority)
             verification_reader = self._read_verification
             verification = {}
             if callable(verification_reader):
@@ -469,116 +511,38 @@ class MagnetometerView(QtCore.QObject):
                     "Apply & Verify를 눌러 active selection을 확인하세요."
                 )
             self.mag_priority_status_labels[side].setText(status_text)
+            self._render_mag_priority_draft_status(side)
             self._refresh_mag_priority_preview(side)
             latest = self._read_inputs()
             active_operation = side in latest.parameter_sides
+            if self._mag_priority_apply_pending.get(side) and not active_operation:
+                self._mag_priority_apply_pending[side] = False
+            busy = active_operation or self._mag_priority_apply_pending.get(side, False)
             armed = side in latest.armed_sides
             enabled = (
                 self._invoke_command_available
                 and side in connected
-                and not active_operation
+                and not busy
                 and not self._recording_locked
             )
             self.mag_priority_refresh_buttons[side].setEnabled(enabled)
-            self.mag_priority_apply_buttons[side].setEnabled(enabled and not armed)
-            tooltip = "Disarm required" if armed else ""
+            self.mag_priority_discard_buttons[side].setEnabled(
+                bool(self._mag_priority_dirty.get(side)) and status is not None and not busy
+            )
+            for combo in controls.values():
+                combo.setEnabled(not busy)
+            voter_gap_instances = self._mag_priority_voter_gap_instances.get(side, ())
+            self.mag_priority_apply_buttons[side].setEnabled(
+                enabled and not armed and not voter_gap_instances
+            )
+            if armed:
+                tooltip = "Disarm required"
+            elif voter_gap_instances:
+                tooltip = "PX4 v1.17 voter gap: lower sensor priorities를 Min (1) 이상으로 바꾸세요."
+            else:
+                tooltip = ""
             self.mag_priority_apply_buttons[side].setToolTip(tooltip or "이 side만 Priority를 적용하고 검증합니다.")
 
-    def _build_px4_parameter_group(self) -> None:
-        group = QtWidgets.QGroupBox("Pixhawk Parameters · calibration-owned groups")
-        parameter_group_layout = QtWidgets.QVBoxLayout(group)
-        hint = QtWidgets.QLabel(
-            "QGC에서 Pixhawk에 저장한 값을 캘리브레이션별로 나누어 표시합니다. "
-            "각 초기화 버튼은 해당 그룹의 파라미터만 PX4 firmware default로 되돌리며, "
-            "값은 PX4 센서축/보드 기준 raw parameter라 NED/ENU/카메라 좌표로 변환하지 않습니다."
-        )
-        hint.setObjectName("statusStrip")
-        hint.setWordWrap(True)
-        parameter_group_layout.addWidget(hint)
-
-        self.px4_parameter_models: dict[str, dict[str, QtGui.QStandardItemModel]] = {}
-        self.px4_parameter_tables: dict[str, dict[str, QtWidgets.QTableView]] = {}
-        self.px4_parameter_status_labels: dict[str, QtWidgets.QLabel] = {}
-        self.px4_parameter_refresh_buttons: dict[str, QtWidgets.QPushButton] = {}
-        self.px4_parameter_group_models: dict[str, dict[str, QtGui.QStandardItemModel]] = {}
-        self.px4_parameter_group_status_labels: dict[str, dict[str, QtWidgets.QLabel]] = {}
-        self.px4_parameter_reset_buttons: dict[str, dict[str, QtWidgets.QPushButton]] = {}
-        tabs = QtWidgets.QTabWidget()
-        for side, side_code, title, command_id in (
-            ("left", "p1", "Pixhawk 1 / P1", "pixhawk.refresh_parameters.p1"),
-            ("right", "p2", "Pixhawk 2 / P2", "pixhawk.refresh_parameters.p2"),
-        ):
-            tab = QtWidgets.QWidget()
-            tab_layout = QtWidgets.QVBoxLayout(tab)
-            controls = QtWidgets.QHBoxLayout()
-            refresh_button = _command_button("QGC 결과 새로고침", command_id, self._invoke_command)
-            controls.addWidget(refresh_button)
-            controls.addStretch(1)
-            tab_layout.addLayout(controls)
-            status_label = QtWidgets.QLabel("PARAM readback 대기 중")
-            status_label.setObjectName("statusStrip")
-            status_label.setWordWrap(True)
-            status_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-            tab_layout.addWidget(status_label)
-            self.px4_parameter_status_labels[side] = status_label
-            self.px4_parameter_refresh_buttons[side] = refresh_button
-            self.px4_parameter_group_models[side] = {}
-            self.px4_parameter_models[side] = self.px4_parameter_group_models[side]
-            self.px4_parameter_tables[side] = {}
-            self.px4_parameter_group_status_labels[side] = {}
-            self.px4_parameter_reset_buttons[side] = {}
-            group_tabs = QtWidgets.QTabWidget()
-            for calibration in PX4_CALIBRATION_GROUPS:
-                group_tab = QtWidgets.QWidget()
-                calibration_layout = QtWidgets.QVBoxLayout(group_tab)
-                group_hint = QtWidgets.QLabel(calibration.description)
-                group_hint.setObjectName("compactContract")
-                group_hint.setWordWrap(True)
-                calibration_layout.addWidget(group_hint)
-                group_controls = QtWidgets.QHBoxLayout()
-                if calibration.resettable:
-                    reset_command_id = f"pixhawk.reset_calibration.{side_code}.{calibration.key}"
-                    reset_button = _command_button(
-                        "Reset to PX4 default",
-                        reset_command_id,
-                        self._invoke_command,
-                    )
-                else:
-                    reset_button = QtWidgets.QPushButton("Manual parameter · no calibration reset")
-                    reset_button.setEnabled(False)
-                    reset_button.setToolTip(
-                        "SENS_BOARD_ROT/Z_OFF are manual board-orientation parameters and are not changed by level calibration."
-                    )
-                group_controls.addWidget(reset_button)
-                group_controls.addStretch(1)
-                calibration_layout.addLayout(group_controls)
-                group_status = QtWidgets.QLabel("PARAM readback 대기 중")
-                group_status.setObjectName("statusStrip")
-                group_status.setWordWrap(True)
-                group_status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-                calibration_layout.addWidget(group_status)
-                model = _table_model(self, ("Parameter", "Current", "Reset target", "Contract"))
-                table = QtWidgets.QTableView()
-                table.setModel(model)
-                table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-                table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-                table.setAlternatingRowColors(True)
-                table.verticalHeader().setVisible(False)
-                table.setMinimumHeight(240)
-                table.horizontalHeader().setStretchLastSection(True)
-                table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
-                table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
-                table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
-                calibration_layout.addWidget(table, 1)
-                self.px4_parameter_group_models[side][calibration.key] = model
-                self.px4_parameter_tables[side][calibration.key] = table
-                self.px4_parameter_group_status_labels[side][calibration.key] = group_status
-                self.px4_parameter_reset_buttons[side][calibration.key] = reset_button
-                group_tabs.addTab(group_tab, calibration.label)
-            tab_layout.addWidget(group_tabs, 1)
-            tabs.addTab(tab, title)
-        parameter_group_layout.addWidget(tabs)
-        self.parameter_group = group
 
     def _refresh_px4_parameter_group(self, snapshot: dict[str, RuntimeStatus]) -> None:
         inputs = self._read_inputs()

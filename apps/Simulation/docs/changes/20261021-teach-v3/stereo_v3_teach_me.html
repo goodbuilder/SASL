@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>스테레오 교정 v3 결과를 손으로 읽는 법</title>
+  <style>
+    :root{color-scheme:light;--ink:#17253a;--muted:#506078;--navy:#173a58;--teal:#08766e;--line:#dce5ec;--bg:#f3f7fa;--paper:#fff;--amber:#fff3d7;--red:#9b4140}
+    *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.68 system-ui,-apple-system,"Noto Sans KR",sans-serif}a{color:#075b80;text-underline-offset:3px}code{font:.89em ui-monospace,SFMono-Regular,Consolas,monospace;background:#eef3f6;border-radius:4px;padding:1px 4px;overflow-wrap:anywhere}button,input{font:inherit}
+    .wrap{max-width:1120px;margin:auto;padding:0 22px}header{background:linear-gradient(125deg,#12354e,#176a68);color:#fff;padding:42px 0 34px}header p{color:#deedef;max-width:840px}.kicker{text-transform:uppercase;letter-spacing:.14em;font-weight:800;font-size:.78rem;opacity:.8}h1{font-size:clamp(2.1rem,4.3vw,3.35rem);line-height:1.15;margin:.3em 0 .45em}h2{font-size:1.5rem;color:var(--navy);margin:0 0 12px}h3{font-size:1.1rem;color:var(--navy);margin:20px 0 7px}p{margin:8px 0}nav{display:flex;gap:8px;flex-wrap:wrap;margin-top:22px}nav a{color:#fff;text-decoration:none;border:1px solid #c1dfe480;border-radius:99px;padding:5px 12px;font-size:.88rem}nav a:hover{background:#ffffff22;color:#fff}
+    main{display:grid;gap:18px;padding-top:22px;padding-bottom:48px}section{background:var(--paper);border:1px solid var(--line);border-radius:16px;padding:26px 30px;box-shadow:0 7px 24px #17354d0b}.lead{font-size:1.1rem;max-width:880px}.callout{border-left:4px solid var(--teal);background:#eaf8f5;border-radius:0 9px 9px 0;padding:12px 16px;margin:15px 0}.warning{border-left-color:#ad7100;background:var(--amber)}.danger{border-left-color:var(--red);background:#fff2f0}.mini{color:var(--muted);font-size:.88rem}.step{display:inline-block;background:#e2eff2;color:#0a5e63;border-radius:99px;padding:2px 10px;font-size:.78rem;font-weight:800;margin-right:8px}.four{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:16px 0}.four>div{border:1px solid var(--line);border-radius:10px;padding:13px 15px;background:#fbfdfe}.four strong{display:block;color:var(--navy);margin-bottom:3px}.formula{font:1rem/1.7 ui-monospace,SFMono-Regular,Consolas,monospace;background:#f0f5f8;padding:12px 15px;border-radius:9px;overflow-x:auto;margin:12px 0}.tablewrap{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:.92rem}th,td{text-align:left;vertical-align:top;padding:10px 11px;border-bottom:1px solid var(--line)}th{background:#edf3f7;color:var(--navy)}td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}.figure{margin:19px 0 14px;border:1px solid var(--line);border-radius:12px;background:#fbfdfe;padding:16px}.figure svg{display:block;width:100%;height:auto;max-height:300px}.figure figcaption{font-size:.87rem;color:var(--muted);margin-top:8px}details{border:1px solid #bfd8d7;background:#f4fbfa;border-radius:9px;padding:9px 13px;margin:11px 0}summary{cursor:pointer;font-weight:750;color:#086863}details p{margin:7px 0 3px}.two{display:grid;grid-template-columns:1fr 1fr;gap:13px}.card{border:1px solid var(--line);border-radius:10px;padding:14px;background:#fbfdfe}.card h3{margin:0 0 6px}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);border:0}ol,ul{padding-left:1.4rem}li{margin:5px 0}
+    @media(max-width:760px){.wrap{padding:0 14px}section{padding:19px}.four,.two{grid-template-columns:1fr}header{padding:29px 0}}
+    @media print{body{background:#fff}header{background:#fff;color:var(--ink);border-bottom:2px solid var(--navy)}header p{color:var(--ink)}nav{display:none}section{box-shadow:none;break-inside:avoid}details{break-inside:avoid}details>*{display:block!important}}
+  </style>
+</head>
+<body>
+<header><div class="wrap">
+  <div class="kicker">SASL · Simulation · Teach Me</div>
+  <h1>스테레오 교정 v3 결과를<br>손으로 읽는 법</h1>
+  <p>이 페이지의 결론은 두 가지입니다. <strong>P2는 V0 결과를 보기 전에 정한 공분산 점수로 선택</strong>됐습니다. <strong>선택 후 V0 위치오차가 항상 최저인 경로라는 뜻은 아닙니다.</strong> 실제 저장값 하나를 계산해 두 판단을 구분합니다.</p>
+  <nav aria-label="학습 순서"><a href="#read">읽는 순서</a><a href="#scene">예제</a><a href="#enu">0.1 좌표</a><a href="#stats">0.2 통계</a><a href="#unit">0.3 반복 단위</a><a href="#methods">방법 용어</a><a href="#selection">1. P2 선정</a><a href="#v0">2. V0 결과</a><a href="#tracking">3. 추종 P95</a><a href="#check">검산</a></nav>
+</div></header>
+<main class="wrap">
+<section id="read">
+  <h2>어떻게 읽을까요?</h2>
+  <p class="lead">대상은 결과를 보고하는 연구자와 상급자입니다. 계산기는 마지막 자리만 확인하면 됩니다. 아래 숫자는 동결 분석 <code>analysis_9cfd7c6cd10b</code>과 [보고용 XLSX v3](../../../recordings/stereo_v1_1/paper1_v1_2_001/outputs/20261021-postfreeze-summary-review/stereo_v1_2_summary_report_ready_v3.xlsx)에 저장된 값입니다.</p>
+  <div class="tablewrap"><table><thead><tr><th>확인할 질문</th><th>먼저 볼 탭</th><th>근거를 따라갈 탭</th></tr></thead><tbody>
+    <tr><td>실험과 QC는 어떻게 끝났나?</td><td>00_요약, 01_실행현황</td><td>07_사후QC, 13_QC시간간격</td></tr>
+    <tr><td>왜 P2를 골랐나?</td><td>12_P2선정추적</td><td>15_선정민감도, 10_계산추적</td></tr>
+    <tr><td>V0에서 실제 위치오차는?</td><td>05_그래프</td><td>16_실행별V0, 08_V0_MC분포</td></tr>
+    <tr><td>추종 P95 값이 왜 둘인가?</td><td>17_추종P95출처</td><td>02_경로추종, 07_사후QC</td></tr>
+    <tr><td>방법과 출처는?</td><td>11_방법계약, 98_출처</td><td>99_정의</td></tr>
+  </tbody></table></div>
+  <div class="callout warning"><strong>범위:</strong> MC 100회는 독립 비행 100회가 아닙니다. “최종 평가 완료”는 지표 산출 완료이며, 수치 정확도 합격 기준은 없습니다.</div>
+</section>
+
+<section id="scene">
+  <h2>예제의 장면과 확인할 답</h2>
+  <p>G0-P2-R01의 방법 A에서 V0 타깃 다섯 점에 전파한 예측 위치 표준편차 σ를 사용합니다. 이것은 <a href="../../../recordings/stereo_v1_1/paper1_v1_2_001/analysis_versions/analysis_9cfd7c6cd10b/path_selection.json">동결된 경로 선정값</a>의 <code>predictions_by_target</code>입니다. 공분산 전파 자체는 코드 산출값으로 고정돼 있으며, 이 페이지는 그 다음 집계부터 손으로 확인합니다.</p>
+  <div class="tablewrap"><table><thead><tr><th>타깃 북쪽 N (m)</th><th class="num">600</th><th class="num">550</th><th class="num">500</th><th class="num">450</th><th class="num">400</th></tr></thead><tbody><tr><td>예측 σ (m)</td><td class="num">0.737328105</td><td class="num">0.673934045</td><td class="num">0.611095793</td><td class="num">0.548771605</td><td class="num">0.486921609</td></tr></tbody></table></div>
+  <div class="callout"><strong>알고 확인할 답:</strong> 이 다섯 값의 평균은 <strong>0.611610232 m</strong>입니다. P2 경로 전체의 선정 점수는 <strong>0.611701449 m</strong>입니다. 두 값의 집계 단위가 다릅니다.</div>
+</section>
+
+<section id="enu">
+  <h2><span class="step">0.1</span>타깃 좌표는 어떤 뜻인가요?</h2>
+  <div class="four">
+    <div><strong>무엇인가요</strong>ENU는 동쪽 E, 북쪽 N, 위쪽 U 순서로 위치를 적습니다. 지도에서 북쪽 거리와 지면 위 높이를 함께 쓰는 것과 비슷합니다.</div>
+    <div><strong>왜 필요한가요</strong><a href="../../../campaigns/stereo_v1_1/analyze_campaign.py">선정 코드 1645–1649행</a>은 다섯 위치에 카메라 자세 불확실성을 전파합니다. 타깃 위치는 실제 V0 위치오차가 아닙니다.</div>
+    <div><strong>예제 숫자로</strong><code>D=600 m</code>이면 <code>E=0 m, N=600 m, U=600×tan(20°)=218.382141 m</code>입니다. U가 양수인지 확인하세요.</div>
+    <div><strong>직접 해보기</strong><code>D=400 m</code>일 때 U는 얼마인가요?<details><summary>정답 보기</summary><p><code>400×tan(20°)=145.588093 m</code>입니다.</p></details></div>
+  </div>
+  <figure class="figure"><svg viewBox="0 0 680 245" role="img" aria-label="world ENU에서 착륙장 기준 E=0, N=600m, U=218.382m 타깃을 보여주는 그림"><defs><marker id="arrow-enu" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#0a7069"/></marker></defs><line x1="90" y1="190" x2="585" y2="190" stroke="#1c5e6e" stroke-width="3" marker-end="url(#arrow-enu)"/><line x1="90" y1="190" x2="90" y2="34" stroke="#0a7069" stroke-width="3" marker-end="url(#arrow-enu)"/><line x1="90" y1="190" x2="505" y2="60" stroke="#d49727" stroke-width="4" stroke-dasharray="10 7"/><circle cx="90" cy="190" r="7" fill="#173a58"/><circle cx="505" cy="60" r="8" fill="#d49727"/><text x="94" y="218" fill="#173a58" font-size="17">착륙장 E=0, N=0, U=0</text><text x="550" y="217" fill="#1c5e6e" font-size="18">북쪽 N</text><text x="39" y="31" fill="#0a7069" font-size="18">위 U</text><text x="360" y="47" fill="#9a650b" font-size="17">타깃 [0, 600, 218.382] m</text><text x="375" y="184" fill="#173a58" font-size="16">N=600 m</text><text x="98" y="78" fill="#0a7069" font-size="16">U=218.382 m</text></svg><figcaption>world ENU의 위치 축입니다. 광학 RDF나 PX4 NED의 축 순서로 이 숫자를 옮기지 않습니다.</figcaption></figure>
+  <div class="tablewrap"><table><thead><tr><th>기호</th><th>뜻</th><th>단위</th><th>프로젝트 필드</th></tr></thead><tbody><tr><td>E</td><td>동쪽</td><td>m</td><td><code>target_world_enu_m[0]</code></td></tr><tr><td>N 또는 D</td><td>북쪽 거리</td><td>m</td><td><code>target_world_enu_m[1]</code></td></tr><tr><td>U</td><td>위쪽 높이</td><td>m</td><td><code>target_world_enu_m[2]</code></td></tr></tbody></table></div>
+</section>
+
+<section id="stats">
+  <h2><span class="step">0.2</span>평균과 중앙값은 어디에 쓰이나요?</h2>
+  <div class="four">
+    <div><strong>무엇인가요</strong>평균은 합을 개수로 나눕니다. 중앙값은 값을 정렬한 뒤 가운데를 고릅니다. P2 선정은 이 두 연산을 순서대로 사용합니다.</div>
+    <div><strong>왜 필요한가요</strong>각 교정 실행×방법에서 타깃 5점의 σ를 평균합니다. 경로 하나에서는 5실행×3방법의 평균 15개를 정렬해 8번째를 선정 점수로 씁니다. <a href="../../../campaigns/stereo_v1_1/analyze_campaign.py">선정 코드 1677–1700행</a>에 두 단계가 있습니다.</div>
+    <div><strong>예제 숫자로</strong><code>3.058051158 m ÷ 5 = 0.611610232 m</code>가 P2-R01/A의 타깃 평균입니다. P2의 15개 평균 중 정렬된 8번째는 <code>0.611701449 m</code>입니다.</div>
+    <div><strong>직접 해보기</strong>위 다섯 σ에서 두 번째로 큰 값은 무엇인가요?<details><summary>정답 보기</summary><p><code>0.673934045 m</code>입니다. 동결 코드의 보조 필드명은 <code>p95</code>이지만 이 연산은 통상적인 보간 95백분위가 아닙니다.</p></details></div>
+  </div>
+  <figure class="figure"><svg viewBox="0 0 770 190" role="img" aria-label="타깃 표준편차 다섯 개의 평균을 구하고 15개 실행과 방법의 평균에서 중앙값을 고르는 흐름"><defs><marker id="arrow-stat" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#0b746f"/></marker></defs><rect x="18" y="52" width="170" height="90" rx="14" fill="#e8f2f8" stroke="#8db7c6"/><text x="38" y="88" fill="#173a58" font-size="17">타깃 σ 5개</text><text x="38" y="115" fill="#526278" font-size="14">m 단위의 코드 산출값</text><line x1="189" y1="97" x2="224" y2="97" stroke="#0b746f" stroke-width="3" marker-end="url(#arrow-stat)"/><rect x="226" y="52" width="160" height="90" rx="14" fill="#e6f5f1" stroke="#79b5ae"/><text x="245" y="88" fill="#08766e" font-size="17">평균 μ 하나</text><text x="245" y="115" fill="#526278" font-size="14">합 ÷ 5</text><line x1="388" y1="97" x2="423" y2="97" stroke="#0b746f" stroke-width="3" marker-end="url(#arrow-stat)"/><rect x="425" y="52" width="150" height="90" rx="14" fill="#e8f2f8" stroke="#8db7c6"/><text x="443" y="88" fill="#173a58" font-size="17">μ 15개</text><text x="443" y="115" fill="#526278" font-size="14">5실행 × 3방법</text><line x1="577" y1="97" x2="612" y2="97" stroke="#0b746f" stroke-width="3" marker-end="url(#arrow-stat)"/><rect x="614" y="52" width="140" height="90" rx="14" fill="#fff0d8" stroke="#dba447"/><text x="633" y="88" fill="#9b620f" font-size="17">점수 S</text><text x="633" y="115" fill="#526278" font-size="14">정렬 8번째</text></svg><figcaption>첫 평균과 마지막 중앙값의 모수가 다릅니다. 경로 후보 JSON의 <code>mean_sigma</code>라는 이름만으로 최종 집계가 평균이라고 판단하면 틀립니다.</figcaption></figure>
+  <div class="tablewrap"><table><thead><tr><th>기호</th><th>뜻</th><th>단위</th><th>프로젝트 위치</th></tr></thead><tbody><tr><td>σ</td><td>한 타깃의 예측 3D 위치 표준편차</td><td>m</td><td><code>predicted_3d_sigma_m</code></td></tr><tr><td>μ</td><td>한 실행×방법의 타깃 5점 평균 σ</td><td>m</td><td><code>per_calibration_prediction</code></td></tr><tr><td>S</td><td>경로별 15개 μ의 중앙값</td><td>m</td><td><code>12_P2선정추적!C10:C14</code></td></tr></tbody></table></div>
+</section>
+
+<section id="unit">
+  <h2><span class="step">0.3</span>case와 비행은 왜 다른가요?</h2>
+  <div class="four">
+    <div><strong>무엇인가요</strong>run은 저장된 시뮬레이션 비행 하나입니다. MC trial은 같은 궤적에 대해 합성 입력을 바꿔 수행한 오프라인 계산 사례입니다.</div>
+    <div><strong>왜 필요한가요</strong><code>16_실행별V0</code>의 한 행은 교정 run과 대응 V0 run 안에서 <code>7 yaw × 100 MC = 700 case</code>의 지표를 평균합니다. case 수를 독립 비행 표본 수로 쓰면 안 됩니다.</div>
+    <div><strong>예제 숫자로</strong>G0-P2-R01/A/all_data의 <a href="../../../recordings/stereo_v1_1/paper1_v1_2_001/analysis_versions/analysis_9cfd7c6cd10b/evaluation_metrics.csv">평가 CSV</a>에는 Y0–Y6 각각 trial 0–99가 있어 700행입니다. 대응 V0 ID는 G0-V0-R01입니다.</div>
+    <div><strong>직접 해보기</strong>같은 경로·방법·범위에서 5개 대응 실행을 합치면 case는 몇 개인가요?<details><summary>정답 보기</summary><p><code>5 × 7 × 100 = 3,500 case</code>입니다. 물리 비행 3,500회라는 뜻은 아닙니다.</p></details></div>
+  </div>
+  <figure class="figure"><svg viewBox="0 0 720 170" role="img" aria-label="한 대응 비행 R01 안에 yaw 일곱 조건과 MC trial 백 개씩 있어 700개 사례가 생기는 흐름"><defs><marker id="arrow-case" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#0b746f"/></marker></defs><rect x="18" y="41" width="155" height="84" rx="13" fill="#e9f2f8" stroke="#91b9c8"/><text x="36" y="74" fill="#173a58" font-size="17">R01 비행쌍</text><text x="36" y="101" fill="#526278" font-size="14">교정 + 대응 V0</text><line x1="176" y1="83" x2="215" y2="83" stroke="#0b746f" stroke-width="3" marker-end="url(#arrow-case)"/><rect x="218" y="41" width="140" height="84" rx="13" fill="#e9f6f3" stroke="#83bcb4"/><text x="240" y="74" fill="#08766e" font-size="17">Y0–Y6</text><text x="240" y="101" fill="#526278" font-size="14">yaw 7조건</text><line x1="361" y1="83" x2="400" y2="83" stroke="#0b746f" stroke-width="3" marker-end="url(#arrow-case)"/><rect x="403" y="41" width="140" height="84" rx="13" fill="#e9f6f3" stroke="#83bcb4"/><text x="425" y="74" fill="#08766e" font-size="17">각 MC100</text><text x="425" y="101" fill="#526278" font-size="14">trial 0–99</text><line x1="546" y1="83" x2="585" y2="83" stroke="#0b746f" stroke-width="3" marker-end="url(#arrow-case)"/><rect x="588" y="41" width="115" height="84" rx="13" fill="#fff0d8" stroke="#d9a44b"/><text x="607" y="74" fill="#9b620f" font-size="17">700 case</text><text x="607" y="101" fill="#526278" font-size="14">지표 행</text></svg><figcaption>700은 같은 대응 실행 안의 계산 행 수입니다. PX4 난수와 비행 반복 독립성은 이 수로 검증되지 않습니다.</figcaption></figure>
+  <div class="tablewrap"><table><thead><tr><th>기호</th><th>뜻</th><th>단위</th><th>프로젝트 필드</th></tr></thead><tbody><tr><td>R</td><td>대응 실행번호</td><td>run ID</td><td><code>calibration_run_id</code>, <code>evaluation_run_id</code></td></tr><tr><td>Y</td><td>yaw 초기 조건</td><td>조건 ID</td><td><code>yaw_case</code></td></tr><tr><td>T</td><td>MC 반복</td><td>trial ID</td><td><code>trial_index</code></td></tr><tr><td>n</td><td>한 실행 안의 평가 사례 수</td><td>case</td><td><code>16_실행별V0!G48:G147</code></td></tr></tbody></table></div>
+</section>
+
+<section id="methods">
+  <h2>계산에 등장하는 방법을 구분하세요</h2>
+  <p>방법 이름은 <a href="../../../recordings/stereo_v1_1/paper1_v1_2_001/analysis_versions/analysis_9cfd7c6cd10b/analysis_methodology.md">동결 분석 방법론</a>과 XLSX <code>11_방법계약</code>의 정의를 따릅니다.</p>
+  <div class="tablewrap"><table><thead><tr><th>이름</th><th>입력과 추정</th><th>이 페이지에서의 역할</th></tr></thead><tbody>
+    <tr><td>A</td><td>좌우 카메라 자세를 각각 추정하며 noisy 드론 RTK를 사용</td><td>선정 점수와 V0 예제의 방법</td></tr>
+    <tr><td>B</td><td>좌우가 영상 pair별 3D 점을 공유하고 드론 RTK를 사용</td><td>P2/P0 대응 비교의 다른 방법</td></tr>
+    <tr><td>C</td><td>공유 3D 점을 영상으로 추정하며 드론 RTK를 추정기에 넣지 않음</td><td>선정 점수의 15개 값에는 포함됨</td></tr>
+    <tr><td>RPY_IMU</td><td>카메라 roll·pitch·yaw를 추정하고 IMU roll/pitch prior를 사용</td><td>이 페이지의 선정·V0 예제 조건</td></tr>
+    <tr><td>YAW_ONLY</td><td>같은 IMU 평균 roll/pitch를 고정하고 yaw만 추정</td><td>XLSX 14_P95짝비교의 상대 조건</td></tr>
+  </tbody></table></div>
+  <div class="callout"><strong>입력 경계:</strong> C도 공통 영상 표본을 고를 때는 드론 RTK 시간 구간이 있는 pair를 사용합니다. 합성 센서 생성기는 참 자세를 읽을 수 있지만, 주 A/B/C 추정기는 GT 위치를 입력받지 않습니다. V0 GT는 동결 자세의 위치 평가에 사용합니다. Huber 손실은 영상 잔차에만 적용되며 RTK·IMU 항은 이차 Gaussian 비용입니다.</div>
+</section>
+
+<section id="selection">
+  <h2><span class="step">1</span>P2는 어떤 순서로 선택됐나요?</h2>
+  <p><a href="../../../campaigns/stereo_v1_1/analyze_campaign.py">선정 코드 1651–1700행</a>은 V0 결과를 읽기 전에 G0의 Y0, all_data, trial 0, RPY_IMU 중 수렴한 A/B/C를 사용합니다. 다섯 타깃의 σ를 실행×방법별로 평균하고, 경로마다 15개 평균의 중앙값을 계산합니다. 과정은 위 <a href="#stats">0.2 흐름 그림</a>과 같습니다.</p>
+  <div class="tablewrap"><table><thead><tr><th>G0-P2 실행</th><th class="num">A 평균 σ (m)</th><th class="num">B 평균 σ (m)</th><th class="num">C 평균 σ (m)</th></tr></thead><tbody>
+    <tr><td>R01</td><td class="num">0.611610232</td><td class="num">0.609857247</td><td class="num">40.582160015</td></tr><tr><td>R02</td><td class="num">0.613056663</td><td class="num">0.611430754</td><td class="num">40.880898060</td></tr><tr><td>R03</td><td class="num">0.612012927</td><td class="num">0.610375918</td><td class="num">40.628700433</td></tr><tr><td>R04</td><td class="num">0.611701449</td><td class="num">0.610117119</td><td class="num">40.462970009</td></tr><tr><td>R05</td><td class="num">0.611302307</td><td class="num">0.609625045</td><td class="num">40.641387194</td></tr>
+  </tbody></table></div>
+  <p>15개를 정렬하면 8번째는 <strong>0.611701449 m</strong>입니다. P4 점수는 <strong>0.611774381 m</strong>이므로 <code>P4−P2=0.000072931 m≈0.073 mm</code>입니다. 동결 규칙은 P2를 골랐습니다. 이는 V0에서 P2가 가장 낮은 실측 오차를 냈다는 뜻이 아닙니다.</p>
+  <div class="callout warning"><strong>선정 안정성:</strong> <code>15_선정민감도</code>에서 경로마다 같은 반복번호의 A/B/C 값을 제외하면 P2가 2회, P4가 3회 1위입니다. 이 분석은 원래 동결 선택을 바꾸지 않습니다.</div>
+</section>
+
+<section id="v0">
+  <h2><span class="step">2</span>V0 실행별 평균은 어떻게 읽나요?</h2>
+  <p>동결된 카메라 자세로 V0 픽셀을 삼각측량하고, 평가기에서 GT와 비교합니다. <code>16_실행별V0</code>는 같은 반복번호의 교정 run과 V0 run을 묶습니다. 각 yaw×MC case에서 이미 계산된 3D RMSE 700개를 평균합니다. 전체 프레임을 하나로 합쳐 다시 계산한 RMSE와는 다른 집계입니다. 위 <a href="#unit">0.3 그림</a>에서 700의 뜻을 확인하세요.</p>
+  <div class="formula">G0-P0-R01 / A / all_data: 777.719994904 m ÷ 700 = 1.111028564 m<br>G0-P2-R01 / A / all_data: 783.649345680 m ÷ 700 = 1.119499065 m<br>P2 − P0 = +0.008470501 m</div>
+  <p>양수이므로 저장된 R01 조건에서는 P2의 case 평균 오차가 더 큽니다. 다른 네 실행의 대응 차이는 <code>16_실행별V0!A22:I41</code>에 있습니다. `all_data`의 A/B는 다섯 실행 모두 P2가 높지만, `matched_200`의 평균 방향은 다릅니다. 독립 비행의 신뢰구간으로 해석하지 마세요.</p>
+</section>
+
+<section id="tracking">
+  <h2><span class="step">3</span>추종 P95가 두 값인 이유는?</h2>
+  <p><a href="../../../recordings/stereo_v1_1/paper1_v1_2_001/source_evidence/summary_workbook_preparation_001/extract_summary_payload.py">기록값 생산 코드 15–34행</a>은 비행 상태 행에 저장된 GT와 참조 위치를 비교하고 GT 시각차가 40 ms를 넘으면 제외합니다. <a href="../../../campaigns/stereo_v1_1/align_gt.py">재정렬값 생산 코드 90–119행</a>은 연구 구간 제어 시각에 원시 GT를 다시 보간합니다. 둘 다 world ENU의 GT−참조 3D 거리와 type-7 보간 P95를 쓰지만 입력 GT 위치가 다를 수 있습니다.</p>
+  <figure class="figure"><svg viewBox="0 0 760 200" role="img" aria-label="기록된 비행 상태 GT를 사용한 P95와 원시 GT를 제어 시각에 재보간한 P95를 나란히 비교하는 그림"><defs><marker id="arrow-p95" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#0b746f"/></marker></defs><rect x="18" y="27" width="204" height="59" rx="12" fill="#e9f2f8" stroke="#91b9c8"/><text x="34" y="63" fill="#173a58" font-size="16">저장 GT + 참조 · 40 ms 제한</text><rect x="18" y="115" width="204" height="59" rx="12" fill="#e9f2f8" stroke="#91b9c8"/><text x="34" y="151" fill="#173a58" font-size="16">원시 GT · 제어 시각 재보간</text><line x1="224" y1="57" x2="273" y2="57" stroke="#0b746f" stroke-width="3" marker-end="url(#arrow-p95)"/><line x1="224" y1="145" x2="273" y2="145" stroke="#0b746f" stroke-width="3" marker-end="url(#arrow-p95)"/><rect x="276" y="27" width="176" height="59" rx="12" fill="#e9f6f3" stroke="#83bcb4"/><text x="295" y="63" fill="#08766e" font-size="16">기록 P95 3.913999 m</text><rect x="276" y="115" width="176" height="59" rx="12" fill="#e9f6f3" stroke="#83bcb4"/><text x="295" y="151" fill="#08766e" font-size="16">재정렬 P95 3.889329 m</text><line x1="456" y1="57" x2="507" y2="96" stroke="#0b746f" stroke-width="3" marker-end="url(#arrow-p95)"/><line x1="456" y1="145" x2="507" y2="106" stroke="#0b746f" stroke-width="3" marker-end="url(#arrow-p95)"/><rect x="511" y="74" width="224" height="55" rx="12" fill="#fff0d8" stroke="#d9a44b"/><text x="529" y="108" fill="#9b620f" font-size="17">차이 0.024670 m</text></svg><figcaption>예: G0-P0-R01/a02, 두 표 모두 1,315개 표본입니다. 같은 표본 수만으로 같은 GT 위치값임을 보장할 수 없습니다.</figcaption></figure>
+  <p><code>17_추종P95출처</code>의 G0-P0-R01/a02 기록값은 3.913999 m, 재정렬값은 3.889329 m입니다. 차이는 약 0.024670 m입니다. 원본 V0 8개의 재정렬 tracking은 동결 전 공개되지 않아 빈칸입니다. 빈칸을 0 m로 읽지 마세요.</p>
+</section>
+
+<section id="check">
+  <h2>끝까지 검산해 보세요</h2>
+  <div class="tablewrap"><table><thead><tr><th>순서</th><th>입력</th><th>연산</th><th class="num">손계산</th><th>XLSX·원자료</th></tr></thead><tbody>
+    <tr><td>1</td><td>N=600 m</td><td>U=N×tan(20°)</td><td class="num">218.382141 m</td><td>12_P2선정추적!B6</td></tr>
+    <tr><td>2</td><td>P2-R01/A의 σ 다섯 개</td><td>합</td><td class="num">3.058051158 m</td><td>path_selection.json</td></tr>
+    <tr><td>3</td><td>위 합</td><td>÷5</td><td class="num">0.611610232 m</td><td>12_P2선정추적 상세행</td></tr>
+    <tr><td>4</td><td>P2의 실행×방법 평균 15개</td><td>정렬 8번째</td><td class="num">0.611701449 m</td><td>12_P2선정추적!C10</td></tr>
+    <tr><td>5</td><td>P4 점수와 P2 점수</td><td>P4−P2</td><td class="num">0.000072931 m</td><td>12_P2선정추적!C11−C10</td></tr>
+    <tr><td>6</td><td>R01/A/all_data P0 RMSE 합</td><td>÷700</td><td class="num">1.111028564 m</td><td>16_실행별V0!D22</td></tr>
+    <tr><td>7</td><td>R01/A/all_data P2 RMSE 합</td><td>÷700</td><td class="num">1.119499065 m</td><td>16_실행별V0!E22</td></tr>
+    <tr><td>8</td><td>두 실행별 평균</td><td>P2−P0</td><td class="num">+0.008470501 m</td><td>16_실행별V0!F22</td></tr>
+  </tbody></table></div>
+  <div class="callout"><strong>저장값 대조:</strong> 경로 선정 JSON과 XLSX는 P2 점수 <code>0.6117014490616841 m</code>에서 일치합니다. 평가 CSV를 700행씩 독립 집계한 R01 평균과 XLSX의 차이는 부동소수 표시 마지막 자리 수준입니다. 이 대조는 집계를 검증하며 공분산 전파 solver의 정확도나 독립 비행 반복성을 증명하지 않습니다.</div>
+  <h3>자주 틀리는 지점</h3>
+  <ul><li>world ENU의 U는 위쪽 양수입니다. PX4 NED의 D와 바꾸지 마세요.</li><li>경로 후보 JSON의 <code>mean_sigma</code> 필드명만 보고 최종 점수를 전체 평균으로 읽지 마세요.</li><li>타깃 5점 보조 <code>p95</code>는 두 번째로 큰 값입니다. 일반적인 95백분위라고 인용하지 마세요.</li><li>700 case는 7 yaw×100 MC입니다. 비행 700회가 아닙니다.</li><li>`all_data`의 P0 우위를 `matched_200`까지 확대하지 마세요.</li><li>추종 1 m는 경고선입니다. 자동 폐기나 정확도 합격선이 아닙니다.</li></ul>
+  <div class="callout warning"><strong>확인하지 않은 것:</strong> 이번 설명을 위해 전체 분석 solver나 SITL을 재실행하지 않았습니다. PX4 난수·비행 반복의 독립성, 모든 case에서 양 자세 변형의 동일 유효 frame ID도 검증하지 않았습니다.</div>
+</section>
+</main></body></html>

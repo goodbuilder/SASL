@@ -12,10 +12,10 @@ import time
 from collections.abc import Mapping
 from typing import Callable, Sequence
 from PyQt5 import QtCore, QtWidgets
-from Workstation.ui.components import WorkspaceHeader
+from Workstation.ui.designer import load_form
 from Workstation.application.status_model import RuntimeStatus, StatusModel
 from Workstation.workstation_core.settings import normalize_pixhawk_gnss_source
-from Workstation.workstation_core.px4_mag_manager import build_mag_selection_preview
+from Workstation.workstation_core.px4_mag_manager import MAG_SLOTS, build_mag_selection_preview
 from .shared import _evidence
 from .pixhawk_parts.connections import (
     ConnectionView,
@@ -183,7 +183,11 @@ class _PixhawkViewSources:
             if getattr(state, "device_id", None) is not None
         }
         params = getattr(status, "params", {}) if status is not None else {}
-        if not isinstance(params, Mapping):
+        if not isinstance(params, Mapping) or any(
+            params.get(f"CAL_MAG{slot}_{suffix}") is None
+            for slot in MAG_SLOTS
+            for suffix in ("ID", "PRIO")
+        ):
             return "PARAM WAITING", None
         return "READY", build_mag_selection_preview(
             params,
@@ -260,29 +264,31 @@ class PixhawkWorkspace(QtWidgets.QWidget):
             part.inspection_requested.connect(self.inspection_requested.emit)
         self.connections.refresh_requested.connect(lambda: self.refresh(self.status_model.snapshot()))
 
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-        layout.addWidget(WorkspaceHeader("Pixhawk"))
-        layout.addLayout(self.connections.actions)
-        for group in (
-            self.connections.transport_group,
-            self.connections.status_group,
-            self.connections.candidate_group,
-            self.attitude.group,
-            self.gnss.receiver_group,
-            self.magnetometers.magnetometer_group,
-            self.magnetometers.mag_priority_group,
-            self.magnetometers.can_magnetometer_group,
-            self.gnss.baseline_group,
-            self.gnss.baseline_yaw_group,
-            self.geometry.group,
-            self.connections.recovery_group,
-            self.gnss.gnss_source_group,
-            self.magnetometers.parameter_group,
+        load_form("pixhawk.ui", self)
+        actions_placeholder = self.actionsLayout.parentWidget()
+        actions_index = self.workspaceLayout.indexOf(actions_placeholder)
+        self.workspaceLayout.removeWidget(actions_placeholder)
+        self.workspaceLayout.insertLayout(actions_index, self.connections.actions)
+        actions_placeholder.deleteLater()
+        for host, group in (
+            (self.transportLayout, self.connections.transport_group),
+            (self.statusLayout, self.connections.status_group),
+            (self.candidateLayout, self.connections.candidate_group),
+            (self.attitudeLayout, self.attitude.group),
+            (self.receiverLayout, self.gnss.receiver_group),
+            (self.magnetometerLayout, self.magnetometers.magnetometer_group),
+            (self.magPriorityLayout, self.magnetometers.mag_priority_group),
+            (self.canMagnetometerLayout, self.magnetometers.can_magnetometer_group),
+            (self.baselineLayout, self.gnss.baseline_group),
+            (self.baselineYawLayout, self.gnss.baseline_yaw_group),
+            (self.geometryLayout, self.geometry.group),
+            (self.recoveryLayout, self.connections.recovery_group),
+            (self.gnssSourceLayout, self.gnss.gnss_source_group),
+            (self.parameterLayout, self.magnetometers.parameter_group),
         ):
-            layout.addWidget(group)
-        layout.addStretch(1)
+            placeholder = host.parentWidget()
+            self.workspaceLayout.replaceWidget(placeholder, group)
+            placeholder.deleteLater()
 
     def refresh(self, snapshot: dict[str, RuntimeStatus]) -> None:
         self.connections.refresh(snapshot)
@@ -389,6 +395,9 @@ class PixhawkWorkspace(QtWidgets.QWidget):
     _inspect_magnetometer_row = _view_alias("magnetometers", "_inspect_magnetometer_row")
     _last_ui_yaw_signature = _view_alias("magnetometers", "_last_ui_yaw_signature")
     _mag_status_auto_refresh_attempts = _view_alias("magnetometers", "_mag_status_auto_refresh_attempts")
+    _mag_priority_dirty = _view_alias("magnetometers", "_mag_priority_dirty")
+    _mag_priority_voter_gap_instances = _view_alias("magnetometers", "_mag_priority_voter_gap_instances")
+    _mag_priority_voter_gap_unknown_instances = _view_alias("magnetometers", "_mag_priority_voter_gap_unknown_instances")
     _magnetometer_inspection = _view_alias("magnetometers", "_magnetometer_inspection")
     _refresh_mag_priority_group = _view_alias("magnetometers", "_refresh_mag_priority_group")
     _refresh_mag_priority_preview = _view_alias("magnetometers", "_refresh_mag_priority_preview")
@@ -397,11 +406,14 @@ class PixhawkWorkspace(QtWidgets.QWidget):
     can_magnetometer_table = _view_alias("magnetometers", "can_magnetometer_table")
     mag_priority_apply_buttons = _view_alias("magnetometers", "mag_priority_apply_buttons")
     mag_priority_combos = _view_alias("magnetometers", "mag_priority_combos")
+    mag_priority_discard_buttons = _view_alias("magnetometers", "mag_priority_discard_buttons")
+    mag_priority_draft_labels = _view_alias("magnetometers", "mag_priority_draft_labels")
     mag_priority_group = _view_alias("magnetometers", "mag_priority_group")
     mag_priority_payload = _view_alias("magnetometers", "mag_priority_payload")
     mag_priority_preview_labels = _view_alias("magnetometers", "mag_priority_preview_labels")
     mag_priority_refresh_buttons = _view_alias("magnetometers", "mag_priority_refresh_buttons")
     mag_priority_status_labels = _view_alias("magnetometers", "mag_priority_status_labels")
+    mag_priority_warning_labels = _view_alias("magnetometers", "mag_priority_warning_labels")
     magnetometer_model = _view_alias("magnetometers", "magnetometer_model")
     magnetometer_table = _view_alias("magnetometers", "magnetometer_table")
     px4_parameter_group_models = _view_alias("magnetometers", "px4_parameter_group_models")

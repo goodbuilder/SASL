@@ -42,3 +42,11 @@ PX4 active device. With five raw instances, a CAN2 priority of 100 may show CAN2
 while actual PX4 selection remains another in-range sensor; after a physical sensor is removed
 and topology is refreshed, the preview reflects the new instance. Existing Apply & Verify still
 requires fresh active-device and ATTITUDE evidence for success.
+
+## Follow-up scope approved 2026-10-12
+
+Fix the priority editor losing staged selections during its 4 Hz refresh, retry timed-out
+`PARAM_SET` acknowledgements, reconcile readback after a failed/partial apply, and surface/block
+the known PX4 v1.17 sparse-voter case when the live instance map proves that an enabled higher
+instance has a disabled lower instance. Preserve the independent P1/P2 paths and actual-device
+verification. Do not save, reboot, alter hardware, or patch firmware automatically.

@@ -252,6 +252,25 @@ readiness. This does not bypass Calibration quality/Apply rules or native-raster
 
 ## Current Run Flow
 
+### Edit layouts with Qt Designer
+
+Workstation loads its Qt 5 Designer forms directly from `ui/forms/` using the
+existing PyQt5 runtime. Edit a form, save it, and restart Workstation; no Python
+UI generation step is needed. From the repository root, for example:
+
+```bash
+designer apps/Workstation/ui/forms/settings_workspace.ui
+./apps/Workstation/run.sh
+```
+
+See [the Designer editing guide](docs/ui/QT_DESIGNER.md) for the page/component
+map, runtime widget boundaries, binding properties and verification commands.
+Live data, device commands, settings and custom video/plot behavior remain with
+the existing owners. All `.ui` files must accompany the application checkout.
+
+
+### Start Workstation
+
 From the repository root, install the Ubuntu manifest and create the one supported venv before
 running the app:
 
@@ -1344,6 +1363,14 @@ Its candidate rows are transient and read-only. The selected URL keeps the exist
   treat PARAM readback alone as success: wait for `ACTIVE VERIFIED`. Save/Reboot remains a separate
   explicit operation and is not required for an immediate runtime experiment.
 
+- MAG priority combos are staged per side. The 4 Hz status refresh preserves changed values;
+  use `Discard` to restore the latest confirmed PARAM readback. Apply may be blocked when the
+  supported PX4 1.17 topology shows an enabled higher `sensor_mag` instance after a disabled lower
+  instance. Set that lower MAG priority to `Min (1)` or higher. If topology/PARAM data is missing,
+  the guard is reported unavailable. `Apply & Verify` changes runtime PARAM values only; use the
+  existing explicit PX4 `param save` action to persist them. Workstation does not reboot
+  automatically.
+
 - Treat `Baseline−P1` and `Baseline−P2` as separate horizontal observations. A positive value
   means P1→P2 lies right/clockwise of that board's Forward direction. Do not interpret
   `CURRENT` as physical-alignment acceptance: the UI intentionally has no target angle or
@@ -1898,7 +1925,9 @@ ages the last sample instead of fabricating a live MAVLink value. PX4 shell
 Workaround: when comparing a priority A/B test, change one `CAL_MAG*_PRIO` through the existing
 disarmed workflow, verify `Actual selected MAG`/`vehicle_magnetometer.device_id`, and use the
 fresh `PX4 yaw°` value as the estimator result. Do not interpret a stale or fallback row as proof
-that the requested MAG was used.
+that the requested MAG was used. Keep unused lower priorities at `Min (1)` or higher on PX4 1.17;
+priority `0` disables a sensor and can create a sparse voter gap that drops a higher instance.
+Workstation blocks Apply when the current readbacks/topology prove this condition.
 
 ### Baseline−P1/P2 is a latest-state physical-alignment aid
 
@@ -2478,6 +2507,11 @@ frozen Mountain image.
 
 ## Change Log
 
+- 2026-10-12: Moved Workstation static UI layouts into checked-in Qt Designer
+  forms loaded by PyQt5. Retained command/state ownership and custom runtime
+  rendering. See the [editing guide](docs/ui/QT_DESIGNER.md) and
+  [verification ledger](docs/changes/20261012-qt-designer-ui/verification.md).
+
 - 2026-10-11: Fixed moved-module compatibility detection so recording callbacks no longer bind
   back to their own panel delegates. Clearing a missing persisted intrinsic path during settings
   save also prevents a stale asset reference from holding application shutdown open.
@@ -2584,6 +2618,10 @@ Historical entries below retain the behavior at their stated date. Current contr
   and show the priority candidate beside the actual `vehicle_magnetometer` device. Priority
   controls remain editable, including CAN2 when it is outside the stock selector range; no
   automatic topology, slot, or calibration mutation is introduced.
+
+- 2026-10-12: MAG priority edits now survive live readback refresh, timed-out PARAM_SET messages
+  retry, partial failures invalidate stale status, and the PX4 1.17 sparse-voter gap is shown and
+  blocked when current topology/readback proves it. Apply remains runtime-only; saving is explicit.
 
 - 2026-09-04: Added the read-only Pixhawk `Dr from Baseline Center`, `Dr from P1`, and
   `Dr from P2` F/R/D/Rg geometry rows plus separate horizontal `∠Dr-P1-P2` and

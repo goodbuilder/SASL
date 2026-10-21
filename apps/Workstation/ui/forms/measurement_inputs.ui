@@ -1,0 +1,78 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>measurementInputs</class>
+ <widget class="QGroupBox" name="measurementInputs">
+  <property name="title">
+   <string>Inputs</string>
+  </property>
+  <layout class="QVBoxLayout" name="measurementInputsLayout">
+   <item>
+    <widget class="QSplitter" name="previewSplitter">
+     <property name="childrenCollapsible">
+      <bool>false</bool>
+     </property>
+     <property name="minimumHeight">
+      <number>280</number>
+     </property>
+     <property name="sizePolicy">
+      <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+       <horstretch>0</horstretch>
+       <verstretch>0</verstretch>
+      </sizepolicy>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="compactContract">
+     <property name="text">
+      <string>Timing: Settings preferred · fallback APP RECEIVE · |Δ|≤100 ms</string>
+     </property>
+     <property name="toolTip">
+      <string>App receive is the default. RTCP/NTP preferred selects pairs only with VERIFIED, current same-epoch evidence; any timing fault falls back to exact app receive.</string>
+     </property>
+     <property name="minimumWidth">
+      <number>0</number>
+     </property>
+     <property name="sizePolicy">
+      <sizepolicy hsizetype="Ignored" vsizetype="Preferred">
+       <horstretch>0</horstretch>
+       <verstretch>0</verstretch>
+      </sizepolicy>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QWidget" name="facts">
+     <layout class="QGridLayout" name="factsLayout">
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+     </layout>
+    </widget>
+   </item>
+   <property name="leftMargin">
+    <number>6</number>
+   </property>
+   <property name="topMargin">
+    <number>6</number>
+   </property>
+   <property name="rightMargin">
+    <number>6</number>
+   </property>
+   <property name="bottomMargin">
+    <number>6</number>
+   </property>
+  </layout>
+ </widget>
+ <resources />
+ <connections />
+</ui>

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Callable
 from PyQt5 import QtCore, QtWidgets
-from Workstation.ui.components import WorkspaceHeader
+from Workstation.ui.designer import load_form
 from Workstation.application.status_model import RuntimeStatus, StatusModel
 from .optical_pose import OpticalPosePane
 
@@ -37,12 +37,7 @@ class AlignmentWorkspace(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Ignored,
             QtWidgets.QSizePolicy.Expanding,
         )
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-        layout.addWidget(
-            WorkspaceHeader("Alignment")
-        )
+        load_form("alignment.ui", self)
 
         # Alignment owns R,t evidence only. Device connection, Survey-in, and
         # their command surfaces stay in Devices; this page compares geometry
@@ -55,7 +50,9 @@ class AlignmentWorkspace(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Ignored,
             QtWidgets.QSizePolicy.Expanding,
         )
-        layout.addWidget(self.optical_pose_pane, 1)
+        self.workspaceLayout.replaceWidget(self.opticalPoseHost, self.optical_pose_pane)
+        self.opticalPoseHost.hide()
+        self.opticalPoseHost.deleteLater()
     def _build_operation_tabs(
         self,
         _invoke_command: Callable[[str], bool] | None = None,

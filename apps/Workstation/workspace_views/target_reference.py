@@ -2,6 +2,7 @@
 from __future__ import annotations
 import time
 from PyQt5 import QtCore, QtGui, QtWidgets
+from Workstation.ui.designer import load_form
 
 
 class TargetReferenceView(QtWidgets.QGroupBox):
@@ -15,69 +16,25 @@ class TargetReferenceView(QtWidgets.QGroupBox):
         self._signature = None
         self._last_refresh = float('-inf')
         self._busy = False
-        layout = QtWidgets.QGridLayout(self)
-        layout.setColumnStretch(1,1)
-        self.platform = QtWidgets.QComboBox()
-        self.platform.addItem('Drone','drone');self.platform.addItem('UAM','uam')
+        load_form("recording_target_reference.ui", self)
+        self.platform.addItem('Drone', 'drone')
+        self.platform.addItem('UAM', 'uam')
         self.platform.setCurrentIndex(1)
-        self.transport = QtWidgets.QComboBox()
-        for label,value in (('Network UDP','network'),('USB / Radio','usb'),('Manual','manual')):
-            self.transport.addItem(label,value)
-        layout.addWidget(QtWidgets.QLabel('Target platform'),0,0)
-        layout.addWidget(self.platform,0,1)
-        layout.addWidget(QtWidgets.QLabel('Receive-only'),0,2)
-        layout.addWidget(self.transport,0,3)
-        self.endpoint = QtWidgets.QLineEdit()
-        self.endpoint.setObjectName('targetDroneEndpoint')
-        self.endpoint.setPlaceholderText('udpin:0.0.0.0:14570 or /dev/serial/by-id/...')
-        self.baud = QtWidgets.QSpinBox();self.baud.setRange(1200,4000000);self.baud.setValue(57600)
-        self.system = QtWidgets.QSpinBox();self.component = QtWidgets.QSpinBox()
-        for spin in (self.system,self.component):spin.setRange(0,255);spin.setSpecialValueText('Any')
-        ids=QtWidgets.QHBoxLayout()
-        for label,widget in (('SYS',self.system),('COMP',self.component),('Baud',self.baud)):
-            ids.addWidget(QtWidgets.QLabel(label));ids.addWidget(widget)
-        layout.addWidget(QtWidgets.QLabel('Target MAVLink'),1,0)
-        layout.addWidget(self.endpoint,1,1)
-        layout.addLayout(ids,1,2,1,2)
-        self.ports = QtWidgets.QLineEdit('14570,14550,14551,14552,14553,14554,14555,14556,14557,14558,14559')
-        self.ports.setToolTip('PC UDP listen ports, comma separated (maximum 16). Target must already transmit here.')
-        layout.addWidget(QtWidgets.QLabel('Listen ports'),2,0)
-        layout.addWidget(self.ports,2,1,1,3)
-        scan=QtWidgets.QHBoxLayout()
-        self.find_network=QtWidgets.QPushButton('Find Network');self.find_usb=QtWidgets.QPushButton('Find USB')
-        self.cancel=QtWidgets.QPushButton('Cancel')
-        self.discovery_status=QtWidgets.QLabel('IDLE');self.discovery_status.setObjectName('statusStrip')
-        self.discovery_status.setMinimumWidth(150)
-        for widget in (self.find_network,self.find_usb,self.cancel,self.discovery_status):scan.addWidget(widget)
-        scan.addStretch(1);layout.addLayout(scan,3,0,1,4)
-        self.model=QtGui.QStandardItemModel(0,6,self)
-        self.model.setHorizontalHeaderLabels(['State','Source / Device','Port / Baud','SYS','COMP','Heartbeat age'])
-        self.table=QtWidgets.QTableView()
-        self.table.setModel(self.model);self.table.setFixedHeight(112)
-        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.table.verticalHeader().hide()
-        self.table.horizontalHeader().setStretchLastSection(True)
-        for index,width in enumerate((135,245,115,55,65,100)):self.table.setColumnWidth(index,width)
-        layout.addWidget(self.table,4,0,1,4)
-        actions=QtWidgets.QHBoxLayout()
-        self.use=QtWidgets.QPushButton('Use selected');self.connect_button=QtWidgets.QPushButton('Connect target')
-        self.stop_button=QtWidgets.QPushButton('Stop target');self.save_button=QtWidgets.QPushButton('Save')
-        for widget in (self.use,self.connect_button,self.stop_button,self.save_button):actions.addWidget(widget)
-        actions.addStretch(1);layout.addLayout(actions,5,0,1,4)
-        self.reference_label=QtWidgets.QLabel()
+        for label, value in (('Network UDP', 'network'), ('USB / Radio', 'usb'), ('Manual', 'manual')):
+            self.transport.addItem(label, value)
+        self.endpoint = self.targetDroneEndpoint
+        self.discovery_status.setObjectName('statusStrip')
+        self.model = QtGui.QStandardItemModel(0, 6, self)
+        self.model.setHorizontalHeaderLabels(['State', 'Source / Device', 'Port / Baud', 'SYS', 'COMP', 'Heartbeat age'])
+        self.table.setModel(self.model)
+        for index, width in enumerate((135, 245, 115, 55, 65, 100)):
+            self.table.setColumnWidth(index, width)
         self.reference_label.setObjectName('compactContract')
-        self.state_label=QtWidgets.QLabel('Target Drone: NOT CONFIGURED')
         self.state_label.setObjectName('compactContract')
-        self.samples_label=QtWidgets.QLabel('HEARTBEAT -- | ATTITUDE --\nGPS1 -- | GPS2 --')
-        self.samples_label.setMinimumHeight(self.samples_label.fontMetrics().lineSpacing()*2)
-        self.message=QtWidgets.QLabel('Ready');self.message.setObjectName('statusStrip')
-        for row,widget in enumerate((self.reference_label,self.state_label,self.samples_label,self.message),6):
+        self.message.setObjectName('statusStrip')
+        self.samples_label.setMinimumHeight(self.samples_label.fontMetrics().lineSpacing() * 2)
+        for widget in (self.reference_label, self.state_label, self.samples_label, self.message):
             widget.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-            widget.setMinimumWidth(0)
-            widget.setSizePolicy(QtWidgets.QSizePolicy.Ignored,QtWidgets.QSizePolicy.Fixed)
-            layout.addWidget(widget,row,0,1,4)
         self.platform.currentIndexChanged.connect(self._edited)
         self.transport.currentIndexChanged.connect(self._edited)
         self.endpoint.textEdited.connect(self._edited)

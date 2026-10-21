@@ -56,3 +56,34 @@ def test_capture_readiness_requires_actual_image_subscriptions(tmp_path: Path):
         encoding="utf-8",
     )
     assert _subscribed(log, STREAM_TOPICS["right"])
+
+
+def test_v12_capture_records_all_minimum_topics_and_rejects_empty_camera_info(tmp_path, monkeypatch):
+    import json
+    import campaigns.stereo_v1_1.capture_streams as module
+    from io import StringIO
+    started = {}
+    class Process:
+        returncode = None
+        def poll(self):
+            return None
+    def start(stream, topics, raw_root, attempt_dir, compression):
+        started[stream] = topics
+        bag = raw_root / stream
+        bag.mkdir()
+        (bag / "metadata.yaml").write_text("placeholder")
+        return Process(), StringIO()
+    def counts(path):
+        return {topic: 0 if topic == "/left_camera/camera_info" else 1
+                for topic in started[path.parent.name]}
+    monkeypatch.setattr(module, "_start_bag", start)
+    monkeypatch.setattr(module, "_subscribed", lambda *_: True)
+    monkeypatch.setattr(module, "_stop_owned", lambda procs: {name: 0 for name in procs})
+    monkeypatch.setattr(module, "metadata_counts", counts)
+    monkeypatch.setattr(module, "STOP", True)
+    result = module.capture(tmp_path, protocol_version="1.2")
+    assert set(started) == {"left", "right", "state"}
+    assert set(started["state"]) == set(module.V12_STATE_TOPICS)
+    assert result["status"] == "CAPTURE_FAILED"
+    assert "/left_camera/camera_info" in result["failure_reason"]
+    assert json.loads((tmp_path / "raw_capture_summary.json").read_text())["protocol_version"] == "1.2"

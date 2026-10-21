@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="스테레오카메라 39회 실험 지시서, M0/A/B/C 교정, GPS yaw90, 재투영 보정식과 프레임 가중치를 설명하는 오프라인 문서">
+<title>스테레오카메라 교정 — 실험에서 보정식까지</title>
+<style>
+:root{--ink:#172b43;--muted:#52637a;--paper:#f5f7fa;--surface:#fff;--line:#d9e1eb;--blue:#245bd7;--blue-soft:#eaf0ff;--teal:#087d76;--teal-soft:#e5f5f1;--orange:#b85c13;--orange-soft:#fff2e6;--purple:#714caf;--nav:#102339;--radius:16px;font-family: "Pretendard","Noto Sans CJK KR","Malgun Gothic",system-ui,sans-serif;color:var(--ink);background:var(--paper);font-synthesis:none}
+*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:30px}body{margin:0;font-size:16px;line-height:1.8;word-break:keep-all;overflow-wrap:break-word}button,input,select{font:inherit}button,a,input{touch-action:manipulation}a{color:var(--blue);text-underline-offset:4px}button{cursor:pointer}button:focus-visible,a:focus-visible,input:focus-visible,summary:focus-visible{outline:3px solid #df8a1b;outline-offset:4px}h1,h2,h3,p{margin-top:0}h1{font-size:clamp(32px,4vw,54px);line-height:1.3;letter-spacing:-.05em;margin-bottom:22px}h2{font-size:30px;line-height:1.4;letter-spacing:-.035em;margin-bottom:18px}h3{font-size:19px;line-height:1.5;margin-bottom:12px}p{margin-bottom:16px}strong{font-weight:750}code{font-family:ui-monospace,Consolas,monospace;font-size:.84em;background:#edf1f7;padding:2px 5px;border-radius:4px;overflow-wrap:anywhere}small,.small{font-size:13px}.muted{color:var(--muted)}.mono{font-family:ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)}
+.procedure{list-style:none;padding:0;margin:24px 0 12px;counter-reset:proc}.procedure li{counter-increment:proc;position:relative;margin:0 0 0 15px;padding:0 0 25px 42px;border-left:1px solid #c9d8ee}.procedure li:last-child{border-left-color:transparent;padding-bottom:2px}.procedure li::before{content:counter(proc,decimal-leading-zero);position:absolute;left:-15px;top:0;width:29px;height:29px;display:grid;place-items:center;border:1px solid #c6d8f4;border-radius:50%;background:var(--surface);color:var(--blue);font-size:10px;font-weight:750}.procedure h4{margin:0 0 5px;font-size:15px;line-height:1.5}.procedure p{margin:0;font-size:14px;color:var(--muted)}.procedure .mini-equation{font-family:"Cambria Math",Georgia,serif;color:var(--ink);font-size:16px}.phase{display:inline-block;border:1px solid var(--line);border-radius:5px;padding:1px 7px;font-size:11px;font-weight:700;color:var(--blue);background:white;margin-right:5px;white-space:nowrap}.matrix-steps{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin:18px 0}.matrix-steps div{border-top:2px solid #b7cbea;padding:10px 2px 0;font-size:12px;color:var(--muted)}.matrix-steps b{display:block;color:var(--ink);font-size:13px;margin-bottom:4px}.notice-inline{padding:12px 15px;border-left:3px solid var(--orange);background:var(--orange-soft);border-radius:0 8px 8px 0;font-size:13px;margin:18px 0}
+.skip{position:fixed;left:16px;top:-100px;z-index:30;background:white;padding:12px}.skip:focus{top:12px}
+.sidebar nav{scrollbar-width:none}.sidebar nav::-webkit-scrollbar{display:none}
+.sidebar{position:fixed;inset:0 auto 0 0;width:238px;background:var(--nav);color:white;padding:34px 22px;display:flex;flex-direction:column;z-index:10}.brand{font-size:12px;letter-spacing:.16em;font-weight:700;color:#a6b8ce}.brand strong{display:block;color:white;font-size:20px;letter-spacing:-.03em;margin-top:5px}.nav-label{font-size:11px;letter-spacing:.14em;color:#a6b8ce;margin:40px 10px 12px}.sidebar nav{display:grid;gap:5px}.sidebar nav a{display:flex;align-items:center;gap:12px;color:#c7d3e2;padding:10px 12px;text-decoration:none;border-radius:8px;font-size:14px;line-height:1.5}.sidebar nav a span{font-size:11px;color:#9fb4d0;min-width:18px}.sidebar nav a:hover,.sidebar nav a.active{background:#223e5e;color:white}.sidebar nav a.active span{color:#9ec5ff}.side-foot{margin-top:auto;font-size:12px;color:#b8c9dd;line-height:1.8;padding:30px 10px 0}.side-foot .dot{display:inline-block;background:#70cbb7;width:6px;height:6px;border-radius:50%;margin-right:7px}
+main{margin-left:238px;padding:58px clamp(24px,4.5vw,76px) 36px;max-width:1530px}.hero{padding:4px 0 40px;border-bottom:1px solid var(--line)}.eyebrow{font-size:12px;font-weight:750;letter-spacing:.13em;text-transform:uppercase;color:var(--blue);margin-bottom:17px}.hero-lead{font-size:19px;max-width:830px;color:var(--muted)}.meta{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:24px}.tag{display:inline-block;border:1px solid var(--line);border-radius:30px;padding:4px 11px;font-size:12px;background:var(--surface);color:var(--muted)}.tag.blue{background:var(--blue-soft);border-color:#cbdafa;color:#194dad}.hero-bottom{display:flex;justify-content:space-between;align-items:center;gap:20px;flex-wrap:wrap;margin-top:26px}.hero-equation{font-size:19px;font-weight:650;letter-spacing:-.02em}.hero-equation b{color:var(--blue)}.button{border:1px solid #cbd6e4;background:white;color:var(--ink);border-radius:9px;padding:8px 14px;font-size:14px;font-weight:650;line-height:1.5}.button.primary{background:var(--blue);color:white;border-color:var(--blue)}.button:hover{filter:brightness(.96)}
+section{padding:54px 0 12px;scroll-margin-top:18px}.section-kicker{display:flex;gap:12px;align-items:center;color:var(--blue);font-weight:700;font-size:12px;letter-spacing:.09em;margin-bottom:11px}.section-kicker span{width:27px;height:27px;border:1px solid #c8d9f4;border-radius:50%;display:grid;place-items:center;font-size:11px}.intro{max-width:850px;color:var(--muted)}.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:22px}.grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px}.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:25px;margin:22px 0}.panel .panel{margin:0}.grid2>.panel,.grid3>.panel{margin:0}.hint{padding:15px 19px;border-left:3px solid var(--blue);background:var(--blue-soft);border-radius:0 9px 9px 0;margin:22px 0;font-size:14px}.hint.teal{background:var(--teal-soft);border-color:var(--teal)}.hint.amber{background:var(--orange-soft);border-color:var(--orange)}.hint p:last-child{margin-bottom:0}.label{font-size:12px;letter-spacing:.02em;color:var(--muted);font-weight:650}.key-number{font-size:42px;line-height:1.2;font-weight:760;letter-spacing:-.04em;margin:8px 0;color:var(--blue)}.key-number small{font-size:16px;font-weight:500;margin-left:5px}.flow{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:15px;margin:26px 0}.step{border-top:3px solid #afc5e8;padding:15px 0 0}.step .step-index{font-size:11px;font-weight:750;color:var(--blue)}.step h3{font-size:16px;margin:7px 0}.step p{font-size:14px;color:var(--muted);margin:0}.check-list{list-style:none;padding:0;margin:0}.check-list li{padding:9px 0;border-bottom:1px solid #e8edf3;font-size:14px}.check-list li:last-child{border:0}.check-list strong{display:block;margin-bottom:2px}ul,ol{padding-left:23px}li{margin-bottom:6px}
+.table-wrap{overflow:auto;margin:22px 0;border:1px solid var(--line);border-radius:12px;background:var(--surface)}table{width:100%;border-collapse:collapse;font-size:14px;text-align:left}th{background:#edf2f8;font-size:12px;letter-spacing:.01em;font-weight:700;padding:12px 15px;border-bottom:1px solid var(--line)}td{padding:14px 15px;border-bottom:1px solid #e5ebf2;vertical-align:top}tr:last-child td{border-bottom:0}td p{margin:5px 0}table .nowrap{white-space:nowrap}caption{text-align:left;padding:12px 15px;font-weight:700}.yes{color:var(--teal);font-weight:700}.no{color:var(--muted)}.term{font-family:"Cambria Math","STIX Two Math",Georgia,serif;font-style:italic}.formula{font-family:"Cambria Math","STIX Two Math",Georgia,serif;font-size:clamp(17px,1.65vw,22px);line-height:2.05;background:#f4f7fc;border-radius:10px;padding:18px 22px;overflow-x:auto;margin:15px 0;letter-spacing:.01em}.formula strong{font-weight:600}.formula .roman{font-style:normal}.formula sub,.formula sup{font-size:.65em}.formula .line{display:block;white-space:nowrap}.formula .explain{font-family:inherit;font-size:.8em;color:var(--muted)}.formula-inline{font-family:"Cambria Math",Georgia,serif;font-size:1.1em;white-space:nowrap}.frac{display:inline-flex;vertical-align:middle;flex-direction:column;text-align:center;line-height:1.4;margin:0 .2em;font-size:.95em}.frac>:first-child{border-bottom:1px solid currentColor;padding:0 4px}.frac>:last-child{padding:0 4px}.math-terms{display:flex;flex-wrap:wrap;gap:9px;margin:14px 0}.math-term{border:1px solid #cbd6e4;border-radius:8px;background:white;padding:12px 14px;text-align:left;color:var(--ink);flex:1;min-width:160px;line-height:1.6}.math-term .term-title{display:block;font-size:12px;font-weight:700;margin-bottom:6px}.math-term .term{font-size:19px;white-space:nowrap}.math-term[aria-pressed="true"]{background:var(--blue-soft);border-color:var(--blue);box-shadow:inset 0 -2px var(--blue)}.term-detail{min-height:90px;padding:17px 20px;background:#f4f7fc;border-radius:9px;font-size:14px}.objective{margin:18px 0}.objective-head{font-family:Georgia,serif;font-size:21px}.objective-head small{font-family:inherit;font-size:14px}.legend{display:flex;gap:18px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin:8px 0}.legend span{display:inline-flex;align-items:center;gap:7px}.swatch{width:10px;height:10px;border-radius:50%;background:var(--teal);display:inline-block}.swatch.square{border-radius:1px;background:var(--orange)}.swatch.blue{background:var(--blue)}
+.controls{display:flex;gap:18px;align-items:flex-end;flex-wrap:wrap;margin:18px 0}.control{flex:1;min-width:200px}.control label{display:flex;justify-content:space-between;gap:15px;font-size:14px;font-weight:650;line-height:1.6;margin-bottom:8px}.control output{font-variant-numeric:tabular-nums;color:var(--blue);white-space:nowrap}input[type="range"]{width:100%;accent-color:var(--blue)}.segmented{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}.segmented button{border:1px solid #cbd6e4;background:#fff;border-radius:7px;padding:7px 13px;color:var(--ink);font-size:13px;font-weight:650}.segmented button[aria-pressed="true"]{background:var(--blue);color:white;border-color:var(--blue)}.chart{display:block;width:100%;height:auto;border-radius:8px;background:#fcfdff}.chart text{font-family:system-ui,"Noto Sans CJK KR",sans-serif;font-size:12px;fill:var(--muted)}.chart .chart-label{fill:var(--ink);font-weight:650}.chart .grid-line{stroke:#e5ebf2;stroke-width:1}.chart .axis-line{stroke:#a8b7cb;stroke-width:1}.chart-caption{font-size:12px;color:var(--muted);margin:10px 0 0}.stats-row{display:flex;gap:30px;flex-wrap:wrap;margin-top:18px;border-top:1px solid var(--line);padding-top:16px}.stat{font-size:12px;color:var(--muted)}.stat output{display:block;font-size:23px;color:var(--ink);font-weight:700;line-height:1.6;font-variant-numeric:tabular-nums}.stat output small{font-size:12px;font-weight:500}.pill{display:inline-block;font-size:11px;background:#edf2f8;color:#385678;padding:3px 8px;border-radius:5px;font-weight:650}.mini-title{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:13px}.mini-title h3{margin:0}.outputs{display:grid;grid-template-columns:1fr 1fr;gap:20px}.file{background:white;border:1px solid var(--line);border-top:4px solid var(--blue);border-radius:12px;padding:25px;min-width:0}.file:nth-child(2){border-top-color:var(--teal)}.file h3{font-family:ui-monospace,Consolas,monospace;font-size:16px;overflow-wrap:anywhere}.file p{font-size:14px;color:var(--muted);margin-bottom:10px}.file .tag{font-size:11px}.source-list{display:grid;grid-template-columns:1fr 1fr;gap:12px}.source-list a{display:block;font-size:14px;overflow-wrap:anywhere}.source-list small{display:block;color:var(--muted)}details{border-top:1px solid var(--line);padding:16px 0}summary{cursor:pointer;font-weight:650;font-size:15px}details p,details ul{font-size:14px;margin-top:12px}footer{border-top:1px solid var(--line);margin-top:44px;padding:22px 0;color:var(--muted);font-size:12px}.print-note{display:none}.error-notice{background:#fff2e6;padding:14px;border-left:3px solid var(--orange)}
+@media(min-width:1500px){main{margin-right:auto}}@media(max-width:1050px){.sidebar{width:205px;padding:26px 14px}main{margin-left:205px;padding-left:26px;padding-right:26px}.grid3{grid-template-columns:1fr}.flow{grid-template-columns:1fr 1fr}.math-term .term{font-size:17px}.grid2{grid-template-columns:1fr}}
+@media(max-width:760px){html{scroll-padding-top:85px}.sidebar{position:sticky;top:0;inset:auto;width:100%;padding:10px 14px;background:var(--nav);display:block}.brand{font-size:10px}.brand strong{display:inline;font-size:14px;margin-left:9px}.nav-label,.side-foot{display:none}.sidebar nav{display:flex;overflow-x:auto;gap:5px;margin-top:7px}.sidebar nav a{white-space:nowrap;padding:7px 9px;font-size:12px}.sidebar nav a span{display:none}main{margin:0;padding:28px 18px}.hero{padding-bottom:28px}.hero-lead{font-size:16px}.hero-equation{font-size:16px}h2{font-size:25px}section{padding-top:38px;scroll-margin-top:92px}.panel{padding:18px}.outputs,.source-list{grid-template-columns:1fr}.formula{padding:12px 14px;font-size:17px}.controls{gap:12px}.control{min-width:100%}.stats-row{gap:22px}.stat output{font-size:20px}.chart text{font-size:13px}.flow{gap:18px}.math-terms{display:grid;grid-template-columns:1fr}.math-term{padding:9px 12px}.math-term .term-title{display:inline;margin-right:14px}.term-detail{min-height:110px}th,td{padding:11px 12px}.table-wrap table{min-width:570px}.mini-title{align-items:flex-start;flex-direction:column;gap:5px}}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*{transition:none!important}}
+@media print{html{scroll-behavior:auto}body{font-size:11px;background:white;color:#000;line-height:1.65}.sidebar,.skip,.no-print,.controls,.segmented{display:none!important}main{margin:0;padding:0;max-width:none}h1{font-size:32px}h2{font-size:23px}h3{font-size:16px}.hero{padding:0 0 20px}section{padding-top:26px}.panel,.file{break-inside:avoid;padding:16px;margin:14px 0}.formula{font-size:15px;background:#f5f5f5;padding:12px}.chart{max-height:240px}.table-wrap{overflow:visible}.table-wrap table{min-width:0;font-size:11px}a{color:#000}a[href^="#"]{text-decoration:none}.grid2{grid-template-columns:1fr 1fr}.grid3{grid-template-columns:1fr 1fr 1fr}.outputs{grid-template-columns:1fr 1fr}.flow{grid-template-columns:repeat(4,1fr)}.hint{font-size:11px}.print-note{display:block;font-size:11px}.hero-lead{font-size:14px}.term-detail{display:none}.math-term{min-width:0;font-size:11px}.math-term .term{font-size:15px}details>:not(summary){display:block!important}.source-list{grid-template-columns:1fr 1fr}footer{font-size:10px}.stats-row{margin-top:8px;padding-top:8px}.stat output{font-size:16px}}
+</style>
+<style>
+.spatial-figure{margin:22px 0;padding:16px;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius)}.spatial-figure svg{display:block;width:100%;height:auto}.spatial-figure figcaption{font-size:13px;color:var(--muted);margin-top:10px}.spatial-figure text{font-family:system-ui,"Noto Sans CJK KR",sans-serif}.spatial-figure .sp-axis{stroke:currentColor;stroke-width:2;fill:none}.spatial-figure .sp-world{stroke:var(--blue);stroke-width:3;fill:none}.spatial-figure .sp-ray{stroke:var(--teal);stroke-width:2.5;stroke-dasharray:7 5;fill:none}.spatial-figure .sp-pred{stroke:var(--orange);stroke-width:2.5;stroke-dasharray:4 4;fill:none}.spatial-figure .sp-panel{fill:#fbfcfe;stroke:var(--line);stroke-width:1.5}.spatial-figure .sp-camera{fill:var(--blue-soft);stroke:var(--blue);stroke-width:2}.spatial-figure .sp-observed{fill:var(--blue);stroke:white;stroke-width:2}.spatial-figure .sp-predicted{fill:var(--orange);stroke:white;stroke-width:2}.spatial-figure .sp-path{stroke:var(--orange);stroke-width:4;fill:none;stroke-linecap:round}.spatial-controls{display:grid;grid-template-columns:minmax(220px,1fr) auto;gap:14px;align-items:end;margin:12px 0}.spatial-controls .readout{font-variant-numeric:tabular-nums;background:var(--blue-soft);border-radius:8px;padding:10px 13px;color:var(--ink);font-size:13px}.spatial-figure .sp-small{font-size:12px;fill:var(--muted)}.spatial-figure .sp-label{font-size:14px;font-weight:700;fill:var(--ink)}
+</style>
+</head>
+<body>
+<a class="skip" href="#main">본문으로 바로 가기</a>
+<aside class="sidebar" aria-label="문서 탐색">
+  <div class="brand">SASL · SIMULATION<strong>스테레오 교정 노트</strong></div>
+  <div class="nav-label">EXPERIMENT → EQUATIONS</div>
+  <nav>
+    <a href="#overview" class="active"><span>01</span> 실험의 목적</a>
+    <a href="#campaign"><span>02</span> 39회 비행 계획</a>
+    <a href="#inputs"><span>03</span> 위치·자세·ray</a>
+    <a href="#methods"><span>04</span> M0 / A / B / C</a>
+    <a href="#equations"><span>05</span> 실제 보정식</a>
+    <a href="#weights"><span>06</span> 프레임별 비중</a>
+    <a href="#outputs"><span>07</span> 평가와 저장 파일</a>
+    <a href="#sources"><span>08</span> 구현 범위와 근거</a>
+  </nav>
+  <div class="side-foot"><span class="dot"></span>오프라인 단일 HTML<br>지시서 v1.2 + GPS yaw90 구현<br>설명 기준: 2026-10-17</div>
+</aside>
+<main id="main">
+  <header class="hero">
+    <div class="eyebrow">Stereo calibration · A practical explainer</div>
+    <div class="meta"><span class="tag blue">39회 실험 지시서</span><span class="tag">보정 원리와 실제 코드</span><span class="tag">인터랙티브 설명 3개</span></div>
+    <h1>움직이는 드론으로,<br>고정된 카메라의 방향을 찾는다.</h1>
+    <p class="hero-lead">여러 프레임의 드론 위치와 영상 픽셀을 함께 설명하는 <strong>좌우 카메라 자세</strong>를 추정합니다. 실험 계획부터 ray, 재투영 오차, 가중치, 그리고 두 XLSX 결과까지 연결해 봅니다.</p>
+    <div class="hero-bottom"><div class="hero-equation">카메라 위치 <b>고정</b> <span aria-hidden="true"> · </span> 카메라 R/P/Y <b>추정</b></div><button class="button no-print" id="print-button" type="button">인쇄 / PDF로 저장</button></div>
+  </header>
+  <noscript><p class="error-notice">설명과 수식은 그대로 읽을 수 있습니다. 비행경로·재투영·가중치 조작은 JavaScript를 켜면 동작합니다.</p></noscript>
+
+  <section id="overview" aria-labelledby="overview-title">
+    <div class="section-kicker"><span>01</span> THE QUESTION</div>
+    <h2 id="overview-title">이 실험은 무엇을 확인하나?</h2>
+    <p class="intro">작은 카메라 방향 오차도 먼 거리의 드론 위치측정에 영향을 줍니다. 이 실험은 영상과 센서 관측으로 방향을 교정하고, <strong>어떤 비행경로와 교정 방식이 효과적인지</strong> 비교합니다.</p>
+    <div class="grid3">
+      <div class="panel"><div class="label">수집할 비행</div><div class="key-number">39<small>회</small></div><p class="small muted">교정용 31회 + 최종평가용 8회.<br>보정 method마다 새로 비행하지 않습니다.</p></div>
+      <div class="panel"><div class="label">주 방법의 카메라 미지수</div><div class="key-number">6<small>개 각도</small></div><p class="small muted">왼쪽 R/P/Y + 오른쪽 R/P/Y.<br>카메라 위치 XYZ는 측정값에 고정합니다.</p></div>
+      <div class="panel"><div class="label">현재 구현의 결과 비교</div><div class="key-number">2<small>개 XLSX</small></div><p class="small muted">기존 초기 yaw와 GPS yaw90.<br>각각 보정 전 M0와 보정 후 A/B/C를 저장합니다.</p></div>
+    </div>
+    <div class="flow" aria-label="실험 진행 순서">
+      <div class="step"><div class="step-index">STEP 1</div><h3>비행·원본 수집</h3><p>좌우 원본 영상, 촬영시각, GT, 카메라 자세와 검출 결과를 저장합니다.</p></div>
+      <div class="step"><div class="step-index">STEP 2</div><h3>관측과 초기값 구성</h3><p>모의 카메라 RTK·IMU, 드론 RTK와 두 yaw 출발점을 준비합니다.</p></div>
+      <div class="step"><div class="step-index">STEP 3</div><h3>교정·규칙 동결</h3><p>P0~P4에서 자세를 추정하고 경로·알고리즘을 정합니다.</p></div>
+      <div class="step"><div class="step-index">STEP 4</div><h3>V0에서 평가</h3><p>교정된 자세를 고정한 채 드론 위치를 추정하고 GT와 비교합니다.</p></div>
+    </div>
+    <div class="hint"><strong>두 가지 비교축을 구분하세요.</strong><br><code>A/B/C</code>는 어떤 정보를 어떻게 함께 사용하는지, <code>RPY_IMU / YAW_ONLY</code>는 카메라의 어떤 각도를 추정하는지 구분합니다. 여기에 <code>기존 yaw / GPS yaw90</code>라는 초기값 비교가 추가되었습니다.</div>
+  </section>
+
+  <section id="campaign" aria-labelledby="campaign-title">
+    <div class="section-kicker"><span>02</span> THE FLIGHT PLAN</div>
+    <h2 id="campaign-title">교정 경로와 최종평가 경로를 분리한다.</h2>
+    <div class="table-wrap"><table><caption class="sr-only">39회 비행 구성</caption><thead><tr><th>카메라 그룹</th><th>실제 광학 yaw</th><th>비행 구성</th><th>횟수</th></tr></thead><tbody>
+      <tr><td><strong>G0</strong> · 기본 설치</td><td>좌 0° / 우 0°</td><td>P0, P1, P2, P3, P4, V0 각각 5회</td><td class="nowrap"><strong>30회</strong></td></tr>
+      <tr><td><strong>G1</strong> · 상대 yaw 오차</td><td>좌 +0.5° / 우 −0.5°</td><td>P0, P4, V0 각각 3회</td><td><strong>9회</strong></td></tr>
+    </tbody></table></div>
+    <div class="panel">
+      <div class="mini-title"><h3>경로에 따라 횡이동이 어떻게 달라질까?</h3><span class="pill">규격의 경로식을 그대로 표시</span></div>
+      <div class="segmented" role="group" aria-label="표시할 비행경로 선택" id="path-buttons">
+        <button type="button" data-path="P0" aria-pressed="false">P0 직선</button><button type="button" data-path="P1" aria-pressed="false">P1 완만한 곡선</button><button type="button" data-path="P2" aria-pressed="false">P2 큰 곡선</button><button type="button" data-path="P3" aria-pressed="false">P3 작은 S</button><button type="button" data-path="P4" aria-pressed="true">P4 큰 S</button><button type="button" data-path="V0" aria-pressed="false">V0 평가</button>
+      </div>
+      <svg class="chart" id="path-chart" viewBox="0 0 760 270" role="img" aria-labelledby="path-chart-title"><title id="path-chart-title">P4 경로: 진행률에 따른 동쪽 횡이동, 진폭 6m</title></svg>
+      <p id="path-detail" class="chart-caption" aria-live="polite">P4 · 교정 · 전방거리 400 → 300m · x(s) = 6 sin³(2πs)m</p>
+      <figure class="spatial-figure"><svg viewBox="0 0 820 290" role="img" aria-labelledby="path3d-title path3d-desc"><title id="path3d-title">P4의 횡변위와 고도 변화를 함께 본 3D 경로</title><desc id="path3d-desc">세계 ENU 축 위에 카메라 기준점과, 먼 고도 높은 시작에서 가까운 낮은 종료점으로 이어지는 S자 드론 경로를 그립니다.</desc><defs><marker id="path3d-axis-arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 Z" fill="var(--blue)"/></marker><marker id="path3d-move-arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 Z" fill="var(--teal)"/></marker><marker id="path3d-route-arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 Z" fill="var(--orange)"/></marker></defs><text x="18" y="26" class="sp-label">같은 P4를 세계의 동쪽·북쪽·높이로 다시 보기</text><path d="M95 226 L365 268 L720 111 L456 70 Z" fill="#f0f4fa" stroke="var(--line)"/><path d="M95 226 L720 111 M185 240 L545 88 M275 254 L634 98 M180 185 L460 70 M275 199 L548 83" stroke="#e2e9f1" fill="none"/><circle cx="95" cy="226" r="4" fill="currentColor"/><text x="38" y="249" class="sp-small">착륙장 원점</text><line x1="95" y1="226" x2="165" y2="237" class="sp-world" marker-end="url(#path3d-axis-arrow)"/><text x="166" y="246" class="sp-small">E</text><line x1="95" y1="226" x2="148" y2="179" class="sp-world" marker-end="url(#path3d-axis-arrow)"/><text x="136" y="170" class="sp-small">N</text><line x1="95" y1="226" x2="95" y2="160" class="sp-world" marker-end="url(#path3d-axis-arrow)"/><text x="101" y="158" class="sp-small">U</text><path d="M218 225 L232 201 L246 230 Z M277 235 L291 211 L305 240 Z" class="sp-camera"/><line x1="231" y1="211" x2="294" y2="222" stroke="#8c9db1" stroke-width="3"/><text x="257" y="259" text-anchor="middle" class="sp-small">고정 baseline</text><line x1="231" y1="211" x2="543" y2="147" class="sp-ray"/><line x1="294" y1="222" x2="543" y2="147" class="sp-ray"/><path id="path3d-route" d="M698 78 C644 47 594 52 612 82 C637 115 561 147 544 125" class="sp-path" marker-end="url(#path3d-route-arrow)"/><circle id="path3d-start" cx="698" cy="78" r="6" fill="var(--orange)"/><circle id="path3d-end" cx="544" cy="125" r="6" fill="var(--blue)"/><circle id="path3d-current" cx="698" cy="78" r="9" fill="var(--teal)" stroke="white" stroke-width="3"/><text id="path3d-start-label" x="690" y="57" text-anchor="end" class="sp-small">시작 D=400m · z≈146m</text><text id="path3d-end-label" x="535" y="151" text-anchor="end" class="sp-small">끝 D=300m · z≈109m</text><text x="603" y="176" text-anchor="middle" class="sp-small">진행하며 횡이동 + 고도 감소</text><rect x="463" y="204" width="300" height="46" rx="8" fill="var(--blue-soft)" stroke="#cbdafa"/><text x="613" y="223" text-anchor="middle" class="sp-small">측면 프로파일: z = D·tan(20°)</text><text x="613" y="240" text-anchor="middle" class="sp-small">투시 개념도 · 경로 수치는 위 식과 표 기준</text></svg><figcaption>위의 슬라이더 그래프는 횡이동 x(s)를 정확히 그립니다. 입체 그림은 전방거리와 고도 변화를 더해 보여줍니다. 카메라 간격과 경로는 화면에 맞춰 그려 비율은 실제 축척이 아닙니다.</figcaption></figure>
+      <figure class="spatial-figure"><svg viewBox="0 0 820 290" role="img" aria-labelledby="path3d-title path3d-desc"><title id="path3d-title">P4의 횡변위와 고도 변화를 함께 본 3D 경로</title><desc id="path3d-desc">세계 ENU 축 위에 카메라 기준점과, 높은 먼 시작에서 낮고 가까운 종료점으로 이어지는 S자 드론 경로를 그립니다.</desc><defs><marker id="path3d-axis-arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 Z" fill="var(--blue)"/></marker><marker id="path3d-move-arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 Z" fill="var(--teal)"/></marker></defs><text x="18" y="26" class="sp-label">같은 P4를 세계의 동쪽·북쪽·높이로 다시 보기</text><path d="M95 226 L365 268 L720 111 L456 70 Z" fill="#f0f4fa" stroke="var(--line)"/><path d="M95 226 L720 111 M185 240 L545 88 M275 254 L634 98 M180 185 L460 70 M275 199 L548 83" stroke="#e2e9f1" fill="none"/><circle cx="95" cy="226" r="4" fill="currentColor"/><text x="38" y="249" class="sp-small">착륙장 원점</text><line x1="95" y1="226" x2="165" y2="237" class="sp-world" marker-end="url(#path3d-axis-arrow)"/><text x="166" y="246" class="sp-small">E</text><line x1="95" y1="226" x2="148" y2="179" class="sp-world" marker-end="url(#path3d-axis-arrow)"/><text x="136" y="170" class="sp-small">N</text><line x1="95" y1="226" x2="95" y2="160" class="sp-world" marker-end="url(#path3d-axis-arrow)"/><text x="101" y="158" class="sp-small">U</text><path d="M218 225 L232 201 L246 230 Z M277 235 L291 211 L305 240 Z" class="sp-camera"/><line x1="231" y1="211" x2="294" y2="222" stroke="#8c9db1" stroke-width="3"/><text x="257" y="259" text-anchor="middle" class="sp-small">고정 baseline</text><line x1="231" y1="211" x2="543" y2="147" class="sp-ray"/><line x1="294" y1="222" x2="543" y2="147" class="sp-ray"/><path d="M698 78 C644 47 594 52 612 82 C637 115 561 147 544 125" class="sp-ray" marker-end="url(#path3d-move-arrow)"/><circle cx="698" cy="78" r="6" fill="var(--orange)"/><circle cx="544" cy="125" r="6" fill="var(--blue)"/><text x="690" y="57" text-anchor="end" class="sp-small">D=400m · z≈146m</text><text x="535" y="151" text-anchor="end" class="sp-small">D=300m · z≈109m</text><text x="603" y="176" text-anchor="middle" class="sp-small">진행하며 횡이동 + 고도 감소</text><rect x="463" y="204" width="300" height="46" rx="8" fill="var(--blue-soft)" stroke="#cbdafa"/><text x="613" y="223" text-anchor="middle" class="sp-small">측면 프로파일: z = D·tan(20°)</text><text x="613" y="240" text-anchor="middle" class="sp-small">이 그림은 투시 개념도 · 수치는 실제 경로 표를 기준</text></svg><figcaption>위의 슬라이더 그래프는 횡이동 x(s)를 정확히 그립니다. 이 3D 개념도는 그 옆에 전방거리와 고도 변화를 추가합니다. 카메라 간격과 경로는 화면에 보기 좋게 그려 비율은 실제 축척이 아닙니다.</figcaption></figure>
+      <div class="spatial-controls"><div class="control"><label for="path3d-progress">P4 경로 진행률 <output id="path3d-progress-value" for="path3d-progress">0.00</output></label><input id="path3d-progress" type="range" min="0" max="100" step="1" value="0"></div><output id="path3d-location" class="readout" aria-live="polite">D=400m · x=0m · z=145.6m</output></div>
+    </div>
+    <div class="grid2">
+      <div><h3>경로와 속도</h3><p class="small">진행률 <span class="term">s</span>는 0~1입니다. P0~P4는 전방거리 400→300m, V0는 600→400m이며, 고도는 <span class="formula-inline">z = D tan(20°)</span>를 따릅니다. 순항은 3D 호길이 기준 5m/s, 시작·끝에는 각각 5초 가감속을 둡니다.</p><p class="small muted">50Hz 시간 참조를 PX4 동역학으로 추종합니다. 촘촘한 waypoint를 순서대로 멈추며 방문하는 비행과 다릅니다.</p></div>
+      <div><h3>같은 영상으로 여러 번 분석</h3><p class="small">yaw 오차 조건, A/B/C, 각도 추정 범위와 Monte Carlo는 수집된 기록에 오프라인으로 적용합니다. 비행 반복과 센서오차 Monte Carlo 반복은 서로 다른 반복입니다.</p><p class="small muted">V0의 측위 오차는 경로·알고리즘 동결 뒤에 평가합니다. 현재 두 yaw 분기는 기존 G0 Y0 교정 기반 경로 선택을 공유합니다.</p></div>
+    </div>
+    <details><summary>실행·수집 때 반드시 확인할 조건</summary><div class="table-wrap"><table><thead><tr><th>점검 항목</th><th>지시서의 핵심 조건</th></tr></thead><tbody>
+      <tr><td>가시거리·영상</td><td>캠페인 far clip 1000m. V0 시작의 광학 깊이가 약 638m라 기본 500m로는 잘릴 수 있습니다. 원본 1280×720, 좌우 카메라·YOLO 목표 20Hz를 실제 고유 프레임률·검출률과 구분해 확인합니다.</td></tr>
+      <tr><td>원본 기록</td><td>lossless 이미지와 촬영시각, /clock·epoch, 카메라 pose, 드론 GT, 프레임별 검출·미검출·미매칭을 보존합니다. 오버레이 MP4만으로 원본 보존을 대신하지 않습니다.</td></tr>
+      <tr><td>시각 정합</td><td>GT 최소 50Hz, 좌우 명목 촬영시각 차이 ≤1ms. GT 보간은 위치 선형 보간·자세 shortest-path SLERP. 현 구현은 40ms 이상 간격과 외삽을 flag 처리합니다.</td></tr>
+      <tr><td>본 구간 시작</td><td>시작점에서 5초간 속도 &lt;0.3m/s, 위치오차 &lt;0.5m, heading 오차 &lt;3°. 준비 대기 상한 120초. 이륙·진입·복귀를 science 구간 측위 RMSE에 섞지 않습니다.</td></tr>
+      <tr><td>재현과 재시도</td><td>코드·설정·모델·가중치와 seed 적용 여부를 기록합니다. SWEEP_SEED가 모든 센서 난수를 제어한다고 가정하지 않습니다. 기술적 실패는 같은 run ID의 새 attempt로 보존하며, 성능이 나쁘다는 이유로 기록을 버리지 않습니다.</td></tr>
+    </tbody></table></div></details>
+  </section>
+
+  <section id="inputs" aria-labelledby="inputs-title">
+    <div class="section-kicker"><span>03</span> THE INPUTS & FRAMES</div>
+    <h2 id="inputs-title">위치는 ray의 원점, 자세는 ray의 방향이다.</h2>
+    <p class="intro">영상의 픽셀은 그 자체로 3D 위치가 아닙니다. 카메라 내부 파라미터로 광학 방향을 만들고, 카메라 자세로 그 방향을 세계좌표에 옮깁니다.</p>
+    <div class="grid2">
+      <div class="panel"><h3>위치 · 고정된 ray 원점</h3><p class="small">실제 장비의 GPS/RTK 위치는 위도·경도·고도에서 공통 원점의 ENU로 변환합니다. 캠페인은 광심의 ENU 관측을 직접 모의 생성합니다.</p><div class="formula"><span class="line">C<sub>L,true</sub> = (−12.5, 0, 0.1) m</span><span class="line">C<sub>R,true</sub> = (+12.5, 0, 0.1) m</span></div><p class="small muted">위 값은 렌더링 참 광심입니다. 주 추정기는 RTK 오차가 포함된 측정 광심 <span class="term">C</span>를 고정 입력으로 사용합니다. 실제 GNSS 안테나와 광심의 레버암은 별도로 다뤄야 합니다.</p></div>
+      <div class="panel"><h3>방향 · 보정하는 회전행렬</h3><div class="formula"><span class="line">d<sub>C</sub> ∝ [ (u−c<sub>x</sub>)/f<sub>x</sub>, (v−c<sub>y</sub>)/f<sub>y</sub>, 1 ]ᵀ</span><span class="line">d<sub>W</sub> = R<sub>WC</sub> d<sub>C</sub> / ‖R<sub>WC</sub> d<sub>C</sub>‖</span><span class="line">ray(λ) = C + λ d<sub>W</sub>, &nbsp; λ ≥ 0</span></div><p class="small muted">픽셀 <span class="term">(u,v)</span>는 검출 bbox 중심입니다. 카메라 자세가 바뀌면 같은 픽셀의 세계좌표 ray 방향이 달라집니다.</p></div>
+    </div>
+    <figure class="spatial-figure"><svg viewBox="0 0 900 330" role="img" aria-labelledby="ray3d-title ray3d-desc"><title id="ray3d-title">두 카메라에서 드론 점으로 향하는 3D 시선과 2D 픽셀 잔차</title><desc id="ray3d-desc">세계좌표에서 고정된 좌우 카메라 광심과 드론 점을 입체 투시로 보여줍니다. 두 광학 ray는 공통 3D 점을 향하고, 오른쪽 삽화는 한 카메라 영상의 관측 픽셀과 예상 픽셀 사이의 2D 오차를 나타냅니다.</desc><defs><marker id="ray3d-blue-arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 Z" fill="var(--blue)"/></marker><marker id="ray3d-orange-arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 Z" fill="var(--orange)"/></marker></defs><text x="18" y="28" class="sp-label">3D 세계에서는 카메라 방향이 ray를 돌리고, 영상에서는 픽셀 오차로 보입니다</text><rect x="18" y="48" width="570" height="254" rx="12" class="sp-panel"/><text x="34" y="72" class="sp-small">world ENU · 광심 위치는 고정, 자세 회전만 보정</text><line x1="104" y1="250" x2="174" y2="250" class="sp-world" marker-end="url(#ray3d-blue-arrow)"/><line x1="104" y1="250" x2="137" y2="207" class="sp-world" marker-end="url(#ray3d-blue-arrow)"/><line x1="104" y1="250" x2="104" y2="185" class="sp-world" marker-end="url(#ray3d-blue-arrow)"/><text x="178" y="255" class="sp-small">E / east</text><text x="139" y="200" class="sp-small">N / north</text><text x="109" y="181" class="sp-small">U</text><line x1="224" y1="238" x2="331" y2="264" stroke="#9cacc0" stroke-width="5"/><path d="M205 238 L222 210 L239 238 Z" class="sp-camera"/><path d="M316 265 L333 237 L350 265 Z" class="sp-camera"/><text x="221" y="203" text-anchor="middle" class="sp-small">C_L</text><text x="333" y="231" text-anchor="middle" class="sp-small">C_R</text><line x1="222" y1="222" x2="468" y2="103" class="sp-ray" marker-end="url(#ray3d-blue-arrow)"/><line x1="333" y1="249" x2="468" y2="103" class="sp-ray" marker-end="url(#ray3d-blue-arrow)"/><circle cx="468" cy="103" r="10" fill="var(--teal)" stroke="white" stroke-width="3"/><text x="481" y="99" class="sp-label">P_t</text><text x="355" y="165" class="sp-small">R_WC d_C</text><line id="ray3d-candidate" x1="222" y1="222" x2="468" y2="103" class="sp-pred" marker-end="url(#ray3d-orange-arrow)"/><circle id="ray3d-candidate-point" cx="468" cy="103" r="6" class="sp-predicted"/><text id="ray3d-yaw-label" x="415" y="126" class="sp-small">후보 yaw ray</text><rect x="616" y="48" width="266" height="254" rx="12" class="sp-panel"/><text x="632" y="72" class="sp-label">한 카메라의 영상 평면</text><text x="632" y="91" class="sp-small">두 점의 차이가 재투영 잔차 e</text><rect x="651" y="112" width="194" height="151" rx="5" fill="white" stroke="#9cacc0" stroke-width="1.5"/><line x1="748" y1="120" x2="748" y2="255" stroke="#e2e8f0"/><line x1="658" y1="188" x2="838" y2="188" stroke="#e2e8f0"/><circle cx="716" cy="164" r="7" class="sp-observed"/><circle cx="788" cy="215" r="7" class="sp-predicted"/><line x1="716" y1="164" x2="788" y2="215" class="sp-pred" marker-end="url(#ray3d-orange-arrow)"/><text x="660" y="159" class="sp-small">관측 p</text><text x="793" y="230" class="sp-small">예상 p̂</text><text x="745" y="284" text-anchor="middle" class="sp-small">u 오른쪽 → · v 아래 ↓</text></svg><figcaption>왼쪽은 3D 광선 기하의 개념도, 오른쪽은 실제로 손실에 넣는 영상 좌표 차이의 개념도입니다. 투시는 이해를 돕기 위한 그림이며 비율은 실제 거리대로 그리지 않았습니다. 수치 비교와 픽셀 잔차 그래프는 2D로 유지합니다.</figcaption></figure>
+    <div class="table-wrap"><table><caption class="sr-only">입력과 좌표계</caption><thead><tr><th>데이터</th><th>좌표·단위</th><th>용도</th></tr></thead><tbody>
+      <tr><td>카메라 광심 / 드론 위치</td><td>world ENU = [동, 북, 위], m</td><td>카메라 위치 고정, 드론 위치 추정·평가</td></tr>
+      <tr><td>픽셀에서 만든 광학 ray</td><td>optical RDF = [우, 아래, 전방]</td><td><span class="term">R<sub>WC</sub></span>로 ENU에 변환</td></tr>
+      <tr><td>PX4 body 자세</td><td>body FRD → Earth NED, quaternion wxyz</td><td>광학 RDF→ENU와 구분; 장착·축 변환 필요</td></tr>
+      <tr><td>모의 카메라 RTK</td><td>σ<sub>ENU</sub> = (0.02, 0.02, 0.04)m</td><td>한 trial의 측정오차를 경로·방법·V0에 공유</td></tr>
+      <tr><td>모의 카메라 IMU R/P</td><td>기본 σ = 0.02°; 내부 계산 rad / rad²</td><td>RPY_IMU의 유한 prior / YAW_ONLY의 고정값</td></tr>
+      <tr><td>모의 드론 RTK</td><td>10Hz, σ<sub>ENU</sub> = (0.02, 0.02, 0.04)m</td><td>A/B 교정 입력. 프로젝트 기체 기준점 관측</td></tr>
+    </tbody></table></div>
+    <div class="hint teal"><strong>저장된 operational ray를 정답에 맞춰 이동시키는 방식이 아닙니다.</strong><br>캠페인 solver는 원본 픽셀·내부 파라미터·측정 카메라 위치와 자세 입력으로 광선을 다시 계산합니다. 카메라 XYZ는 움직이지 않고 R/P/Y가 바뀝니다.</div>
+    <details><summary>이 문서의 R/P/Y는 어떤 회전 순서인가?</summary><div class="formula"><span class="line">R<sub>WC</sub>(φ, θ, ψ) = R<sub>z,world</sub>(−ψ) R<sub>WC,nominal</sub> R<sub>x,optical</sub>(θ) R<sub>z,optical</sub>(φ)</span></div><p><strong>φ</strong>는 광학 전방축 roll, <strong>θ</strong>는 명목 고각 20°에 대한 pitch 보정량, <strong>ψ</strong>는 북쪽에서 동쪽으로 증가하는 방위각입니다. θ=0은 총 고각 0°가 아니라 명목 고각 20°입니다. 원시 Pixhawk Euler R/P/Y를 이 변수에 그대로 복사하면 안 됩니다.</p></details>
+  </section>
+
+  <section id="methods" aria-labelledby="methods-title">
+    <div class="section-kicker"><span>04</span> THE COMPARISONS</div>
+    <h2 id="methods-title">초기값 × 교정 방법 × 추정 범위</h2>
+    <p class="intro">세 구분은 서로 독립입니다. 예를 들어 <strong>GPS yaw90 → B 공동교정 → RPY_IMU</strong>는 baseline으로 만든 yaw에서 출발해 좌우 R/P/Y를 모두 추정합니다.</p>
+    <div class="table-wrap"><table><caption>① method: 교정 정보를 어떻게 사용하는가?</caption><thead><tr><th>method</th><th>영상으로 자세 교정</th><th>드론 RTK</th><th>핵심 의미</th></tr></thead><tbody>
+      <tr><td><strong>M0</strong><br><code>M0_sensor_only</code></td><td class="no">없음</td><td class="no">사용 안 함</td><td>측정 카메라 위치 + IMU R/P + 해당 분기의 초기 yaw로 바로 위치측정. 영상은 드론 픽셀 검출에 사용.</td></tr>
+      <tr><td><strong>A</strong><br><code>A_rtk_independent</code></td><td class="yes">좌우 독립 교정</td><td class="yes">사용</td><td>각 카메라의 재투영 오차를 별도로 최소화. RTK 불확실성을 픽셀 공분산으로 전달.</td></tr>
+      <tr><td><strong>B</strong><br><code>B_rtk_joint</code></td><td class="yes">좌우 공동 교정</td><td class="yes">사용</td><td>같은 시각의 드론 3D 위치변수를 좌우가 공유. RTK 주변에서 드론 위치도 함께 조정.</td></tr>
+      <tr><td><strong>C</strong><br><code>C_no_drone_rtk_joint</code></td><td class="yes">좌우 공동 교정</td><td class="no">금지</td><td>좌우 영상과 카메라 위치·IMU 사전정보 사용. 드론 GT나 알려진 명령경로도 입력 금지.</td></tr>
+      <tr><td><strong>ORACLE</strong></td><td class="no">교정 알고리즘 아님</td><td>평가용 진단</td><td>참 카메라 위치·자세를 사용하는 기하학적 참고 결과.</td></tr>
+    </tbody></table></div>
+    <div class="grid2">
+      <div class="panel"><h3>② 각도 추정 범위</h3><ul class="check-list"><li><strong>RPY_IMU · 주 방법</strong>좌우 R/P/Y 총 6개를 추정. R/P는 IMU 불확실성으로 제한하며 갱신을 허용합니다.</li><li><strong>YAW_ONLY · 비교 기준</strong>같은 IMU R/P에 고정하고 yaw 2개만 추정합니다.</li><li><strong>YAW_IDEAL · 별도 진단</strong>참 위치·참 R/P와 이상적 드론 RTK를 사용하는 조건. 주 비교와 구분합니다.</li></ul><p class="small muted" style="margin-top:14px">B/C의 시각별 드론 위치변수는 카메라 각도 6개/2개와 별도로 계산합니다.</p></div>
+      <div class="panel"><h3>③ yaw 초기값의 출처</h3><ul class="check-list"><li><strong>기존 yaw</strong>G0는 Y0~Y6의 지정 편향. G1은 좌우 0°에서 시작하며 실제 yaw는 +0.5°/−0.5°입니다.</li><li><strong>GPS yaw90</strong>잡음이 포함된 카메라 RTK baseline에 수직인 공통 yaw를 계산합니다. 좌우의 R/P 관측은 그대로 사용합니다.</li><li><strong>보정에서는 yaw도 갱신</strong>yaw90을 고정하는 제약이나 별도 yaw prior를 추가하지 않습니다. M0만 초기 자세를 그대로 씁니다.</li></ul></div>
+    </div>
+    <div class="formula"><span class="line">Δ = C<sub>R</sub> − C<sub>L</sub> = [ΔE, ΔN, ΔU]ᵀ</span><span class="line">β = atan2(ΔE, ΔN), &nbsp; ψ<sub>candidate</sub> ∈ {β − 90°, β + 90°}</span></div>
+    <p class="small">Workstation과 같은 방향 선택 규칙을 사용합니다. 다만 현재 모의 캠페인에는 측정 Pixhawk yaw가 없으므로 <strong>nominal 북쪽 0°를 180° 분기 선택에만 사용</strong>합니다. 실제 Pixhawk yaw를 사용했다고 기록하지 않습니다. GPS baseline은 G1의 개별 광학 설치 오차를 직접 알려주지 않습니다.</p>
+    <details><summary>기존 yaw의 Y0~Y6 값 보기</summary><div class="table-wrap"><table><thead><tr><th>조건</th><th>좌 yaw 편향</th><th>우 yaw 편향</th></tr></thead><tbody><tr><td>Y0</td><td>0°</td><td>0°</td></tr><tr><td>Y1</td><td>0°</td><td>+0.5°</td></tr><tr><td>Y2</td><td>0°</td><td>−0.5°</td></tr><tr><td>Y3</td><td>+0.5°</td><td>+0.5°</td></tr><tr><td>Y4</td><td>−0.5°</td><td>−0.5°</td></tr><tr><td>Y5</td><td>+0.5°</td><td>−0.5°</td></tr><tr><td>Y6</td><td>−0.5°</td><td>+0.5°</td></tr></tbody></table></div><p>이 값들은 G0의 초기 편향 조건입니다. GPS yaw90 분기에 이 편향을 다시 더하지 않습니다. Y0도 RTK·IMU 잡음이 남아 있으므로 전체 무오차 조건은 아닙니다.</p></details>
+  </section>
+
+  <section id="equations" aria-labelledby="equations-title">
+    <div class="section-kicker"><span>05</span> THE CALIBRATION EQUATIONS</div>
+    <h2 id="equations-title">한 자세가 모든 프레임을 설명하도록 맞춘다.</h2>
+    <p class="intro">드론 위치와 관측 픽셀은 프레임마다 달라집니다. 반면 고정 설치한 카메라의 위치와 자세는 시간 전체에 공통입니다. <strong>프레임별 드론 위치 P<sub>t</sub>와 공통 카메라 자세 R<sub>c</sub></strong>를 구분하는 것이 핵심입니다.</p>
+    <div class="panel" id="plain-explanation">
+      <div class="section-kicker"><span>0</span> FIRST, NO EQUATIONS</div>
+      <h3>말로 먼저 설명하면: 카메라의 방향 손잡이를 조금씩 돌려 보는 과정입니다.</h3>
+      <p>삼각대 위 카메라는 한 곳에 고정돼 있습니다. 드론은 여기저기 움직이고, 매 순간 카메라 영상 속 다른 자리에 보입니다. 우리는 드론이 영상에 찍힌 자리와 그 순간의 드론 위치를 알고 있습니다.</p>
+      <p><strong>컴퓨터는 카메라 위치를 옮기지 않습니다.</strong> 카메라의 방향을 하나 정해 놓고 “이 방향이 맞다면, 여기 있던 드론은 화면의 어디에 보여야 하지?”를 프레임마다 계산합니다. 예상 자리가 실제 점과 어긋나면 방향을 조금 바꿔 다시 계산합니다.</p>
+      <p>한 장면만 잘 맞추는 방향을 찾는 게 아닙니다. 수백 장면을 한꺼번에 봅니다. 방향 하나를 바꿀 때 그 방향은 모든 프레임에 똑같이 적용되므로, 많은 장면을 동시에 가장 잘 설명하는 방향을 고릅니다. 어떤 한 프레임이 맞지 않더라도 나머지 관측과 센서 정보까지 함께 보는 절충 결과가 될 수 있습니다.</p>
+      <div class="grid2">
+        <div><h4>각 method는 무엇을 믿나?</h4><ul class="check-list"><li><strong>A · RTK 점에 맞추기</strong>매 순간의 드론 위치는 RTK가 알려준 위치 근처라고 보고, 왼쪽·오른쪽 카메라를 따로 맞춥니다.</li><li><strong>B · 함께 맞추기</strong>두 카메라가 같은 순간 같은 드론을 봤다고 놓고, 하나의 드론 위치를 함께 추정합니다. RTK는 그 위치를 잡아당기는 참고점 역할을 합니다.</li><li><strong>C · 영상끼리 맞추기</strong>드론 RTK 위치를 주지 않습니다. 왼쪽·오른쪽 영상의 두 ray가 같은 드론을 설명하도록 풉니다. 해가 불안정하면 그 상태를 기록합니다.</li></ul></div>
+        <div><h4>각도 비교는 다른 질문</h4><ul class="check-list"><li><strong>RPY_IMU</strong>왼쪽·오른쪽의 R/P/Y 여섯 값을 모두 조정합니다. R/P는 카메라 IMU 측정값 주변에서 움직일 수 있습니다.</li><li><strong>YAW_ONLY</strong>두 카메라의 R/P는 IMU 값에 고정하고, yaw만 조정합니다.</li><li><strong>M0</strong>방향 손잡이를 돌리지 않습니다. 주어진 IMU R/P와 해당 조건의 초기 yaw를 그대로 써서 비교 기준 위치를 계산합니다.</li></ul></div>
+      </div>
+      <div class="hint"><strong>비유를 한 문장으로 기억하면:</strong> 드론 RTK는 여러 시각의 드론 위치를 가리키는 참고점이고, 영상 픽셀은 카메라가 실제로 바라본 화면의 점입니다. 교정기는 이 둘을 설명하도록 <strong>카메라의 방향을 고릅니다.</strong> 카메라 위치는 움직이지 않습니다.</div>
+      <details><summary>용어를 쉬운 말로 보기</summary><div class="table-wrap"><table><thead><tr><th>기호·용어</th><th>쉬운 뜻</th></tr></thead><tbody><tr><td><strong>C</strong> · 카메라 중심</td><td>ray가 출발하는 고정 위치. 왼쪽 카메라와 오른쪽 카메라에 하나씩 있습니다.</td></tr><tr><td><strong>P<sub>t</sub></strong> · 드론 위치</td><td>시각 t에 드론이 있던 위치. 움직이므로 시각마다 다릅니다.</td></tr><tr><td><strong>관측 픽셀 p</strong></td><td>실제 영상에서 YOLO bbox 중심으로 찾은 화면의 점.</td></tr><tr><td><strong>예상 픽셀 p̂</strong></td><td>후보 카메라 방향을 사용했을 때 드론이 화면에 나타나야 한다고 계산한 점.</td></tr><tr><td><strong>재투영 오차 e</strong></td><td>예상 점과 실제 점 사이 차이. 작을수록 그 후보 방향이 영상과 잘 맞습니다.</td></tr><tr><td><strong>prior</strong> · 사전정보</td><td>카메라 IMU 측정 방향을 참고값으로 주되, RPY_IMU에서는 오차 범위 안에서 조정하도록 허용하는 항.</td></tr><tr><td><strong>수렴 / rank</strong></td><td>수렴은 계산기가 멈췄다는 뜻이고, rank는 가진 관측으로 추정값을 구별할 수 있는지 보는 검사입니다. 수렴 하나만으로 정확성이 증명되지는 않습니다.</td></tr></tbody></table></div></details>
+    </div>
+    <div class="panel">
+      <div class="section-kicker"><span>1—9</span> WHAT THE PROGRAM DOES</div>
+      <h3>실제 처리를 한 단계씩 따라가기</h3>
+      <ol class="procedure">
+        <li><h4>원본 영상에서 같은 순간의 좌우 화면을 짝짓습니다</h4><p>각 카메라 영상에서 드론 bbox 중심을 찾습니다. 좌우 촬영시각은 1ms 이내로 맞춥니다. YOLO 처리가 끝난 시각은 촬영시각이 아니므로 대신 사용하지 않습니다.</p><details><summary>시각 정보를 왜 맞추나요?</summary><p>드론은 계속 움직입니다. 좌우 카메라가 서로 다른 순간에 찍은 프레임을 짝지으면, 두 화면의 위치 차이는 카메라 방향뿐 아니라 드론 움직임 차이도 포함합니다. 그래서 pair의 촬영시각을 기준으로 10Hz RTK와 GT를 필요한 시각에 맞춥니다.</p></details></li>
+        <li><h4>카메라 위치와 카메라 IMU를 측정값으로 준비합니다</h4><p>각 카메라 광심의 noisy RTK 위치를 ray의 고정 출발점으로 둡니다. 카메라에 붙인 IMU의 R/P는 측정 참고값입니다. 이는 비행 드론의 IMU 자세가 아닙니다.</p><details><summary>XYZ를 왜 최적화하지 않나요?</summary><p>이번 실험 질문은 카메라 방향 교정입니다. 위치와 방향을 동시에 움직이면 어느 쪽 변화가 오차를 줄였는지 혼합되므로, RTK 광심 좌표를 고정하고 R/P/Y 회전만 비교합니다.</p></details></li>
+        <li><h4>비행 기록에서 교정에 쓸 프레임을 고릅니다</h4><p><code>all_data</code>는 양쪽에서 검출되고 드론 RTK 시각 bracket이 있는 고유 pair를 사용합니다. <code>matched_200</code>은 그중 시간대별로 균일한 고유 200쌍입니다. 200쌍이 안 되면 미충족이라고 표시하고 프레임을 복제하지 않습니다.</p><details><summary>C는 RTK를 안 쓰는데 표본 선택에도 전혀 관계없나요?</summary><p>현재 파이프라인은 세 method의 비교에 공통 pair를 사용하고, 그 공통 pair는 10Hz RTK bracket이 있는 영상 pair에서 고릅니다. 하지만 C의 solver에는 RTK 위치값과 공분산을 전달하지 않습니다. 즉 C는 RTK 위치로 자세를 맞추지 않지만, 어떤 프레임이 선택 가능한지에는 RTK 시각 bracket이 쓰입니다.</p></details></li>
+        <li><h4>두 시작 자세 중 하나를 선택합니다</h4><p><strong>기존 yaw</strong>는 G0의 Y0~Y6 편향 조건, 또는 G1의 좌우 nominal 0°에서 시작합니다. <strong>GPS yaw90</strong>은 카메라 광심 RTK의 두 지점을 잇는 선에 수직인 방향 후보 둘 중 하나를 택합니다.</p><details><summary>GPS yaw90은 어디까지 쓰이나요?</summary><p>현재 합성 캠페인에는 실제 Pixhawk yaw 관측이 없습니다. 그래서 nominal 북쪽은 두 후보의 방향을 고르는 데만 씁니다. 선택한 yaw는 optimizer의 시작점입니다. 이후 A/B/C에서 yaw를 고칠 수 있고, yaw90으로 고정하는 벌점은 없습니다. GPS baseline만으로 G1의 좌우 개별 광학 yaw 오차를 알아내는 것은 아닙니다.</p></details></li>
+        <li><h4>모드를 고르고 시작 자세를 만듭니다</h4><p><code>RPY_IMU</code>는 카메라별 IMU R/P와 위 yaw에서 출발해 여섯 각도를 조정합니다. <code>YAW_ONLY</code>는 같은 R/P 측정값을 고정하고 좌우 yaw 두 값만 조정합니다. M0는 어느 각도도 조정하지 않습니다.</p><details><summary>각도 6개는 왜 카메라 위치가 아닌가요?</summary><p>왼쪽 카메라의 φ, θ, ψ와 오른쪽 카메라의 φ, θ, ψ입니다. 카메라 위치 C<sub>L</sub>, C<sub>R</sub>는 이 최적화 변수에 들어있지 않습니다. B/C의 시각별 잠재 드론 위치 P<sub>t</sub>는 별도의 변수 묶음입니다.</p></details></li>
+        <li><h4>각 프레임의 예상 화면 위치를 계산합니다</h4><p>후보 방향과 그 시각 드론 위치를 이용해 “드론이 이 화면 어디에 보여야 할까?”를 다시 투영합니다. 검출점과 예상점의 차이가 재투영 오차입니다.</p><details><summary>한 드론 위치만 맞추나요?</summary><p>아닙니다. 드론은 프레임마다 P<sub>t</sub>가 다릅니다. 한 카메라의 방향은 전체 프레임에서 공통이므로, solver는 여러 시각의 오차를 합쳐 카메라마다 하나의 자세를 구합니다.</p></details></li>
+        <li><h4>A, B, C 규칙으로 오차를 합치고 자세를 조정합니다</h4><p>A는 RTK 위치의 불확실성을 픽셀 오차에 반영하고 좌우 카메라를 따로 풉니다. B는 RTK와 영상을 함께 맞추며 좌우가 같은 P<sub>t</sub>를 공유합니다. C는 RTK 위치 항을 빼고 두 영상과 카메라 IMU 참고값을 사용합니다. 큰 오차는 Huber가 영향력을 줄입니다.</p><details><summary>최적화는 버튼을 돌리듯 한 번에 계산되나요?</summary><p>실제 solver는 후보 각도에서 재투영·공분산·Huber 잔차를 계산하고, 그 잔차를 줄이는 쪽으로 각도를 반복 갱신합니다. B/C는 각도 후보마다 시각별 드론 위치도 내부 반복으로 갱신합니다. 계산이 항상 하나의 전역 정답을 찾는다는 보장은 없습니다.</p></details></li>
+        <li><h4>계산 결과가 잘 정해졌는지 검사합니다</h4><p>optimizer가 정상 종료했는지, 각도 Jacobian에 필요한 독립 정보가 있는지를 검사합니다. rank 부족이나 비수렴이면 그 상태와 관측성 진단을 남깁니다. 낮은 정확도나 실패를 감추려고 프레임을 지우지 않습니다.</p><details><summary>CONVERGED면 정확한 카메라인가요?</summary><p>아닙니다. 현재 코드의 optimizer 성공과 각도 rank 검사를 통과했다는 의미입니다. 실장비 성능 인증이나 허용오차 통과 판정은 아닙니다.</p></details></li>
+        <li><h4>보정 자세를 고정하고 V0에서 따로 확인합니다</h4><p>교정 경로에서 선택된 회전행렬을 고정한 채 V0 영상으로 새 드론 위치를 삼각측량합니다. 평가기가 GT와 비교해 자세오차·위치 RMSE/P95·검출률을 계산합니다. 그 결과로 카메라를 다시 맞추거나 유리한 경로로 바꾸지 않습니다.</p></li>
+      </ol>
+    </div>
+    <div class="formula"><span class="line">q<sub>c,t</sub> = R<sub>c</sub>ᵀ (P<sub>t</sub> − C<sub>c</sub>) = [X<sub>C</sub>, Y<sub>C</sub>, Z<sub>C</sub>]ᵀ</span><span class="line">p̂<sub>c,t</sub> = [ f<sub>x</sub>X<sub>C</sub>/Z<sub>C</sub> + c<sub>x</sub>, &nbsp; f<sub>y</sub>Y<sub>C</sub>/Z<sub>C</sub> + c<sub>y</sub> ]ᵀ</span><span class="line">e<sub>c,t</sub> = p̂<sub>c,t</sub> − p<sub>c,t</sub></span></div>
+    <p class="small"><span class="term">c</span>는 왼쪽/오른쪽 카메라, <span class="term">t</span>는 시각입니다. <span class="term">p̂</span>는 예상 픽셀, <span class="term">p</span>는 검출 픽셀입니다. 영상 쌍의 촬영시각에 RTK를 보간해 대응시키며, 수신·처리완료 시각을 촬영시각으로 대체하지 않습니다.</p>
+
+    <div class="panel">
+      <div class="mini-title"><h3>직접 보기: yaw 하나를 바꾸면 5개 프레임이 함께 바뀐다.</h3><span class="pill">설명용 합성 예시 · 실제 실험 결과 아님</span></div>
+      <p class="small muted">고정된 왼쪽 카메라의 수평 2D 투영 예시입니다. 드론의 위치는 프레임마다 다르지만 슬라이더의 yaw는 모든 프레임에 공통으로 적용됩니다. 실제 solver는 좌우 영상과 3D 회전·위치를 사용합니다.</p>
+      <div class="controls"><div class="control"><label for="yaw-slider">공통 카메라 yaw <output id="yaw-value" for="yaw-slider">0.000°</output></label><input id="yaw-slider" type="range" min="-0.6" max="1" step="0.001" value="0"></div><button type="button" class="button primary" id="fit-demo">예시에서 최적 yaw 찾기</button><button type="button" class="button" id="reset-demo">초기 yaw 0°</button></div>
+      <div class="legend"><span><i class="swatch" aria-hidden="true"></i>검출 픽셀 · 고정</span><span><i class="swatch square" aria-hidden="true"></i>후보 자세의 예상 픽셀 · 이동</span><span>연결선 길이 = 재투영 차이</span></div>
+      <svg id="projection-chart" class="chart" viewBox="0 0 760 290" role="img" aria-labelledby="projection-chart-title"><title id="projection-chart-title">5개 프레임의 관측 및 예상 u 픽셀 비교</title></svg>
+      <div class="stats-row" aria-live="polite"><div class="stat">수평 재투영 RMSE<output id="demo-rmse">— <small>px</small></output></div><div class="stat">정규화 잔차의 Huber 손실 합<output id="demo-cost">—</output></div><div class="stat">모든 프레임에 공유되는 yaw<output id="demo-shared">0.000°</output></div></div>
+      <p class="chart-caption">K의 f<sub>x</sub>=8241.647px를 사용한 수평 예시. 카메라 동쪽 위치 −12.5m, 합성 참 yaw 0.300°, 작은 고정 픽셀 오차를 포함합니다. u 좌표는 560~1240px 확대 범위입니다. 예시의 탐색 버튼은 1D 격자 탐색이며 실제 최적화 알고리즘과 다릅니다.</p>
+    </div>
+
+    <div class="panel objective">
+      <h3>B · 좌우 공동교정의 목적함수</h3>
+      <p class="small">카메라 위치 C<sub>L</sub>, C<sub>R</sub>는 고정합니다. RPY_IMU에서는 좌우 각도와 각 시각의 공유 드론 위치를 추정합니다.</p>
+      <div class="objective-head">min <small>over φ<sub>L/R</sub>, θ<sub>L/R</sub>, ψ<sub>L/R</sub>, {P<sub>t</sub>}</small> &nbsp; J<sub>B</sub></div>
+      <div class="formula"><span class="line">J<sub>B</sub> = ∑<sub>c,t</sub> ρ<sub>H</sub>( e<sub>c,t</sub> / σ<sub>px</sub> )</span><span class="line">&emsp;&emsp;+ ½∑<sub>t</sub> ‖L<sub>RTK,t</sub><sup>−1</sup> (P<sub>t</sub> − P<sub>t</sub><sup>RTK</sup>)‖²</span><span class="line">&emsp;&emsp;+ ½∑<sub>c</sub> ‖L<sub>IMU,c</sub><sup>−1</sup> [wrap(φ<sub>c</sub>−μ<sub>φ,c</sub>), θ<sub>c</sub>−μ<sub>θ,c</sub>]ᵀ‖²</span></div>
+      <div class="math-terms no-print" role="group" aria-label="목적함수 항 설명 선택">
+        <button class="math-term" type="button" data-term="image" aria-pressed="true"><span class="term-title">영상 항</span><span class="term">예상 픽셀 − 검출 픽셀</span></button>
+        <button class="math-term" type="button" data-term="rtk" aria-pressed="false"><span class="term-title">드론 RTK 항</span><span class="term">잠재 위치 − RTK 관측</span></button>
+        <button class="math-term" type="button" data-term="imu" aria-pressed="false"><span class="term-title">카메라 IMU 항</span><span class="term">추정 R/P − IMU 관측</span></button>
+      </div>
+      <div id="term-detail" class="term-detail" aria-live="polite"><strong>영상 항</strong> — 모든 프레임의 예상 픽셀이 실제 검출 픽셀에 가까워지도록 합니다. 기본 σ<sub>px</sub>=1px이며, 왼쪽·오른쪽의 u/v 잔차가 각각 들어갑니다.</div>
+      <p class="small muted" style="margin-top:15px">Σ = LLᵀ는 공분산의 Cholesky 분해입니다. L<sup>−1</sup>을 곱해 단위와 불확실성을 정규화합니다. 영상 벡터에 적힌 ρ<sub>H</sub>는 <strong>각 영상 잔차 성분의 Huber 손실 합</strong>을 뜻합니다. RTK와 IMU는 이차항이며, 모든 비용의 공통 ½ 배율은 최적해를 바꾸지 않습니다. IMU prior는 카메라별 한 번 들어가며 프레임마다 복제하지 않습니다.</p>
+      <p class="print-note">영상 항: 픽셀 정합. RTK 항: 드론 위치의 RTK 일관성. IMU 항: 카메라 R/P 사전정보 일관성. 실제 구현은 영상 잔차에만 Huber를 적용합니다. RTK/IMU 센서 항은 공분산 whitening 뒤 이차 가우시안 비용으로 유지합니다.</p>
+    </div>
+    <div class="grid2">
+      <div class="panel"><h3>A · 카메라별 독립교정</h3><p class="small">P<sub>t</sub><sup>RTK</sup>를 투영하되 RTK 위치 불확실성을 픽셀로 전파합니다. 위치를 별도 최적화 변수로 두지 않습니다.</p><div class="formula"><span class="line">S<sub>c,t</sub> = J<sub>proj,c,t</sub> Σ<sub>RTK,t</sub> J<sub>proj,c,t</sub>ᵀ + σ<sub>px</sub>²I</span><span class="line">S<sub>c,t</sub> = L<sub>c,t</sub>L<sub>c,t</sub>ᵀ</span><span class="line">J<sub>A,c</sub> = ∑<sub>t</sub> ρ<sub>H</sub>(L<sub>c,t</sub><sup>−1</sup> e<sub>c,t</sub>) + IMU 항</span></div><p class="small muted">J<sub>proj</sub>는 드론 위치 변화가 픽셀에 미치는 미분입니다. 프레임별 거리·기하에 따라 공분산이 달라집니다. 현재 A는 이 1차 공분산 전파를 사용하는 robust 잔차 최소화입니다.</p></div>
+      <div class="panel"><h3>C · 드론 RTK 없는 공동교정</h3><p class="small">B와 같은 시각별 공유 드론 위치변수를 사용하지만 RTK 항을 제외합니다.</p><div class="formula"><span class="line">J<sub>C</sub> = ∑<sub>c,t</sub> ρ<sub>H</sub>(e<sub>c,t</sub> / σ<sub>px</sub>)</span><span class="line">&emsp;&emsp;+ 카메라 IMU 항</span></div><p class="small muted">관측성이 부족하면 여러 자세가 비슷한 영상을 설명할 수 있습니다. rank 부족·비수렴을 그대로 기록하며, GT·명령경로·참 yaw를 추가해 성공으로 만들지 않습니다.</p><p class="small"><strong>YAW_ONLY</strong>는 A/B/C 모두에서 R/P를 측정 평균에 고정합니다. 이때 R/P를 추정하는 IMU prior 항은 필요하지 않습니다.</p></div>
+    </div>
+    <div class="panel" id="process-detail">
+      <div class="section-kicker"><span>HOW</span> A CALIBRATION BATCH</div>
+      <h3>한 배치가 처리되는 순서</h3>
+      <p class="small muted">한 배치는 하나의 교정 비행(run), Monte Carlo trial, yaw 초기화 조건, 표본 범위의 조합입니다. 좌우의 모든 프레임은 같은 카메라 자세를 공유합니다. 각 프레임에는 서로 다른 드론 위치가 있습니다.</p>
+      <ol class="procedure">
+        <li><h4>원본 관측을 읽고 촬영시각으로 맞춘다</h4><p>각 눈의 원본 이미지와 그 이미지에서 검출된 bbox 중심을 읽습니다. 좌우 pair는 촬영시각 차이 ≤1ms인 서로 다른 프레임으로 구성됩니다. 드론 RTK는 노출/pair 시각에 시간 보간하고, GT는 estimator input에서 분리합니다.</p></li>
+        <li><h4>카메라 센서 입력을 한 번 생성해 반복 경로에 공유한다</h4><p>한 rig 반복과 trial에 대해 카메라 광심 RTK 오차, IMU roll/pitch 오차를 생성합니다. 같은 센서 표본을 교정 경로, A/B/C, yaw 변형 및 대응 V0에 재사용하여 비교 조건 사이에 새 잡음이 끼지 않도록 합니다.</p></li>
+        <li><h4>공통 pair mask와 표본 범위를 동결한다</h4><p><strong>all_data</strong>는 science 구간에서 양쪽 bbox가 있고 10Hz RTK 시각 bracket까지 있는 고유 pair를 씁니다. <strong>matched_200</strong>은 이 집합에서 시간을 고르게 나눈 200개 고유 pair를 선택합니다. 부족하면 <code>MATCHED_200_UNMET</code>를 기록하며 복제하지 않습니다. C estimator에는 RTK 위치·공분산을 넘기지 않지만, 현재 파이프라인의 공통 pair 선택은 RTK bracket이 있는 영상 pair를 기준으로 합니다.</p></li>
+        <li><h4>두 yaw 초기화 중 하나로 시작 자세를 만든다</h4><p><strong>기존 분기</strong>는 G0의 Y0~Y6 편향 또는 G1의 nominal 0°를 씁니다. <strong>GPS yaw90 분기</strong>는 noisy 카메라 RTK 광심의 우−좌 수평 baseline에서 ±90° 두 후보를 만들고, 명시한 nominal 북쪽 기준으로 방향을 선택합니다. 그 heading을 좌우에 공통 초기값으로 씁니다. 실제 Pixhawk yaw를 사용했다고 가정하지 않습니다.</p></li>
+        <li><h4>미지수와 초기 guess를 설정한다</h4><p><code>RPY_IMU</code>의 optimizer 변수는 <span class="mini-equation">[φ<sub>L</sub>, θ<sub>L</sub>, ψ<sub>L</sub>, φ<sub>R</sub>, θ<sub>R</sub>, ψ<sub>R</sub>]</span>, 총 6개입니다. 시작 φ/θ는 각 카메라 IMU 평균, yaw는 분기의 초기 heading입니다. <code>YAW_ONLY</code>는 yaw 2개만 변수로 두고 R/P를 같은 IMU 평균에 고정합니다. 어느 경우에도 카메라 위치는 변수가 아닙니다.</p></li>
+        <li><h4>선택한 A/B/C 방식으로 자세를 최적화한다</h4><p><strong>A</strong>는 좌우를 별도 문제로 풀고 RTK 공분산을 픽셀 공분산으로 전파합니다. <strong>B</strong>는 시각별 드론 위치를 좌우가 공유하고 RTK 관측을 함께 사용합니다. <strong>C</strong>는 영상만으로 공유 위치를 구성하고 드론 RTK 값은 받지 않습니다. 세 방법 모두 각도 추정과 IMU R/P 제약을 함께 사용합니다.</p></li>
+        <li><h4>초기 yaw 주변만 맞추는 것이 아니라 재투영 차이를 최소화한다</h4><p>현재 목적함수에는 yaw prior 벌점이 없습니다. 초기 yaw는 optimizer 출발점입니다. 각 후보 자세로 각 프레임의 예상 픽셀을 다시 계산하고, 영상 재투영 잔차에는 Huber를 적용하고, B의 RTK 항과 카메라 IMU prior에는 정규화한 이차 가우시안 비용을 적용합니다. 반복해 목적함수를 줄인 최종 회전행렬이 보정 결과입니다.</p></li>
+        <li><h4>성공·실패와 진단을 그대로 저장한다</h4><p>외부 각도 optimizer는 Huber <code>f_scale=1.345</code>, 최대 500 평가를 사용합니다. B/C의 내부 드론 위치는 각 각도 후보에서 초기 ray/RTK 위치로 시작해 감쇠 Gauss–Newton을 10회 수행합니다. optimizer 성공과 각도 Jacobian rank가 모두 통과해야 <code>CONVERGED</code>입니다. rank 부족·실패도 결과로 남습니다.</p></li>
+        <li><h4>교정 결과를 얼린 뒤 V0에서 한 번 평가한다</h4><p>교정 경로에서 구한 각도와 고정 광심을 V0에 그대로 적용합니다. V0 픽셀만으로 위치를 삼각측량하고, 평가 단계에서만 Gazebo GT와 비교해 위치의 3D RMSE/P95·검출률·유효 측정률 등을 계산합니다. 카메라 자세오차는 교정 단계의 별도 진단이며 V0에서 자세를 재추정하지 않습니다. V0 측위오차로 다시 최적화하거나 경로를 바꾸지 않습니다.</p></li>
+      </ol>
+      <div class="notice-inline"><strong>교정 중 truth 사용 금지:</strong> sensor 관측 생성기는 참 카메라 pose를 읽어 noisy synthetic RTK/IMU를 만들 수 있습니다. A/B/C estimator input은 allowlist로 제한합니다. 참 드론 위치는 교정 중 입력하지 않고, V0 GT는 최종 성능 평가에만 씁니다. YAW_IDEAL/ORACLE은 이름이 붙은 별도 truth assisted 진단입니다.</div>
+      <h4>각도 solver 한 번의 안쪽을 펼치면</h4>
+      <div class="matrix-steps" aria-label="자세 최적화 반복 흐름"><div><b>① 후보 각도</b>φ/θ/ψ 입력 → 좌우 R<sub>WC</sub> 구성</div><div><b>② 점 투영</b>각 P<sub>t</sub>를 K와 R<sub>WC</sub>로 예상 픽셀에 투영</div><div><b>③ 잔차·가중치</b>검출점 차이를 공분산 정규화 후 Huber</div><div><b>④ 변수 갱신</b>A는 카메라별, B/C는 공유 잠재점 포함 갱신</div><div><b>⑤ 중단·판정</b>optimizer 성공 + rank 검사, covariance·condition 기록</div></div>
+      <p class="small muted">이 반복은 한 프레임씩 카메라 자세를 바꾸는 과정이 아닙니다. 모든 프레임의 residual과 IMU prior를 모아 좌우 카메라의 한 쌍 자세를 함께 정합니다. A만 좌우 optimizer 호출을 나눕니다.</p>
+    </div>
+    <details><summary>실제 코드는 이 식을 어떻게 푸나?</summary><p>외부 카메라 각도 최적화는 SciPy <code>least_squares</code>의 Huber 손실을 사용하며 <code>f_scale=1.345</code>, <code>max_nfev=500</code>, <code>x_scale="jac"</code>입니다. A는 좌우 문제를 각각 풉니다.</p><p>B/C는 후보 카메라 각도마다 시각별 드론 위치를 내부에서 감쇠 Gauss–Newton 방식으로 10회 갱신한 뒤 외부 각도 잔차를 계산합니다. 위 공동 목적함수를 내부 위치 추정으로 근사해 푸는 구현이며, 전역 최적해 보장을 의미하지 않습니다.</p><p>결과의 <code>CONVERGED</code>는 최적화 성공과 코드의 각도 Jacobian rank 검사를 통과했다는 뜻입니다. B/C가 가진 전체 잠재 위치변수의 관측성을 모두 인증하거나 실장비 정확도를 보장한다는 뜻은 아닙니다.</p></details>
+  </section>
+
+  <section id="weights" aria-labelledby="weights-title">
+    <div class="section-kicker"><span>06</span> WEIGHTING EACH OBSERVATION</div>
+    <h2 id="weights-title">같은 1픽셀이라도 불확실성이 다르면 비중이 다르다.</h2>
+    <p class="intro">첫 단계는 공분산으로 잔차를 정규화하는 것입니다. 다음 단계는 큰 영상 정규화 잔차를 Huber로 완화하는 것입니다. 현재 코드에는 YOLO confidence나 프레임 순서에 따른 별도 가중치가 없습니다.</p>
+    <div class="grid2">
+      <div class="panel"><h3>① 불확실성으로 정규화</h3><div class="formula"><span class="line">r = e / σ &nbsp; (독립인 스칼라 관측)</span><span class="line">r = L<sup>−1</sup>e &nbsp; (공분산을 가진 벡터)</span></div><p class="small">같은 오차라면 σ가 작을수록 더 큰 불일치로 취급합니다. B/C 영상 잔차의 기본 σ는 1px입니다. A는 RTK 공분산 전파까지 포함해 픽셀 잔차를 정규화합니다.</p></div>
+      <div class="panel"><h3>② Huber로 이상치 영향 완화</h3><div class="formula"><span class="line">ρ<sub>H</sub>(r) = ½r² &nbsp;&nbsp; if |r| ≤ δ</span><span class="line">ρ<sub>H</sub>(r) = δ(|r| − ½δ) &nbsp; otherwise</span><span class="line">δ = 1.345</span></div><p class="small">작은 잔차에서는 제곱 손실, 큰 잔차에서는 선형 증가입니다. 관측을 삭제하지 않고 영향이 지나치게 커지는 것을 제한합니다.</p></div>
+    </div>
+    <div class="panel">
+      <div class="mini-title"><h3>잔차 크기에 따른 유효 가중치</h3><span class="pill">B/C 영상 잔차 한 성분의 예시</span></div>
+      <div class="controls"><div class="control"><label for="error-slider">재투영 오차 |e| <output id="error-value" for="error-slider">5.00 px</output></label><input id="error-slider" type="range" min="0" max="10" step="0.05" value="5"></div><div class="control"><label for="sigma-slider">관측 표준편차 σ <output id="sigma-value" for="sigma-slider">1.00 px</output></label><input id="sigma-slider" type="range" min="0.2" max="3" step="0.05" value="1"></div></div>
+      <svg id="weight-chart" class="chart" viewBox="0 0 760 280" role="img" aria-labelledby="weight-chart-title"><title id="weight-chart-title">정규화 잔차에 따른 Huber 유효 가중치 곡선</title></svg>
+      <div class="stats-row" aria-live="polite"><div class="stat">정규화 잔차 |r| = |e|/σ<output id="r-value">5.000</output></div><div class="stat">Huber 가중치 w<output id="weight-value">0.269</output></div><div class="stat">스칼라 유효계수 w/σ²<output id="effective-value">0.269 <small>px⁻²</small></output></div><div class="stat">Huber 손실 ρ<sub>H</sub><output id="loss-value">5.820</output></div></div>
+      <div class="formula"><span class="line">w(r) = 1 &nbsp; if |r| ≤ 1.345</span><span class="line">w(r) = 1.345 / |r| &nbsp; otherwise</span></div>
+      <p class="chart-caption">슬라이더의 σ 변경은 설명용입니다. 이 문서에서 값을 움직여도 Simulation 설정은 바뀌지 않습니다. A의 상관된 픽셀 잔차는 Cholesky 변환 이후 성분별로 처리하므로 단순한 프레임당 숫자 하나로 표현할 수 없습니다.</p>
+    </div>
+    <div class="hint"><strong>“프레임마다 같은 비중인가?”에 대한 답</strong><br>기본 픽셀 σ는 동일하지만, 공분산과 잔차 크기에 따라 유효 비중이 달라집니다. 영상의 좌우 u/v에는 성분별 Huber를 적용하고, RTK·IMU는 공분산으로 정규화한 이차 비용을 유지합니다. 프레임 하나에 고정된 단일 Huber 가중치를 붙이는 구조는 아닙니다.</div>
+    <div class="grid2"><div><h3>프레임 수가 많으면?</h3><p class="small">목적함수는 프레임 잔차의 <strong>합</strong>입니다. 1/N로 정규화하지 않으므로 프레임 수가 늘면 영상·RTK 항의 총 영향이 커질 수 있습니다. IMU prior는 카메라별 한 번 들어갑니다.</p><p class="small">그래서 전체 관측 비교와 함께 <strong>시간 구간별로 선택한 고유 200쌍</strong> 비교를 수행합니다. 200쌍을 확보하지 못하면 미충족으로 표시하고 프레임을 복제하지 않습니다.</p></div><div><h3>숫자 가중치만으로 결정되나?</h3><p class="small">각 프레임에서 자세 변화가 픽셀을 얼마나 움직이는지도 다릅니다. 이 민감도, 즉 Jacobian까지 합쳐져 정보량이 정해집니다.</p><div class="formula"><span class="line">정보행렬 ≈ Jᵀ W J</span></div><p class="small muted">그래서 같은 수의 프레임이라도 직선·곡선·S자 경로의 자세 식별 능력이 다를 수 있습니다. 연속 프레임을 독립 비행 반복으로 세지는 않습니다.</p></div></div>
+  </section>
+
+  <section id="outputs" aria-labelledby="outputs-title">
+    <div class="section-kicker"><span>07</span> EVALUATION & OUTPUTS</div>
+    <h2 id="outputs-title">보정된 자세를 고정하고, 다른 비행에서 시험한다.</h2>
+    <p class="intro">P0~P4로 구한 회전행렬과 고정 카메라 위치를 V0 동안 유지합니다. V0의 좌우 픽셀로 드론 위치를 삼각측량한 다음, 평가기에서만 GT와 비교합니다.</p>
+    <div class="formula"><span class="line">위치오차<sub>t</sub> = P̂<sub>t</sub> − P<sub>t</sub><sup>GT</sup> &nbsp; [E, N, U] m</span><span class="line">3D RMSE = √( (1/N) ∑<sub>t</sub> ‖P̂<sub>t</sub> − P<sub>t</sub><sup>GT</sup>‖² )</span></div>
+    <p class="small">삼각측량은 두 광선으로 초기 3D 점을 만들고 영상 재투영 잔차를 줄이는 계산을 사용합니다. 평가 함수에는 드론 RTK를 넣지 않습니다. RMSE/P95뿐 아니라 검출률·유효 측정률·교정 실패와 관측성 진단도 함께 봅니다.</p>
+    <div class="outputs">
+      <div class="file"><span class="label">EXISTING YAW</span><h3 style="margin-top:10px">existing_yaw_results.xlsx</h3><p>지정 초기 yaw → M0와 A/B/C 보정 결과</p><span class="tag">RPY_IMU</span> <span class="tag">YAW_ONLY</span> <span class="tag">별도 이상적 진단</span></div>
+      <div class="file"><span class="label">GPS BASELINE YAW90</span><h3 style="margin-top:10px">gps_yaw90_results.xlsx</h3><p>baseline yaw90 → M0와 독립 재계산한 A/B/C</p><span class="tag">RPY_IMU</span> <span class="tag">YAW_ONLY</span> <span class="tag">방향 선택 근거</span></div>
+    </div>
+    <div class="table-wrap"><table><thead><tr><th>XLSX 시트</th><th>내용</th></tr></thead><tbody><tr><td><strong>Evaluation</strong></td><td>V0 위치오차, 검출·유효 측정률, 평가 상태, M0와 보정 후 결과. V0 동안 카메라 자세를 동결하므로 V0 카메라 자세오차를 재추정하지 않음</td></tr><tr><td><strong>Calibration</strong></td><td>A/B/C·각도 추정 범위별 수렴 상태, 추정 회전행렬·각도, 조건수 등</td></tr><tr><td><strong>Inputs</strong></td><td>trial 설정, 초기 yaw, GPS yaw90 baseline·분기 선택 근거, 입력 해시</td></tr><tr><td><strong>Contract</strong></td><td>좌표·각도 규약, truth 사용 정책, 평가 동결 해시와 범위</td></tr></tbody></table></div>
+    <p class="small">결과는 새 <code>analysis_versions/analysis_&lt;hash&gt;/</code>에 저장합니다. 기존 CSV 이름은 기존 yaw 행을 유지하고, GPS yaw90은 <code>gps_yaw90_*.csv</code>와 <code>GPS_YAW90</code> JSON 디렉터리를 사용합니다. 녹화 종료 시의 <code>session_*.xlsx</code>와는 별도 분석 산출물입니다.</p>
+    <div class="hint teal"><strong>현재 수치 결과 버전과 범위:</strong> 이 페이지는 방법 설명입니다. 동결된 수치 결과는 <code>analysis_9cfd7c6cd10b</code>에 있으며, 36,200개 원래 v1.2 yaw case와 6,200개 GPS_YAW90 확장을 합친 42,400개 primary case를 포함합니다. 민감도 50,000건은 별도입니다. V0는 동결한 카메라 자세로 위치·검출·유효 측정률을 평가합니다. <a href="../../recordings/stereo_v1_1/paper1_v1_2_001/outputs/20261021-postfreeze-summary-review/stereo_v1_2_summary_report_ready_v3.xlsx">보고용 보완 workbook</a>과 <a href="../../recordings/stereo_v1_1/paper1_v1_2_001/analysis_versions/analysis_9cfd7c6cd10b/analysis_methodology.md">analysis methodology</a>를 참조하세요. 2026-10-18 운영 보고서의 진행 상태는 당시 기록으로 유지됩니다.</div>
+    <div class="hint teal"><strong>완료의 기준도 나누어 기록합니다.</strong><br>39회 원본 수집·QC, 교정 추정기 구현·계산, 최종평가는 서로 다른 완료 상태입니다. 낮은 정확도나 비수렴을 없애려고 유리한 결과가 나올 때까지 재실행하지 않습니다. 기록 손상·잘못된 설정은 별도 attempt로 재시도합니다.</div>
+  </section>
+
+  <section id="sources" aria-labelledby="sources-title">
+    <div class="section-kicker"><span>08</span> SCOPE & SOURCE OF TRUTH</div>
+    <h2 id="sources-title">원래 지시서와 현재 구현을 구분해 읽는다.</h2>
+    <div class="hint amber"><strong>영상의 강건 손실과 센서 prior를 구분합니다.</strong><p>현재 solver는 영상에만 Huber를 적용합니다. IMU prior는 지시서의 <span class="formula-inline">rᵀΣ<sup>−1</sup>r</span> 이차형을 유지하며 큰 IMU 잔차를 Huber로 약화하지 않습니다. B의 드론 RTK 항도 내부 잠재점 계산과 외부 목적함수 모두 같은 이차 가우시안 비용을 사용합니다. A는 RTK 불확실성을 영상 공분산으로 전파하고, C에는 드론 RTK 항이 없습니다.</p></div>
+    <div class="table-wrap"><table><thead><tr><th>항목</th><th>설명 범위</th></tr></thead><tbody>
+      <tr><td>39회·경로·G0/G1·주 센서오차</td><td>원래 v1.2 지시서의 규격</td></tr>
+      <tr><td>GPS yaw90과 두 XLSX</td><td>후속 Simulation 구현 확장. 원래 지시서에 있던 항목은 아님</td></tr>
+      <tr><td>Monte Carlo</td><td>현재 구현은 trial 0에서 전체 교정 슬롯·yaw 조건·전체/200쌍을 계산. 후속 trial은 G0/G1의 P0/P4 첫 반복 슬롯에서 대표 조건으로 계산</td></tr>
+      <tr><td>민감도 분석</td><td>기존 25개 민감도 시나리오는 기존 yaw 분기에 유지. GPS yaw90에 모든 민감도를 복제한 것은 아님</td></tr>
+      <tr><td>인터랙티브 그래프</td><td>경로 그래프는 규격식. 재투영·Huber 그래프는 원리 설명용이며 실험 성능 결과가 아님</td></tr>
+      <tr><td>구현 검증</td><td>이번 확장 시 관련 테스트 31개, Workstation 방향 선택 비교, 전용 환경의 G0/G1 일부 기록 재처리·XLSX 생성 확인. 39회 전체 신규 재분석 결과를 이 문서에서 제시하지 않음</td></tr>
+    </tbody></table></div>
+    <h3>근거 파일</h3>
+    <p class="small muted">본문과 조작 기능은 이 HTML만으로 동작합니다. 아래 상대경로 링크는 저장소의 현재 위치에서 열 때 원문으로 연결됩니다.</p>
+    <div class="source-list">
+      <div><a href="02_Codex_작업지시문.txt">02 · Codex 작업지시문</a><small>실험 절차, 교정 범위, GT 분리, 완료 기준</small></div>
+      <div><a href="03_experiment_spec.json">03 · experiment spec</a><small>카메라·경로·잡음·39회 수치 규격</small></div>
+      <div><a href="04_run_manifest.json">04 · run manifest</a><small>실행 ID·반복·seed 목록</small></div>
+      <div><a href="../../campaigns/stereo_v1_1/calibration_solver.py">calibration_solver.py</a><small>회전, 재투영, 공분산 정규화, Huber·최적화</small></div>
+      <div><a href="../../campaigns/stereo_v1_1/analyze_campaign.py">analyze_campaign.py</a><small>M0, 초기 yaw, 샘플 선택, 교정·V0 평가 순서</small></div>
+      <div><a href="../../campaigns/stereo_v1_1/gps_yaw90.py">gps_yaw90.py</a><small>ENU baseline, 수직 yaw, 방향 분기 선택</small></div>
+      <div><a href="../../campaigns/stereo_v1_1/analysis_workbooks.py">analysis_workbooks.py</a><small>두 XLSX의 내용 분리·불변 저장</small></div>
+      <div><a href="../../campaigns/stereo_v1_1/GPS_YAW90_ANALYSIS.md">GPS yaw90 분석 계약</a><small>초기값·보정·출력·민감도 범위</small></div>
+    </div>
+  </section>
+  <footer><strong>Coordinate contract checked</strong> · world ENU [E,N,U] · PX4 NED [N,E,D] · optical RDF [R,D,F] · R<sub>WC</sub>: optical→world · rad / rad².<br>이 설명서는 원본 작업지시서를 대체하거나 Simulation 설정을 변경하지 않습니다. 수식·슬라이더는 현재 규격과 코드의 이해를 돕기 위한 것입니다.</footer>
+</main>
+<script>
+'use strict';
+(() => {
+  const NS='http://www.w3.org/2000/svg';
+  const $=id=>document.getElementById(id);
+  function svgEl(tag,attrs,text){const node=document.createElementNS(NS,tag);Object.entries(attrs||{}).forEach(([k,v])=>node.setAttribute(k,v));if(text!==undefined)node.textContent=text;return node;}
+  function add(svg,tag,attrs,text){const node=svgEl(tag,attrs,text);svg.appendChild(node);return node;}
+  function clear(svg,titleId,title){svg.replaceChildren(svgEl('title',{id:titleId},title));}
+  function line(svg,x1,y1,x2,y2,cls='grid-line'){return add(svg,'line',{x1,y1,x2,y2,class:cls});}
+  function text(svg,x,y,value,attrs={}){return add(svg,'text',{x,y,...attrs},value);}
+  function chartWidth(svg,height){const width=Math.max(290,Math.round(svg.getBoundingClientRect().width));svg.setAttribute('viewBox',`0 0 ${width} ${height}`);return width;}
+  const delta=1.345;
+  function huber(r){const a=Math.abs(r);return a<=delta?0.5*r*r:delta*(a-0.5*delta);}
+  function huberWeight(r){const a=Math.abs(r);return a<=delta?1:delta/a;}
+  const pathSpecs={P0:{A:0,shape:'straight',start:400,end:300},P1:{A:3,shape:'bow',start:400,end:300},P2:{A:6,shape:'bow',start:400,end:300},P3:{A:3,shape:'s',start:400,end:300},P4:{A:6,shape:'s',start:400,end:300},V0:{A:0,shape:'straight',start:600,end:400}};
+  let activePath='P4';
+  function pathValue(spec,s){return spec.shape==='bow'?spec.A*Math.sin(Math.PI*s)**2:spec.shape==='s'?spec.A*Math.sin(2*Math.PI*s)**3:0;}
+  function spatialPoint(spec,s){const D=spec.start+(spec.end-spec.start)*s,x=pathValue(spec,s),z=D*Math.tan(Math.PI*20/180);return {D,x,z,sx:250+.8*D+5*x+.1*z,sy:244-.15*D-.35*z-3*x};}
+  function updateSpatialProgress(){const s=Number($('path3d-progress').value)/100,p=spatialPoint(pathSpecs[activePath],s),route=$('path3d-route');const point=route.getPointAtLength(route.getTotalLength()*s);$('path3d-current').setAttribute('cx',point.x);$('path3d-current').setAttribute('cy',point.y);$('path3d-progress-value').textContent=s.toFixed(2);$('path3d-location').textContent=`D=${p.D.toFixed(1)}m · 동쪽 x=${p.x.toFixed(1)}m · 고도 z=${p.z.toFixed(1)}m`;}
+  function drawSpatialPath(id){const spec=pathSpecs[id],route=$('path3d-route');let d='';for(let i=0;i<=100;i++){const p=spatialPoint(spec,i/100);d+=(i?'L':'M')+p.sx.toFixed(1)+','+p.sy.toFixed(1);}route.setAttribute('d',d);const start=spatialPoint(spec,0),end=spatialPoint(spec,1);$('path3d-start').setAttribute('cx',start.sx);$('path3d-start').setAttribute('cy',start.sy);$('path3d-end').setAttribute('cx',end.sx);$('path3d-end').setAttribute('cy',end.sy);$('path3d-start-label').setAttribute('x',start.sx-7);$('path3d-start-label').setAttribute('y',start.sy-12);$('path3d-start-label').textContent=`시작 D=${spec.start}m · z≈${start.z.toFixed(1)}m`;$('path3d-end-label').setAttribute('x',end.sx-7);$('path3d-end-label').setAttribute('y',end.sy+20);$('path3d-end-label').textContent=`끝 D=${spec.end}m · z≈${end.z.toFixed(1)}m`;$('path3d-title').textContent=`${id} 3D 경로: 전방거리 ${spec.start}→${spec.end}m, 진폭 ${spec.A}m`;updateSpatialProgress();}
+  function drawSpatialYaw(yaw){const origin={x:222,y:222},v={x:246,y:-119},angle=-Number(yaw)*Math.PI/180*8,x=origin.x+v.x*Math.cos(angle)-v.y*Math.sin(angle),y=origin.y+v.x*Math.sin(angle)+v.y*Math.cos(angle);$('ray3d-candidate').setAttribute('x2',x);$('ray3d-candidate').setAttribute('y2',y);$('ray3d-candidate-point').setAttribute('cx',x);$('ray3d-candidate-point').setAttribute('cy',y);$('ray3d-yaw-label').textContent=`후보 yaw ${Number(yaw).toFixed(3)}° · 표시각은 확대`;}
+  function drawPath(id){
+    activePath=id;
+    const spec=pathSpecs[id],svg=$('path-chart'),left=67,right=chartWidth(svg,270)-30,top=25,bottom=218;
+    const x=s=>left+(right-left)*s,y=v=>top+(7-v)/14*(bottom-top);
+    clear(svg,'path-chart-title',`${id}: 진행률 0~1에 따른 동쪽 횡이동, 진폭 ${spec.A}m`);
+    [-6,-3,0,3,6].forEach(v=>{line(svg,left,y(v),right,y(v));text(svg,left-12,y(v)+4,v,{'text-anchor':'end'});});
+    [0,.25,.5,.75,1].forEach(s=>{line(svg,x(s),top,x(s),bottom);text(svg,x(s),bottom+22,s.toFixed(s===0||s===1?0:2),{'text-anchor':'middle'});});
+    text(svg,16,17,'x: 동쪽 횡이동 (m)',{class:'chart-label'});text(svg,(left+right)/2,263,'진행률 s (0 = 시작, 1 = 끝)',{'text-anchor':'middle',class:'chart-label'});
+    let d='';for(let i=0;i<=200;i++){const s=i/200;d+=(i?'L':'M')+x(s).toFixed(2)+','+y(pathValue(spec,s)).toFixed(2);}
+    add(svg,'path',{d,fill:'none',stroke:'#245bd7','stroke-width':3});
+    [0,1].forEach(s=>add(svg,'circle',{cx:x(s),cy:y(pathValue(spec,s)),r:4,fill:'#245bd7'}));
+    const formula=spec.shape==='bow'?`${spec.A} sin²(πs)`:spec.shape==='s'?`${spec.A} sin³(2πs)`:'0';
+    $('path-detail').textContent=`${id} · ${id==='V0'?'최종평가':'교정'} · 전방거리 ${spec.start} → ${spec.end}m · x(s) = ${formula} m · z = D tan(20°)`;
+    document.querySelectorAll('[data-path]').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.path===id)));
+    drawSpatialPath(id);
+  }
+  $('path3d-progress').addEventListener('input',updateSpatialProgress);
+  $('path-buttons').addEventListener('click',event=>{const button=event.target.closest('[data-path]');if(button)drawPath(button.dataset.path);});
+  const fx=8241.646774127139,cx=640,trueYaw=.3;
+  const points=[[-6,400],[4,375],[-2,350],[6,325],[0,300]],noise=[.5,-.7,.2,.6,-.4];
+  const predict=(point,yaw)=>cx+fx*Math.tan(Math.atan2(point[0]+12.5,point[1])-yaw*Math.PI/180);
+  const observations=points.map((point,i)=>predict(point,trueYaw)+noise[i]);
+  function demoScore(yaw){return points.reduce((sum,point,i)=>sum+huber(predict(point,yaw)-observations[i]),0);}
+  function drawProjection(){
+    const yaw=Number($('yaw-slider').value),svg=$('projection-chart'),left=50,right=chartWidth(svg,290)-29,top=35,bottom=235;
+    clear(svg,'projection-chart-title',`공통 yaw ${yaw.toFixed(3)}도에서 5프레임의 수평 재투영 비교`);
+    const x=u=>left+(u-560)/680*(right-left);[600,800,1000,1200].forEach(u=>{line(svg,x(u),top-13,x(u),bottom+10);text(svg,x(u),bottom+32,String(u),{'text-anchor':'middle'});});
+    let sse=0;
+    points.forEach((point,i)=>{const yy=top+i*48,obs=observations[i],pred=predict(point,yaw),error=pred-obs;sse+=error*error;
+      text(svg,18,yy+4,`t${i+1}`,{class:'chart-label'});line(svg,left,yy,right,yy);
+      add(svg,'line',{x1:x(obs),y1:yy,x2:x(pred),y2:yy,stroke:'#bd916d','stroke-width':2});
+      add(svg,'circle',{cx:x(obs),cy:yy,r:5,fill:'#087d76'});add(svg,'rect',{x:x(pred)-4.5,y:yy-4.5,width:9,height:9,fill:'#b85c13'});
+      const labelX=Math.max(left+3,Math.min(right-56,Math.max(x(pred),x(obs))+9));text(svg,labelX,yy-11,`${error>=0?'+':''}${error.toFixed(1)} px`,{'font-size':11});
+    });
+    text(svg,(left+right)/2,286,'영상 u 좌표 (px) · 확대 범위',{'text-anchor':'middle',class:'chart-label'});
+    $('yaw-value').textContent=yaw.toFixed(3)+'°';$('demo-shared').textContent=yaw.toFixed(3)+'°';$('demo-rmse').textContent=Math.sqrt(sse/points.length).toFixed(2)+' px';$('demo-cost').textContent=demoScore(yaw).toFixed(3);
+    drawSpatialYaw(yaw);
+  }
+  $('yaw-slider').addEventListener('input',drawProjection);
+  $('fit-demo').addEventListener('click',()=>{let best=-.6,cost=Infinity;for(let i=0;i<=1600;i++){const yaw=-.6+i*.001,score=demoScore(yaw);if(score<cost){best=yaw;cost=score;}}$('yaw-slider').value=best.toFixed(3);drawProjection();});
+  $('reset-demo').addEventListener('click',()=>{$('yaw-slider').value=0;drawProjection();});
+  const descriptions={image:'<strong>영상 항</strong> — 모든 프레임의 예상 픽셀이 실제 검출 픽셀에 가까워지도록 합니다. 기본 σ<sub>px</sub>=1px이며, 왼쪽·오른쪽의 u/v 잔차가 각각 들어갑니다.',rtk:'<strong>드론 RTK 항</strong> — 좌우 카메라가 공유하는 시각별 드론 위치 P<sub>t</sub>가 RTK 관측과 일관되도록 합니다. RTK 공분산이 크면 더 큰 위치 차이를 허용합니다. C에는 이 항이 없습니다.',imu:'<strong>카메라 IMU 항</strong> — 추정한 R/P가 측정 평균에서 얼마나 벗어났는지 공분산으로 정규화합니다. RPY_IMU에서는 갱신을 허용하되 제약하며, YAW_ONLY에서는 측정값에 고정합니다. yaw prior 항은 없습니다.'};
+  document.querySelectorAll('[data-term]').forEach(button=>button.addEventListener('click',()=>{document.querySelectorAll('[data-term]').forEach(peer=>peer.setAttribute('aria-pressed',String(peer===button)));$('term-detail').innerHTML=descriptions[button.dataset.term];}));
+  function drawWeight(){
+    const e=Number($('error-slider').value),sigma=Number($('sigma-slider').value),r=e/sigma,w=huberWeight(r),svg=$('weight-chart');
+    const left=64,right=chartWidth(svg,280)-30,top=28,bottom=222,max=Math.max(8,Math.ceil(r*1.15)),x=v=>left+v/max*(right-left),y=v=>bottom-v*(bottom-top);
+    clear(svg,'weight-chart-title',`정규화 잔차 ${r.toFixed(3)}, Huber 가중치 ${w.toFixed(3)}`);
+    [0,.25,.5,.75,1].forEach(v=>{line(svg,left,y(v),right,y(v));text(svg,left-12,y(v)+4,v.toFixed(2),{'text-anchor':'end'});});
+    for(let i=0;i<=4;i++){const v=i*max/4;line(svg,x(v),top,x(v),bottom);text(svg,x(v),bottom+23,v.toFixed(1),{'text-anchor':'middle'});}
+    text(svg,11,17,'가중치 w',{class:'chart-label'});text(svg,(left+right)/2,273,'정규화 잔차 |r| = |e| / σ',{'text-anchor':'middle',class:'chart-label'});
+    let d='';for(let i=0;i<=300;i++){const v=i*max/300;d+=(i?'L':'M')+x(v).toFixed(2)+','+y(huberWeight(v)).toFixed(2);}add(svg,'path',{d,fill:'none',stroke:'#245bd7','stroke-width':3});
+    add(svg,'line',{x1:x(delta),y1:top,x2:x(delta),y2:bottom,stroke:'#8b9db5','stroke-dasharray':'4 4'});text(svg,x(delta)+7,top+19,'δ = 1.345');
+    add(svg,'line',{x1:x(r),y1:y(w),x2:x(r),y2:bottom,stroke:'#087d76','stroke-dasharray':'3 4'});add(svg,'circle',{cx:x(r),cy:y(w),r:6,fill:'#087d76',stroke:'#fff','stroke-width':2});
+    $('error-value').textContent=e.toFixed(2)+' px';$('sigma-value').textContent=sigma.toFixed(2)+' px';$('r-value').textContent=r.toFixed(3);$('weight-value').textContent=w.toFixed(3);$('effective-value').textContent=(w/(sigma*sigma)).toFixed(3)+' px⁻²';$('loss-value').textContent=huber(r).toFixed(3);
+  }
+  ['error-slider','sigma-slider'].forEach(id=>$(id).addEventListener('input',drawWeight));
+  $('print-button').addEventListener('click',()=>window.print());
+  const navLinks=[...document.querySelectorAll('.sidebar nav a')];
+  if('IntersectionObserver' in window){const observer=new IntersectionObserver(entries=>{const visible=entries.filter(entry=>entry.isIntersecting).sort((a,b)=>a.boundingClientRect.top-b.boundingClientRect.top);if(visible.length){navLinks.forEach(link=>{const active=link.hash==='#'+visible[0].target.id;link.classList.toggle('active',active);if(active)link.setAttribute('aria-current','location');else link.removeAttribute('aria-current');});}},{rootMargin:'-15% 0px -65% 0px',threshold:0});document.querySelectorAll('main section').forEach(section=>observer.observe(section));}
+  drawPath('P4');drawProjection();drawWeight();
+  window.addEventListener('resize',()=>{drawPath(activePath);drawProjection();drawWeight();});
+})();
+</script>
+</body>
+</html>

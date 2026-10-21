@@ -45,6 +45,12 @@ def test_missing_ground_truth_produces_explicitly_unavailable_errors():
     assert result["attitude_gt_valid"] is False
 
 
+@pytest.mark.parametrize("model_name", ["x500_2m", "x500_15m"])
+def test_evaluation_records_height_midpoint_contract(model_name):
+    result = evaluation_metadata(SimpleNamespace(pair_id=1), _alignment(), None, {}, target_model_name=model_name)
+    assert result["gt_reference_definition"] == "project_defined_vehicle_reference_at_visual_height_midpoint_v1"
+
+
 def test_vector_error_rejects_non_finite_estimate():
     metrics = {
         "x_forward_m": float("nan"),

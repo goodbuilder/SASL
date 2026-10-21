@@ -89,7 +89,7 @@ python_has_yolo_runtime() {
 
 python_has_campaign_analysis_runtime() {
   local python_bin="$1"
-  "$python_bin" -c "import numpy, scipy, zstandard" >/dev/null 2>&1
+  "$python_bin" -c "import numpy, scipy, zstandard, xlsxwriter" >/dev/null 2>&1
 }
 
 install_campaign_analysis_runtime() {

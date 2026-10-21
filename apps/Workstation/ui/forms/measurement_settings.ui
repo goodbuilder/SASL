@@ -1,0 +1,261 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>measurementSettings</class>
+ <widget class="QGroupBox" name="measurementSettings">
+  <property name="title">
+   <string>Settings</string>
+  </property>
+  <layout class="QVBoxLayout" name="measurementSettingsLayout">
+   <item>
+    <widget class="QWidget" name="geometry">
+     <layout class="QGridLayout" name="geometryLayout">
+      <item row="0" column="0">
+       <widget class="QLabel" name="yolo_confidenceLabel">
+        <property name="text">
+         <string>Confidence</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <widget class="QDoubleSpinBox" name="yolo_confidence">
+        <property name="minimum">
+         <double>0.01</double>
+        </property>
+        <property name="maximum">
+         <double>1.0</double>
+        </property>
+        <property name="decimals">
+         <number>3</number>
+        </property>
+        <property name="suffix">
+         <string />
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="2">
+       <widget class="QLabel" name="yolo_iouLabel">
+        <property name="text">
+         <string>IoU</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="3">
+       <widget class="QDoubleSpinBox" name="yolo_iou">
+        <property name="minimum">
+         <double>0.01</double>
+        </property>
+        <property name="maximum">
+         <double>1.0</double>
+        </property>
+        <property name="decimals">
+         <number>3</number>
+        </property>
+        <property name="suffix">
+         <string />
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0">
+       <widget class="QLabel" name="pixhawk_left_gnss_sourceLabel">
+        <property name="text">
+         <string>P1 GNSS source</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="QComboBox" name="pixhawk_left_gnss_source" />
+      </item>
+      <item row="1" column="2">
+       <widget class="QLabel" name="pixhawk_right_gnss_sourceLabel">
+        <property name="text">
+         <string>P2 GNSS source</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="3">
+       <widget class="QComboBox" name="pixhawk_right_gnss_source" />
+      </item>
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QGroupBox" name="pairGates">
+     <property name="title">
+      <string>Pair gates</string>
+     </property>
+     <layout class="QGridLayout" name="pairGatesLayout">
+      <item row="0" column="0">
+       <widget class="QPushButton" name="class_gate_enabled">
+        <property name="text">
+         <string>Class gate</string>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0">
+       <widget class="QPushButton" name="matching_gate_enabled">
+        <property name="text">
+         <string>Time matching</string>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="2">
+       <widget class="QPushButton" name="time_delta_gate_enabled">
+        <property name="text">
+         <string>Max Δt</string>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="4">
+       <widget class="QPushButton" name="vertical_delta_gate_enabled">
+        <property name="text">
+         <string>Vertical Δ</string>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1" rowspan="1" colspan="2">
+       <widget class="QLineEdit" name="class_gate">
+        <property name="placeholderText">
+         <string>class id or name</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="QComboBox" name="time_basis">
+        <property name="toolTip">
+         <string>RTCP/NTP is used only while Clock and current frame timing are usable; otherwise live distance uses exact app-receive monotonic time.</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="3">
+       <widget class="QDoubleSpinBox" name="max_pair_delta_s">
+        <property name="toolTip">
+         <string>Authoritative app-receive pair limit; values may be stricter than 100 ms.</string>
+        </property>
+        <property name="minimum">
+         <double>0.0</double>
+        </property>
+        <property name="maximum">
+         <double>0.1</double>
+        </property>
+        <property name="decimals">
+         <number>3</number>
+        </property>
+        <property name="suffix">
+         <string> s</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="5">
+       <widget class="QDoubleSpinBox" name="max_vertical_delta_px">
+        <property name="minimum">
+         <double>0.0</double>
+        </property>
+        <property name="maximum">
+         <double>5000.0</double>
+        </property>
+        <property name="decimals">
+         <number>1</number>
+        </property>
+        <property name="suffix">
+         <string> px</string>
+        </property>
+       </widget>
+      </item>
+      <property name="leftMargin">
+       <number>6</number>
+      </property>
+      <property name="topMargin">
+       <number>6</number>
+      </property>
+      <property name="rightMargin">
+       <number>6</number>
+      </property>
+      <property name="bottomMargin">
+       <number>6</number>
+      </property>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="status">
+     <property name="text">
+      <string>Apply updates idle preview now; an active Measurement keeps timing until the next run. Save persists.</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QWidget" name="actions">
+     <layout class="QHBoxLayout" name="actionsLayout">
+      <item>
+       <widget class="QPushButton" name="apply">
+        <property name="text">
+         <string>Apply</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="save">
+        <property name="text">
+         <string>Save</string>
+        </property>
+       </widget>
+      </item>
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+     </layout>
+    </widget>
+   </item>
+   <property name="leftMargin">
+    <number>6</number>
+   </property>
+   <property name="topMargin">
+    <number>6</number>
+   </property>
+   <property name="rightMargin">
+    <number>6</number>
+   </property>
+   <property name="bottomMargin">
+    <number>6</number>
+   </property>
+  </layout>
+ </widget>
+ <resources />
+ <connections />
+</ui>

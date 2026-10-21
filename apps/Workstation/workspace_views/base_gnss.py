@@ -5,11 +5,11 @@ from __future__ import annotations
 import time
 from typing import Callable
 from PyQt5 import QtCore, QtWidgets
-from Workstation.ui.components import EngineeringValue, WorkspaceHeader
+from Workstation.ui.components import EngineeringValue
+from Workstation.ui.designer import load_form
 from Workstation.application.status_model import RuntimeStatus
 from .shared import (
     _append_table_row,
-    _command_button,
     _display_number,
     _evidence,
     _live_inspection,
@@ -89,202 +89,54 @@ class BaseGnssWorkspace(QtWidgets.QWidget):
         self._ntrip_fixed_after_connect_s: float | None = None
         self._last_state_text = "--"
         self._last_base_fix: bool | None = None
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-        layout.addWidget(WorkspaceHeader("Base GNSS"))
-
-        # Fixed 3-column x 2-row action grid. Survey-in and NTRIP start/stop
-        # share a cell with their counterpart because refresh() never makes
-        # both visible at once (local_mode vs network_mode are exclusive),
-        # so the visible grid always stays a clean, fully-packed 3x2 layout
-        # regardless of which operation mode is active.
-        actions = QtWidgets.QGridLayout()
-        self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
-        for command_id, label, row, col in (
-            ("gnss.base_discover", "Find Base", 0, 0),
-            ("gnss.base_connect", "Connect", 0, 1),
-            ("gnss.base_disconnect", "Disconnect", 0, 2),
-            ("gnss.survey_start", "Start Survey-in", 1, 0),
-            ("gnss.ntrip_start", "Start NTRIP", 1, 0),
-            ("gnss.survey_stop", "Stop Survey-in", 1, 1),
-            ("gnss.ntrip_stop", "Stop NTRIP", 1, 1),
-            ("gnss.ntrip_forget_password", "Forget NTRIP password", 1, 2),
-        ):
-            button = _command_button(label, command_id, invoke_command)
-            self.operation_buttons[command_id] = button
-            actions.addWidget(button, row, col)
-        layout.addLayout(actions)
-
-        summary_group = QtWidgets.QGroupBox("Current state")
-        summary_layout = QtWidgets.QGridLayout(summary_group)
-        self.summary_values: dict[str, EngineeringValue] = {}
-        for index, (key, label) in enumerate(
-            (
-                ("progress", "진행 단계"),
-                ("mode", "Mode"),
-                ("state", "Operation (raw)"),
-                ("source", "Correction source"),
-                ("rtcm", "RTCM stream"),
-            )
-        ):
-            value = EngineeringValue(label)
-            self.summary_values[key] = value
-            summary_layout.addWidget(value, index // 2, index % 2)
-        layout.addWidget(summary_group)
-
-        self.serial_group = QtWidgets.QGroupBox("Base receiver")
-        serial_layout = QtWidgets.QGridLayout(self.serial_group)
-        self.serial_values: dict[str, EngineeringValue] = {}
-        for index, (key, label) in enumerate(
-            (("connection", "Connection"), ("device", "Device"), ("baud", "Baud"), ("satellites", "Satellites"))
-        ):
-            value = EngineeringValue(label)
-            self.serial_values[key] = value
-            serial_layout.addWidget(value, index // 4, index % 4)
-        layout.addWidget(self.serial_group)
-
-        self.candidate_group = QtWidgets.QGroupBox("Discovered Base receivers")
-        candidate_layout = QtWidgets.QVBoxLayout(self.candidate_group)
-        self.discovery_status = EngineeringValue("Discovery")
-        candidate_layout.addWidget(self.discovery_status)
-        self.candidate_model = _table_model(self, ("Port", "Target", "Baud", "Status", "UBX messages"))
-        self.candidate_table = QtWidgets.QTableView()
-        self.candidate_table.setModel(self.candidate_model)
-        self.candidate_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.candidate_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.candidate_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.candidate_table.verticalHeader().setVisible(False)
-        self.candidate_table.setMaximumHeight(132)
-        self.candidate_table.horizontalHeader().setStretchLastSection(True)
-        self.candidate_table.clicked.connect(self._inspect_candidate_row)
-        self.candidate_table.selectionModel().selectionChanged.connect(self._refresh_candidate_action)
-        candidate_layout.addWidget(self.candidate_table)
-        candidate_actions = QtWidgets.QHBoxLayout()
-        self.apply_candidate_button = QtWidgets.QPushButton("Use selected receiver")
-        self.apply_candidate_button.setEnabled(False)
-        self.apply_candidate_button.clicked.connect(self._apply_selected_candidate)
-        candidate_actions.addWidget(self.apply_candidate_button)
-        candidate_actions.addStretch(1)
-        candidate_layout.addLayout(candidate_actions)
-        self.candidate_feedback = QtWidgets.QLabel("")
-        self.candidate_feedback.setObjectName("statusStrip")
-        self.candidate_feedback.setWordWrap(True)
-        candidate_layout.addWidget(self.candidate_feedback)
-        layout.addWidget(self.candidate_group)
-        self._candidate_signature: tuple[tuple[object, ...], ...] = ()
-
-        self.survey_group = QtWidgets.QGroupBox("Survey-in (수신기 자체 관측치)")
-        survey_layout = QtWidgets.QGridLayout(self.survey_group)
-        self.survey_values: dict[str, EngineeringValue] = {}
-        for index, (key, label) in enumerate(
-            (
-                ("status", "Status"),
-                ("duration", "Duration"),
-                ("accuracy", "Mean accuracy"),
-                ("observations", "Observations"),
-                ("ecef", "Mean ECEF X/Y/Z"),
-            )
-        ):
-            value = EngineeringValue(label)
-            self.survey_values[key] = value
-            survey_layout.addWidget(value, index // 3, index % 3)
-        layout.addWidget(self.survey_group)
-
-        self.ntrip_group = QtWidgets.QGroupBox("NTRIP")
-        ntrip_layout = QtWidgets.QGridLayout(self.ntrip_group)
-        self.ntrip_values: dict[str, EngineeringValue] = {}
-        for index, (key, label) in enumerate(
-            (
-                ("connection", "Connection"),
-                ("health", "Health"),
-                ("caster", "Caster"),
-                ("mountpoint", "Mountpoint"),
-                ("gga", "GGA policy"),
-                ("gga_transmission", "GGA 전송 상태"),
-                ("status", "Caster response"),
-                ("transport", "Transport"),
-                ("rtcm", "RTCM"),
-                ("coverage", "RTCM 완전성 (관측치 포함?)"),
-                ("reconnects", "Reconnects"),
-                ("error", "Last error"),
-            )
-        ):
-            value = EngineeringValue(label)
-            self.ntrip_values[key] = value
-            ntrip_layout.addWidget(value, index // 3, index % 3)
-        layout.addWidget(self.ntrip_group)
-
-        self.fixed_group = QtWidgets.QGroupBox("Fixed Base acquisition")
-        fixed_layout = QtWidgets.QGridLayout(self.fixed_group)
-        self.fixed_values: dict[str, EngineeringValue] = {}
-        for index, (key, label) in enumerate(
-            (
-                ("position", "WGS84 position"),
-                ("height", "Height"),
-                ("gnss_fix_stage", "GNSS Fixed 단계 (수신기 raw)"),
-                ("fix", "Base fix (임시 · 좌표 확보 단계)"),
-                ("samples", "Samples"),
-                ("scatter", "Scatter H/V"),
-                ("reconfigure", "Apply verification"),
-                ("ntrip_delta", "NTRIP 연결 전/후"),
-            )
-        ):
-            value = EngineeringValue(label)
-            self.fixed_values[key] = value
-            fixed_layout.addWidget(value, index // 3, index % 3)
-        layout.addWidget(self.fixed_group)
-
-        self.checklist_group = QtWidgets.QGroupBox("Base-assisted checklist (informational only)")
-        checklist_layout = QtWidgets.QGridLayout(self.checklist_group)
-        self.checklist_values: dict[str, EngineeringValue] = {}
-        for index, (key, label) in enumerate(
-            (
-                ("base_coordinate", "1. Base coordinate confirmed"),
-                ("base_rtcm", "2. Base RTCM output"),
-                ("left_fixed", "3. Left Rover RTK Fixed"),
-                ("right_fixed", "4. Right Rover RTK Fixed"),
-                ("stabilized", "5. L/R Fixed stabilized"),
-                ("rtcm_complete", "6. RTCM 관측치(MSM) 포함"),
-            )
-        ):
-            value = EngineeringValue(label)
-            self.checklist_values[key] = value
-            checklist_layout.addWidget(value, index // 2, index % 2)
-        checklist_note = QtWidgets.QLabel("표시 전용 상태 · 이 항목들은 측정 시작/진행을 차단하지 않습니다.")
-        checklist_note.setObjectName("statusStrip")
-        checklist_note.setWordWrap(True)
-        checklist_layout.addWidget(checklist_note, 3, 0, 1, 2)
-        layout.addWidget(self.checklist_group)
-
-        route_group = QtWidgets.QGroupBox("RTCM distribution")
-        route_layout = QtWidgets.QVBoxLayout(route_group)
-        self.route_model = _table_model(self, ("Target", "Frames", "Packets", "Bytes", "Failures", "Last delivery"))
-        self.route_table = QtWidgets.QTableView()
-        self.route_table.setModel(self.route_model)
-        self.route_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.route_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.route_table.verticalHeader().setVisible(False)
-        self.route_table.setMaximumHeight(136)
-        self.route_table.horizontalHeader().setStretchLastSection(True)
-        self.route_table.clicked.connect(self._inspect_route_row)
-        route_layout.addWidget(self.route_table)
-        layout.addWidget(route_group)
-
-        for group_name, group_values in (
-            ("summary", self.summary_values),
-            ("serial", self.serial_values),
-            ("survey", self.survey_values),
-            ("ntrip", self.ntrip_values),
-            ("fixed", self.fixed_values),
-            ("checklist", self.checklist_values),
-        ):
-            for key, value in group_values.items():
+        load_form("base_gnss.ui", self)
+        for widget in self.findChildren(QtWidgets.QWidget):
+            legacy_name = widget.property("legacyObjectName")
+            if legacy_name:
+                widget.setObjectName(str(legacy_name))
+        self.operation_buttons = {
+            'gnss.base_discover': self.operation_buttons_gnss_base_discover,
+            'gnss.base_connect': self.operation_buttons_gnss_base_connect,
+            'gnss.base_disconnect': self.operation_buttons_gnss_base_disconnect,
+            'gnss.survey_start': self.operation_buttons_gnss_survey_start,
+            'gnss.ntrip_start': self.operation_buttons_gnss_ntrip_start,
+            'gnss.survey_stop': self.operation_buttons_gnss_survey_stop,
+            'gnss.ntrip_stop': self.operation_buttons_gnss_ntrip_stop,
+            'gnss.ntrip_forget_password': self.operation_buttons_gnss_ntrip_forget_password,
+        }
+        for command_id, button in self.operation_buttons.items():
+            button.setEnabled(invoke_command is not None)
+            if invoke_command is not None:
+                button.clicked.connect(
+                    lambda _checked=False, command=command_id: invoke_command(command)
+                )
+        # Form slots own placement; EngineeringValue keeps its display/inspection behavior.
+        for group_name in ("summary", "serial", "survey", "ntrip", "fixed", "checklist"):
+            values = {}
+            prefix = group_name + "_values_"
+            for slot in self.findChildren(QtWidgets.QWidget):
+                if not slot.objectName().startswith(prefix) or slot.property("engineeringLabel") is None:
+                    continue
+                key = slot.objectName()[len(prefix):]
+                value = EngineeringValue(str(slot.property("engineeringLabel")), slot)
+                slot.layout().addWidget(value)
+                values[key] = value
                 value.activated.connect(
                     lambda group_name=group_name, key=key: self._inspect_value(group_name, key)
                 )
-
-        layout.addStretch(1)
+            setattr(self, group_name + "_values", values)
+        discovery_slot = self.discovery_status
+        self.discovery_status = EngineeringValue(str(discovery_slot.property("engineeringLabel")), discovery_slot)
+        discovery_slot.layout().addWidget(self.discovery_status)
+        self.candidate_model = _table_model(self, ("Port", "Target", "Baud", "Status", "UBX messages"))
+        self.candidate_table.setModel(self.candidate_model)
+        self.candidate_table.clicked.connect(self._inspect_candidate_row)
+        self.candidate_table.selectionModel().selectionChanged.connect(self._refresh_candidate_action)
+        self.apply_candidate_button.clicked.connect(self._apply_selected_candidate)
+        self._candidate_signature: tuple[tuple[object, ...], ...] = ()
+        self.route_model = _table_model(self, ("Target", "Frames", "Packets", "Bytes", "Failures", "Last delivery"))
+        self.route_table.setModel(self.route_model)
+        self.route_table.clicked.connect(self._inspect_route_row)
 
     @staticmethod
     def _dict(value: object) -> dict[str, object]:

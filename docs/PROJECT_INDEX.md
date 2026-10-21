@@ -13,6 +13,7 @@ Obsidian에서 프로젝트를 읽을 때 사용하는 시작점이다. 생성�
 ## 1. 먼저 읽기
 
 - [[./README.md|README]] — 전체 프로젝트 개요와 실행 진입점
+- [[docs/literature/index|논문 후보·문헌 관계도]] — Simulation/Workstation 연구 후보와 연결된 선행 문헌
 - [[apps/StereoWIRIS/docs/README]] — StereoWIRIS 문서 목차
 - [[apps/StereoWIRIS/docs/PROJECT]] — 목적, 구조, 측정 흐름, 운영 기준
 - [[apps/StereoWIRIS/docs/usage]] — 실제 실행·연결·측정·동기화 사용법

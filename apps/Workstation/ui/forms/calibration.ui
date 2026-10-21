@@ -1,0 +1,545 @@
+<ui version="4.0">
+  <class>CalibrationWorkspace</class>
+  <widget class="QWidget" name="CalibrationWorkspace">
+    <layout class="QVBoxLayout" name="workspaceLayout">
+      <property name="leftMargin">
+        <number>8</number>
+      </property>
+      <property name="topMargin">
+        <number>8</number>
+      </property>
+      <property name="rightMargin">
+        <number>8</number>
+      </property>
+      <property name="bottomMargin">
+        <number>8</number>
+      </property>
+      <property name="spacing">
+        <number>6</number>
+      </property>
+      <item>
+        <widget class="QFrame" name="workstationHeader">
+          <layout class="QVBoxLayout" name="headerLayout">
+            <property name="leftMargin">
+              <number>6</number>
+            </property>
+            <property name="topMargin">
+              <number>6</number>
+            </property>
+            <property name="rightMargin">
+              <number>6</number>
+            </property>
+            <property name="bottomMargin">
+              <number>6</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item>
+              <widget class="QLabel" name="workspaceTitle">
+                <property name="text">
+                  <string>Calibration</string>
+                </property>
+              </widget>
+            </item>
+          </layout>
+        </widget>
+      </item>
+      <item>
+        <widget class="QWidget" name="simpleHost">
+          <layout class="QVBoxLayout" name="simpleLayout">
+            <property name="leftMargin">
+              <number>0</number>
+            </property>
+            <property name="topMargin">
+              <number>0</number>
+            </property>
+            <property name="rightMargin">
+              <number>0</number>
+            </property>
+            <property name="bottomMargin">
+              <number>0</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+          </layout>
+        </widget>
+      </item>
+      <item>
+        <widget class="QGroupBox" name="advancedCalibrationGroup">
+          <property name="toolTip">
+            <string>파일별 선택, subset 품질, K/D·R/t 상세, 세션 경로를 검토합니다.</string>
+          </property>
+          <layout class="QVBoxLayout" name="advancedGroupLayout">
+            <property name="leftMargin">
+              <number>6</number>
+            </property>
+            <property name="topMargin">
+              <number>6</number>
+            </property>
+            <property name="rightMargin">
+              <number>6</number>
+            </property>
+            <property name="bottomMargin">
+              <number>6</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item>
+              <widget class="QToolButton" name="advancedCalibrationToggle">
+                <property name="text">
+                  <string>고급 캘리브레이션</string>
+                </property>
+                <property name="checkable">
+                  <bool>true</bool>
+                </property>
+                <property name="toolButtonStyle">
+                  <enum>Qt::ToolButtonTextBesideIcon</enum>
+                </property>
+                <property name="arrowType">
+                  <enum>Qt::RightArrow</enum>
+                </property>
+              </widget>
+            </item>
+            <item>
+              <widget class="QWidget" name="advanced_calibration_content">
+                <layout class="QVBoxLayout" name="advancedContentLayout">
+                  <property name="leftMargin">
+                    <number>6</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>6</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>6</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>6</number>
+                  </property>
+                  <property name="spacing">
+                    <number>6</number>
+                  </property>
+                  <item>
+                    <widget class="QWidget" name="zoomHost">
+                      <layout class="QVBoxLayout" name="zoomHostLayout">
+                        <property name="leftMargin">
+                          <number>0</number>
+                        </property>
+                        <property name="topMargin">
+                          <number>0</number>
+                        </property>
+                        <property name="rightMargin">
+                          <number>0</number>
+                        </property>
+                        <property name="bottomMargin">
+                          <number>0</number>
+                        </property>
+                        <property name="spacing">
+                          <number>6</number>
+                        </property>
+                      </layout>
+                    </widget>
+                  </item>
+                  <item>
+                    <widget class="QGroupBox" name="cameraHost">
+                      <layout class="QVBoxLayout" name="cameraHostLayout">
+                        <property name="leftMargin">
+                          <number>6</number>
+                        </property>
+                        <property name="topMargin">
+                          <number>6</number>
+                        </property>
+                        <property name="rightMargin">
+                          <number>6</number>
+                        </property>
+                        <property name="bottomMargin">
+                          <number>6</number>
+                        </property>
+                        <property name="spacing">
+                          <number>5</number>
+                        </property>
+                        <item>
+                          <widget class="QWidget" name="operationHost">
+                            <layout class="QVBoxLayout" name="operationLayout">
+                              <property name="leftMargin">
+                                <number>0</number>
+                              </property>
+                              <property name="topMargin">
+                                <number>0</number>
+                              </property>
+                              <property name="rightMargin">
+                                <number>0</number>
+                              </property>
+                              <property name="bottomMargin">
+                                <number>0</number>
+                              </property>
+                              <property name="spacing">
+                                <number>6</number>
+                              </property>
+                            </layout>
+                          </widget>
+                        </item>
+                        <item>
+                          <widget class="QWidget" name="cameraModeHost">
+                            <layout class="QVBoxLayout" name="cameraModeLayout">
+                              <property name="leftMargin">
+                                <number>0</number>
+                              </property>
+                              <property name="topMargin">
+                                <number>0</number>
+                              </property>
+                              <property name="rightMargin">
+                                <number>0</number>
+                              </property>
+                              <property name="bottomMargin">
+                                <number>0</number>
+                              </property>
+                              <property name="spacing">
+                                <number>6</number>
+                              </property>
+                            </layout>
+                          </widget>
+                        </item>
+                        <item>
+                          <widget class="QWidget" name="captureHost">
+                            <layout class="QVBoxLayout" name="captureLayout">
+                              <property name="leftMargin">
+                                <number>0</number>
+                              </property>
+                              <property name="topMargin">
+                                <number>0</number>
+                              </property>
+                              <property name="rightMargin">
+                                <number>0</number>
+                              </property>
+                              <property name="bottomMargin">
+                                <number>0</number>
+                              </property>
+                              <property name="spacing">
+                                <number>6</number>
+                              </property>
+                            </layout>
+                          </widget>
+                        </item>
+                        <item>
+                          <widget class="QWidget" name="sessionHost">
+                            <layout class="QVBoxLayout" name="sessionLayout">
+                              <property name="leftMargin">
+                                <number>0</number>
+                              </property>
+                              <property name="topMargin">
+                                <number>0</number>
+                              </property>
+                              <property name="rightMargin">
+                                <number>0</number>
+                              </property>
+                              <property name="bottomMargin">
+                                <number>0</number>
+                              </property>
+                              <property name="spacing">
+                                <number>6</number>
+                              </property>
+                            </layout>
+                          </widget>
+                        </item>
+                        <item>
+                          <widget class="QWidget" name="filesHost">
+                            <layout class="QVBoxLayout" name="filesLayout">
+                              <property name="leftMargin">
+                                <number>0</number>
+                              </property>
+                              <property name="topMargin">
+                                <number>0</number>
+                              </property>
+                              <property name="rightMargin">
+                                <number>0</number>
+                              </property>
+                              <property name="bottomMargin">
+                                <number>0</number>
+                              </property>
+                              <property name="spacing">
+                                <number>6</number>
+                              </property>
+                            </layout>
+                          </widget>
+                        </item>
+                      </layout>
+                      <property name="title">
+                        <string>Shared calibration inputs</string>
+                      </property>
+                    </widget>
+                  </item>
+                  <item>
+                    <widget class="QGroupBox" name="profileHost">
+                      <property name="title">
+                        <string>Active calibration bundle</string>
+                      </property>
+                      <layout class="QGridLayout" name="profileGrid">
+                        <property name="leftMargin">
+                          <number>6</number>
+                        </property>
+                        <property name="topMargin">
+                          <number>6</number>
+                        </property>
+                        <property name="rightMargin">
+                          <number>6</number>
+                        </property>
+                        <property name="bottomMargin">
+                          <number>6</number>
+                        </property>
+                        <property name="spacing">
+                          <number>6</number>
+                        </property>
+                        <item row="0" column="0">
+                          <widget class="QWidget" name="profile_state" />
+                        </item>
+                        <item row="0" column="1">
+                          <widget class="QWidget" name="profile_profile_path" />
+                        </item>
+                        <item row="1" column="0">
+                          <widget class="QWidget" name="profile_zoom" />
+                        </item>
+                        <item row="1" column="1">
+                          <widget class="QWidget" name="profile_extrinsics_profile_path" />
+                        </item>
+                        <item row="2" column="0">
+                          <widget class="QWidget" name="profile_extrinsics_source_zoom" />
+                        </item>
+                        <item row="2" column="1">
+                          <widget class="QWidget" name="profile_combination" />
+                        </item>
+                        <item row="3" column="0">
+                          <widget class="QWidget" name="profile_zoom_readback" />
+                        </item>
+                        <item row="3" column="1">
+                          <widget class="QWidget" name="profile_validation_mode" />
+                        </item>
+                        <item row="4" column="0">
+                          <widget class="QWidget" name="profile_status_label" />
+                        </item>
+                        <item row="4" column="1">
+                          <widget class="QWidget" name="profile_valid_pair_count" />
+                        </item>
+                        <item row="5" column="0">
+                          <widget class="QWidget" name="profile_progress" />
+                        </item>
+                      </layout>
+                    </widget>
+                  </item>
+                  <item>
+                    <widget class="QGroupBox" name="setupGroup">
+                      <property name="title">
+                        <string>Shared checkerboard setup</string>
+                      </property>
+                      <layout class="QGridLayout" name="setupGroupLayout">
+                        <property name="leftMargin">
+                          <number>6</number>
+                        </property>
+                        <property name="topMargin">
+                          <number>6</number>
+                        </property>
+                        <property name="rightMargin">
+                          <number>6</number>
+                        </property>
+                        <property name="bottomMargin">
+                          <number>6</number>
+                        </property>
+                        <property name="spacing">
+                          <number>6</number>
+                        </property>
+                        <item row="0" column="0">
+                          <widget class="QLabel" name="inner_colsLabel">
+                            <property name="text">
+                              <string>Inner columns</string>
+                            </property>
+                          </widget>
+                        </item>
+                        <item row="0" column="1">
+                          <widget class="QSpinBox" name="setup_inner_cols">
+                            <property name="minimum">
+                              <number>2</number>
+                            </property>
+                            <property name="maximum">
+                              <number>30</number>
+                            </property>
+                            <property name="suffix">
+                              <string />
+                            </property>
+                          </widget>
+                        </item>
+                        <item row="0" column="2">
+                          <widget class="QLabel" name="inner_rowsLabel">
+                            <property name="text">
+                              <string>Inner rows</string>
+                            </property>
+                          </widget>
+                        </item>
+                        <item row="0" column="3">
+                          <widget class="QSpinBox" name="setup_inner_rows">
+                            <property name="minimum">
+                              <number>2</number>
+                            </property>
+                            <property name="maximum">
+                              <number>30</number>
+                            </property>
+                            <property name="suffix">
+                              <string />
+                            </property>
+                          </widget>
+                        </item>
+                        <item row="1" column="0">
+                          <widget class="QLabel" name="square_size_mmLabel">
+                            <property name="text">
+                              <string>Square size</string>
+                            </property>
+                          </widget>
+                        </item>
+                        <item row="1" column="1">
+                          <widget class="QDoubleSpinBox" name="setup_square_size_mm">
+                            <property name="minimum">
+                              <double>1</double>
+                            </property>
+                            <property name="maximum">
+                              <double>500</double>
+                            </property>
+                            <property name="suffix">
+                              <string> mm</string>
+                            </property>
+                            <property name="decimals">
+                              <number>3</number>
+                            </property>
+                          </widget>
+                        </item>
+                        <item row="1" column="2">
+                          <widget class="QLabel" name="min_imagesLabel">
+                            <property name="text">
+                              <string>Minimum images</string>
+                            </property>
+                          </widget>
+                        </item>
+                        <item row="1" column="3">
+                          <widget class="QSpinBox" name="setup_min_images">
+                            <property name="minimum">
+                              <number>3</number>
+                            </property>
+                            <property name="maximum">
+                              <number>100</number>
+                            </property>
+                            <property name="suffix">
+                              <string />
+                            </property>
+                          </widget>
+                        </item>
+                        <item row="2" column="0">
+                          <widget class="QLabel" name="calculation_pair_countLabel">
+                            <property name="text">
+                              <string>Calculation pairs</string>
+                            </property>
+                          </widget>
+                        </item>
+                        <item row="2" column="1">
+                          <widget class="QSpinBox" name="setup_calculation_pair_count">
+                            <property name="minimum">
+                              <number>0</number>
+                            </property>
+                            <property name="maximum">
+                              <number>10000</number>
+                            </property>
+                            <property name="suffix">
+                              <string> pair</string>
+                            </property>
+                            <property name="specialValueText">
+                              <string>all pairs</string>
+                            </property>
+                            <property name="value">
+                              <number>20</number>
+                            </property>
+                          </widget>
+                        </item>
+                        <item row="3" column="0">
+                          <widget class="QLabel" name="rootLabel">
+                            <property name="text">
+                              <string>Calibration root</string>
+                            </property>
+                          </widget>
+                        </item>
+                        <item row="3" column="1" rowspan="1" colspan="3">
+                          <widget class="QLineEdit" name="setup_calibration_root" />
+                        </item>
+                        <item row="4" column="0">
+                          <widget class="QLabel" name="modeLabel">
+                            <property name="text">
+                              <string>Calculation mode</string>
+                            </property>
+                          </widget>
+                        </item>
+                        <item row="4" column="1">
+                          <widget class="QComboBox" name="setup_validation_mode">
+                            <item>
+                              <property name="text">
+                                <string>Pixhawk attitude + GPS/RTK baseline</string>
+                              </property>
+                            </item>
+                            <item>
+                              <property name="text">
+                                <string>Checkerboard stereo R/T</string>
+                              </property>
+                            </item>
+                          </widget>
+                        </item>
+                        <item row="5" column="0" rowspan="1" colspan="4">
+                          <widget class="QLabel" name="setupContract">
+                            <property name="text">
+                              <string>Square: mm · pixels/intrinsics: OpenCV optical RDF · X_right = R_left_to_right X_left + T_left_to_right_m · save zoom comes from the captured camera readback</string>
+                            </property>
+                            <property name="wordWrap">
+                              <bool>true</bool>
+                            </property>
+                          </widget>
+                        </item>
+                        <item row="6" column="0">
+                          <widget class="QPushButton" name="applySetupButton">
+                            <property name="text">
+                              <string>Apply setup</string>
+                            </property>
+                            <property name="commandId" stdset="0">
+                              <string>calibration.apply_setup</string>
+                            </property>
+                          </widget>
+                        </item>
+                        <item row="6" column="1">
+                          <widget class="QPushButton" name="saveSetupButton">
+                            <property name="text">
+                              <string>Save setup</string>
+                            </property>
+                            <property name="commandId" stdset="0">
+                              <string>calibration.save_setup</string>
+                            </property>
+                          </widget>
+                        </item>
+                      </layout>
+                    </widget>
+                  </item>
+                  <item>
+                    <widget class="QPushButton" name="handoffButton">
+                      <property name="text">
+                        <string>Advanced Zoom</string>
+                      </property>
+                      <property name="toolTip">
+                        <string>Open Advanced camera controls for physical zoom commands.</string>
+                      </property>
+                    </widget>
+                  </item>
+                </layout>
+              </widget>
+            </item>
+          </layout>
+        </widget>
+      </item>
+    </layout>
+  </widget>
+  <resources />
+  <connections />
+</ui>

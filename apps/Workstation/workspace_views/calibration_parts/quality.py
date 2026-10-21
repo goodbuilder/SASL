@@ -10,6 +10,7 @@ import json
 from collections.abc import Mapping
 from pathlib import Path
 from PyQt5 import QtCore, QtGui, QtWidgets
+from Workstation.ui.designer import load_form
 from Workstation.workstation_core.theme import ERROR_TEXT, SUCCESS_TEXT
 from Workstation.workstation_core.settings import DEFAULT_CALIBRATION_ROOT
 from Workstation.workstation_core.calibration_selection import resolve_calibration_selection_paths
@@ -82,34 +83,18 @@ class CalibrationQualityPanel(QtCore.QObject):
         self._sync_calibration_outlier_view()
 
     def _build_calibration_outlier_group(self) -> QtWidgets.QGroupBox:
-        group = QtWidgets.QGroupBox("Outlier analysis")
-        layout = QtWidgets.QVBoxLayout(group)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(5)
-        self.calibration_outlier_summary = QtWidgets.QLabel(
-            "Run calibration (K,D) 후 사진별 reprojection error가 표시됩니다."
-        )
-        self.calibration_outlier_summary.setObjectName("statusStrip")
-        self.calibration_outlier_summary.setWordWrap(True)
-        layout.addWidget(self.calibration_outlier_summary)
+        group = load_form('calibration_outlier.ui', QtWidgets.QGroupBox())
+        self.calibration_outlier_summary = group.calibration_outlier_summary
+        self.calibration_outlier_summary.setObjectName('statusStrip')
         self.calibration_outlier_plot = CalibrationErrorPlot()
-        self.calibration_outlier_plot.exclude_requested.connect(
-            lambda payload: self._handle_calibration_outlier_action(payload, restore=False)
-        )
-        self.calibration_outlier_plot.restore_requested.connect(
-            lambda payload: self._handle_calibration_outlier_action(payload, restore=True)
-        )
-        layout.addWidget(self.calibration_outlier_plot)
-        self.calibration_outlier_table = QtWidgets.QTableWidget(0, 6)
-        self.calibration_outlier_table.setObjectName("calibrationOutlierTable")
-        self.calibration_outlier_table.setHorizontalHeaderLabels(
-            ("Side", "File", "Error px", "Coverage", "Board", "State")
-        )
-        self.calibration_outlier_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.calibration_outlier_table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        placeholder = group.calibration_outlier_plot
+        group.formLayout.replaceWidget(placeholder, self.calibration_outlier_plot)
+        placeholder.deleteLater()
+        self.calibration_outlier_plot.exclude_requested.connect(lambda payload: self._handle_calibration_outlier_action(payload, restore=False))
+        self.calibration_outlier_plot.restore_requested.connect(lambda payload: self._handle_calibration_outlier_action(payload, restore=True))
+        self.calibration_outlier_table = group.calibration_outlier_table
+        self.calibration_outlier_table.setObjectName('calibrationOutlierTable')
         self.calibration_outlier_table.verticalHeader().setVisible(False)
-        self.calibration_outlier_table.setMinimumHeight(72)
-        self.calibration_outlier_table.setMaximumHeight(190)
         header = self.calibration_outlier_table.horizontalHeader()
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
@@ -117,98 +102,39 @@ class CalibrationQualityPanel(QtCore.QObject):
         header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
         header.setStretchLastSection(True)
-        layout.addWidget(self.calibration_outlier_table)
         return group
 
 
     def _build_calibration_quality_group(self) -> QtWidgets.QGroupBox:
         """Build a presentation-only view of the owner's quality snapshot."""
-
-        group = QtWidgets.QGroupBox("Calibration quality gate")
-        group.setObjectName("calibrationQualityGroup")
+        group = load_form('calibration_quality.ui', QtWidgets.QGroupBox())
+        group.setObjectName('calibrationQualityGroup')
         self.calibration_quality_group = group
-        layout = QtWidgets.QVBoxLayout(group)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(5)
-
-        values_layout = QtWidgets.QGridLayout()
-        values_layout.setHorizontalSpacing(8)
-        values_layout.setVerticalSpacing(4)
         self.calibration_quality_values: dict[str, EngineeringValue] = {}
-        for index, (key, label) in enumerate(
-            (
-                ("state", "Quality state"),
-                ("effective_pose_count", "Effective poses"),
-                ("coverage", "Center coverage"),
-                ("principal_offsets", "Principal offsets"),
-                ("subset_stability", "Subset cx/cy/focal stability"),
-                ("uncertainty", "Solver uncertainty / max view error"),
-                ("reasons", "Reasons"),
-                ("source", "Source"),
-            )
-        ):
+        for (index, (key, label)) in enumerate((('state', 'Quality state'), ('effective_pose_count', 'Effective poses'), ('coverage', 'Center coverage'), ('principal_offsets', 'Principal offsets'), ('subset_stability', 'Subset cx/cy/focal stability'), ('uncertainty', 'Solver uncertainty / max view error'), ('reasons', 'Reasons'), ('source', 'Source'))):
             value = EngineeringValue(label)
-            value.setObjectName(f"calibrationQuality_{key}")
+            value.setObjectName(f'calibrationQuality_{key}')
             self.calibration_quality_values[key] = value
-            values_layout.addWidget(value, index // 2, index % 2)
-        self.calibration_quality_state_label = self.calibration_quality_values["state"].value
-        self.calibration_quality_reasons_label = self.calibration_quality_values["reasons"].value
-        layout.addLayout(values_layout)
-
-        coverage_label = QtWidgets.QLabel(
-            "Board-center occupancy (source-provided 3×3 grid; no UI geometry recomputation)"
-        )
-        coverage_label.setObjectName("compactContract")
-        coverage_label.setWordWrap(True)
-        layout.addWidget(coverage_label)
-        self.calibration_center_coverage_table = QtWidgets.QTableWidget(3, 3)
-        self.calibration_center_coverage_table.setObjectName("calibrationCenterCoverage3x3")
-        self.calibration_center_coverage_table.setHorizontalHeaderLabels(
-            ("Left", "Center", "Right")
-        )
-        self.calibration_center_coverage_table.setVerticalHeaderLabels(
-            ("Top", "Middle", "Bottom")
-        )
-        self.calibration_center_coverage_table.setEditTriggers(
-            QtWidgets.QAbstractItemView.NoEditTriggers
-        )
-        self.calibration_center_coverage_table.setSelectionMode(
-            QtWidgets.QAbstractItemView.NoSelection
-        )
-        self.calibration_center_coverage_table.setMaximumHeight(126)
-        self.calibration_center_coverage_table.horizontalHeader().setSectionResizeMode(
-            QtWidgets.QHeaderView.Stretch
-        )
-        self.calibration_center_coverage_table.verticalHeader().setSectionResizeMode(
-            QtWidgets.QHeaderView.Stretch
-        )
-        layout.addWidget(self.calibration_center_coverage_table)
-
-        self.calibration_quality_warning_checkbox = QtWidgets.QCheckBox(
-            "I reviewed this WARNING and explicitly allow Save / Apply for this result"
-        )
-        self.calibration_quality_warning_checkbox.setObjectName(
-            "calibrationQualityWarningConfirmation"
-        )
-        self.calibration_quality_warning_checkbox.setToolTip(
-            "Confirmation applies only to the currently displayed source-backed quality snapshot."
-        )
-        self.calibration_quality_warning_checkbox.toggled.connect(
-            self.confirm_calibration_quality_warning
-        )
+            placeholder = getattr(group, f"calibration_quality_values_{key}")
+            group.values_layout.replaceWidget(placeholder, value)
+            placeholder.deleteLater()
+        self.calibration_quality_state_label = self.calibration_quality_values['state'].value
+        self.calibration_quality_reasons_label = self.calibration_quality_values['reasons'].value
+        coverage_label = group.coverage_label
+        coverage_label.setObjectName('compactContract')
+        self.calibration_center_coverage_table = group.calibration_center_coverage_table
+        self.calibration_center_coverage_table.setObjectName('calibrationCenterCoverage3x3')
+        self.calibration_center_coverage_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.calibration_center_coverage_table.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.calibration_quality_warning_checkbox = group.calibration_quality_warning_checkbox
+        self.calibration_quality_warning_checkbox.setObjectName('calibrationQualityWarningConfirmation')
+        self.calibration_quality_warning_checkbox.toggled.connect(self.confirm_calibration_quality_warning)
         self.calibration_quality_warning_checkbox.setVisible(False)
-        layout.addWidget(self.calibration_quality_warning_checkbox)
-
-        self.calibration_quality_gate_label = QtWidgets.QLabel(
-            "UNVERIFIED · legacy result has no quality snapshot; existing Save / Apply behavior is preserved."
-        )
-        self.calibration_quality_gate_label.setObjectName("statusStrip")
-        self.calibration_quality_gate_label.setWordWrap(True)
-        layout.addWidget(self.calibration_quality_gate_label)
-
+        self.calibration_quality_gate_label = group.calibration_quality_gate_label
+        self.calibration_quality_gate_label.setObjectName('statusStrip')
         for row in range(3):
             for column in range(3):
-                item = QtWidgets.QTableWidgetItem("--")
+                item = QtWidgets.QTableWidgetItem('--')
                 item.setTextAlignment(QtCore.Qt.AlignCenter)
                 self.calibration_center_coverage_table.setItem(row, column, item)
         return group

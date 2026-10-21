@@ -443,7 +443,22 @@ def collect(output_root: Path, action: str = "preflight",
             if workbook_plan is None:
                 pixel_rate_multiplier = 1.0
             bytes_per_second = measured_bytes_per_second * pixel_rate_multiplier
-            overhead_seconds = 60.0 * len(pending_runs)
+            if workbook_plan is not None and any(
+                row.get("protocol_version") == "1.2" for row in pending_runs
+            ):
+                # Include the declared entry/readiness/landing limits, rather
+                # than assuming a 600 m approach and landing fit in 60 s.
+                overhead_seconds = sum(
+                    float(row["parameters"]["Entry"]["entry_timeout_s"])
+                    + float(row["parameters"]["Entry"]["science_start_readiness_timeout_s"])
+                    + float(row["parameters"]["Entry"]["landing_timeout_s"])
+                    + float(row["parameters"]["Entry"]["postscience_hold_s"])
+                    + float(row["parameters"]["FrameGate"]["origin_timeout_s"])
+                    + 30.0  # recorder/controller preparation and flush reserve
+                    for row in pending_runs
+                )
+            else:
+                overhead_seconds = 60.0 * len(pending_runs)
             projected_bytes = int(math.ceil(bytes_per_second * (science_seconds + overhead_seconds) * 1.25))
             free_after_probe = shutil.disk_usage(output_root).free
             required_for_campaign = projected_bytes + MINIMUM_NEXT_RUN_BYTES
@@ -513,7 +528,8 @@ def collect(output_root: Path, action: str = "preflight",
             for name in ("campaign_run.py", "trajectory_contract.py", "campaign_setpoints.py",
                          "capture_streams.py", "state_recorder.py", "qc_attempt.py",
                          "preflight_capture.py", "calibration_solver.py", "analyze_campaign.py",
-                         "workbook_campaign.py")
+                         "workbook_campaign.py", "setpoint_cadence.py", "science_dispatch.py",
+                         "capture_readiness.py", "simulation_stepper.py", "verify_simulation_steps.py", "offboard_arming.py")
         },
         "software": {
             "python": sys.version.split()[0], "python_executable_role": "preflight process",

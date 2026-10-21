@@ -26,6 +26,8 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-root", type=Path,
                         help="Optional preserved checkout for before/after characterization")
+    parser.add_argument("--designer-coverage", action="store_true",
+                        help="Capture every workspace at three sizes and editable tab pages")
     args = parser.parse_args()
     links = json.loads(subprocess.check_output(["ip", "-j", "link", "show"], text=True))
     if [link["ifname"] for link in links] != ["lo"]:
@@ -80,15 +82,46 @@ def main() -> None:
             ("tasks.calibration", "calibration"),
             ("tasks.advanced", "advanced"),
         )
+        if args.designer_coverage:
+            views += (
+                ("processing.experiment", "protocol"),
+                ("devices.time", "time"),
+                ("devices.telemetry", "telemetry"),
+                ("devices.gnss", "base_gnss"),
+                ("devices.pixhawk", "pixhawk"),
+                ("processing.alignment", "alignment"),
+                ("tasks.settings", "settings"),
+            )
         observed = []
-        for context, name in views:
+
+        def capture(context, name):
             window.navigation.select_context(context)
             app.processEvents()
             QtTest.QTest.qWait(40)
             path = output / f"{name}.png"
             assert window.grab().save(str(path))
+            current = window.workspace_host.currentWidget()
+            viewport = current.viewport() if isinstance(current, QtWidgets.QScrollArea) else current
+            assert viewport.width() > 100 and viewport.height() > 100, viewport.size()
             observed.append({"context": context, "image": path.name,
-                             "width": window.width(), "height": window.height()})
+                             "width": window.width(), "height": window.height(),
+                             "viewport_width": viewport.width(), "viewport_height": viewport.height()})
+
+        sizes = ((1366, 900), (1366, 768), (1920, 1080)) if args.designer_coverage else ((1366, 900),)
+        for width, height in sizes:
+            window.resize(width, height)
+            for context, name in views:
+                suffix = f"-{width}x{height}" if args.designer_coverage else ""
+                capture(context, name + suffix)
+        if args.designer_coverage:
+            for context, name, tabs in (
+                ("tasks.settings", "settings-tab", window.settings_workspace.tabs),
+                ("tasks.advanced", "advanced-tab", window.advanced.tabs),
+                ("processing.alignment", "alignment-tab", window.alignment.operation_tabs),
+            ):
+                for index in range(tabs.count()):
+                    tabs.setCurrentIndex(index)
+                    capture(context, f"{name}-{index}")
         for _ in range(200):
             window.close()
             app.processEvents()

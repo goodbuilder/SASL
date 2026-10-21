@@ -10,8 +10,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
+import sys
 from collections import defaultdict
 from pathlib import Path
+
+SIM_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(SIM_ROOT))
+from campaigns.stereo_v1_1.gt_alignment import GroundTruthSeries
 
 
 def _read(path: Path) -> dict:
@@ -57,6 +63,64 @@ def _analysis_handoff(root: Path) -> dict:
     }
 
 
+def _lateral_cost(positions):
+    """World ENU [east,north,up] metres: lateral means signed east axis."""
+    points = [tuple(float(value) for value in position) for position in positions]
+    if len(points) < 2 or any(len(p) != 3 or not all(math.isfinite(v) for v in p) for p in points):
+        raise ValueError("flight cost requires at least two finite world ENU positions")
+    east = [p[0] for p in points]
+    return {"lateral_total_travel_m": sum(abs(b-a) for a,b in zip(east,east[1:])),
+            "lateral_span_m": max(east)-min(east),
+            "lateral_net_displacement_m": east[-1]-east[0]}
+
+
+def reference_flight_cost(reference):
+    # Samples are mandatory: a configured excursion is not total lateral travel.
+    if not reference.get("samples"):
+        raise ValueError("reference samples are required for flight cost")
+    return {"science_reference_"+name:value for name,value in
+            _lateral_cost(row["position_world_enu_m"] for row in reference["samples"]).items()}
+
+
+def actual_science_flight_cost(gt_rows, start, end):
+    """Observed science duration and sampled GT polyline cost, never accuracy.
+
+    Boundary positions use the shared GT alignment owner with same-epoch,
+    no-extrapolation interpolation. Its threshold is exclusive, so 40 ms + 1 ns
+    implements an inclusive <=40 ms bound for integer nanosecond timestamps.
+    """
+    epoch = int(start["simulation_epoch"])
+    start_ns, end_ns = int(start["simulation_timestamp_ns"]), int(end["simulation_timestamp_ns"])
+    if int(end["simulation_epoch"]) != epoch or end_ns <= start_ns:
+        raise ValueError("flight cost science boundaries cross epoch or do not increase")
+    series = GroundTruthSeries(gt_rows, max_bracketing_gap_ns=40_000_001)
+    points = []
+    for stamp in (start_ns,end_ns):
+        aligned = series.align(epoch,stamp)
+        if aligned.status not in ("EXACT","INTERPOLATED"):
+            raise ValueError(f"flight cost boundary alignment failed: {aligned.status}")
+        points.append((stamp,aligned.position_world_enu_m))
+    for row in gt_rows:
+        stamp = int(row["source_timestamp_ns"])
+        if int(row["simulation_epoch"]) == epoch and start_ns < stamp < end_ns:
+            points.append((stamp,series.align(epoch,stamp).position_world_enu_m))
+    points.sort(key=lambda item:item[0])
+    if any(b[0]-a[0] > 40_000_000 for a,b in zip(points,points[1:])):
+        raise ValueError("flight cost sampled GT gap exceeds 40 ms")
+    positions = [position for _,position in points]
+    return {"science_actual_duration_s": (end_ns-start_ns)/1e9,
+            "science_actual_sampled_length_3d_m": sum(math.dist(a,b) for a,b in zip(positions,positions[1:])),
+            "science_actual_sampled_point_count": len(points),
+            **{"science_actual_sampled_"+name:value for name,value in _lateral_cost(positions).items()}}
+
+
+REFERENCE_LATERAL_FIELDS = tuple("science_reference_"+name for name in
+    ("lateral_total_travel_m","lateral_span_m","lateral_net_displacement_m"))
+ACTUAL_COST_FIELDS = ("science_actual_duration_s","science_actual_sampled_length_3d_m",
+    "science_actual_sampled_lateral_total_travel_m","science_actual_sampled_lateral_span_m",
+    "science_actual_sampled_lateral_net_displacement_m")
+
+
 def summarize(root: Path, *, allow_partial: bool = False) -> dict:
     root = root.resolve()
     status = _read(root / "run_status.json")
@@ -91,14 +155,18 @@ def summarize(root: Path, *, allow_partial: bool = False) -> dict:
             "tracking_3d_rmse_m_calibration_only": None,
             "tracking_3d_p95_m_calibration_only": None,
             "qc_warnings": None,
+            **{name:None for name in (*REFERENCE_LATERAL_FIELDS,*ACTUAL_COST_FIELDS)},
+            "science_actual_sampled_point_count": None,
         }
         if slot["status"] in ("VALID", "VALID_WITH_WARNINGS"):
             attempt = slot["attempts"][-1]
             directory = root / attempt["recording_path"]
             qc = _read(directory / "qc_report.json")
-            if qc["status"] != slot["status"] or not qc["counted_in_39"]:
+            counted = qc.get("counted_in_campaign", qc.get("counted_in_39", False))
+            if qc["status"] != slot["status"] or not counted:
                 raise ValueError(f"status/QC disagreement: {slot['run_id']}")
             reference = _read(directory / "flight_reference.json")
+            row.update(reference_flight_cost(reference))
             controller = _read(directory / "controller_result.json")
             observations = _read(directory / "observation_summary.json")
             image_index = _read(directory / "image_index_summary.json")
@@ -121,6 +189,8 @@ def summarize(root: Path, *, allow_partial: bool = False) -> dict:
                 raise ValueError(f"partial science boundary requires manual review: {slot['run_id']}")
             science_pairs = science_both = 0
             if science_completed:
+                gt_rows = [json.loads(line) for line in (directory / "ground_truth.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+                row.update(actual_science_flight_cost(gt_rows,starts[0],ends[0]))
                 with (directory / "paired_observations.jsonl").open(encoding="utf-8") as handle:
                     for line in handle:
                         pair = json.loads(line)
@@ -182,6 +252,7 @@ def summarize(root: Path, *, allow_partial: bool = False) -> dict:
             "science_both_detected_pair_count_total": sum(item["both_detected_pairs_science"] or 0 for item in rows),
             "science_reference_duration_s": mean("science_reference_duration_s"),
             "science_reference_length_3d_m": mean("science_reference_length_3d_m"),
+            **{name+"_mean":mean(name) for name in (*REFERENCE_LATERAL_FIELDS,*ACTUAL_COST_FIELDS)},
             "both_detected_pair_rate_full_capture_mean": mean("both_detected_pair_rate_full_capture"),
             "both_detected_pair_rate_science_mean": mean("both_detected_pair_rate_science"),
             "both_detected_pairs_science_mean": mean("both_detected_pairs_science"),
@@ -193,7 +264,17 @@ def summarize(root: Path, *, allow_partial: bool = False) -> dict:
         "planned_run_count": 39, "valid_run_count": status["valid_run_count"],
         "run_scope": "separate SITL attempts; source capture plus offline YOLO observations",
         "measurement_estimator_status": "implemented_offline_A_B_C_RPY_IMU_YAW_ONLY",
-        "v0_positioning_metrics_revealed": analysis_handoff["v0_position_metrics_available_after_freeze"],
+        "v0_positioning_metrics_revealed": False,
+        "flight_cost_contract": {
+            "position_frame": "world_enu:east,north,up_m",
+            "lateral_axis": "east; net displacement is signed final minus initial",
+            "total_lateral_travel": "sum absolute successive east increments",
+            "span": "maximum east minus minimum east",
+            "actual_scope": "observed science_start through science_end in one simulation epoch",
+            "actual_distance_method": "GT-sampled polyline approximation; not continuous path truth",
+            "boundary_alignment": "GroundTruthSeries; no extrapolation; brackets and internal gaps <=40ms",
+            "accuracy_comparison": "none; no estimated-position versus GT error computed",
+        },
         "offline_analysis": analysis_handoff,
         "raw_storage_contract": "one immutable run/attempt directory; separate left/right bag and state JSONL streams",
         "runs": runs, "by_path": paths,

@@ -111,6 +111,52 @@ def _huber_weights(standardized: np.ndarray) -> np.ndarray:
                     HUBER_F_SCALE / np.maximum(absolute, 1e-12))
 
 
+def _image_huber_prior_quadratic_loss(image_rows: int):
+    """SciPy rho(z): Huber for leading image rows, quadratic for sensor rows.
+
+    SciPy supplies z=(whitened_residual/f_scale)**2 and scales the cost back.
+    rho(z)=z therefore retains the Gaussian r.T inv(Sigma) r sensor penalty.
+    The common one-half least-squares convention applies to every block.
+    """
+    def loss(z):
+        rho = np.vstack((z.copy(), np.ones_like(z), np.zeros_like(z)))
+        indices = np.flatnonzero(z[:image_rows] > 1.0)
+        root = np.sqrt(z[indices])
+        rho[0, indices] = 2.0 * root - 1.0
+        rho[1, indices] = 1.0 / root
+        rho[2, indices] = -0.5 / root ** 3
+        return rho
+    return loss
+
+
+def _gaussian_rtk_normal_terms(whitener, delta):
+    """Quadratic ENU-metre RTK factor; whitened residual is dimensionless."""
+    whitened = np.einsum("nij,nj->ni", whitener, delta)
+    return (np.einsum("nki,nkj->nij", whitener, whitener),
+            np.einsum("nki,nk->ni", whitener, whitened))
+
+
+def _prior_observability(jacobian, prior_rows: int, parameter_scope: str):
+    """Local loss-weighted attitude Jacobian diagnostics at the fitted pose.
+
+    B/C points have been profiled out; this is not full latent-state rank.
+    Removing prior rows assesses local data information, not a refit.
+    YAW_ONLY still conditions on its fixed measured IMU roll/pitch angles.
+    """
+    def describe(matrix):
+        rank, condition = _rank_condition(matrix)
+        return {"rank": rank, "condition_number": _json_number(condition),
+                "rank_deficient": rank < matrix.shape[1],
+                "singular_values_per_rad": np.linalg.svd(matrix, compute_uv=False).tolist(),
+                "residual_rows": int(matrix.shape[0]), "parameter_count": int(matrix.shape[1])}
+    return {"parameter_scope": parameter_scope,
+            "jacobian_units": "dimensionless whitened residual per radian",
+            "linearization": "same fitted pose; loss-weighted Jacobian; no refit",
+            "imu_prior_rows": prior_rows,
+            "data_only": describe(jacobian[:-prior_rows] if prior_rows else jacobian),
+            "imu_included": describe(jacobian)}
+
+
 def _camera_inputs(sensor_observations: dict, trial_config: dict,
                    variant: str) -> dict[str, dict[str, np.ndarray | float]]:
     if set(sensor_observations.get("cameras", {})) != set(CAMERA_ORDER):
@@ -295,10 +341,9 @@ def _fit_latent_points(left_uv, right_uv, cameras, rotations, intrinsics,
         if np.any(uncertain_rtk):
             delta = points[uncertain_rtk] - rtk_positions[uncertain_rtk]
             whitener = rtk_whitener[uncertain_rtk]
-            whitened = np.einsum("nij,nj->ni", whitener, delta)
-            weights = _huber_weights(whitened)
-            hessian[uncertain_rtk] += np.einsum("nki,nk,nkj->nij", whitener, weights, whitener)
-            gradient[uncertain_rtk] += np.einsum("nki,nk,nk->ni", whitener, weights, whitened)
+            rtk_hessian, rtk_gradient = _gaussian_rtk_normal_terms(whitener, delta)
+            hessian[uncertain_rtk] += rtk_hessian
+            gradient[uncertain_rtk] += rtk_gradient
         damping = np.maximum(1e-10, np.trace(hessian, axis1=1, axis2=2) * 1e-12)
         damped = hessian + identity * damping[:, None, None]
         try:
@@ -398,6 +443,46 @@ def _full_covariance(parameter_covariance: np.ndarray, variant: str) -> list[lis
     return full
 
 
+def _attitude_correlation(covariance, *, rank_deficient: bool) -> dict:
+    """Dimensionless correlation of the reported local attitude covariance.
+
+    Fixed axes are None, not independent unit-variance observations. A deficient
+    Jacobian's pseudoinverse is not a covariance on its unobservable directions;
+    suppress correlations in that case rather than implying identified angles.
+    """
+    order = [f"{side}_{axis}" for side in CAMERA_ORDER for axis in ("phi", "theta", "psi")]
+    if len(covariance) != 6 or any(len(row) != 6 for row in covariance):
+        raise ValueError("attitude covariance must use the six-axis declared order")
+    matrix = [[None] * 6 for _ in range(6)]
+    invalid = [(i, j) for i in range(6) for j in range(6)
+               if covariance[i][j] is not None and not math.isfinite(covariance[i][j])]
+    undefined = [i for i in range(6) if covariance[i][i] is None
+                 or not math.isfinite(covariance[i][i]) or covariance[i][i] <= 0]
+    out_of_bounds = []
+    if not rank_deficient and not invalid:
+        for i in range(6):
+            for j in range(6):
+                if i in undefined or j in undefined or covariance[i][j] is None:
+                    continue
+                # Sequential division avoids overflow in variance products.
+                value = covariance[i][j] / math.sqrt(covariance[i][i]) / math.sqrt(covariance[j][j])
+                if not math.isfinite(value) or abs(value) > 1.0 + 1e-10:
+                    out_of_bounds.append([i, j])
+                    continue
+                matrix[i][j] = max(-1.0, min(1.0, value))
+    status = ("UNDEFINED_RANK_DEFICIENT" if rank_deficient else
+              "INVALID_NONFINITE_COVARIANCE" if invalid else
+              "INVALID_CORRELATION_BOUNDS" if out_of_bounds else
+              "PARTIALLY_DEFINED" if undefined else "DEFINED")
+    return {"matrix": matrix, "parameter_order": order, "units": "dimensionless",
+            "source_covariance_units": "rad^2", "status": status,
+            "rank_deficient": rank_deficient,
+            "undefined_variance_axes": [order[i] for i in undefined],
+            "nonfinite_covariance_indices": [list(pair) for pair in invalid],
+            "out_of_bounds_indices": out_of_bounds,
+            "interpretation": "local loss-weighted attitude covariance; fixed/zero-variance axes undefined; rank-deficient pseudoinverse correlations suppressed"}
+
+
 def solve_calibration(*, method: str, attitude_variant: str,
                       sensor_observations: dict, trial_config: dict,
                       image_pairs: list[dict], intrinsics: dict,
@@ -474,7 +559,9 @@ def solve_calibration(*, method: str, attitude_variant: str,
                                  left_uv if side == "left" else right_uv,
                                  intrinsics_tuple, pixel_sigma)
 
-            fit = least_squares(residual, camera_x0, loss="huber", f_scale=HUBER_F_SCALE,
+            fit = least_squares(residual, camera_x0,
+                                loss=_image_huber_prior_quadratic_loss(2 * len(selected_pairs)),
+                                f_scale=HUBER_F_SCALE,
                                 max_nfev=500, x_scale="jac")
             rank, condition = _rank_condition(fit.jac)
             local_covariance = _result_covariance(fit.jac)
@@ -487,6 +574,9 @@ def solve_calibration(*, method: str, attitude_variant: str,
                 estimated[side] = (float(cameras[side]["imu_mean"][0]),
                                    float(cameras[side]["imu_mean"][1]), float(fit.x[0]))
             fit_records.append({"success": bool(fit.success), "message": str(fit.message),
+                                "observability": _prior_observability(
+                                    fit.jac, 2 if attitude_variant == "RPY_IMU" else 0,
+                                    f"{side} camera attitude radians; fixed measured center"),
                                 "rank": rank, "parameter_count": len(fit.x),
                                 "condition_number": _json_number(condition), "cost": _json_number(fit.cost),
                                 "evaluations": int(fit.nfev)})
@@ -496,13 +586,18 @@ def solve_calibration(*, method: str, attitude_variant: str,
                                    left_uv, right_uv, intrinsics_tuple,
                                    pixel_sigma, rtk_positions, rtk_covariances)
 
-        fit = least_squares(residual, x0, loss="huber", f_scale=HUBER_F_SCALE,
+        fit = least_squares(residual, x0,
+                            loss=_image_huber_prior_quadratic_loss(4 * len(selected_pairs)),
+                            f_scale=HUBER_F_SCALE,
                             max_nfev=500, x_scale="jac")
         rank, condition = _rank_condition(fit.jac)
         parameter_covariance = _result_covariance(fit.jac)
         estimated = {side: _pose_from_parameters(fit.x, index, attitude_variant, cameras[side])
                      for index, side in enumerate(CAMERA_ORDER)}
         fit_records.append({"success": bool(fit.success), "message": str(fit.message),
+                            "observability": _prior_observability(
+                                fit.jac, 4 if attitude_variant == "RPY_IMU" else 0,
+                                "stereo camera attitude radians; latent ENU points profiled out; fixed measured centers"),
                             "rank": rank, "parameter_count": len(fit.x),
                             "condition_number": _json_number(condition), "cost": _json_number(fit.cost),
                             "evaluations": int(fit.nfev)})
@@ -547,6 +642,7 @@ def solve_calibration(*, method: str, attitude_variant: str,
             side: [float(value) for value in estimated[side]] for side in CAMERA_ORDER
         },
         "attitude_covariance_rad2": covariance,
+        "attitude_correlation": _attitude_correlation(covariance, rank_deficient=not ranks_ok),
         "covariance_estimated_parameter_order": (
             [f"{side}_{axis}" for side in CAMERA_ORDER for axis in ("phi", "theta", "psi")]
             if attitude_variant == "RPY_IMU" else ["left_psi", "right_psi"]
@@ -559,6 +655,9 @@ def solve_calibration(*, method: str, attitude_variant: str,
         "convergence_status": status,
         "optimizer_policy": {
             "loss": "Huber", "f_scale_standardized_residual": HUBER_F_SCALE,
+            "loss_scope": "image residuals only",
+            "imu_prior_loss": "quadratic whitened Gaussian; r.T inv(Sigma_IMU) r",
+            "drone_rtk_loss": "B: quadratic whitened Gaussian in both latent and outer objectives; A: propagated into image covariance; C: absent",
             "pixel_sigma_px": pixel_sigma,
             "yaw_prior_penalty": "none",
             "camera_translation_variables": 0,

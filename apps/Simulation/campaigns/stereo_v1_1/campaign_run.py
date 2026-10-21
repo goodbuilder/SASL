@@ -52,7 +52,9 @@ FROZEN_FILES = (
     "flight_controller.py", "trajectory_contract.py", "flight_gates.py",
     "campaign_setpoints.py", "runtime_observation.py", "ros_observation_bridge.py",
     "bag_index.py", "postprocess_detections.py", "gt_alignment.py", "align_gt.py",
-    "qc_attempt.py", "model_manifest.json", "workbook_campaign.py",
+    "qc_attempt.py", "model_manifest.json", "workbook_campaign.py", "setpoint_cadence.py",
+    "science_dispatch.py",
+    "capture_readiness.py", "timing_diagnostics.py", "entry_liftoff.py", "simulation_stepper.py", "verify_simulation_steps.py", "offboard_arming.py",
 )
 
 
@@ -129,6 +131,7 @@ def _effective_config(source: dict, attempt_id: str, reference_path: Path,
         return {
             "schema_version": "stereo_v1_1_workbook_effective_config_v1",
             "document_version": "workbook_v1_1",
+            "protocol_version": source.get("protocol_version", "1.1"),
             "sequence": source["sequence"],
             "run_id": source["run_id"],
             "attempt_id": attempt_id,
@@ -380,6 +383,7 @@ def _prepare_attempt(output_root: Path, source: dict, development: bool) -> tupl
             "path_shape": source["shape"],
             "workbook_sha256": source["workbook_sha256"],
             "workbook_schema_version": source.get("workbook_schema_version"),
+            "protocol_version": source.get("protocol_version", "1.1"),
             "workbook_parameters_file": "workbook_parameters.json",
             "workbook_parameter_sources_file": "workbook_parameter_sources.json",
             "seed_policy": source.get("seed_policy", "none"),
@@ -398,7 +402,7 @@ def _prepare_attempt(output_root: Path, source: dict, development: bool) -> tupl
 
 
 def _postprocess(output_root: Path, attempt_dir: Path, run_id: str,
-                 attempt_id: str, source: dict | str) -> None:
+                 attempt_id: str, source: dict | str, development: bool = False) -> None:
     workbook_source = isinstance(source, dict) and "parameters" in source
     parameters = source["parameters"] if workbook_source else None
     capture = parameters["Capture"] if parameters else {}
@@ -408,7 +412,8 @@ def _postprocess(output_root: Path, attempt_dir: Path, run_id: str,
                               "--run-id", run_id, "--attempt-id", attempt_id,
                               "--pair-tolerance-s", str(capture.get("pair_tolerance_s", 0.001))),
                  attempt_dir / "index_processing.log")
-    derived = output_root / "파생_재처리" / run_id / attempt_id
+    derived = (output_root / "개발시험" / "파생_재처리" / attempt_dir.name if development
+               else output_root / "파생_재처리" / run_id / attempt_id)
     derived.mkdir(parents=True, exist_ok=False)
     yolo = derived / "yolo-8.4.127"
     yolo_script = CAMPAIGN_ROOT / "postprocess_detections.py"
@@ -501,6 +506,8 @@ def _run_one(output_root: Path, source: dict, *, development: bool = False) -> d
         if workbook_source:
             env["PX4_GZ_WORLD"] = _workbook_environment_value(source, "world_name")
         _apply_requested_seed(env, source, workbook_source=workbook_source)
+        if workbook_source and source.get("protocol_version") == "1.2":
+            env["PX4_CONSOLE_LOG"] = str(attempt_dir / "px4_console")
         operator_command = [
             str(SIM_ROOT / "run_operator_view.sh"), "--headless", "--no-yolo",
             "--raw-view", "--skip-px4-build", "--px4-model-name", vehicle_model_id,
@@ -512,15 +519,32 @@ def _run_one(output_root: Path, source: dict, *, development: bool = False) -> d
 
         state_command = _ros_command(ROOT_PYTHON, CAMPAIGN_ROOT / "state_recorder.py",
                                      "--attempt-dir", str(attempt_dir))
-        state, handle = _spawn(state_command, attempt_dir / "state_recorder.log")
-        handles.append(handle)
-        _wait_token(state, attempt_dir / "state_recorder.log", "STATE_READY", 45)
+        v12_capture = workbook_source and source.get("protocol_version") == "1.2"
+        if not v12_capture:
+            state, handle = _spawn(state_command, attempt_dir / "state_recorder.log")
+            handles.append(handle)
+            _wait_token(state, attempt_dir / "state_recorder.log", "STATE_READY", 45)
 
         image_command = _ros_command(ROOT_PYTHON, CAMPAIGN_ROOT / "capture_streams.py",
                                      "--attempt-dir", str(attempt_dir), "--compression", "zstd")
+        if workbook_source and source.get("protocol_version") == "1.2":
+            image_command.extend(("--protocol-version", "1.2"))
         images, handle = _spawn(image_command, attempt_dir / "capture_runner.log")
         handles.append(handle)
         _wait_token(images, attempt_dir / "capture_runner.log", "CAPTURE_READY", 45)
+        if v12_capture:
+            # Bag subscriptions can impose startup load. Preserve their warmup
+            # frames, but start the state capture and mission only after the
+            # real GT publication stream has stabilized at the declared rate.
+            capture_settings = source["parameters"]["Capture"]
+            _run_checked(_ros_command(ROOT_PYTHON, CAMPAIGN_ROOT / "capture_readiness.py",
+                "--attempt-dir", str(attempt_dir),
+                "--min-gt-hz", str(capture_settings["min_gt_rate_hz"]),
+                "--max-gt-gap-s", str(capture_settings["max_gt_bracketing_gap_s"])),
+                attempt_dir / "capture_readiness.log", timeout_s=70)
+            state, handle = _spawn(state_command, attempt_dir / "state_recorder.log")
+            handles.append(handle)
+            _wait_token(state, attempt_dir / "state_recorder.log", "STATE_READY", 45)
 
         controller_command = _ros_command(ROOT_PYTHON, CAMPAIGN_ROOT / "flight_controller.py",
                                           "--run-id", run_id,
@@ -528,8 +552,31 @@ def _run_one(output_root: Path, source: dict, *, development: bool = False) -> d
                                           "--reference-json", str(attempt_dir / "flight_reference.json"),
                                           "--attempt-dir", str(attempt_dir))
         if workbook_source:
-            controller_command.extend(("--run-config-json", str(attempt_dir / "workbook_parameters.json")))
-        controller, handle = _spawn(controller_command, attempt_dir / "controller.log")
+            controller_command.extend(("--run-config-json", str(attempt_dir / "workbook_parameters.json"),
+                                       "--protocol-version", source.get("protocol_version", "1.1")))
+        if v12_capture:
+            controller_command.extend(("--world-name", _workbook_environment_value(source, "world_name")))
+        controller_env = os.environ.copy()
+        if v12_capture:
+            # Installed gz-msgs10 Python bindings predate the user protobuf C
+            # backend. Select its supported pure-Python parser for this isolated
+            # controller process only; no package/system setting is changed.
+            controller_env["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+        reviewed_retry = False
+        if not development:
+            current_status = json.loads((output_root / "run_status.json").read_text())
+            current_slot = next(row for row in current_status["run_slots"] if row["run_id"] == source["run_id"])
+            reviewed_retry = bool(current_slot["attempts"][-1].get("reviewed_retry_authorization"))
+        timing_diagnostics_enabled = development or reviewed_retry or v12_capture
+        if timing_diagnostics_enabled:
+            controller_command.append("--timing-diagnostics")
+        _write_new(attempt_dir / "controller_launch.json", {
+            "timing_diagnostics": timing_diagnostics_enabled,
+            "reviewed_retry": reviewed_retry,
+            "protobuf_backend": controller_env.get("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "default"),
+            "argv_historical_provenance": controller_command,
+        })
+        controller, handle = _spawn(controller_command, attempt_dir / "controller.log", env=controller_env)
         handles.append(handle)
         reference_duration = json.loads((attempt_dir / "flight_reference.json").read_text())["science_duration_s"]
         frame_gate = source["parameters"]["FrameGate"] if workbook_source else {}
@@ -573,7 +620,7 @@ def _run_one(output_root: Path, source: dict, *, development: bool = False) -> d
     if reason is None and image_code == 0 and state_code == 0:
         try:
             _postprocess(output_root, attempt_dir, run_id, attempt_id,
-                         source if workbook_source else source["path_id"])
+                         source if workbook_source else source["path_id"], development)
         except BaseException as exc:
             reason = f"{type(exc).__name__}: postprocessing: {exc}"
             print(f"{run_id}/{attempt_id}: {reason}", flush=True)
@@ -587,6 +634,10 @@ def _run_one(output_root: Path, source: dict, *, development: bool = False) -> d
         qc["counted_in_39"] = False
         qc["counted_in_campaign"] = False
         qc["infrastructure_errors"].append("runner_lifecycle_failure")
+    if development:
+        qc["development"] = True
+        qc["counted_in_campaign"] = False
+        qc["counted_in_39"] = False
     _write_new(attempt_dir / "qc_report.json", qc)
     _append_checksum(attempt_dir, attempt_dir / "qc_report.json")
     _write_new(attempt_dir / "runner_result.json", {
@@ -698,9 +749,13 @@ def main() -> int:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--run-id")
     parser.add_argument("--development", action="store_true")
+    parser.add_argument("--frozen-workbook", action="store_true",
+                        help="Use the existing frozen XLSX plan for one selected main or DEVELOPMENT run")
     args = parser.parse_args()
     if args.development and args.command != "run":
         parser.error("--development is only supported for one selected run")
+    if args.frozen_workbook and args.command != "run":
+        parser.error("--frozen-workbook requires one selected run")
     output_root = args.output_root.resolve()
     if not output_root.is_dir():
         parser.error("output root does not exist")
@@ -717,8 +772,16 @@ def main() -> int:
         if args.command == "run":
             if not args.run_id:
                 parser.error("run requires --run-id")
-            qc = _run_one(output_root, _source_manifest(args.run_id),
-                          development=args.development)
+            if args.frozen_workbook:
+                from campaigns.stereo_v1_1.workbook_campaign import _load_frozen_plan
+                plan = _load_frozen_plan(output_root)
+                matches = [row for row in plan["planned_runs"] if row["run_id"] == args.run_id]
+                if len(matches) != 1:
+                    parser.error("run-id not present exactly once in frozen workbook")
+                source = matches[0]
+            else:
+                source = _source_manifest(args.run_id)
+            qc = _run_one(output_root, source, development=args.development)
             if args.development:
                 unexpected_protocol = [item for item in qc["protocol_errors"]
                                        if item != "run_id_not_in_39_slot_manifest"]

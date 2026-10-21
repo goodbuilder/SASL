@@ -8,6 +8,7 @@ from __future__ import annotations
 import time
 from collections.abc import Mapping
 from PyQt5 import QtCore, QtWidgets
+from .layouts import load_component_form
 from Workstation.ui.components import EngineeringValue
 
 
@@ -71,105 +72,8 @@ class RtkObservations(QtCore.QObject):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        observations_group = QtWidgets.QGroupBox("Drone RTK Capture Observations")
-        self.observations_group = observations_group
-        observations_group.setObjectName("opticalPoseDroneRtkObservationsGroup")
-        observations_layout = QtWidgets.QVBoxLayout(observations_group)
-        observations_layout.setContentsMargins(6, 6, 6, 6)
-        observations_layout.setSpacing(5)
-
-        current_observation_header = QtWidgets.QLabel("Current Observation")
-        current_observation_header.setObjectName("compactContract")
-        observations_layout.addWidget(current_observation_header)
-        self.current_observation_summary_label = QtWidgets.QLabel("No observation yet")
-        self.current_observation_summary_label.setObjectName("statusStrip")
-        observations_layout.addWidget(self.current_observation_summary_label)
-        current_observation_grid = QtWidgets.QGridLayout()
-        current_observation_grid.setSpacing(5)
-        self.current_observation_values: dict[str, EngineeringValue] = {}
-        for index, (key, label) in enumerate(
-            (
-                ("drone_rtk", "Drone RTK"),
-                ("gnss_age", "GNSS age"),
-                ("sync", "Sync"),
-                ("target", "Target"),
-            )
-        ):
-            value = EngineeringValue(label)
-            value.set_value("--")
-            self.current_observation_values[key] = value
-            current_observation_grid.addWidget(value, index // 2, index % 2)
-        observations_layout.addLayout(current_observation_grid)
-
-        history_header = QtWidgets.QLabel("Observation History")
-        history_header.setObjectName("compactContract")
-        observations_layout.addWidget(history_header)
-        self.observation_history_table = QtWidgets.QTableWidget(0, len(self.DRONE_RTK_OBSERVATION_HEADERS))
-        self.observation_history_table.setObjectName("opticalPoseDroneRtkObservationTable")
-        self.observation_history_table.setHorizontalHeaderLabels(self.DRONE_RTK_OBSERVATION_HEADERS)
-        self.observation_history_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.observation_history_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.observation_history_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.observation_history_table.verticalHeader().setVisible(False)
-        self.observation_history_table.setMaximumHeight(140)
-        self.observation_history_table.horizontalHeader().setStretchLastSection(True)
+        load_component_form("optical_pose_observations.ui", self, "observations")
         self.observation_history_table.itemSelectionChanged.connect(self._refresh_drone_rtk_observation_detail)
-        observations_layout.addWidget(self.observation_history_table)
-
-        details_header = QtWidgets.QLabel("Selected Observation Details")
-        details_header.setObjectName("compactContract")
-        observations_layout.addWidget(details_header)
-        details_grid = QtWidgets.QGridLayout()
-        details_grid.setSpacing(5)
-        self.observation_detail_values: dict[str, EngineeringValue] = {}
-        for index, (key, label) in enumerate(
-            (
-                ("observation_id", "Observation ID"),
-                ("observation_state", "State"),
-                ("observation_burst_id", "Burst ID"),
-                ("drone_latitude", "Drone latitude"),
-                ("drone_longitude", "Drone longitude"),
-                ("drone_altitude", "Drone altitude"),
-                ("drone_ellipsoid_height", "Drone ellipsoid height"),
-                ("drone_fix", "Drone fix"),
-                ("drone_satellites", "Drone satellites"),
-                ("drone_eph_epv", "Drone eph / epv"),
-                ("drone_timestamp", "Drone GNSS timestamp"),
-                ("p1_latitude", "P1 latitude"),
-                ("p1_longitude", "P1 longitude"),
-                ("p1_altitude", "P1 altitude"),
-                ("p1_ellipsoid_height", "P1 ellipsoid height"),
-                ("p1_fix", "P1 fix"),
-                ("p1_satellites", "P1 satellites"),
-                ("p1_eph_epv", "P1 eph / epv"),
-                ("p1_timestamp", "P1 GNSS timestamp"),
-                ("p2_latitude", "P2 latitude"),
-                ("p2_longitude", "P2 longitude"),
-                ("p2_altitude", "P2 altitude"),
-                ("p2_ellipsoid_height", "P2 ellipsoid height"),
-                ("p2_fix", "P2 fix"),
-                ("p2_satellites", "P2 satellites"),
-                ("p2_eph_epv", "P2 eph / epv"),
-                ("p2_timestamp", "P2 GNSS timestamp"),
-                ("left_frame_id", "Left frame ID"),
-                ("left_frame_sha", "Left frame SHA prefix"),
-                ("left_frame_timestamp", "Left frame timestamp"),
-                ("left_frame_timestamp_reference", "Left timestamp reference"),
-                ("right_frame_id", "Right frame ID"),
-                ("right_frame_sha", "Right frame SHA prefix"),
-                ("right_frame_timestamp", "Right frame timestamp"),
-                ("right_frame_timestamp_reference", "Right timestamp reference"),
-                ("sync_state", "Sync state"),
-                ("sync_delta_left", "Sync delta L"),
-                ("sync_delta_right", "Sync delta R"),
-                ("sync_reason", "Sync reason"),
-            )
-        ):
-            value = EngineeringValue(label)
-            value.set_value("--")
-            self.observation_detail_values[key] = value
-            details_grid.addWidget(value, index // 2, index % 2)
-        observations_layout.addLayout(details_grid)
 
         self._drone_rtk_observation_rows: dict[str, dict[str, object]] = {}
         self._drone_rtk_observation_order: list[str] = []

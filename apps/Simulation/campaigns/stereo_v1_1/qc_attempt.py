@@ -63,6 +63,221 @@ def _yolo_rate_errors(yolo_summary: dict, capture: dict, image_summary: dict) ->
     return errors
 
 
+def _v12_cadence_errors(attempt_dir: Path, controller: dict, evidence: dict,
+                        warnings: list[str] | None = None) -> list[str]:
+    from campaigns.stereo_v1_1.setpoint_cadence import summarize_setpoint_cadence
+    events_path = attempt_dir / "events.jsonl"
+    events = list(_rows(events_path)) if events_path.is_file() else []
+    starts = [r for r in events if r.get("event") == "science_start"]
+    completed = controller.get("controller_status") == "science_completed"
+    if not starts and not completed:
+        return []  # No science prefix existed before this flight failure.
+    if len(starts) != 1:
+        return ["science_cadence_window_unavailable"]
+    start = starts[0]
+    names = ("science_end",) if completed else ("science_end", "emergency_landing_requested", "emergency_landing_request_failed")
+    ends = [r for r in events if r.get("event") in names]
+    end = ends[0] if ends else None
+    if (end is None or start.get("simulation_epoch") is None
+            or start.get("simulation_epoch") != end.get("simulation_epoch")
+            or start.get("simulation_timestamp_ns") is None or end.get("simulation_timestamp_ns") is None
+            or end["simulation_timestamp_ns"] < start["simulation_timestamp_ns"]):
+        return ["science_cadence_window_unavailable"]
+    timing_path = attempt_dir / "science_setpoint_timing.jsonl"
+    if not timing_path.is_file() or timing_path.stat().st_size == 0:
+        return ["missing_science_setpoint_timing"]
+    rows = list(_rows(timing_path))
+    if any(r.get("simulation_epoch") != start["simulation_epoch"]
+           for r in rows if r.get("reference_update", True)):
+        return ["science_setpoint_cadence_epoch_mismatch"]
+    try:
+        # Evaluate the raw prefix against the protocol's 50 Hz requirement;
+        # never trust an opaque controller success boolean or shortened window.
+        cadence = summarize_setpoint_cadence(rows, 50.0,
+            start["simulation_timestamp_ns"], end["simulation_timestamp_ns"])
+    except (KeyError, TypeError, ValueError):
+        return ["science_setpoint_timing_invalid"]
+    evidence["science_setpoint_cadence_recomputed"] = cadence
+    if (cadence["sufficient_unique_simulation_cadence"] and cadence.get("jitter_warning")
+            and warnings is not None):
+        warnings.append("science_setpoint_cadence_jitter_above_diagnostic_threshold")
+    return ([] if cadence["sufficient_unique_simulation_cadence"] else
+            ["science_setpoint_cadence_below_v12_requirement"])
+
+
+def _v12_raw_state_errors(attempt_dir: Path, frames: list[dict], epoch: int,
+                          start_ns: int, end_ns: int, max_gap_s: float,
+                          evidence: dict, min_gt_rate_hz: float = 50.0) -> list[str]:
+    """Require image-time GT brackets and clock coverage in the raw state bag.
+
+    JSONL state-recorder health cannot substitute for missing raw-bag samples.
+    The index contains deserialized bag samples, not copied recorder JSONL.
+    """
+    from bisect import bisect_left
+    path = attempt_dir / "raw_state_index.jsonl"
+    if not path.is_file():
+        return ["missing_raw_state_index"]
+    rows = list(_rows(path))
+    stamps = {}
+    for topic in ("/clock", "/simulation/ground_truth/vehicle_reference_link"):
+        stamps[topic] = sorted({row["simulation_timestamp_ns"] for row in rows
+                                if row.get("topic") == topic and row.get("simulation_epoch") == epoch
+                                and row.get("simulation_timestamp_ns") is not None})
+    gt = stamps["/simulation/ground_truth/vehicle_reference_link"]
+    clock = stamps["/clock"]
+    gap_ns = round(max_gap_s*1e9)
+    errors, invalid = [], []
+    for frame in frames:
+        timestamp = frame["image_timestamp_ns"]
+        if frame.get("simulation_epoch") != epoch or not start_ns <= timestamp <= end_ns:
+            continue
+        i = bisect_left(gt, timestamp)
+        if i < len(gt) and gt[i] == timestamp:
+            continue
+        if i == 0 or i == len(gt) or gt[i]-gt[i-1] > gap_ns:
+            invalid.append({"camera_id": frame["camera_id"], "image_timestamp_ns": timestamp})
+    if not gt or invalid:
+        errors.append("science_images_lack_raw_bag_gt_brackets")
+    gt_inside = [t for t in gt if start_ns <= t <= end_ns]
+    if len(gt_inside) + 1 + 1e-9 < min_gt_rate_hz * (end_ns-start_ns)/1e9:
+        errors.append("science_raw_bag_gt_rate_below_requested")
+    clock_inside = [t for t in clock if start_ns <= t <= end_ns]
+    gaps = [(a, b) for a, b in zip([start_ns, *clock_inside], [*clock_inside, end_ns]) if b-a > gap_ns]
+    if not clock_inside or gaps:
+        errors.append("science_raw_bag_clock_coverage_missing")
+    evidence["v12_raw_state_coverage"] = {
+        "simulation_epoch": epoch, "max_bracketing_gap_ns": gap_ns,
+        "raw_gt_unique_samples": len(gt), "raw_gt_science_unique_samples": len(gt_inside),
+        "required_gt_hz": min_gt_rate_hz, "raw_clock_unique_samples": len(clock),
+        "images_without_raw_gt_brackets": invalid, "clock_missing_intervals_ns": gaps}
+    return errors
+
+
+def _v12_capture_errors(attempt_dir: Path, source: dict, evidence: dict) -> list[str]:
+    """Audit v1.2 raw acquisition, independently of detector/flight performance.
+
+    Method: science image coverage in Gazebo simulation ns and epoch. Allow
+    1.5 nominal camera periods for transport/sampling jitter, but require the
+    configured frame rate with only one endpoint-frame allowance per window.
+    Missing detections do not affect this acquisition gate. For an interrupted
+    flight validate its recorded science prefix, never demand a successful end.
+    """
+    errors = []
+    camera = source["parameters"]["CameraModel"]
+    summary_path = attempt_dir / "image_index_summary.json"
+    summary = _read_json(summary_path) if summary_path.is_file() else {}
+    expected_k = [camera["fx_px"], 0, camera["cx_px"],
+                  0, camera["fy_px"], camera["cy_px"], 0, 0, 1]
+    for side in ("left", "right"):
+        info = summary.get("camera_info", {}).get(side, {})
+        variants = info.get("variants", [])
+        if info.get("message_count", 0) <= 0 or not variants:
+            errors.append(f"{side}_camera_info_missing")
+        for value in variants:
+            k = value.get("k", [])
+            if (value.get("width") != camera["image_width_px"]
+                    or value.get("height") != camera["image_height_px"]
+                    or len(k) != 9 or any(not math.isclose(float(a), float(b), rel_tol=1e-7, abs_tol=1e-6)
+                                         for a, b in zip(k, expected_k))
+                    or any(abs(float(v)) > 1e-12 for v in value.get("d", []))):
+                errors.append(f"{side}_camera_info_differs_from_workbook")
+                break
+    raw_path = attempt_dir / "raw_capture_summary.json"
+    raw = _read_json(raw_path) if raw_path.is_file() else {}
+    required_topics = {
+        "left": ("/left_camera/image", "/left_camera/camera_info"),
+        "right": ("/right_camera/image", "/right_camera/camera_info"),
+        "state": ("/clock", "/simulation/ground_truth/vehicle_reference_link",
+                  "/simulation/camera_pose_diagnostics/left", "/simulation/camera_pose_diagnostics/right"),
+    }
+    for stream, topics in required_topics.items():
+        entry = raw.get("streams", {}).get(stream, {})
+        for topic in topics:
+            if entry.get("topic_counts", {}).get(topic, 0) <= 0:
+                errors.append(f"missing_v12_raw_topic:{topic}")
+        if stream == "state":
+            if not entry.get("files"):
+                errors.append("missing_state_bag_artifacts")
+            for artifact in entry.get("files", []):
+                path = attempt_dir / artifact["path_from_attempt_root"]
+                if not path.is_file() or _sha256(path) != artifact["sha256"]:
+                    errors.append("state_bag_hash_mismatch")
+    image_path = attempt_dir / "image_index.jsonl"
+    frames = list(_rows(image_path)) if image_path.is_file() else []
+    for side in ("left", "right"):
+        if any(row.get("image_width_px") != camera["image_width_px"]
+               or row.get("image_height_px") != camera["image_height_px"]
+               for row in frames if row.get("camera_id") == side):
+            errors.append(f"{side}_raw_image_dimensions_differ_from_workbook")
+    events_path = attempt_dir / "events.jsonl"
+    events = list(_rows(events_path)) if events_path.is_file() else []
+    starts = [row for row in events if row.get("event") == "science_start"]
+    controller_path = attempt_dir / "controller_result.json"
+    controller = _read_json(controller_path) if controller_path.is_file() else {}
+    if not starts:
+        if controller.get("controller_status") == "science_completed":
+            errors.append("completed_science_missing_start_event")
+        evidence["v12_science_capture"] = {"status": "NOT_REACHED"}
+        return errors
+    if len(starts) != 1:
+        errors.append("science_start_event_ambiguous")
+        return errors
+    start = starts[0]
+    epoch = start.get("simulation_epoch")
+    start_ns = start.get("simulation_timestamp_ns")
+    ends = [row for row in events if row.get("event") == "science_end"]
+    if len(ends) == 1:
+        end = ends[0]
+    else:
+        if controller.get("controller_status") == "science_completed":
+            errors.append("completed_science_missing_end_event")
+            return errors
+        # Controller records the last observed science timestamp on abort.
+        candidates = [row for row in events if row.get("event") in
+                      ("emergency_landing_requested", "emergency_landing_request_failed")
+                      and row.get("simulation_epoch") == epoch]
+        end = candidates[-1] if candidates else None
+    if (end is None or epoch is None or start_ns is None
+            or end.get("simulation_epoch") != epoch or end.get("simulation_timestamp_ns") is None
+            or end["simulation_timestamp_ns"] < start_ns):
+        errors.append("science_capture_window_unavailable")
+        return errors
+    end_ns = end["simulation_timestamp_ns"]
+    duration_s = (end_ns - start_ns) / 1e9
+    rate = float(camera["camera_rate_hz"])
+    gap_limit_ns = 1.5e9 / rate
+    capture_evidence = {"status": "CHECKED", "simulation_epoch": epoch,
+                        "start_simulation_ns": start_ns, "end_simulation_ns": end_ns,
+                        "requested_hz": rate, "gap_limit_ns": gap_limit_ns,
+                        "endpoint_frame_allowance": 1, "cameras": {}}
+    for side in ("left", "right"):
+        stamps = sorted({int(row["image_timestamp_ns"]) for row in frames
+                         if row.get("camera_id") == side and row.get("simulation_epoch") == epoch
+                         and start_ns <= row["image_timestamp_ns"] <= end_ns})
+        gaps = [b-a for a, b in zip(stamps, stamps[1:])]
+        boundaries = [stamps[0]-start_ns, end_ns-stamps[-1]] if stamps else []
+        camera_evidence = {"unique_frame_count": len(stamps), "duration_s": duration_s,
+                           "observed_window_hz": len(stamps)/duration_s if duration_s else None,
+                           "max_gap_ns": max(gaps, default=None),
+                           "missing_intervals_simulation_ns": [[a, b] for a, b in
+                               zip([start_ns, *stamps], [*stamps, end_ns]) if b-a > gap_limit_ns]}
+        capture_evidence["cameras"][side] = camera_evidence
+        if not stamps:
+            errors.append(f"{side}_science_images_missing")
+            continue
+        if boundaries and max(boundaries) > gap_limit_ns:
+            errors.append(f"{side}_science_image_boundary_missing")
+        if gaps and max(gaps) > gap_limit_ns:
+            errors.append(f"{side}_science_image_gap")
+        if len(stamps) + 1 + 1e-9 < rate * duration_s:
+            errors.append(f"{side}_science_camera_rate_below_requested")
+    evidence["v12_science_capture"] = capture_evidence
+    errors.extend(_v12_raw_state_errors(attempt_dir, frames, epoch, start_ns, end_ns,
+        float(source["parameters"].get("Capture", {}).get("max_gt_bracketing_gap_s", 0.04)), evidence,
+        float(source["parameters"].get("Capture", {}).get("min_gt_rate_hz", 50.0))))
+    return errors
+
+
 def _workbook_run_manifest_errors(actual: dict, planned_source: dict) -> list[str]:
     """Compare run metadata with the workbook's normalized source row.
 
@@ -368,8 +583,14 @@ def validate(attempt_dir: Path, run_id: str, attempt_id: str,
         evidence["controller_failure_reason"] = controller.get("failure_reason")
         if controller.get("controller_status") != "science_completed":
             reason = controller.get("failure_reason", "")
-            if any(term in reason for term in ("telemetry became stale", "simulation clock reset", "local frame reset")):
+            if any(term in reason for term in ("telemetry became stale", "simulation clock reset", "local frame reset",
+                                                "simulation step control:", "simulation time moved backwards")):
                 infrastructure_errors.append("controller_runtime_boundary_failure")
+            elif (workbook_source and planned_source.get("protocol_version") == "1.2"
+                  and not ((attempt_dir / "events.jsonl").is_file()
+                           and any(row.get("event") == "science_start"
+                                   for row in _rows(attempt_dir / "events.jsonl")))):
+                infrastructure_errors.append("pre_science_execution_failure")
             else:
                 warnings.append("science_not_completed_performance_outcome")
 
@@ -440,6 +661,11 @@ def validate(attempt_dir: Path, run_id: str, attempt_id: str,
         actual_gap = _read_json(gt_alignment_path).get("maximum_bracketing_gap_s")
         if actual_gap is None or not math.isclose(float(actual_gap), float(expected_gap), rel_tol=0, abs_tol=1e-12):
             protocol_errors.append("gt_alignment_gap_differs_from_workbook")
+
+    if workbook_source and planned_source.get("protocol_version") == "1.2":
+        infrastructure_errors.extend(_v12_capture_errors(attempt_dir, planned_source, evidence))
+        if controller_path.is_file():
+            infrastructure_errors.extend(_v12_cadence_errors(attempt_dir, controller, evidence, warnings))
 
     checksums_path = attempt_dir / "checksums.sha256"
     if checksums_path.is_file():

@@ -269,7 +269,7 @@ def test_default_manifest_workbook_compiles_exact_order_seeds_scopes_and_referen
     assert reference["samples"][0]["t_science_s"] == 0
     assert reference["samples"][0]["heading_deg_clockwise_from_north"] == 180
     environment = scenario_environment(parameters, 1)
-    assert environment["CAMERA_CLIP_FAR_M"] == "700.0"
+    assert environment["CAMERA_CLIP_FAR_M"] == "1000.0"
     assert environment["CAM_L_OPTICAL_PITCH_DEG"] == "20.0"
     assert plan["workbook_schema_version"] == "sweep_manifest_v2"
     contract = plan["environment_contract"]
@@ -357,7 +357,7 @@ def test_workbook_declares_vehicle_model_and_rejects_unsupported_model(tmp_path:
                 return
         raise AssertionError("Vehicle.model_id parameter row was not found")
     _edit_manifest_sheet(DEFAULT_WORKBOOK, edited, "Parameters", replace_model)
-    with pytest.raises(ValueError, match="REQ-VEHICLE-MODEL failed"):
+    with pytest.raises(ValueError, match="Vehicle.model_id|REQ-VEHICLE-MODEL failed"):
         build_workbook_plan(edited)
 
     unsupported_reference = tmp_path / "unsupported_reference_link.xlsx"
@@ -373,7 +373,7 @@ def test_workbook_declares_vehicle_model_and_rejects_unsupported_model(tmp_path:
                 return
         raise AssertionError("Vehicle.reference_link parameter row was not found")
     _edit_manifest_sheet(DEFAULT_WORKBOOK, unsupported_reference, "Parameters", replace_reference)
-    with pytest.raises(ValueError, match="REQ-VEHICLE-REFERENCE failed"):
+    with pytest.raises(ValueError, match="Vehicle.reference_link|REQ-VEHICLE-REFERENCE failed"):
         build_workbook_plan(unsupported_reference)
 
 
@@ -554,3 +554,93 @@ def test_requested_seed_policy_is_applied_and_legacy_environment_seed_is_cleared
     legacy = {"SIM_GAZEBO_SEED": "stale"}
     _apply_requested_seed(legacy, {"seed_requested": 123}, workbook_source=False)
     assert legacy["SIM_GAZEBO_SEED"] == "123"
+
+
+def test_workbook_does_not_open_external_protocol_manifest(monkeypatch):
+    original = Path.read_text
+    def guarded(path, *args, **kwargs):
+        if path.name == "04_run_manifest.json":
+            raise AssertionError("external manifest must remain provenance only")
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "read_text", guarded)
+    plan = build_workbook_plan(DEFAULT_WORKBOOK)
+    assert {run["protocol_version"] for run in plan["planned_runs"]} == {"1.2"}
+    environment = scenario_environment(plan["planned_runs"][0]["parameters"], 1)
+    for kind in ("COMMON", "RELATIVE"):
+        for axis in ("ROLL", "PITCH", "YAW"):
+            assert environment[f"{kind}_OPTICAL_{axis}_ERROR_DEG"] == "0.0"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("CameraModel.far_clip_m", 700), ("Motion.setpoint_hz", 20),
+    ("CameraPX4Mount.left_mount_pitch_deg", 8),
+    ("CameraGeometry.left_up_m", 1), ("Capture.yolo_target_hz", 5),
+])
+def test_v1_2_rejects_scientific_parameter_drift(tmp_path, field, value):
+    edited = tmp_path / "drift.xlsx"
+    def replace(root, strings):
+        for row in root.findall("m:sheetData/m:row", NS)[1:]:
+            number = int(row.attrib["r"])
+            if _cell_text(row.find(f"m:c[@r='A{number}']", NS), strings) == field:
+                _set_numeric_cell(root, f"C{number}", value)
+                return
+        raise AssertionError(field)
+    _edit_manifest_sheet(DEFAULT_WORKBOOK, edited, "Parameters", replace)
+    with pytest.raises(ValueError, match=field):
+        build_workbook_plan(edited)
+
+
+@pytest.mark.parametrize("cell,value", [("D2", "unknown_protocol"),])
+def test_unknown_protocol_cannot_bypass_contract(tmp_path, cell, value):
+    edited = tmp_path / "unknown.xlsx"
+    _edit_manifest_sheet(DEFAULT_WORKBOOK, edited, "Campaign",
+                         lambda root, strings: _set_text_cell(root, cell, value))
+    with pytest.raises(ValueError, match="unsupported campaign protocol_id"):
+        build_workbook_plan(edited)
+
+
+@pytest.mark.parametrize("cell,value", [("F2", "P4"), ("I2", "locked_final_test")])
+def test_workbook_rejects_slot_semantic_drift(tmp_path, cell, value):
+    edited = tmp_path / "slot.xlsx"
+    _edit_manifest_sheet(DEFAULT_WORKBOOK, edited, "RunManifest",
+                         lambda root, strings: _set_text_cell(root, cell, value))
+    with pytest.raises(ValueError, match="differs from the v1.2 instruction"):
+        build_workbook_plan(edited)
+
+
+def test_v1_2_executes_four_pilot_slots_before_remaining_runs(tmp_path, monkeypatch):
+    from campaigns.stereo_v1_1 import campaign_run
+    from campaigns.stereo_v1_1.campaign_status import begin_attempt, finish_attempt
+    from campaigns.stereo_v1_1.workbook_campaign import execute_campaign
+
+    output = tmp_path / "campaign"
+    output.mkdir()
+    (output / "environment_report.json").write_text(json.dumps({"status": "PREFLIGHT_PASS"}))
+    executed = []
+    def fake_run_one(output_root, source):
+        executed.append(source["run_id"])
+        attempt, _ = begin_attempt(output_root, source["run_id"])
+        qc = dict(run_id=source["run_id"], attempt_id=attempt["attempt_id"], status="VALID",
+                  infrastructure_errors=[], protocol_errors=[], warnings=[], evidence={})
+        finish_attempt(output_root, source["run_id"], attempt["attempt_id"], qc)
+        return qc
+    monkeypatch.setattr(campaign_run, "_run_one", fake_run_one)
+    monkeypatch.setattr(campaign_run, "_existing_sitl_processes", lambda: [])
+    monkeypatch.setattr(campaign_run, "_audit_valid", lambda root: {"planned": 39, "valid_readback": 39})
+    assert execute_campaign("run", DEFAULT_WORKBOOK, output)["status"] == "WORKBOOK_CAMPAIGN_COMPLETE"
+    assert executed[:4] == list(campaign_run.PILOT_IDS)
+    assert len(executed) == len(set(executed)) == 39
+    frozen = json.loads((output / "workbook_campaign_plan.json").read_text())
+    assert [run["sequence"] for run in frozen["planned_runs"]] == list(range(1, 40))
+
+
+def test_declared_v1_1_keeps_slot_contract_without_external_file(tmp_path):
+    edited = tmp_path / "v1_1.xlsx"
+    _edit_manifest_sheet(DEFAULT_WORKBOOK, edited, "Campaign",
+                         lambda root, strings: _set_text_cell(root, "D2", "stereo_calibration_campaign_v1_1"))
+    assert len(read_numeric_workbook(edited)["run_manifest"]) == 39
+    corrupt = tmp_path / "v1_1_bad_seed.xlsx"
+    _edit_manifest_sheet(edited, corrupt, "RunManifest",
+                         lambda root, strings: _set_numeric_cell(root, "M2", 42))
+    with pytest.raises(ValueError, match="seed_requested differs from the v1.1 instruction"):
+        read_numeric_workbook(corrupt)

@@ -1,0 +1,267 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>measurementMethod</class>
+ <widget class="QGroupBox" name="measurementMethod">
+  <property name="title">
+   <string>Measurement method</string>
+  </property>
+  <layout class="QGridLayout" name="measurementMethodLayout">
+   <item row="0" column="0">
+    <widget class="QLabel" name="readyLabel">
+     <property name="text">
+      <string>Ready method</string>
+     </property>
+    </widget>
+   </item>
+   <item row="0" column="1">
+    <widget class="QComboBox" name="measurementMethodCombo">
+     <property name="toolTip">
+      <string>현재 exact K,D와 필요한 live/candidate 입력이 모두 준비된 방식만 표시합니다. 선택 방식이 준비 상태를 잃으면 이 Measurement가 생성될 때 고정된 fallback 순서로 자동 전환합니다.</string>
+     </property>
+    </widget>
+   </item>
+   <item row="1" column="0" rowspan="1" colspan="2">
+    <widget class="QLabel" name="methodStatus">
+     <property name="text">
+      <string>준비된 측정 방식 확인 중</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item row="2" column="0">
+    <widget class="QLabel" name="fillLabel">
+     <property name="text">
+      <string>DOF fill for</string>
+     </property>
+    </widget>
+   </item>
+   <item row="2" column="1">
+    <widget class="QComboBox" name="measurementFillMethodCombo">
+     <property name="toolTip">
+      <string>방식이 직접 제공하는 축은 OWN으로 잠깁니다. 미관측 회전축은 PX4, 미관측 이동축은 GNSS 토글로 이 Measurement에서만 채웁니다.</string>
+     </property>
+    </widget>
+   </item>
+   <item row="3" column="0" rowspan="1" colspan="2">
+    <widget class="QWidget" name="fillWidget">
+     <layout class="QGridLayout" name="fillLayout">
+      <item row="0" column="1">
+       <widget class="QLabel" name="axis1">
+        <property name="text">
+         <string>Roll</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="2">
+       <widget class="QLabel" name="axis2">
+        <property name="text">
+         <string>Pitch</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="3">
+       <widget class="QLabel" name="axis3">
+        <property name="text">
+         <string>Yaw</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="4">
+       <widget class="QLabel" name="axis4">
+        <property name="text">
+         <string>North</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="5">
+       <widget class="QLabel" name="axis5">
+        <property name="text">
+         <string>East</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="6">
+       <widget class="QLabel" name="axis6">
+        <property name="text">
+         <string>Down</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0">
+       <widget class="QLabel" name="leftLabel">
+        <property name="text">
+         <string>Left</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="QPushButton" name="measurementFillLeftRollDeg">
+        <property name="text">
+         <string>--</string>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="2">
+       <widget class="QPushButton" name="measurementFillLeftPitchDeg">
+        <property name="text">
+         <string>--</string>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="3">
+       <widget class="QPushButton" name="measurementFillLeftYawDeg">
+        <property name="text">
+         <string>--</string>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="4">
+       <widget class="QPushButton" name="measurementFillLeftNorthM">
+        <property name="text">
+         <string>--</string>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="5">
+       <widget class="QPushButton" name="measurementFillLeftEastM">
+        <property name="text">
+         <string>--</string>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="6">
+       <widget class="QPushButton" name="measurementFillLeftDownM">
+        <property name="text">
+         <string>--</string>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="0">
+       <widget class="QLabel" name="rightLabel">
+        <property name="text">
+         <string>Right</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <widget class="QPushButton" name="measurementFillRightRollDeg">
+        <property name="text">
+         <string>--</string>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="2">
+       <widget class="QPushButton" name="measurementFillRightPitchDeg">
+        <property name="text">
+         <string>--</string>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="3">
+       <widget class="QPushButton" name="measurementFillRightYawDeg">
+        <property name="text">
+         <string>--</string>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="4">
+       <widget class="QPushButton" name="measurementFillRightNorthM">
+        <property name="text">
+         <string>--</string>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="5">
+       <widget class="QPushButton" name="measurementFillRightEastM">
+        <property name="text">
+         <string>--</string>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="6">
+       <widget class="QPushButton" name="measurementFillRightDownM">
+        <property name="text">
+         <string>--</string>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+     </layout>
+    </widget>
+   </item>
+   <item row="4" column="0" rowspan="1" colspan="2">
+    <widget class="QLabel" name="fillStatus">
+     <property name="text">
+      <string>Pre 증거로 Measurement 초안이 준비된 경우 측정 시작 전에 fill source를 조정할 수 있습니다.</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <property name="leftMargin">
+    <number>6</number>
+   </property>
+   <property name="topMargin">
+    <number>6</number>
+   </property>
+   <property name="rightMargin">
+    <number>6</number>
+   </property>
+   <property name="bottomMargin">
+    <number>6</number>
+   </property>
+  </layout>
+ </widget>
+ <resources />
+ <connections />
+</ui>

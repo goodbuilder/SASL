@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from Workstation.ui.designer import load_form
 from PyQt5 import QtGui, QtWidgets
 from Workstation.workstation_core.coordinate_contract import (
     BASELINE_TRANSLATION_FRAME,
@@ -25,89 +26,48 @@ class DiagnosticsContent(QtWidgets.QWidget):
         super().__init__(parent)
         self.backend = backend
         self.status_model = status_model
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
-        self.tabs = QtWidgets.QTabWidget()
+        load_form("diagnostics.ui", self)
+        for widget in self.findChildren(QtWidgets.QWidget):
+            if widget.property("styleObjectName"):
+                widget.setObjectName(widget.property("styleObjectName"))
         self.system_model = QtGui.QStandardItemModel(0, 6, self)
         self.system_model.setHorizontalHeaderLabels(["Key", "State", "Level", "Source", "Age", "Detail"])
-        self.system_table = QtWidgets.QTableView()
         self.system_table.setModel(self.system_model)
-        self.system_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.system_table.verticalHeader().setVisible(False)
         for column, width in ((0, 180), (1, 110), (2, 70), (3, 360), (4, 80)):
             self.system_table.setColumnWidth(column, width)
         self.system_table.horizontalHeader().setStretchLastSection(True)
-        self.log_view = QtWidgets.QPlainTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
         self._log_pending_count = 0
-        self.log_new_label = QtWidgets.QLabel("")
-        self.log_new_label.setObjectName("statusStrip")
         self.log_new_label.hide()
-        self.log_follow_button = QtWidgets.QPushButton("Follow latest")
-        self.log_follow_button.setObjectName("secondaryAction")
         self.log_follow_button.clicked.connect(self._follow_latest_log)
         self.log_follow_button.hide()
-        log_page = QtWidgets.QWidget()
-        log_layout = QtWidgets.QVBoxLayout(log_page)
-        log_layout.setContentsMargins(0, 0, 0, 0)
-        log_toolbar = QtWidgets.QHBoxLayout()
-        log_toolbar.addWidget(self.log_new_label)
-        log_toolbar.addStretch(1)
-        log_toolbar.addWidget(self.log_follow_button)
-        log_layout.addLayout(log_toolbar)
-        log_layout.addWidget(self.log_view)
-        self.measurement_view = QtWidgets.QPlainTextEdit()
-        self.measurement_view.setReadOnly(True)
-        self.measurement_view.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
-        self.camera_view = self._diagnostic_text_view()
-        self.pixhawk_view = self._diagnostic_text_view()
-        self.gnss_view = self._diagnostic_text_view()
-        self.performance_view = self._diagnostic_text_view()
-        self.ftp_view = self._diagnostic_text_view()
-        self.tabs.addTab(self.system_table, "System")
-        self.tabs.addTab(self.camera_view, "Camera")
-        self.tabs.addTab(self.pixhawk_view, "Pixhawk")
-        self.tabs.addTab(self.gnss_view, "GNSS")
-        self.tabs.addTab(log_page, "Log")
-        self.tabs.addTab(self.ftp_view, "FTP")
-        self.tabs.addTab(self.measurement_view, "Measurement")
-        self.tabs.addTab(self.performance_view, "Performance")
-        layout.addWidget(self.tabs)
-
-    @staticmethod
-    def _diagnostic_text_view() -> QtWidgets.QPlainTextEdit:
-        view = QtWidgets.QPlainTextEdit()
-        view.setReadOnly(True)
-        view.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
-        return view
 
     def select_tab_for_context(self, context_id: str) -> None:
-        tab_indexes = {
-            "diagnostics.camera": 1,
-            "diagnostics.pixhawk": 2,
-            "diagnostics.gnss": 3,
-            "diagnostics.logs": 4,
-            "diagnostics.ftp": 5,
-            "diagnostics.measurement": 6,
-            "diagnostics.performance": 7,
+        pages = {
+            "diagnostics.camera": self.camera_view,
+            "diagnostics.pixhawk": self.pixhawk_view,
+            "diagnostics.gnss": self.gnss_view,
+            "diagnostics.logs": self.log_page,
+            "diagnostics.ftp": self.ftp_view,
+            "diagnostics.measurement": self.measurement_view,
+            "diagnostics.performance": self.performance_view,
         }
-        self.tabs.setCurrentIndex(tab_indexes.get(context_id, 0))
+        self.tabs.setCurrentWidget(pages.get(context_id, self.system_table))
 
     def refresh(self, snapshot: dict[str, RuntimeStatus]) -> None:
-        refreshers = (
-            self._refresh_system,
-            self._refresh_camera,
-            self._refresh_pixhawk,
-            self._refresh_gnss,
-            self._refresh_log,
-            self._refresh_ftp,
-            self._refresh_measurement,
-            self._refresh_performance,
-        )
-        index = self.tabs.currentIndex()
-        if 0 <= index < len(refreshers):
-            refreshers[index](snapshot)
+        refreshers = {
+            self.system_table: self._refresh_system,
+            self.camera_view: self._refresh_camera,
+            self.pixhawk_view: self._refresh_pixhawk,
+            self.gnss_view: self._refresh_gnss,
+            self.log_page: self._refresh_log,
+            self.ftp_view: self._refresh_ftp,
+            self.measurement_view: self._refresh_measurement,
+            self.performance_view: self._refresh_performance,
+        }
+        refresh = refreshers.get(self.tabs.currentWidget())
+        if refresh is not None:
+            refresh(snapshot)
 
     def _refresh_system(self, snapshot: dict[str, RuntimeStatus]) -> None:
         rows = tuple(

@@ -813,6 +813,20 @@ mag 선택 불가 → `vehicle_magnetometer` 미발행 → EKF2 mag 없음 → y
      range +0.015°~+0.081°), 두 보드 모두 실제 헤딩·mag 융합 상태.
    - 변경마다 PARAM_SAVE + 재부팅 후 측정했다.
 
+## Workstation MAG Priority Apply 동작 (2026-10-12)
+
+`Devices > Pixhawk` priority 값은 side별 draft이며 4 Hz status refresh가 미적용 값을 덮어쓰지
+않는다. `Discard`는 마지막 PARAM readback 값으로 되돌리고, Apply 중에는 그 side 입력이 잠긴다.
+Apply는 PARAM_SET ACK 누락만 최대 3회 전송하며, 최종 PARAM readback과 active device ID 및 새
+ATTITUDE를 별도로 확인한다. 실패/부분 적용은 이전 PARAM 표시를 무효화하므로 Refresh MAG로
+실제 값을 다시 읽는다.
+
+PX4 1.17에서 활성 higher `sensor_mag` instance 앞에 priority `0`인 lower instance가 확인되면
+Apply 전에 차단한다. lower filler는 `Min (1)` 이상으로 직접 설정한다. 미확인 topology에서는
+경고만 표시하고 기존 Disarm/연결 조건을 적용한다. Apply는 RAM 갱신이며 `param save`와 reboot은
+별도 동작이다. voter가 이미 sparse 상태로 시작된 경우, filler 수정 후 disarmed 재부팅이 voter
+구성을 복구할 수 있지만 Workstation은 자동 저장/재부팅하지 않는다.
+
 주의: `CAL_MAG2_YAW`는 **현재 장착 방향에서의 상수 오차만** 상쇄한다. hard-iron/scale이 미보정이면
 헤딩이 바뀔 때 오차가 다시 달라질 수 있으므로, 운용 전 QGroundControl RM3100 재보정이 근본 해결이며
 그 뒤에는 `CAL_MAG2_YAW`를 0으로 되돌리고 ΔYaw를 재측정해야 한다. `CAL_MAG2_YAW`≠0을 넣으면 PX4가

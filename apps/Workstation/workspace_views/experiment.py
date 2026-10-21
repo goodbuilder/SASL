@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from Workstation.ui.designer import load_form
 from PyQt5 import QtCore, QtWidgets
-from Workstation.ui.components import WorkspaceHeader
 from Workstation.application.status_model import RuntimeStatus
 from .shared import _evidence
 
@@ -16,121 +16,25 @@ class ExperimentWorkspace(QtWidgets.QWidget):
     def __init__(self, backend: object, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.backend = backend
-        layout = QtWidgets.QVBoxLayout(self)
-        self._layout = layout
+        load_form("experiment.ui", self)
         self._run_preparation_controller: object | None = None
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-        layout.addWidget(
-            WorkspaceHeader(
-                "Protocol",
-                "0 external prerequisite → 1–11 field protocol · evidence follows the operator order",
-            )
-        )
-        prerequisite_row = QtWidgets.QHBoxLayout()
-        note = QtWidgets.QLabel(
-            "QGC Pixhawk Sensor Calibration is completed outside Workstation. "
-            "Camera intrinsic/stereo calibration remains available in Calibration before the run."
-        )
-        note.setObjectName("compactContract")
-        note.setWordWrap(True)
-        prerequisite_row.addWidget(note, 1)
-        self.pre_run_calibration_button = QtWidgets.QPushButton("Open pre-run calibration")
-        self.pre_run_calibration_button.clicked.connect(
-            lambda _checked=False: self.open_context.emit("tasks.calibration")
-        )
-        prerequisite_row.addWidget(self.pre_run_calibration_button)
-        layout.addLayout(prerequisite_row)
-
-        protocol_group = QtWidgets.QGroupBox("Protocol")
-        protocol_layout = QtWidgets.QGridLayout(protocol_group)
-        protocol_layout.setColumnStretch(1, 1)
-        protocol_layout.setColumnStretch(2, 3)
-        protocol_layout.addWidget(QtWidgets.QLabel("Step"), 0, 0)
-        protocol_layout.addWidget(QtWidgets.QLabel("State"), 0, 1)
-        protocol_layout.addWidget(QtWidgets.QLabel("Evidence / action"), 0, 2)
-        protocol_layout.addWidget(QtWidgets.QLabel("Open"), 0, 3)
-        self.step_states: dict[int, QtWidgets.QLabel] = {}
-        self.step_details: dict[int, QtWidgets.QLabel] = {}
-        self.step_buttons: dict[int, QtWidgets.QPushButton] = {}
-        self.step_action_buttons: dict[int, tuple[QtWidgets.QPushButton, ...]] = {}
-        steps = (
-            (0, "QGC Pixhawk calibration", "External", None),
-            (
-                1,
-                "Connect and verify WIRIS / Pixhawk / Base GNSS",
-                "",
-                (
-                    ("Cameras", "devices.cameras"),
-                    ("Pixhawk", "devices.pixhawk"),
-                    ("Base", "devices.gnss"),
-                ),
-            ),
-            (2, "Start Base Survey-in or NTRIP", "", "devices.gnss"),
-            (3, "Initial WIRIS time synchronization", "", "devices.time"),
-            (
-                4,
-                "RTCM injection and numeric fix_type",
-                "",
-                (("Base", "devices.gnss"), ("Pixhawk", "devices.pixhawk")),
-            ),
-            (5, "Physical baseline alignment", "", "processing.alignment"),
-            (6, "Physical Roll / Pitch / Yaw alignment", "", "processing.alignment"),
-            (7, "Repeat physical alignment evidence", "", "processing.alignment"),
-            (8, "Final time-sync quality check / resync", "", "devices.time"),
-            (9, "YOLO and measurement settings", "", "processing.measurement"),
-            (10, "Start measurement", "", "processing.measurement"),
-            (11, "Save measured data", "", "tasks.recording"),
-        )
-        for row, (number, label, initial_state, context) in enumerate(steps, start=1):
-            protocol_layout.addWidget(QtWidgets.QLabel(f"{number}. {label}"), row, 0)
-            state = QtWidgets.QLabel(initial_state or "WAIT")
-            state.setObjectName("protocolState")
-            self.step_states[number] = state
-            protocol_layout.addWidget(state, row, 1)
-            detail = QtWidgets.QLabel("--")
-            detail.setObjectName("protocolCheck")
-            detail.setWordWrap(True)
-            self.step_details[number] = detail
-            protocol_layout.addWidget(detail, row, 2)
-            if context is None:
-                button = QtWidgets.QPushButton("External")
-                button.setEnabled(False)
-                action_widget: QtWidgets.QWidget = button
-                action_buttons = (button,)
-            elif isinstance(context, tuple):
-                action_widget = QtWidgets.QWidget()
-                action_layout = QtWidgets.QHBoxLayout(action_widget)
-                action_layout.setContentsMargins(0, 0, 0, 0)
-                action_layout.setSpacing(4)
-                buttons: list[QtWidgets.QPushButton] = []
-                for button_label, target in context:
-                    action_button = QtWidgets.QPushButton(button_label)
-                    action_button.clicked.connect(
-                        lambda _checked=False, target=target: self.open_context.emit(target)
-                    )
-                    action_layout.addWidget(action_button)
-                    buttons.append(action_button)
-                action_buttons = tuple(buttons)
-                button = action_buttons[0]
-            else:
-                button = QtWidgets.QPushButton("Open")
-                button.clicked.connect(lambda _checked=False, target=context: self.open_context.emit(target))
-                action_widget = button
-                action_buttons = (button,)
-            self.step_buttons[number] = button
-            self.step_action_buttons[number] = action_buttons
-            protocol_layout.addWidget(action_widget, row, 3)
-        layout.addWidget(protocol_group)
-        self._protocol_group = protocol_group
-        contract = QtWidgets.QLabel(
-            "Fix evidence is numeric PX4/MAVLink fix_type; RTK_FIXED=6 is reported as a ratio and is not assumed for every run. "
-            "Raw baseline remains NED [north,east,down]; alignment view is P1 body FRD [forward,right,down]."
-        )
-        contract.setObjectName("compactContract")
-        contract.setWordWrap(True)
-        layout.addWidget(contract)
-        layout.addStretch(1)
+        for widget in self.findChildren(QtWidgets.QWidget):
+            if widget.property("styleObjectName"):
+                widget.setObjectName(widget.property("styleObjectName"))
+        self.step_states = {number: getattr(self, f"step_states_{number}") for number in range(12)}
+        self.step_details = {number: getattr(self, f"step_details_{number}") for number in range(12)}
+        self.step_action_buttons = {
+            number: tuple(button for button in self.findChildren(QtWidgets.QPushButton)
+                          if button.property("protocolStep") == number)
+            for number in range(12)
+        }
+        self.step_buttons = {number: buttons[0] for number, buttons in self.step_action_buttons.items()}
+        for button in self.findChildren(QtWidgets.QPushButton):
+            context = button.property("contextId")
+            if context:
+                button.clicked.connect(
+                    lambda _checked=False, target=context: self.open_context.emit(target)
+                )
 
     def attach_run_preparation(
         self,

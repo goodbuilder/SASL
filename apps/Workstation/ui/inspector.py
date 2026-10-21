@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from typing import Callable, Mapping
 
 from PyQt5 import QtCore, QtWidgets
@@ -7,6 +9,7 @@ from PyQt5 import QtCore, QtWidgets
 from Workstation.workstation_core.coordinate_contract import MEASUREMENT_AXIS_CONTRACT, MEASUREMENT_FRAME
 
 from Workstation.ui.components import EngineeringValue, PropertySection
+from Workstation.ui.designer import load_form
 from Workstation.application.evidence import EvidenceAdapter
 from Workstation.ui.navigation import canonical_context_id
 from Workstation.application.status_model import RuntimeStatus, StatusModel
@@ -118,6 +121,25 @@ _CONTEXT_LAYOUTS = {
 }
 
 
+class InspectorSection(PropertySection):
+    """PropertySection with its form layout supplied by Qt Designer."""
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        QtWidgets.QGroupBox.__init__(self, parent)
+
+    @property
+    def form(self) -> QtWidgets.QFormLayout:
+        return self.layout()
+
+
+class InspectorValue(EngineeringValue):
+    """Promoted live value widget; Designer owns placement and row labels."""
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__("", parent)
+        self.label.hide()
+
+
 class InspectorWidget(QtWidgets.QWidget):
     command_requested = QtCore.pyqtSignal(str, object)
 
@@ -128,146 +150,38 @@ class InspectorWidget(QtWidgets.QWidget):
         self._context_id = "overview"
         self._selection: dict[str, object] | None = None
         self._optical_pose_snapshot: dict[str, object] = {}
-        root = QtWidgets.QVBoxLayout(self)
-        root.setContentsMargins(6, 6, 6, 6)
-        root.setSpacing(6)
-        self.context_label = QtWidgets.QLabel("Overview")
-        self.context_label.setObjectName("inspectorContext")
-        self.context_label.setWordWrap(True)
-        root.addWidget(self.context_label)
-        self.status_section = PropertySection("Status")
-        self.status_value = EngineeringValue("")
-        self.source_value = EngineeringValue("")
-        self.status_value.label.hide()
-        self.source_value.label.hide()
-        self.status_section.add_row("State", self.status_value)
-        self.status_section.add_row("Evidence", self.source_value)
-        root.addWidget(self.status_section)
-
-        self.mountain_margin_section = PropertySection("Mountain detection")
-        self.mountain_margin_combo = QtWidgets.QComboBox()
-        self.mountain_margin_combo.setObjectName("inspectorMountainRidgeMargin")
-        self.mountain_margin_combo.setEditable(False)
-        for percent in (2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 15.0):
-            label = f"{percent:.0f}%" + ("  (default)" if percent == 6.0 else "")
-            self.mountain_margin_combo.addItem(label, percent / 100.0)
-        self.mountain_margin_combo.setToolTip(
-            "How close a matched point must be to Mountain's estimated ridge/skyline\n"
-            "boundary to be kept, as a fraction of image height. Wider keeps more\n"
-            "matches but risks drifting off the ridge; narrower is stricter but can\n"
-            "drop legitimate points on a jagged silhouette. Takes effect on the next\n"
-            "Auto-select Mountain run, not live."
-        )
+        load_form("inspector.ui", self)
+        for widget in self.findChildren(QtWidgets.QWidget):
+            style_name = widget.property("styleObjectName")
+            if style_name:
+                widget.setObjectName(style_name)
+            if isinstance(widget, InspectorValue):
+                widget.label.setText(widget.property("displayLabel") or "")
+        for combo in (self.mountain_margin_combo, self.mountain_max_points_combo):
+            values = json.loads(combo.property("optionValues"))
+            if len(values) != combo.count():
+                raise ValueError(f"Inspector option label/value count mismatch: {combo.objectName()}")
+            for index, value in enumerate(values):
+                combo.setItemData(index, value)
+        self.context_values: dict[str, EngineeringValue] = {
+            key: getattr(self, f"context_{key}_value")
+            for key in ("primary", "secondary", "timing", "contract", "verdict")
+        }
+        self.context_row_labels: dict[str, QtWidgets.QLabel] = {
+            key: self.context_section.form.labelForField(value)
+            for key, value in self.context_values.items()
+        }
+        self.geometry_values: dict[str, EngineeringValue] = {
+            key: getattr(self, f"geometry_{key}_value")
+            for key in ("bundle", "intrinsics", "extrinsics", "pose", "evidence")
+        }
         self.mountain_margin_combo.currentIndexChanged.connect(self._request_mountain_ridge_margin)
-        self.mountain_margin_section.add_row("Ridge margin", self.mountain_margin_combo)
-
-        self.mountain_max_points_combo = QtWidgets.QComboBox()
-        self.mountain_max_points_combo.setObjectName("inspectorMountainMaxPoints")
-        self.mountain_max_points_combo.setEditable(False)
-        for count in (0, 4, 8, 12, 16, 20, 30, 40, 80, 200):
-            label = "All inliers  (default)" if count == 0 else f"{count}"
-            self.mountain_max_points_combo.addItem(label, count)
-        self.mountain_max_points_combo.setToolTip(
-            "How many spatially-spread correspondences Mountain/Cloud keep for\n"
-            "the final suggestion. 'All inliers' stores and shows every match\n"
-            "that passes RANSAC (complete evidence for the relative-rotation\n"
-            "fit); a number caps the overlay to that many spread points.\n"
-            "Takes effect on the next Auto-select run, not live."
-        )
         self.mountain_max_points_combo.currentIndexChanged.connect(self._request_mountain_max_points)
-        self.mountain_margin_section.add_row("Max points", self.mountain_max_points_combo)
-        root.addWidget(self.mountain_margin_section)
-
-        self.context_section = PropertySection("Context")
-        self.context_values: dict[str, EngineeringValue] = {}
-        self.context_row_labels: dict[str, QtWidgets.QLabel] = {}
-        for key, label in (
-            ("primary", "Selection"),
-            ("secondary", "Value"),
-            ("timing", "Freshness"),
-            ("contract", "Contract"),
-            ("verdict", "Verdict"),
-        ):
-            value = EngineeringValue("")
-            value.label.hide()
-            self.context_values[key] = value
-            self.context_section.add_row(label, value)
-            row_label = self.context_section.form.labelForField(value)
-            if isinstance(row_label, QtWidgets.QLabel):
-                self.context_row_labels[key] = row_label
-        root.addWidget(self.context_section)
-
-        self.geometry_section = PropertySection("Active Geometry")
-        self.geometry_values: dict[str, EngineeringValue] = {}
-        for key, label in (
-            ("bundle", "Bundle"),
-            ("intrinsics", "K,D"),
-            ("extrinsics", "R,t"),
-            ("pose", "Pose"),
-            ("evidence", "Evidence"),
-        ):
-            value = EngineeringValue(label)
-            value.label.hide()
-            self.geometry_values[key] = value
-            self.geometry_section.add_row(label, value)
-
-        self.geometry_candidate_combo = QtWidgets.QComboBox()
-        self.geometry_candidate_combo.setObjectName("inspectorPoseCandidate")
-        self.geometry_candidate_combo.setToolTip(
-            "Select an immutable optical-pose candidate. The full observable DOF "
-            "mask is applied through the OpticalPoseController."
-        )
-        self.geometry_candidate_combo.currentIndexChanged.connect(
-            self._refresh_geometry_actions
-        )
-        self.geometry_section.add_row("Candidate", self.geometry_candidate_combo)
-
-        geometry_actions = QtWidgets.QHBoxLayout()
-        self.geometry_apply_candidate_button = QtWidgets.QPushButton("Apply pose candidate")
-        self.geometry_apply_candidate_button.setObjectName("inspectorApplyPoseCandidate")
-        self.geometry_apply_candidate_button.setToolTip(
-            "Apply the selected candidate's observable Roll/Pitch/Yaw and NED position DOFs."
-        )
-        self.geometry_apply_candidate_button.clicked.connect(
-            self._request_geometry_candidate
-        )
-        self.geometry_revert_button = QtWidgets.QPushButton("Revert pose")
-        self.geometry_revert_button.setObjectName("inspectorRevertPose")
-        self.geometry_revert_button.setToolTip(
-            "Restore the immutable extrinsics profile that was active before the pose selection."
-        )
+        self.geometry_candidate_combo.currentIndexChanged.connect(self._refresh_geometry_actions)
+        self.geometry_apply_candidate_button.clicked.connect(self._request_geometry_candidate)
         self.geometry_revert_button.clicked.connect(self._request_geometry_revert)
-        self.geometry_apply_bundle_button = QtWidgets.QPushButton("Apply K,D + R,t")
-        self.geometry_apply_bundle_button.setObjectName("inspectorApplyGeometryBundle")
-        self.geometry_apply_bundle_button.setToolTip(
-            "Apply the currently selected operating K,D and R,t bundle through the calibration owner."
-        )
         self.geometry_apply_bundle_button.clicked.connect(self._request_geometry_bundle)
-        geometry_actions.addWidget(self.geometry_apply_candidate_button)
-        geometry_actions.addWidget(self.geometry_revert_button)
-        geometry_actions.addWidget(self.geometry_apply_bundle_button)
-        geometry_actions.addStretch(1)
-        geometry_action_host = QtWidgets.QWidget()
-        geometry_action_host.setLayout(geometry_actions)
-        self.geometry_section.form.addRow(geometry_action_host)
-        root.addWidget(self.geometry_section)
-
-        self.output_section = PropertySection("Output")
-        contract_value = QtWidgets.QLabel(f"{MEASUREMENT_FRAME}\n[F, R, D] · metres")
-        contract_value.setWordWrap(True)
-        contract_value.setToolTip(MEASUREMENT_AXIS_CONTRACT)
-        contract_value.setMinimumHeight(42)
-        contract_value.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        self.output_section.add_row("Frame", contract_value)
-        root.addWidget(self.output_section)
-
-        self.open_advanced_button = QtWidgets.QPushButton("Advanced tools")
-        self.open_advanced_button.setToolTip(
-            "Open Workstation low-level controls and diagnostics."
-        )
         self.open_advanced_button.clicked.connect(self.open_advanced)
-        root.addWidget(self.open_advanced_button)
-        root.addStretch(1)
 
     def refresh(self, context_id: str, status_model: StatusModel) -> None:
         context_id = canonical_context_id(context_id)

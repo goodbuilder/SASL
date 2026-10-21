@@ -189,8 +189,12 @@ values are shown with their PX4 semantic label and raw number. These values reta
 sensor-axis/board-parameter contract and are not converted to NED, ENU, or camera frames.
 The P1/P2 MAG Priority cards also show a bounded read-only `sensor_mag instance → device_id →
 role/CAL_MAG slot` topology map, a priority candidate preview, and the actual
-`vehicle_magnetometer` device. The priority combos remain editable for all roles; candidate and
-actual are deliberately separate and topology refresh never blocks the controls or moves focus.
+`vehicle_magnetometer` device. Priority combos stage edits per side and readback refresh never
+overwrites them; `Discard` restores confirmed PARAM values. Candidate and actual are deliberately
+separate. CAN2 stays editable outside the stock range. A known PX4 1.17 sparse-voter gap blocks
+Apply and names the disabled lower instance; incomplete topology marks the guard unavailable.
+Draft and warning rows use short summaries with detail in tooltips so live text updates do not move
+controls or scroll.
 The IMU magnetometer table shows the three `SCALED_IMU/2/3` rows plus the existing dedicated
 RM3100 `DEBUG_VECT` `CAN1_MAG`/`CAN2_MAG` rows, preserving each row's original topic and unit.
 Stable PX4 Shell `sensor_mag` readback may populate those same RM3100 rows with a
@@ -293,3 +297,11 @@ field data density and long-running finalization remain conditions.
 ## Target reference connection controls
 
 The implemented sessionless location is Data → Status (the legacy Current tab), with TargetReferenceView composed into RecordingWorkspace. It uses the existing compact group/control/table vocabulary: platform/transport, endpoint/baud/SYS/COMP, UDP listen ports, Find Network/Find USB/Cancel, bounded candidate table, Use selected/Connect/Stop/Save, connection state and two fixed receive-status lines. UAM disables live controls while retaining stable group geometry. Long errors and endpoints have detail tooltips. In-place age updates preserve focus, selection and outer scrolling; a newly accepted search clears only its candidate selection.
+
+## Qt Designer layout source
+
+Static Workstation layout is stored in `ui/forms/*.ui` and loaded with PyQt5
+through `ui/designer.py`. The shell and feature/component forms preserve the
+existing workspace, command and resource owners. Custom rendering remains in
+its original widget classes; dynamic models and runtime settings are not form
+data. See [QT_DESIGNER.md](QT_DESIGNER.md) for exact editing and binding rules.

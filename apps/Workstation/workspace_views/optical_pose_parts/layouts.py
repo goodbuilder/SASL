@@ -1,9 +1,10 @@
-"""Qt sizing policies for frozen native previews and current method pages."""
+"""Optical-pose Designer adapters, component bindings and native sizing policies."""
 
 from __future__ import annotations
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 from Workstation.ui.annotation_image_view import AnnotationImageView
+from Workstation.ui.components import EngineeringValue
 
 
 class _FrozenPreviewColumn(QtWidgets.QWidget):
@@ -89,3 +90,107 @@ class _FrozenPreviewGroup(QtWidgets.QGroupBox):
         if desired_height > 0 and self.minimumHeight() != desired_height:
             self.setMinimumHeight(desired_height)
         super().resizeEvent(event)
+
+
+class OpticalPoseValue(EngineeringValue):
+    """Designer promotion adapter for the existing live engineering value."""
+
+    def __init__(self, parent=None):
+        super().__init__("", parent)
+
+
+class FrozenAnnotationView(AnnotationImageView):
+    """Native annotation canvas with the established wheel interaction contract."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent, wheel_zoom_requires_control=False)
+
+
+def bind_component_form(form, owner, owner_name, make_solver_button=None):
+    """Bind form-declared fields to their existing state owner, without copying state."""
+    import json
+
+    # The legacy command factory owns callback wiring. Transfer only presentation
+    # from its Designer slot so the public two-argument factory remains intact.
+    if make_solver_button is not None:
+        for slot in sorted(
+            form.findChildren(QtWidgets.QPushButton),
+            key=lambda button: int(button.property("commandRegistrationOrder") or 0),
+        ):
+            if not slot.property("solverButton") or slot.property("designerCommandBound"):
+                continue
+            button = make_solver_button(slot.property("commandId"), slot.text())
+            button.setObjectName(slot.objectName())
+            # Preserve Designer's editable presentation, including button-specific
+            # properties. Parentage, geometry, visibility and signal connections
+            # belong to the existing runtime/layout owners and are not copied.
+            for property_name in (
+                "text", "font", "palette", "styleSheet", "cursor", "locale",
+                "toolTip", "toolTipDuration", "statusTip", "whatsThis",
+                "accessibleName", "accessibleDescription", "layoutDirection",
+                "focusPolicy", "contextMenuPolicy", "autoFillBackground",
+                "enabled", "minimumSize", "maximumSize", "sizePolicy",
+                "icon", "iconSize", "shortcut", "checkable", "checked",
+                "autoRepeat", "autoRepeatDelay", "autoRepeatInterval",
+                "autoExclusive", "autoDefault", "default", "flat",
+            ):
+                button.setProperty(property_name, slot.property(property_name))
+            for key in slot.dynamicPropertyNames():
+                name = bytes(key).decode()
+                button.setProperty(name, slot.property(name))
+            button.setProperty("designerCommandBound", True)
+            parent = slot.parentWidget()
+            parent.layout().replaceWidget(slot, button)
+            slot.setParent(None)
+            slot.deleteLater()
+
+    for widget in (form, *form.findChildren(QtWidgets.QWidget)):
+        style_name = widget.property("styleObjectName")
+        if style_name:
+            widget.setObjectName(style_name)
+        if isinstance(widget, OpticalPoseValue):
+            widget.label.setText(widget.property("displayLabel") or "")
+        if isinstance(widget, QtWidgets.QComboBox) and widget.property("optionValues"):
+            values = json.loads(widget.property("optionValues"))
+            if len(values) != widget.count():
+                raise ValueError(f"Optical-pose Designer option count mismatch: {widget.objectName()}")
+            for index, value in enumerate(values):
+                widget.setItemData(index, value)
+        if isinstance(widget, QtWidgets.QTableWidget):
+            for column, width in enumerate(json.loads(widget.property("columnWidths") or "[]")):
+                widget.setColumnWidth(column, width)
+            for column, mode in enumerate(json.loads(widget.property("headerResizeModes") or "[]")):
+                widget.horizontalHeader().setSectionResizeMode(column, mode)
+            for row, height in enumerate(json.loads(widget.property("rowHeights") or "[]")):
+                widget.setRowHeight(row, height)
+                for column in range(widget.columnCount()):
+                    if widget.item(row, column) is None:
+                        widget.setItem(row, column, QtWidgets.QTableWidgetItem("--"))
+        for component, field, key in json.loads(widget.property("componentBindings") or "[]"):
+            if component != owner_name:
+                continue
+            if key is None:
+                setattr(owner, field, widget)
+            elif isinstance(key, int):
+                values = getattr(owner, field, None)
+                if values is None:
+                    values = []
+                    setattr(owner, field, values)
+                while len(values) <= key:
+                    values.append(None)
+                values[key] = widget
+            else:
+                values = getattr(owner, field, None)
+                if values is None:
+                    values = {}
+                    setattr(owner, field, values)
+                values[key] = widget
+    return form
+
+
+def load_component_form(name, owner, owner_name, make_solver_button=None):
+    """Load one checked-in component form independent of the working directory."""
+    from Workstation.ui.designer import load_form
+
+    form = load_form(name, None)
+    return bind_component_form(form, owner, owner_name, make_solver_button)

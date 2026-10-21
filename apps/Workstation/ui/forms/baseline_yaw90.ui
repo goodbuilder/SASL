@@ -1,0 +1,625 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+  <class>BaselineYaw90Pane</class>
+  <widget class="QWidget" name="widget1">
+    <property name="minimumSize">
+      <size>
+        <width>0</width>
+        <height>0</height>
+      </size>
+    </property>
+    <property name="maximumSize">
+      <size>
+        <width>16777215</width>
+        <height>16777215</height>
+      </size>
+    </property>
+    <layout class="QVBoxLayout" name="layout2" stretch="0,0,0,0,0,0,0,0,0">
+      <property name="leftMargin">
+        <number>6</number>
+      </property>
+      <property name="topMargin">
+        <number>6</number>
+      </property>
+      <property name="rightMargin">
+        <number>6</number>
+      </property>
+      <property name="bottomMargin">
+        <number>6</number>
+      </property>
+      <property name="spacing">
+        <number>5</number>
+      </property>
+      <item>
+        <layout class="QHBoxLayout" name="layout3" stretch="0,0,1,0">
+          <property name="leftMargin">
+            <number>0</number>
+          </property>
+          <property name="topMargin">
+            <number>0</number>
+          </property>
+          <property name="rightMargin">
+            <number>0</number>
+          </property>
+          <property name="bottomMargin">
+            <number>0</number>
+          </property>
+          <property name="spacing">
+            <number>5</number>
+          </property>
+          <item>
+            <widget class="QPushButton" name="preview_button">
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+              <property name="text">
+                <string>Preview</string>
+              </property>
+              <property name="checkable">
+                <bool>false</bool>
+              </property>
+              <property name="commandId" stdset="0">
+                <string>camera.toggle</string>
+              </property>
+            </widget>
+          </item>
+          <item>
+            <widget class="QCheckBox" name="center_line_checkbox">
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+              <property name="text">
+                <string>Center line</string>
+              </property>
+              <property name="checkable">
+                <bool>true</bool>
+              </property>
+              <property name="legacyObjectName" stdset="0">
+                <string>baselineYaw90CenterLine</string>
+              </property>
+            </widget>
+          </item>
+          <item>
+            <spacer name="spacer6">
+              <property name="orientation">
+                <enum>Qt::Horizontal</enum>
+              </property>
+              <property name="sizeHint">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+            </spacer>
+          </item>
+          <item>
+            <widget class="QPushButton" name="measurement_button">
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+              <property name="text">
+                <string>Measurement로 이동</string>
+              </property>
+              <property name="checkable">
+                <bool>false</bool>
+              </property>
+            </widget>
+          </item>
+        </layout>
+      </item>
+      <item>
+        <widget class="QLabel" name="status">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>24</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>24</height>
+            </size>
+          </property>
+          <property name="text">
+            <string>Live installation · Measurement IDLE · Reverse locked</string>
+          </property>
+          <property name="wordWrap">
+            <bool>false</bool>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::LinksAccessibleByMouse</set>
+          </property>
+          <property name="legacyObjectName" stdset="0">
+            <string>statusStrip</string>
+          </property>
+        </widget>
+      </item>
+      <item>
+        <layout class="QHBoxLayout" name="layout9" stretch="1,1">
+          <property name="leftMargin">
+            <number>0</number>
+          </property>
+          <property name="topMargin">
+            <number>0</number>
+          </property>
+          <property name="rightMargin">
+            <number>0</number>
+          </property>
+          <property name="bottomMargin">
+            <number>0</number>
+          </property>
+          <property name="spacing">
+            <number>5</number>
+          </property>
+          <item>
+            <widget class="QWidget" name="previews_left">
+              <property name="previewSide" stdset="0">
+                <string>left</string>
+              </property>
+              <property name="legacyObjectName" stdset="0">
+                <string>cameraPreview</string>
+              </property>
+            </widget>
+          </item>
+          <item>
+            <widget class="QWidget" name="previews_right">
+              <property name="previewSide" stdset="0">
+                <string>right</string>
+              </property>
+              <property name="legacyObjectName" stdset="0">
+                <string>cameraPreview</string>
+              </property>
+            </widget>
+          </item>
+        </layout>
+      </item>
+      <item>
+        <layout class="QHBoxLayout" name="layout12" stretch="4,5">
+          <property name="leftMargin">
+            <number>0</number>
+          </property>
+          <property name="topMargin">
+            <number>0</number>
+          </property>
+          <property name="rightMargin">
+            <number>0</number>
+          </property>
+          <property name="bottomMargin">
+            <number>0</number>
+          </property>
+          <property name="spacing">
+            <number>5</number>
+          </property>
+          <item>
+            <widget class="QTableWidget" name="attitude_table">
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>78</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>78</height>
+                </size>
+              </property>
+              <property name="rowCount">
+                <number>2</number>
+              </property>
+              <property name="columnCount">
+                <number>5</number>
+              </property>
+              <column>
+                <property name="text">
+                  <string>장치</string>
+                </property>
+              </column>
+              <column>
+                <property name="text">
+                  <string>Roll°</string>
+                </property>
+              </column>
+              <column>
+                <property name="text">
+                  <string>Pitch°</string>
+                </property>
+              </column>
+              <column>
+                <property name="text">
+                  <string>State</string>
+                </property>
+              </column>
+              <column>
+                <property name="text">
+                  <string>Age s</string>
+                </property>
+              </column>
+              <property name="editTriggers">
+                <set>QAbstractItemView::NoEditTriggers</set>
+              </property>
+              <property name="selectionBehavior">
+                <enum>QAbstractItemView::SelectRows</enum>
+              </property>
+              <property name="selectionMode">
+                <enum>QAbstractItemView::SingleSelection</enum>
+              </property>
+              <attribute name="verticalHeaderVisible">
+                <bool>false</bool>
+              </attribute>
+              <attribute name="horizontalHeaderStretchLastSection">
+                <bool>false</bool>
+              </attribute>
+              <property name="legacyObjectName" stdset="0">
+                <string>baselineYaw90AttitudeTable</string>
+              </property>
+              <property name="verticalScrollBarPolicy">
+                <enum>Qt::ScrollBarAlwaysOff</enum>
+              </property>
+            </widget>
+          </item>
+          <item>
+            <widget class="QTableWidget" name="angle_table">
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>102</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>102</height>
+                </size>
+              </property>
+              <property name="rowCount">
+                <number>3</number>
+              </property>
+              <property name="columnCount">
+                <number>4</number>
+              </property>
+              <column>
+                <property name="text">
+                  <string>GNSS 방위·각도</string>
+                </property>
+              </column>
+              <column>
+                <property name="text">
+                  <string>값°</string>
+                </property>
+              </column>
+              <column>
+                <property name="text">
+                  <string>State</string>
+                </property>
+              </column>
+              <column>
+                <property name="text">
+                  <string>Age s</string>
+                </property>
+              </column>
+              <property name="editTriggers">
+                <set>QAbstractItemView::NoEditTriggers</set>
+              </property>
+              <property name="selectionBehavior">
+                <enum>QAbstractItemView::SelectRows</enum>
+              </property>
+              <property name="selectionMode">
+                <enum>QAbstractItemView::SingleSelection</enum>
+              </property>
+              <attribute name="verticalHeaderVisible">
+                <bool>false</bool>
+              </attribute>
+              <attribute name="horizontalHeaderStretchLastSection">
+                <bool>false</bool>
+              </attribute>
+              <property name="legacyObjectName" stdset="0">
+                <string>baselineYaw90AngleTable</string>
+              </property>
+              <property name="verticalScrollBarPolicy">
+                <enum>Qt::ScrollBarAlwaysOff</enum>
+              </property>
+            </widget>
+          </item>
+        </layout>
+      </item>
+      <item>
+        <widget class="QLabel" name="branch_status">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>24</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>24</height>
+            </size>
+          </property>
+          <property name="text">
+            <string>Yaw preview: --° · −90°: --° / +90°: --° · WAITING</string>
+          </property>
+          <property name="wordWrap">
+            <bool>false</bool>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::LinksAccessibleByMouse</set>
+          </property>
+          <property name="legacyObjectName" stdset="0">
+            <string>statusStrip</string>
+          </property>
+        </widget>
+      </item>
+      <item>
+        <layout class="QHBoxLayout" name="layout16" stretch="0,0,0,1">
+          <property name="leftMargin">
+            <number>0</number>
+          </property>
+          <property name="topMargin">
+            <number>0</number>
+          </property>
+          <property name="rightMargin">
+            <number>0</number>
+          </property>
+          <property name="bottomMargin">
+            <number>0</number>
+          </property>
+          <property name="spacing">
+            <number>5</number>
+          </property>
+          <item>
+            <widget class="QCheckBox" name="reverse_checkbox">
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+              <property name="enabled">
+                <bool>false</bool>
+              </property>
+              <property name="text">
+                <string>Reverse baseline yaw branch</string>
+              </property>
+              <property name="checkable">
+                <bool>true</bool>
+              </property>
+              <property name="legacyObjectName" stdset="0">
+                <string>baselineYaw90Reverse</string>
+              </property>
+            </widget>
+          </item>
+          <item>
+            <widget class="QPushButton" name="apply_button">
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+              <property name="enabled">
+                <bool>false</bool>
+              </property>
+              <property name="text">
+                <string>Apply</string>
+              </property>
+              <property name="checkable">
+                <bool>false</bool>
+              </property>
+            </widget>
+          </item>
+          <item>
+            <widget class="QPushButton" name="save_button">
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+              <property name="enabled">
+                <bool>false</bool>
+              </property>
+              <property name="text">
+                <string>Save</string>
+              </property>
+              <property name="checkable">
+                <bool>false</bool>
+              </property>
+            </widget>
+          </item>
+          <item>
+            <widget class="QLabel" name="settings_status">
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+              <property name="text">
+                <string />
+              </property>
+              <property name="wordWrap">
+                <bool>false</bool>
+              </property>
+              <property name="alignment">
+                <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+              </property>
+              <property name="textInteractionFlags">
+                <set>Qt::LinksAccessibleByMouse</set>
+              </property>
+            </widget>
+          </item>
+        </layout>
+      </item>
+      <item alignment="Qt::AlignLeft">
+        <widget class="QToolButton" name="reference_toggle">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+          <property name="text">
+            <string>중앙점 기준 참고 정보</string>
+          </property>
+          <property name="checkable">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+      <item>
+        <widget class="QTableWidget" name="reference_table">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>174</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>174</height>
+            </size>
+          </property>
+          <property name="rowCount">
+            <number>6</number>
+          </property>
+          <property name="columnCount">
+            <number>3</number>
+          </property>
+          <column>
+            <property name="text">
+              <string>GNSS 중앙점 기준</string>
+            </property>
+          </column>
+          <column>
+            <property name="text">
+              <string>값</string>
+            </property>
+          </column>
+          <column>
+            <property name="text">
+              <string>State</string>
+            </property>
+          </column>
+          <property name="editTriggers">
+            <set>QAbstractItemView::NoEditTriggers</set>
+          </property>
+          <property name="selectionBehavior">
+            <enum>QAbstractItemView::SelectRows</enum>
+          </property>
+          <property name="selectionMode">
+            <enum>QAbstractItemView::SingleSelection</enum>
+          </property>
+          <attribute name="verticalHeaderVisible">
+            <bool>false</bool>
+          </attribute>
+          <attribute name="horizontalHeaderStretchLastSection">
+            <bool>false</bool>
+          </attribute>
+          <property name="verticalScrollBarPolicy">
+            <enum>Qt::ScrollBarAlwaysOff</enum>
+          </property>
+        </widget>
+      </item>
+      <item>
+        <widget class="QLabel" name="contract">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+          <property name="text">
+            <string>Azimuth: North=0°, clockwise · ∠Dr–P1–P2 / ∠Dr–P2–P1: horizontal GNSS internal angles. 근거리 Drone 동시 조준은 공통·평행 yaw 정렬 완료를 뜻하지 않습니다.</string>
+          </property>
+          <property name="wordWrap">
+            <bool>true</bool>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::LinksAccessibleByMouse</set>
+          </property>
+          <property name="legacyObjectName" stdset="0">
+            <string>compactContract</string>
+          </property>
+        </widget>
+      </item>
+    </layout>
+  </widget>
+  <resources />
+  <connections />
+</ui>

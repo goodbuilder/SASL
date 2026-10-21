@@ -9,37 +9,14 @@ import math
 import time
 from collections.abc import Mapping
 from PyQt5 import QtCore, QtWidgets
+from .layouts import load_component_form
 
 
 class LiveRelativePose(QtCore.QObject):
     def __init__(self, methods, parent=None):
         super().__init__(parent)
         self._methods = tuple(methods)
-        self.live_rt_group = QtWidgets.QGroupBox("R,t · 실시간")
-        live_layout = QtWidgets.QVBoxLayout(self.live_rt_group)
-        note = QtWidgets.QLabel(
-            "자동 갱신 · R,t: X_right = R × X_left + t · OpenCV RDF (Right, Down, Forward), t 단위 m"
-        )
-        note.setObjectName("compactContract")
-        note.setWordWrap(True)
-        live_layout.addWidget(note)
-        self.live_rt_table = QtWidgets.QTableWidget(2, 5)
-        self.live_rt_table.setObjectName("alignmentLiveRtTable")
-        self.live_rt_table.setHorizontalHeaderLabels(("Method", "R · 3×3", "t · RDF (m)", "State", "Age (s)"))
-        self.live_rt_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.live_rt_table.setWordWrap(False)
-        self.live_rt_table.setTextElideMode(QtCore.Qt.ElideNone)
-        self.live_rt_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.live_rt_table.verticalHeader().hide()
-        self.live_rt_table.horizontalHeader().setStretchLastSection(True)
-        for col, width in enumerate((165, 315, 175, 100, 85)):
-            self.live_rt_table.setColumnWidth(col, width)
-        for row in range(2):
-            self.live_rt_table.setRowHeight(row, 72)
-            for column in range(5):
-                self.live_rt_table.setItem(row, column, QtWidgets.QTableWidgetItem("--"))
-        self.live_rt_table.setFixedHeight(196)
-        live_layout.addWidget(self.live_rt_table)
+        load_component_form("optical_pose_live_reference.ui", self, "live_reference")
         self._live_rt_rows: dict[str, dict[str, object]] = {}
         self.set_live_rt_snapshot({"rows": []})
         self.destroyed.connect(self.live_rt_group.deleteLater)

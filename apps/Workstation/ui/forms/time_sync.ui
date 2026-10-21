@@ -1,0 +1,1022 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+  <class>TimeWorkspace</class>
+  <widget class="QWidget" name="widget1">
+    <property name="minimumSize">
+      <size>
+        <width>0</width>
+        <height>0</height>
+      </size>
+    </property>
+    <property name="maximumSize">
+      <size>
+        <width>16777215</width>
+        <height>16777215</height>
+      </size>
+    </property>
+    <layout class="QVBoxLayout" name="layout2" stretch="0,0,0,0,0,0,1">
+      <property name="leftMargin">
+        <number>8</number>
+      </property>
+      <property name="topMargin">
+        <number>8</number>
+      </property>
+      <property name="rightMargin">
+        <number>8</number>
+      </property>
+      <property name="bottomMargin">
+        <number>8</number>
+      </property>
+      <property name="spacing">
+        <number>6</number>
+      </property>
+      <item>
+        <widget class="QFrame" name="widget3">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+          <layout class="QVBoxLayout" name="layout4" stretch="0,0">
+            <property name="leftMargin">
+              <number>8</number>
+            </property>
+            <property name="topMargin">
+              <number>6</number>
+            </property>
+            <property name="rightMargin">
+              <number>8</number>
+            </property>
+            <property name="bottomMargin">
+              <number>6</number>
+            </property>
+            <property name="spacing">
+              <number>1</number>
+            </property>
+            <item>
+              <widget class="QLabel" name="widget5">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="text">
+                  <string>Clock</string>
+                </property>
+                <property name="wordWrap">
+                  <bool>false</bool>
+                </property>
+                <property name="alignment">
+                  <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+                </property>
+                <property name="textInteractionFlags">
+                  <set>Qt::LinksAccessibleByMouse</set>
+                </property>
+                <property name="legacyObjectName" stdset="0">
+                  <string>workspaceTitle</string>
+                </property>
+              </widget>
+            </item>
+            <item>
+              <widget class="QLabel" name="widget6">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="text">
+                  <string>RTCP/NTP</string>
+                </property>
+                <property name="wordWrap">
+                  <bool>true</bool>
+                </property>
+                <property name="alignment">
+                  <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+                </property>
+                <property name="textInteractionFlags">
+                  <set>Qt::LinksAccessibleByMouse</set>
+                </property>
+                <property name="legacyObjectName" stdset="0">
+                  <string>workspaceSubtitle</string>
+                </property>
+              </widget>
+            </item>
+          </layout>
+          <property name="legacyObjectName" stdset="0">
+            <string>workstationHeader</string>
+          </property>
+        </widget>
+      </item>
+      <item>
+        <widget class="QGroupBox" name="widget7">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+          <property name="title">
+            <string>Clock</string>
+          </property>
+          <layout class="QHBoxLayout" name="layout8" stretch="0,0,1,0,0">
+            <property name="leftMargin">
+              <number>6</number>
+            </property>
+            <property name="topMargin">
+              <number>6</number>
+            </property>
+            <property name="rightMargin">
+              <number>6</number>
+            </property>
+            <property name="bottomMargin">
+              <number>6</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item>
+              <widget class="QPushButton" name="operation_buttons_time_set_pc">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="text">
+                  <string>Set camera clock</string>
+                </property>
+                <property name="commandId" stdset="0">
+                  <string>time.set_pc</string>
+                </property>
+              </widget>
+            </item>
+            <item>
+              <widget class="QPushButton" name="operation_buttons_time_check_sync">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="text">
+                  <string>Check sync</string>
+                </property>
+                <property name="commandId" stdset="0">
+                  <string>time.check_sync</string>
+                </property>
+              </widget>
+            </item>
+            <item>
+              <spacer name="spacer11">
+                <property name="orientation">
+                  <enum>Qt::Horizontal</enum>
+                </property>
+                <property name="sizeHint">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+              </spacer>
+            </item>
+            <item>
+              <widget class="QPushButton" name="operation_buttons_time_apply_settings">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="text">
+                  <string>Apply limits</string>
+                </property>
+                <property name="commandId" stdset="0">
+                  <string>time.apply_settings</string>
+                </property>
+              </widget>
+            </item>
+            <item>
+              <widget class="QPushButton" name="operation_buttons_time_save_settings">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="text">
+                  <string>Save limits</string>
+                </property>
+                <property name="commandId" stdset="0">
+                  <string>time.save_settings</string>
+                </property>
+              </widget>
+            </item>
+          </layout>
+        </widget>
+      </item>
+      <item>
+        <widget class="QGroupBox" name="widget14">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+          <property name="title">
+            <string>Sync status</string>
+          </property>
+          <layout class="QVBoxLayout" name="layout15" stretch="0,0,0">
+            <property name="leftMargin">
+              <number>9</number>
+            </property>
+            <property name="topMargin">
+              <number>9</number>
+            </property>
+            <property name="rightMargin">
+              <number>9</number>
+            </property>
+            <property name="bottomMargin">
+              <number>9</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item>
+              <layout class="QHBoxLayout" name="layout16" stretch="1,1">
+                <property name="leftMargin">
+                  <number>0</number>
+                </property>
+                <property name="topMargin">
+                  <number>0</number>
+                </property>
+                <property name="rightMargin">
+                  <number>0</number>
+                </property>
+                <property name="bottomMargin">
+                  <number>0</number>
+                </property>
+                <property name="spacing">
+                  <number>6</number>
+                </property>
+                <item>
+                  <widget class="QLabel" name="sync_status">
+                    <property name="minimumSize">
+                      <size>
+                        <width>0</width>
+                        <height>0</height>
+                      </size>
+                    </property>
+                    <property name="maximumSize">
+                      <size>
+                        <width>16777215</width>
+                        <height>16777215</height>
+                      </size>
+                    </property>
+                    <property name="text">
+                      <string>Waiting for RTCP/NTP</string>
+                    </property>
+                    <property name="wordWrap">
+                      <bool>true</bool>
+                    </property>
+                    <property name="alignment">
+                      <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+                    </property>
+                    <property name="textInteractionFlags">
+                      <set>Qt::TextSelectableByMouse</set>
+                    </property>
+                    <property name="legacyObjectName" stdset="0">
+                      <string>statusStrip</string>
+                    </property>
+                  </widget>
+                </item>
+                <item>
+                  <widget class="QLabel" name="sync_reason">
+                    <property name="minimumSize">
+                      <size>
+                        <width>0</width>
+                        <height>0</height>
+                      </size>
+                    </property>
+                    <property name="maximumSize">
+                      <size>
+                        <width>16777215</width>
+                        <height>16777215</height>
+                      </size>
+                    </property>
+                    <property name="text">
+                      <string />
+                    </property>
+                    <property name="wordWrap">
+                      <bool>true</bool>
+                    </property>
+                    <property name="alignment">
+                      <set>Qt::AlignRight|Qt::AlignVCenter</set>
+                    </property>
+                    <property name="textInteractionFlags">
+                      <set>Qt::TextSelectableByMouse</set>
+                    </property>
+                    <property name="legacyObjectName" stdset="0">
+                      <string>statusReason</string>
+                    </property>
+                  </widget>
+                </item>
+              </layout>
+            </item>
+            <item>
+              <widget class="QLabel" name="schedule_status">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="text">
+                  <string>STUS schedule: MANUAL · manual seed required</string>
+                </property>
+                <property name="wordWrap">
+                  <bool>true</bool>
+                </property>
+                <property name="alignment">
+                  <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+                </property>
+                <property name="textInteractionFlags">
+                  <set>Qt::TextSelectableByMouse</set>
+                </property>
+                <property name="legacyObjectName" stdset="0">
+                  <string>statusStrip</string>
+                </property>
+              </widget>
+            </item>
+            <item>
+              <widget class="QPlainTextEdit" name="sync_summary">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>200</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>200</height>
+                  </size>
+                </property>
+                <property name="readOnly">
+                  <bool>true</bool>
+                </property>
+                <property name="maximumBlockCount">
+                  <number>80</number>
+                </property>
+              </widget>
+            </item>
+          </layout>
+        </widget>
+      </item>
+      <item>
+        <widget class="QGroupBox" name="widget21">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+          <property name="title">
+            <string>Sync limits</string>
+          </property>
+          <layout class="QGridLayout" name="layout22" columnstretch="0,1,0,1">
+            <property name="leftMargin">
+              <number>9</number>
+            </property>
+            <property name="topMargin">
+              <number>9</number>
+            </property>
+            <property name="rightMargin">
+              <number>9</number>
+            </property>
+            <property name="bottomMargin">
+              <number>9</number>
+            </property>
+            <property name="spacing">
+              <number>-1</number>
+            </property>
+            <item row="0" column="0" rowspan="1" colspan="1">
+              <widget class="QLabel" name="widget23">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="text">
+                  <string>History</string>
+                </property>
+                <property name="wordWrap">
+                  <bool>false</bool>
+                </property>
+                <property name="alignment">
+                  <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+                </property>
+                <property name="textInteractionFlags">
+                  <set>Qt::LinksAccessibleByMouse</set>
+                </property>
+              </widget>
+            </item>
+            <item row="0" column="1" rowspan="1" colspan="1">
+              <widget class="QDoubleSpinBox" name="settings_widgets_camera_sync_history_window_s">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="minimum">
+                  <double>0.1</double>
+                </property>
+                <property name="maximum">
+                  <double>5.0</double>
+                </property>
+                <property name="singleStep">
+                  <double>1.0</double>
+                </property>
+                <property name="suffix">
+                  <string> s</string>
+                </property>
+                <property name="decimals">
+                  <number>2</number>
+                </property>
+              </widget>
+            </item>
+            <item row="0" column="2" rowspan="1" colspan="1">
+              <widget class="QLabel" name="widget25">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="text">
+                  <string>Receive skew</string>
+                </property>
+                <property name="wordWrap">
+                  <bool>false</bool>
+                </property>
+                <property name="alignment">
+                  <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+                </property>
+                <property name="textInteractionFlags">
+                  <set>Qt::LinksAccessibleByMouse</set>
+                </property>
+              </widget>
+            </item>
+            <item row="0" column="3" rowspan="1" colspan="1">
+              <widget class="QDoubleSpinBox" name="settings_widgets_camera_sync_receive_pair_max_delta_ms">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="minimum">
+                  <double>0.0</double>
+                </property>
+                <property name="maximum">
+                  <double>2000.0</double>
+                </property>
+                <property name="singleStep">
+                  <double>1.0</double>
+                </property>
+                <property name="suffix">
+                  <string> ms</string>
+                </property>
+                <property name="decimals">
+                  <number>1</number>
+                </property>
+              </widget>
+            </item>
+            <item row="1" column="0" rowspan="1" colspan="1">
+              <widget class="QLabel" name="widget27">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="text">
+                  <string>L/R RTCP Δt gate</string>
+                </property>
+                <property name="wordWrap">
+                  <bool>false</bool>
+                </property>
+                <property name="alignment">
+                  <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+                </property>
+                <property name="textInteractionFlags">
+                  <set>Qt::LinksAccessibleByMouse</set>
+                </property>
+              </widget>
+            </item>
+            <item row="1" column="1" rowspan="1" colspan="1">
+              <widget class="QDoubleSpinBox" name="settings_widgets_camera_sync_rtcp_pair_max_delta_ms">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="minimum">
+                  <double>0.0</double>
+                </property>
+                <property name="maximum">
+                  <double>1000.0</double>
+                </property>
+                <property name="singleStep">
+                  <double>1.0</double>
+                </property>
+                <property name="suffix">
+                  <string> ms</string>
+                </property>
+                <property name="decimals">
+                  <number>1</number>
+                </property>
+              </widget>
+            </item>
+            <item row="1" column="2" rowspan="1" colspan="1">
+              <widget class="QLabel" name="widget29">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="text">
+                  <string>SR stale</string>
+                </property>
+                <property name="wordWrap">
+                  <bool>false</bool>
+                </property>
+                <property name="alignment">
+                  <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+                </property>
+                <property name="textInteractionFlags">
+                  <set>Qt::LinksAccessibleByMouse</set>
+                </property>
+              </widget>
+            </item>
+            <item row="1" column="3" rowspan="1" colspan="1">
+              <widget class="QDoubleSpinBox" name="settings_widgets_camera_sync_max_sr_age_s">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="minimum">
+                  <double>0.1</double>
+                </property>
+                <property name="maximum">
+                  <double>60.0</double>
+                </property>
+                <property name="singleStep">
+                  <double>1.0</double>
+                </property>
+                <property name="suffix">
+                  <string> s</string>
+                </property>
+                <property name="decimals">
+                  <number>2</number>
+                </property>
+              </widget>
+            </item>
+            <item row="2" column="0" rowspan="1" colspan="1">
+              <widget class="QLabel" name="widget31">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="text">
+                  <string>SR-PC diagnostic</string>
+                </property>
+                <property name="wordWrap">
+                  <bool>false</bool>
+                </property>
+                <property name="alignment">
+                  <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+                </property>
+                <property name="textInteractionFlags">
+                  <set>Qt::LinksAccessibleByMouse</set>
+                </property>
+              </widget>
+            </item>
+            <item row="2" column="1" rowspan="1" colspan="1">
+              <widget class="QDoubleSpinBox" name="settings_widgets_camera_sync_max_pc_offset_ms">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="minimum">
+                  <double>0.0</double>
+                </property>
+                <property name="maximum">
+                  <double>5000.0</double>
+                </property>
+                <property name="singleStep">
+                  <double>1.0</double>
+                </property>
+                <property name="suffix">
+                  <string> ms</string>
+                </property>
+                <property name="decimals">
+                  <number>1</number>
+                </property>
+              </widget>
+            </item>
+            <item row="2" column="2" rowspan="1" colspan="1">
+              <widget class="QLabel" name="widget33">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="text">
+                  <string>Clock rate error</string>
+                </property>
+                <property name="wordWrap">
+                  <bool>false</bool>
+                </property>
+                <property name="alignment">
+                  <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+                </property>
+                <property name="textInteractionFlags">
+                  <set>Qt::LinksAccessibleByMouse</set>
+                </property>
+              </widget>
+            </item>
+            <item row="2" column="3" rowspan="1" colspan="1">
+              <widget class="QDoubleSpinBox" name="settings_widgets_camera_sync_clock_rate_error_pct">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="minimum">
+                  <double>0.0</double>
+                </property>
+                <property name="maximum">
+                  <double>10.0</double>
+                </property>
+                <property name="singleStep">
+                  <double>1.0</double>
+                </property>
+                <property name="suffix">
+                  <string> %</string>
+                </property>
+                <property name="decimals">
+                  <number>3</number>
+                </property>
+              </widget>
+            </item>
+            <item row="3" column="0" rowspan="1" colspan="1">
+              <widget class="QLabel" name="widget35">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="text">
+                  <string>Required SR</string>
+                </property>
+                <property name="wordWrap">
+                  <bool>false</bool>
+                </property>
+                <property name="alignment">
+                  <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+                </property>
+                <property name="textInteractionFlags">
+                  <set>Qt::LinksAccessibleByMouse</set>
+                </property>
+              </widget>
+            </item>
+            <item row="3" column="1" rowspan="1" colspan="1">
+              <widget class="QSpinBox" name="settings_widgets_camera_sync_required_sr_count">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="minimum">
+                  <number>1</number>
+                </property>
+                <property name="maximum">
+                  <number>20</number>
+                </property>
+                <property name="singleStep">
+                  <number>1</number>
+                </property>
+                <property name="suffix">
+                  <string> count</string>
+                </property>
+              </widget>
+            </item>
+            <item row="3" column="2" rowspan="1" colspan="1">
+              <widget class="QLabel" name="widget37">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="text">
+                  <string>Warmup</string>
+                </property>
+                <property name="wordWrap">
+                  <bool>false</bool>
+                </property>
+                <property name="alignment">
+                  <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+                </property>
+                <property name="textInteractionFlags">
+                  <set>Qt::LinksAccessibleByMouse</set>
+                </property>
+              </widget>
+            </item>
+            <item row="3" column="3" rowspan="1" colspan="1">
+              <widget class="QDoubleSpinBox" name="settings_widgets_camera_sync_warmup_timeout_s">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="minimum">
+                  <double>1.0</double>
+                </property>
+                <property name="maximum">
+                  <double>120.0</double>
+                </property>
+                <property name="singleStep">
+                  <double>1.0</double>
+                </property>
+                <property name="suffix">
+                  <string> s</string>
+                </property>
+                <property name="decimals">
+                  <number>1</number>
+                </property>
+              </widget>
+            </item>
+          </layout>
+        </widget>
+      </item>
+      <item>
+        <widget class="QLabel" name="sync_settings_status">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+          <property name="text">
+            <string>Sync limits apply now; Save keeps them for the next run.</string>
+          </property>
+          <property name="wordWrap">
+            <bool>true</bool>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::LinksAccessibleByMouse</set>
+          </property>
+          <property name="legacyObjectName" stdset="0">
+            <string>statusStrip</string>
+          </property>
+        </widget>
+      </item>
+      <item>
+        <widget class="QLabel" name="widget40">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+          <property name="text">
+            <string>RTCP/NTP timestamps</string>
+          </property>
+          <property name="wordWrap">
+            <bool>false</bool>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::LinksAccessibleByMouse</set>
+          </property>
+          <property name="legacyObjectName" stdset="0">
+            <string>compactContract</string>
+          </property>
+        </widget>
+      </item>
+      <item>
+        <spacer name="spacer41">
+          <property name="orientation">
+            <enum>Qt::Vertical</enum>
+          </property>
+          <property name="sizeHint">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+        </spacer>
+      </item>
+    </layout>
+  </widget>
+  <resources />
+  <connections />
+</ui>

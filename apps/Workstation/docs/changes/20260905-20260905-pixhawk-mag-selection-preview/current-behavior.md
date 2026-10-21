@@ -38,3 +38,30 @@ The older `Px4MagManager.use_rm3100_for_yaw()` helper sets non-target slots to z
 packet does not change that legacy helper's command semantics. The new UI preview must not
 claim that PARAM priority alone proves active selection. Existing tests cover active-device
 verification, but not five-instance topology prediction or the post-removal instance-3 case.
+
+## 2026-10-12 follow-up baseline
+
+The visible Pixhawk workspace refreshes at the 4 Hz status cadence. When cached MAG status exists,
+`_refresh_mag_priority_group()` writes cached slot priorities into every combo on each refresh.
+`mag_priority_payload()` then reads those same combo values when Apply is invoked. There is no
+staged/dirty editor state, so a changed value can be silently reverted before Apply. The existing
+UI test reads the payload immediately after an edit and does not refresh between those actions.
+
+The integer PARAM write sends once and returns `None` when no matching `PARAM_VALUE` arrives;
+unlike PARAM reads, it has no retry. The worker stops at the first mismatch, so earlier slots can
+remain changed. The Apply failure handler leaves cached MAG status intact, which can present old
+values after a partial write. MAVLink specifies retrying PARAM_SET when its response times out.
+
+The existing PX4 v1.17 preview predicts highest priority but does not report the sparse voter
+failure when a higher `sensor_mag` instance is enabled while a known lower instance is priority 0.
+The authoritative P1/P2 notes document this condition and the `Min (1)` filler workaround. No
+current hardware session was opened for this follow-up; firmware/runtime acceptance remains
+hardware-manual and outside this code-only authorization.
+
+## Concurrent UI form migration observed during implementation
+
+While this follow-up was in progress, the active `20261012-qt-designer-ui` packet converted the
+Pixhawk MagnetometerView markup to the shared `pixhawk_magnetometers.ui` form. The MAG fix now
+binds draft/busy behavior to that form's existing controls; it does not edit the form resources or
+the other packet's Settings/MainWindow work. The focused Qt tests ran against this form-based
+worktree. Live visual review of the migration remains unverified.

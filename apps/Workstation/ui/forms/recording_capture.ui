@@ -1,0 +1,165 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>recordingCapture</class>
+ <widget class="QGroupBox" name="recordingCapture">
+  <property name="title">
+   <string>Capture evidence</string>
+  </property>
+  <layout class="QGridLayout" name="recordingCaptureLayout">
+   <item row="0" column="0" rowspan="1" colspan="2">
+    <widget class="QWidget" name="valuesHost">
+     <layout class="QGridLayout" name="valuesLayout">
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+     </layout>
+    </widget>
+   </item>
+   <item row="3" column="0" rowspan="1" colspan="2">
+    <widget class="QWidget" name="controlsHost">
+     <layout class="QHBoxLayout" name="controlsLayout">
+      <item>
+       <widget class="QLabel" name="purposeLabel">
+        <property name="text">
+         <string>HR purpose</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QComboBox" name="hrCapturePurpose" />
+      </item>
+      <item>
+       <widget class="QPushButton" name="captureHr">
+        <property name="text">
+         <string>Capture HR Still</string>
+        </property>
+        <property name="toolTip">
+         <string>Sends SIHR TRUE, CPTR, and ICPT to both cameras. Photos remain in camera internal storage. The chosen Pre/Post/Checkpoint purpose is recorded with the capture event; image import is a later, explicit evidence action.</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="captureOz">
+        <property name="text">
+         <string>Capture OZ Still</string>
+        </property>
+        <property name="toolTip">
+         <string>Sends SIVI TRUE, CPTR, and ICPT to both cameras for a separate visible/OZ still. It is stored on the camera independently from the recorded RTSP video.</string>
+        </property>
+       </widget>
+      </item>
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+     </layout>
+    </widget>
+   </item>
+   <item row="4" column="0" rowspan="1" colspan="2">
+    <widget class="QLabel" name="hrStatus">
+     <property name="text">
+      <string>Capture HR Still: camera-internal storage · select event, then import exact left/right files</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item row="5" column="0" rowspan="1" colspan="2">
+    <widget class="QLabel" name="ozStatus">
+     <property name="text">
+      <string>Capture OZ Still: camera-internal FHD still · separate from recorded RTSP video</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item row="6" column="0" rowspan="1" colspan="2">
+    <widget class="QTableView" name="hrCaptureEventTable">
+     <property name="editTriggers">
+      <enum>QAbstractItemView::NoEditTriggers</enum>
+     </property>
+     <property name="selectionBehavior">
+      <enum>QAbstractItemView::SelectRows</enum>
+     </property>
+     <property name="selectionMode">
+      <enum>QAbstractItemView::SingleSelection</enum>
+     </property>
+     <property name="maximumHeight">
+      <number>112</number>
+     </property>
+     <attribute name="verticalHeaderVisible">
+      <bool>false</bool>
+     </attribute>
+     <attribute name="horizontalHeaderStretchLastSection">
+      <bool>true</bool>
+     </attribute>
+    </widget>
+   </item>
+   <item row="7" column="0" rowspan="1" colspan="2">
+    <widget class="QWidget" name="importHost">
+     <layout class="QHBoxLayout" name="importLayout">
+      <item>
+       <widget class="QPushButton" name="importLeft">
+        <property name="text">
+         <string>Import selected Left HR</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="importRight">
+        <property name="text">
+         <string>Import selected Right HR</string>
+        </property>
+       </widget>
+      </item>
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+     </layout>
+    </widget>
+   </item>
+   <property name="leftMargin">
+    <number>6</number>
+   </property>
+   <property name="topMargin">
+    <number>6</number>
+   </property>
+   <property name="rightMargin">
+    <number>6</number>
+   </property>
+   <property name="bottomMargin">
+    <number>6</number>
+   </property>
+  </layout>
+ </widget>
+ <resources />
+ <connections />
+</ui>

@@ -8,6 +8,7 @@ an acceptable implicit default.
 
 from __future__ import annotations
 
+import copy
 import bisect
 import math
 from dataclasses import dataclass
@@ -119,6 +120,42 @@ def interpolate_reference(samples: Sequence[Mapping[str, object]], elapsed_s: fl
         raise ValueError("reference time must be finite")
     if any(right <= left for left, right in zip(times, times[1:])):
         raise ValueError("reference times must increase strictly")
+    return _interpolate_validated_reference(samples, times, t)
+
+
+class PreparedReference:
+    """Immutable owned reference snapshot, validated once before flight.
+
+    Sampling performs a binary search and the same ENU linear interpolation as
+    interpolate_reference. Preparation rejects malformed rows before arming.
+    """
+    def __init__(self, samples: Sequence[Mapping[str, object]]):
+        if not samples:
+            raise ValueError("reference has no samples")
+        self._samples = tuple(copy.deepcopy(dict(row)) for row in samples)
+        self._times = tuple(float(row["t_science_s"]) for row in self._samples)
+        if not all(math.isfinite(value) for value in self._times):
+            raise ValueError("reference time must be finite")
+        if any(right <= left for left, right in zip(self._times, self._times[1:])):
+            raise ValueError("reference times must increase strictly")
+        for row in self._samples:
+            for name in ("position_world_enu_m", "velocity_world_enu_mps", "acceleration_world_enu_mps2"):
+                values = row[name]
+                if not isinstance(values, (list, tuple)) or len(values) != 3:
+                    raise ValueError(f"{name} must contain three ENU components")
+                for value in values:
+                    _finite(value, name)
+            _finite(row["heading_deg_clockwise_from_north"], "heading")
+
+    def sample(self, elapsed_s: float) -> dict:
+        result = _interpolate_validated_reference(
+            self._samples, self._times, _finite(elapsed_s, "elapsed science time"))
+        # Exact endpoints retain metadata and list/tuple types without exposing
+        # the owned validated reference to mutation by callers.
+        return copy.deepcopy(result)
+
+
+def _interpolate_validated_reference(samples, times, t) -> dict:
     if t < times[0] or t > times[-1]:
         raise ValueError("science time is outside reference")
     index = bisect.bisect_left(times, t)

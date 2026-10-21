@@ -1,0 +1,54 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>measurementComparison</class>
+ <widget class="QGroupBox" name="measurementComparison">
+  <property name="title">
+   <string>Extrinsics 분석 미리보기 (F/R/D/Rg)</string>
+  </property>
+  <layout class="QVBoxLayout" name="measurementComparisonLayout">
+   <item>
+    <widget class="QLabel" name="note">
+     <property name="text">
+      <string>동일 좌/우 검출 픽셀에 대해 각 외부 파라미터 소스로 계산한 결과 미리보기 · 이 표는 분석 미리보기입니다. 위 Method 비교 표는 실제 pair별 계산 기록을 표시합니다.</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QTableView" name="table">
+     <property name="editTriggers">
+      <enum>QAbstractItemView::NoEditTriggers</enum>
+     </property>
+     <property name="selectionBehavior">
+      <enum>QAbstractItemView::SelectRows</enum>
+     </property>
+     <property name="maximumHeight">
+      <number>220</number>
+     </property>
+     <attribute name="verticalHeaderVisible">
+      <bool>false</bool>
+     </attribute>
+     <attribute name="horizontalHeaderStretchLastSection">
+      <bool>true</bool>
+     </attribute>
+    </widget>
+   </item>
+   <property name="leftMargin">
+    <number>6</number>
+   </property>
+   <property name="topMargin">
+    <number>6</number>
+   </property>
+   <property name="rightMargin">
+    <number>6</number>
+   </property>
+   <property name="bottomMargin">
+    <number>6</number>
+   </property>
+  </layout>
+ </widget>
+ <resources />
+ <connections />
+</ui>

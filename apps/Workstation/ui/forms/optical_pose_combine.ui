@@ -1,0 +1,319 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>OpticalPoseForm</class>
+ <widget class="QWidget" name="QWidget">
+  <layout class="QVBoxLayout" name="QVBoxLayout" stretch="0,0,0,0,0,0,0,0,0,0,1">
+   <property name="leftMargin">
+    <number>6</number>
+   </property>
+   <property name="topMargin">
+    <number>6</number>
+   </property>
+   <property name="rightMargin">
+    <number>6</number>
+   </property>
+   <property name="bottomMargin">
+    <number>6</number>
+   </property>
+   <property name="spacing">
+    <number>6</number>
+   </property>
+   <item>
+    <widget class="QLabel" name="compactContract">
+     <property name="text">
+      <string>Compose explicitly selected non-overlapping candidate axes into one immutable candidate.</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="compactContract_2">
+     <property name="styleObjectName" stdset="0">
+      <string>compactContract</string>
+     </property>
+     <property name="text">
+      <string>Compose only non-overlapping axes observable on both camera sides with shared prior/K,D</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="method_information_labels_Combine">
+     <property name="componentBindings" stdset="0">
+      <string>[["methods", "method_information_labels", "Combine"]]</string>
+     </property>
+     <property name="styleObjectName" stdset="0">
+      <string>statusStrip</string>
+     </property>
+     <property name="text">
+      <string>Combine readiness · candidates=0 · combined=--</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="method_detail_labels_Combine">
+     <property name="componentBindings" stdset="0">
+      <string>[["methods", "method_detail_labels", "Combine"]]</string>
+     </property>
+     <property name="styleObjectName" stdset="0">
+      <string>compactContract</string>
+     </property>
+     <property name="text">
+      <string>sources=-- · axes must be non-overlapping and observable on both sides</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="compactContract_3">
+     <property name="styleObjectName" stdset="0">
+      <string>compactContract</string>
+     </property>
+     <property name="text">
+      <string>Check at least two immutable candidates. A typical use is Horizon R/P + Drone RTK Yaw: the first contributes Roll/Pitch and the second contributes Yaw. Candidates with overlapping DOF, different explicit priors, or different exact K,D are rejected by the owner.</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QListWidget" name="combine_candidate_list">
+     <property name="componentBindings" stdset="0">
+      <string>[["candidates", "combine_candidate_list", null]]</string>
+     </property>
+     <property name="styleObjectName" stdset="0">
+      <string>opticalPoseCombineCandidateList</string>
+     </property>
+     <property name="toolTip">
+      <string>Explicit source candidates for the combined pose. Check each source; the owner retains their IDs, hashes, shared prior, and quality evidence.</string>
+     </property>
+     <property name="minimumSize">
+      <size>
+       <width>0</width>
+       <height>82</height>
+      </size>
+     </property>
+     <property name="maximumSize">
+      <size>
+       <width>16777215</width>
+       <height>160</height>
+      </size>
+     </property>
+     <property name="editTriggers">
+      <set>QAbstractItemView::DoubleClicked|QAbstractItemView::EditKeyPressed</set>
+     </property>
+     <property name="selectionMode">
+      <enum>QAbstractItemView::NoSelection</enum>
+     </property>
+     <property name="selectionBehavior">
+      <enum>QAbstractItemView::SelectItems</enum>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="compactContract_4">
+     <property name="styleObjectName" stdset="0">
+      <string>compactContract</string>
+     </property>
+     <property name="text">
+      <string>Per checked candidate, which axes it contributes to the combined pose. Defaults to every axis that candidate actually observed; uncheck an axis to exclude it (e.g. take only Checkerboard's translation while Horizon supplies Roll/Pitch). An axis checked by more than one candidate blocks the build below until resolved.</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QTableWidget" name="combine_dof_table">
+     <property name="componentBindings" stdset="0">
+      <string>[["candidates", "combine_dof_table", null]]</string>
+     </property>
+     <property name="styleObjectName" stdset="0">
+      <string>opticalPoseCombineDofTable</string>
+     </property>
+     <property name="minimumSize">
+      <size>
+       <width>0</width>
+       <height>82</height>
+      </size>
+     </property>
+     <property name="maximumSize">
+      <size>
+       <width>16777215</width>
+       <height>160</height>
+      </size>
+     </property>
+     <property name="editTriggers">
+      <set>QAbstractItemView::NoEditTriggers</set>
+     </property>
+     <property name="selectionMode">
+      <enum>QAbstractItemView::ExtendedSelection</enum>
+     </property>
+     <property name="selectionBehavior">
+      <enum>QAbstractItemView::SelectItems</enum>
+     </property>
+     <property name="rowCount">
+      <number>0</number>
+     </property>
+     <property name="columnCount">
+      <number>7</number>
+     </property>
+     <property name="alternatingRowColors">
+      <bool>false</bool>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+     <column>
+      <property name="text">
+       <string>Candidate</string>
+      </property>
+     </column>
+     <column>
+      <property name="text">
+       <string>Roll</string>
+      </property>
+     </column>
+     <column>
+      <property name="text">
+       <string>Pitch</string>
+      </property>
+     </column>
+     <column>
+      <property name="text">
+       <string>Yaw</string>
+      </property>
+     </column>
+     <column>
+      <property name="text">
+       <string>N</string>
+      </property>
+     </column>
+     <column>
+      <property name="text">
+       <string>E</string>
+      </property>
+     </column>
+     <column>
+      <property name="text">
+       <string>D</string>
+      </property>
+     </column>
+     <property name="columnWidths" stdset="0">
+      <string>[394, 41, 53, 42, 36, 36, 36]</string>
+     </property>
+     <property name="headerResizeModes" stdset="0">
+      <string>[1, 3, 3, 3, 3, 3, 3]</string>
+     </property>
+     <property name="rowHeights" stdset="0">
+      <string>[]</string>
+     </property>
+     <attribute name="verticalHeaderVisible">
+      <bool>false</bool>
+     </attribute>
+     <attribute name="horizontalHeaderStretchLastSection">
+      <bool>false</bool>
+     </attribute>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="combine_candidate_status">
+     <property name="componentBindings" stdset="0">
+      <string>[["candidates", "combine_candidate_status", null]]</string>
+     </property>
+     <property name="styleObjectName" stdset="0">
+      <string>statusStrip</string>
+     </property>
+     <property name="text">
+      <string>No candidates checked · select at least two</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <layout class="QHBoxLayout" name="QHBoxLayout" stretch="0,1">
+     <property name="leftMargin">
+      <number>0</number>
+     </property>
+     <property name="topMargin">
+      <number>0</number>
+     </property>
+     <property name="rightMargin">
+      <number>0</number>
+     </property>
+     <property name="bottomMargin">
+      <number>0</number>
+     </property>
+     <property name="spacing">
+      <number>6</number>
+     </property>
+     <item>
+      <widget class="QPushButton" name="combine_button">
+       <property name="componentBindings" stdset="0">
+        <string>[["candidates", "combine_button", null]]</string>
+       </property>
+       <property name="toolTip">
+        <string>Combine explicitly checked candidates only when they share the same prior and exact operating K,D profile and optimize non-overlapping DOF. This creates a new candidate; it does not apply the pose automatically.</string>
+       </property>
+       <property name="enabled">
+        <bool>false</bool>
+       </property>
+       <property name="text">
+        <string>Build combined candidate</string>
+       </property>
+       <property name="commandId" stdset="0">
+        <string>alignment.pose.solve_combined</string>
+       </property>
+       <property name="solverButton" stdset="0">
+        <bool>true</bool>
+       </property>
+       <property name="commandRegistrationOrder" stdset="0">
+        <number>14</number>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <spacer name="spacer_13">
+       <property name="orientation">
+        <enum>Qt::Horizontal</enum>
+       </property>
+       <property name="sizeHint">
+        <size>
+         <width>0</width>
+         <height>0</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <spacer name="spacer_14">
+     <property name="orientation">
+      <enum>Qt::Vertical</enum>
+     </property>
+     <property name="sizeHint">
+      <size>
+       <width>0</width>
+       <height>0</height>
+      </size>
+     </property>
+    </spacer>
+   </item>
+  </layout>
+ </widget>
+ <resources />
+ <connections />
+</ui>

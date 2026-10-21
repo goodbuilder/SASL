@@ -1,0 +1,155 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>OpticalPoseForm</class>
+ <widget class="QGroupBox" name="readiness_group">
+  <property name="componentBindings" stdset="0">
+   <string>[["methods", "readiness_group", null]]</string>
+  </property>
+  <property name="title">
+   <string>Readiness</string>
+  </property>
+  <layout class="QGridLayout" name="QGridLayout">
+   <property name="leftMargin">
+    <number>6</number>
+   </property>
+   <property name="topMargin">
+    <number>6</number>
+   </property>
+   <property name="rightMargin">
+    <number>6</number>
+   </property>
+   <property name="bottomMargin">
+    <number>6</number>
+   </property>
+   <property name="spacing">
+    <number>6</number>
+   </property>
+   <item row="0" column="0" rowspan="1" colspan="1">
+    <widget class="OpticalPoseValue" name="readiness_values_state">
+     <property name="componentBindings" stdset="0">
+      <string>[["methods", "readiness_values", "state"]]</string>
+     </property>
+     <property name="toolTip">
+      <string>From: optical pose owner snapshot</string>
+     </property>
+     <property name="displayLabel" stdset="0">
+      <string>Pose state</string>
+     </property>
+    </widget>
+   </item>
+   <item row="0" column="1" rowspan="1" colspan="1">
+    <widget class="OpticalPoseValue" name="readiness_values_operating_zoom">
+     <property name="componentBindings" stdset="0">
+      <string>[["methods", "readiness_values", "operating_zoom"]]</string>
+     </property>
+     <property name="toolTip">
+      <string>From: optical pose owner snapshot</string>
+     </property>
+     <property name="displayLabel" stdset="0">
+      <string>Operating zoom L/R</string>
+     </property>
+    </widget>
+   </item>
+   <item row="1" column="0" rowspan="1" colspan="1">
+    <widget class="OpticalPoseValue" name="readiness_values_intrinsics">
+     <property name="componentBindings" stdset="0">
+      <string>[["methods", "readiness_values", "intrinsics"]]</string>
+     </property>
+     <property name="toolTip">
+      <string>From: optical pose owner snapshot</string>
+     </property>
+     <property name="displayLabel" stdset="0">
+      <string>Exact K,D</string>
+     </property>
+    </widget>
+   </item>
+   <item row="1" column="1" rowspan="1" colspan="1">
+    <widget class="OpticalPoseValue" name="readiness_values_base_extrinsics">
+     <property name="componentBindings" stdset="0">
+      <string>[["methods", "readiness_values", "base_extrinsics"]]</string>
+     </property>
+     <property name="toolTip">
+      <string>From: optical pose owner snapshot</string>
+     </property>
+     <property name="displayLabel" stdset="0">
+      <string>Base R,t</string>
+     </property>
+    </widget>
+   </item>
+   <item row="2" column="0" rowspan="1" colspan="1">
+    <widget class="OpticalPoseValue" name="readiness_values_mountain_uv">
+     <property name="componentBindings" stdset="0">
+      <string>[["methods", "readiness_values", "mountain_uv"]]</string>
+     </property>
+     <property name="toolTip">
+      <string>From: optical pose owner snapshot</string>
+     </property>
+     <property name="displayLabel" stdset="0">
+      <string>Mountain u,v</string>
+     </property>
+    </widget>
+   </item>
+   <item row="2" column="1" rowspan="1" colspan="1">
+    <widget class="OpticalPoseValue" name="readiness_values_terrain">
+     <property name="componentBindings" stdset="0">
+      <string>[["methods", "readiness_values", "terrain"]]</string>
+     </property>
+     <property name="toolTip">
+      <string>From: optical pose owner snapshot</string>
+     </property>
+     <property name="displayLabel" stdset="0">
+      <string>Terrain GeoTIFF</string>
+     </property>
+    </widget>
+   </item>
+   <item row="3" column="0" rowspan="1" colspan="1">
+    <widget class="OpticalPoseValue" name="readiness_values_target_reference">
+     <property name="componentBindings" stdset="0">
+      <string>[["methods", "readiness_values", "target_reference"]]</string>
+     </property>
+     <property name="toolTip">
+      <string>From: optical pose owner snapshot</string>
+     </property>
+     <property name="displayLabel" stdset="0">
+      <string>Target reference</string>
+     </property>
+    </widget>
+   </item>
+   <item row="3" column="1" rowspan="1" colspan="1">
+    <widget class="OpticalPoseValue" name="readiness_values_yaw90_reference">
+     <property name="componentBindings" stdset="0">
+      <string>[["methods", "readiness_values", "yaw90_reference"]]</string>
+     </property>
+     <property name="toolTip">
+      <string>From: optical pose owner snapshot</string>
+     </property>
+     <property name="displayLabel" stdset="0">
+      <string>Mountain/Cloud 기준</string>
+     </property>
+    </widget>
+   </item>
+   <item row="4" column="0" rowspan="1" colspan="2">
+    <widget class="QLabel" name="compactContract_5">
+     <property name="styleObjectName" stdset="0">
+      <string>compactContract</string>
+     </property>
+     <property name="text">
+      <string>Each solver below creates an independent candidate and shares the same review/apply path.</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <customwidgets>
+  <customwidget>
+   <class>OpticalPoseValue</class>
+   <extends>QWidget</extends>
+   <header>Workstation.workspace_views.optical_pose_parts.layouts</header>
+  </customwidget>
+ </customwidgets>
+ <resources />
+ <connections />
+</ui>

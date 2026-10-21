@@ -1,0 +1,7 @@
+# Match the dependency versions captured in the frozen analysis manifest.
+# ROS 2 message packages are provided by sourcing /opt/ros/humble/setup.bash.
+numpy==1.24.4
+scipy==1.8.0
+XlsxWriter==3.2.9
+zstandard==0.25.0
+PyYAML==6.0.3

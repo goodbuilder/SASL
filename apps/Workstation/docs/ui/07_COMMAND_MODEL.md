@@ -204,6 +204,19 @@ after PARAM readback, exact active `vehicle_magnetometer.device_id`, and fresh A
 commands are independent. A Measurement start that requires live Pixhawk data consumes this
 verification result and fails closed when a required side is unverified.
 
+MAG priority combos are per-side drafts. Periodic readback refresh does not overwrite edited
+slots; `Discard` reloads the last confirmed values. Apply locks only the active side. Integer
+PARAM_SET is retransmitted at most three times when no matching PARAM_VALUE arrives; a received
+mismatched value ends the operation without retry. The worker checks final readback for each
+written priority. A failed or partial Apply invalidates old readback and marks the advanced MAG
+table uncertain until Refresh MAG succeeds.
+
+On the supported PX4 1.17 topology, Apply is rejected before writing if a known disabled lower
+instance would leave the selected higher instance outside the sparse voter. The message identifies
+the `sensor_mag` instance and CAL_MAG slot; the operator can set a filler priority to Min (1).
+Incomplete topology leaves this firmware guard unavailable. Apply changes runtime parameters only;
+the existing `param save` and reboot commands remain separate and explicit.
+
 ## 14. Detection / Recording / Calibration Separation
 
 - Detection enable/disable → Command

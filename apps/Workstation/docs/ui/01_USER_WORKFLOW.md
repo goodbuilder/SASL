@@ -156,18 +156,31 @@ it as `Custom (raw)` rather than silently remapping it. MAG offsets, scales, sof
 and board-rotation values remain PX4 sensor-axis parameters; Workstation does not convert
 them to NED, ENU, or camera coordinates.
 
+Priority edits are staged per side and survive the 4 Hz readback refresh. `Discard` restores
+the latest confirmed PARAM values. Priority `0` means Disabled. With the supported PX4 1.17
+selector, Apply is blocked when an enabled higher `sensor_mag` instance has a known disabled
+lower instance, because the sparse voter can drop that input; set the lower MAG priority to
+`Min (1)` or higher. If topology/PARAM readback is incomplete, Workstation marks this guard
+unavailable and keeps the existing Apply gates.
+
 The visible `Devices > Pixhawk` page provides independent P1/P2 MAG Priority controls for the
 logical roles `BOARD`, `CAN1`, `CAN2`, `GPS1_MAG`, and `GPS2_MAG`. `Apply & Verify` requires
 Disarm, verifies the CAL_MAG PARAM readback, then waits for a post-apply
 `vehicle_magnetometer.device_id` and fresh ATTITUDE. `ACTIVE VERIFIED` is side-specific; a P1
 failure never changes P2. A live-Pixhawk Measurement is admitted only when each required side is
 verified; methods without live Pixhawk inputs retain their existing readiness rules.
+Apply changes runtime PARAM values and is not a persistence command. Use the existing explicit
+PX4 `param save` action to persist them; a reboot is not normally needed for a live priority
+change, and Workstation never reboots automatically. If PX4 was already started with a sparse
+voter gap, saving corrected filler priorities and an explicit disarmed reboot may be needed to
+rebuild the voter.
 
 The same cards also show a read-only selection preview: the live `sensor_mag` instance-to-device
 map, the priority candidate implied by the current combo values, and the actual PX4 selected
 device. CAN2 priority remains editable even when its instance is outside the stock selector
-range; the screen reports candidate versus actual instead of blocking the operator or inventing
-an active-source result.
+range. A confirmed v1.17 voter gap is the only topology condition that blocks Apply; missing
+topology shows that the guard could not be evaluated. The screen reports candidate versus actual
+instead of inventing an active-source result.
 
 The Pixhawk `Magn` tables add read-only `RAW yaw°`, `Corrected yaw°`, and `PX4 yaw°` beside each
 IMU/CAN row.

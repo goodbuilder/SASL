@@ -48,6 +48,9 @@ def test_separate_raw_files_clock_epoch_and_gt_gap_flag(tmp_path: Path):
     attitude = json.loads((tmp_path / "px4_attitude.jsonl").read_text().splitlines()[0])
     assert gt["position_world_enu_m"] == [2.0, 415.0, 1.0]
     assert gt["quaternion_order"] == "xyzw"
+    assert gt["reference_definition"] == "project_defined_vehicle_reference_at_visual_height_midpoint_v1"
+    assert gt["reference_parent_frame"] == "base_link_flu"
+    assert gt["reference_offset_parent_m"] == [0.0, 0.0, -0.35910692405]
     assert local["position_local_ned_m"] == [-3.0, 4.0, -5.0]
     assert local["axis_contract"] == "px4_local_ned:north,east,down"
     assert attitude["quaternion_order"] == "wxyz"
@@ -81,3 +84,41 @@ def test_sigint_ros_external_shutdown_is_expected_only_after_stop_request():
     assert not _expected_stop_exception(ExternalShutdownException(), False)
     assert not _expected_stop_exception(RCLError("unrelated ROS writer error"), True)
     assert not _expected_stop_exception(RuntimeError("writer failed"), True)
+
+
+def test_real_ros_sigint_keeps_context_alive_until_recorder_loop_exits(tmp_path):
+    import importlib.util
+    import os
+    import subprocess
+    import pytest
+    if importlib.util.find_spec("rclpy") is None:
+        pytest.skip("ROS environment is required for real signal ownership check")
+    script = r"""
+import os, signal, sys, threading
+from pathlib import Path
+import rclpy
+sys.path.insert(0, sys.argv[1])
+from campaigns.stereo_v1_1 import state_recorder as recorder
+original_init = rclpy.init
+original_stop = recorder._stop
+def init(**kwargs):
+    original_init(**kwargs)
+    threading.Timer(0.5, lambda: os.kill(os.getpid(), signal.SIGINT)).start()
+def stop(signum, frame):
+    print('CONTEXT_AT_STOP=' + str(rclpy.ok()), flush=True)
+    original_stop(signum, frame)
+rclpy.init = init
+recorder._stop = stop
+sys.argv = ['state_recorder.py', '--attempt-dir', sys.argv[2]]
+raise SystemExit(recorder.main())
+"""
+    result = subprocess.run([sys.executable, '-c', script, str(SIM_ROOT), str(tmp_path)],
+                            env={**os.environ, 'ROS_DOMAIN_ID': '89'},
+                            text=True, capture_output=True, timeout=30)
+    # No publishers intentionally: missing required streams must still fail QC.
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert 'CONTEXT_AT_STOP=True' in result.stdout
+    summary = json.loads((tmp_path / 'state_capture_summary.json').read_text())
+    assert summary['status'] == 'STATE_CAPTURE_FAILED'
+    assert summary['failure_reason'] == 'required stream missing'
+    assert 'RCLError' not in result.stdout + result.stderr

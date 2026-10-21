@@ -1,0 +1,644 @@
+<ui version="4.0">
+  <class>CalibrationOperations</class>
+  <widget class="QTabWidget" name="calibrationKindTabs">
+    <widget class="QWidget" name="intrinsicsPage">
+      <attribute name="title">
+        <string>Intrinsics</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="intrinsics_page_layout">
+        <property name="leftMargin">
+          <number>6</number>
+        </property>
+        <property name="topMargin">
+          <number>6</number>
+        </property>
+        <property name="rightMargin">
+          <number>6</number>
+        </property>
+        <property name="bottomMargin">
+          <number>6</number>
+        </property>
+        <property name="spacing">
+          <number>6</number>
+        </property>
+        <item>
+          <widget class="QLabel" name="intrinsics_contract_label">
+            <property name="text">
+              <string>Per-camera image pixels → K,D in OpenCV optical RDF. Profiles are camera-, native-raster-, focus-, and zoom-specific.</string>
+            </property>
+            <property name="wordWrap">
+              <bool>true</bool>
+            </property>
+          </widget>
+        </item>
+        <item>
+          <widget class="_ContentSizedOperationTabs" name="intrinsics_operation_tabs">
+            <widget class="QWidget" name="intrinsicsCapturePage">
+              <attribute name="title">
+                <string>Capture</string>
+              </attribute>
+              <layout class="QVBoxLayout" name="intrinsicsCaptureLayout">
+                <property name="leftMargin">
+                  <number>6</number>
+                </property>
+                <property name="topMargin">
+                  <number>6</number>
+                </property>
+                <property name="rightMargin">
+                  <number>6</number>
+                </property>
+                <property name="bottomMargin">
+                  <number>6</number>
+                </property>
+                <property name="spacing">
+                  <number>6</number>
+                </property>
+                <item>
+                  <layout class="QGridLayout" name="intrinsicsCaptureActions">
+                    <property name="leftMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="topMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="rightMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="bottomMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="spacing">
+                      <number>6</number>
+                    </property>
+                  </layout>
+                </item>
+                <item>
+                  <widget class="QLabel" name="intrinsicsCaptureHint">
+                    <property name="text">
+                      <string>Each camera contributes its own checkerboard image set. Left/right files remain separate inputs to the two K,D solves.</string>
+                    </property>
+                    <property name="wordWrap">
+                      <bool>true</bool>
+                    </property>
+                  </widget>
+                </item>
+              </layout>
+            </widget>
+            <widget class="QWidget" name="intrinsicsComputePage">
+              <attribute name="title">
+                <string>Compute</string>
+              </attribute>
+              <layout class="QVBoxLayout" name="intrinsicsComputeLayout">
+                <property name="leftMargin">
+                  <number>6</number>
+                </property>
+                <property name="topMargin">
+                  <number>6</number>
+                </property>
+                <property name="rightMargin">
+                  <number>6</number>
+                </property>
+                <property name="bottomMargin">
+                  <number>6</number>
+                </property>
+                <property name="spacing">
+                  <number>6</number>
+                </property>
+                <item>
+                  <layout class="QGridLayout" name="intrinsicsComputeActions">
+                    <property name="leftMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="topMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="rightMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="bottomMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="spacing">
+                      <number>6</number>
+                    </property>
+                    <item row="0" column="0">
+                      <widget class="QPushButton" name="intrinsicsComputeButton0">
+                        <property name="text">
+                          <string>Run calibration (K,D)</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>calibration.run_intrinsic</string>
+                        </property>
+                        <property name="sizePolicy">
+                          <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                            <horstretch>0</horstretch>
+                            <verstretch>0</verstretch>
+                          </sizepolicy>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="0" column="1">
+                      <widget class="QPushButton" name="intrinsicsComputeButton1">
+                        <property name="text">
+                          <string>Save Intrinsics</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>calibration.save_intrinsics</string>
+                        </property>
+                        <property name="sizePolicy">
+                          <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                            <horstretch>0</horstretch>
+                            <verstretch>0</verstretch>
+                          </sizepolicy>
+                        </property>
+                      </widget>
+                    </item>
+                  </layout>
+                </item>
+                <item>
+                  <widget class="QWidget" name="qualityHost">
+                    <layout class="QVBoxLayout" name="qualityLayout">
+                      <property name="leftMargin">
+                        <number>0</number>
+                      </property>
+                      <property name="topMargin">
+                        <number>0</number>
+                      </property>
+                      <property name="rightMargin">
+                        <number>0</number>
+                      </property>
+                      <property name="bottomMargin">
+                        <number>0</number>
+                      </property>
+                      <property name="spacing">
+                        <number>6</number>
+                      </property>
+                    </layout>
+                  </widget>
+                </item>
+                <item>
+                  <widget class="QWidget" name="outlierHost">
+                    <layout class="QVBoxLayout" name="outlierLayout">
+                      <property name="leftMargin">
+                        <number>0</number>
+                      </property>
+                      <property name="topMargin">
+                        <number>0</number>
+                      </property>
+                      <property name="rightMargin">
+                        <number>0</number>
+                      </property>
+                      <property name="bottomMargin">
+                        <number>0</number>
+                      </property>
+                      <property name="spacing">
+                        <number>6</number>
+                      </property>
+                    </layout>
+                  </widget>
+                </item>
+              </layout>
+            </widget>
+            <widget class="QWidget" name="intrinsicsProfilesPage">
+              <attribute name="title">
+                <string>Profiles</string>
+              </attribute>
+              <layout class="QVBoxLayout" name="intrinsicsProfilesLayout">
+                <property name="leftMargin">
+                  <number>6</number>
+                </property>
+                <property name="topMargin">
+                  <number>6</number>
+                </property>
+                <property name="rightMargin">
+                  <number>6</number>
+                </property>
+                <property name="bottomMargin">
+                  <number>6</number>
+                </property>
+                <property name="spacing">
+                  <number>6</number>
+                </property>
+                <item>
+                  <layout class="QGridLayout" name="intrinsicsProfilesActions">
+                    <property name="leftMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="topMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="rightMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="bottomMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="spacing">
+                      <number>6</number>
+                    </property>
+                    <item row="0" column="0">
+                      <widget class="QPushButton" name="intrinsicsProfilesButton0">
+                        <property name="text">
+                          <string>Load Intrinsics</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>calibration.load_intrinsics</string>
+                        </property>
+                        <property name="sizePolicy">
+                          <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                            <horstretch>0</horstretch>
+                            <verstretch>0</verstretch>
+                          </sizepolicy>
+                        </property>
+                      </widget>
+                    </item>
+                  </layout>
+                </item>
+              </layout>
+            </widget>
+            <property name="sizePolicy">
+              <sizepolicy hsizetype="Expanding" vsizetype="Maximum">
+                <horstretch>0</horstretch>
+                <verstretch>0</verstretch>
+              </sizepolicy>
+            </property>
+          </widget>
+        </item>
+        <item>
+          <widget class="QGroupBox" name="intrinsics_result_group">
+            <property name="title">
+              <string>Intrinsics result</string>
+            </property>
+            <layout class="QVBoxLayout" name="intrinsicsResultLayout">
+              <property name="leftMargin">
+                <number>6</number>
+              </property>
+              <property name="topMargin">
+                <number>6</number>
+              </property>
+              <property name="rightMargin">
+                <number>6</number>
+              </property>
+              <property name="bottomMargin">
+                <number>6</number>
+              </property>
+              <property name="spacing">
+                <number>6</number>
+              </property>
+              <item>
+                <widget class="QTableView" name="intrinsic_table">
+                  <property name="maximumSize">
+                    <size>
+                      <width>16777215</width>
+                      <height>108</height>
+                    </size>
+                  </property>
+                </widget>
+              </item>
+            </layout>
+          </widget>
+        </item>
+        <item>
+          <widget class="QGroupBox" name="checkerboard_validation_outer_group">
+            <property name="title">
+              <string>Advanced intrinsics validation (optional)</string>
+            </property>
+            <property name="checkable">
+              <bool>true</bool>
+            </property>
+            <property name="checked">
+              <bool>false</bool>
+            </property>
+            <layout class="QVBoxLayout" name="validationLayout">
+              <property name="leftMargin">
+                <number>6</number>
+              </property>
+              <property name="topMargin">
+                <number>6</number>
+              </property>
+              <property name="rightMargin">
+                <number>6</number>
+              </property>
+              <property name="bottomMargin">
+                <number>6</number>
+              </property>
+              <property name="spacing">
+                <number>6</number>
+              </property>
+            </layout>
+          </widget>
+        </item>
+      </layout>
+    </widget>
+    <widget class="QWidget" name="extrinsicsPage">
+      <attribute name="title">
+        <string>Extrinsics</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="extrinsics_page_layout">
+        <property name="leftMargin">
+          <number>6</number>
+        </property>
+        <property name="topMargin">
+          <number>6</number>
+        </property>
+        <property name="rightMargin">
+          <number>6</number>
+        </property>
+        <property name="bottomMargin">
+          <number>6</number>
+        </property>
+        <property name="spacing">
+          <number>6</number>
+        </property>
+        <item>
+          <widget class="QLabel" name="extrinsics_bundle_contract_label">
+            <property name="text">
+              <string>Input bundle: Left K,D + Right K,D + synchronized stereo pairs. Output: X_right = R_left_to_right X_left + T_left_to_right_m in OpenCV optical RDF.</string>
+            </property>
+            <property name="wordWrap">
+              <bool>true</bool>
+            </property>
+          </widget>
+        </item>
+        <item>
+          <widget class="_ContentSizedOperationTabs" name="extrinsics_operation_tabs">
+            <widget class="QWidget" name="extrinsicsCapturePage">
+              <attribute name="title">
+                <string>Capture</string>
+              </attribute>
+              <layout class="QVBoxLayout" name="extrinsicsCaptureLayout">
+                <property name="leftMargin">
+                  <number>6</number>
+                </property>
+                <property name="topMargin">
+                  <number>6</number>
+                </property>
+                <property name="rightMargin">
+                  <number>6</number>
+                </property>
+                <property name="bottomMargin">
+                  <number>6</number>
+                </property>
+                <property name="spacing">
+                  <number>6</number>
+                </property>
+                <item>
+                  <layout class="QGridLayout" name="extrinsicsCaptureActions">
+                    <property name="leftMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="topMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="rightMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="bottomMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="spacing">
+                      <number>6</number>
+                    </property>
+                  </layout>
+                </item>
+                <item>
+                  <widget class="QLabel" name="extrinsicsCaptureHint">
+                    <property name="text">
+                      <string>Extrinsics consumes synchronized left/right rows from the shared photo selection. Applied Left/Right K,D must match the native raster. Camera, focus, and zoom provenance is operator-reviewed and does not gate readiness.</string>
+                    </property>
+                    <property name="wordWrap">
+                      <bool>true</bool>
+                    </property>
+                  </widget>
+                </item>
+              </layout>
+            </widget>
+            <widget class="QWidget" name="extrinsicsComputePage">
+              <attribute name="title">
+                <string>Compute</string>
+              </attribute>
+              <layout class="QVBoxLayout" name="extrinsicsComputeLayout">
+                <property name="leftMargin">
+                  <number>6</number>
+                </property>
+                <property name="topMargin">
+                  <number>6</number>
+                </property>
+                <property name="rightMargin">
+                  <number>6</number>
+                </property>
+                <property name="bottomMargin">
+                  <number>6</number>
+                </property>
+                <property name="spacing">
+                  <number>6</number>
+                </property>
+                <item>
+                  <layout class="QGridLayout" name="extrinsicsComputeActions">
+                    <property name="leftMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="topMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="rightMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="bottomMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="spacing">
+                      <number>6</number>
+                    </property>
+                    <item row="0" column="0">
+                      <widget class="QPushButton" name="extrinsicsComputeButton0">
+                        <property name="text">
+                          <string>Calculate R,t</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>calibration.run_extrinsics</string>
+                        </property>
+                        <property name="sizePolicy">
+                          <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                            <horstretch>0</horstretch>
+                            <verstretch>0</verstretch>
+                          </sizepolicy>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="0" column="1">
+                      <widget class="QPushButton" name="extrinsicsComputeButton1">
+                        <property name="text">
+                          <string>Save R,t</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>calibration.save_extrinsics</string>
+                        </property>
+                        <property name="sizePolicy">
+                          <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                            <horstretch>0</horstretch>
+                            <verstretch>0</verstretch>
+                          </sizepolicy>
+                        </property>
+                      </widget>
+                    </item>
+                  </layout>
+                </item>
+              </layout>
+            </widget>
+            <widget class="QWidget" name="extrinsicsProfilesPage">
+              <attribute name="title">
+                <string>Profiles</string>
+              </attribute>
+              <layout class="QVBoxLayout" name="extrinsicsProfilesLayout">
+                <property name="leftMargin">
+                  <number>6</number>
+                </property>
+                <property name="topMargin">
+                  <number>6</number>
+                </property>
+                <property name="rightMargin">
+                  <number>6</number>
+                </property>
+                <property name="bottomMargin">
+                  <number>6</number>
+                </property>
+                <property name="spacing">
+                  <number>6</number>
+                </property>
+                <item>
+                  <layout class="QGridLayout" name="extrinsicsProfilesActions">
+                    <property name="leftMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="topMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="rightMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="bottomMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="spacing">
+                      <number>6</number>
+                    </property>
+                    <item row="0" column="0">
+                      <widget class="QPushButton" name="extrinsicsProfilesButton0">
+                        <property name="text">
+                          <string>Load R,t</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>calibration.load_extrinsics</string>
+                        </property>
+                        <property name="sizePolicy">
+                          <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                            <horstretch>0</horstretch>
+                            <verstretch>0</verstretch>
+                          </sizepolicy>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="0" column="1">
+                      <widget class="QPushButton" name="extrinsicsProfilesButton1">
+                        <property name="text">
+                          <string>Apply verified K,D + R,t bundle</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>calibration.apply_bundle</string>
+                        </property>
+                        <property name="sizePolicy">
+                          <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                            <horstretch>0</horstretch>
+                            <verstretch>0</verstretch>
+                          </sizepolicy>
+                        </property>
+                      </widget>
+                    </item>
+                  </layout>
+                </item>
+              </layout>
+            </widget>
+            <property name="sizePolicy">
+              <sizepolicy hsizetype="Expanding" vsizetype="Maximum">
+                <horstretch>0</horstretch>
+                <verstretch>0</verstretch>
+              </sizepolicy>
+            </property>
+          </widget>
+        </item>
+        <item>
+          <widget class="QGroupBox" name="extrinsics_result_group">
+            <property name="title">
+              <string>Extrinsics result</string>
+            </property>
+            <layout class="QVBoxLayout" name="extrinsicsResultLayout">
+              <property name="leftMargin">
+                <number>6</number>
+              </property>
+              <property name="topMargin">
+                <number>6</number>
+              </property>
+              <property name="rightMargin">
+                <number>6</number>
+              </property>
+              <property name="bottomMargin">
+                <number>6</number>
+              </property>
+              <property name="spacing">
+                <number>6</number>
+              </property>
+              <item>
+                <widget class="QWidget" name="extrinsicValueHost">
+                  <layout class="QVBoxLayout" name="extrinsicValueLayout">
+                    <property name="leftMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="topMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="rightMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="bottomMargin">
+                      <number>0</number>
+                    </property>
+                    <property name="spacing">
+                      <number>6</number>
+                    </property>
+                  </layout>
+                </widget>
+              </item>
+              <item>
+                <widget class="QLabel" name="calibration_contract">
+                  <property name="text">
+                    <string />
+                  </property>
+                  <property name="wordWrap">
+                    <bool>true</bool>
+                  </property>
+                </widget>
+              </item>
+            </layout>
+          </widget>
+        </item>
+      </layout>
+    </widget>
+    <property name="sizePolicy">
+      <sizepolicy hsizetype="Expanding" vsizetype="Maximum">
+        <horstretch>0</horstretch>
+        <verstretch>0</verstretch>
+      </sizepolicy>
+    </property>
+  </widget>
+  <customwidgets>
+    <customwidget>
+      <class>_ContentSizedOperationTabs</class>
+      <extends>QTabWidget</extends>
+      <header>Workstation.workspace_views.calibration_parts.widgets</header>
+      <container>1</container>
+    </customwidget>
+  </customwidgets>
+  <resources />
+  <connections />
+</ui>

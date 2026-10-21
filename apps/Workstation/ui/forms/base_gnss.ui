@@ -1,0 +1,1639 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+  <class>BaseGnssWorkspace</class>
+  <widget class="QWidget" name="widget1">
+    <property name="minimumSize">
+      <size>
+        <width>0</width>
+        <height>0</height>
+      </size>
+    </property>
+    <property name="maximumSize">
+      <size>
+        <width>16777215</width>
+        <height>16777215</height>
+      </size>
+    </property>
+    <layout class="QVBoxLayout" name="layout2" stretch="0,0,0,0,0,0,0,0,0,0,1">
+      <property name="leftMargin">
+        <number>8</number>
+      </property>
+      <property name="topMargin">
+        <number>8</number>
+      </property>
+      <property name="rightMargin">
+        <number>8</number>
+      </property>
+      <property name="bottomMargin">
+        <number>8</number>
+      </property>
+      <property name="spacing">
+        <number>6</number>
+      </property>
+      <item>
+        <widget class="QFrame" name="widget3">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+          <layout class="QVBoxLayout" name="layout4" stretch="0">
+            <property name="leftMargin">
+              <number>8</number>
+            </property>
+            <property name="topMargin">
+              <number>6</number>
+            </property>
+            <property name="rightMargin">
+              <number>8</number>
+            </property>
+            <property name="bottomMargin">
+              <number>6</number>
+            </property>
+            <property name="spacing">
+              <number>1</number>
+            </property>
+            <item>
+              <widget class="QLabel" name="widget5">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="text">
+                  <string>Base GNSS</string>
+                </property>
+                <property name="wordWrap">
+                  <bool>false</bool>
+                </property>
+                <property name="alignment">
+                  <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+                </property>
+                <property name="textInteractionFlags">
+                  <set>Qt::LinksAccessibleByMouse</set>
+                </property>
+                <property name="legacyObjectName" stdset="0">
+                  <string>workspaceTitle</string>
+                </property>
+              </widget>
+            </item>
+          </layout>
+          <property name="legacyObjectName" stdset="0">
+            <string>workstationHeader</string>
+          </property>
+        </widget>
+      </item>
+      <item>
+        <layout class="QGridLayout" name="layout6" columnstretch="0,0,0">
+          <property name="leftMargin">
+            <number>0</number>
+          </property>
+          <property name="topMargin">
+            <number>0</number>
+          </property>
+          <property name="rightMargin">
+            <number>0</number>
+          </property>
+          <property name="bottomMargin">
+            <number>0</number>
+          </property>
+          <property name="spacing">
+            <number>6</number>
+          </property>
+          <item row="0" column="0" rowspan="1" colspan="1">
+            <widget class="QPushButton" name="operation_buttons_gnss_base_discover">
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+              <property name="text">
+                <string>Find Base</string>
+              </property>
+              <property name="commandId" stdset="0">
+                <string>gnss.base_discover</string>
+              </property>
+            </widget>
+          </item>
+          <item row="0" column="1" rowspan="1" colspan="1">
+            <widget class="QPushButton" name="operation_buttons_gnss_base_connect">
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+              <property name="text">
+                <string>Connect</string>
+              </property>
+              <property name="commandId" stdset="0">
+                <string>gnss.base_connect</string>
+              </property>
+            </widget>
+          </item>
+          <item row="0" column="2" rowspan="1" colspan="1">
+            <widget class="QPushButton" name="operation_buttons_gnss_base_disconnect">
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+              <property name="text">
+                <string>Disconnect</string>
+              </property>
+              <property name="commandId" stdset="0">
+                <string>gnss.base_disconnect</string>
+              </property>
+            </widget>
+          </item>
+          <item row="1" column="0" rowspan="1" colspan="1">
+            <widget class="QPushButton" name="operation_buttons_gnss_survey_start">
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+              <property name="text">
+                <string>Start Survey-in</string>
+              </property>
+              <property name="commandId" stdset="0">
+                <string>gnss.survey_start</string>
+              </property>
+            </widget>
+          </item>
+          <item row="1" column="0" rowspan="1" colspan="1">
+            <widget class="QPushButton" name="operation_buttons_gnss_ntrip_start">
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+              <property name="text">
+                <string>Start NTRIP</string>
+              </property>
+              <property name="commandId" stdset="0">
+                <string>gnss.ntrip_start</string>
+              </property>
+            </widget>
+          </item>
+          <item row="1" column="1" rowspan="1" colspan="1">
+            <widget class="QPushButton" name="operation_buttons_gnss_survey_stop">
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+              <property name="text">
+                <string>Stop Survey-in</string>
+              </property>
+              <property name="commandId" stdset="0">
+                <string>gnss.survey_stop</string>
+              </property>
+            </widget>
+          </item>
+          <item row="1" column="1" rowspan="1" colspan="1">
+            <widget class="QPushButton" name="operation_buttons_gnss_ntrip_stop">
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+              <property name="text">
+                <string>Stop NTRIP</string>
+              </property>
+              <property name="commandId" stdset="0">
+                <string>gnss.ntrip_stop</string>
+              </property>
+            </widget>
+          </item>
+          <item row="1" column="2" rowspan="1" colspan="1">
+            <widget class="QPushButton" name="operation_buttons_gnss_ntrip_forget_password">
+              <property name="minimumSize">
+                <size>
+                  <width>0</width>
+                  <height>0</height>
+                </size>
+              </property>
+              <property name="maximumSize">
+                <size>
+                  <width>16777215</width>
+                  <height>16777215</height>
+                </size>
+              </property>
+              <property name="text">
+                <string>Forget NTRIP password</string>
+              </property>
+              <property name="commandId" stdset="0">
+                <string>gnss.ntrip_forget_password</string>
+              </property>
+            </widget>
+          </item>
+        </layout>
+      </item>
+      <item>
+        <widget class="QGroupBox" name="widget15">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+          <property name="title">
+            <string>Current state</string>
+          </property>
+          <layout class="QGridLayout" name="layout16" columnstretch="0,0">
+            <property name="leftMargin">
+              <number>9</number>
+            </property>
+            <property name="topMargin">
+              <number>9</number>
+            </property>
+            <property name="rightMargin">
+              <number>9</number>
+            </property>
+            <property name="bottomMargin">
+              <number>9</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item row="0" column="0" rowspan="1" colspan="1">
+              <widget class="QWidget" name="summary_values_progress">
+                <property name="engineeringLabel" stdset="0">
+                  <string>진행 단계</string>
+                </property>
+                <layout class="QVBoxLayout" name="summary_values_progress_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="0" column="1" rowspan="1" colspan="1">
+              <widget class="QWidget" name="summary_values_mode">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Mode</string>
+                </property>
+                <layout class="QVBoxLayout" name="summary_values_mode_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="1" column="0" rowspan="1" colspan="1">
+              <widget class="QWidget" name="summary_values_state">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Operation (raw)</string>
+                </property>
+                <layout class="QVBoxLayout" name="summary_values_state_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="1" column="1" rowspan="1" colspan="1">
+              <widget class="QWidget" name="summary_values_source">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Correction source</string>
+                </property>
+                <layout class="QVBoxLayout" name="summary_values_source_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="2" column="0" rowspan="1" colspan="1">
+              <widget class="QWidget" name="summary_values_rtcm">
+                <property name="engineeringLabel" stdset="0">
+                  <string>RTCM stream</string>
+                </property>
+                <layout class="QVBoxLayout" name="summary_values_rtcm_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+          </layout>
+        </widget>
+      </item>
+      <item>
+        <widget class="QGroupBox" name="serial_group">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+          <property name="title">
+            <string>Base receiver</string>
+          </property>
+          <layout class="QGridLayout" name="layout23" columnstretch="0,0,0,0">
+            <property name="leftMargin">
+              <number>9</number>
+            </property>
+            <property name="topMargin">
+              <number>9</number>
+            </property>
+            <property name="rightMargin">
+              <number>9</number>
+            </property>
+            <property name="bottomMargin">
+              <number>9</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item row="0" column="0" rowspan="1" colspan="1">
+              <widget class="QWidget" name="serial_values_connection">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Connection</string>
+                </property>
+                <layout class="QVBoxLayout" name="serial_values_connection_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="0" column="1" rowspan="1" colspan="1">
+              <widget class="QWidget" name="serial_values_device">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Device</string>
+                </property>
+                <layout class="QVBoxLayout" name="serial_values_device_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="0" column="2" rowspan="1" colspan="1">
+              <widget class="QWidget" name="serial_values_baud">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Baud</string>
+                </property>
+                <layout class="QVBoxLayout" name="serial_values_baud_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="0" column="3" rowspan="1" colspan="1">
+              <widget class="QWidget" name="serial_values_satellites">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Satellites</string>
+                </property>
+                <layout class="QVBoxLayout" name="serial_values_satellites_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+          </layout>
+        </widget>
+      </item>
+      <item>
+        <widget class="QGroupBox" name="candidate_group">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+          <property name="title">
+            <string>Discovered Base receivers</string>
+          </property>
+          <layout class="QVBoxLayout" name="layout29" stretch="0,0,0,0">
+            <property name="leftMargin">
+              <number>9</number>
+            </property>
+            <property name="topMargin">
+              <number>9</number>
+            </property>
+            <property name="rightMargin">
+              <number>9</number>
+            </property>
+            <property name="bottomMargin">
+              <number>9</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item>
+              <widget class="QWidget" name="discovery_status">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Discovery</string>
+                </property>
+                <layout class="QVBoxLayout" name="discovery_status_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item>
+              <widget class="QTableView" name="candidate_table">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>132</height>
+                  </size>
+                </property>
+                <property name="editTriggers">
+                  <set>QAbstractItemView::NoEditTriggers</set>
+                </property>
+                <property name="selectionBehavior">
+                  <enum>QAbstractItemView::SelectRows</enum>
+                </property>
+                <property name="selectionMode">
+                  <enum>QAbstractItemView::SingleSelection</enum>
+                </property>
+                <attribute name="verticalHeaderVisible">
+                  <bool>false</bool>
+                </attribute>
+                <attribute name="horizontalHeaderStretchLastSection">
+                  <bool>true</bool>
+                </attribute>
+              </widget>
+            </item>
+            <item>
+              <layout class="QHBoxLayout" name="layout32" stretch="0,1">
+                <property name="leftMargin">
+                  <number>0</number>
+                </property>
+                <property name="topMargin">
+                  <number>0</number>
+                </property>
+                <property name="rightMargin">
+                  <number>0</number>
+                </property>
+                <property name="bottomMargin">
+                  <number>0</number>
+                </property>
+                <property name="spacing">
+                  <number>6</number>
+                </property>
+                <item>
+                  <widget class="QPushButton" name="apply_candidate_button">
+                    <property name="minimumSize">
+                      <size>
+                        <width>0</width>
+                        <height>0</height>
+                      </size>
+                    </property>
+                    <property name="maximumSize">
+                      <size>
+                        <width>16777215</width>
+                        <height>16777215</height>
+                      </size>
+                    </property>
+                    <property name="enabled">
+                      <bool>false</bool>
+                    </property>
+                    <property name="text">
+                      <string>Use selected receiver</string>
+                    </property>
+                  </widget>
+                </item>
+                <item>
+                  <spacer name="spacer34">
+                    <property name="orientation">
+                      <enum>Qt::Horizontal</enum>
+                    </property>
+                    <property name="sizeHint">
+                      <size>
+                        <width>0</width>
+                        <height>0</height>
+                      </size>
+                    </property>
+                  </spacer>
+                </item>
+              </layout>
+            </item>
+            <item>
+              <widget class="QLabel" name="candidate_feedback">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="text">
+                  <string />
+                </property>
+                <property name="wordWrap">
+                  <bool>true</bool>
+                </property>
+                <property name="alignment">
+                  <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+                </property>
+                <property name="textInteractionFlags">
+                  <set>Qt::LinksAccessibleByMouse</set>
+                </property>
+                <property name="legacyObjectName" stdset="0">
+                  <string>statusStrip</string>
+                </property>
+              </widget>
+            </item>
+          </layout>
+        </widget>
+      </item>
+      <item>
+        <widget class="QGroupBox" name="survey_group">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+          <property name="title">
+            <string>Survey-in (수신기 자체 관측치)</string>
+          </property>
+          <layout class="QGridLayout" name="layout37" columnstretch="0,0,0">
+            <property name="leftMargin">
+              <number>9</number>
+            </property>
+            <property name="topMargin">
+              <number>9</number>
+            </property>
+            <property name="rightMargin">
+              <number>9</number>
+            </property>
+            <property name="bottomMargin">
+              <number>9</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item row="0" column="0" rowspan="1" colspan="1">
+              <widget class="QWidget" name="survey_values_status">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Status</string>
+                </property>
+                <layout class="QVBoxLayout" name="survey_values_status_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="0" column="1" rowspan="1" colspan="1">
+              <widget class="QWidget" name="survey_values_duration">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Duration</string>
+                </property>
+                <layout class="QVBoxLayout" name="survey_values_duration_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="0" column="2" rowspan="1" colspan="1">
+              <widget class="QWidget" name="survey_values_accuracy">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Mean accuracy</string>
+                </property>
+                <layout class="QVBoxLayout" name="survey_values_accuracy_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="1" column="0" rowspan="1" colspan="1">
+              <widget class="QWidget" name="survey_values_observations">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Observations</string>
+                </property>
+                <layout class="QVBoxLayout" name="survey_values_observations_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="1" column="1" rowspan="1" colspan="1">
+              <widget class="QWidget" name="survey_values_ecef">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Mean ECEF X/Y/Z</string>
+                </property>
+                <layout class="QVBoxLayout" name="survey_values_ecef_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+          </layout>
+        </widget>
+      </item>
+      <item>
+        <widget class="QGroupBox" name="ntrip_group">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+          <property name="title">
+            <string>NTRIP</string>
+          </property>
+          <layout class="QGridLayout" name="layout44" columnstretch="0,0,0">
+            <property name="leftMargin">
+              <number>9</number>
+            </property>
+            <property name="topMargin">
+              <number>9</number>
+            </property>
+            <property name="rightMargin">
+              <number>9</number>
+            </property>
+            <property name="bottomMargin">
+              <number>9</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item row="0" column="0" rowspan="1" colspan="1">
+              <widget class="QWidget" name="ntrip_values_connection">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Connection</string>
+                </property>
+                <layout class="QVBoxLayout" name="ntrip_values_connection_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="0" column="1" rowspan="1" colspan="1">
+              <widget class="QWidget" name="ntrip_values_health">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Health</string>
+                </property>
+                <layout class="QVBoxLayout" name="ntrip_values_health_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="0" column="2" rowspan="1" colspan="1">
+              <widget class="QWidget" name="ntrip_values_caster">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Caster</string>
+                </property>
+                <layout class="QVBoxLayout" name="ntrip_values_caster_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="1" column="0" rowspan="1" colspan="1">
+              <widget class="QWidget" name="ntrip_values_mountpoint">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Mountpoint</string>
+                </property>
+                <layout class="QVBoxLayout" name="ntrip_values_mountpoint_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="1" column="1" rowspan="1" colspan="1">
+              <widget class="QWidget" name="ntrip_values_gga">
+                <property name="engineeringLabel" stdset="0">
+                  <string>GGA policy</string>
+                </property>
+                <layout class="QVBoxLayout" name="ntrip_values_gga_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="1" column="2" rowspan="1" colspan="1">
+              <widget class="QWidget" name="ntrip_values_gga_transmission">
+                <property name="engineeringLabel" stdset="0">
+                  <string>GGA 전송 상태</string>
+                </property>
+                <layout class="QVBoxLayout" name="ntrip_values_gga_transmission_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="2" column="0" rowspan="1" colspan="1">
+              <widget class="QWidget" name="ntrip_values_status">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Caster response</string>
+                </property>
+                <layout class="QVBoxLayout" name="ntrip_values_status_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="2" column="1" rowspan="1" colspan="1">
+              <widget class="QWidget" name="ntrip_values_transport">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Transport</string>
+                </property>
+                <layout class="QVBoxLayout" name="ntrip_values_transport_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="2" column="2" rowspan="1" colspan="1">
+              <widget class="QWidget" name="ntrip_values_rtcm">
+                <property name="engineeringLabel" stdset="0">
+                  <string>RTCM</string>
+                </property>
+                <layout class="QVBoxLayout" name="ntrip_values_rtcm_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="3" column="0" rowspan="1" colspan="1">
+              <widget class="QWidget" name="ntrip_values_coverage">
+                <property name="engineeringLabel" stdset="0">
+                  <string>RTCM 완전성 (관측치 포함?)</string>
+                </property>
+                <layout class="QVBoxLayout" name="ntrip_values_coverage_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="3" column="1" rowspan="1" colspan="1">
+              <widget class="QWidget" name="ntrip_values_reconnects">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Reconnects</string>
+                </property>
+                <layout class="QVBoxLayout" name="ntrip_values_reconnects_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="3" column="2" rowspan="1" colspan="1">
+              <widget class="QWidget" name="ntrip_values_error">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Last error</string>
+                </property>
+                <layout class="QVBoxLayout" name="ntrip_values_error_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+          </layout>
+        </widget>
+      </item>
+      <item>
+        <widget class="QGroupBox" name="fixed_group">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+          <property name="title">
+            <string>Fixed Base acquisition</string>
+          </property>
+          <layout class="QGridLayout" name="layout58" columnstretch="0,0,0">
+            <property name="leftMargin">
+              <number>9</number>
+            </property>
+            <property name="topMargin">
+              <number>9</number>
+            </property>
+            <property name="rightMargin">
+              <number>9</number>
+            </property>
+            <property name="bottomMargin">
+              <number>9</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item row="0" column="0" rowspan="1" colspan="1">
+              <widget class="QWidget" name="fixed_values_position">
+                <property name="engineeringLabel" stdset="0">
+                  <string>WGS84 position</string>
+                </property>
+                <layout class="QVBoxLayout" name="fixed_values_position_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="0" column="1" rowspan="1" colspan="1">
+              <widget class="QWidget" name="fixed_values_height">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Height</string>
+                </property>
+                <layout class="QVBoxLayout" name="fixed_values_height_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="0" column="2" rowspan="1" colspan="1">
+              <widget class="QWidget" name="fixed_values_gnss_fix_stage">
+                <property name="engineeringLabel" stdset="0">
+                  <string>GNSS Fixed 단계 (수신기 raw)</string>
+                </property>
+                <layout class="QVBoxLayout" name="fixed_values_gnss_fix_stage_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="1" column="0" rowspan="1" colspan="1">
+              <widget class="QWidget" name="fixed_values_fix">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Base fix (임시 · 좌표 확보 단계)</string>
+                </property>
+                <layout class="QVBoxLayout" name="fixed_values_fix_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="1" column="1" rowspan="1" colspan="1">
+              <widget class="QWidget" name="fixed_values_samples">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Samples</string>
+                </property>
+                <layout class="QVBoxLayout" name="fixed_values_samples_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="1" column="2" rowspan="1" colspan="1">
+              <widget class="QWidget" name="fixed_values_scatter">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Scatter H/V</string>
+                </property>
+                <layout class="QVBoxLayout" name="fixed_values_scatter_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="2" column="0" rowspan="1" colspan="1">
+              <widget class="QWidget" name="fixed_values_reconfigure">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Apply verification</string>
+                </property>
+                <layout class="QVBoxLayout" name="fixed_values_reconfigure_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="2" column="1" rowspan="1" colspan="1">
+              <widget class="QWidget" name="fixed_values_ntrip_delta">
+                <property name="engineeringLabel" stdset="0">
+                  <string>NTRIP 연결 전/후</string>
+                </property>
+                <layout class="QVBoxLayout" name="fixed_values_ntrip_delta_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+          </layout>
+        </widget>
+      </item>
+      <item>
+        <widget class="QGroupBox" name="checklist_group">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+          <property name="title">
+            <string>Base-assisted checklist (informational only)</string>
+          </property>
+          <layout class="QGridLayout" name="layout68" columnstretch="0,0">
+            <property name="leftMargin">
+              <number>9</number>
+            </property>
+            <property name="topMargin">
+              <number>9</number>
+            </property>
+            <property name="rightMargin">
+              <number>9</number>
+            </property>
+            <property name="bottomMargin">
+              <number>9</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item row="0" column="0" rowspan="1" colspan="1">
+              <widget class="QWidget" name="checklist_values_base_coordinate">
+                <property name="engineeringLabel" stdset="0">
+                  <string>1. Base coordinate confirmed</string>
+                </property>
+                <layout class="QVBoxLayout" name="checklist_values_base_coordinate_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="0" column="1" rowspan="1" colspan="1">
+              <widget class="QWidget" name="checklist_values_base_rtcm">
+                <property name="engineeringLabel" stdset="0">
+                  <string>2. Base RTCM output</string>
+                </property>
+                <layout class="QVBoxLayout" name="checklist_values_base_rtcm_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="1" column="0" rowspan="1" colspan="1">
+              <widget class="QWidget" name="checklist_values_left_fixed">
+                <property name="engineeringLabel" stdset="0">
+                  <string>3. Left Rover RTK Fixed</string>
+                </property>
+                <layout class="QVBoxLayout" name="checklist_values_left_fixed_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="1" column="1" rowspan="1" colspan="1">
+              <widget class="QWidget" name="checklist_values_right_fixed">
+                <property name="engineeringLabel" stdset="0">
+                  <string>4. Right Rover RTK Fixed</string>
+                </property>
+                <layout class="QVBoxLayout" name="checklist_values_right_fixed_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="2" column="0" rowspan="1" colspan="1">
+              <widget class="QWidget" name="checklist_values_stabilized">
+                <property name="engineeringLabel" stdset="0">
+                  <string>5. L/R Fixed stabilized</string>
+                </property>
+                <layout class="QVBoxLayout" name="checklist_values_stabilized_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="2" column="1" rowspan="1" colspan="1">
+              <widget class="QWidget" name="checklist_values_rtcm_complete">
+                <property name="engineeringLabel" stdset="0">
+                  <string>6. RTCM 관측치(MSM) 포함</string>
+                </property>
+                <layout class="QVBoxLayout" name="checklist_values_rtcm_complete_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item row="3" column="0" rowspan="1" colspan="2">
+              <widget class="QLabel" name="widget75">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="text">
+                  <string>표시 전용 상태 · 이 항목들은 측정 시작/진행을 차단하지 않습니다.</string>
+                </property>
+                <property name="wordWrap">
+                  <bool>true</bool>
+                </property>
+                <property name="alignment">
+                  <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+                </property>
+                <property name="textInteractionFlags">
+                  <set>Qt::LinksAccessibleByMouse</set>
+                </property>
+                <property name="legacyObjectName" stdset="0">
+                  <string>statusStrip</string>
+                </property>
+              </widget>
+            </item>
+          </layout>
+        </widget>
+      </item>
+      <item>
+        <widget class="QGroupBox" name="widget76">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+          <property name="title">
+            <string>RTCM distribution</string>
+          </property>
+          <layout class="QVBoxLayout" name="layout77" stretch="0">
+            <property name="leftMargin">
+              <number>9</number>
+            </property>
+            <property name="topMargin">
+              <number>9</number>
+            </property>
+            <property name="rightMargin">
+              <number>9</number>
+            </property>
+            <property name="bottomMargin">
+              <number>9</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item>
+              <widget class="QTableView" name="route_table">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>136</height>
+                  </size>
+                </property>
+                <property name="editTriggers">
+                  <set>QAbstractItemView::NoEditTriggers</set>
+                </property>
+                <property name="selectionBehavior">
+                  <enum>QAbstractItemView::SelectRows</enum>
+                </property>
+                <property name="selectionMode">
+                  <enum>QAbstractItemView::ExtendedSelection</enum>
+                </property>
+                <attribute name="verticalHeaderVisible">
+                  <bool>false</bool>
+                </attribute>
+                <attribute name="horizontalHeaderStretchLastSection">
+                  <bool>true</bool>
+                </attribute>
+              </widget>
+            </item>
+          </layout>
+        </widget>
+      </item>
+      <item>
+        <spacer name="spacer79">
+          <property name="orientation">
+            <enum>Qt::Vertical</enum>
+          </property>
+          <property name="sizeHint">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+        </spacer>
+      </item>
+    </layout>
+  </widget>
+  <resources />
+  <connections />
+</ui>

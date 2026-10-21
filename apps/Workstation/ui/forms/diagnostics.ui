@@ -1,0 +1,190 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>DiagnosticsContent</class>
+ <widget class="QWidget" name="DiagnosticsContent">
+  <layout class="QVBoxLayout" name="QVBoxLayout" stretch="0">
+   <property name="leftMargin">
+    <number>4</number>
+   </property>
+   <property name="topMargin">
+    <number>4</number>
+   </property>
+   <property name="rightMargin">
+    <number>4</number>
+   </property>
+   <property name="bottomMargin">
+    <number>4</number>
+   </property>
+   <property name="spacing">
+    <number>6</number>
+   </property>
+   <item>
+    <widget class="QTabWidget" name="tabs">
+     <widget class="QTableView" name="system_table">
+      <property name="editTriggers">
+       <set>QAbstractItemView::NoEditTriggers</set>
+      </property>
+      <attribute name="title">
+       <string>System</string>
+      </attribute>
+     </widget>
+     <widget class="QPlainTextEdit" name="camera_view">
+      <property name="readOnly">
+       <bool>true</bool>
+      </property>
+      <property name="lineWrapMode">
+       <enum>QPlainTextEdit::NoWrap</enum>
+      </property>
+      <attribute name="title">
+       <string>Camera</string>
+      </attribute>
+     </widget>
+     <widget class="QPlainTextEdit" name="pixhawk_view">
+      <property name="readOnly">
+       <bool>true</bool>
+      </property>
+      <property name="lineWrapMode">
+       <enum>QPlainTextEdit::NoWrap</enum>
+      </property>
+      <attribute name="title">
+       <string>Pixhawk</string>
+      </attribute>
+     </widget>
+     <widget class="QPlainTextEdit" name="gnss_view">
+      <property name="readOnly">
+       <bool>true</bool>
+      </property>
+      <property name="lineWrapMode">
+       <enum>QPlainTextEdit::NoWrap</enum>
+      </property>
+      <attribute name="title">
+       <string>GNSS</string>
+      </attribute>
+     </widget>
+     <widget class="QWidget" name="log_page">
+      <layout class="QVBoxLayout" name="QVBoxLayout2" stretch="0,0">
+       <property name="leftMargin">
+        <number>0</number>
+       </property>
+       <property name="topMargin">
+        <number>0</number>
+       </property>
+       <property name="rightMargin">
+        <number>0</number>
+       </property>
+       <property name="bottomMargin">
+        <number>0</number>
+       </property>
+       <property name="spacing">
+        <number>6</number>
+       </property>
+       <item>
+        <layout class="QHBoxLayout" name="QHBoxLayout" stretch="0,1,0">
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="topMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <property name="bottomMargin">
+          <number>0</number>
+         </property>
+         <property name="spacing">
+          <number>6</number>
+         </property>
+         <item>
+          <widget class="QLabel" name="log_new_label">
+           <property name="styleObjectName" stdset="0">
+            <string>statusStrip</string>
+           </property>
+           <property name="text">
+            <string />
+           </property>
+           <property name="wordWrap">
+            <bool>false</bool>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <spacer name="diagnosticsSpacer16">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint">
+            <size>
+             <width>0</width>
+             <height>0</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+         <item>
+          <widget class="QPushButton" name="log_follow_button">
+           <property name="styleObjectName" stdset="0">
+            <string>secondaryAction</string>
+           </property>
+           <property name="text">
+            <string>Follow latest</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QPlainTextEdit" name="log_view">
+         <property name="readOnly">
+          <bool>true</bool>
+         </property>
+         <property name="lineWrapMode">
+          <enum>QPlainTextEdit::NoWrap</enum>
+         </property>
+        </widget>
+       </item>
+      </layout>
+      <attribute name="title">
+       <string>Log</string>
+      </attribute>
+     </widget>
+     <widget class="QPlainTextEdit" name="ftp_view">
+      <property name="readOnly">
+       <bool>true</bool>
+      </property>
+      <property name="lineWrapMode">
+       <enum>QPlainTextEdit::NoWrap</enum>
+      </property>
+      <attribute name="title">
+       <string>FTP</string>
+      </attribute>
+     </widget>
+     <widget class="QPlainTextEdit" name="measurement_view">
+      <property name="readOnly">
+       <bool>true</bool>
+      </property>
+      <property name="lineWrapMode">
+       <enum>QPlainTextEdit::NoWrap</enum>
+      </property>
+      <attribute name="title">
+       <string>Measurement</string>
+      </attribute>
+     </widget>
+     <widget class="QPlainTextEdit" name="performance_view">
+      <property name="readOnly">
+       <bool>true</bool>
+      </property>
+      <property name="lineWrapMode">
+       <enum>QPlainTextEdit::NoWrap</enum>
+      </property>
+      <attribute name="title">
+       <string>Performance</string>
+      </attribute>
+     </widget>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <resources />
+ <connections />
+</ui>

@@ -3,7 +3,7 @@
 from sasl_common.stereo_geometry import BASELINE_CENTER_FRD_FRAME
 from stereo_ground_sim.coordinate_frames import (
     SOURCE_GAZEBO_ENTITY,
-    VEHICLE_REFERENCE_DEFINITION,
+    vehicle_reference_definition,
     VEHICLE_REFERENCE_LINK,
 )
 from stereo_ground_sim.research_recording import (
@@ -143,7 +143,9 @@ def build_terminal_record(
                 "gt_reference_name", VEHICLE_REFERENCE_LINK
             ),
             "gt_reference_definition": metrics.get(
-                "gt_reference_definition", VEHICLE_REFERENCE_DEFINITION
+                "gt_reference_definition", vehicle_reference_definition(
+                    getattr(node, "target_model_name", "x500_15m")
+                )
             ),
             "gt_fallback_used": bool(metrics.get("gt_fallback_used", False)),
             "gt_forward_m": metrics.get("gt_forward_m"),

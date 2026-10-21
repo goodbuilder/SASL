@@ -1,0 +1,1111 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+  <class>ConnectionView</class>
+  <widget class="QWidget" name="widget1">
+    <property name="minimumSize">
+      <size>
+        <width>0</width>
+        <height>0</height>
+      </size>
+    </property>
+    <property name="maximumSize">
+      <size>
+        <width>16777215</width>
+        <height>16777215</height>
+      </size>
+    </property>
+    <layout class="QVBoxLayout" name="layout2" stretch="0,0,0">
+      <property name="leftMargin">
+        <number>11</number>
+      </property>
+      <property name="topMargin">
+        <number>11</number>
+      </property>
+      <property name="rightMargin">
+        <number>11</number>
+      </property>
+      <property name="bottomMargin">
+        <number>11</number>
+      </property>
+      <property name="spacing">
+        <number>6</number>
+      </property>
+      <item>
+        <widget class="QGroupBox" name="status_group">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+          <property name="title">
+            <string>Connection</string>
+          </property>
+          <layout class="QHBoxLayout" name="layout4" stretch="0,0,0,1">
+            <property name="leftMargin">
+              <number>9</number>
+            </property>
+            <property name="topMargin">
+              <number>9</number>
+            </property>
+            <property name="rightMargin">
+              <number>9</number>
+            </property>
+            <property name="bottomMargin">
+              <number>9</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item>
+              <widget class="QWidget" name="indicators_pixhawk_left">
+                <property name="customKind" stdset="0">
+                  <string>StatusIndicator</string>
+                </property>
+                <property name="customLabel" stdset="0">
+                  <string>P1</string>
+                </property>
+                <layout class="QVBoxLayout" name="indicators_pixhawk_left_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+                <property name="legacyObjectName" stdset="0">
+                  <string>statusIndicator</string>
+                </property>
+              </widget>
+            </item>
+            <item>
+              <widget class="QWidget" name="indicators_pixhawk_right">
+                <property name="customKind" stdset="0">
+                  <string>StatusIndicator</string>
+                </property>
+                <property name="customLabel" stdset="0">
+                  <string>P2</string>
+                </property>
+                <layout class="QVBoxLayout" name="indicators_pixhawk_right_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+                <property name="legacyObjectName" stdset="0">
+                  <string>statusIndicator</string>
+                </property>
+              </widget>
+            </item>
+            <item>
+              <widget class="QWidget" name="indicators_pixhawk_drone">
+                <property name="customKind" stdset="0">
+                  <string>StatusIndicator</string>
+                </property>
+                <property name="customLabel" stdset="0">
+                  <string>Drone</string>
+                </property>
+                <layout class="QVBoxLayout" name="indicators_pixhawk_drone_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+                <property name="legacyObjectName" stdset="0">
+                  <string>statusIndicator</string>
+                </property>
+              </widget>
+            </item>
+            <item>
+              <spacer name="spacer8">
+                <property name="orientation">
+                  <enum>Qt::Horizontal</enum>
+                </property>
+                <property name="sizeHint">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+              </spacer>
+            </item>
+          </layout>
+        </widget>
+      </item>
+      <item>
+        <widget class="QGroupBox" name="recovery_group">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+          <property name="title">
+            <string>ETH MAV</string>
+          </property>
+          <layout class="QVBoxLayout" name="layout10" stretch="0,0,0">
+            <property name="leftMargin">
+              <number>9</number>
+            </property>
+            <property name="topMargin">
+              <number>9</number>
+            </property>
+            <property name="rightMargin">
+              <number>9</number>
+            </property>
+            <property name="bottomMargin">
+              <number>9</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item>
+              <widget class="QLabel" name="widget11">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="text">
+                  <string>ETH MAVLINK RX STALLED일 때만, Find USB에서 현재 heartbeat system ID가 유일하게 검증된 해당 Pixhawk를 operator 확인 후 재부팅합니다. 설정/파라미터는 쓰지 않으며 재부팅 후 Heartbeat+ATTITUDE 10초 qualification을 다시 통과해야 합니다.</string>
+                </property>
+                <property name="wordWrap">
+                  <bool>true</bool>
+                </property>
+                <property name="alignment">
+                  <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+                </property>
+                <property name="textInteractionFlags">
+                  <set>Qt::LinksAccessibleByMouse</set>
+                </property>
+                <property name="legacyObjectName" stdset="0">
+                  <string>statusStrip</string>
+                </property>
+              </widget>
+            </item>
+            <item>
+              <layout class="QHBoxLayout" name="layout12" stretch="0,0,1">
+                <property name="leftMargin">
+                  <number>0</number>
+                </property>
+                <property name="topMargin">
+                  <number>0</number>
+                </property>
+                <property name="rightMargin">
+                  <number>0</number>
+                </property>
+                <property name="bottomMargin">
+                  <number>0</number>
+                </property>
+                <property name="spacing">
+                  <number>6</number>
+                </property>
+                <item>
+                  <widget class="QGroupBox" name="widget13">
+                    <property name="minimumSize">
+                      <size>
+                        <width>0</width>
+                        <height>0</height>
+                      </size>
+                    </property>
+                    <property name="maximumSize">
+                      <size>
+                        <width>16777215</width>
+                        <height>16777215</height>
+                      </size>
+                    </property>
+                    <property name="title">
+                      <string>P1</string>
+                    </property>
+                    <layout class="QGridLayout" name="layout14" columnstretch="0,0">
+                      <property name="leftMargin">
+                        <number>9</number>
+                      </property>
+                      <property name="topMargin">
+                        <number>9</number>
+                      </property>
+                      <property name="rightMargin">
+                        <number>9</number>
+                      </property>
+                      <property name="bottomMargin">
+                        <number>9</number>
+                      </property>
+                      <property name="spacing">
+                        <number>6</number>
+                      </property>
+                      <item row="0" column="0" rowspan="1" colspan="2">
+                        <widget class="QWidget" name="recovery_values_left_usb">
+                          <property name="engineeringLabel" stdset="0">
+                            <string>USB 제어</string>
+                          </property>
+                          <layout class="QVBoxLayout" name="recovery_values_left_usb_layout">
+                            <property name="leftMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="topMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="rightMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="bottomMargin">
+                              <number>0</number>
+                            </property>
+                          </layout>
+                        </widget>
+                      </item>
+                      <item row="1" column="0" rowspan="1" colspan="2">
+                        <widget class="QWidget" name="recovery_values_left_baud">
+                          <property name="engineeringLabel" stdset="0">
+                            <string>Baud</string>
+                          </property>
+                          <layout class="QVBoxLayout" name="recovery_values_left_baud_layout">
+                            <property name="leftMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="topMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="rightMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="bottomMargin">
+                              <number>0</number>
+                            </property>
+                          </layout>
+                        </widget>
+                      </item>
+                      <item row="2" column="0" rowspan="1" colspan="2">
+                        <widget class="QWidget" name="recovery_values_left_recovery">
+                          <property name="engineeringLabel" stdset="0">
+                            <string>상태</string>
+                          </property>
+                          <layout class="QVBoxLayout" name="recovery_values_left_recovery_layout">
+                            <property name="leftMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="topMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="rightMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="bottomMargin">
+                              <number>0</number>
+                            </property>
+                          </layout>
+                        </widget>
+                      </item>
+                      <item row="3" column="0" rowspan="1" colspan="2">
+                        <widget class="QWidget" name="recovery_values_left_telemetry">
+                          <property name="engineeringLabel" stdset="0">
+                            <string>Telemetry</string>
+                          </property>
+                          <layout class="QVBoxLayout" name="recovery_values_left_telemetry_layout">
+                            <property name="leftMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="topMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="rightMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="bottomMargin">
+                              <number>0</number>
+                            </property>
+                          </layout>
+                        </widget>
+                      </item>
+                      <item row="4" column="0" rowspan="1" colspan="2">
+                        <widget class="QPushButton" name="recovery_buttons_left">
+                          <property name="minimumSize">
+                            <size>
+                              <width>170</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                          <property name="maximumSize">
+                            <size>
+                              <width>16777215</width>
+                              <height>16777215</height>
+                            </size>
+                          </property>
+                          <property name="toolTip">
+                            <string>P1 ETH RX stall과 고유 USB sysid를 다시 검증하고 확인창 뒤 해당 side만 one-shot 재부팅합니다. USB가 없거나 애매하면 command 없이 수동 전원 복구를 안내합니다.</string>
+                          </property>
+                          <property name="text">
+                            <string>P1 verified-USB reboot</string>
+                          </property>
+                          <property name="commandId" stdset="0">
+                            <string>pixhawk.recover_eth_mavlink.p1</string>
+                          </property>
+                        </widget>
+                      </item>
+                    </layout>
+                  </widget>
+                </item>
+                <item>
+                  <widget class="QGroupBox" name="widget20">
+                    <property name="minimumSize">
+                      <size>
+                        <width>0</width>
+                        <height>0</height>
+                      </size>
+                    </property>
+                    <property name="maximumSize">
+                      <size>
+                        <width>16777215</width>
+                        <height>16777215</height>
+                      </size>
+                    </property>
+                    <property name="title">
+                      <string>P2</string>
+                    </property>
+                    <layout class="QGridLayout" name="layout21" columnstretch="0,0">
+                      <property name="leftMargin">
+                        <number>9</number>
+                      </property>
+                      <property name="topMargin">
+                        <number>9</number>
+                      </property>
+                      <property name="rightMargin">
+                        <number>9</number>
+                      </property>
+                      <property name="bottomMargin">
+                        <number>9</number>
+                      </property>
+                      <property name="spacing">
+                        <number>6</number>
+                      </property>
+                      <item row="0" column="0" rowspan="1" colspan="2">
+                        <widget class="QWidget" name="recovery_values_right_usb">
+                          <property name="engineeringLabel" stdset="0">
+                            <string>USB 제어</string>
+                          </property>
+                          <layout class="QVBoxLayout" name="recovery_values_right_usb_layout">
+                            <property name="leftMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="topMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="rightMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="bottomMargin">
+                              <number>0</number>
+                            </property>
+                          </layout>
+                        </widget>
+                      </item>
+                      <item row="1" column="0" rowspan="1" colspan="2">
+                        <widget class="QWidget" name="recovery_values_right_baud">
+                          <property name="engineeringLabel" stdset="0">
+                            <string>Baud</string>
+                          </property>
+                          <layout class="QVBoxLayout" name="recovery_values_right_baud_layout">
+                            <property name="leftMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="topMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="rightMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="bottomMargin">
+                              <number>0</number>
+                            </property>
+                          </layout>
+                        </widget>
+                      </item>
+                      <item row="2" column="0" rowspan="1" colspan="2">
+                        <widget class="QWidget" name="recovery_values_right_recovery">
+                          <property name="engineeringLabel" stdset="0">
+                            <string>상태</string>
+                          </property>
+                          <layout class="QVBoxLayout" name="recovery_values_right_recovery_layout">
+                            <property name="leftMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="topMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="rightMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="bottomMargin">
+                              <number>0</number>
+                            </property>
+                          </layout>
+                        </widget>
+                      </item>
+                      <item row="3" column="0" rowspan="1" colspan="2">
+                        <widget class="QWidget" name="recovery_values_right_telemetry">
+                          <property name="engineeringLabel" stdset="0">
+                            <string>Telemetry</string>
+                          </property>
+                          <layout class="QVBoxLayout" name="recovery_values_right_telemetry_layout">
+                            <property name="leftMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="topMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="rightMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="bottomMargin">
+                              <number>0</number>
+                            </property>
+                          </layout>
+                        </widget>
+                      </item>
+                      <item row="4" column="0" rowspan="1" colspan="2">
+                        <widget class="QPushButton" name="recovery_buttons_right">
+                          <property name="minimumSize">
+                            <size>
+                              <width>170</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                          <property name="maximumSize">
+                            <size>
+                              <width>16777215</width>
+                              <height>16777215</height>
+                            </size>
+                          </property>
+                          <property name="toolTip">
+                            <string>P2 ETH RX stall과 고유 USB sysid를 다시 검증하고 확인창 뒤 해당 side만 one-shot 재부팅합니다. USB가 없거나 애매하면 command 없이 수동 전원 복구를 안내합니다.</string>
+                          </property>
+                          <property name="text">
+                            <string>P2 verified-USB reboot</string>
+                          </property>
+                          <property name="commandId" stdset="0">
+                            <string>pixhawk.recover_eth_mavlink.p2</string>
+                          </property>
+                        </widget>
+                      </item>
+                    </layout>
+                  </widget>
+                </item>
+                <item>
+                  <spacer name="spacer27">
+                    <property name="orientation">
+                      <enum>Qt::Horizontal</enum>
+                    </property>
+                    <property name="sizeHint">
+                      <size>
+                        <width>0</width>
+                        <height>0</height>
+                      </size>
+                    </property>
+                  </spacer>
+                </item>
+              </layout>
+            </item>
+            <item>
+              <widget class="QLabel" name="recovery_feedback">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="text">
+                  <string />
+                </property>
+                <property name="wordWrap">
+                  <bool>true</bool>
+                </property>
+                <property name="alignment">
+                  <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+                </property>
+                <property name="textInteractionFlags">
+                  <set>Qt::LinksAccessibleByMouse</set>
+                </property>
+                <property name="legacyObjectName" stdset="0">
+                  <string>statusStrip</string>
+                </property>
+              </widget>
+            </item>
+          </layout>
+        </widget>
+      </item>
+      <item>
+        <widget class="QGroupBox" name="candidate_group">
+          <property name="minimumSize">
+            <size>
+              <width>0</width>
+              <height>0</height>
+            </size>
+          </property>
+          <property name="maximumSize">
+            <size>
+              <width>16777215</width>
+              <height>16777215</height>
+            </size>
+          </property>
+          <property name="title">
+            <string>Network candidates and assignments</string>
+          </property>
+          <layout class="QVBoxLayout" name="layout30" stretch="0,0,0,0,0">
+            <property name="leftMargin">
+              <number>9</number>
+            </property>
+            <property name="topMargin">
+              <number>9</number>
+            </property>
+            <property name="rightMargin">
+              <number>9</number>
+            </property>
+            <property name="bottomMargin">
+              <number>9</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item>
+              <layout class="QHBoxLayout" name="layout31" stretch="1,1">
+                <property name="leftMargin">
+                  <number>0</number>
+                </property>
+                <property name="topMargin">
+                  <number>0</number>
+                </property>
+                <property name="rightMargin">
+                  <number>0</number>
+                </property>
+                <property name="bottomMargin">
+                  <number>0</number>
+                </property>
+                <property name="spacing">
+                  <number>6</number>
+                </property>
+                <item>
+                  <widget class="QGroupBox" name="widget32">
+                    <property name="minimumSize">
+                      <size>
+                        <width>0</width>
+                        <height>0</height>
+                      </size>
+                    </property>
+                    <property name="maximumSize">
+                      <size>
+                        <width>16777215</width>
+                        <height>16777215</height>
+                      </size>
+                    </property>
+                    <property name="title">
+                      <string>P1 network assignment</string>
+                    </property>
+                    <layout class="QGridLayout" name="layout33" columnstretch="1,1,1">
+                      <property name="leftMargin">
+                        <number>6</number>
+                      </property>
+                      <property name="topMargin">
+                        <number>6</number>
+                      </property>
+                      <property name="rightMargin">
+                        <number>6</number>
+                      </property>
+                      <property name="bottomMargin">
+                        <number>6</number>
+                      </property>
+                      <property name="spacing">
+                        <number>-1</number>
+                      </property>
+                      <item row="0" column="0" rowspan="1" colspan="1">
+                        <widget class="QWidget" name="network_assignment_values_left_state">
+                          <property name="engineeringLabel" stdset="0">
+                            <string>State</string>
+                          </property>
+                          <layout class="QVBoxLayout" name="network_assignment_values_left_state_layout">
+                            <property name="leftMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="topMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="rightMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="bottomMargin">
+                              <number>0</number>
+                            </property>
+                          </layout>
+                        </widget>
+                      </item>
+                      <item row="0" column="1" rowspan="1" colspan="1">
+                        <widget class="QWidget" name="network_assignment_values_left_nic">
+                          <property name="engineeringLabel" stdset="0">
+                            <string>NIC</string>
+                          </property>
+                          <layout class="QVBoxLayout" name="network_assignment_values_left_nic_layout">
+                            <property name="leftMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="topMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="rightMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="bottomMargin">
+                              <number>0</number>
+                            </property>
+                          </layout>
+                        </widget>
+                      </item>
+                      <item row="0" column="2" rowspan="1" colspan="1">
+                        <widget class="QWidget" name="network_assignment_values_left_local">
+                          <property name="engineeringLabel" stdset="0">
+                            <string>Local IPv4</string>
+                          </property>
+                          <layout class="QVBoxLayout" name="network_assignment_values_left_local_layout">
+                            <property name="leftMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="topMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="rightMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="bottomMargin">
+                              <number>0</number>
+                            </property>
+                          </layout>
+                        </widget>
+                      </item>
+                      <item row="1" column="0" rowspan="1" colspan="1">
+                        <widget class="QWidget" name="network_assignment_values_left_endpoint">
+                          <property name="engineeringLabel" stdset="0">
+                            <string>Endpoint</string>
+                          </property>
+                          <layout class="QVBoxLayout" name="network_assignment_values_left_endpoint_layout">
+                            <property name="leftMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="topMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="rightMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="bottomMargin">
+                              <number>0</number>
+                            </property>
+                          </layout>
+                        </widget>
+                      </item>
+                      <item row="1" column="1" rowspan="1" colspan="2">
+                        <widget class="QWidget" name="network_assignment_values_left_route">
+                          <property name="engineeringLabel" stdset="0">
+                            <string>Route</string>
+                          </property>
+                          <layout class="QVBoxLayout" name="network_assignment_values_left_route_layout">
+                            <property name="leftMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="topMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="rightMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="bottomMargin">
+                              <number>0</number>
+                            </property>
+                          </layout>
+                        </widget>
+                      </item>
+                    </layout>
+                  </widget>
+                </item>
+                <item>
+                  <widget class="QGroupBox" name="widget39">
+                    <property name="minimumSize">
+                      <size>
+                        <width>0</width>
+                        <height>0</height>
+                      </size>
+                    </property>
+                    <property name="maximumSize">
+                      <size>
+                        <width>16777215</width>
+                        <height>16777215</height>
+                      </size>
+                    </property>
+                    <property name="title">
+                      <string>P2 network assignment</string>
+                    </property>
+                    <layout class="QGridLayout" name="layout40" columnstretch="1,1,1">
+                      <property name="leftMargin">
+                        <number>6</number>
+                      </property>
+                      <property name="topMargin">
+                        <number>6</number>
+                      </property>
+                      <property name="rightMargin">
+                        <number>6</number>
+                      </property>
+                      <property name="bottomMargin">
+                        <number>6</number>
+                      </property>
+                      <property name="spacing">
+                        <number>-1</number>
+                      </property>
+                      <item row="0" column="0" rowspan="1" colspan="1">
+                        <widget class="QWidget" name="network_assignment_values_right_state">
+                          <property name="engineeringLabel" stdset="0">
+                            <string>State</string>
+                          </property>
+                          <layout class="QVBoxLayout" name="network_assignment_values_right_state_layout">
+                            <property name="leftMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="topMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="rightMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="bottomMargin">
+                              <number>0</number>
+                            </property>
+                          </layout>
+                        </widget>
+                      </item>
+                      <item row="0" column="1" rowspan="1" colspan="1">
+                        <widget class="QWidget" name="network_assignment_values_right_nic">
+                          <property name="engineeringLabel" stdset="0">
+                            <string>NIC</string>
+                          </property>
+                          <layout class="QVBoxLayout" name="network_assignment_values_right_nic_layout">
+                            <property name="leftMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="topMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="rightMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="bottomMargin">
+                              <number>0</number>
+                            </property>
+                          </layout>
+                        </widget>
+                      </item>
+                      <item row="0" column="2" rowspan="1" colspan="1">
+                        <widget class="QWidget" name="network_assignment_values_right_local">
+                          <property name="engineeringLabel" stdset="0">
+                            <string>Local IPv4</string>
+                          </property>
+                          <layout class="QVBoxLayout" name="network_assignment_values_right_local_layout">
+                            <property name="leftMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="topMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="rightMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="bottomMargin">
+                              <number>0</number>
+                            </property>
+                          </layout>
+                        </widget>
+                      </item>
+                      <item row="1" column="0" rowspan="1" colspan="1">
+                        <widget class="QWidget" name="network_assignment_values_right_endpoint">
+                          <property name="engineeringLabel" stdset="0">
+                            <string>Endpoint</string>
+                          </property>
+                          <layout class="QVBoxLayout" name="network_assignment_values_right_endpoint_layout">
+                            <property name="leftMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="topMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="rightMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="bottomMargin">
+                              <number>0</number>
+                            </property>
+                          </layout>
+                        </widget>
+                      </item>
+                      <item row="1" column="1" rowspan="1" colspan="2">
+                        <widget class="QWidget" name="network_assignment_values_right_route">
+                          <property name="engineeringLabel" stdset="0">
+                            <string>Route</string>
+                          </property>
+                          <layout class="QVBoxLayout" name="network_assignment_values_right_route_layout">
+                            <property name="leftMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="topMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="rightMargin">
+                              <number>0</number>
+                            </property>
+                            <property name="bottomMargin">
+                              <number>0</number>
+                            </property>
+                          </layout>
+                        </widget>
+                      </item>
+                    </layout>
+                  </widget>
+                </item>
+              </layout>
+            </item>
+            <item>
+              <widget class="QWidget" name="discovery_status">
+                <property name="engineeringLabel" stdset="0">
+                  <string>Discovery</string>
+                </property>
+                <layout class="QVBoxLayout" name="discovery_status_layout">
+                  <property name="leftMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="topMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="rightMargin">
+                    <number>0</number>
+                  </property>
+                  <property name="bottomMargin">
+                    <number>0</number>
+                  </property>
+                </layout>
+              </widget>
+            </item>
+            <item>
+              <widget class="QTableView" name="candidate_table">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>170</height>
+                  </size>
+                </property>
+                <property name="editTriggers">
+                  <set>QAbstractItemView::NoEditTriggers</set>
+                </property>
+                <property name="selectionBehavior">
+                  <enum>QAbstractItemView::SelectRows</enum>
+                </property>
+                <property name="selectionMode">
+                  <enum>QAbstractItemView::SingleSelection</enum>
+                </property>
+                <attribute name="verticalHeaderVisible">
+                  <bool>false</bool>
+                </attribute>
+                <attribute name="horizontalHeaderStretchLastSection">
+                  <bool>false</bool>
+                </attribute>
+                <property name="horizontalScrollMode">
+                  <enum>QAbstractItemView::ScrollPerPixel</enum>
+                </property>
+                <property name="alternatingRowColors">
+                  <bool>false</bool>
+                </property>
+              </widget>
+            </item>
+            <item>
+              <layout class="QHBoxLayout" name="layout48" stretch="0,0,0,1">
+                <property name="leftMargin">
+                  <number>0</number>
+                </property>
+                <property name="topMargin">
+                  <number>0</number>
+                </property>
+                <property name="rightMargin">
+                  <number>0</number>
+                </property>
+                <property name="bottomMargin">
+                  <number>0</number>
+                </property>
+                <property name="spacing">
+                  <number>6</number>
+                </property>
+                <item>
+                  <widget class="QPushButton" name="candidate_buttons_left">
+                    <property name="minimumSize">
+                      <size>
+                        <width>0</width>
+                        <height>0</height>
+                      </size>
+                    </property>
+                    <property name="maximumSize">
+                      <size>
+                        <width>16777215</width>
+                        <height>16777215</height>
+                      </size>
+                    </property>
+                    <property name="enabled">
+                      <bool>false</bool>
+                    </property>
+                    <property name="text">
+                      <string>Assign P1</string>
+                    </property>
+                  </widget>
+                </item>
+                <item>
+                  <widget class="QPushButton" name="candidate_buttons_right">
+                    <property name="minimumSize">
+                      <size>
+                        <width>0</width>
+                        <height>0</height>
+                      </size>
+                    </property>
+                    <property name="maximumSize">
+                      <size>
+                        <width>16777215</width>
+                        <height>16777215</height>
+                      </size>
+                    </property>
+                    <property name="enabled">
+                      <bool>false</bool>
+                    </property>
+                    <property name="text">
+                      <string>Assign P2</string>
+                    </property>
+                  </widget>
+                </item>
+                <item>
+                  <widget class="QPushButton" name="candidate_buttons_host">
+                    <property name="minimumSize">
+                      <size>
+                        <width>0</width>
+                        <height>0</height>
+                      </size>
+                    </property>
+                    <property name="maximumSize">
+                      <size>
+                        <width>16777215</width>
+                        <height>16777215</height>
+                      </size>
+                    </property>
+                    <property name="enabled">
+                      <bool>false</bool>
+                    </property>
+                    <property name="text">
+                      <string>Assign Host</string>
+                    </property>
+                  </widget>
+                </item>
+                <item>
+                  <spacer name="spacer52">
+                    <property name="orientation">
+                      <enum>Qt::Horizontal</enum>
+                    </property>
+                    <property name="sizeHint">
+                      <size>
+                        <width>0</width>
+                        <height>0</height>
+                      </size>
+                    </property>
+                  </spacer>
+                </item>
+              </layout>
+            </item>
+            <item>
+              <widget class="QLabel" name="candidate_feedback">
+                <property name="minimumSize">
+                  <size>
+                    <width>0</width>
+                    <height>0</height>
+                  </size>
+                </property>
+                <property name="maximumSize">
+                  <size>
+                    <width>16777215</width>
+                    <height>16777215</height>
+                  </size>
+                </property>
+                <property name="text">
+                  <string />
+                </property>
+                <property name="wordWrap">
+                  <bool>true</bool>
+                </property>
+                <property name="alignment">
+                  <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+                </property>
+                <property name="textInteractionFlags">
+                  <set>Qt::LinksAccessibleByMouse</set>
+                </property>
+                <property name="legacyObjectName" stdset="0">
+                  <string>statusStrip</string>
+                </property>
+              </widget>
+            </item>
+          </layout>
+        </widget>
+      </item>
+    </layout>
+  </widget>
+  <resources />
+  <connections />
+</ui>

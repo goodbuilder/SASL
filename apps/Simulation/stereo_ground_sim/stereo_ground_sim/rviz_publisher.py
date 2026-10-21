@@ -16,6 +16,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 from stereo_ground_sim.rviz_geometry import camera_frustum_geometry, ray_line_geometry
 from stereo_ground_sim.visualization_payloads import ray_metrics_document
+from stereo_ground_sim.coordinate_frames import vehicle_reference_offset_world_enu_m
 
 
 class RvizVisualizationPublisher:
@@ -254,7 +255,7 @@ class RvizVisualizationPublisher:
 
 
     def _publish_actual_drone_marker(self, position_world_enu_m, orientation_xyzw, stamp_ns):
-        """Render the authoritative Gazebo vehicle-reference pose as a drone mesh."""
+        """Recover base_link from the reference pose before placing its mesh."""
 
         publisher = getattr(self.node, "ray_marker_pub", None)
         if publisher is None:
@@ -267,7 +268,12 @@ class RvizVisualizationPublisher:
         marker.id = 40
         marker.type = Marker.MESH_RESOURCE
         marker.action = Marker.ADD
-        marker.pose.position = self.node._marker_point(position_world_enu_m)
+        offset = vehicle_reference_offset_world_enu_m(
+            getattr(self.node, "target_model_name", "x500_15m"), orientation_xyzw
+        )
+        marker.pose.position = self.node._marker_point(
+            tuple(p - d for p, d in zip(position_world_enu_m, offset))
+        )
         (
             marker.pose.orientation.x,
             marker.pose.orientation.y,

@@ -1,0 +1,30 @@
+<ui version="4.0">
+  <class>attitudeGroup</class>
+  <widget class="QGroupBox" name="attitudeGroup">
+    <property name="title">
+      <string>Attitude (R/P/Y)</string>
+    </property>
+    <layout class="QVBoxLayout" name="attitudeLayout">
+      <property name="leftMargin">
+        <number>6</number>
+      </property>
+      <property name="topMargin">
+        <number>6</number>
+      </property>
+      <property name="rightMargin">
+        <number>6</number>
+      </property>
+      <property name="bottomMargin">
+        <number>6</number>
+      </property>
+      <property name="spacing">
+        <number>6</number>
+      </property>
+      <item>
+        <widget class="QTableView" name="attitude_table" />
+      </item>
+    </layout>
+  </widget>
+  <resources />
+  <connections />
+</ui>

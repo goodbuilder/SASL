@@ -1,0 +1,29 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>recordingContract</class>
+ <widget class="QWidget" name="recordingContract">
+  <layout class="QVBoxLayout" name="contractLayout">
+   <item>
+    <widget class="QLabel" name="contract_label">
+     <property name="text">
+      <string>Time: recording clock</string>
+     </property>
+    </widget>
+   </item>
+   <property name="leftMargin">
+    <number>0</number>
+   </property>
+   <property name="topMargin">
+    <number>0</number>
+   </property>
+   <property name="rightMargin">
+    <number>0</number>
+   </property>
+   <property name="bottomMargin">
+    <number>0</number>
+   </property>
+  </layout>
+ </widget>
+ <resources />
+ <connections />
+</ui>

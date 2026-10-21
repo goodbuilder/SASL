@@ -76,3 +76,60 @@ def test_reference_interpolates_inside_science_and_rejects_extrapolation():
     for t in (-0.01, 0.03):
         with pytest.raises(ValueError, match="outside reference"):
             interpolate_reference(samples, t)
+
+
+def _sampler_rows(count=3):
+    return [dict(t_science_s=i*.02, position_world_enu_m=[i, 400-i, 100+i],
+                 velocity_world_enu_mps=[1, -2, -1], acceleration_world_enu_mps2=[0, 1, -1],
+                 heading_deg_clockwise_from_north=180, endpoint_metadata={'row': i})
+            for i in range(count)]
+
+
+def test_prepared_reference_exactly_matches_legacy_and_owns_validated_input():
+    from campaigns.stereo_v1_1.trajectory_contract import PreparedReference
+    rows = _sampler_rows()
+    prepared = PreparedReference(rows)
+    for t in [0, .004, .02, .026, .04]:
+        assert prepared.sample(t) == interpolate_reference(rows, t)
+    rows[0]['position_world_enu_m'][0] = 999
+    result = prepared.sample(0)
+    assert result['position_world_enu_m'][0] == 0
+    result['position_world_enu_m'][0] = 888
+    assert prepared.sample(0)['position_world_enu_m'][0] == 0
+    for t in [-.001, .041, float('nan')]:
+        with pytest.raises(ValueError):
+            prepared.sample(t)
+
+
+@pytest.mark.parametrize('defect', ['duplicate_time', 'nan_position', 'short_velocity'])
+def test_prepared_reference_rejects_bad_rows_before_flight(defect):
+    from campaigns.stereo_v1_1.trajectory_contract import PreparedReference
+    rows = _sampler_rows()
+    if defect == 'duplicate_time':
+        rows[1]['t_science_s'] = 0
+    elif defect == 'nan_position':
+        rows[1]['position_world_enu_m'][0] = float('nan')
+    else:
+        rows[1]['velocity_world_enu_mps'] = [0]
+    with pytest.raises(ValueError):
+        PreparedReference(rows)
+
+
+def test_prepared_query_has_logarithmic_time_index_access_without_rescan():
+    from campaigns.stereo_v1_1.trajectory_contract import PreparedReference
+    class CountedTimes:
+        def __init__(self, values):
+            self.values = values
+            self.reads = 0
+        def __len__(self):
+            return len(self.values)
+        def __iter__(self):
+            raise AssertionError('a flight query must not scan reference times')
+        def __getitem__(self, index):
+            self.reads += 1
+            return self.values[index]
+    prepared = PreparedReference(_sampler_rows(4096))
+    index = CountedTimes(prepared._times)
+    prepared._times = index
+    prepared.sample(40.001)
+    assert index.reads < 25

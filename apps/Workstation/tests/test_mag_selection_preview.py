@@ -72,3 +72,56 @@ def test_preview_keeps_requested_priority_edit_separate_from_actual_device() -> 
     assert preview.predicted_device_id == RM3100_BACKUP_ID
     assert preview.actual_device_id == GPS2_MAG_ID
     assert preview.actual_role == "GPS2_MAG"
+
+
+def test_v117_preview_reports_disabled_lower_instance_before_priority_winner() -> None:
+    params = _params(slot2_id=RM3100_PRIMARY_ID)
+    params.update(
+        {
+            "CAL_MAG0_PRIO": 0,
+            "CAL_MAG1_PRIO": 0,
+            "CAL_MAG2_PRIO": 100,
+            "CAL_MAG3_PRIO": 0,
+        }
+    )
+    topology = {
+        0: BOARD_INTERNAL_MAG_ID,
+        1: GPS1_MAG_ID,
+        2: RM3100_PRIMARY_ID,
+    }
+
+    unsafe = build_mag_selection_preview(params, topology)
+    assert unsafe.predicted_instance == 2
+    assert unsafe.priority_voter_gap_instances == (1,)
+
+    params["CAL_MAG1_PRIO"] = 1
+    safe = build_mag_selection_preview(params, topology)
+    assert safe.predicted_instance == 2
+    assert safe.priority_voter_gap_instances == ()
+
+
+def test_v117_preview_does_not_count_reserved_instance_zero_as_sparse_gap() -> None:
+    params = _params(slot2_id=RM3100_PRIMARY_ID)
+    params.update({"CAL_MAG0_PRIO": 0, "CAL_MAG1_PRIO": 1, "CAL_MAG2_PRIO": 100})
+
+    preview = build_mag_selection_preview(
+        params,
+        {0: BOARD_INTERNAL_MAG_ID, 1: GPS1_MAG_ID, 2: RM3100_PRIMARY_ID},
+    )
+
+    assert preview.priority_voter_gap_instances == ()
+
+
+
+
+def test_v117_preview_reports_missing_lower_topology_as_guard_unknown() -> None:
+    params = _params(slot2_id=RM3100_PRIMARY_ID)
+    params.update({"CAL_MAG1_PRIO": 1, "CAL_MAG2_PRIO": 100})
+
+    preview = build_mag_selection_preview(
+        params,
+        {0: BOARD_INTERNAL_MAG_ID, 2: RM3100_PRIMARY_ID},
+    )
+
+    assert preview.priority_voter_gap_instances == ()
+    assert preview.priority_voter_gap_unknown_instances == (1,)

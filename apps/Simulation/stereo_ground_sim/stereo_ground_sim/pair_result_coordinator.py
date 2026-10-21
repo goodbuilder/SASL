@@ -799,7 +799,10 @@ class PairResultCoordinator:
         return vector_error(metrics, prefix, gt_baseline)
 
     def _evaluation_metadata(self, pair, alignment, gt_baseline, metrics):
-        return evaluation_metadata(pair, alignment, gt_baseline, metrics)
+        return evaluation_metadata(
+            pair, alignment, gt_baseline, metrics,
+            target_model_name=getattr(self.node, "target_model_name", "x500_15m"),
+        )
 
     def _pair_result_metadata(
         self,

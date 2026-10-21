@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 import math
 
 from PyQt5 import QtCore, QtWidgets
+from Workstation.ui.designer import load_form
 
 from Workstation.workstation_core.measurement_methods import (
     MEASUREMENT_METHOD_IDS, MEASUREMENT_METHOD_LABELS,
@@ -22,32 +23,12 @@ class MethodWorkerRecoveryPane(QtWidgets.QGroupBox):
         self._selected_row: dict[str, object] = {}
         self._full_status = ""
         self._full_feedback = ""
-        layout = QtWidgets.QGridLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        self.method_combo = QtWidgets.QComboBox()
-        self.method_combo.setAccessibleName("상태를 확인할 측정 방법")
-        self.method_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        self.method_combo.setMinimumContentsLength(18)
+        load_form("recording_method_worker.ui", self)
         for method in MEASUREMENT_METHOD_IDS:
             self.method_combo.addItem(MEASUREMENT_METHOD_LABELS[method], method)
-        self.status_label = QtWidgets.QLabel("--")
-        self.feedback_label = QtWidgets.QLabel("경과 시간만으로 계산 실패를 판정하지 않습니다.")
         for label in (self.status_label, self.feedback_label):
             label.setObjectName("statusStrip")
-            label.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
             label.setFixedHeight(label.fontMetrics().lineSpacing() + 8)
-        self.restart_button = QtWidgets.QPushButton("선택 계산 중단·재시작")
-        self.restart_button.setAccessibleName("선택 방법의 현재 계산을 중단하고 재시작")
-        self.restart_button.setToolTip(
-            "표시된 방법의 현재 계산을 FAILED로 기록하고 대기 중인 계산을 계속합니다. "
-            "다른 방법의 계산과 관측은 계속됩니다."
-        )
-        self.restart_button.setEnabled(False)
-        layout.addWidget(self.method_combo, 0, 0)
-        layout.addWidget(self.status_label, 0, 1)
-        layout.addWidget(self.restart_button, 0, 2)
-        layout.addWidget(self.feedback_label, 1, 0, 1, 3)
-        layout.setColumnStretch(1, 1)
         self.method_combo.currentIndexChanged.connect(self._render)
         self.restart_button.clicked.connect(self._restart)
         self.refresh()

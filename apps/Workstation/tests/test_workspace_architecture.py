@@ -73,12 +73,12 @@ VIEW_DEPENDENCIES = {
     },
     "optical_pose_parts": set(),
     "optical_pose_parts.annotations": {"optical_pose_parts.layouts"},
-    "optical_pose_parts.candidates": set(),
+    "optical_pose_parts.candidates": {"optical_pose_parts.layouts"},
     "optical_pose_parts.layouts": set(),
-    "optical_pose_parts.live_reference": set(),
+    "optical_pose_parts.live_reference": {"optical_pose_parts.layouts"},
     "optical_pose_parts.methods": {"optical_pose_parts.layouts"},
-    "optical_pose_parts.observations": set(),
-    "optical_pose_parts.suggestions": {"optical_pose_parts.annotations"},
+    "optical_pose_parts.observations": {"optical_pose_parts.layouts"},
+    "optical_pose_parts.suggestions": {"optical_pose_parts.annotations", "optical_pose_parts.layouts"},
     "overview": {"shared"},
     "pixhawk": {
         "shared", "pixhawk_parts.connections", "pixhawk_parts.attitude", "pixhawk_parts.gnss",
@@ -86,12 +86,13 @@ VIEW_DEPENDENCIES = {
     },
     "pixhawk_parts": set(),
     "pixhawk_parts.attitude": {"shared"},
-    "pixhawk_parts.connections": {"shared", "network_helpers", "pixhawk_parts.contracts"},
+    "pixhawk_parts.connections": {"shared", "network_helpers", "pixhawk_parts.contracts", "pixhawk_parts.designer"},
+    "pixhawk_parts.designer": set(),
     "pixhawk_parts.contracts": set(),
     "pixhawk_parts.formatting": set(),
     "pixhawk_parts.geometry": {"shared", "pixhawk_parts.formatting"},
-    "pixhawk_parts.gnss": {"shared", "pixhawk_parts.formatting"},
-    "pixhawk_parts.magnetometers": {"shared", "px4_widgets", "pixhawk_parts.contracts", "pixhawk_parts.formatting"},
+    "pixhawk_parts.gnss": {"shared", "pixhawk_parts.formatting", "pixhawk_parts.designer"},
+    "pixhawk_parts.magnetometers": {"shared", "px4_widgets", "pixhawk_parts.contracts", "pixhawk_parts.formatting", "pixhawk_parts.designer"},
     "px4_widgets": set(),
     "recording": {"session", "shared", "target_reference"},
     "session": set(),
@@ -115,12 +116,12 @@ def test_compatibility_names_identify_the_actual_feature_classes():
 
 
 def test_facade_contains_only_explicit_imports_and_export_declarations():
-    tree = ast.parse((APP_ROOT / "workspaces.py").read_text())
+    tree = ast.parse((APP_ROOT / "ui" / "workspaces.py").read_text())
     for node in tree.body:
         if isinstance(node, ast.Expr):
             assert isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
         elif isinstance(node, ast.ImportFrom):
-            assert node.module.startswith("workspace_views.")
+            assert node.module.startswith("Workstation.workspace_views.")
             assert all(alias.name != "*" for alias in node.names)
         else:
             assert isinstance(node, ast.Assign)
@@ -364,7 +365,7 @@ def test_owner_import_loads_only_expected_transitive_dependencies(module):
 
 
 def test_production_composition_imports_concrete_view_owners():
-    for filename in ("main_window.py", "baseline_yaw90_pane.py"):
+    for filename in ("application/main_window.py", "ui/baseline_yaw90_pane.py"):
         tree = ast.parse((APP_ROOT / filename).read_text())
         imports = [node for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)]
         assert any("workspace_views." in (node.module or "") for node in imports)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -20,9 +22,8 @@ from Workstation.workstation_core.measurement_methods import (
     MEASUREMENT_METHOD_LABELS,
     normalize_measurement_method_fallback_order,
 )
-from Workstation.workstation_core.measurement_data_store import STREAM_PATHS
 
-from Workstation.ui.components import WorkspaceHeader
+from Workstation.ui.designer import load_form
 
 
 def _mapping(value: object) -> dict[str, Any]:
@@ -44,43 +45,73 @@ class SettingsWorkspace(QtWidgets.QWidget):
         self.settings_widgets: dict[str, QtWidgets.QWidget] = {}
         self._gnss_network_password_explicit = False
         self._snapshot = self._read_snapshot()
+        load_form("settings_workspace.ui", self)
 
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-        layout.addWidget(
-            WorkspaceHeader(
-                "Settings",
-            )
+        # Designer owns the form; Python owns settings values and option IDs.
+        # Snapshot values (especially credentials and local paths) never live in .ui.
+        for widget in self.findChildren(QtWidgets.QWidget):
+            style_name = widget.property("styleObjectName")
+            if style_name:
+                widget.setObjectName(style_name)
+            key = widget.property("settingsKey")
+            if not key:
+                continue
+            if key in self.settings_widgets:
+                raise ValueError(f"Duplicate Designer settings key: {key}")
+            self.settings_widgets[key] = widget
+            if isinstance(widget, QtWidgets.QComboBox):
+                values = json.loads(widget.property("optionValues"))
+                if len(values) != widget.count():
+                    raise ValueError(f"Designer option label/value count mismatch: {key}")
+                for index, value in enumerate(values):
+                    widget.setItemData(index, value)
+                widget.setCurrentIndex(0)
+            self._set_widget_value(key, self._field_value(key))
+        self._set_widget_value(
+            "camera_sync_interval_s", self._value("camera_sync_interval_s", 1800.0)
         )
 
-        self.tabs = QtWidgets.QTabWidget()
-        self.tabs.setDocumentMode(True)
-        self._build_camera_tab()
-        self._build_yolo_tab()
-        self._build_pixhawk_tab()
-        self._build_storage_tab()
-        self._build_runtime_tab()
-        self._build_time_sync_tab()
-        self._build_gnss_tab()
-        layout.addWidget(self.tabs, 1)
-
-        actions = QtWidgets.QHBoxLayout()
+        # Paths are resolved at runtime and persisted by the existing data owner.
+        self.settings_widgets["measurement_data_root"].setPlaceholderText(
+            f"Default: {WORKSTATION_MEASUREMENT_DATA_ROOT}"
+        )
         self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
-        for command_id, label in (
-            ("settings.apply", "Apply"),
-            ("settings.save", "Save"),
-        ):
-            button = QtWidgets.QPushButton(label)
-            button.setProperty("commandId", command_id)
-            if invoke_command is None:
-                button.setEnabled(False)
-            else:
-                button.clicked.connect(lambda _checked=False, command=command_id: invoke_command(command))
-            self.operation_buttons[command_id] = button
-            actions.addWidget(button)
-        actions.addStretch(1)
-        layout.addLayout(actions)
+        for button in self.findChildren(QtWidgets.QPushButton):
+            command_id = button.property("commandId")
+            if command_id:
+                button.setEnabled(invoke_command is not None)
+                if invoke_command is not None:
+                    button.clicked.connect(
+                        lambda _checked=False, command=command_id: invoke_command(command)
+                    )
+                self.operation_buttons[command_id] = button
+            side = button.property("ftpSide")
+            if side:
+                button.clicked.connect(
+                    lambda _checked=False, camera=side: self._open_wiris_ftp_browser(camera)
+                )
+        self.yolo_weights_browse_button.clicked.connect(self._browse_yolo_weights)
+        self.measurementDataRootBrowse.clicked.connect(self._browse_measurement_data_root)
+        self.measurement_fallback_list.model().rowsMoved.connect(
+            lambda *_args: self._refresh_measurement_fallback_labels()
+        )
+        self._set_measurement_fallback_order(
+            self._value("measurement_method_fallback_order", ())
+        )
+        # This session-only field deliberately stays outside settings_widgets.
+        self.gnss_network_password_edit.setText(DEFAULT_NTRIP_SESSION_PASSWORD)
+        self.gnss_network_password_edit.textChanged.connect(
+            lambda _text: setattr(self, "_gnss_network_password_explicit", True)
+        )
+        self.gnss_network_forget_password_button.clicked.connect(
+            lambda: self.invoke_command("gnss.ntrip_forget_password") if self.invoke_command else None
+        )
+        self.settings_widgets["gnss_operation_mode"].currentIndexChanged.connect(
+            lambda _index: self._refresh_gnss_mode_controls()
+        )
+        self._refresh_gnss_mode_controls()
+        self._refresh_settings_credential_status()
+
 
     def _read_snapshot(self) -> dict[str, Any]:
         reader = getattr(self.backend, "workstation_settings_snapshot", None)
@@ -173,162 +204,6 @@ class SettingsWorkspace(QtWidgets.QWidget):
         }
         return mapping.get(key, "")
 
-    def _text(self, key: str, *, password: bool = False, placeholder: str = "") -> QtWidgets.QLineEdit:
-        widget = QtWidgets.QLineEdit(str(self._field_value(key) or ""))
-        if password:
-            widget.setEchoMode(QtWidgets.QLineEdit.Password)
-        if placeholder:
-            widget.setPlaceholderText(placeholder)
-        self.settings_widgets[key] = widget
-        return widget
-
-    def _integer(self, key: str, minimum: int, maximum: int, suffix: str = "") -> QtWidgets.QSpinBox:
-        widget = QtWidgets.QSpinBox()
-        widget.setRange(minimum, maximum)
-        try:
-            widget.setValue(int(self._field_value(key)))
-        except (TypeError, ValueError):
-            widget.setValue(minimum)
-        widget.setSuffix(suffix)
-        self.settings_widgets[key] = widget
-        return widget
-
-    def _number(
-        self,
-        key: str,
-        minimum: float,
-        maximum: float,
-        decimals: int = 3,
-        suffix: str = "",
-    ) -> QtWidgets.QDoubleSpinBox:
-        widget = QtWidgets.QDoubleSpinBox()
-        widget.setRange(minimum, maximum)
-        widget.setDecimals(decimals)
-        try:
-            widget.setValue(float(self._field_value(key)))
-        except (TypeError, ValueError):
-            widget.setValue(minimum)
-        widget.setSuffix(suffix)
-        self.settings_widgets[key] = widget
-        return widget
-
-    def _toggle(self, key: str, label: str) -> QtWidgets.QCheckBox:
-        widget = QtWidgets.QCheckBox(label)
-        widget.setChecked(bool(self._field_value(key)))
-        self.settings_widgets[key] = widget
-        return widget
-
-    def _combo(self, key: str, items: tuple[tuple[str, str], ...]) -> QtWidgets.QComboBox:
-        widget = QtWidgets.QComboBox()
-        for label, value in items:
-            widget.addItem(label, value)
-        current = str(self._field_value(key) or "")
-        index = widget.findData(current)
-        widget.setCurrentIndex(max(0, index))
-        self.settings_widgets[key] = widget
-        return widget
-
-    @staticmethod
-    def _group(title: str, rows: list[tuple[str, QtWidgets.QWidget]]) -> QtWidgets.QGroupBox:
-        group = QtWidgets.QGroupBox(title)
-        form = QtWidgets.QFormLayout(group)
-        form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
-        form.setHorizontalSpacing(10)
-        form.setVerticalSpacing(6)
-        for label, widget in rows:
-            form.addRow(label, widget)
-        return group
-
-    def _tab(self, title: str) -> QtWidgets.QVBoxLayout:
-        page = QtWidgets.QWidget()
-        outer = QtWidgets.QVBoxLayout(page)
-        outer.setContentsMargins(6, 6, 6, 6)
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        content = QtWidgets.QWidget()
-        content_layout = QtWidgets.QVBoxLayout(content)
-        content_layout.setContentsMargins(2, 2, 2, 2)
-        content_layout.setSpacing(8)
-        scroll.setWidget(content)
-        outer.addWidget(scroll)
-        self.tabs.addTab(page, title)
-        return content_layout
-
-    def _build_camera_tab(self) -> None:
-        layout = self._tab("Camera / WIRIS")
-        layout.addWidget(
-            self._group(
-                "Camera network",
-                [
-                    ("Local interface", self._text("interface_name", placeholder="enx...")),
-                    ("PC camera-network address", self._text("camera_host_address", placeholder="10.0.0.10/24")),
-                    ("Left RTSP URL", self._text("left_rtsp_url")),
-                    ("Right RTSP URL", self._text("right_rtsp_url")),
-                ],
-            )
-        )
-        layout.addWidget(
-            self._group(
-                "WIRIS control / STIP",
-                [
-                    ("Left control host", self._text("left_control_host")),
-                    ("Right control host", self._text("right_control_host")),
-                    ("WIRIS control port", self._integer("wiris_control_port", 1, 65535)),
-                    ("Left control port", self._integer("left_control_port", 1, 65535)),
-                    ("Right control port", self._integer("right_control_port", 1, 65535)),
-                    ("Control timeout", self._number("wiris_control_timeout_s", 0.1, 60.0, 2, " s")),
-                    ("Left STIP IP", self._text("left_stip_ip")),
-                    ("Right STIP IP", self._text("right_stip_ip")),
-                    ("STIP subnet mask", self._text("stip_subnet_mask")),
-                    ("Reboot after STIP", self._toggle("stip_reboot", "Send REBT after STIP/STMS")),
-                ],
-            )
-        )
-        layout.addWidget(
-            self._group(
-                "WIRIS FTP (HR/OZ capture download)",
-                [
-                    ("Enable FTP download", self._toggle("wiris_ftp_enabled", "Download captured stills after HR/OZ capture")),
-                ],
-            )
-        )
-        # Each WIRIS camera has its own local FTP account (set on the unit
-        # itself), so the connection settings are per-side rather than a
-        # single value applied to both hosts.
-        layout.addWidget(
-            self._group(
-                "Left WIRIS FTP",
-                [
-                    ("FTP port", self._integer("left_ftp_port", 1, 65535)),
-                    ("FTP user", self._text("left_ftp_user")),
-                    ("FTP password", self._text("left_ftp_password", password=True)),
-                    ("FTP remote dir", self._text("left_ftp_remote_dir", placeholder="/")),
-                    ("FTP timeout", self._number("left_ftp_timeout_s", 0.5, 60.0, 1, " s")),
-                    ("", self._ftp_browse_button("Left")),
-                ],
-            )
-        )
-        layout.addWidget(
-            self._group(
-                "Right WIRIS FTP",
-                [
-                    ("FTP port", self._integer("right_ftp_port", 1, 65535)),
-                    ("FTP user", self._text("right_ftp_user")),
-                    ("FTP password", self._text("right_ftp_password", password=True)),
-                    ("FTP remote dir", self._text("right_ftp_remote_dir", placeholder="/")),
-                    ("FTP timeout", self._number("right_ftp_timeout_s", 0.5, 60.0, 1, " s")),
-                    ("", self._ftp_browse_button("Right")),
-                ],
-            )
-        )
-        layout.addStretch(1)
-
-    def _ftp_browse_button(self, side: str) -> QtWidgets.QPushButton:
-        button = QtWidgets.QPushButton("Browse FTP...")
-        button.setToolTip("Open a live FTP browser to explore the camera and find the right remote dir.")
-        button.clicked.connect(lambda: self._open_wiris_ftp_browser(side))
-        return button
 
     def _open_wiris_ftp_browser(self, initial_side: str) -> None:
         hosts = {
@@ -370,119 +245,6 @@ class SettingsWorkspace(QtWidgets.QWidget):
             if key in self.settings_widgets:
                 self.settings_widgets[key].setText(dialog.selected_remote_dir)
 
-    def _build_yolo_tab(self) -> None:
-        layout = self._tab("YOLO / RTSP")
-        weights_edit = self._text("yolo_weights_path")
-        weights_edit.setToolTip(
-            "YOLO model path relative to SASL_WORKSTATION_DATA_ROOT. "
-            "Measurement applies the current selection immediately before Detection starts; "
-            "Save persists it for later Workstation runs."
-        )
-        weights_row = QtWidgets.QWidget()
-        weights_layout = QtWidgets.QHBoxLayout(weights_row)
-        weights_layout.setContentsMargins(0, 0, 0, 0)
-        weights_layout.setSpacing(6)
-        weights_layout.addWidget(weights_edit, 1)
-        self.yolo_weights_browse_button = QtWidgets.QPushButton("파일 선택…")
-        self.yolo_weights_browse_button.setToolTip(
-            "Select .pt, .onnx, .engine, or .torchscript weights. External files are "
-            "copied into verified content-addressed Workstation model storage."
-        )
-        self.yolo_weights_browse_button.clicked.connect(self._browse_yolo_weights)
-        weights_layout.addWidget(self.yolo_weights_browse_button)
-        self.yolo_weights_selection_status = QtWidgets.QLabel(
-            "다음 Measurement 시작 직전에 현재 선택 모델을 적용합니다. "
-            "Save는 즉시 저장하며 기존 정상 종료 저장 동작도 유지됩니다."
-        )
-        self.yolo_weights_selection_status.setObjectName("statusStrip")
-        self.yolo_weights_selection_status.setWordWrap(True)
-        yolo_input_size = self._integer("yolo_input_size", 160, 1920, " px")
-        yolo_input_size.setToolTip(
-            "Applied to the hidden YOLO runtime owner now and used from the next Detection start."
-        )
-        layout.addWidget(
-            self._group(
-                "YOLO runtime",
-                [
-                    ("Weights path", weights_row),
-                    ("", self.yolo_weights_selection_status),
-                    ("Inference device", self._combo("yolo_device", (("CPU", "cpu"), ("CUDA", "cuda:0")))),
-                    ("YOLO input size", yolo_input_size),
-                    ("Preview width", self._integer("preview_width", 320, 3840, " px")),
-                    ("RTSP latency", self._integer("rtsp_latency_ms", 0, 5000, " ms")),
-                    ("YOLO event queue", self._integer("yolo_event_queue_size", 1, 10000)),
-                    ("Decoded frame queue", self._integer("yolo_frame_queue_size", 1, 1000)),
-                ],
-            )
-        )
-        reconnect_policy = self._combo(
-            "rtsp_reconnect_policy",
-            (("Manual", "manual"), ("Automatic", "automatic")),
-        )
-        reconnect_policy.setToolTip(
-            "Manual ends a failed camera worker without nested reconnect loops. "
-            "Automatic restores local RTSP and child-process retries."
-        )
-        encoded_queue_mode = self._combo(
-            "rtsp_encoded_queue_mode",
-            (
-                ("Latest (drop old)", "latest"),
-                ("Reference-safe (preserve 8)", "reference_safe"),
-            ),
-        )
-        encoded_queue_mode.setToolTip(
-            "Latest protects latency by dropping old compressed access units. "
-            "Reference-safe preserves up to eight at each pre-decode boundary "
-            "and may increase latency. Applies on the next camera Preview start."
-        )
-        layout.addWidget(
-            self._group(
-                "Stream backend",
-                [
-                    ("Decoder", self._combo("rtsp_decoder", (("Auto", "auto"), ("NVIDIA", "nvidia"), ("Software", "software")))),
-                    (
-                        "Backend",
-                        self._combo(
-                            "stream_backend",
-                            (("GStreamer", "gstreamer"), ("OpenCV/FFmpeg", "opencv"), ("OpenCV Auto", "opencv_auto"), ("PyAV", "pyav")),
-                        ),
-                    ),
-                    ("RTSP transport", self._combo("rtsp_transport", (("UDP", "udp"), ("TCP interleaved", "tcp")))),
-                    ("H.264 compressed queue", encoded_queue_mode),
-                    ("Reconnect policy", reconnect_policy),
-                ],
-            )
-        )
-        encoder_bitrate = self._integer("wiris_visible_encoder_bitrate", 0, 1_000_000_000)
-        encoder_bitrate.setToolTip(
-            "Manual-reference WIRIS SEBR VISIBLE value. RTSP enable and Auto-Connect do not apply it. "
-            "Zero enables constant-quality mode; nonzero disables QP control."
-        )
-        encoder_qp = self._integer("wiris_visible_encoder_qp", 0, 51)
-        encoder_qp.setToolTip(
-            "Manual-reference WIRIS SEQZ VISIBLE value; RTSP enable and Auto-Connect do not apply it. "
-            "Effective only when bitrate is zero."
-        )
-        encoder_gop = self._integer("wiris_visible_encoder_gop", 0, 32767)
-        encoder_gop.setToolTip(
-            "Manual-reference WIRIS SEGS VISIBLE value; RTSP enable and Auto-Connect do not apply it."
-        )
-        encoder_idr = self._integer("wiris_visible_encoder_idr", 0, 1_000_000_000)
-        encoder_idr.setToolTip(
-            "Manual-reference WIRIS SEIR VISIBLE value; RTSP enable and Auto-Connect do not apply it."
-        )
-        layout.addWidget(
-            self._group(
-                "WIRIS visible encoder reference (manual only)",
-                [
-                    ("Bitrate", encoder_bitrate),
-                    ("QP", encoder_qp),
-                    ("GOP size", encoder_gop),
-                    ("IDR interval", encoder_idr),
-                ],
-            )
-        )
-        layout.addStretch(1)
 
     def _workstation_data_root(self) -> Path:
         owner = getattr(self.backend, "panel", self.backend)
@@ -536,150 +298,6 @@ class SettingsWorkspace(QtWidgets.QWidget):
             f"{action} · 다음 Measurement 시작 시 적용: {portable}"
         )
 
-    def _build_pixhawk_tab(self) -> None:
-        layout = self._tab("PX4 / MAVLink")
-        layout.addWidget(
-            self._group(
-                "MAVLink / host",
-                [
-                    ("Pixhawk host address", self._text("pixhawk_host_address")),
-                ],
-            )
-        )
-        layout.addWidget(
-            self._group(
-                "Pixhawk endpoints",
-                [
-                    (
-                        "P1 transport",
-                        self._combo(
-                            "left_pixhawk_transport",
-                            (
-                                ("P1 Telemetry Radio", "radio"),
-                                ("Ethernet", "ethernet"),
-                                ("USB", "usb"),
-                            ),
-                        ),
-                    ),
-                    (
-                        "P2 transport",
-                        self._combo(
-                            "right_pixhawk_transport",
-                            (
-                                ("P2 Telemetry Radio", "radio"),
-                                ("Ethernet", "ethernet"),
-                                ("USB", "usb"),
-                            ),
-                        ),
-                    ),
-                    (
-                        "Drone transport",
-                        self._combo(
-                            "drone_pixhawk_transport",
-                            (
-                                ("Drone Telemetry Radio", "radio"),
-                                ("Ethernet", "ethernet"),
-                                ("USB", "usb"),
-                            ),
-                        ),
-                    ),
-                    ("P1 Radio device", self._text("left_pixhawk_radio_device", placeholder="/dev/serial/by-id/...")),
-                    ("P2 Radio device", self._text("right_pixhawk_radio_device", placeholder="/dev/serial/by-id/...")),
-                    ("Drone Radio device", self._text("drone_pixhawk_radio_device", placeholder="/dev/serial/by-id/...")),
-                    ("P1 Radio baud", self._integer("left_pixhawk_radio_baud", 1, 10_000_000)),
-                    ("P2 Radio baud", self._integer("right_pixhawk_radio_baud", 1, 10_000_000)),
-                    ("Drone Radio baud", self._integer("drone_pixhawk_radio_baud", 1, 10_000_000)),
-                    ("Left Ethernet IP", self._text("left_pixhawk_eth_ip")),
-                    ("Right Ethernet IP", self._text("right_pixhawk_eth_ip")),
-                    ("Drone Ethernet IP", self._text("drone_pixhawk_eth_ip")),
-                    ("Left MAVLink URL", self._text("left_mavlink_url")),
-                    ("Right MAVLink URL", self._text("right_mavlink_url")),
-                    ("Left MAVLink baud", self._integer("left_mavlink_baud", 1, 10_000_000)),
-                    ("Right MAVLink baud", self._integer("right_mavlink_baud", 1, 10_000_000)),
-                    ("Drone Telemetry URL", self._text("drone_telemetry_url", placeholder="udpin:0.0.0.0:14552")),
-                    ("Drone Telemetry baud", self._integer("drone_telemetry_baud", 1, 10_000_000)),
-                    (
-                        "Drone RTCM source",
-                        self._combo(
-                            "drone_telemetry_rtcm_source",
-                            (("Base GNSS", "base"), ("Network NTRIP", "ntrip")),
-                        ),
-                    ),
-                    (
-                        "Forward RTCM to drone",
-                        self._toggle(
-                            "drone_telemetry_rtcm_forward",
-                            "Send the selected RTCM source to the connected drone Pixhawk",
-                        ),
-                    ),
-                    ("Left bootstrap URL", self._text("left_pixhawk_bootstrap_url")),
-                    ("Right bootstrap URL", self._text("right_pixhawk_bootstrap_url")),
-                    ("Left bootstrap baud", self._integer("left_pixhawk_bootstrap_baud", 1, 10_000_000)),
-                    ("Right bootstrap baud", self._integer("right_pixhawk_bootstrap_baud", 1, 10_000_000)),
-                    ("Drone bootstrap URL", self._text("drone_pixhawk_bootstrap_url")),
-                    ("Drone bootstrap baud", self._integer("drone_pixhawk_bootstrap_baud", 1, 10_000_000)),
-                ],
-            )
-        )
-        layout.addWidget(
-            self._group(
-                "PX4 transport setup",
-                [
-                    ("Ethernet mode", self._combo("pixhawk_ethernet_mode", (("MAVLink", "mavlink"),))),
-                    (
-                        "Legacy auto stream setup",
-                        self._toggle(
-                            "mavlink_configure_streams",
-                            "Compatibility value only; Connect never applies persistent PX4 parameters",
-                        ),
-                    ),
-                    ("MAVLink stream rate", self._integer("mavlink_stream_rate", 1, 10_000_000)),
-                ],
-            )
-        )
-        layout.addStretch(1)
-
-    def _build_storage_tab(self) -> None:
-        layout = self._tab("Storage")
-        path_edit = self._text(
-            "measurement_data_root",
-            placeholder=f"Default: {WORKSTATION_MEASUREMENT_DATA_ROOT}",
-        )
-        path_edit.setToolTip(
-            "Leave blank for the default recordings folder. A custom directory must be "
-            "relative to SASL_WORKSTATION_DATA_ROOT. Active capture keeps its current owner; "
-            "an applied change is used by the next capture."
-        )
-        path_row = QtWidgets.QWidget()
-        path_layout = QtWidgets.QHBoxLayout(path_row)
-        path_layout.setContentsMargins(0, 0, 0, 0)
-        path_layout.setSpacing(6)
-        path_layout.addWidget(path_edit, 1)
-        browse = QtWidgets.QPushButton("Browse…")
-        browse.setObjectName("measurementDataRootBrowse")
-        browse.clicked.connect(self._browse_measurement_data_root)
-        path_layout.addWidget(browse)
-        layout.addWidget(
-            self._group(
-                "Availability-first measurement data",
-                [("Data folder", path_row)],
-            )
-        )
-        self.storage_path_status_label = QtWidgets.QLabel(
-            "Storage errors are reported but never disable Measurement Start."
-        )
-        self.storage_path_status_label.setObjectName("compactContract")
-        self.storage_path_status_label.setWordWrap(True)
-        layout.addWidget(self.storage_path_status_label)
-        paths = QtWidgets.QLabel(
-            "Timestamped append files: <stream>_<creation timestamp>.jsonl; legacy fixed names remain readable. "
-            "Native video, image, and ULog bytes use creation-time names."
-        )
-        paths.setObjectName("compactContract")
-        paths.setWordWrap(True)
-        paths.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        layout.addWidget(paths)
-        layout.addStretch(1)
 
     def _browse_measurement_data_root(self) -> None:
         data_root = self._workstation_data_root()
@@ -728,84 +346,6 @@ class SettingsWorkspace(QtWidgets.QWidget):
             f"Pending data folder: {portable} · applies to the next capture."
         )
 
-    def _build_runtime_tab(self) -> None:
-        layout = self._tab("Runtime / Calibration")
-        layout.addWidget(
-            self._group(
-                "Intrinsics / measurement mode",
-                [
-                    ("Intrinsics path", self._text("intrinsics_path")),
-                    ("Auto-load intrinsics", self._toggle("auto_load_intrinsics", "Load the active zoom profile at startup")),
-                    ("Manual focal override", self._toggle("manual_focal_override", "Use the manual focal fallback")),
-                    ("Triangulation enabled", self._toggle("use_triangulation", "Run 3D triangulation")),
-                    ("Display mode", self._combo("measurement_display_mode", (("Detection", "detection"), ("Preview", "preview")))),
-                    ("Use RTK baseline", self._toggle("use_rtk_baseline", "Use GPS/RTK baseline when selected")),
-                    ("Require RTK fixed", self._toggle("require_rtk_fixed", "Block measurement until RTK Fixed")),
-                ],
-            )
-        )
-        fallback_group = QtWidgets.QGroupBox("Measurement fallback order")
-        fallback_layout = QtWidgets.QVBoxLayout(fallback_group)
-        fallback_note = QtWidgets.QLabel(
-            "Measurement의 preferred 방식이 준비 상태를 잃으면 이 순서에서 준비된 첫 방식을 사용합니다. "
-            "행을 드래그해 순위를 변경합니다."
-        )
-        fallback_note.setObjectName("statusStrip")
-        fallback_note.setWordWrap(True)
-        fallback_layout.addWidget(fallback_note)
-        self.measurement_fallback_list = QtWidgets.QListWidget()
-        self.measurement_fallback_list.setObjectName("measurementFallbackOrderList")
-        self.measurement_fallback_list.setDragDropMode(QtWidgets.QAbstractItemView.InternalMove)
-        self.measurement_fallback_list.setDefaultDropAction(QtCore.Qt.MoveAction)
-        self.measurement_fallback_list.setMinimumHeight(170)
-        fallback_layout.addWidget(self.measurement_fallback_list)
-        self.measurement_fallback_list.model().rowsMoved.connect(
-            lambda *_args: self._refresh_measurement_fallback_labels()
-        )
-        self._set_measurement_fallback_order(
-            self._value("measurement_method_fallback_order", ())
-        )
-        layout.addWidget(fallback_group)
-        layout.addStretch(1)
-
-    def _build_time_sync_tab(self) -> None:
-        layout = self._tab("Time / Sync")
-        interval = QtWidgets.QSpinBox()
-        interval.setRange(5, 1440)
-        interval.setValue(
-            max(
-                5,
-                min(
-                    1440,
-                    round(float(self._value("camera_sync_interval_s", 1800.0)) / 60.0),
-                ),
-            )
-        )
-        interval.setSuffix(" min")
-        self.settings_widgets["camera_sync_interval_s"] = interval
-        layout.addWidget(
-            self._group(
-                "STUS scheduling",
-                [
-                    (
-                        "Mode",
-                        self._combo(
-                            "camera_sync_mode",
-                            (("Manual", "manual"), ("Auto", "auto")),
-                        ),
-                    ),
-                    ("Auto interval", interval),
-                ],
-            )
-        )
-        note = QtWidgets.QLabel(
-            "Auto requires one manually VERIFIED STUS after every Workstation start/new camera "
-            "connection. Scheduled STUS keeps Preview, YOLO and MP4 workers running."
-        )
-        note.setObjectName("statusStrip")
-        note.setWordWrap(True)
-        layout.addWidget(note)
-        layout.addStretch(1)
 
     def _measurement_fallback_order(self) -> tuple[str, ...]:
         return tuple(
@@ -905,153 +445,6 @@ class SettingsWorkspace(QtWidgets.QWidget):
                 if widget is not None:
                     widget.setEnabled(False)
 
-    def _build_gnss_tab(self) -> None:
-        layout = self._tab("GNSS / RTK")
-        site_label = self._text("gnss_site_label", placeholder="Per-experiment site name")
-        site_label.setToolTip(
-            "실험 장소 또는 측점을 사람이 식별하기 위한 이름입니다. "
-            "GNSS 보정과 거리 계산에는 사용되지 않고 측정 데이터의 현장 메모로 저장됩니다."
-        )
-        site_address = self._text(
-            "gnss_site_address",
-            placeholder="Per-experiment address or field note",
-        )
-        site_address.setToolTip(
-            "현장 주소, 설치 위치, 조사 조건 등 기록용 주소/메모입니다. "
-            "GNSS 보정과 측정 계산에는 영향을 주지 않습니다."
-        )
-        operation_mode = self._combo(
-            "gnss_operation_mode",
-            (
-                ("Local Survey-in", "LOCAL_SURVEY_IN"),
-                ("Network assisted fixed base", "NETWORK_ASSISTED_FIXED_BASE"),
-                ("Network RTK direct", "NETWORK_RTK_DIRECT"),
-            ),
-        )
-        operation_mode.setToolTip(
-            "Local Survey-in은 Base가 직접 보정 기준을 만들고, Network assisted fixed base는 "
-            "Base가 NTRIP를 수신하며, Network RTK direct는 Base 없이 Network NTRIP를 사용합니다."
-        )
-        operation_mode.currentIndexChanged.connect(
-            lambda _index: self._refresh_gnss_mode_controls()
-        )
-        layout.addWidget(
-            self._group(
-                "Base / operation",
-                [
-                    ("Experiment site / point", site_label),
-                    ("Experiment address / note", site_address),
-                    ("Operation mode", operation_mode),
-                    (
-                        "Base serial port",
-                        self._text(
-                            "gnss_base_serial_port",
-                            placeholder="Required for Local Survey-in / assisted fixed base",
-                        ),
-                    ),
-                    ("Base baud", self._integer("gnss_base_baud", 1, 10_000_000)),
-                    ("Survey-in minimum duration", self._integer("gnss_base_survey_in_min_duration_s", 1, 86_400, " s")),
-                    ("Survey-in accuracy", self._number("gnss_base_survey_in_accuracy_m", 0.001, 1000.0, 3, " m")),
-                    ("GNSS readiness gate", self._toggle("gnss_readiness_gate_enabled", "Require GNSS readiness before operation")),
-                ],
-            )
-        )
-        layout.addWidget(
-            self._group(
-                "RTCM routing / Drone readiness",
-                [
-                    ("P1 Pixhawk RTCM route", self._toggle("gnss_route_left_enabled", "Send correction frames to P1")),
-                    ("P2 Pixhawk RTCM route", self._toggle("gnss_route_right_enabled", "Send correction frames to P2")),
-                    ("Drone RTCM route", self._toggle("gnss_route_drone_enabled", "Enable the Drone correction route and readiness target")),
-                    ("Drone RTK Fixed requirement", self._toggle("gnss_require_drone_rtk_fixed", "Require Drone RTK Fixed for GNSS readiness")),
-                ],
-            )
-        )
-        # Deployment session default.  This masked widget remains outside
-        # settings_widgets/settings_payload(), so the password is never
-        # serialized even when the operator leaves the default unchanged.
-        self.gnss_network_password_edit = QtWidgets.QLineEdit(DEFAULT_NTRIP_SESSION_PASSWORD)
-        self.gnss_network_password_edit.setEchoMode(QtWidgets.QLineEdit.Password)
-        self.gnss_network_password_edit.setPlaceholderText("NTRIP password")
-        self.gnss_network_password_edit.textChanged.connect(
-            lambda _text: setattr(self, "_gnss_network_password_explicit", True)
-        )
-        self.gnss_network_credential_status_label = QtWidgets.QLabel("--")
-        self.gnss_network_forget_password_button = QtWidgets.QPushButton("Forget saved password")
-        self.gnss_network_forget_password_button.clicked.connect(
-            lambda: self.invoke_command("gnss.ntrip_forget_password") if self.invoke_command else None
-        )
-        layout.addWidget(
-            self._group(
-                "NTRIP caster (any provider)",
-                [
-                    (
-                        "Caster host",
-                        self._text("gnss_network_caster_host", placeholder="caster.example.com (hostname only)"),
-                    ),
-                    ("Caster port", self._integer("gnss_network_caster_port", 1, 65535)),
-                    ("Mountpoint", self._text("gnss_network_mountpoint", placeholder="MOUNTPOINT")),
-                    ("Username", self._text("gnss_network_username", placeholder="NTRIP username")),
-                    ("Password", self.gnss_network_password_edit),
-                    ("Remember password securely", self._toggle("gnss_network_remember_password", "Store password in the OS credential store")),
-                    ("Credential status", self.gnss_network_credential_status_label),
-                    ("", self.gnss_network_forget_password_button),
-                    ("TLS", self._toggle("gnss_network_tls", "Use TLS for NTRIP")),
-                    ("Reconnect interval", self._number("gnss_network_reconnect_interval_s", 0.0, 3600.0, 2, " s")),
-                    ("Connect timeout", self._number("gnss_network_connect_timeout_s", 0.1, 3600.0, 2, " s")),
-                    ("Read timeout", self._number("gnss_network_read_timeout_s", 0.1, 3600.0, 2, " s")),
-                    ("GGA policy", self._combo("gnss_network_gga_policy", (("Base GNSS (assisted fixed base)", "BASE_GNSS"), ("System center", "SYSTEM_CENTER"), ("Left GNSS", "LEFT_GNSS"), ("Manual / disabled", "MANUAL"), ("Per rover session", "PER_ROVER_SESSION")))),
-                ],
-            )
-        )
-        layout.addWidget(
-            self._group(
-                "레거시 환경변수 인증 (선택 사항 -- 위 Username/Password가 비어 있을 때만 fallback으로 사용)",
-                [
-                    (
-                        "Username environment variable",
-                        self._text("gnss_network_username_env", placeholder="NTRIP_USERNAME"),
-                    ),
-                    (
-                        "Password environment variable",
-                        self._text("gnss_network_password_env", placeholder="NTRIP_PASSWORD"),
-                    ),
-                ],
-            )
-        )
-        layout.addWidget(
-            self._group(
-                "Readiness limits (WGS84 / quality inputs)",
-                [
-                    ("Minimum numeric fix_type", self._integer("gnss_readiness_minimum_fix_type", 0, 255)),
-                    ("Minimum fixed duration", self._number("gnss_readiness_minimum_fixed_duration_s", 0.0, 86_400.0, 2, " s")),
-                    ("Maximum correction age", self._number("gnss_readiness_maximum_correction_age_s", 0.0, 3600.0, 2, " s")),
-                    ("Maximum GPS sample age", self._number("gnss_readiness_maximum_gps_sample_age_s", 0.0, 3600.0, 2, " s")),
-                    ("Maximum horizontal accuracy", self._number("gnss_readiness_maximum_horizontal_accuracy_m", 0.0, 1000.0, 4, " m")),
-                    ("Maximum vertical accuracy", self._number("gnss_readiness_maximum_vertical_accuracy_m", 0.0, 1000.0, 4, " m")),
-                    ("Maximum L/R timestamp delta", self._number("gnss_readiness_maximum_left_right_timestamp_delta_ms", 0.0, 10_000.0, 2, " ms")),
-                    ("Maximum baseline std", self._number("gnss_readiness_maximum_baseline_std_m", 0.0, 1000.0, 4, " m")),
-                ],
-            )
-        )
-        layout.addWidget(
-            self._group(
-                "Fixed base profile",
-                [
-                    ("Coordinate profile path", self._text("gnss_fixed_coordinate_profile_path")),
-                    ("Acquisition duration", self._number("gnss_fixed_acquisition_duration_s", 0.1, 86_400.0, 2, " s")),
-                    ("Minimum fixed duration", self._number("gnss_fixed_minimum_fixed_duration_s", 0.1, 86_400.0, 2, " s")),
-                    ("Minimum fixed ratio", self._number("gnss_fixed_minimum_fixed_ratio", 0.001, 1.0, 4)),
-                    ("Maximum horizontal scatter", self._number("gnss_fixed_max_horizontal_scatter_m", 0.0001, 1000.0, 4, " m")),
-                    ("Maximum vertical scatter", self._number("gnss_fixed_max_vertical_scatter_m", 0.0001, 1000.0, 4, " m")),
-                    ("Permit profile reuse", self._toggle("gnss_fixed_permit_profile_reuse", "Reuse an existing fixed-base profile")),
-                    ("Height type", self._combo("gnss_fixed_height_type", (("Ellipsoid", "ELLIPSOID"), ("MSL", "MSL"), ("Unknown", "UNKNOWN")))),
-                ],
-            )
-        )
-        layout.addStretch(1)
-        self._refresh_gnss_mode_controls()
-        self._refresh_settings_credential_status()
 
     def _refresh_settings_credential_status(self) -> None:
         """Show whether a password is saved for the currently-displayed caster/username.

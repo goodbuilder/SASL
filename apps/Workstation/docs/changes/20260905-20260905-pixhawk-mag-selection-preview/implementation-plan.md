@@ -29,3 +29,23 @@ remain operator-owned.
 
 Stop if implementing the preview requires automatic CAL_MAG ID remapping, a new telemetry
 protocol, or a firmware change; those are outside this packet.
+
+## 2026-10-12 approved follow-up slices
+
+1. Add pure v1.17 sparse-voter-gap detection to the existing preview contract; preserve the
+   `sensor_mag` instance index and CAL_MAG device-ID mapping.
+2. Make visible P1/P2 priority combos staged per-side/per-slot editor state. Add explicit
+   Discard, preserve drafts across 4 Hz refresh, and disable only the busy side's controls.
+3. Enforce a proven gap in the parameter worker before writes; retry missing PARAM_SET ACKs,
+   check final readback, and reconcile stale cache after failed/partial application.
+4. Update current Workstation/Pixhawk operational docs and regression tests.
+
+Source map: `workstation_core/px4_mag_manager.py`, `workspace_views/pixhawk_parts/magnetometers.py`,
+`workspace_views/pixhawk.py`, `workers/device_runtime_workers.py`,
+`controllers/device_runtime_controller.py`, `workstation_core/pixhawk_link/wire_commands.py`,
+related Workstation tests, `README.md`, `Pixhawk.md`, and `docs/ui/01_USER_WORKFLOW.md` /
+`docs/ui/07_COMMAND_MODEL.md`.
+
+The user's “수정해” instruction on 2026-10-12 explicitly approves this follow-up scope; no second
+approval gate is needed. Hardware parameter changes, firmware changes, and automatic save/reboot
+are excluded.

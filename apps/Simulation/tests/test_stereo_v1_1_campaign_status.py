@@ -18,6 +18,7 @@ from campaigns.stereo_v1_1.campaign_status import (
     finish_attempt,
     initialize,
     revalidate_known_qc_regression,
+    revalidate_cadence_qc_regression,
 )
 
 
@@ -32,6 +33,11 @@ def test_initial_status_has_39_planned_slots_and_no_attempts(tmp_path: Path):
     assert all(row["attempts"] == [] and row["seed_effective"] is None and row["recording_path"] is None
                for row in status["run_slots"])
     assert actual["actual_attempt_count"] == 0
+    mapping = json.loads((tmp_path / "schema_mapping.json").read_text())
+    topics = {row["topic"]: row for row in mapping["topics"]}
+    assert topics["/clock"]["output"] == "clock.jsonl.simulation_timestamp_ns"
+    assert "FLU to ENU" in topics["/simulation/camera_pose_diagnostics/left"]["contract"]
+    assert topics["/left_camera/camera_info"]["message"] == "sensor_msgs/msg/CameraInfo"
     with pytest.raises(FileExistsError, match="already exist"):
         initialize(tmp_path)
     assert json.loads((tmp_path / "run_status.json").read_text()) == status
@@ -67,7 +73,20 @@ def test_structural_failure_retries_same_seed_without_overwriting(tmp_path: Path
     qc2 = {"run_id": "G0-P0-R01", "attempt_id": "a02", "status": "INFRASTRUCTURE_FAILED",
            "infrastructure_errors": ["missing_ground_truth"], "protocol_errors": []}
     finish_attempt(tmp_path, "G0-P0-R01", "a02", qc2)
-    with pytest.raises(ValueError, match="same technical failure twice"):
+    with pytest.raises(ValueError, match="two consecutive technical failures"):
+        begin_attempt(tmp_path, "G0-P0-R01")
+
+
+def test_different_consecutive_technical_failures_also_require_review(tmp_path: Path):
+    initialize(tmp_path)
+    for reason in ("missing_ground_truth", "image_queue_overflow"):
+        attempt, _ = begin_attempt(tmp_path, "G0-P0-R01")
+        finish_attempt(tmp_path, "G0-P0-R01", attempt["attempt_id"], {
+            "run_id": "G0-P0-R01", "attempt_id": attempt["attempt_id"],
+            "status": "INFRASTRUCTURE_FAILED", "infrastructure_errors": [reason],
+            "protocol_errors": [],
+        })
+    with pytest.raises(ValueError, match="two consecutive technical failures"):
         begin_attempt(tmp_path, "G0-P0-R01")
 
 
@@ -133,6 +152,67 @@ def _checksum_entries(attempt_dir: Path) -> dict[str, str]:
     return result
 
 
+def _cadence_false_positive(tmp_path):
+    from campaigns.stereo_v1_1.campaign_status import _write_attempt_checksums
+    attempt, folder, previous = _known_qc_deviation(tmp_path)
+    for filename, collection in (("run_status.json", "run_slots"), ("manifest_actual.json", "attempts")):
+        path = tmp_path / filename
+        value = json.loads(path.read_text())
+        row = value[collection][0]
+        row["status"] = "INFRASTRUCTURE_FAILED"
+        if collection == "run_slots":
+            row["attempts"][0]["status"] = "INFRASTRUCTURE_FAILED"
+        path.write_text(json.dumps(value))
+    previous.update(status="INFRASTRUCTURE_FAILED", protocol_errors=[],
+                    infrastructure_errors=["science_setpoint_cadence_below_v12_requirement"])
+    (folder / "qc_report.json").write_text(json.dumps(previous))
+    (folder / "runner_result.json").write_text(json.dumps({"qc_status": "INFRASTRUCTURE_FAILED", "runner_failure_reason": None}))
+    (folder / "run_manifest.json").write_text(json.dumps({"protocol_version": "1.2"}))
+    _write_attempt_checksums(folder)
+    fresh = {**previous, "status": "VALID_WITH_WARNINGS", "counted_in_campaign": True,
+             "infrastructure_errors": [], "evidence": {"science_setpoint_cadence_recomputed": {
+                 "criterion": "reference_slot_coverage_v2", "missing_full_slot_count": 0,
+                 "sufficient_unique_simulation_cadence": True}}}
+    return folder, fresh
+
+
+def test_cadence_revalidation_preserves_raw_and_original_checksums(tmp_path):
+    folder, fresh = _cadence_false_positive(tmp_path)
+    raw = (folder / "source.json").read_bytes()
+    original_checksums = (folder / "checksums.sha256").read_bytes()
+    revalidate_cadence_qc_regression(tmp_path, "G0-P0-R01", "a01", fresh)
+    assert (folder / "source.json").read_bytes() == raw
+    assert (folder / "checksums_pre_revalidation.sha256").read_bytes() == original_checksums
+    assert json.loads((folder / "qc_report_pre_revalidation.json").read_text())["status"] == "INFRASTRUCTURE_FAILED"
+    assert json.loads((tmp_path / "run_status.json").read_text())["valid_run_count"] == 1
+    assert json.loads((folder / "qc_revalidation.json").read_text())["criterion"] == "reference_slot_coverage_v2"
+    _checksum_entries(folder)
+    with pytest.raises(ValueError):
+        revalidate_cadence_qc_regression(tmp_path, "G0-P0-R01", "a01", fresh)
+
+
+@pytest.mark.parametrize("defect", ["other_error", "missing_slot", "source_changed", "not_latest"])
+def test_cadence_revalidation_rejects_unrelated_or_unproven_repair(tmp_path, defect):
+    from campaigns.stereo_v1_1.campaign_status import _write_attempt_checksums
+    folder, fresh = _cadence_false_positive(tmp_path)
+    attempt_id = "a01"
+    if defect == "other_error":
+        p = folder / "qc_report.json"
+        previous = json.loads(p.read_text())
+        previous["infrastructure_errors"].append("missing_ground_truth")
+        p.write_text(json.dumps(previous))
+        _write_attempt_checksums(folder)
+    elif defect == "missing_slot":
+        fresh["evidence"]["science_setpoint_cadence_recomputed"]["missing_full_slot_count"] = 1
+    elif defect == "source_changed":
+        (folder / "source.json").write_text("changed")
+    else:
+        attempt_id = "a02"
+    with pytest.raises(ValueError):
+        revalidate_cadence_qc_regression(tmp_path, "G0-P0-R01", attempt_id, fresh)
+    assert not (folder / "qc_revalidation.json").exists()
+
+
 def test_known_qc_regression_revalidates_same_attempt_and_preserves_prior_report(tmp_path: Path):
     attempt, attempt_dir, previous = _known_qc_deviation(tmp_path)
     fresh = {
@@ -181,3 +261,72 @@ def test_known_qc_revalidation_rejects_unrelated_protocol_errors(tmp_path: Path)
     }
     with pytest.raises(ValueError, match="outside the known validator regression"):
         revalidate_known_qc_regression(tmp_path, "G0-P0-R01", "a01", fresh)
+
+
+@pytest.mark.parametrize('tamper', [False, True])
+def test_reviewed_user_retry_is_one_attempt_and_evidence_bound(tmp_path, tamper):
+    from campaigns.stereo_v1_1.campaign_status import authorize_reviewed_retry
+    initialize(tmp_path)
+    for _ in range(2):
+        attempt, _ = begin_attempt(tmp_path, 'G0-P0-R01')
+        finish_attempt(tmp_path, 'G0-P0-R01', attempt['attempt_id'], {
+            'run_id': 'G0-P0-R01', 'attempt_id': attempt['attempt_id'],
+            'status': 'INFRASTRUCTURE_FAILED', 'infrastructure_errors': ['cadence'],
+            'protocol_errors': []})
+    evidence = tmp_path / 'review.json'
+    evidence.write_text('{"repaired": false}')
+    authorize_reviewed_retry(tmp_path, 'G0-P0-R01',
+                            user_instruction='Resume after the diagnostic report',
+                            evidence_paths=['review.json'])
+    if tamper:
+        evidence.write_text('changed')
+        with pytest.raises(ValueError, match='two consecutive'):
+            begin_attempt(tmp_path, 'G0-P0-R01')
+        return
+    with pytest.raises(ValueError, match='already recorded'):
+        authorize_reviewed_retry(tmp_path, 'G0-P0-R01', user_instruction='Again',
+                                 evidence_paths=['review.json'])
+    attempt, _ = begin_attempt(tmp_path, 'G0-P0-R01')
+    assert attempt['attempt_id'] == 'a03'
+    assert attempt['reviewed_retry_authorization']['used']
+    assert attempt['reviewed_retry_authorization']['cause_repaired'] is False
+    finish_attempt(tmp_path, 'G0-P0-R01', 'a03', {
+        'run_id': 'G0-P0-R01', 'attempt_id': 'a03',
+        'status': 'INFRASTRUCTURE_FAILED', 'infrastructure_errors': ['cadence'],
+        'protocol_errors': []})
+    with pytest.raises(ValueError, match='two consecutive'):
+        begin_attempt(tmp_path, 'G0-P0-R01')
+
+
+@pytest.mark.parametrize('blocked_case', [None, 'tampered_raw', 'science_started', 'empty_checksums'])
+def test_nonstart_reclassification_preserves_raw_and_allows_same_seed_retry(tmp_path, blocked_case):
+    from campaigns.stereo_v1_1.campaign_status import invalidate_pre_science_attempt, _write_attempt_checksums
+    initialize(tmp_path)
+    attempt, directory = begin_attempt(tmp_path, 'G0-V0-R01')
+    original = {'run_id': 'G0-V0-R01', 'attempt_id': 'a01', 'status': 'VALID_WITH_WARNINGS',
+                'infrastructure_errors': [], 'protocol_errors': [], 'counted_in_campaign': True,
+                'evidence': {'controller_status': 'failed', 'controller_failure_reason': 'entry timeout'}}
+    finish_attempt(tmp_path, 'G0-V0-R01', 'a01', original)
+    (directory / 'qc_report.json').write_text(json.dumps(original))
+    (directory / 'runner_result.json').write_text(json.dumps({'qc_status': 'VALID_WITH_WARNINGS'}))
+    (directory / 'controller_result.json').write_text(json.dumps({'controller_status': 'failed', 'failure_reason': 'entry timeout'}))
+    (directory / 'run_manifest.json').write_text(json.dumps({'protocol_version': '1.2'}))
+    (directory / 'events.jsonl').write_text(json.dumps({'event': 'science_start' if blocked_case == 'science_started' else 'entry_started'})+'\n')
+    raw = directory / 'ground_truth.jsonl'
+    raw.write_text('original raw\n')
+    _write_attempt_checksums(directory)
+    fresh = {**original, 'status': 'INFRASTRUCTURE_FAILED', 'counted_in_campaign': False,
+             'counted_in_39': False, 'infrastructure_errors': ['pre_science_execution_failure']}
+    if blocked_case:
+        if blocked_case == 'tampered_raw':raw.write_text('tampered\n')
+        if blocked_case == 'empty_checksums':(directory/'checksums.sha256').write_text('')
+        with pytest.raises(ValueError):invalidate_pre_science_attempt(tmp_path, 'G0-V0-R01', 'a01', fresh)
+        return
+    row = invalidate_pre_science_attempt(tmp_path, 'G0-V0-R01', 'a01', fresh)
+    assert row['status'] == 'INFRASTRUCTURE_FAILED'
+    assert raw.read_text() == 'original raw\n'
+    assert json.loads((directory / 'qc_report.json.before_entry_reclassification').read_text()) == original
+    assert json.loads((tmp_path / 'run_status.json').read_text())['valid_run_count'] == 0
+    next_attempt, _ = begin_attempt(tmp_path, 'G0-V0-R01')
+    assert next_attempt['attempt_id'] == 'a02'
+    assert next_attempt['seed_requested'] == attempt['seed_requested']

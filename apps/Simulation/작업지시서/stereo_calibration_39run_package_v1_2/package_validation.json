@@ -1,0 +1,48 @@
+{
+  "status": "PACKAGE_VALIDATION_PASS",
+  "document_version": "1.2",
+  "date_kst": "2026-10-13",
+  "human_guide_pages": 11,
+  "planned_runs": 39,
+  "group_counts": {
+    "G0": 30,
+    "G1": 9
+  },
+  "manifest_and_reference_files_byte_identical_to_v1_1": true,
+  "main_calibration_and_reprocessing_contract_unchanged": true,
+  "source_coordinate_tests": {
+    "status": "SOURCE_CONTRACT_PASS",
+    "source_commit": "0d83e0a2f7fe45c2f6c34f480bfb92a34fb7fd59",
+    "runtime_executed": false,
+    "tested_optical_attitude_cases": 10,
+    "maximum_rotation_element_error": 2.220446049250313e-16,
+    "camera_centers_unchanged": true,
+    "baseline_frd_enu_roundtrip_points": 3,
+    "v0_start_left_optical_depth_m": 638.4724614712147,
+    "repository_clip_far_m": 500.0,
+    "campaign_clip_far_m": 1000.0,
+    "debug_bag_missing_verified": [
+      "/clock",
+      "/simulation/ground_truth/vehicle_reference_link"
+    ],
+    "reference_link_offset_m": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "limits": [
+      "Pure source geometry only; generated Gazebo world and runtime transforms not executed",
+      "No PX4 controller or calibration estimator implemented or tested by this check"
+    ]
+  },
+  "student_gazebo_executed": false,
+  "new_controllers_and_estimators_implemented": false,
+  "rendering_config_change": "Far clip 1000m required; source default500m",
+  "limits": [
+    "Actual Gazebo mesh visibility, FPS, sync, GT rate and PX4 tracking need runtime checks",
+    "Existing records need equivalence audit before reuse"
+  ],
+  "pdf_visual_review": "All 11 rendered pages inspected; no clipped text, overlapping cells, missing glyphs or overflow",
+  "source_repository_modified": false,
+  "remote_repository_modified": false
+}

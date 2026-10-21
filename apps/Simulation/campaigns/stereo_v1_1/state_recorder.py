@@ -14,9 +14,15 @@ import json
 import math
 import os
 import signal
+import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "stereo_ground_sim"))
+from stereo_ground_sim.coordinate_frames import (
+    vehicle_reference_definition,
+    vehicle_reference_offset_parent_m,
+)
 
 STOP = False
 
@@ -126,6 +132,11 @@ class StateRecordWriter:
             "source_timestamp_ns": stamp,
             "receive_monotonic_ns": int(receive_monotonic_ns),
             "reference_link": "vehicle_reference_link",
+            # This campaign admits only x500_2m. Positions already contain the
+            # adapter's offset; record provenance without shifting them again.
+            "reference_definition": vehicle_reference_definition("x500_2m"),
+            "reference_offset_parent_m": list(vehicle_reference_offset_parent_m("x500_2m")),
+            "reference_parent_frame": "base_link_flu",
             "position_frame": "gazebo_world_enu",
             "position_axis_order": "east,north,up",
             "position_world_enu_m": position,
@@ -238,10 +249,14 @@ def main() -> int:
         from px4_msgs.msg import VehicleAttitude, VehicleLocalPosition
         from rclpy.node import Node
         from rclpy.qos import QoSProfile, ReliabilityPolicy
+        from rclpy.signals import SignalHandlerOptions
         from rosgraph_msgs.msg import Clock
         from std_msgs.msg import String
 
-        rclpy.init()
+        # This process owns SIGINT/SIGTERM via _stop. Keep the ROS context
+        # alive until spin stops and callbacks drain; rclpy default handlers
+        # otherwise shut it down concurrently with spin_once timer creation.
+        rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
         node = Node("stereo_v1_1_state_recorder")
         qos = QoSProfile(depth=100, reliability=ReliabilityPolicy.BEST_EFFORT)
 

@@ -99,3 +99,52 @@ Independent direct PX4 readback then showed `vehicle_magnetometer.device_id=8944
 `-7.277°`. During the first run the Workstation UI's Radio Shell active-ID label remained
 `VERIFYING` because queued Shell responses intermittently reported an older device; the parser
 was then corrected to prefer the newest PX4 uORB timestamp and its focused regression passed.
+
+## 2026-10-12 RCA follow-up — staged edits, PARAM retry, voter guard
+
+### Slice evidence
+
+| Slice | Evidence | Result |
+|---|---|---|
+| PX4 v1.17 sparse-voter gap prediction | `tests/test_mag_selection_preview.py` covers a disabled lower instance, positive filler priority, and the reserved instance-0 validator | PASS |
+| Draft survives the 4 Hz Pixhawk refresh; Discard restores confirmed values; voter-gap Apply is blocked | `tests/test_pixhawk_magnetometer_workspace.py::test_pixhawk_workspace_renders_p1_p2_imu_magnetometer_table` | PASS |
+| PARAM_SET retries missing ACK only, stops on value mismatch | `tests/test_workstation_pixhawk_gnss.py::test_param_set_retries_missing_ack_but_not_received_value_mismatch`; `tests/test_mavlink_liveness.py` | PASS |
+| Worker rejects voter gap before writes and checks final PARAM readback | `tests/test_workstation_pixhawk_gnss.py::test_mag_apply_worker_blocks_known_v117_voter_gap_before_any_write`; `...::test_mag_apply_worker_checks_fresh_final_priority_readback` | PASS |
+| Controller captures side topology and invalidates uncertain readback after partial apply | `tests/test_device_admin_boundaries.py` follow-up cases | PASS |
+
+Focused regression command (automated-fake / offscreen, Python 3.10):
+
+```text
+PYTHONPATH="../..:..:../../common/python" QT_QPA_PLATFORM=offscreen \
+../../.venv/bin/python -m pytest -p no:cacheprovider -q \
+  tests/test_mag_selection_preview.py \
+  tests/test_pixhawk_magnetometer_workspace.py \
+  tests/test_mavlink_liveness.py \
+  tests/test_workstation_pixhawk_gnss.py::test_common_param_receive_loop_preserves_integer_bits_and_unmatched_message \
+  tests/test_workstation_pixhawk_gnss.py::test_param_set_retries_missing_ack_but_not_received_value_mismatch \
+  tests/test_workstation_pixhawk_gnss.py::test_pixhawk_shell_and_parameter_workers_use_exclusive_command_path \
+  tests/test_workstation_pixhawk_gnss.py::test_mag_apply_worker_blocks_known_v117_voter_gap_before_any_write \
+  tests/test_workstation_pixhawk_gnss.py::test_mag_apply_worker_checks_fresh_final_priority_readback \
+  tests/test_device_admin_boundaries.py::test_mag_apply_failure_invalidates_cached_readback_after_possible_partial_write \
+  tests/test_device_admin_boundaries.py::test_voter_gap_prewrite_block_keeps_confirmed_readback_available \
+  tests/test_device_admin_boundaries.py::test_parameter_worker_receives_captured_side_topology_for_voter_guard
+```
+
+Result: latest run `80 passed in 2.63s`. A preceding run passed 79 tests; the added incomplete-
+topology warning assertion initially expected the word `disabled` while the compact UI says `off`.
+The assertion was corrected and the final run passed. Earlier focused attempts also exposed a
+misplaced `actual_role` assertion and a missing public workspace alias; both were corrected.
+Scoped `git diff --check` over the changed MAG/Pixhawk source, tests, and product docs passed.
+
+### Not run / residual boundary
+
+- Full Workstation suite not rerun; the earlier packet's `1931 passed, 2 skipped, 27 failed`
+  baseline remains recorded above.
+- No visual/manual review of the live 1600×980 UI, locale/font scaling, or concurrent Qt Designer
+  changes was performed.
+- No connected Pixhawk `ver all`, PARAM write, save, reboot, or hardware voter readback was run.
+  The local GUI/worker behavior is automated-fake evidence; installed firmware and live selection
+  remain hardware-unverified. The user authorized code changes only.
+- Coordinate contract: only scalar `sensor_mag` instance, device ID, and `CAL_MAGn_PRIO` values
+  were added to the preview guard. No `x/y/z`, sensor-axis, NED/ENU, FRD, or camera-frame values
+  were changed or converted.

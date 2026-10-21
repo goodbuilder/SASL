@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Simulation v1.2 실험 결과 · 3인 독립 심사</title>
+  <style>
+    :root { color-scheme: light; --ink:#162234; --muted:#536276; --line:#dbe2ea; --bg:#f4f7fa; --paper:#fff; --navy:#14334e; --teal:#087d79; --amber:#a96200; --red:#a23e3e; }
+    * { box-sizing:border-box } html { scroll-behavior:smooth } body { margin:0; font:16px/1.65 system-ui,-apple-system,"Noto Sans KR",sans-serif; color:var(--ink); background:var(--bg) }
+    a { color:#075d82; text-underline-offset:3px } a:hover { color:#003c59 } .shell { max-width:1160px; margin:auto; padding:24px }
+    header { background:linear-gradient(125deg,#102f48,#176364); color:#fff; padding:42px 0 36px } header .shell { padding-top:0; padding-bottom:0 }
+    .eyebrow { font-size:.78rem; letter-spacing:.15em; text-transform:uppercase; font-weight:800; opacity:.8 } h1 { margin:.4rem 0 .65rem; font-size:clamp(2rem,4vw,3.15rem); line-height:1.18 } header p { max-width:800px; margin:0; color:#e1edf0 }
+    nav { display:flex; flex-wrap:wrap; gap:8px; margin-top:25px } nav a { color:#fff; text-decoration:none; border:1px solid #a9c9ce70; border-radius:999px; padding:5px 12px; font-size:.88rem } nav a:hover { color:#fff; background:#ffffff22 }
+    main { display:grid; gap:18px; padding-top:22px; padding-bottom:48px } section { background:var(--paper); border:1px solid var(--line); border-radius:16px; padding:25px 28px; box-shadow:0 5px 22px #17304a0a } h2 { margin:0 0 12px; color:var(--navy); font-size:1.48rem } h3 { margin:22px 0 7px; color:var(--navy); font-size:1.08rem } p { margin:8px 0 } .lead { font-size:1.1rem; max-width:900px }
+    .statgrid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin:19px 0 4px } .stat { background:#edf4f5; border-radius:11px; padding:13px 16px } .stat b { display:block; font-size:1.44rem; color:var(--navy) } .stat span { font-size:.84rem; color:var(--muted) }
+    .notice { border-left:4px solid var(--amber); background:#fff8eb; padding:12px 15px; border-radius:0 9px 9px 0; margin:14px 0 } .positive { border-left-color:var(--teal); background:#ecf8f6 } .critical { border-left-color:var(--red); background:#fff2f0 }
+    .tag { display:inline-block; border-radius:999px; padding:2px 9px; font-size:.72rem; font-weight:800; vertical-align:2px; margin-right:7px; background:#f9e5e2; color:#8c3535 } .tag.medium { background:#fff0d6; color:#825000 } .tag.good { background:#dff2ee; color:#07645e }
+    .issue { border-top:1px solid var(--line); padding:15px 0 1px } .issue:first-of-type { border-top:0 } .issue h3 { margin:0 0 5px } .evidence { color:var(--muted); font-size:.89rem } .decision { font-weight:700; color:var(--navy) }
+    table { width:100%; border-collapse:collapse; font-size:.91rem } th,td { border-bottom:1px solid var(--line); padding:10px 11px; text-align:left; vertical-align:top } th { background:#edf3f7; color:var(--navy); font-weight:750 } .tablewrap { overflow-x:auto } code { font: .88em ui-monospace,SFMono-Regular,Consolas,monospace; background:#f0f3f6; padding:1px 4px; border-radius:4px; overflow-wrap:anywhere }
+    ol,ul { padding-left:1.35rem } li { margin:6px 0 } .columns { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:13px } .card { border:1px solid var(--line); border-radius:11px; padding:16px; background:#fcfdfd } .card h3 { margin:0 0 7px } .small { color:var(--muted); font-size:.87rem } .sources li { overflow-wrap:anywhere }
+    @media(max-width:760px) { .shell { padding:16px } section { padding:19px } .statgrid { grid-template-columns:repeat(2,1fr) } .columns { grid-template-columns:1fr } }
+    @media print { body { background:#fff } header { background:#fff; color:var(--ink); border-bottom:2px solid var(--navy) } header p { color:var(--ink) } nav { display:none } section { box-shadow:none; break-inside:avoid } a { color:var(--ink) } }
+  </style>
+</head>
+<body>
+<header><div class="shell">
+  <div class="eyebrow">SASL · Simulation · evidence review</div>
+  <h1>v1.2 실험 결과<br>3인 독립 심사 보고서</h1>
+  <p>동결 분석 <code>analysis_9cfd7c6cd10b</code>와 사후 검토 워크북을 대상으로 한 잠정 심사입니다. 세 심사자는 같은 자료를 독립적으로 읽고, 결과 타당성·재현성·문서 계약을 각각 집중 검토했습니다. 이는 학회·저널의 공식 판정이 아닙니다.</p>
+  <nav aria-label="목차"><a href="#verdict">종합 판정</a><a href="#issues">주요 지적</a><a href="#reviewers">심사자별 의견</a><a href="#audit">완전성 감사</a><a href="#actions">수정 순서</a><a href="#scope">검토 범위</a></nav>
+</div></header>
+<main class="shell">
+<section id="verdict">
+  <h2>종합 판정 · 주요 수정 필요</h2>
+  <p class="lead">수치 집계와 GT 제외 목록에서는 확인한 범위의 불일치가 없었습니다. 그러나 <strong>P2 선택의 실질적 우위, 추종 품질 경고의 해석, MC 반복의 통계 단위</strong>를 정리하지 않으면 논문에서 강한 성능 주장을 하기 어렵습니다.</p>
+  <div class="statgrid"><div class="stat"><b>39 / 54</b><span>유효 슬롯 / 전체 attempt</span></div><div class="stat"><b>39 / 39</b><span>추종 위치 P95 &gt; 1 m</span></div><div class="stat"><b>9,788 / 0</b><span>무효 GT 이미지 / 연구 구간 내부</span></div><div class="stat"><b>4,664 × 100</b><span>조건 그룹 × MC trial</span></div></div>
+  <div class="notice positive"><strong>확인된 강점.</strong> 원본 실행 현황 39·54·15건, 평가 CSV 466,400행, 39개 GT 파일의 해시와 상태별 집계, 제외 프레임 9,788행은 심사자가 대조한 범위에서 일치했습니다. GT 제외 프레임은 모두 연구 구간 이전으로 기록됩니다.</div>
+  <div class="notice positive"><strong>후속 워크북 보완.</strong> <a href="../../../recordings/stereo_v1_1/paper1_v1_2_001/outputs/20261021-postfreeze-summary-review/stereo_v1_2_summary_report_ready.xlsx">상급자 보고용 보완본</a>은 이 심사의 원래 대상에 방법·MC 입력 계약, P2 선정 계산 추적, QC 시간 간격, 대응 사례 P95 탭을 추가했습니다. 아래 지적은 당시 심사 대상 워크북에 대한 기록이며, 실험의 독립 비행 반복성과 수치 합격 기준은 이 보완으로 새로 검증되지 않습니다.</div>
+  <div class="notice critical"><strong>가장 치명적인 주장 위험.</strong> P2는 동결 전에 정한 규칙으로 선택됐지만, 표시된 예측 차이는 작고 V0 평균 RMSE에서 일관된 최저 경로가 아닙니다. “P2가 최적 성능을 입증했다”는 결론은 현재 자료와 맞지 않습니다.</div>
+</section>
+
+<section id="issues">
+  <h2>Reject·감점 가능 사유</h2>
+  <article class="issue"><h3><span class="tag">주요 1</span>P2 선정 계산을 원래 워크북에서 따라가기 어려움</h3><p>동결 코드는 G0 trial-0 RPY_IMU에서 각 교정 실행×방법마다 V0 타깃 5점의 예측 3D 위치 σ를 평균하고, 경로별 15개 평균의 <strong>중앙값을 선택 점수</strong>로 사용합니다. 동률이면 평균 참조시간과 경로 ID를 사용합니다. 원래 심사 대상의 <code>06_리뷰판정!A26:F31</code>에는 최종 점수와 보조 P95가 있었지만, 두 단계 집계와 원천 75개 값을 표에서 직접 재구성하기 어려웠습니다.</p><p class="evidence">근거: <code>analyze_campaign.py:1668-1700</code>, <code>path_selection.json:candidate_summary,per_calibration_prediction</code>; 원래 심사 대상 XLSX <code>06_리뷰판정!A24:F31</code>.</p><p><span class="decision">보완:</span> 후속 워크북 <code>12_P2선정추적</code>에 75개 원천 예측, Excel AVERAGE→MEDIAN 계산, 동결 점수 대조와 동률 순서를 추가했습니다. P2와 P4의 점수 차이는 약 0.073 mm이며, 이는 실제 V0 성능 차이를 뜻하지 않습니다.</p></article>
+  <article class="issue"><h3><span class="tag">주요 2</span>사전 선택을 사후 성능 우월성으로 해석할 수 없음</h3><p>V0 RPY_IMU <code>all_data</code> 평균 3D RMSE는 A에서 P0 1.17184 m, P2 1.17993 m이고 B에서도 P0 1.17144 m, P2 1.17969 m입니다. 평가 조건과 지표에 따라 순위가 달라집니다.</p><p class="evidence">근거: XLSX <code>06_리뷰판정!A36:M55</code>; 동결 <code>analysis_summary.json</code>.</p><p><span class="decision">수정:</span> “사전 공분산 규칙으로 P2 선택”과 “선택 후 V0에서 관측한 경로별 결과”를 분리하고, 반복 실행 단위의 차이·변동과 실용적으로 의미 있는 차이 범위를 보고하세요. 검증 전까지 전역 최적 또는 일관된 최고 성능이라는 표현을 피하세요.</p></article>
+  <article class="issue"><h3><span class="tag">주요 3</span>추종 경고 39건과 당시 QC 경고 31건의 관계</h3><p>39개 수용 실행의 추종 위치 P95는 모두 작업지시서의 1 m 경고선을 넘습니다. 동결 전 QC 경고는 31건이며, V0 8건은 당시 경고 집계에서 빠졌습니다. 1 m는 <strong>경고 기준</strong>으로 기록되어 있으므로 이를 자동 폐기 기준으로 바꿔 해석해서도 안 됩니다.</p><p class="evidence">근거: XLSX <code>06_리뷰판정!B6:B7</code>, <code>07_사후QC!F:I</code>; <a href="../../../작업지시서/stereo_calibration_39run_package_v1_2/09_작업지시서_상세설명.html">작업지시서</a> 329행.</p><p><span class="decision">수정:</span> 원래 QC 판정과 사후 재집계를 별도 열로 유지하고, 논문의 주요 결과 옆에 추종 조건을 밝히세요. 가능하면 P95 크기에 따른 교정·V0 지표 민감도를 제시하세요. “완료”는 절차 완료인지 성능 합격인지 명확히 쓰세요.</p></article>
+  <article class="issue"><h3><span class="tag">주요 4</span>MC 분포와 비행 간 불확실성을 구분해야 함</h3><p>4,664개 조건에 각각 100개 trial이 있지만, 이는 독립적인 물리 비행 100회가 아닙니다. PX4 난수 적용과 비행 반복 독립성은 확인되지 않았습니다. 워크북의 2.5–97.5 백분위를 비행 간 신뢰구간으로 부르면 표본 단위를 과장합니다.</p><p class="evidence">근거: XLSX <code>01_실행현황!H열</code>, <code>06_리뷰판정!A3</code>, <code>08_V0_MC분포</code>; <a href="../../../작업지시서/stereo_calibration_39run_package_v1_2/MC100_설명.html">MC100 설명</a>.</p><p><span class="decision">수정:</span> MC 백분위는 센서오차 모의의 경험적 범위라고 표시하고, 경로·방법 간 추론은 실행(run) 단위의 대응 차이와 독립성 확인을 별도로 제시하세요.</p></article>
+  <article class="issue"><h3><span class="tag medium">주요 5</span>방법 C의 큰 꼬리와 조건별 비교 불가 사례</h3><p>방법 C는 특정 조건에서 매우 큰 위치 오차를 보이며, GPS_YAW90 C/all_data 짝비교에는 비교 불가 사례 407건이 있습니다. A/B의 평균 차이는 작아 전체 평균 한 값만으로 우열을 단정하기 어렵습니다.</p><p class="evidence">근거: 동결 <code>analysis_summary.json</code>, <code>attitude_variant_comparisons.csv</code>; XLSX <code>05_그래프</code>.</p><p><span class="decision">수정:</span> 방법별 중앙값·상위 분위수·실패 및 비교 불가 건수와 분모를 함께 제시하고, C의 발산 조건을 별도로 분석하세요. 평균 개선과 사례별 개선 비율이 다른 방향일 때는 둘 다 설명하세요.</p></article>
+  <article class="issue"><h3><span class="tag medium">문서 6</span>V0 자세오차 표현이 평가 계약과 충돌</h3><p><a href="../../../작업지시서/stereo_calibration_39run_package_v1_2/stereo-calibration-explained.html">교정 설명 HTML</a> 221행은 V0에서 “자세오차·3D RMSE/P95·검출률”을 계산한다고 읽히지만, 같은 문서 261행과 동결 자료는 V0에서 카메라 자세를 고정하고 위치를 평가한다고 설명합니다.</p><p><span class="decision">수정:</span> 221행의 “자세오차”를 교정 단계의 별도 진단으로 옮기거나 삭제해 V0 카메라 자세오차를 새로 평가한 듯한 인상을 없애세요.</p></article>
+</section>
+
+<section id="reviewers"><h2>심사자별 독립 의견</h2><div class="columns">
+  <div class="card"><h3>심사자 1 · 결과 타당성</h3><p>사전 선택과 사후 V0 성능을 분리해야 합니다. P2의 일관된 우위, A/B의 일반적 우열, MC100에 기반한 비행 간 신뢰구간은 현재 자료로 방어하기 어렵습니다.</p><p class="small">반대 근거도 확인: P2의 사전 선택 기록은 존재하며, matched_200 등 일부 조건에서는 P2의 RMSE가 낮습니다. 이를 전체 조건의 우위로 확장할 근거는 아닙니다.</p></div>
+  <div class="card"><h3>심사자 2 · 재현성과 원자료</h3><p>39/54/15 실행 건수, 466,400 평가 행, 39개 GT 파일의 해시·상태 건수, 9,788개 상세 제외 프레임에서 확인한 불일치는 없습니다.</p><p class="small">한계: 전체 분석의 재실행, 전체 대형 체크섬 목록, 일부 출처 시트의 허용 범위 밖 증거와 개별 이벤트·pair 연결의 전수 재계산은 수행하지 않았습니다.</p></div>
+  <div class="card"><h3>심사자 3 · 방법·문서 계약</h3><p>HTML의 MC 단위, 경고 기준, 주요 좌표 계약은 동결 분석과 대체로 일치합니다. 워크북의 P2 선정 표에는 실제 중앙값 선택 점수가 빠져 있어 재현 가능한 제시가 필요합니다.</p><p class="small">동결 파일의 시각·해시는 사전 선택 주장을 뒷받침하지만, 허용된 자료만으로 동결 전 V0 결과에 접근하지 않았다는 사실을 독립적으로 확증할 수는 없습니다.</p></div>
+</div></section>
+
+<section id="audit"><h2>완전성 감사</h2><div class="tablewrap"><table><thead><tr><th>검토 항목</th><th>판정</th><th>근거와 범위</th></tr></thead><tbody>
+  <tr><td>연구 문제·기여·선행연구와 비교</td><td>확인 불가</td><td>배정 대상은 실험 결과 워크북과 방법 자료입니다. 논문 원고와 선행연구 목록은 배정되지 않았습니다.</td></tr>
+  <tr><td>방법·평가 지표와 주장 연결</td><td>수정 필요</td><td>P2 중앙값 선정 규칙과 표의 평균/P95 제시가 다르며, V0 사후 순위는 조건별로 달라집니다.</td></tr>
+  <tr><td>자료·분모·반복 횟수</td><td>부분 확인</td><td>39/54/15 및 4,664×100 집계 확인. MC는 독립 비행 반복이 아닙니다.</td></tr>
+  <tr><td>표·그래프·단위·범위</td><td>수정 필요</td><td>C의 극단값과 비교 불가 분모, 추종 P95의 경고 범위를 주요 그래프 해석에 병기해야 합니다.</td></tr>
+  <tr><td>실패·결측·한계</td><td>부분 확인</td><td>GT 제외 9,788개와 연구 구간 내부 0개 확인. C 실패 꼬리 및 독립성 한계의 결과 해석 보강 필요.</td></tr>
+  <tr><td>수식·알고리즘·계산</td><td>부분 확인</td><td>대표 MC 그룹 평균·표본 SD와 집계 관계 확인. 전체 분석 재실행과 모든 수식의 독립 검증은 미수행.</td></tr>
+  <tr><td>인용·참고문헌·제목·저자·결론</td><td>해당 요소 없음</td><td>실험 결과 워크북은 완성된 논문 원고가 아니며 이 요소들을 심사 대상으로 제공하지 않았습니다.</td></tr>
+  <tr><td>부록·배정 보조자료</td><td>부분 확인</td><td>동결 JSON/CSV, 선택 실행 QC·GT, HTML 4개를 사용. 원시 영상·실행 코드·전체 로그는 범위 밖입니다.</td></tr>
+</tbody></table></div></section>
+
+<section id="actions"><h2>수정 우선순위</h2><ol>
+  <li><strong>P2 선정 점수 공개:</strong> 중앙값, 집계 단위, 동률 처리와 선택 계산 추적을 워크북에 추가하고 사전 선택과 사후 평가를 구분합니다.</li>
+  <li><strong>결과 주장의 범위 조정:</strong> P2 또는 특정 방법의 우월성 대신 조건별 관측 차이, 실패율과 꼬리 분포를 보고합니다.</li>
+  <li><strong>추종 경고와 평가 상태 명시:</strong> 39/39 경고, 기존 QC 31건, V0 8건의 차이를 설명하고 “완료”의 의미를 절차 완료로 한정합니다.</li>
+  <li><strong>통계 단위 정리:</strong> MC 분포와 비행 실행 단위 결과를 분리하고, 독립성 검증 전에는 비행 간 신뢰구간·유의성 주장을 하지 않습니다.</li>
+  <li><strong>HTML 문구 수정:</strong> 교정 설명 HTML 221행의 V0 “자세오차” 표현을 평가 계약에 맞춥니다.</li>
+</ol><p class="small">새 물리 실험이 필요한 주장은 독립 반복성, 실제 장비·동적 자세 일반화, 비행 간 신뢰구간입니다. 기존 자료만으로 가능한 보완은 선정 계산 추적, 실행 단위 기술 통계, 방법 C 실패 분포, 문서 표현 수정입니다.</p></section>
+
+<section id="scope"><h2>검토 범위와 출처</h2>
+  <p><strong>심사 기준:</strong> <code>moontaehyung:reviewer</code>의 <code>reviewer.toml</code>. 세 심사자 모두 읽기 전용으로 진행했으며 외부 인터넷 자료를 사용하지 않았습니다.</p>
+  <ul class="sources">
+    <li><strong>검토 대상:</strong> <a href="../../../recordings/stereo_v1_1/paper1_v1_2_001/outputs/20261021-postfreeze-summary-review/stereo_v1_2_summary_postfreeze_reviewed.xlsx">사후 검토 XLSX</a>, <a href="../../../recordings/stereo_v1_1/paper1_v1_2_001/stereo_v1_2_summary.xlsx">원본 요약 XLSX</a>.</li>
+    <li><strong>동결 분석:</strong> <a href="../../../recordings/stereo_v1_1/paper1_v1_2_001/analysis_versions/analysis_9cfd7c6cd10b/analysis_freeze.json">analysis_freeze.json</a>, <a href="../../../recordings/stereo_v1_1/paper1_v1_2_001/analysis_versions/analysis_9cfd7c6cd10b/path_selection.json">path_selection.json</a>, <a href="../../../recordings/stereo_v1_1/paper1_v1_2_001/analysis_versions/analysis_9cfd7c6cd10b/analysis_methodology.md">analysis_methodology.md</a>, manifest·summary·평가/교정 CSV·자세 비교 CSV·체크섬 목록.</li>
+    <li><strong>실행 증거:</strong> 선택된 39개 attempt의 QC·GT 요약·이벤트, 대응 재처리 GT 프레임 파일 및 이미지 인덱스. 개별 파일 경로는 XLSX <code>07_사후QC</code>와 <code>09_GT제외프레임</code>에 기록되어 있습니다.</li>
+    <li><strong>HTML:</strong> <a href="../../../작업지시서/stereo_calibration_39run_package_v1_2/09_작업지시서_상세설명.html">상세 작업지시서</a>, <a href="../../../작업지시서/stereo_calibration_39run_package_v1_2/stereo-calibration-explained.html">교정 설명</a>, <a href="../../../작업지시서/stereo_calibration_39run_package_v1_2/10_StereoCAM_상급자용_코드운영보고서.html">운영 보고서</a>, <a href="../../../작업지시서/stereo_calibration_39run_package_v1_2/MC100_설명.html">MC100 설명</a>.</li>
+  </ul>
+  <p class="small">자료 경계: 심사자에게 이전 리뷰 결과나 정답 자료를 주지 않았습니다. 심사자별 실제 열람 범위는 달랐으며, 확인하지 않은 원시 영상·전체 소스 코드·전체 대형 해시 목록은 검증 완료로 표시하지 않았습니다. 이 보고서는 세 심사의 공통 근거와 서로 다른 관찰을 대조한 편집 결과입니다.</p>
+  <p class="small"><strong>좌표 계약:</strong> 평가 위치 오차는 world ENU의 [east, north, up] m, PX4 local은 NED [north, east, down], 카메라 광학은 RDF [right, down, forward]입니다. 이 보고서는 저장된 수치의 의미만 검토하며 좌표 변환을 새로 계산하지 않았습니다.</p>
+</section>
+</main>
+</body>
+</html>

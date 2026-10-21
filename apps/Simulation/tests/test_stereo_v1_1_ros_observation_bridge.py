@@ -18,6 +18,11 @@ from campaigns.stereo_v1_1.runtime_observation import ObservationCache
 
 def test_ros_callback_payloads_preserve_world_and_local_frames(monkeypatch):
     bridge = RosObservationBridge.__new__(RosObservationBridge)
+    import threading
+    bridge.diagnostic_sink = None
+    bridge.diagnostic_error_count = 0
+    bridge._clock_handler_lock = threading.RLock()
+    bridge._clock_handler = None
     bridge.cache = ObservationCache()
     bridge.last_error = None
     monkeypatch.setattr("campaigns.stereo_v1_1.ros_observation_bridge.time.monotonic_ns", lambda: 20_000_000_000)

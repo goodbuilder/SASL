@@ -1,0 +1,306 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+  <class>ConnectionControls</class>
+  <widget class="QWidget" name="ConnectionControls">
+    <layout class="QVBoxLayout" name="controlsLayout">
+      <property name="leftMargin">
+        <number>0</number>
+      </property>
+      <property name="topMargin">
+        <number>0</number>
+      </property>
+      <property name="rightMargin">
+        <number>0</number>
+      </property>
+      <property name="bottomMargin">
+        <number>0</number>
+      </property>
+      <property name="spacing">
+        <number>6</number>
+      </property>
+      <item>
+        <layout class="QHBoxLayout" name="actionsLayout">
+          <property name="leftMargin">
+            <number>0</number>
+          </property>
+          <property name="topMargin">
+            <number>0</number>
+          </property>
+          <property name="rightMargin">
+            <number>0</number>
+          </property>
+          <property name="bottomMargin">
+            <number>0</number>
+          </property>
+          <property name="spacing">
+            <number>6</number>
+          </property>
+          <item>
+            <widget class="QPushButton" name="action_connect_mavlink">
+              <property name="text">
+                <string>Connect</string>
+              </property>
+              <property name="commandId" stdset="0">
+                <string>pixhawk.connect_mavlink</string>
+              </property>
+            </widget>
+          </item>
+          <item>
+            <widget class="QPushButton" name="action_disconnect_mavlink">
+              <property name="text">
+                <string>Disconnect</string>
+              </property>
+              <property name="commandId" stdset="0">
+                <string>pixhawk.disconnect_mavlink</string>
+              </property>
+            </widget>
+          </item>
+          <item>
+            <widget class="QPushButton" name="action_discover_usb">
+              <property name="text">
+                <string>Find USB</string>
+              </property>
+              <property name="commandId" stdset="0">
+                <string>pixhawk.discover_usb</string>
+              </property>
+            </widget>
+          </item>
+          <item>
+            <widget class="QPushButton" name="action_discover_mavlink_candidates">
+              <property name="text">
+                <string>Find network</string>
+              </property>
+              <property name="commandId" stdset="0">
+                <string>pixhawk.discover_mavlink_candidates</string>
+              </property>
+            </widget>
+          </item>
+          <item>
+            <widget class="QPushButton" name="action_swap">
+              <property name="text">
+                <string>Swap P1/P2</string>
+              </property>
+              <property name="commandId" stdset="0">
+                <string>alignment.swap_pixhawks</string>
+              </property>
+            </widget>
+          </item>
+          <item>
+            <widget class="QPushButton" name="action_reset_level_calibration">
+              <property name="text">
+                <string>Reset level cal.</string>
+              </property>
+              <property name="commandId" stdset="0">
+                <string>pixhawk.reset_level_calibration</string>
+              </property>
+            </widget>
+          </item>
+          <item>
+            <widget class="QPushButton" name="left_shell">
+              <property name="text">
+                <string>P1 Shell</string>
+              </property>
+              <property name="toolTip">
+                <string>활성 Ethernet MAVLink 연결로 PX4 Shell을 엽니다.</string>
+              </property>
+            </widget>
+          </item>
+          <item>
+            <widget class="QPushButton" name="right_shell">
+              <property name="text">
+                <string>P2 Shell</string>
+              </property>
+              <property name="toolTip">
+                <string>활성 Ethernet MAVLink 연결로 PX4 Shell을 엽니다.</string>
+              </property>
+            </widget>
+          </item>
+        </layout>
+      </item>
+      <item>
+        <widget class="QGroupBox" name="transport_group">
+          <property name="title">
+            <string>Board transport · explicit Connect only</string>
+          </property>
+          <layout class="QGridLayout" name="transport_groupLayout">
+            <property name="leftMargin">
+              <number>6</number>
+            </property>
+            <property name="topMargin">
+              <number>6</number>
+            </property>
+            <property name="rightMargin">
+              <number>6</number>
+            </property>
+            <property name="bottomMargin">
+              <number>6</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item row="0" column="0">
+              <widget class="QLabel" name="transportLabel0">
+                <property name="text">
+                  <string>Board</string>
+                </property>
+              </widget>
+            </item>
+            <item row="0" column="1">
+              <widget class="QLabel" name="transportLabel1">
+                <property name="text">
+                  <string>Transport</string>
+                </property>
+              </widget>
+            </item>
+            <item row="0" column="2">
+              <widget class="QLabel" name="transportLabel2">
+                <property name="text">
+                  <string>Serial device</string>
+                </property>
+              </widget>
+            </item>
+            <item row="0" column="3">
+              <widget class="QLabel" name="transportLabel3">
+                <property name="text">
+                  <string>Baud</string>
+                </property>
+              </widget>
+            </item>
+            <item row="1" column="0">
+              <widget class="QLabel" name="leftBoard">
+                <property name="text">
+                  <string>P1 / sysid 1</string>
+                </property>
+              </widget>
+            </item>
+            <item row="1" column="1">
+              <widget class="QComboBox" name="left_transport">
+                <item>
+                  <property name="text">
+                    <string>P1 Telemetry Radio</string>
+                  </property>
+                </item>
+                <item>
+                  <property name="text">
+                    <string>Ethernet</string>
+                  </property>
+                </item>
+                <item>
+                  <property name="text">
+                    <string>USB</string>
+                  </property>
+                </item>
+              </widget>
+            </item>
+            <item row="1" column="2">
+              <widget class="QLineEdit" name="left_device">
+                <property name="placeholderText">
+                  <string>/dev/serial/by-id/...</string>
+                </property>
+              </widget>
+            </item>
+            <item row="1" column="3">
+              <widget class="QSpinBox" name="left_baud">
+                <property name="minimum">
+                  <number>1200</number>
+                </property>
+                <property name="maximum">
+                  <number>4000000</number>
+                </property>
+                <property name="value">
+                  <number>57600</number>
+                </property>
+              </widget>
+            </item>
+            <item row="1" column="4">
+              <widget class="QPushButton" name="left_connect">
+                <property name="text">
+                  <string>Connect</string>
+                </property>
+              </widget>
+            </item>
+            <item row="1" column="5">
+              <widget class="QPushButton" name="left_disconnect">
+                <property name="text">
+                  <string>Disconnect</string>
+                </property>
+              </widget>
+            </item>
+            <item row="2" column="0">
+              <widget class="QLabel" name="rightBoard">
+                <property name="text">
+                  <string>P2 / sysid 2</string>
+                </property>
+              </widget>
+            </item>
+            <item row="2" column="1">
+              <widget class="QComboBox" name="right_transport">
+                <item>
+                  <property name="text">
+                    <string>P2 Telemetry Radio</string>
+                  </property>
+                </item>
+                <item>
+                  <property name="text">
+                    <string>Ethernet</string>
+                  </property>
+                </item>
+                <item>
+                  <property name="text">
+                    <string>USB</string>
+                  </property>
+                </item>
+              </widget>
+            </item>
+            <item row="2" column="2">
+              <widget class="QLineEdit" name="right_device">
+                <property name="placeholderText">
+                  <string>/dev/serial/by-id/...</string>
+                </property>
+              </widget>
+            </item>
+            <item row="2" column="3">
+              <widget class="QSpinBox" name="right_baud">
+                <property name="minimum">
+                  <number>1200</number>
+                </property>
+                <property name="maximum">
+                  <number>4000000</number>
+                </property>
+                <property name="value">
+                  <number>57600</number>
+                </property>
+              </widget>
+            </item>
+            <item row="2" column="4">
+              <widget class="QPushButton" name="right_connect">
+                <property name="text">
+                  <string>Connect</string>
+                </property>
+              </widget>
+            </item>
+            <item row="2" column="5">
+              <widget class="QPushButton" name="right_disconnect">
+                <property name="text">
+                  <string>Disconnect</string>
+                </property>
+              </widget>
+            </item>
+            <item row="3" column="0" rowspan="1" colspan="6">
+              <widget class="QLabel" name="droneHint">
+                <property name="text">
+                  <string>Drone / sysid 3 transport와 Connect는 Devices → Telemetry에서 관리합니다.</string>
+                </property>
+                <property name="wordWrap">
+                  <bool>true</bool>
+                </property>
+              </widget>
+            </item>
+          </layout>
+        </widget>
+      </item>
+    </layout>
+  </widget>
+  <resources />
+  <connections />
+</ui>

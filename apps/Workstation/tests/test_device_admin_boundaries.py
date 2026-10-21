@@ -407,6 +407,103 @@ def test_parameter_legacy_role_fallback_is_finite_and_explicit_camera_wins():
     assert interpret_parameter_result(legacy, active_requests=(("left", "mag_refresh"),)).camera == "left"
 
 
+def test_mag_apply_failure_invalidates_cached_readback_after_possible_partial_write():
+    from Workstation.controllers.device_runtime_controller import DeviceRuntimeController
+
+    invalidated: list[tuple[str, str]] = []
+    logs: list[str] = []
+    button_states: list[dict[str, object]] = []
+    panel = SimpleNamespace(
+        _px4_mag_verification_targets={},
+        _px4_mag_status_cache={"left": object()},
+        _px4_mag_status_incomplete={"left": ("CAL_MAG1_PRIO",)},
+        _invalidate_px4_mag_readback_after_apply_failure=lambda camera, error: (
+            invalidated.append((camera, error)),
+            panel._px4_mag_status_cache.pop(camera, None),
+            panel._px4_mag_status_incomplete.pop(camera, None),
+        ),
+        _log=logs.append,
+        _set_px4_mag_manager_button_state=lambda camera, **kwargs: button_states.append(kwargs),
+    )
+
+    DeviceRuntimeController(panel)._owned_pixhawk_parameter_worker_failed(
+        "left", "mag_apply", "CAL_MAG1_PRIO response timeout; partial write"
+    )
+
+    assert "left" not in panel._px4_mag_status_cache
+    assert "left" not in panel._px4_mag_status_incomplete
+    assert invalidated and invalidated[0][0] == "left"
+    assert "partial write" in logs[-1]
+    assert button_states[-1]["actions_enabled"] is False
+
+
+def test_voter_gap_prewrite_block_keeps_confirmed_readback_available():
+    shown: list[tuple[str, str]] = []
+    logs: list[str] = []
+    button_states: list[dict[str, object]] = []
+    confirmed = object()
+    panel = SimpleNamespace(
+        _px4_mag_verification_targets={},
+        _px4_mag_status_cache={"left": confirmed},
+        _show_px4_mag_priority_blocked=lambda camera, error: shown.append((camera, error)),
+        _invalidate_px4_mag_readback_after_apply_failure=lambda *_args: pytest.fail(
+            "pre-write guard must preserve the confirmed readback"
+        ),
+        _log=logs.append,
+        _set_px4_mag_manager_button_state=lambda _camera, **kwargs: button_states.append(kwargs),
+    )
+
+    controller_module.DeviceRuntimeController(panel)._owned_pixhawk_parameter_worker_failed(
+        "left", "mag_apply", "PX4 v1.17 voter gap: lower sensor_mag instance i1/CAL_MAG1 is disabled"
+    )
+
+    assert panel._px4_mag_status_cache["left"] is confirmed
+    assert shown and shown[0][0] == "left"
+    assert button_states[-1]["actions_enabled"] is True
+    assert "voter gap" in logs[-1]
+
+
+def test_parameter_worker_receives_captured_side_topology_for_voter_guard():
+    class FakeOwner:
+        def __init__(self) -> None:
+            self.worker = None
+
+        def busy(self, _kind, _camera):
+            return False
+
+        def prepare(self, _kind, _camera, *, worker_factory, **_callbacks):
+            self.worker = worker_factory()
+            return object()
+
+        def start(self, _job):
+            return None
+
+    owner = FakeOwner()
+    panel = SimpleNamespace(
+        mavlink_pixhawk=object(),
+        _mavlink_open_sides=lambda: {"left"},
+        px4_mag_managers={"left": SimpleNamespace(armed=False)},
+        latest_vehicle_mag_device_ids={"left": 8944899},
+        latest_sensor_mag_instances={
+            "left": {
+                0: SimpleNamespace(device_id=4395041),
+                2: SimpleNamespace(device_id=8944899),
+            }
+        },
+        _set_px4_mag_manager_button_state=lambda *_args, **_kwargs: None,
+        _log=lambda _message: None,
+    )
+    controller = controller_module.DeviceRuntimeController(panel)
+    controller._maintenance_job_owner = lambda: owner
+    controller._maintenance_result_guard = lambda *_args: (lambda: True)
+    controller._log_pixhawk_admin_start = lambda *_args: None
+
+    assert controller._start_pixhawk_parameter_worker(
+        "left", "mag_apply", priorities={"CAL_MAG2": 100}
+    ) is True
+    assert owner.worker.instance_device_ids == {0: 4395041, 2: 8944899}
+
+
 def test_attitude_presentation_preserves_asymmetric_sensor_axes_units_and_degree_offsets():
     status = SimpleNamespace(
         accel_slots=(SimpleNamespace(slot=0, device_id=101, priority=50, calibrated=True,
@@ -426,7 +523,7 @@ def test_attitude_presentation_preserves_asymmetric_sensor_axes_units_and_degree
 
 
 def test_new_admin_and_result_modules_have_no_panel_or_transport_creation_dependency():
-    root = Path(controller_module.__file__).parent / "device_runtime"
+    root = Path(controller_module.__file__).parents[1] / "device_runtime"
     for name in ("admin_commands.py", "admin_jobs.py", "qt_jobs.py", "discovery_jobs.py", "parameters.py", "presentation.py"):
         tree = ast.parse((root / name).read_text())
         assert not any(isinstance(node, ast.Attribute) and node.attr in {"panel", "mavlink_connection"}

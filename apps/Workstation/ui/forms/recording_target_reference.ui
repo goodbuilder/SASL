@@ -1,0 +1,371 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>targetReference</class>
+ <widget class="QGroupBox" name="targetReference">
+  <property name="title">
+   <string>Target reference</string>
+  </property>
+  <layout class="QGridLayout" name="targetReferenceLayout" columnstretch="0,1,0,0">
+   <item row="0" column="0">
+    <widget class="QLabel" name="platformLabel">
+     <property name="text">
+      <string>Target platform</string>
+     </property>
+    </widget>
+   </item>
+   <item row="0" column="1">
+    <widget class="QComboBox" name="platform" />
+   </item>
+   <item row="0" column="2">
+    <widget class="QLabel" name="receiveLabel">
+     <property name="text">
+      <string>Receive-only</string>
+     </property>
+    </widget>
+   </item>
+   <item row="0" column="3">
+    <widget class="QComboBox" name="transport" />
+   </item>
+   <item row="1" column="0">
+    <widget class="QLabel" name="endpointLabel">
+     <property name="text">
+      <string>Target MAVLink</string>
+     </property>
+    </widget>
+   </item>
+   <item row="1" column="1">
+    <widget class="QLineEdit" name="targetDroneEndpoint">
+     <property name="placeholderText">
+      <string>udpin:0.0.0.0:14570 or /dev/serial/by-id/...</string>
+     </property>
+    </widget>
+   </item>
+   <item row="1" column="2" rowspan="1" colspan="2">
+    <widget class="QWidget" name="identityHost">
+     <layout class="QHBoxLayout" name="identityLayout">
+      <item>
+       <widget class="QLabel" name="systemLabel">
+        <property name="text">
+         <string>SYS</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QSpinBox" name="system">
+        <property name="minimum">
+         <number>0</number>
+        </property>
+        <property name="maximum">
+         <number>255</number>
+        </property>
+        <property name="value">
+         <number>0</number>
+        </property>
+        <property name="specialValueText">
+         <string>Any</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLabel" name="componentLabel">
+        <property name="text">
+         <string>COMP</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QSpinBox" name="component">
+        <property name="minimum">
+         <number>0</number>
+        </property>
+        <property name="maximum">
+         <number>255</number>
+        </property>
+        <property name="value">
+         <number>0</number>
+        </property>
+        <property name="specialValueText">
+         <string>Any</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLabel" name="baudLabel">
+        <property name="text">
+         <string>Baud</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QSpinBox" name="baud">
+        <property name="minimum">
+         <number>1200</number>
+        </property>
+        <property name="maximum">
+         <number>4000000</number>
+        </property>
+        <property name="value">
+         <number>57600</number>
+        </property>
+       </widget>
+      </item>
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+     </layout>
+    </widget>
+   </item>
+   <item row="2" column="0">
+    <widget class="QLabel" name="portsLabel">
+     <property name="text">
+      <string>Listen ports</string>
+     </property>
+    </widget>
+   </item>
+   <item row="2" column="1" rowspan="1" colspan="3">
+    <widget class="QLineEdit" name="ports">
+     <property name="text">
+      <string>14570,14550,14551,14552,14553,14554,14555,14556,14557,14558,14559</string>
+     </property>
+     <property name="toolTip">
+      <string>PC UDP listen ports, comma separated (maximum 16). Target must already transmit here.</string>
+     </property>
+    </widget>
+   </item>
+   <item row="3" column="0" rowspan="1" colspan="4">
+    <widget class="QWidget" name="scanHost">
+     <layout class="QHBoxLayout" name="scanLayout">
+      <item>
+       <widget class="QPushButton" name="find_network">
+        <property name="text">
+         <string>Find Network</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="find_usb">
+        <property name="text">
+         <string>Find USB</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="cancel">
+        <property name="text">
+         <string>Cancel</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLabel" name="discovery_status">
+        <property name="text">
+         <string>IDLE</string>
+        </property>
+        <property name="minimumWidth">
+         <number>150</number>
+        </property>
+       </widget>
+      </item>
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+      <item>
+       <spacer name="scanLayoutSpacer">
+        <property name="orientation">
+         <enum>Qt::Horizontal</enum>
+        </property>
+        <property name="sizeHint">
+         <size>
+          <width>20</width>
+          <height>0</height>
+         </size>
+        </property>
+       </spacer>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item row="4" column="0" rowspan="1" colspan="4">
+    <widget class="QTableView" name="table">
+     <property name="minimumHeight">
+      <number>112</number>
+     </property>
+     <property name="maximumHeight">
+      <number>112</number>
+     </property>
+     <property name="selectionBehavior">
+      <enum>QAbstractItemView::SelectRows</enum>
+     </property>
+     <property name="selectionMode">
+      <enum>QAbstractItemView::SingleSelection</enum>
+     </property>
+     <property name="editTriggers">
+      <enum>QAbstractItemView::NoEditTriggers</enum>
+     </property>
+     <attribute name="verticalHeaderVisible">
+      <bool>false</bool>
+     </attribute>
+     <attribute name="horizontalHeaderStretchLastSection">
+      <bool>true</bool>
+     </attribute>
+    </widget>
+   </item>
+   <item row="5" column="0" rowspan="1" colspan="4">
+    <widget class="QWidget" name="actionsHost">
+     <layout class="QHBoxLayout" name="actionsLayout">
+      <item>
+       <widget class="QPushButton" name="use">
+        <property name="text">
+         <string>Use selected</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="connect_button">
+        <property name="text">
+         <string>Connect target</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="stop_button">
+        <property name="text">
+         <string>Stop target</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="save_button">
+        <property name="text">
+         <string>Save</string>
+        </property>
+       </widget>
+      </item>
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+      <item>
+       <spacer name="actionsLayoutSpacer">
+        <property name="orientation">
+         <enum>Qt::Horizontal</enum>
+        </property>
+        <property name="sizeHint">
+         <size>
+          <width>20</width>
+          <height>0</height>
+         </size>
+        </property>
+       </spacer>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item row="6" column="0" rowspan="1" colspan="4">
+    <widget class="QLabel" name="reference_label">
+     <property name="text">
+      <string />
+     </property>
+     <property name="minimumWidth">
+      <number>0</number>
+     </property>
+     <property name="sizePolicy">
+      <sizepolicy hsizetype="Ignored" vsizetype="Fixed">
+       <horstretch>0</horstretch>
+       <verstretch>0</verstretch>
+      </sizepolicy>
+     </property>
+    </widget>
+   </item>
+   <item row="7" column="0" rowspan="1" colspan="4">
+    <widget class="QLabel" name="state_label">
+     <property name="text">
+      <string>Target Drone: NOT CONFIGURED</string>
+     </property>
+     <property name="minimumWidth">
+      <number>0</number>
+     </property>
+     <property name="sizePolicy">
+      <sizepolicy hsizetype="Ignored" vsizetype="Fixed">
+       <horstretch>0</horstretch>
+       <verstretch>0</verstretch>
+      </sizepolicy>
+     </property>
+    </widget>
+   </item>
+   <item row="8" column="0" rowspan="1" colspan="4">
+    <widget class="QLabel" name="samples_label">
+     <property name="text">
+      <string>HEARTBEAT -- | ATTITUDE --
+GPS1 -- | GPS2 --</string>
+     </property>
+     <property name="minimumWidth">
+      <number>0</number>
+     </property>
+     <property name="sizePolicy">
+      <sizepolicy hsizetype="Ignored" vsizetype="Fixed">
+       <horstretch>0</horstretch>
+       <verstretch>0</verstretch>
+      </sizepolicy>
+     </property>
+    </widget>
+   </item>
+   <item row="9" column="0" rowspan="1" colspan="4">
+    <widget class="QLabel" name="message">
+     <property name="text">
+      <string>Ready</string>
+     </property>
+     <property name="minimumWidth">
+      <number>0</number>
+     </property>
+     <property name="sizePolicy">
+      <sizepolicy hsizetype="Ignored" vsizetype="Fixed">
+       <horstretch>0</horstretch>
+       <verstretch>0</verstretch>
+      </sizepolicy>
+     </property>
+    </widget>
+   </item>
+   <property name="leftMargin">
+    <number>6</number>
+   </property>
+   <property name="topMargin">
+    <number>6</number>
+   </property>
+   <property name="rightMargin">
+    <number>6</number>
+   </property>
+   <property name="bottomMargin">
+    <number>6</number>
+   </property>
+  </layout>
+ </widget>
+ <resources />
+ <connections />
+</ui>

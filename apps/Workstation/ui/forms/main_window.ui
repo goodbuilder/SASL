@@ -1,0 +1,148 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>WorkstationMainWindow</class>
+ <widget class="QMainWindow" name="workstationMainWindow">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>1600</width>
+    <height>980</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>StereoWIRIS Workstation</string>
+  </property>
+  <widget class="QWidget" name="centralwidget">
+   <layout class="QVBoxLayout" name="workspaceLayout">
+    <property name="leftMargin">
+     <number>0</number>
+    </property>
+    <property name="topMargin">
+     <number>0</number>
+    </property>
+    <property name="rightMargin">
+     <number>0</number>
+    </property>
+    <property name="bottomMargin">
+     <number>0</number>
+    </property>
+    <property name="spacing">
+     <number>0</number>
+    </property>
+    <item>
+     <widget class="QStackedWidget" name="workspaceHost" />
+    </item>
+   </layout>
+  </widget>
+  <widget class="QMenuBar" name="menubar">
+   <widget class="QMenu" name="fileMenu">
+    <property name="title">
+     <string>File</string>
+    </property>
+   </widget>
+   <addaction name="fileMenu" />
+   <widget class="QMenu" name="viewMenu">
+    <property name="title">
+     <string>View</string>
+    </property>
+   </widget>
+   <addaction name="viewMenu" />
+   <widget class="QMenu" name="deviceMenu">
+    <property name="title">
+     <string>Device</string>
+    </property>
+   </widget>
+   <addaction name="deviceMenu" />
+   <widget class="QMenu" name="runMenu">
+    <property name="title">
+     <string>Run</string>
+    </property>
+   </widget>
+   <addaction name="runMenu" />
+   <widget class="QMenu" name="toolsMenu">
+    <property name="title">
+     <string>Tools</string>
+    </property>
+   </widget>
+   <addaction name="toolsMenu" />
+   <widget class="QMenu" name="diagnosticsMenu">
+    <property name="title">
+     <string>Diagnostics</string>
+    </property>
+   </widget>
+   <addaction name="diagnosticsMenu" />
+  </widget>
+  <widget class="QStatusBar" name="statusbar" />
+  <widget class="QToolBar" name="primaryToolbar">
+   <property name="windowTitle">
+    <string>Primary</string>
+   </property>
+   <property name="movable">
+    <bool>false</bool>
+   </property>
+   <property name="toolButtonStyle">
+    <enum>Qt::ToolButtonTextOnly</enum>
+   </property>
+   <attribute name="toolBarArea">
+    <enum>TopToolBarArea</enum>
+   </attribute>
+   <attribute name="toolBarBreak">
+    <bool>false</bool>
+   </attribute>
+  </widget>
+  <widget class="QDockWidget" name="navigationDock">
+   <property name="windowTitle">
+    <string>Navigation</string>
+   </property>
+   <attribute name="dockWidgetArea">
+    <number>1</number>
+   </attribute>
+   <widget class="QWidget" name="navigationDockContent" />
+  </widget>
+  <widget class="QDockWidget" name="inspectorDock">
+   <property name="windowTitle">
+    <string>Inspector</string>
+   </property>
+   <property name="minimumSize">
+    <size>
+     <width>240</width>
+     <height>0</height>
+    </size>
+   </property>
+   <property name="maximumSize">
+    <size>
+     <width>360</width>
+     <height>16777215</height>
+    </size>
+   </property>
+   <attribute name="dockWidgetArea">
+    <number>2</number>
+   </attribute>
+   <widget class="QWidget" name="inspectorDockContent" />
+  </widget>
+  <widget class="QDockWidget" name="diagnosticsDock">
+   <property name="windowTitle">
+    <string>Diagnostics</string>
+   </property>
+   <property name="minimumSize">
+    <size>
+     <width>0</width>
+     <height>120</height>
+    </size>
+   </property>
+   <property name="maximumSize">
+    <size>
+     <width>16777215</width>
+     <height>280</height>
+    </size>
+   </property>
+   <attribute name="dockWidgetArea">
+    <number>8</number>
+   </attribute>
+   <widget class="QWidget" name="diagnosticsDockContent" />
+  </widget>
+ </widget>
+ <resources />
+ <connections />
+</ui>

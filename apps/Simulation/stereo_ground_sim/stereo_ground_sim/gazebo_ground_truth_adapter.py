@@ -12,14 +12,15 @@ import json
 import math
 import subprocess
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterable
 
 from .coordinate_frames import (
-    REFERENCE_OFFSET_PARENT_M,
     REFERENCE_OFFSET_PARENT_RPY_RAD,
     SOURCE_GAZEBO_ENTITY,
-    VEHICLE_REFERENCE_DEFINITION,
+    vehicle_reference_definition,
+    vehicle_reference_offset_parent_m,
+    vehicle_reference_offset_world_enu_m,
     VEHICLE_REFERENCE_LINK,
     WORLD_FRAME,
 )
@@ -312,6 +313,22 @@ class PoseVState:
         return record
 
 
+def pose_record_to_vehicle_reference(record: PoseRecord, model_name: str) -> PoseRecord:
+    """Shift a base_link world pose to its semantic reference, preserving stamp.
+
+    p_world_reference = p_world_base + R_world_base * offset_base (metres).
+    Both positions use ENU; the offset is base_link FLU, not PX4 FRD.
+    """
+    offset = vehicle_reference_offset_world_enu_m(
+        model_name, record.orientation_world_from_entity_xyzw
+    )
+    return replace(
+        record,
+        entity_name=VEHICLE_REFERENCE_LINK,
+        position_world_enu_m=tuple(p + d for p, d in zip(record.position_world_enu_m, offset)),
+    )
+
+
 def pose_record_to_ros_message(record: PoseRecord) -> Any:
     """Build a PoseStamped without importing ROS during pure parser tests."""
 
@@ -401,8 +418,8 @@ class GazeboGroundTruthAdapter:
             f"source_gazebo_entity={self._source_link_name}, "
             f"parent_model_name={self._parent_model_name}, "
             f"published_reference_name={VEHICLE_REFERENCE_LINK}, "
-            f"reference_definition={VEHICLE_REFERENCE_DEFINITION}, "
-            f"reference_offset_parent_m={REFERENCE_OFFSET_PARENT_M}, "
+            f"reference_definition={vehicle_reference_definition(self._parent_model_name)}, "
+            f"reference_offset_parent_m={vehicle_reference_offset_parent_m(self._parent_model_name)}, "
             f"reference_offset_parent_rpy_rad={REFERENCE_OFFSET_PARENT_RPY_RAD}"
         )
 
@@ -504,7 +521,8 @@ class GazeboGroundTruthAdapter:
                                 "Gazebo simulation stamp decreased; treating the sample as a reset/restart"
                             )
                         try:
-                            self._publisher.publish(pose_record_to_ros_message(record))
+                            reference = pose_record_to_vehicle_reference(record, self._parent_model_name)
+                            self._publisher.publish(pose_record_to_ros_message(reference))
                             self._publish_rviz_marker(record)
                         except Exception as exc:
                             if self._shutdown.is_set() or not self._rclpy.ok():
@@ -580,5 +598,6 @@ __all__ = [
     "parse_pose_v_payload",
     "pose_record_world_from_payload",
     "pose_record_to_ros_message",
+    "pose_record_to_vehicle_reference",
     "stamp_ns_from_header",
 ]

@@ -1,0 +1,104 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>RecordingWorkspace</class>
+ <widget class="QWidget" name="RecordingWorkspace">
+  <layout class="QVBoxLayout" name="pageLayout" stretch="0,1">
+   <property name="spacing">
+    <number>6</number>
+   </property>
+   <item>
+    <widget class="QWidget" name="headerHost">
+     <layout class="QVBoxLayout" name="headerLayout">
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QTabWidget" name="sessionsTabs">
+     <widget class="QWidget" name="sessionsCurrentTab">
+      <attribute name="title">
+       <string>Current</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="currentLayout">
+       <property name="leftMargin">
+        <number>0</number>
+       </property>
+       <property name="topMargin">
+        <number>0</number>
+       </property>
+       <property name="rightMargin">
+        <number>0</number>
+       </property>
+       <property name="bottomMargin">
+        <number>0</number>
+       </property>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="sessionsEvidenceTab">
+      <attribute name="title">
+       <string>Evidence</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="evidenceLayout">
+       <property name="leftMargin">
+        <number>0</number>
+       </property>
+       <property name="topMargin">
+        <number>0</number>
+       </property>
+       <property name="rightMargin">
+        <number>0</number>
+       </property>
+       <property name="bottomMargin">
+        <number>0</number>
+       </property>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="sessionsReviewTab">
+      <attribute name="title">
+       <string>Review</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="reviewLayout">
+       <property name="leftMargin">
+        <number>0</number>
+       </property>
+       <property name="topMargin">
+        <number>0</number>
+       </property>
+       <property name="rightMargin">
+        <number>0</number>
+       </property>
+       <property name="bottomMargin">
+        <number>0</number>
+       </property>
+      </layout>
+     </widget>
+    </widget>
+   </item>
+   <property name="leftMargin">
+    <number>8</number>
+   </property>
+   <property name="topMargin">
+    <number>8</number>
+   </property>
+   <property name="rightMargin">
+    <number>8</number>
+   </property>
+   <property name="bottomMargin">
+    <number>8</number>
+   </property>
+  </layout>
+ </widget>
+ <resources />
+ <connections />
+</ui>

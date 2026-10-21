@@ -4,3 +4,4 @@
 # comes from sourcing /opt/ros/humble/setup.bash.
 zstandard==0.25.0
 scipy==1.15.3
+XlsxWriter==3.2.9

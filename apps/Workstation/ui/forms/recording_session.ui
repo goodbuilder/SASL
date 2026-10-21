@@ -1,0 +1,278 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>SessionWorkspace</class>
+ <widget class="QWidget" name="SessionWorkspace">
+  <layout class="QVBoxLayout" name="pageLayout">
+   <item>
+    <widget class="QWidget" name="headerHost">
+     <layout class="QVBoxLayout" name="headerLayout">
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QGroupBox" name="lifecycle_group">
+     <property name="title">
+      <string>Session folder</string>
+     </property>
+     <layout class="QVBoxLayout" name="lifecycle_groupLayout">
+      <item>
+       <widget class="QWidget" name="actionsHost">
+        <layout class="QHBoxLayout" name="actionLayout">
+         <item>
+          <widget class="QPushButton" name="sessionWorkspaceOpen">
+           <property name="text">
+            <string>Create Session Folder</string>
+           </property>
+           <property name="toolTip">
+            <string>Create recordings/YYYYMMDD_HHMMSS_nanoseconds and route subsequent outputs into it.</string>
+           </property>
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Maximum" vsizetype="Fixed">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="sessionWorkspaceClose">
+           <property name="text">
+            <string>Close Session</string>
+           </property>
+           <property name="toolTip">
+            <string>Stop active Detection, save and seal the current Measurement, then close the Session.</string>
+           </property>
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Maximum" vsizetype="Fixed">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+          </widget>
+         </item>
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="topMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <property name="bottomMargin">
+          <number>0</number>
+         </property>
+         <item>
+          <spacer name="actionLayoutSpacer">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint">
+            <size>
+             <width>20</width>
+             <height>0</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+        </layout>
+       </widget>
+      </item>
+      <item>
+       <widget class="QWidget" name="folderHost">
+        <layout class="QFormLayout" name="folderLayout">
+         <item row="0" column="0">
+          <widget class="QLabel" name="sessionWorkspaceLifecycleLabel">
+           <property name="text">
+            <string>State</string>
+           </property>
+          </widget>
+         </item>
+         <item row="0" column="1">
+          <widget class="QLabel" name="sessionWorkspaceLifecycle">
+           <property name="text">
+            <string>No session folder</string>
+           </property>
+           <property name="wordWrap">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="0">
+          <widget class="QLabel" name="sessionWorkspaceFolderNameLabel">
+           <property name="text">
+            <string>Folder name</string>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="1">
+          <widget class="QLabel" name="sessionWorkspaceFolderName">
+           <property name="text">
+            <string>—</string>
+           </property>
+           <property name="wordWrap">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="0">
+          <widget class="QLabel" name="sessionWorkspaceCreatedLabel">
+           <property name="text">
+            <string>Created</string>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="1">
+          <widget class="QLabel" name="sessionWorkspaceCreated">
+           <property name="text">
+            <string>—</string>
+           </property>
+           <property name="wordWrap">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+         <item row="3" column="0">
+          <widget class="QLabel" name="sessionWorkspaceFolderPathLabel">
+           <property name="text">
+            <string>Storage path</string>
+           </property>
+          </widget>
+         </item>
+         <item row="3" column="1">
+          <widget class="QLabel" name="sessionWorkspaceFolderPath">
+           <property name="text">
+            <string>—</string>
+           </property>
+           <property name="wordWrap">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="topMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <property name="bottomMargin">
+          <number>0</number>
+         </property>
+        </layout>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLabel" name="storage_rule_label">
+        <property name="text">
+         <string>Outputs created after this folder opens are stored beneath it. Calibration, Alignment, Measurement, and Recording remain responsible for their own files.</string>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLabel" name="sessionWorkspaceFeedback">
+        <property name="text">
+         <string />
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <property name="leftMargin">
+       <number>6</number>
+      </property>
+      <property name="topMargin">
+       <number>6</number>
+      </property>
+      <property name="rightMargin">
+       <number>6</number>
+      </property>
+      <property name="bottomMargin">
+       <number>6</number>
+      </property>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QGroupBox" name="navigation_group">
+     <property name="title">
+      <string>Continue</string>
+     </property>
+     <layout class="QHBoxLayout" name="navigation_groupLayout">
+      <item>
+       <widget class="QPushButton" name="open_measurement_button">
+        <property name="text">
+         <string>Continue to Measurement</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="open_review_button">
+        <property name="text">
+         <string>Review Stored Files</string>
+        </property>
+       </widget>
+      </item>
+      <property name="leftMargin">
+       <number>6</number>
+      </property>
+      <property name="topMargin">
+       <number>6</number>
+      </property>
+      <property name="rightMargin">
+       <number>6</number>
+      </property>
+      <property name="bottomMargin">
+       <number>6</number>
+      </property>
+      <item>
+       <spacer name="navigation_groupLayoutSpacer">
+        <property name="orientation">
+         <enum>Qt::Horizontal</enum>
+        </property>
+        <property name="sizeHint">
+         <size>
+          <width>20</width>
+          <height>0</height>
+         </size>
+        </property>
+       </spacer>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <property name="leftMargin">
+    <number>0</number>
+   </property>
+   <property name="topMargin">
+    <number>0</number>
+   </property>
+   <property name="rightMargin">
+    <number>0</number>
+   </property>
+   <property name="bottomMargin">
+    <number>0</number>
+   </property>
+  </layout>
+ </widget>
+ <resources />
+ <connections />
+</ui>

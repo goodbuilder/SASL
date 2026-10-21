@@ -34,13 +34,21 @@ from px4_auto_mission import (
 from campaigns.stereo_v1_1.campaign_setpoints import (
     send_position_velocity_yaw, send_position_yaw,
 )
+from campaigns.stereo_v1_1.entry_liftoff import VerticalLiftoffGate
+from campaigns.stereo_v1_1.offboard_arming import arm_with_offboard_stream
 from campaigns.stereo_v1_1.flight_gates import (
     OriginObservation, SettleSample, fit_observed_origin, science_start_ready,
 )
+from campaigns.stereo_v1_1.timing_diagnostics import BufferedTimingDiagnostics, timed_stage
+from campaigns.stereo_v1_1.science_dispatch import ScienceDispatcher
+from campaigns.stereo_v1_1.simulation_stepper import (
+    SimulationStepper, check_step_barrier, wait_clock_evidence, PauseAdmissionRecovery,
+)
+from campaigns.stereo_v1_1.setpoint_cadence import summarize_setpoint_cadence
 from campaigns.stereo_v1_1.ros_observation_bridge import RosObservationBridge
 from campaigns.stereo_v1_1.runtime_observation import FlightSnapshot, ObservationCache
 from campaigns.stereo_v1_1.trajectory_contract import (
-    LocalNed, LocalNedVelocity, WorldEnu,
+    LocalNed, LocalNedVelocity, WorldEnu, PreparedReference,
     heading_clockwise_from_north_to_px4_yaw_rad, interpolate_reference,
     world_position_to_px4_local_ned, world_velocity_to_px4_local_ned,
 )
@@ -93,6 +101,11 @@ class AttemptLog:
         self.states = (attempt_dir / "flight_state.jsonl").open("x", encoding="utf-8")
         self.result_path = attempt_dir / "controller_result.json"
         self.coordinate_check_path = attempt_dir / "coordinate_frame_check.json"
+        self.send_timing = (attempt_dir / "science_setpoint_timing.jsonl").open("x", encoding="utf-8")
+        self.send_rows = []
+        self.required_hz = 50.0
+        self.science_start_ns = None
+        self.science_end_ns = None
 
     def event(self, name: str, snapshot: FlightSnapshot | None = None, **details) -> None:
         row = {
@@ -132,7 +145,27 @@ class AttemptLog:
         }
         self.states.write(json.dumps(row, allow_nan=False, sort_keys=True) + "\n")
 
+    def science_send(self, snapshot: FlightSnapshot | None, *, reference_update=True,
+                     clock_receive_monotonic_ns=None) -> None:
+        row = {
+            "host_monotonic_ns": time.monotonic_ns(),
+            "simulation_timestamp_ns": None if snapshot is None else snapshot.simulation_time_ns,
+            "simulation_epoch": None if snapshot is None else snapshot.simulation_epoch,
+        }
+        row["reference_update"] = reference_update
+        row["clock_receive_monotonic_ns"] = clock_receive_monotonic_ns
+        row["clock_receive_to_send_age_ns"] = (
+            None if clock_receive_monotonic_ns is None else
+            row["host_monotonic_ns"] - clock_receive_monotonic_ns)
+        self.send_rows.append(row)
+        self.send_timing.write(json.dumps(row, allow_nan=False) + "\n")
+
     def finish(self, status: str, **details) -> None:
+        self.send_timing.flush()
+        os.fsync(self.send_timing.fileno())
+        self.send_timing.close()
+        details["science_setpoint_cadence"] = summarize_setpoint_cadence(
+            self.send_rows, self.required_hz, self.science_start_ns, self.science_end_ns)
         self.events.flush()
         self.states.flush()
         os.fsync(self.events.fileno())
@@ -241,6 +274,43 @@ def _tick_sleep(next_wall_s: float) -> float:
     return next_wall_s
 
 
+def _vertical_liftoff(master, bridge, cache, log, launch, origin, yaw,
+                      boot_time, period, lead_m, entry_deadline):
+    gate = VerticalLiftoffGate(launch)
+    deadline = min(entry_deadline, time.monotonic() + 60.0)
+    last_fresh_wall = time.monotonic()
+    next_tick = time.monotonic()
+    target = gate.target(launch.px4_local_ned_m, lead_m)
+    log.event("vertical_liftoff_started", launch,
+              launch_position_local_ned_m=launch.px4_local_ned_m.as_xyz(),
+              launch_position_world_enu_m=launch.gt_world_enu_m.as_xyz(),
+              target_rise_m=10.0, position_tolerance_m=0.5,
+              horizontal_drift_limit_m=1.0, speed_limit_mps=1.0,
+              stable_duration_s=1.0, maximum_sample_gap_s=0.2, timeout_s=60.0)
+    while time.monotonic() < deadline:
+        _check_stop()
+        snap = _snapshot(bridge, cache)
+        if snap is None:
+            if time.monotonic() - last_fresh_wall > 1.0:
+                raise RuntimeError("vertical liftoff telemetry became stale")
+        else:
+            last_fresh_wall = time.monotonic()
+            ready = gate.observe(snap)
+            target = gate.target(snap.px4_local_ned_m, lead_m)
+            send_position_yaw(master, now_ms(boot_time), target, yaw)
+            log.state("entry_vertical", snap, target, None, origin)
+            if ready:
+                log.event("vertical_liftoff_complete", snap,
+                          measured_local_rise_m=launch.px4_local_ned_m.down_m-snap.px4_local_ned_m.down_m,
+                          measured_world_rise_m=snap.gt_world_enu_m.up_m-launch.gt_world_enu_m.up_m)
+                return snap, target
+            next_tick = _tick_sleep(next_tick + period)
+            continue
+        send_position_yaw(master, now_ms(boot_time), target, yaw)
+        next_tick = _tick_sleep(next_tick + period)
+    raise RuntimeError("vertical liftoff did not reach verified launch clearance within entry timeout")
+
+
 def _fly(args, samples, log: AttemptLog, run_config: dict | None = None) -> dict:
     run_config = run_config or {}
     frame_gate = run_config.get("FrameGate", {})
@@ -248,13 +318,25 @@ def _fly(args, samples, log: AttemptLog, run_config: dict | None = None) -> dict
     motion = run_config.get("Motion", {})
     vehicle = run_config.get("Vehicle", {})
     args.setpoint_hz = float(motion.get("setpoint_hz", args.setpoint_hz))
+    log.required_hz = args.setpoint_hz
     args.entry_timeout_s = float(entry.get("entry_timeout_s", args.entry_timeout_s))
     args.entry_lead_m = float(entry.get("entry_lead_m", args.entry_lead_m))
     args.land_timeout_s = float(entry.get("landing_timeout_s", args.land_timeout_s))
+    prepared_reference = (PreparedReference(samples)
+                          if getattr(args, "protocol_version", "1.1") == "1.2" else None)
     cache = ObservationCache()
-    bridge = RosObservationBridge(cache)
+    diagnostic_sink = getattr(log, "timing_diagnostics", None)
+    bridge = (RosObservationBridge(cache, diagnostic_sink=diagnostic_sink)
+              if diagnostic_sink is not None else RosObservationBridge(cache))
+    def received_clock_evidence():
+        if bridge.last_error:
+            raise RuntimeError(f"simulation step control: observation failed: {bridge.last_error}")
+        return cache.clock_observation(time.monotonic_ns())
+
     master = None
     heartbeat = None
+    dispatcher = None
+    stepper = None
     offboard_attempted = False
     science_started = False
     last_snapshot = None
@@ -274,6 +356,19 @@ def _fly(args, samples, log: AttemptLog, run_config: dict | None = None) -> dict
                       origin_world_enu_m=origin.as_xyz())
             return {"controller_status": "preflight_complete",
                     "origin_world_enu_m": origin.as_xyz()}
+        if getattr(args, "protocol_version", "1.1") == "1.2":
+            # Warm transport discovery and validate imports before arming. The
+            # world remains continuous until the verified science-start gate.
+            stepper = SimulationStepper(args.world_name)
+            baseline = cache.clock_observation(time.monotonic_ns())
+            stepper.warmup_continuous()
+            warmed = wait_clock_evidence(
+                received_clock_evidence,
+                last_snapshot.simulation_epoch,
+                (last_snapshot.xy_reset_counter, last_snapshot.z_reset_counter),
+                baseline_ns=baseline['source_timestamp_ns'], quiescent=False,
+                check_stop=_check_stop)
+            log.event("simulation_step_service_warmed", last_snapshot, clock_evidence=warmed)
         first = samples[0]
         start_world = WorldEnu.from_reference_xyz(first["position_world_enu_m"])
         goal = world_position_to_px4_local_ned(start_world, origin)
@@ -290,11 +385,31 @@ def _fly(args, samples, log: AttemptLog, run_config: dict | None = None) -> dict
             if phase == "prestream":
                 set_mode(master, "OFFBOARD")
                 offboard_attempted = True
-        arm(master)
+        if getattr(args, "protocol_version", "1.1") == "1.2":
+            arm_with_offboard_stream(
+                master, lambda: send_position_yaw(master, now_ms(boot_time), hold_at, yaw),
+                lambda name, **details: log.event(name, last_snapshot, **details),
+                _check_stop, hz=50.0)
+        else:
+            arm(master)
         log.event("entry_started", last_snapshot, target_position_world_enu_m=start_world.as_xyz())
 
         entry_deadline = time.monotonic() + args.entry_timeout_s
+        if getattr(args, "protocol_version", "1.1") == "1.2":
+            # Re-observe launch after arming/prestream; never use an old ground
+            # snapshot as evidence of clearance or a new local-frame generation.
+            launch = _snapshot(bridge, cache)
+            if launch is None:
+                raise RuntimeError("fresh launch telemetry unavailable for vertical liftoff")
+            if (launch.simulation_epoch != last_snapshot.simulation_epoch or
+                    (launch.xy_reset_counter, launch.z_reset_counter) !=
+                    (last_snapshot.xy_reset_counter, last_snapshot.z_reset_counter)):
+                raise RuntimeError("coordinate generation changed before vertical liftoff")
+            last_snapshot, hold_at = _vertical_liftoff(
+                master, bridge, cache, log, launch, origin, yaw,
+                boot_time, period, args.entry_lead_m, entry_deadline)
         settle_deadline = None
+        pause_recovery = PauseAdmissionRecovery()
         settle_duration_s = float(entry.get("science_start_stable_s", 5.0))
         stable_samples: deque[SettleSample] = deque(
             maxlen=max(500, int(args.setpoint_hz * (settle_duration_s + 5.0)))
@@ -317,6 +432,8 @@ def _fly(args, samples, log: AttemptLog, run_config: dict | None = None) -> dict
                 raise RuntimeError("simulation clock reset during entry")
             reset = (snap.xy_reset_counter, snap.z_reset_counter)
             if reset != last_reset:
+                if pause_recovery.attempts:
+                    raise RuntimeError("simulation step control: local frame reset during pause recovery")
                 log.event("px4_local_reset_during_entry", snap, old=last_reset, new=reset)
                 # Stop advancing and observe the new coordinate origin while hovering.
                 hold_at = snap.px4_local_ned_m
@@ -364,6 +481,43 @@ def _fly(args, samples, log: AttemptLog, run_config: dict | None = None) -> dict
                 max_position_error_m=float(entry.get("science_start_position_error_m", 0.5)),
                 max_heading_error_deg=float(entry.get("science_start_heading_error_deg", 3.0)),
             ):
+                if getattr(args, "protocol_version", "1.1") == "1.2":
+                    if args.setpoint_hz != 50.0:
+                        raise RuntimeError("simulation step control: v1.2 requires 50 Hz reference")
+                    pause_recovery.begin()
+                    stepper.pause()
+                    log.event("simulation_step_pause_requested", snap, physics_dt_ns=4_000_000,
+                              max_physics_steps=5, pause_attempt=pause_recovery.attempts)
+                    clock_evidence = wait_clock_evidence(
+                        received_clock_evidence, epoch, last_reset,
+                        baseline_ns=snap.simulation_time_ns, quiescent=True,
+                        keepalive=lambda: send_position_yaw(master, now_ms(boot_time), hold_at, yaw),
+                        check_stop=_check_stop,
+                        timeout_s=max(0.0, min(2.0, entry_deadline-time.monotonic(),
+                            (settle_deadline-time.monotonic()) if settle_deadline is not None else 2.0)))
+                    admission_details = {}
+                    observed = cache.snapshot(time.monotonic_ns(), diagnostic_details=admission_details)
+                    log.event("simulation_step_pause_admission", observed or snap,
+                              pause_attempt=pause_recovery.attempts,
+                              clock_evidence=clock_evidence, snapshot_admission=admission_details)
+                    if observed is None:
+                        pause_recovery.recover(stepper, stable_samples)
+                        log.event("simulation_step_pause_recovery", snap,
+                                  pause_attempt=pause_recovery.attempts,
+                                  original_stability_required_s=settle_duration_s)
+                        last_fresh_wall = time.monotonic()
+                        next_tick = time.monotonic()
+                        continue
+                    if (observed.simulation_epoch != epoch or
+                            (observed.xy_reset_counter, observed.z_reset_counter) != last_reset):
+                        raise RuntimeError("simulation step control: frame changed at paused admission")
+                    snap = last_snapshot = observed
+                    if (math.dist(snap.px4_local_ned_m.as_xyz(), goal.as_xyz()) > float(entry.get("science_start_position_error_m", 0.5))
+                            or math.dist(snap.gt_world_enu_m.as_xyz(), start_world.as_xyz()) > float(entry.get("science_start_position_error_m", 0.5))
+                            or snap.speed_mps > float(entry.get("science_start_speed_mps", 0.3))
+                            or _heading_error_deg(snap.px4_heading_rad, yaw) > float(entry.get("science_start_heading_error_deg", 3.0))):
+                        raise RuntimeError("simulation step control: paused science-start bounds failed")
+                    log.event("simulation_step_pause_confirmed", snap)
                 world_error_m = math.dist(snap.gt_world_enu_m.as_xyz(), start_world.as_xyz())
                 log.coordinate_frame_check(
                     run_id=log.run_id,
@@ -396,46 +550,95 @@ def _fly(args, samples, log: AttemptLog, run_config: dict | None = None) -> dict
             raise RuntimeError("entry trajectory did not reach the science start")
 
         science_start_ns = last_snapshot.simulation_time_ns
+        log.science_start_ns = science_start_ns
         duration_s = float(samples[-1]["t_science_s"])
-        next_tick = time.monotonic()
-        last_fresh_wall = time.monotonic()
         last_science_position = goal
         last_science_velocity = LocalNedVelocity(0.0, 0.0, 0.0)
-        while True:
-            _check_stop()
-            snap = _snapshot(bridge, cache)
-            if snap is None:
-                if time.monotonic() - last_fresh_wall > 1.0:
-                    raise RuntimeError("science telemetry became stale")
-                send_position_velocity_yaw(
-                    master, now_ms(boot_time), last_science_position,
-                    last_science_velocity, yaw,
-                )
-                next_tick = _tick_sleep(next_tick + period)
-                continue
-            last_fresh_wall, last_snapshot = time.monotonic(), snap
-            if snap.simulation_epoch != epoch:
-                raise RuntimeError("simulation clock reset during science")
-            if (snap.xy_reset_counter, snap.z_reset_counter) != last_reset:
-                raise RuntimeError("PX4 local frame reset during science")
-            elapsed = (snap.simulation_time_ns - science_start_ns) / 1_000_000_000.0
-            if elapsed < 0:
-                raise RuntimeError("science simulation time moved backwards")
-            if elapsed >= duration_s:
-                break
-            reference = interpolate_reference(samples, elapsed)
-            world = WorldEnu.from_reference_xyz(reference["position_world_enu_m"])
-            local = world_position_to_px4_local_ned(world, origin)
-            velocity = world_velocity_to_px4_local_ned(reference["velocity_world_enu_mps"])
-            send_position_velocity_yaw(master, now_ms(boot_time), local, velocity, yaw)
-            last_science_position, last_science_velocity = local, velocity
-            log.state("science", snap, local, velocity, origin, reference)
-            next_tick = _tick_sleep(next_tick + period)
+
+        def send_science_update(snap, elapsed, clock_received_ns):
+            nonlocal last_science_position, last_science_velocity
+            with timed_stage(diagnostic_sink, "prepare_reference_and_ned", snap.simulation_time_ns):
+                reference = (prepared_reference.sample(elapsed) if prepared_reference is not None
+                             else interpolate_reference(samples, elapsed))
+                world = WorldEnu.from_reference_xyz(reference["position_world_enu_m"])
+                local = world_position_to_px4_local_ned(world, origin)
+                velocity = world_velocity_to_px4_local_ned(reference["velocity_world_enu_mps"])
+            with timed_stage(diagnostic_sink, "mavlink_send", snap.simulation_time_ns):
+                send_position_velocity_yaw(master, now_ms(boot_time), local, velocity, yaw)
+            with timed_stage(diagnostic_sink, "post_send_logging", snap.simulation_time_ns):
+                log.science_send(snap, clock_receive_monotonic_ns=(
+                    clock_received_ns if dispatcher.last_update_ns is not None else None))
+                last_science_position, last_science_velocity = local, velocity
+                log.state("science", snap, local, velocity, origin, reference)
+
+        def send_science_keepalive():
+            send_position_velocity_yaw(master, now_ms(boot_time), last_science_position,
+                                       last_science_velocity, yaw)
+            log.science_send(None, reference_update=False)
+
+        dispatcher = ScienceDispatcher(last_snapshot, duration_s, args.setpoint_hz,
+                                       send_science_update, send_science_keepalive,
+                                       time.monotonic_ns(),
+                                       diagnostic_sink=diagnostic_sink)
+        # Register and seed under the callback lock so startup cannot reorder a
+        # newer clock event ahead of the initial observed science snapshot.
+        bridge.set_clock_handler(dispatcher.on_clock, initial_snapshot=last_snapshot)
+        try:
+            next_tick = time.monotonic()
+            if stepper is not None:
+                science_end_target_ns = science_start_ns + round(duration_s * 1e9)
+                observed_ns = science_start_ns
+                while observed_ns < science_end_target_ns:
+                    _check_stop()
+                    progress = dispatcher.progress_snapshot()
+                    if not check_step_barrier(progress, observed_ns, science_end_target_ns):
+                        raise RuntimeError("simulation step control: previous reference was not dispatched")
+                    steps, target_ns = stepper.next_target(observed_ns, science_end_target_ns)
+                    requested_wall_ns = time.monotonic_ns()
+                    stepper.step(steps)
+                    deadline = time.monotonic() + 2.0
+                    while True:
+                        _check_stop()
+                        if bridge.last_error:
+                            raise RuntimeError(f"simulation step control: observer failed: {bridge.last_error}")
+                        progress = dispatcher.progress_snapshot()
+                        if check_step_barrier(progress, target_ns, science_end_target_ns):
+                            break
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError("simulation step control: observed clock/reference barrier timeout")
+                        try:
+                            dispatcher.watchdog(time.monotonic_ns())
+                        except RuntimeError as exc:
+                            raise RuntimeError(f"simulation step control: {exc}") from exc
+                        time.sleep(min(period, 0.002))
+                    observed_ns = target_ns
+                    log.event("simulation_step_completed", progress["snapshot"],
+                              requested_physics_steps=steps, requested_target_ns=target_ns,
+                              request_monotonic_ns=requested_wall_ns,
+                              barrier_monotonic_ns=time.monotonic_ns())
+            else:
+                while not dispatcher.finished:
+                    _check_stop()
+                    if bridge.last_error:
+                        raise RuntimeError(f"ROS observation failed: {bridge.last_error}")
+                    dispatcher.watchdog(time.monotonic_ns())
+                    next_tick = _tick_sleep(next_tick + period)
+            last_snapshot = dispatcher.last_snapshot
+        finally:
+            bridge.set_clock_handler(None)
+            last_snapshot = dispatcher.last_snapshot
+            # Preserve the actual observed prefix on abort for emergency events
+            # and QC; successful runs replace this with the nominal science end.
+            log.science_end_ns = last_snapshot.simulation_time_ns
 
         final_world = WorldEnu.from_reference_xyz(samples[-1]["position_world_enu_m"])
         final_local = world_position_to_px4_local_ned(final_world, origin)
         send_position_yaw(master, now_ms(boot_time), final_local, yaw)
+        log.science_end_ns = science_start_ns + round(duration_s * 1e9)
         log.event("science_end", last_snapshot, duration_reference_s=duration_s)
+        if stepper is not None:
+            stepper.resume()
+            log.event("simulation_step_continuous_resumed", last_snapshot)
         hold_start_ns = last_snapshot.simulation_time_ns
         next_tick = time.monotonic()
         last_fresh_wall = time.monotonic()
@@ -462,9 +665,22 @@ def _fly(args, samples, log: AttemptLog, run_config: dict | None = None) -> dict
         request_land(master)
         log.event("landing_requested", last_snapshot)
         wait_landed(master, args.land_timeout_s)
-        log.event("landing_confirmed", last_snapshot)
-        return {"controller_status": "science_completed", "science_duration_reference_s": duration_s}
+        # The legacy helper may consume an old ON_GROUND packet. Retain its
+        # teardown behavior, but never present that receipt as physical truth.
+        last_snapshot = _snapshot(bridge, cache) or last_snapshot
+        log.event("landing_status_received", last_snapshot,
+                  physical_landing_verified=False,
+                  source="legacy_mavlink_extended_sys_state_unverified")
+        print("Legacy ON_GROUND signal received; physical landing is unverified.", flush=True)
+        return {"controller_status": "science_completed", "science_duration_reference_s": duration_s,
+                "physical_landing_verified": False}
     except BaseException:
+        if stepper is not None:
+            try:
+                stepper.resume()
+                log.event("simulation_step_error_resume", last_snapshot)
+            except Exception as resume_error:
+                log.event("simulation_step_resume_failed", last_snapshot, reason=str(resume_error))
         if offboard_attempted and master is not None:
             try:
                 request_land(master)
@@ -474,15 +690,29 @@ def _fly(args, samples, log: AttemptLog, run_config: dict | None = None) -> dict
                 log.event("emergency_landing_request_failed", last_snapshot, reason=str(exc))
         raise
     finally:
+        bridge.set_clock_handler(None)
+        if stepper is not None and stepper.paused:
+            try:
+                stepper.resume()
+            except Exception as resume_error:
+                log.event("simulation_step_resume_failed_final", last_snapshot, reason=str(resume_error))
         if heartbeat is not None:
             heartbeat.stop()
         if master is not None:
             master.close()
         bridge.close()
+        if diagnostic_sink is not None:
+            diagnostic_sink({"component": "diagnostic_producers", "action": "stopped",
+                             "bridge_error_count": bridge.diagnostic_error_count,
+                             "observer_shutdown_verified": bridge.diagnostic_shutdown_complete,
+                             "dispatcher_error_count": (0 if dispatcher is None else
+                                                        dispatcher.diagnostic_error_count)})
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--protocol-version", choices=("1.1", "1.2"), default="1.1")
+    parser.add_argument("--world-name", default="stereo_ground_drone")
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--attempt-id", required=True)
     parser.add_argument("--reference-json", type=Path, required=True)
@@ -490,6 +720,8 @@ def main() -> int:
                         help="workbook parameters frozen for this attempt")
     parser.add_argument("--attempt-dir", type=Path, required=True)
     parser.add_argument("--connect", default="udpin:0.0.0.0:14540")
+    parser.add_argument("--timing-diagnostics", action="store_true",
+                        help="Buffer callback/dispatch evidence until shutdown (development diagnosis)")
     parser.add_argument("--preflight-only", action="store_true",
                         help="Observe PX4/Gazebo origin and exit without mode, arm or flight commands")
     parser.add_argument("--setpoint-hz", type=float, default=20.0)
@@ -510,14 +742,21 @@ def main() -> int:
     if args.attempt_dir.exists() is False:
         parser.error("attempt directory must already exist")
     logger = AttemptLog(args.attempt_dir, args.run_id, args.attempt_id)
+    logger.timing_diagnostics = BufferedTimingDiagnostics() if args.timing_diagnostics else None
+    if logger.timing_diagnostics is not None:
+        logger.timing_diagnostics.start_gc_tracking()
     signal.signal(signal.SIGINT, _stop_signal)
     signal.signal(signal.SIGTERM, _stop_signal)
     try:
         result = _fly(args, samples, logger, run_config)
     except BaseException as exc:
+        if logger.timing_diagnostics is not None:
+            logger.timing_diagnostics.persist(args.attempt_dir)
         logger.event("controller_failed", reason=f"{type(exc).__name__}: {exc}")
         logger.finish("failed", failure_type=type(exc).__name__, failure_reason=str(exc))
         raise
+    if logger.timing_diagnostics is not None:
+        logger.timing_diagnostics.persist(args.attempt_dir)
     logger.finish(result["controller_status"],
                   **{k: v for k, v in result.items() if k != "controller_status"})
     return 0

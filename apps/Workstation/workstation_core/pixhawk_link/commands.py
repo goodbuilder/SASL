@@ -85,6 +85,10 @@ class MavlinkCommands:
                 timeout_s=timeout_s,
                 on_unmatched=io.on_unmatched,
                 on_receive_poll=io.on_receive_poll,
+                on_retry=lambda retry_attempt: self.status(
+                    f"{camera_label_ko(camera)} PX4 PARAM {name} 응답 시간 초과; "
+                    f"{retry_attempt}/{wire_commands.MAVLINK_PARAMETER_SET_MAX_ATTEMPTS}회 재전송"
+                ),
                 send_lock=io.send_lock,
             )
         if actual == int(value):

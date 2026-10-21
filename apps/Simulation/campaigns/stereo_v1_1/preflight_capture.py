@@ -20,6 +20,24 @@ REPO_ROOT = SIM_ROOT.parents[1]
 CAMPAIGN_ROOT = Path(__file__).resolve().parent
 
 
+def _run_step_probe(python: Path, attempt_dir: Path, source: dict, env: dict) -> dict:
+    from campaigns.stereo_v1_1.campaign_run import _workbook_environment_value
+    report_path = attempt_dir / "simulation_step_probe.json"
+    command = _ros_command(python, CAMPAIGN_ROOT / "verify_simulation_steps.py",
+                           "--world-name", _workbook_environment_value(source, "world_name"),
+                           "--report", str(report_path))
+    probe_env = dict(env, PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION="python")
+    with (attempt_dir / "simulation_step_probe.log").open("x", encoding="utf-8") as log:
+        subprocess.run(command, cwd=REPO_ROOT, env=probe_env, stdout=log,
+                       stderr=subprocess.STDOUT, timeout=30, check=True)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if report.get("status") != "PASS":
+        raise RuntimeError("simulation step control: no-flight probe failed")
+    return {"status": report["status"], "path": report_path.name,
+            "sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+            "evidence": report}
+
+
 def _spawn(command: list[str], log_path: Path, env: dict[str, str]):
     handle = log_path.open("x", encoding="utf-8")
     try:
@@ -155,10 +173,13 @@ def run_group(output_root: Path, group: str, spec: dict | None = None,
     else:
         env["SIM_SCENARIO_CONFIG"] = f"config/campaign/v1_1/{group}.env"
         env["SIM_GAZEBO_SEED"] = "0"
+    if workbook_source is not None and workbook_source.get("protocol_version") == "1.2":
+        env["PX4_CONSOLE_LOG"] = str(attempt_dir / "px4_console")
     python = Path(os.environ.get("STEREO_V1_1_ROOT_PYTHON", sys.executable)).expanduser()
     operator = state = capture = None
     handles = []
     failure = None
+    step_probe = None
     try:
         operator_command = [str(SIM_ROOT / "run_operator_view.sh"), "--headless", "--no-yolo",
                             "--raw-view", "--skip-px4-build", "--px4-model-name", vehicle_model_id,
@@ -169,16 +190,34 @@ def run_group(output_root: Path, group: str, spec: dict | None = None,
 
         state_command = _ros_command(python, CAMPAIGN_ROOT / "state_recorder.py",
                                      "--attempt-dir", str(attempt_dir), "--duration-s", "12")
-        state, handle = _spawn(state_command, attempt_dir / "state_recorder.log", env)
-        handles.append(handle)
-        _wait_token(state, attempt_dir / "state_recorder.log", "STATE_READY", 60)
+        v12_capture = workbook_source is not None and workbook_source.get("protocol_version") == "1.2"
+        if not v12_capture:
+            state, handle = _spawn(state_command, attempt_dir / "state_recorder.log", env)
+            handles.append(handle)
+            _wait_token(state, attempt_dir / "state_recorder.log", "STATE_READY", 60)
 
         capture_command = _ros_command(python, CAMPAIGN_ROOT / "capture_streams.py",
                                        "--attempt-dir", str(attempt_dir), "--duration-s", "5",
                                        "--compression", "zstd")
+        if workbook_source is not None and workbook_source.get("protocol_version") == "1.2":
+            capture_command.extend(("--protocol-version", "1.2"))
         capture, handle = _spawn(capture_command, attempt_dir / "capture_runner.log", env)
         handles.append(handle)
         _wait_token(capture, attempt_dir / "capture_runner.log", "CAPTURE_READY", 60)
+        if v12_capture:
+            settings = workbook_source["parameters"]["Capture"]
+            readiness_command = _ros_command(python, CAMPAIGN_ROOT / "capture_readiness.py",
+                "--attempt-dir", str(attempt_dir),
+                "--min-gt-hz", str(settings["min_gt_rate_hz"]),
+                "--max-gt-gap-s", str(settings["max_gt_bracketing_gap_s"]))
+            with (attempt_dir / "capture_readiness.log").open("x", encoding="utf-8") as readiness_log:
+                subprocess.run(readiness_command, cwd=REPO_ROOT, env=env,
+                               stdout=readiness_log, stderr=subprocess.STDOUT,
+                               timeout=70, check=True)
+            state, handle = _spawn(state_command, attempt_dir / "state_recorder.log", env)
+            handles.append(handle)
+            _wait_token(state, attempt_dir / "state_recorder.log", "STATE_READY", 60)
+            step_probe = _run_step_probe(python, attempt_dir, workbook_source, env)
         capture_code = capture.wait(timeout=90)
         state_code = state.wait(timeout=30)
         if capture_code != 0 or state_code != 0:
@@ -276,6 +315,7 @@ def run_group(output_root: Path, group: str, spec: dict | None = None,
         "camera_orientation_error_deg": orientation_errors,
         "camera_truth_sha256": hashlib.sha256(camera_truth_path.read_bytes()).hexdigest(),
         "operator_exit_code": operator_code,
+        "simulation_step_probe": step_probe,
     }
     _write_probe_report(attempt_dir, result)
     return result

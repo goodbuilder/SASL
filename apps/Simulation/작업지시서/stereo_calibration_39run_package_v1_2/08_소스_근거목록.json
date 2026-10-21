@@ -1,0 +1,92 @@
+{
+  "repository": "https://github.com/goodbuilder/SASL",
+  "branch": "Final",
+  "commit": "0d83e0a2f7fe45c2f6c34f480bfb92a34fb7fd59",
+  "files": [
+    {
+      "path": "AGENTS.md",
+      "url": "https://github.com/goodbuilder/SASL/blob/0d83e0a2f7fe45c2f6c34f480bfb92a34fb7fd59/AGENTS.md",
+      "sha256": "b937c637df6132286757792bb210b583e8a19e45b708828cdea71684cc8d66fc"
+    },
+    {
+      "path": "apps/Simulation/README.md",
+      "url": "https://github.com/goodbuilder/SASL/blob/0d83e0a2f7fe45c2f6c34f480bfb92a34fb7fd59/apps/Simulation/README.md",
+      "sha256": "8c7c0c6afdeb214998fa48d45b07db82f57173f1dbb2cb594f5600706d81492b"
+    },
+    {
+      "path": "apps/Simulation/config/simulation.env",
+      "url": "https://github.com/goodbuilder/SASL/blob/0d83e0a2f7fe45c2f6c34f480bfb92a34fb7fd59/apps/Simulation/config/simulation.env",
+      "sha256": "a44d75e55617efdf51e049d57d844ff0f1b99fb59bbac0218346ce08247f5f16"
+    },
+    {
+      "path": "apps/Simulation/run_operator_view.sh",
+      "url": "https://github.com/goodbuilder/SASL/blob/0d83e0a2f7fe45c2f6c34f480bfb92a34fb7fd59/apps/Simulation/run_operator_view.sh",
+      "sha256": "1f971396b56d503a4870ef647a0398ed6b017ccf7b4674fa494f310ebacd37b4"
+    },
+    {
+      "path": "apps/Simulation/run_auto.sh",
+      "url": "https://github.com/goodbuilder/SASL/blob/0d83e0a2f7fe45c2f6c34f480bfb92a34fb7fd59/apps/Simulation/run_auto.sh",
+      "sha256": "08f15a202114f5a906758a05de9918fdc1ae824aa2b59a148c95d6bb4d93939e"
+    },
+    {
+      "path": "apps/Simulation/run_auto_attitude_sweep.sh",
+      "url": "https://github.com/goodbuilder/SASL/blob/0d83e0a2f7fe45c2f6c34f480bfb92a34fb7fd59/apps/Simulation/run_auto_attitude_sweep.sh",
+      "sha256": "cd733783087a6c942dc200b8693917b8ef618736a00386e67df76ca1d76c28bf"
+    },
+    {
+      "path": "apps/Simulation/run_px4_waypoint_mission.sh",
+      "url": "https://github.com/goodbuilder/SASL/blob/0d83e0a2f7fe45c2f6c34f480bfb92a34fb7fd59/apps/Simulation/run_px4_waypoint_mission.sh",
+      "sha256": "1546bfdacf744fd08a05914919191ecd53b734b1941728f1606f19003396fc37"
+    },
+    {
+      "path": "apps/Simulation/scripts/px4_waypoint_mission.py",
+      "url": "https://github.com/goodbuilder/SASL/blob/0d83e0a2f7fe45c2f6c34f480bfb92a34fb7fd59/apps/Simulation/scripts/px4_waypoint_mission.py",
+      "sha256": "01d4f286e4d11d288b750c424d6d90a5a75b07e54d6beefb2dae0032913d7a68"
+    },
+    {
+      "path": "apps/Simulation/stereo_ground_sim/launch/stereo_ground_sim.launch.py",
+      "url": "https://github.com/goodbuilder/SASL/blob/0d83e0a2f7fe45c2f6c34f480bfb92a34fb7fd59/apps/Simulation/stereo_ground_sim/launch/stereo_ground_sim.launch.py",
+      "sha256": "48182d78f7e2701d4688034d7a087eb01483c849bcc4e8ef2dd69dcbb25a15e5"
+    },
+    {
+      "path": "apps/Simulation/stereo_ground_sim/stereo_ground_sim/coordinate_frames.py",
+      "url": "https://github.com/goodbuilder/SASL/blob/0d83e0a2f7fe45c2f6c34f480bfb92a34fb7fd59/apps/Simulation/stereo_ground_sim/stereo_ground_sim/coordinate_frames.py",
+      "sha256": "9d6065f85383da40a1dfc8944d71ac96a5e6427c48aefc3ed1f8ace2a2de6b4b"
+    },
+    {
+      "path": "apps/Simulation/stereo_ground_sim/stereo_ground_sim/camera_pose_coordinator.py",
+      "url": "https://github.com/goodbuilder/SASL/blob/0d83e0a2f7fe45c2f6c34f480bfb92a34fb7fd59/apps/Simulation/stereo_ground_sim/stereo_ground_sim/camera_pose_coordinator.py",
+      "sha256": "273d5308fabc9aca397c329ed03bf62a0cf4408c93a9bb29bc30e19d8350fa64"
+    },
+    {
+      "path": "apps/Simulation/stereo_ground_sim/stereo_ground_sim/operator_recorder.py",
+      "url": "https://github.com/goodbuilder/SASL/blob/0d83e0a2f7fe45c2f6c34f480bfb92a34fb7fd59/apps/Simulation/stereo_ground_sim/stereo_ground_sim/operator_recorder.py",
+      "sha256": "1500119b02ad45c087aa62e5b85432a807dc690498c1142b5a451aaab7319e34"
+    },
+    {
+      "path": "apps/Simulation/stereo_ground_sim/stereo_ground_sim/research_recording.py",
+      "url": "https://github.com/goodbuilder/SASL/blob/0d83e0a2f7fe45c2f6c34f480bfb92a34fb7fd59/apps/Simulation/stereo_ground_sim/stereo_ground_sim/research_recording.py",
+      "sha256": "682aba59335505bf6e3c956ed87a4ae4bc7b6ba6273a64ea132e52798380512f"
+    },
+    {
+      "path": "apps/Simulation/stereo_ground_sim/stereo_ground_sim/research_record_fields.py",
+      "url": "https://github.com/goodbuilder/SASL/blob/0d83e0a2f7fe45c2f6c34f480bfb92a34fb7fd59/apps/Simulation/stereo_ground_sim/stereo_ground_sim/research_record_fields.py",
+      "sha256": "ff5e8d6527b05e6a61c91560a7fcf08bd6489e51e98f391aedd5ecd2abd0674d"
+    },
+    {
+      "path": "apps/Simulation/stereo_ground_sim/stereo_ground_sim/gazebo_ground_truth_adapter.py",
+      "url": "https://github.com/goodbuilder/SASL/blob/0d83e0a2f7fe45c2f6c34f480bfb92a34fb7fd59/apps/Simulation/stereo_ground_sim/stereo_ground_sim/gazebo_ground_truth_adapter.py",
+      "sha256": "e01d586d87a16d8219c5ed4c2370e5b5c68dfbac536c2848acd08e8b2da03a61"
+    },
+    {
+      "path": "apps/Simulation/stereo_ground_sim/stereo_ground_sim/correction_qualification.py",
+      "url": "https://github.com/goodbuilder/SASL/blob/0d83e0a2f7fe45c2f6c34f480bfb92a34fb7fd59/apps/Simulation/stereo_ground_sim/stereo_ground_sim/correction_qualification.py",
+      "sha256": "cc91f3abf03e15bb8e875cce372e3c1278719878a2575593be597da8946f0afd"
+    },
+    {
+      "path": "apps/Simulation/scripts/rtk_stereo_calibration_pipeline.py",
+      "url": "https://github.com/goodbuilder/SASL/blob/0d83e0a2f7fe45c2f6c34f480bfb92a34fb7fd59/apps/Simulation/scripts/rtk_stereo_calibration_pipeline.py",
+      "sha256": "11a62bb42ac7046d17e0717d4a9ba5d74447929e7a26e39be46ac9de48173bc8"
+    }
+  ]
+}

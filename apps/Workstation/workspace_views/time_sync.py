@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from typing import Callable
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtWidgets
 from Workstation.workstation_core.theme import ERROR_TEXT
-from Workstation.ui.components import WorkspaceHeader
+from Workstation.ui.designer import load_form
 from Workstation.application.status_model import RuntimeStatus
-from .shared import _command_button, _compact_text, _evidence
+from .shared import _compact_text, _evidence
 
 
 class TimeWorkspace(QtWidgets.QWidget):
@@ -27,134 +27,40 @@ class TimeWorkspace(QtWidgets.QWidget):
         super().__init__(parent)
         self.backend = backend
         self.invoke_command = invoke_command
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-        layout.addWidget(
-            WorkspaceHeader("Clock", "RTCP/NTP")
-        )
-
-        workflow_group = QtWidgets.QGroupBox("Clock")
-        workflow_layout = QtWidgets.QHBoxLayout(workflow_group)
-        workflow_layout.setContentsMargins(6, 6, 6, 6)
-        workflow_layout.setSpacing(6)
-        self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
-        for command_id, label in (
-            ("time.set_pc", "Set camera clock"),
-            ("time.check_sync", "Check sync"),
-        ):
-            button = _command_button(label, command_id, invoke_command)
-            self.operation_buttons[command_id] = button
-            workflow_layout.addWidget(button)
-        workflow_layout.addStretch(1)
-        layout.addWidget(workflow_group)
-
-        sync_group = QtWidgets.QGroupBox("Sync status")
-        sync_layout = QtWidgets.QVBoxLayout(sync_group)
-        sync_status_row = QtWidgets.QHBoxLayout()
-        self.sync_status = QtWidgets.QLabel("Waiting for RTCP/NTP")
-        self.sync_status.setObjectName("statusStrip")
-        self.sync_status.setWordWrap(True)
-        self.sync_status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        self.sync_reason = QtWidgets.QLabel("")
-        self.sync_reason.setObjectName("statusReason")
-        self.sync_reason.setWordWrap(True)
-        self.sync_reason.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        self.sync_reason.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        load_form("time_sync.ui", self)
+        for widget in self.findChildren(QtWidgets.QWidget):
+            legacy_name = widget.property("legacyObjectName")
+            if legacy_name:
+                widget.setObjectName(str(legacy_name))
+        self.operation_buttons = {
+            'time.set_pc': self.operation_buttons_time_set_pc,
+            'time.check_sync': self.operation_buttons_time_check_sync,
+            'time.apply_settings': self.operation_buttons_time_apply_settings,
+            'time.save_settings': self.operation_buttons_time_save_settings,
+        }
+        self.settings_widgets = {
+            'camera_sync_history_window_s': self.settings_widgets_camera_sync_history_window_s,
+            'camera_sync_receive_pair_max_delta_ms': self.settings_widgets_camera_sync_receive_pair_max_delta_ms,
+            'camera_sync_rtcp_pair_max_delta_ms': self.settings_widgets_camera_sync_rtcp_pair_max_delta_ms,
+            'camera_sync_max_sr_age_s': self.settings_widgets_camera_sync_max_sr_age_s,
+            'camera_sync_max_pc_offset_ms': self.settings_widgets_camera_sync_max_pc_offset_ms,
+            'camera_sync_clock_rate_error_pct': self.settings_widgets_camera_sync_clock_rate_error_pct,
+            'camera_sync_required_sr_count': self.settings_widgets_camera_sync_required_sr_count,
+            'camera_sync_warmup_timeout_s': self.settings_widgets_camera_sync_warmup_timeout_s,
+        }
+        for command_id, button in self.operation_buttons.items():
+            button.setEnabled(invoke_command is not None)
+            if invoke_command is not None:
+                button.clicked.connect(
+                    lambda _checked=False, command=command_id: invoke_command(command)
+                )
         self.sync_reason.setStyleSheet(f"color: {ERROR_TEXT};")
         self.sync_reason.hide()
-        sync_status_row.addWidget(self.sync_status, 1)
-        sync_status_row.addWidget(self.sync_reason, 1)
-        sync_layout.addLayout(sync_status_row)
-        self.schedule_status = QtWidgets.QLabel(
-            "STUS schedule: MANUAL · manual seed required"
-        )
-        self.schedule_status.setObjectName("statusStrip")
-        self.schedule_status.setWordWrap(True)
-        self.schedule_status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        sync_layout.addWidget(self.schedule_status)
-        self.sync_summary = QtWidgets.QPlainTextEdit()
-        self.sync_summary.setReadOnly(True)
-        self.sync_summary.setMaximumBlockCount(80)
-        # Tall enough to show recent RTCP/NTP sync lines without an inner
-        # scrollbar; the workspace itself scrolls at the page level.
-        self.sync_summary.setFixedHeight(200)
-        sync_layout.addWidget(self.sync_summary)
-        layout.addWidget(sync_group)
-
         settings = _evidence(self.backend).measurement_settings()
-        self.settings_widgets: dict[str, QtWidgets.QWidget] = {}
-
-        def double_spin(
-            key: str,
-            minimum: float,
-            maximum: float,
-            decimals: int,
-            suffix: str,
-        ) -> QtWidgets.QDoubleSpinBox:
-            widget = QtWidgets.QDoubleSpinBox()
-            widget.setRange(minimum, maximum)
-            widget.setDecimals(decimals)
-            widget.setValue(float(settings.get(key) if settings.get(key) is not None else minimum))
-            widget.setSuffix(suffix)
-            self.settings_widgets[key] = widget
-            return widget
-
-        def int_spin(
-            key: str,
-            minimum: int,
-            maximum: int,
-            suffix: str = "",
-        ) -> QtWidgets.QSpinBox:
-            widget = QtWidgets.QSpinBox()
-            widget.setRange(minimum, maximum)
+        for key, widget in self.settings_widgets.items():
             value = settings.get(key)
-            widget.setValue(int(value if value is not None else minimum))
-            widget.setSuffix(suffix)
-            self.settings_widgets[key] = widget
-            return widget
-
-        limits_group = QtWidgets.QGroupBox("Sync limits")
-        limits_form = QtWidgets.QGridLayout(limits_group)
-        limits_form.setHorizontalSpacing(8)
-        limits_form.setVerticalSpacing(5)
-        limits_form.setColumnStretch(1, 1)
-        limits_form.setColumnStretch(3, 1)
-        limits_fields = (
-            ("History", double_spin("camera_sync_history_window_s", 0.1, 5.0, 2, " s")),
-            ("Receive skew", double_spin("camera_sync_receive_pair_max_delta_ms", 0.0, 2000.0, 1, " ms")),
-            ("L/R RTCP Δt gate", double_spin("camera_sync_rtcp_pair_max_delta_ms", 0.0, 1000.0, 1, " ms")),
-            ("SR stale", double_spin("camera_sync_max_sr_age_s", 0.1, 60.0, 2, " s")),
-            ("SR-PC diagnostic", double_spin("camera_sync_max_pc_offset_ms", 0.0, 5000.0, 1, " ms")),
-            ("Clock rate error", double_spin("camera_sync_clock_rate_error_pct", 0.0, 10.0, 3, " %")),
-            ("Required SR", int_spin("camera_sync_required_sr_count", 1, 20, " count")),
-            ("Warmup", double_spin("camera_sync_warmup_timeout_s", 1.0, 120.0, 1, " s")),
-        )
-        for index, (label, widget) in enumerate(limits_fields):
-            row = index // 2
-            column = (index % 2) * 2
-            limits_form.addWidget(QtWidgets.QLabel(label), row, column)
-            limits_form.addWidget(widget, row, column + 1)
-        layout.addWidget(limits_group)
-
-        self.sync_settings_status = QtWidgets.QLabel(
-            "Sync limits apply now; Save keeps them for the next run."
-        )
-        self.sync_settings_status.setObjectName("statusStrip")
-        self.sync_settings_status.setWordWrap(True)
-        layout.addWidget(self.sync_settings_status)
-        for command_id, label in (
-            ("time.apply_settings", "Apply limits"),
-            ("time.save_settings", "Save limits"),
-        ):
-            button = _command_button(label, command_id, invoke_command)
-            self.operation_buttons[command_id] = button
-            workflow_layout.addWidget(button)
-
-        contract = QtWidgets.QLabel("RTCP/NTP timestamps")
-        contract.setObjectName("compactContract")
-        layout.addWidget(contract)
-        layout.addStretch(1)
+            if value is not None:
+                widget.setValue(int(value) if isinstance(widget, QtWidgets.QSpinBox) else float(value))
 
     @staticmethod
     def _widget_text(widget: object, default: str = "--") -> str:

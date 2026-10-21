@@ -45,3 +45,11 @@ show direct PX4 active IDs separately from the preview.
 Approved scope: implement the selection preview and live instance identity read model only.
 Explicitly excluded: automatic priority/slot remapping, hardware removal, firmware changes, and
 CAN2 action blocking/reason dialogs.
+
+## 2026-10-12 follow-up approval record
+
+After reviewing the RCA fix proposal, the user requested implementation (“수정해”). This
+authorizes the follow-up scope recorded in `decisions.md`: preserve staged edits, retry timed-out
+PARAM_SET acknowledgements, reconcile failed/partial writes, and guard the known PX4 v1.17
+sparse-voter case. CAN2/out-of-range topology remains editable. No PARAM save, reboot, physical
+device operation, or firmware change is authorized by this request.

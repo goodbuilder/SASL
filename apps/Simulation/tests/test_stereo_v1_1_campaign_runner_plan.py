@@ -54,3 +54,16 @@ def test_resume_preserves_incomplete_attempt_and_reopens_slot(tmp_path):
     assert next_attempt["attempt_id"] == "a02"
     assert next_attempt["seed_requested"] == slot["seed_requested"]
     assert next_path != attempt_path
+
+
+def test_selected_frozen_workbook_main_run_uses_source_without_development(tmp_path, monkeypatch):
+    from campaigns.stereo_v1_1 import campaign_run as runner
+    from campaigns.stereo_v1_1 import workbook_campaign as workbook
+    (tmp_path/'run_status.json').write_text('{}')
+    source={'run_id':'G0-V0-R01','protocol_version':'1.2','parameters':{'test':'frozen'}}
+    monkeypatch.setattr(workbook,'_load_frozen_plan',lambda root:{'planned_runs':[source]})
+    observed=[]
+    monkeypatch.setattr(runner,'_run_one',lambda root,row,**kw:observed.append((row,kw)) or {'status':'VALID_WITH_WARNINGS'})
+    monkeypatch.setattr(sys,'argv',['campaign_run.py','run','--frozen-workbook','--run-id','G0-V0-R01','--output-root',str(tmp_path)])
+    assert runner.main()==0
+    assert observed==[(source,{'development':False})]

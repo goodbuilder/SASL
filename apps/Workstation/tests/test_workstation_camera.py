@@ -1921,7 +1921,7 @@ def test_wiris_command_worker_reports_partial_timeout_without_ui_join(monkeypatc
     assert results[0]["statuses"]["right"] == "실패: right camera timeout"
 
 def test_workstation_uses_explicit_camera_coordinate_label() -> None:
-    source = (Path(__file__).resolve().parents[2] / "Workstation" / "panel_alignment.py").read_text(
+    source = (Path(__file__).resolve().parents[2] / "Workstation" / "panel" / "panel_alignment.py").read_text(
         encoding="utf-8"
     )
     assert "OpenCV optical RDF" in source

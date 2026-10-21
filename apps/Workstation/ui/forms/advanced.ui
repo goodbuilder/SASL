@@ -1,0 +1,1059 @@
+<ui version="4.0">
+  <class>AdvancedWorkspace</class>
+  <widget class="QWidget" name="AdvancedWorkspace">
+    <layout class="QVBoxLayout" name="workspaceLayout">
+      <property name="leftMargin">
+        <number>8</number>
+      </property>
+      <property name="topMargin">
+        <number>8</number>
+      </property>
+      <property name="rightMargin">
+        <number>8</number>
+      </property>
+      <property name="bottomMargin">
+        <number>8</number>
+      </property>
+      <property name="spacing">
+        <number>6</number>
+      </property>
+      <item>
+        <widget class="QFrame" name="workstationHeader">
+          <layout class="QVBoxLayout" name="headerLayout">
+            <property name="leftMargin">
+              <number>6</number>
+            </property>
+            <property name="topMargin">
+              <number>6</number>
+            </property>
+            <property name="rightMargin">
+              <number>6</number>
+            </property>
+            <property name="bottomMargin">
+              <number>6</number>
+            </property>
+            <property name="spacing">
+              <number>6</number>
+            </property>
+            <item>
+              <widget class="QLabel" name="workspaceTitle">
+                <property name="text">
+                  <string>Advanced</string>
+                </property>
+              </widget>
+            </item>
+          </layout>
+        </widget>
+      </item>
+      <item>
+        <widget class="QTabWidget" name="tabs">
+          <widget class="QWidget" name="wirisPage">
+            <attribute name="title">
+              <string>Camera control</string>
+            </attribute>
+            <layout class="QVBoxLayout" name="wirisLayout">
+              <property name="leftMargin">
+                <number>6</number>
+              </property>
+              <property name="topMargin">
+                <number>6</number>
+              </property>
+              <property name="rightMargin">
+                <number>6</number>
+              </property>
+              <property name="bottomMargin">
+                <number>6</number>
+              </property>
+              <property name="spacing">
+                <number>6</number>
+              </property>
+              <item>
+                <widget class="QGroupBox" name="wirisCommands">
+                  <property name="title">
+                    <string>WIRIS SDK command</string>
+                  </property>
+                  <layout class="QGridLayout" name="wirisCommandsLayout">
+                    <property name="leftMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="topMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="rightMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="bottomMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="spacing">
+                      <number>6</number>
+                    </property>
+                    <item row="0" column="0">
+                      <widget class="QLabel" name="wirisLabel0">
+                        <property name="text">
+                          <string>Target</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="1" column="0">
+                      <widget class="QLabel" name="wirisLabel1">
+                        <property name="text">
+                          <string>Catalog</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="2" column="0">
+                      <widget class="QLabel" name="wirisLabel2">
+                        <property name="text">
+                          <string>Command</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="3" column="0">
+                      <widget class="QLabel" name="wirisLabel3">
+                        <property name="text">
+                          <string>Terminator</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="0" column="1">
+                      <widget class="QComboBox" name="wiris_target_combo">
+                        <item>
+                          <property name="text">
+                            <string>Both cameras</string>
+                          </property>
+                        </item>
+                        <item>
+                          <property name="text">
+                            <string>Left camera</string>
+                          </property>
+                        </item>
+                        <item>
+                          <property name="text">
+                            <string>Right camera</string>
+                          </property>
+                        </item>
+                      </widget>
+                    </item>
+                    <item row="1" column="1" rowspan="1" colspan="2">
+                      <widget class="QComboBox" name="wiris_catalog_combo" />
+                    </item>
+                    <item row="2" column="1" rowspan="1" colspan="2">
+                      <widget class="QLineEdit" name="wiris_command_edit">
+                        <property name="placeholderText">
+                          <string>SDK command, e.g. HIWS</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="3" column="1">
+                      <widget class="QComboBox" name="wiris_terminator_combo">
+                        <item>
+                          <property name="text">
+                            <string>LINE</string>
+                          </property>
+                        </item>
+                        <item>
+                          <property name="text">
+                            <string>NULL</string>
+                          </property>
+                        </item>
+                      </widget>
+                    </item>
+                    <item row="3" column="2">
+                      <widget class="QPushButton" name="wiris_send_button">
+                        <property name="text">
+                          <string>Send</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>advanced.wiris.send</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="4" column="0" rowspan="1" colspan="3">
+                      <widget class="QLabel" name="wiris_status_label">
+                        <property name="text">
+                          <string />
+                        </property>
+                        <property name="wordWrap">
+                          <bool>true</bool>
+                        </property>
+                      </widget>
+                    </item>
+                  </layout>
+                </widget>
+              </item>
+              <item>
+                <widget class="QGroupBox" name="wirisResponses">
+                  <property name="title">
+                    <string>Command responses</string>
+                  </property>
+                  <layout class="QGridLayout" name="wirisResponsesLayout">
+                    <property name="leftMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="topMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="rightMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="bottomMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="spacing">
+                      <number>6</number>
+                    </property>
+                    <item row="0" column="0">
+                      <widget class="QPlainTextEdit" name="wiris_response_log">
+                        <property name="readOnly">
+                          <bool>true</bool>
+                        </property>
+                        <property name="maximumBlockCount">
+                          <number>400</number>
+                        </property>
+                        <property name="placeholderText">
+                          <string>WIRIS SDK responses from the selected camera target appear here.</string>
+                        </property>
+                        <property name="minimumSize">
+                          <size>
+                            <width>0</width>
+                            <height>150</height>
+                          </size>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="1" column="0">
+                      <widget class="QPushButton" name="wiris_response_clear_button">
+                        <property name="text">
+                          <string>Clear responses</string>
+                        </property>
+                      </widget>
+                    </item>
+                  </layout>
+                </widget>
+              </item>
+              <item>
+                <widget class="QGroupBox" name="zoomGroup">
+                  <property name="title">
+                    <string>Zoom</string>
+                  </property>
+                  <layout class="QGridLayout" name="zoomGroupLayout">
+                    <property name="leftMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="topMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="rightMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="bottomMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="spacing">
+                      <number>6</number>
+                    </property>
+                    <item row="0" column="0">
+                      <widget class="QLabel" name="zoomTargetLabel">
+                        <property name="text">
+                          <string>Target</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="0" column="1">
+                      <widget class="QComboBox" name="zoom_target_combo">
+                        <item>
+                          <property name="text">
+                            <string>Both cameras</string>
+                          </property>
+                        </item>
+                        <item>
+                          <property name="text">
+                            <string>Left camera</string>
+                          </property>
+                        </item>
+                        <item>
+                          <property name="text">
+                            <string>Right camera</string>
+                          </property>
+                        </item>
+                      </widget>
+                    </item>
+                    <item row="0" column="2">
+                      <widget class="QLabel" name="zoomLevelLabel">
+                        <property name="text">
+                          <string>Level</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="0" column="3">
+                      <widget class="QSpinBox" name="zoom_level_spin">
+                        <property name="maximum">
+                          <number>100</number>
+                        </property>
+                        <property name="value">
+                          <number>10</number>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="0" column="4">
+                      <widget class="QPushButton" name="zoom_set_button">
+                        <property name="text">
+                          <string>Set</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>advanced.zoom.set</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="1" column="0" rowspan="1" colspan="2">
+                      <widget class="QPushButton" name="zoom_in_button">
+                        <property name="text">
+                          <string>In</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>advanced.zoom.in</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="1" column="2" rowspan="1" colspan="2">
+                      <widget class="QPushButton" name="zoom_out_button">
+                        <property name="text">
+                          <string>Out</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>advanced.zoom.out</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="1" column="4">
+                      <widget class="QPushButton" name="zoom_stop_button">
+                        <property name="text">
+                          <string>Stop</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>advanced.zoom.stop</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="2" column="0" rowspan="1" colspan="5">
+                      <widget class="QLabel" name="zoom_status_label">
+                        <property name="text">
+                          <string />
+                        </property>
+                        <property name="wordWrap">
+                          <bool>true</bool>
+                        </property>
+                      </widget>
+                    </item>
+                  </layout>
+                </widget>
+              </item>
+            </layout>
+          </widget>
+          <widget class="QWidget" name="px4Page">
+            <attribute name="title">
+              <string>Pixhawk tools</string>
+            </attribute>
+            <layout class="QVBoxLayout" name="px4Layout">
+              <property name="leftMargin">
+                <number>6</number>
+              </property>
+              <property name="topMargin">
+                <number>6</number>
+              </property>
+              <property name="rightMargin">
+                <number>6</number>
+              </property>
+              <property name="bottomMargin">
+                <number>6</number>
+              </property>
+              <property name="spacing">
+                <number>6</number>
+              </property>
+              <item>
+                <widget class="QGroupBox" name="px4Tools">
+                  <property name="title">
+                    <string>PX4 tools</string>
+                  </property>
+                  <layout class="QGridLayout" name="px4ToolsLayout">
+                    <property name="leftMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="topMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="rightMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="bottomMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="spacing">
+                      <number>6</number>
+                    </property>
+                    <item row="0" column="0">
+                      <widget class="QLabel" name="sideLabel">
+                        <property name="text">
+                          <string>Side</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="0" column="1">
+                      <widget class="QComboBox" name="px4_camera_combo">
+                        <item>
+                          <property name="text">
+                            <string>Pixhawk 1 / Left</string>
+                          </property>
+                        </item>
+                        <item>
+                          <property name="text">
+                            <string>Pixhawk 2 / Right</string>
+                          </property>
+                        </item>
+                        <item>
+                          <property name="text">
+                            <string>Drone Pixhawk / sysid 3</string>
+                          </property>
+                        </item>
+                      </widget>
+                    </item>
+                    <item row="1" column="2">
+                      <widget class="QLabel" name="priorityLabelBOARD">
+                        <property name="text">
+                          <string>BOARD</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="1" column="3">
+                      <widget class="QComboBox" name="priority_BOARD" />
+                    </item>
+                    <item row="2" column="2">
+                      <widget class="QLabel" name="priorityLabelCAN1">
+                        <property name="text">
+                          <string>CAN1</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="2" column="3">
+                      <widget class="QComboBox" name="priority_CAN1" />
+                    </item>
+                    <item row="3" column="2">
+                      <widget class="QLabel" name="priorityLabelCAN2">
+                        <property name="text">
+                          <string>CAN2</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="3" column="3">
+                      <widget class="QComboBox" name="priority_CAN2" />
+                    </item>
+                    <item row="4" column="2">
+                      <widget class="QLabel" name="priorityLabelGPS1_MAG">
+                        <property name="text">
+                          <string>GPS1_MAG</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="4" column="3">
+                      <widget class="QComboBox" name="priority_GPS1_MAG" />
+                    </item>
+                    <item row="5" column="2">
+                      <widget class="QLabel" name="priorityLabelGPS2_MAG">
+                        <property name="text">
+                          <string>GPS2_MAG</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="5" column="3">
+                      <widget class="QComboBox" name="priority_GPS2_MAG" />
+                    </item>
+                    <item row="0" column="4">
+                      <widget class="QPushButton" name="px4_refresh_mag_button">
+                        <property name="text">
+                          <string>Refresh MAG</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>advanced.px4.refresh_mag</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="1" column="0" rowspan="1" colspan="2">
+                      <widget class="QPushButton" name="px4_refresh_attitude_button">
+                        <property name="text">
+                          <string>Refresh attitude</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>advanced.px4.refresh_attitude</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="1" column="4">
+                      <widget class="QPushButton" name="px4_shell_button">
+                        <property name="text">
+                          <string>Shell</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>advanced.px4.shell</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="2" column="0" rowspan="1" colspan="2">
+                      <widget class="QPushButton" name="px4_apply_mag_button">
+                        <property name="text">
+                          <string>Apply MAG</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>advanced.px4.apply_mag</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="3" column="0" rowspan="1" colspan="2">
+                      <widget class="QPushButton" name="px4_save_mag_button">
+                        <property name="text">
+                          <string>Save MAG</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>advanced.px4.save_mag</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="4" column="0" rowspan="1" colspan="2">
+                      <widget class="QPushButton" name="px4_reboot_button">
+                        <property name="text">
+                          <string>Reboot</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>advanced.px4.reboot</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="5" column="0" rowspan="1" colspan="2">
+                      <widget class="QPushButton" name="manual_eth_button">
+                        <property name="text">
+                          <string>Apply persistent Ethernet MAV_2</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="6" column="0" rowspan="1" colspan="5">
+                      <widget class="QLabel" name="px4_status_label">
+                        <property name="text">
+                          <string>MAG: disarmed + PARAM readback · attitude calibration: QGC Sensor Setup</string>
+                        </property>
+                        <property name="wordWrap">
+                          <bool>true</bool>
+                        </property>
+                      </widget>
+                    </item>
+                  </layout>
+                </widget>
+              </item>
+              <item>
+                <widget class="QGroupBox" name="px4Transfer">
+                  <property name="title">
+                    <string>MAVFTP file / log / firmware staging</string>
+                  </property>
+                  <layout class="QGridLayout" name="px4TransferLayout">
+                    <property name="leftMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="topMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="rightMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="bottomMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="spacing">
+                      <number>6</number>
+                    </property>
+                    <item row="0" column="0">
+                      <widget class="QLabel" name="localLabel">
+                        <property name="text">
+                          <string>Local</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="0" column="1" rowspan="1" colspan="3">
+                      <widget class="QLineEdit" name="px4_transfer_local_edit" />
+                    </item>
+                    <item row="0" column="4">
+                      <widget class="QPushButton" name="browse_button">
+                        <property name="text">
+                          <string>Browse</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="1" column="0">
+                      <widget class="QLabel" name="remoteLabel">
+                        <property name="text">
+                          <string>Remote</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="1" column="1" rowspan="1" colspan="4">
+                      <widget class="QLineEdit" name="px4_transfer_remote_edit">
+                        <property name="text">
+                          <string>/fs/microsd/workstation/files/upload.bin</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="2" column="0">
+                      <widget class="QPushButton" name="restart_button">
+                        <property name="text">
+                          <string>Restart upload</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="2" column="1">
+                      <widget class="QPushButton" name="resume_button">
+                        <property name="text">
+                          <string>Resume verified partial</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="2" column="2">
+                      <widget class="QPushButton" name="stage_button">
+                        <property name="text">
+                          <string>Stage firmware</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="2" column="3">
+                      <widget class="QPushButton" name="cancel_button">
+                        <property name="text">
+                          <string>Cancel</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="2" column="4">
+                      <widget class="QPushButton" name="download_button">
+                        <property name="text">
+                          <string>Restart download</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="2" column="5">
+                      <widget class="QPushButton" name="resume_download_button">
+                        <property name="text">
+                          <string>Resume download</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="3" column="0">
+                      <widget class="QLabel" name="usbLabel">
+                        <property name="text">
+                          <string>Direct USB</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="3" column="1" rowspan="1" colspan="2">
+                      <widget class="QLineEdit" name="px4_flash_usb_edit">
+                        <property name="placeholderText">
+                          <string>Direct Pixhawk USB, e.g. /dev/ttyACM0</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="3" column="3">
+                      <widget class="QPushButton" name="flash_button">
+                        <property name="text">
+                          <string>Flash selected local firmware by USB</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="3" column="4">
+                      <widget class="QPushButton" name="cancel_flash_button">
+                        <property name="text">
+                          <string>Cancel USB flash</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="4" column="0" rowspan="1" colspan="6">
+                      <widget class="QLabel" name="px4_transfer_status_label">
+                        <property name="text">
+                          <string>IDLE</string>
+                        </property>
+                        <property name="wordWrap">
+                          <bool>true</bool>
+                        </property>
+                      </widget>
+                    </item>
+                  </layout>
+                </widget>
+              </item>
+              <item>
+                <widget class="QGroupBox" name="watchGroup">
+                  <property name="title">
+                    <string>Field watch</string>
+                  </property>
+                  <layout class="QGridLayout" name="watchGroupLayout">
+                    <property name="leftMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="topMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="rightMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="bottomMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="spacing">
+                      <number>6</number>
+                    </property>
+                    <item row="0" column="0">
+                      <widget class="QLabel" name="watchLabelname">
+                        <property name="text">
+                          <string>Name</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="0" column="1">
+                      <widget class="QLineEdit" name="watch_name_edit">
+                        <property name="text">
+                          <string>local_z</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="1" column="0">
+                      <widget class="QLabel" name="watchLabelmessage">
+                        <property name="text">
+                          <string>Message</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="1" column="1">
+                      <widget class="QLineEdit" name="watch_message_edit">
+                        <property name="text">
+                          <string>ATTITUDE</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="2" column="0">
+                      <widget class="QLabel" name="watchLabelfield">
+                        <property name="text">
+                          <string>Field</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="2" column="1">
+                      <widget class="QLineEdit" name="watch_field_edit">
+                        <property name="text">
+                          <string>z</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="0" column="2">
+                      <widget class="QPushButton" name="watch_add_mavlink_button">
+                        <property name="text">
+                          <string>Add</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>advanced.watch.add_mavlink</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="2" column="2">
+                      <widget class="QPushButton" name="watch_discover_mavlink_button">
+                        <property name="text">
+                          <string>Find fields</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>advanced.watch.discover_mavlink</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="3" column="2">
+                      <widget class="QPushButton" name="watch_remove_button">
+                        <property name="text">
+                          <string>Remove</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>advanced.watch.remove</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="3" column="0">
+                      <widget class="QLabel" name="watchRemoveLabel">
+                        <property name="text">
+                          <string>Remove</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="3" column="1">
+                      <widget class="QComboBox" name="watch_remove_combo" />
+                    </item>
+                    <item row="4" column="0" rowspan="1" colspan="3">
+                      <widget class="QLabel" name="watch_status_label">
+                        <property name="text">
+                          <string />
+                        </property>
+                        <property name="wordWrap">
+                          <bool>true</bool>
+                        </property>
+                      </widget>
+                    </item>
+                  </layout>
+                </widget>
+              </item>
+              <item>
+                <widget class="QGroupBox" name="baselineGroup">
+                  <property name="title">
+                    <string>Message fields</string>
+                  </property>
+                  <layout class="QGridLayout" name="baselineGroupLayout">
+                    <property name="leftMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="topMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="rightMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="bottomMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="spacing">
+                      <number>6</number>
+                    </property>
+                    <item row="0" column="0">
+                      <widget class="QPushButton" name="baseline_refresh_button">
+                        <property name="text">
+                          <string>Refresh</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>advanced.baseline.scan</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="1" column="0">
+                      <widget class="QTableView" name="baseline_mavlink_table">
+                        <property name="maximumSize">
+                          <size>
+                            <width>16777215</width>
+                            <height>100</height>
+                          </size>
+                        </property>
+                      </widget>
+                    </item>
+                    <item row="2" column="0">
+                      <widget class="QLabel" name="baseline_status_label">
+                        <property name="text">
+                          <string />
+                        </property>
+                        <property name="wordWrap">
+                          <bool>true</bool>
+                        </property>
+                      </widget>
+                    </item>
+                  </layout>
+                </widget>
+              </item>
+            </layout>
+          </widget>
+          <widget class="QWidget" name="previewPage">
+            <attribute name="title">
+              <string>Preview</string>
+            </attribute>
+            <layout class="QVBoxLayout" name="previewLayout">
+              <property name="leftMargin">
+                <number>6</number>
+              </property>
+              <property name="topMargin">
+                <number>6</number>
+              </property>
+              <property name="rightMargin">
+                <number>6</number>
+              </property>
+              <property name="bottomMargin">
+                <number>6</number>
+              </property>
+              <property name="spacing">
+                <number>6</number>
+              </property>
+              <item>
+                <widget class="QPushButton" name="preview_refresh_button">
+                  <property name="text">
+                    <string>Refresh</string>
+                  </property>
+                  <property name="commandId" stdset="0">
+                    <string>advanced.preview.refresh</string>
+                  </property>
+                </widget>
+              </item>
+              <item>
+                <widget class="QSplitter" name="previewSplitter">
+                  <property name="orientation">
+                    <enum>Qt::Horizontal</enum>
+                  </property>
+                  <widget class="QLabel" name="left_preview">
+                    <property name="text">
+                      <string>LEFT preview waiting</string>
+                    </property>
+                    <property name="alignment">
+                      <set>Qt::AlignCenter</set>
+                    </property>
+                    <property name="minimumSize">
+                      <size>
+                        <width>320</width>
+                        <height>180</height>
+                      </size>
+                    </property>
+                    <property name="sizePolicy">
+                      <sizepolicy hsizetype="Ignored" vsizetype="Expanding">
+                        <horstretch>0</horstretch>
+                        <verstretch>0</verstretch>
+                      </sizepolicy>
+                    </property>
+                  </widget>
+                  <widget class="QLabel" name="right_preview">
+                    <property name="text">
+                      <string>RIGHT preview waiting</string>
+                    </property>
+                    <property name="alignment">
+                      <set>Qt::AlignCenter</set>
+                    </property>
+                    <property name="minimumSize">
+                      <size>
+                        <width>320</width>
+                        <height>180</height>
+                      </size>
+                    </property>
+                    <property name="sizePolicy">
+                      <sizepolicy hsizetype="Ignored" vsizetype="Expanding">
+                        <horstretch>0</horstretch>
+                        <verstretch>0</verstretch>
+                      </sizepolicy>
+                    </property>
+                  </widget>
+                </widget>
+              </item>
+              <item>
+                <widget class="QLabel" name="preview_status_label">
+                  <property name="text">
+                    <string>Pixels: OpenCV RDF</string>
+                  </property>
+                  <property name="wordWrap">
+                    <bool>true</bool>
+                  </property>
+                </widget>
+              </item>
+            </layout>
+          </widget>
+          <widget class="QWidget" name="mediaPage">
+            <attribute name="title">
+              <string>Files</string>
+            </attribute>
+            <layout class="QVBoxLayout" name="mediaLayout">
+              <property name="leftMargin">
+                <number>6</number>
+              </property>
+              <property name="topMargin">
+                <number>6</number>
+              </property>
+              <property name="rightMargin">
+                <number>6</number>
+              </property>
+              <property name="bottomMargin">
+                <number>6</number>
+              </property>
+              <property name="spacing">
+                <number>6</number>
+              </property>
+              <item>
+                <widget class="QGroupBox" name="mediaTools">
+                  <property name="title">
+                    <string>Manual recording and files</string>
+                  </property>
+                  <layout class="QGridLayout" name="mediaToolsLayout">
+                    <property name="leftMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="topMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="rightMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="bottomMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="spacing">
+                      <number>6</number>
+                    </property>
+                    <item row="0" column="0">
+                      <widget class="QPushButton" name="manual_record_button">
+                        <property name="text">
+                          <string>Manual record</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>recording.toggle</string>
+                        </property>
+                        <property name="toolTip">
+                          <string>Advanced fallback for recording outside an automatic Measurement run.</string>
+                        </property>
+                      </widget>
+                    </item>
+                  </layout>
+                </widget>
+              </item>
+              <item>
+                <widget class="QGroupBox" name="mediaVideo">
+                  <property name="title">
+                    <string>Video playback</string>
+                  </property>
+                  <layout class="QGridLayout" name="mediaVideoLayout">
+                    <property name="leftMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="topMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="rightMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="bottomMargin">
+                      <number>6</number>
+                    </property>
+                    <property name="spacing">
+                      <number>6</number>
+                    </property>
+                    <item row="0" column="0">
+                      <widget class="QComboBox" name="media_video_combo" />
+                    </item>
+                    <item row="0" column="1">
+                      <widget class="QPushButton" name="media_play_button">
+                        <property name="text">
+                          <string>Play</string>
+                        </property>
+                        <property name="commandId" stdset="0">
+                          <string>advanced.media.open_video</string>
+                        </property>
+                      </widget>
+                    </item>
+                  </layout>
+                </widget>
+              </item>
+              <item>
+                <widget class="QLabel" name="media_status_label">
+                  <property name="text">
+                    <string>Current data and storage health are available in Data; legacy recordings open in the file manager.</string>
+                  </property>
+                  <property name="wordWrap">
+                    <bool>true</bool>
+                  </property>
+                </widget>
+              </item>
+            </layout>
+          </widget>
+        </widget>
+      </item>
+    </layout>
+  </widget>
+  <resources />
+  <connections />
+</ui>

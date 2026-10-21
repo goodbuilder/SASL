@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from typing import Sequence
 from PyQt5 import QtCore, QtGui, QtWidgets
 from Workstation.ui.annotation_image_view import AnnotationMode
+from Workstation.ui.designer import load_form
 
 from .optical_pose_parts.annotations import FrozenAnnotations
 from .optical_pose_parts.suggestions import SuggestionReview
@@ -45,9 +46,7 @@ class OpticalPosePane(QtWidgets.QWidget):
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self._optical_pose_layout_width_hint = 0
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(6)
+        load_form("optical_pose.ui", self)
         self.solver_buttons = {}
 
         def make_solver_button(command_id, label):
@@ -82,49 +81,25 @@ class OpticalPosePane(QtWidgets.QWidget):
             component.information_changed.connect(self._refresh_method_information)
         self.methods.mountain_lines_changed.connect(self.annotations._set_mountain_auto_lines_hidden)
         self.annotations._set_mountain_auto_lines_hidden(True)
-        layout.addWidget(self.methods.readiness_group)
-        layout.addWidget(self.annotations.preview_group)
-        contract = QtWidgets.QLabel(
-            "Frames: image pixels/OpenCV optical RDF · pose PX4 virtual FRD→world NED · "
-            "GNSS WGS84 · candidate application is immutable and owner-controlled"
-        )
-        contract.setObjectName("compactContract")
-        contract.setWordWrap(True)
-        self.contract_label = contract
-
-        method_column = QtWidgets.QWidget()
-        method_column.setObjectName("alignmentMethodColumn")
-        method_column_layout = QtWidgets.QVBoxLayout(method_column)
-        method_column_layout.setContentsMargins(0, 0, 0, 0)
-        method_column_layout.setSpacing(6)
-        method_column_layout.addWidget(self.method_tabs)
-        method_column_layout.addWidget(self.auto_group)
-        method_column_layout.addStretch(1)
-        self.method_column = method_column
-
-        candidate_review = QtWidgets.QWidget()
-        candidate_review.setObjectName("alignmentCandidateReview")
-        candidate_review_layout = QtWidgets.QVBoxLayout(candidate_review)
-        candidate_review_layout.setContentsMargins(0, 0, 0, 0)
-        candidate_review_layout.setSpacing(6)
-        candidate_review_layout.addWidget(self.candidate_group)
-        candidate_review_layout.addWidget(self.observations_group)
-        candidate_review_layout.addWidget(self.contract_label)
-        candidate_review_layout.addStretch(1)
-        self.candidate_review_widget = candidate_review
-
-        lower_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        lower_splitter.setObjectName("alignmentMethodReviewSplitter")
-        lower_splitter.setChildrenCollapsible(False)
-        lower_splitter.setHandleWidth(8)
-        lower_splitter.addWidget(method_column)
-        lower_splitter.addWidget(candidate_review)
-        lower_splitter.setStretchFactor(0, 3)
-        lower_splitter.setStretchFactor(1, 2)
-        lower_splitter.setSizes([720, 480])
-        self.method_review_splitter = lower_splitter
-        layout.addWidget(self.live_reference.live_rt_group)
-        layout.addWidget(lower_splitter)
+        for slot, component in (
+            (self.readinessSlot, self.methods.readiness_group),
+            (self.previewSlot, self.annotations.preview_group),
+            (self.liveReferenceSlot, self.live_reference.live_rt_group),
+            (self.methodsSlot, self.methods.method_tabs),
+            (self.suggestionsSlot, self.suggestions.auto_group),
+            (self.candidatesSlot, self.candidates.candidate_group),
+            (self.observationsSlot, self.observations.observations_group),
+        ):
+            slot.parentWidget().layout().replaceWidget(slot, component)
+            slot.setParent(None)
+            slot.deleteLater()
+        self.contract_label.setObjectName("compactContract")
+        self.method_column.setObjectName("alignmentMethodColumn")
+        self.candidate_review_widget.setObjectName("alignmentCandidateReview")
+        self.method_review_splitter.setObjectName("alignmentMethodReviewSplitter")
+        self.method_review_splitter.setStretchFactor(0, 3)
+        self.method_review_splitter.setStretchFactor(1, 2)
+        self.method_review_splitter.setSizes([720, 480])
         self.methods.method_tabs.currentChanged.connect(self._handle_method_tab_changed)
         self._handle_method_tab_changed(self.methods.method_tabs.currentIndex())
 

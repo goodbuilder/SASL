@@ -55,10 +55,12 @@ def _write_frozen_protocol(output_root: Path, *, include_protocol: bool = True) 
         "schema_version": "stereo_v1_1_topic_schema_mapping_v1",
         "topics": [
             {"topic": "/clock", "message": "rosgraph_msgs/msg/Clock",
-             "output": "ground_truth.jsonl.simulation_timestamp_ns",
+             "output": "clock.jsonl.simulation_timestamp_ns",
+             "raw_bag_output_v1_2": "raw_images_or_lossless_bag/state",
              "contract": "Gazebo simulation clock; reset increments simulation_epoch"},
             {"topic": "/simulation/ground_truth/vehicle_reference_link",
              "message": "geometry_msgs/msg/PoseStamped", "output": "ground_truth.jsonl",
+             "raw_bag_output_v1_2": "raw_images_or_lossless_bag/state",
              "contract": "Gazebo world ENU [east,north,up] metres; orientation world_from_vehicle_reference_link xyzw"},
             {"topic": "/fmu/out/vehicle_local_position_v1",
              "message": "px4_msgs/msg/VehicleLocalPosition", "output": "flight_state.jsonl",
@@ -69,14 +71,21 @@ def _write_frozen_protocol(output_root: Path, *, include_protocol: bool = True) 
              "output": "raw_images_or_lossless_bag/left", "contract": "lossless source image; Gazebo exposure stamp"},
             {"topic": "/right_camera/image", "message": "sensor_msgs/msg/Image",
              "output": "raw_images_or_lossless_bag/right", "contract": "lossless source image; Gazebo exposure stamp"},
+            {"topic": "/left_camera/camera_info", "message": "sensor_msgs/msg/CameraInfo",
+             "output": "raw_images_or_lossless_bag/left", "contract": "optical RDF intrinsics; row-major K in pixels"},
+            {"topic": "/right_camera/camera_info", "message": "sensor_msgs/msg/CameraInfo",
+             "output": "raw_images_or_lossless_bag/right", "contract": "optical RDF intrinsics; row-major K in pixels"},
             {"topic": "/simulation/camera_pose_diagnostics/left", "message": "std_msgs/msg/String",
              "output": "camera_truth.json.camera_payloads.left",
-             "contract": "Gazebo observed camera optical center world ENU and optical RDF orientation xyzw"},
+             "raw_bag_output_v1_2": "raw_images_or_lossless_bag/state",
+             "contract": "center world ENU; observed_optical_orientation_world_from_entity_xyzw maps camera-link FLU to ENU; convert local axes explicitly to optical RDF"},
             {"topic": "/simulation/camera_pose_diagnostics/right", "message": "std_msgs/msg/String",
              "output": "camera_truth.json.camera_payloads.right",
-             "contract": "Gazebo observed camera optical center world ENU and optical RDF orientation xyzw"},
+             "raw_bag_output_v1_2": "raw_images_or_lossless_bag/state",
+             "contract": "center world ENU; observed_optical_orientation_world_from_entity_xyzw maps camera-link FLU to ENU; convert local axes explicitly to optical RDF"},
         ],
         "offline_observation_fields": {
+            "raw_state_index.jsonl": "v1.2 deserialized raw-bag clock/GT/camera messages; simulation ns and epoch kept separate from rosbag receive UTC ns",
             "observations_left.jsonl": "original source frame id, exposure/receive/inference times, detection status, bbox xyxy and center uv in original 1280x720 pixels",
             "observations_right.jsonl": "original source frame id, exposure/receive/inference times, detection status, bbox xyxy and center uv in original 1280x720 pixels",
             "paired_observations.jsonl": "unique left/right source-frame IDs, pair midpoint and skew, both detection statuses",
@@ -156,6 +165,41 @@ def _slot(status: dict, run_id: str) -> dict:
     return matches[0]
 
 
+def authorize_reviewed_retry(output_root: Path, run_id: str, *, user_instruction: str,
+                             evidence_paths: list[str]) -> dict:
+    """Record an explicit user-directed one-attempt exception after failure review.
+
+    This does not certify repair, reclassify failures, or modify acceptance QC.
+    Caller holds the runner lock. Evidence paths are campaign-relative and hashed.
+    """
+    output_root = output_root.resolve()
+    status = _load(output_root / "run_status.json")
+    row = _slot(status, run_id)
+    if not user_instruction.strip() or not evidence_paths:
+        raise ValueError("explicit user instruction and review evidence required")
+    if row["status"] != "INFRASTRUCTURE_FAILED" or len(row["attempts"]) < 2 or not all(
+            item["status"] == "INFRASTRUCTURE_FAILED" for item in row["attempts"][-2:]):
+        raise ValueError("reviewed retry only applies to two consecutive technical failures")
+    next_id = f"a{len(row['attempts']) + 1:02d}"
+    authorizations = row.setdefault("reviewed_retry_authorizations", [])
+    if any(item["attempt_id"] == next_id for item in authorizations):
+        raise ValueError("retry authorization already recorded for this attempt")
+    evidence = {}
+    for name in evidence_paths:
+        path = (output_root / name).resolve()
+        if Path(name).is_absolute() or not path.is_relative_to(output_root) or not path.is_file():
+            raise ValueError("review evidence must be an existing campaign-relative file")
+        evidence[name] = _sha256(path)
+    entry = {"attempt_id": next_id, "reviewed_attempt_ids": [x["attempt_id"] for x in row["attempts"]],
+             "user_instruction": user_instruction, "evidence_sha256": evidence,
+             "cause_repaired": False, "qc_unchanged": True, "used": False,
+             "authorized_utc_ns": time.time_ns()}
+    authorizations.append(entry)
+    _atomic_json(output_root / "run_status.json", status)
+    _append_change(output_root, "user_authorized_reviewed_retry", run_id=run_id, **entry)
+    return entry
+
+
 def begin_attempt(output_root: Path, run_id: str) -> tuple[dict, Path]:
     """Allocate a new immutable attempt for a manifest slot under a held runner lock."""
     output_root = output_root.resolve()
@@ -168,12 +212,22 @@ def begin_attempt(output_root: Path, run_id: str) -> tuple[dict, Path]:
         raise ValueError("previous attempt remains RUNNING; reconcile before resume")
     if row["status"] == "PROTOCOL_DEVIATION":
         raise ValueError("protocol deviation requires a documented revision before retry")
+    retry_authorization = None
     if len(row["attempts"]) >= 2 and all(
         attempt["status"] == "INFRASTRUCTURE_FAILED"
-        and attempt.get("failure_reason") == row["attempts"][-1].get("failure_reason")
         for attempt in row["attempts"][-2:]
     ):
-        raise ValueError("same technical failure twice; repair the cause before retry")
+        expected_id = f"a{len(row['attempts']) + 1:02d}"
+        for item in row.get("reviewed_retry_authorizations", []):
+            if (item["attempt_id"] == expected_id and not item["used"]
+                    and item["reviewed_attempt_ids"] == [x["attempt_id"] for x in row["attempts"]]
+                    and item.get("user_instruction") and item.get("evidence_sha256")
+                    and all((output_root / name).is_file() and _sha256(output_root / name) == digest
+                            for name, digest in item["evidence_sha256"].items())):
+                retry_authorization = item
+                break
+        if retry_authorization is None:
+            raise ValueError("two consecutive technical failures; document and repair the causes before retry")
     number = len(row["attempts"]) + 1
     attempt_id = f"a{number:02d}"
     attempt_path = output_root / "원본_실행별" / run_id / attempt_id
@@ -191,6 +245,10 @@ def begin_attempt(output_root: Path, run_id: str) -> tuple[dict, Path]:
         "failure_reason": None,
         "started_utc_ns": time.time_ns(),
     }
+    if retry_authorization is not None:
+        retry_authorization["used"] = True
+        retry_authorization["used_utc_ns"] = time.time_ns()
+        record["reviewed_retry_authorization"] = retry_authorization.copy()
     row["attempts"].append(record.copy())
     row["attempt_count"] = len(row["attempts"])
     row["status"] = "RUNNING"
@@ -258,10 +316,22 @@ def _write_attempt_checksums(attempt_dir: Path) -> None:
 
 def revalidate_known_qc_regression(output_root: Path, run_id: str, attempt_id: str,
                                    qc_report: dict) -> dict:
+    return _revalidate_qc_regression(output_root, run_id, attempt_id, qc_report)
+
+
+def revalidate_cadence_qc_regression(output_root: Path, run_id: str, attempt_id: str,
+                                    qc_report: dict) -> dict:
+    """Recover only the v1.2 cadence-only false positive, never missing slots."""
+    return _revalidate_qc_regression(output_root, run_id, attempt_id, qc_report,
+                                     cadence_slot_fix=True)
+
+
+def _revalidate_qc_regression(output_root: Path, run_id: str, attempt_id: str,
+                              qc_report: dict, *, cadence_slot_fix: bool = False) -> dict:
     """Accept a corrected QC result for a preserved workbook attempt.
 
-    This path is deliberately limited to the two known false-positive errors
-    caused by comparing workbook Vehicle values with absent plan-level aliases.
+    This path is limited to the named Vehicle-alias or cadence-slot validator
+    regressions. Each recipe requires its exact original error set and fresh QC.
     It never starts another flight or changes the captured source data.
     """
     output_root = output_root.resolve()
@@ -270,14 +340,15 @@ def revalidate_known_qc_regression(output_root: Path, run_id: str, attempt_id: s
     if status.get("schema_version") != "stereo_v1_1_workbook_run_status_v1":
         raise ValueError("QC regression revalidation is restricted to workbook campaigns")
     row = _slot(status, run_id)
-    if row.get("status") != "PROTOCOL_DEVIATION" or not row.get("attempts"):
+    previous_status = "INFRASTRUCTURE_FAILED" if cadence_slot_fix else "PROTOCOL_DEVIATION"
+    if row.get("status") != previous_status or not row.get("attempts"):
         raise ValueError("slot is not a completed protocol-deviation attempt")
     attempt = row["attempts"][-1]
-    if attempt.get("attempt_id") != attempt_id or attempt.get("status") != "PROTOCOL_DEVIATION":
+    if attempt.get("attempt_id") != attempt_id or attempt.get("status") != previous_status:
         raise ValueError("attempt is not the slot's latest protocol-deviation attempt")
     actual_matches = [item for item in actual.get("attempts", [])
                       if item.get("run_id") == run_id and item.get("attempt_id") == attempt_id]
-    if len(actual_matches) != 1 or actual_matches[0].get("status") != "PROTOCOL_DEVIATION":
+    if len(actual_matches) != 1 or actual_matches[0].get("status") != previous_status:
         raise ValueError("manifest_actual does not contain one matching failed attempt")
 
     attempt_dir = output_root / attempt["recording_path"]
@@ -288,12 +359,32 @@ def revalidate_known_qc_regression(output_root: Path, run_id: str, attempt_id: s
     previous = _load(report_path)
     previous_result = _load(result_path)
     previous_errors = previous.get("protocol_errors", [])
+    known_error = (set(previous_errors) == REVALIDATABLE_QC_REGRESSION_ERRORS
+                   and len(previous_errors) == len(REVALIDATABLE_QC_REGRESSION_ERRORS)
+                   and not previous.get("infrastructure_errors"))
+    if cadence_slot_fix:
+        known_error = (previous.get("infrastructure_errors") ==
+                       ["science_setpoint_cadence_below_v12_requirement"]
+                       and not previous_errors and not previous_result.get("runner_failure_reason"))
+        manifest_path = attempt_dir / "run_manifest.json"
+        if not manifest_path.is_file() or _load(manifest_path).get("protocol_version") != "1.2":
+            raise ValueError("cadence recovery requires a v1.2 source attempt")
+        cadence = qc_report.get("evidence", {}).get("science_setpoint_cadence_recomputed", {})
+        if (cadence.get("criterion") != "reference_slot_coverage_v2"
+                or cadence.get("missing_full_slot_count") != 0
+                or cadence.get("sufficient_unique_simulation_cadence") is not True):
+            raise ValueError("fresh cadence QC must substantiate all reference slots")
+        if not (attempt_dir / "checksums.sha256").is_file():
+            raise ValueError("original attempt checksums are required for cadence recovery")
+        for line in (attempt_dir / "checksums.sha256").read_text(encoding="utf-8").splitlines():
+            digest, relative = line.split("  ", 1)
+            source_file = (attempt_dir / relative).resolve()
+            if (not source_file.is_relative_to(attempt_dir.resolve())
+                    or not source_file.is_file() or _sha256(source_file) != digest):
+                raise ValueError("original source checksums must pass before cadence recovery")
     if (previous.get("run_id") != run_id or previous.get("attempt_id") != attempt_id
-            or previous.get("status") != "PROTOCOL_DEVIATION"
-            or set(previous_errors) != REVALIDATABLE_QC_REGRESSION_ERRORS
-            or len(previous_errors) != len(REVALIDATABLE_QC_REGRESSION_ERRORS)
-            or previous.get("infrastructure_errors")
-            or previous_result.get("qc_status") != "PROTOCOL_DEVIATION"):
+            or previous.get("status") != previous_status or not known_error
+            or previous_result.get("qc_status") != previous_status):
         raise ValueError("saved QC contains a deviation outside the known validator regression")
     if (qc_report.get("run_id") != run_id or qc_report.get("attempt_id") != attempt_id
             or qc_report.get("status") not in ("VALID", "VALID_WITH_WARNINGS")
@@ -304,13 +395,18 @@ def revalidate_known_qc_regression(output_root: Path, run_id: str, attempt_id: s
         raise FileExistsError("pre-revalidation QC snapshot already exists")
     if (attempt_dir / "runner_result_pre_revalidation.json").exists():
         raise FileExistsError("pre-revalidation runner snapshot already exists")
+    if cadence_slot_fix and (attempt_dir / "checksums_pre_revalidation.sha256").exists():
+        raise FileExistsError("pre-revalidation checksum snapshot already exists")
 
     old_qc_sha256 = _sha256(report_path)
     old_result_sha256 = _sha256(result_path)
-    for source_path, snapshot_name in (
+    snapshots = [
         (report_path, "qc_report_pre_revalidation.json"),
         (result_path, "runner_result_pre_revalidation.json"),
-    ):
+    ]
+    if cadence_slot_fix:
+        snapshots.append((attempt_dir / "checksums.sha256", "checksums_pre_revalidation.sha256"))
+    for source_path, snapshot_name in snapshots:
         with source_path.open("rb") as source_handle, (attempt_dir / snapshot_name).open("xb") as target_handle:
             target_handle.write(source_handle.read())
             target_handle.flush()
@@ -323,6 +419,7 @@ def revalidate_known_qc_regression(output_root: Path, run_id: str, attempt_id: s
         "qc_revalidated": True,
         "previous_qc_status": previous["status"],
         "previous_protocol_errors": previous_errors,
+        "previous_infrastructure_errors": previous.get("infrastructure_errors", []),
     }
     _atomic_json(result_path, updated_result)
     qc_validator = Path(__file__).resolve().with_name("qc_attempt.py")
@@ -330,15 +427,20 @@ def revalidate_known_qc_regression(output_root: Path, run_id: str, attempt_id: s
         "schema_version": "stereo_v1_1_qc_revalidation_v1",
         "run_id": run_id,
         "attempt_id": attempt_id,
-        "reason": "corrected workbook Vehicle lookup in QC; source attempt retained",
+        "reason": ("corrected unsupported 30 ms hard gate to anchored 50 Hz reference-slot coverage; raw source retained"
+                   if cadence_slot_fix else "corrected workbook Vehicle lookup in QC; source attempt retained"),
         "previous_qc_status": previous["status"],
         "previous_protocol_errors": previous_errors,
+        "previous_infrastructure_errors": previous.get("infrastructure_errors", []),
         "previous_qc_report_sha256": old_qc_sha256,
         "previous_runner_result_sha256": old_result_sha256,
         "revalidated_qc_status": qc_report["status"],
         "qc_validator_sha256": _sha256(qc_validator),
         "revalidated_utc_ns": time.time_ns(),
     }
+    if cadence_slot_fix:
+        revalidation["criterion"] = "reference_slot_coverage_v2"
+        revalidation["cadence_evaluator_sha256"] = _sha256(Path(__file__).with_name("setpoint_cadence.py"))
     _write_new(attempt_dir / "qc_revalidation.json", revalidation)
     _write_attempt_checksums(attempt_dir)
 
@@ -361,6 +463,87 @@ def revalidate_known_qc_regression(output_root: Path, run_id: str, attempt_id: s
         previous_qc_report_sha256=old_qc_sha256,
         qc_validator_sha256=revalidation["qc_validator_sha256"],
     )
+    return row
+
+
+def invalidate_pre_science_attempt(output_root: Path, run_id: str, attempt_id: str,
+                                    qc_report: dict) -> dict:
+    """Correct a v1.2 false-valid nonstart; retain raw and original QC evidence.
+
+    Caller holds the runner lock. This never promotes data or grants a rerun for
+    poor in-science performance. All original hashes must pass before mutation.
+    """
+    output_root = output_root.resolve()
+    status = _load(output_root / "run_status.json")
+    actual = _load(output_root / "manifest_actual.json")
+    row = _slot(status, run_id)
+    if row["status"] not in ("VALID", "VALID_WITH_WARNINGS") or not row["attempts"]:
+        raise ValueError("only a previously counted latest attempt can be invalidated")
+    attempt = row["attempts"][-1]
+    if attempt["attempt_id"] != attempt_id:
+        raise ValueError("attempt must be latest")
+    directory = output_root / attempt["recording_path"]
+    controller = _load(directory / "controller_result.json")
+    events = [json.loads(line) for line in (directory / "events.jsonl").read_text().splitlines()]
+    if (_load(directory / "run_manifest.json").get("protocol_version") != "1.2"
+            or controller.get("controller_status") == "science_completed"
+            or any(item.get("event") == "science_start" for item in events)):
+        raise ValueError("in-science performance outcomes must not be invalidated")
+    if (qc_report.get("run_id") != run_id or qc_report.get("attempt_id") != attempt_id
+            or qc_report.get("status") != "INFRASTRUCTURE_FAILED"
+            or "pre_science_execution_failure" not in qc_report.get("infrastructure_errors", [])
+            or qc_report.get("counted_in_campaign") or qc_report.get("counted_in_39")):
+        raise ValueError("fresh QC must establish pre-science execution failure")
+    matches = [item for item in actual["attempts"]
+               if item["run_id"] == run_id and item["attempt_id"] == attempt_id]
+    previous = _load(directory / "qc_report.json")
+    previous_result = _load(directory / "runner_result.json")
+    if (len(matches) != 1 or matches[0]["status"] != row["status"]
+            or previous.get("status") != row["status"]
+            or previous_result.get("qc_status") != row["status"]):
+        raise ValueError("saved attempt/status/QC identity disagreement")
+    checksum_rows = (directory / "checksums.sha256").read_text().splitlines()
+    listed = set()
+    for line in checksum_rows:
+        digest, relative = line.split("  ", 1)
+        path = (directory / relative).resolve()
+        if relative in listed or not path.is_relative_to(directory.resolve()) or not path.is_file() or _sha256(path) != digest:
+            raise ValueError("original attempt hash mismatch")
+        listed.add(relative)
+    expected = {str(path.relative_to(directory)) for path in directory.rglob("*")
+                if path.is_file() and path.name != "checksums.sha256"}
+    if not listed or not expected.issubset(listed):
+        raise ValueError("original checksum coverage incomplete")
+    snapshot_names = ("qc_report.json", "runner_result.json", "checksums.sha256")
+    for name in snapshot_names:
+        if (directory / (name + ".before_entry_reclassification")).exists():
+            raise FileExistsError("original entry classification snapshot already exists")
+    for name in snapshot_names:
+        with (directory / (name + ".before_entry_reclassification")).open("xb") as f:
+            f.write((directory / name).read_bytes())
+            f.flush()
+            os.fsync(f.fileno())
+    reassessment = {"method": "v12_pre_science_classification_correction",
+                    "previous_status": row["status"], "new_status": "INFRASTRUCTURE_FAILED",
+                    "controller_failure_reason": controller.get("failure_reason"),
+                    "raw_preserved": True, "qc_validator_sha256": _sha256(Path(__file__).with_name("qc_attempt.py")),
+                    "utc_ns": time.time_ns()}
+    _write_new(directory / "entry_classification_reassessment.json", reassessment)
+    _atomic_json(directory / "qc_report.json", qc_report)
+    _atomic_json(directory / "runner_result.json", {
+        **previous_result, "qc_status": "INFRASTRUCTURE_FAILED",
+        "previous_qc_status": previous["status"],
+        "entry_classification_reassessment": "entry_classification_reassessment.json"})
+    _write_attempt_checksums(directory)
+    for target in (attempt, matches[0], row):
+        target["status"] = "INFRASTRUCTURE_FAILED"
+        target["failure_reason"] = "pre_science_execution_failure: " + str(controller.get("failure_reason"))
+        target["entry_classification_reassessment"] = str((directory / "entry_classification_reassessment.json").relative_to(output_root))
+    _atomic_json(output_root / "manifest_actual.json", actual)
+    _refresh_counts(output_root, status)
+    _atomic_json(output_root / "run_status.json", status)
+    _append_change(output_root, "attempt_entry_failure_reclassified", run_id=run_id,
+                   attempt_id=attempt_id, **reassessment)
     return row
 
 

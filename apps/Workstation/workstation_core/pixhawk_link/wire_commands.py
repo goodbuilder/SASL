@@ -18,6 +18,7 @@ from .policy import (
     _NSH_PROMPT_TAIL_RE,
     MAVLINK_COMMAND_RECEIVE_POLL_S,
     MAVLINK_SHELL_OUTPUT_IDLE_S,
+    MAVLINK_PARAMETER_SET_MAX_ATTEMPTS,
     _MAVLINK_FLOAT_PARAM_TYPES,
 )
 
@@ -399,6 +400,7 @@ def _mavlink_set_param_int(
     timeout_s: float = 2.0,
     on_unmatched: Callable[[Any], None] | None = None,
     on_receive_poll: Callable[[], None] | None = None,
+    on_retry: Callable[[int], None] | None = None,
     send_lock: Any = None,
 ) -> int | None:
     mav = getattr(connection, "mav", None)
@@ -408,21 +410,30 @@ def _mavlink_set_param_int(
     target_system = int(getattr(connection, "target_system", 0) or 1)
     target_component = int(getattr(connection, "target_component", 0) or 1)
     param_type = _mavlink_constant(mavlink, "MAV_PARAM_TYPE_INT32", 6)
-    with send_lock if send_lock is not None else nullcontext():
-        mav.param_set_send(
-            target_system,
-            target_component,
-            _mavlink_param_id(name),
-            _mavlink_int_to_param_float(int(value)),
-            param_type,
+    for _attempt in range(max(1, int(MAVLINK_PARAMETER_SET_MAX_ATTEMPTS))):
+        with send_lock if send_lock is not None else nullcontext():
+            mav.param_set_send(
+                target_system,
+                target_component,
+                _mavlink_param_id(name),
+                _mavlink_int_to_param_float(int(value)),
+                param_type,
+            )
+        actual = _mavlink_recv_param_value(
+            connection,
+            name,
+            timeout_s=timeout_s,
+            on_unmatched=on_unmatched,
+            on_receive_poll=on_receive_poll,
         )
-    return _mavlink_recv_param_value(
-        connection,
-        name,
-        timeout_s=timeout_s,
-        on_unmatched=on_unmatched,
-        on_receive_poll=on_receive_poll,
-    )
+        if actual is not None:
+            # A received value mismatch is an authoritative response (possibly
+            # a rejected or constrained value), not a lost acknowledgement.
+            # Retry only when PARAM_VALUE never arrived.
+            return actual
+        if on_retry is not None and _attempt + 1 < max(1, int(MAVLINK_PARAMETER_SET_MAX_ATTEMPTS)):
+            on_retry(_attempt + 2)
+    return None
 
 
 def _decode_mavlink_serial_control(message: Any) -> str:

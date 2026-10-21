@@ -10,7 +10,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Sequence
 from PyQt5 import QtCore, QtWidgets
-from Workstation.ui.components import EngineeringValue
+from .layouts import load_component_form
 
 
 class CandidateReview(QtCore.QObject):
@@ -59,127 +59,23 @@ class CandidateReview(QtCore.QObject):
         self._make_solver_button = make_solver_button
         self._active_profile_id = ""
         self._candidate_rows = {}
-        candidate_group = QtWidgets.QGroupBox("R,t candidates · compare")
-        self.candidate_group = candidate_group
-        candidate_group.setObjectName("opticalPoseCandidatesGroup")
-        candidate_layout = QtWidgets.QVBoxLayout(candidate_group)
-        self.candidate_table = QtWidgets.QTableWidget(0, len(self.CANDIDATE_HEADERS))
-        self.candidate_table.setObjectName("opticalPoseCandidateTable")
-        self.candidate_table.setHorizontalHeaderLabels(list(self.CANDIDATE_HEADERS))
-        self.candidate_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.candidate_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.candidate_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.candidate_table.setAlternatingRowColors(True)
-        self.candidate_table.verticalHeader().setVisible(False)
-        self.candidate_table.horizontalHeader().setStretchLastSection(True)
-        self.candidate_table.setMinimumHeight(145)
+        load_component_form("optical_pose_candidates.ui", self, "candidates")
         self.candidate_table.itemSelectionChanged.connect(self._refresh_candidate_actions)
-        candidate_layout.addWidget(self.candidate_table)
-        self.candidate_detail_text = QtWidgets.QPlainTextEdit()
-        self.candidate_detail_text.setObjectName("opticalPoseCandidateDetail")
-        self.candidate_detail_text.setReadOnly(True)
-        self.candidate_detail_text.setMaximumHeight(110)
-        self.candidate_detail_text.setPlaceholderText(
-            "Select a candidate to review its provenance: rotation/translation/lever-arm "
-            "source, GNSS fix quality, Sampson/rms residuals, inliers, apply eligibility, "
-            "and warnings."
-        )
-        candidate_layout.addWidget(self.candidate_detail_text)
-        self.reference_value = EngineeringValue("Existing calibration R,t")
-        candidate_layout.addWidget(self.reference_value)
-
-        candidate_actions = QtWidgets.QHBoxLayout()
-        self.apply_button = QtWidgets.QPushButton("Apply candidate")
-        self.apply_button.setProperty("commandId", "alignment.pose.apply_candidate")
-        self.apply_button.setEnabled(False)
-        self.apply_button.setToolTip(
-            "Apply every DOF the selected candidate optimized and observed on both camera sides. "
-            "Use Combine when axes must come from different candidates."
-        )
         self.apply_button.clicked.connect(self._request_apply)
-        self.revert_button = QtWidgets.QPushButton("Revert active pose")
-        self.revert_button.setProperty("commandId", "alignment.pose.revert")
-        self.revert_button.setEnabled(False)
         self.revert_button.clicked.connect(self._request_revert)
-        self.reset_button = QtWidgets.QPushButton("Reset Alignment")
-        self.reset_button.setProperty("commandId", "alignment.pose.reset")
-        self.reset_button.setToolTip(
-            "Clear candidates, frozen frames, annotations, observations, and the active pose. "
-            "A reset event is appended; stored data is not deleted."
-        )
         self.reset_button.clicked.connect(self._request_reset)
-        self.candidate_status_label = QtWidgets.QLabel("No pose candidate")
-        self.candidate_status_label.setObjectName("statusStrip")
-        candidate_actions.addWidget(self.apply_button)
-        candidate_actions.addWidget(self.revert_button)
-        candidate_actions.addWidget(self.reset_button)
-        candidate_actions.addWidget(self.candidate_status_label, 1)
-        candidate_layout.addLayout(candidate_actions)
         self.destroyed.connect(self.candidate_group.deleteLater)
 
     def create_combine_button(self):
-        make_solver_button = self._make_solver_button
-        self.combine_button = make_solver_button(
-            "alignment.pose.solve_combined",
-            "Build combined candidate",
+        self.combine_form = load_component_form(
+            "optical_pose_combine.ui", self, "candidates", self._make_solver_button
         )
-        self.combine_button.setEnabled(False)
-        self.combine_button.setToolTip(
-            "Combine explicitly checked candidates only when they share the same prior and exact "
-            "operating K,D profile and optimize non-overlapping DOF. This creates a new candidate; "
-            "it does not apply the pose automatically."
-        )
+        self.combine_candidate_list.itemChanged.connect(self._on_combine_candidates_changed)
+        self.combine_dof_table.itemChanged.connect(self._refresh_combine_action)
         return self.combine_button
 
     def populate_combine_page(self, page_layout: QtWidgets.QVBoxLayout) -> None:
-        selection_note = QtWidgets.QLabel(
-            "Check at least two immutable candidates. A typical use is Horizon R/P + Drone RTK Yaw: "
-            "the first contributes Roll/Pitch and the second contributes Yaw. Candidates with "
-            "overlapping DOF, different explicit priors, or different exact K,D are rejected by the owner."
-        )
-        selection_note.setObjectName("compactContract")
-        selection_note.setWordWrap(True)
-        page_layout.addWidget(selection_note)
-        self.combine_candidate_list = QtWidgets.QListWidget()
-        self.combine_candidate_list.setObjectName("opticalPoseCombineCandidateList")
-        self.combine_candidate_list.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
-        self.combine_candidate_list.setMinimumHeight(82)
-        self.combine_candidate_list.setMaximumHeight(160)
-        self.combine_candidate_list.setToolTip(
-            "Explicit source candidates for the combined pose. Check each source; the owner "
-            "retains their IDs, hashes, shared prior, and quality evidence."
-        )
-        self.combine_candidate_list.itemChanged.connect(self._on_combine_candidates_changed)
-        page_layout.addWidget(self.combine_candidate_list)
-
-        dof_note = QtWidgets.QLabel(
-            "Per checked candidate, which axes it contributes to the combined pose. Defaults to "
-            "every axis that candidate actually observed; uncheck an axis to exclude it (e.g. take "
-            "only Checkerboard's translation while Horizon supplies Roll/Pitch). An axis checked by "
-            "more than one candidate blocks the build below until resolved."
-        )
-        dof_note.setObjectName("compactContract")
-        dof_note.setWordWrap(True)
-        page_layout.addWidget(dof_note)
-        self.combine_dof_table = QtWidgets.QTableWidget(0, 7)
-        self.combine_dof_table.setObjectName("opticalPoseCombineDofTable")
-        self.combine_dof_table.setHorizontalHeaderLabels(["Candidate", "Roll", "Pitch", "Yaw", "N", "E", "D"])
-        self.combine_dof_table.verticalHeader().setVisible(False)
-        self.combine_dof_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
-        for column in range(1, 7):
-            self.combine_dof_table.horizontalHeader().setSectionResizeMode(
-                column, QtWidgets.QHeaderView.ResizeToContents
-            )
-        self.combine_dof_table.setMinimumHeight(82)
-        self.combine_dof_table.setMaximumHeight(160)
-        self.combine_dof_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.combine_dof_table.itemChanged.connect(self._refresh_combine_action)
-        page_layout.addWidget(self.combine_dof_table)
-
-        self.combine_candidate_status = QtWidgets.QLabel("No candidates checked · select at least two")
-        self.combine_candidate_status.setObjectName("statusStrip")
-        self.combine_candidate_status.setWordWrap(True)
-        page_layout.addWidget(self.combine_candidate_status)
+        page_layout.addWidget(self.combine_form)
 
     @staticmethod
     def _candidate_text(value: object, *, digits: int = 3) -> str:

@@ -1,0 +1,840 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>OpticalPoseForm</class>
+ <widget class="_CurrentPageTabWidget" name="method_tabs">
+  <property name="componentBindings" stdset="0">
+   <string>[["methods", "method_tabs", null]]</string>
+  </property>
+  <property name="styleObjectName" stdset="0">
+   <string>alignmentOperationTabs</string>
+  </property>
+  <widget class="QWidget" name="QWidget_2">
+   <layout class="QVBoxLayout" name="QVBoxLayout_2" stretch="0,0,0,0,0,1">
+    <property name="leftMargin">
+     <number>6</number>
+    </property>
+    <property name="topMargin">
+     <number>6</number>
+    </property>
+    <property name="rightMargin">
+     <number>6</number>
+    </property>
+    <property name="bottomMargin">
+     <number>6</number>
+    </property>
+    <property name="spacing">
+     <number>6</number>
+    </property>
+    <item>
+     <widget class="QLabel" name="compactContract_6">
+      <property name="styleObjectName" stdset="0">
+       <string>compactContract</string>
+      </property>
+      <property name="text">
+       <string>Two horizon points constrain Roll/Pitch only. Yaw and camera position remain at the prior pose.</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="compactContract_7">
+      <property name="styleObjectName" stdset="0">
+       <string>compactContract</string>
+      </property>
+      <property name="text">
+       <string>Observed: Roll/Pitch · Measurement fill: Yaw=pair-frozen Pixhawk, t=pair-frozen GNSS</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="method_information_labels_Horizon">
+      <property name="componentBindings" stdset="0">
+       <string>[["methods", "method_information_labels", "Horizon"]]</string>
+      </property>
+      <property name="styleObjectName" stdset="0">
+       <string>statusStrip</string>
+      </property>
+      <property name="text">
+       <string>Solve readiness · horizon points L/R=0/0 (2 required each) · candidate=-- · Measurement also requires fresh Pixhawk Yaw and usable GNSS t</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="method_detail_labels_Horizon">
+      <property name="componentBindings" stdset="0">
+       <string>[["methods", "method_detail_labels", "Horizon"]]</string>
+      </property>
+      <property name="styleObjectName" stdset="0">
+       <string>compactContract</string>
+      </property>
+      <property name="text">
+       <string>model=-- · L/R RMS px=--/-- · sensitivity R/P=--/-- deg</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <layout class="QHBoxLayout" name="QHBoxLayout_2" stretch="0,1">
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+      <property name="spacing">
+       <number>6</number>
+      </property>
+      <item>
+       <widget class="QPushButton" name="QPushButton">
+        <property name="toolTip">
+         <string>Automatically fit Roll/Pitch from the manually marked horizon line. The horizon cannot observe Yaw.</string>
+        </property>
+        <property name="text">
+         <string>Solve Horizon Roll/Pitch</string>
+        </property>
+        <property name="commandId" stdset="0">
+         <string>alignment.pose.solve_horizon</string>
+        </property>
+        <property name="solverButton" stdset="0">
+         <bool>true</bool>
+        </property>
+        <property name="commandRegistrationOrder" stdset="0">
+         <number>8</number>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <spacer name="spacer_35">
+        <property name="orientation">
+         <enum>Qt::Horizontal</enum>
+        </property>
+        <property name="sizeHint">
+         <size>
+          <width>0</width>
+          <height>0</height>
+         </size>
+        </property>
+       </spacer>
+      </item>
+     </layout>
+    </item>
+    <item>
+     <spacer name="spacer_36">
+      <property name="orientation">
+       <enum>Qt::Vertical</enum>
+      </property>
+      <property name="sizeHint">
+       <size>
+        <width>0</width>
+        <height>0</height>
+       </size>
+      </property>
+     </spacer>
+    </item>
+   </layout>
+   <attribute name="title">
+    <string>Horizon</string>
+   </attribute>
+   <attribute name="toolTip">
+    <string>Two horizon points constrain Roll/Pitch only. Yaw and camera position remain at the prior pose.</string>
+   </attribute>
+  </widget>
+  <widget class="QWidget" name="QWidget_3">
+   <layout class="QVBoxLayout" name="QVBoxLayout_3" stretch="0,0,0,0,0,0,1">
+    <property name="leftMargin">
+     <number>6</number>
+    </property>
+    <property name="topMargin">
+     <number>6</number>
+    </property>
+    <property name="rightMargin">
+     <number>6</number>
+    </property>
+    <property name="bottomMargin">
+     <number>6</number>
+    </property>
+    <property name="spacing">
+     <number>6</number>
+    </property>
+    <item>
+     <widget class="QLabel" name="compactContract_8">
+      <property name="styleObjectName" stdset="0">
+       <string>compactContract</string>
+      </property>
+      <property name="text">
+       <string>Click corresponding Mountain features in the same order on both frames. Uses paired u,v and the numeric GNSS baseline; no GeoTIFF or terrain height.</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="compactContract_9">
+      <property name="styleObjectName" stdset="0">
+       <string>compactContract</string>
+      </property>
+      <property name="text">
+       <string>Observed: relative R from paired u,v · t: frozen GNSS baseline · no terrain height</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="method_information_labels_Mountain___GNSS">
+      <property name="componentBindings" stdset="0">
+       <string>[["methods", "method_information_labels", "Mountain + GNSS"]]</string>
+      </property>
+      <property name="styleObjectName" stdset="0">
+       <string>statusStrip</string>
+      </property>
+      <property name="text">
+       <string>Solve readiness · paired ridge points L/R=0/0 (≥4, equal order) · candidate=-- · GNSS Yaw90 + P1 R/P at capture request; existing Base R,t is not required</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="method_detail_labels_Mountain___GNSS">
+      <property name="componentBindings" stdset="0">
+       <string>[["methods", "method_detail_labels", "Mountain + GNSS"]]</string>
+      </property>
+      <property name="styleObjectName" stdset="0">
+       <string>compactContract</string>
+      </property>
+      <property name="text">
+       <string>pairs=-- · inlier ratio=-- · Sampson RMS px=-- · baseline=-- m · lever-arm=--</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QCheckBox" name="mountain_hide_auto_lines_checkbox">
+      <property name="componentBindings" stdset="0">
+       <string>[["methods", "mountain_hide_auto_lines_checkbox", null]]</string>
+      </property>
+      <property name="styleObjectName" stdset="0">
+       <string>mountainHideAutoSuggestionLines</string>
+      </property>
+      <property name="toolTip">
+       <string>Hide only the line joining Mountain Auto-select points. Right-click an automatic point to exclude its corresponding left/right pair from the overlay and from the accepted solver input.</string>
+      </property>
+      <property name="text">
+       <string>Hide Auto-select connecting lines</string>
+      </property>
+      <property name="checked">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <layout class="QHBoxLayout" name="QHBoxLayout_3" stretch="0,0,1">
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+      <property name="spacing">
+       <number>6</number>
+      </property>
+      <item>
+       <widget class="QPushButton" name="QPushButton_2">
+        <property name="toolTip">
+         <string>Build metric R,t from at least four same-order paired Mountain u,v clicks on frozen left/right frames and the numeric left/right GNSS baseline. No GeoTIFF or terrain height is used. Fix quality is recorded as evidence, not used as a hard gate. Assumes camera optical center equals GNSS antenna.</string>
+        </property>
+        <property name="text">
+         <string>Solve GNSS + Mountain R,t</string>
+        </property>
+        <property name="commandId" stdset="0">
+         <string>alignment.pose.solve_gnss_mountain</string>
+        </property>
+        <property name="solverButton" stdset="0">
+         <bool>true</bool>
+        </property>
+        <property name="commandRegistrationOrder" stdset="0">
+         <number>9</number>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="QPushButton_3">
+        <property name="toolTip">
+         <string>Rotation-only solve from the same paired Ridge points treated as far-field sky/cloud correspondences (Auto-select Cloud). Translation is never applied by this candidate; the Cloud measurement method fills N/E/D from live GNSS. Both frozen frames must be simultaneous within the burst pairing tolerance.</string>
+        </property>
+        <property name="text">
+         <string>Solve Cloud rotation</string>
+        </property>
+        <property name="commandId" stdset="0">
+         <string>alignment.pose.solve_cloud_rotation</string>
+        </property>
+        <property name="solverButton" stdset="0">
+         <bool>true</bool>
+        </property>
+        <property name="commandRegistrationOrder" stdset="0">
+         <number>10</number>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <spacer name="spacer_47">
+        <property name="orientation">
+         <enum>Qt::Horizontal</enum>
+        </property>
+        <property name="sizeHint">
+         <size>
+          <width>0</width>
+          <height>0</height>
+         </size>
+        </property>
+       </spacer>
+      </item>
+     </layout>
+    </item>
+    <item>
+     <spacer name="spacer_48">
+      <property name="orientation">
+       <enum>Qt::Vertical</enum>
+      </property>
+      <property name="sizeHint">
+       <size>
+        <width>0</width>
+        <height>0</height>
+       </size>
+      </property>
+     </spacer>
+    </item>
+   </layout>
+   <attribute name="title">
+    <string>Mountain + GNSS</string>
+   </attribute>
+   <attribute name="toolTip">
+    <string>Click corresponding Mountain features in the same order on both frames. Uses paired u,v and the numeric GNSS baseline; no GeoTIFF or terrain height.</string>
+   </attribute>
+  </widget>
+  <widget class="QWidget" name="QWidget_4">
+   <layout class="QVBoxLayout" name="QVBoxLayout_4" stretch="0,0,0,0,0,0,1">
+    <property name="leftMargin">
+     <number>6</number>
+    </property>
+    <property name="topMargin">
+     <number>6</number>
+    </property>
+    <property name="rightMargin">
+     <number>6</number>
+    </property>
+    <property name="bottomMargin">
+     <number>6</number>
+    </property>
+    <property name="spacing">
+     <number>6</number>
+    </property>
+    <item>
+     <widget class="QLabel" name="compactContract_10">
+      <property name="styleObjectName" stdset="0">
+       <string>compactContract</string>
+      </property>
+      <property name="text">
+       <string>Full 6-DOF pose from 2D/3D correspondences against an imported GeoTIFF -- the only method that does not inherit any axis from the prior pose when it succeeds.</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="compactContract_11">
+      <property name="styleObjectName" stdset="0">
+       <string>compactContract</string>
+      </property>
+      <property name="text">
+       <string>Observed: full 6-DOF · requires GeoTIFF vertical datum and matched 2D/3D points</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="method_information_labels_Terrain_PnP">
+      <property name="componentBindings" stdset="0">
+       <string>[["methods", "method_information_labels", "Terrain PnP"]]</string>
+      </property>
+      <property name="styleObjectName" stdset="0">
+       <string>statusStrip</string>
+      </property>
+      <property name="text">
+       <string>Solve readiness · ridge points L/R=0/0 · terrain=-- · candidate=--</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="method_detail_labels_Terrain_PnP">
+      <property name="componentBindings" stdset="0">
+       <string>[["methods", "method_detail_labels", "Terrain PnP"]]</string>
+      </property>
+      <property name="styleObjectName" stdset="0">
+       <string>compactContract</string>
+      </property>
+      <property name="text">
+       <string>L/R reprojection RMSE=--/-- px · positive depth=--/--</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="compactContract_12">
+      <property name="styleObjectName" stdset="0">
+       <string>compactContract</string>
+      </property>
+      <property name="text">
+       <string>Uses the same Ridge points as Mountain + GNSS -- switch to Ridge mode on that tab to click them. "Solve Terrain PnP" will prompt for a correspondences JSON matching each side's clicked points 1:1 with object_points_ned_m; see the Readiness card above for GeoTIFF/vertical-datum status.</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <layout class="QHBoxLayout" name="QHBoxLayout_4" stretch="0,0,1">
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+      <property name="spacing">
+       <number>6</number>
+      </property>
+      <item>
+       <widget class="QPushButton" name="QPushButton_4">
+        <property name="text">
+         <string>Import GeoTIFF</string>
+        </property>
+        <property name="commandId" stdset="0">
+         <string>alignment.pose.import_terrain</string>
+        </property>
+        <property name="solverButton" stdset="0">
+         <bool>true</bool>
+        </property>
+        <property name="commandRegistrationOrder" stdset="0">
+         <number>11</number>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="QPushButton_5">
+        <property name="text">
+         <string>Solve Terrain PnP</string>
+        </property>
+        <property name="commandId" stdset="0">
+         <string>alignment.pose.solve_terrain</string>
+        </property>
+        <property name="solverButton" stdset="0">
+         <bool>true</bool>
+        </property>
+        <property name="commandRegistrationOrder" stdset="0">
+         <number>12</number>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <spacer name="spacer_59">
+        <property name="orientation">
+         <enum>Qt::Horizontal</enum>
+        </property>
+        <property name="sizeHint">
+         <size>
+          <width>0</width>
+          <height>0</height>
+         </size>
+        </property>
+       </spacer>
+      </item>
+     </layout>
+    </item>
+    <item>
+     <spacer name="spacer_60">
+      <property name="orientation">
+       <enum>Qt::Vertical</enum>
+      </property>
+      <property name="sizeHint">
+       <size>
+        <width>0</width>
+        <height>0</height>
+       </size>
+      </property>
+     </spacer>
+    </item>
+   </layout>
+   <attribute name="title">
+    <string>Terrain PnP</string>
+   </attribute>
+   <attribute name="toolTip">
+    <string>Full 6-DOF pose from 2D/3D correspondences against an imported GeoTIFF -- the only method that does not inherit any axis from the prior pose when it succeeds.</string>
+   </attribute>
+  </widget>
+  <widget class="QWidget" name="QWidget_5">
+   <layout class="QVBoxLayout" name="QVBoxLayout_5" stretch="0,0,0,0,0,1">
+    <property name="leftMargin">
+     <number>6</number>
+    </property>
+    <property name="topMargin">
+     <number>6</number>
+    </property>
+    <property name="rightMargin">
+     <number>6</number>
+    </property>
+    <property name="bottomMargin">
+     <number>6</number>
+    </property>
+    <property name="spacing">
+     <number>6</number>
+    </property>
+    <item>
+     <widget class="QLabel" name="compactContract_13">
+      <property name="styleObjectName" stdset="0">
+       <string>compactContract</string>
+      </property>
+      <property name="text">
+       <string>One synchronized target constrains Yaw; two or more non-degenerate target/ray observations constrain Roll/Pitch/Yaw. Missing Translation is supplied by live GNSS in Measurement.</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="compactContract_14">
+      <property name="styleObjectName" stdset="0">
+       <string>compactContract</string>
+      </property>
+      <property name="text">
+       <string>1 target: Yaw · 2+ targets: Roll/Pitch/Yaw · Measurement t: pair-frozen GNSS</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="method_information_labels_Drone_Rotation">
+      <property name="componentBindings" stdset="0">
+       <string>[["methods", "method_information_labels", "Drone Rotation"]]</string>
+      </property>
+      <property name="styleObjectName" stdset="0">
+       <string>statusStrip</string>
+      </property>
+      <property name="text">
+       <string>Solve readiness · target points L/R=0/0 · captured observations=0 · candidate=--</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="method_detail_labels_Drone_Rotation">
+      <property name="componentBindings" stdset="0">
+       <string>[["methods", "method_detail_labels", "Drone Rotation"]]</string>
+      </property>
+      <property name="styleObjectName" stdset="0">
+       <string>compactContract</string>
+      </property>
+      <property name="text">
+       <string>observations L/R=--/-- · angular RMS=-- · Translation=pair-frozen GNSS</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <layout class="QHBoxLayout" name="QHBoxLayout_5" stretch="0,1">
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+      <property name="spacing">
+       <number>6</number>
+      </property>
+      <item>
+       <widget class="QPushButton" name="QPushButton_6">
+        <property name="text">
+         <string>Solve Drone RTK Rotation</string>
+        </property>
+        <property name="commandId" stdset="0">
+         <string>alignment.pose.solve_drone_yaw</string>
+        </property>
+        <property name="solverButton" stdset="0">
+         <bool>true</bool>
+        </property>
+        <property name="commandRegistrationOrder" stdset="0">
+         <number>13</number>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <spacer name="spacer_69">
+        <property name="orientation">
+         <enum>Qt::Horizontal</enum>
+        </property>
+        <property name="sizeHint">
+         <size>
+          <width>0</width>
+          <height>0</height>
+         </size>
+        </property>
+       </spacer>
+      </item>
+     </layout>
+    </item>
+    <item>
+     <spacer name="spacer_70">
+      <property name="orientation">
+       <enum>Qt::Vertical</enum>
+      </property>
+      <property name="sizeHint">
+       <size>
+        <width>0</width>
+        <height>0</height>
+       </size>
+      </property>
+     </spacer>
+    </item>
+   </layout>
+   <attribute name="title">
+    <string>Drone Rotation</string>
+   </attribute>
+   <attribute name="toolTip">
+    <string>One synchronized target constrains Yaw; two or more non-degenerate target/ray observations constrain Roll/Pitch/Yaw. Missing Translation is supplied by live GNSS in Measurement.</string>
+   </attribute>
+  </widget>
+  <widget class="QWidget" name="QWidget_6">
+   <layout class="QVBoxLayout" name="QVBoxLayout_6" stretch="0,0,0,0,0,1">
+    <property name="leftMargin">
+     <number>6</number>
+    </property>
+    <property name="topMargin">
+     <number>6</number>
+    </property>
+    <property name="rightMargin">
+     <number>6</number>
+    </property>
+    <property name="bottomMargin">
+     <number>6</number>
+    </property>
+    <property name="spacing">
+     <number>6</number>
+    </property>
+    <item>
+     <widget class="QLabel" name="compactContract_15">
+      <property name="styleObjectName" stdset="0">
+       <string>compactContract</string>
+      </property>
+      <property name="text">
+       <string>Accumulate at least four synchronized Frozen target pairs in Drone Rotation, then solve full six-DOF camera pose without a separate JSON file. Translation is solved from the observations instead of inherited from live GNSS.</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="compactContract_16">
+      <property name="styleObjectName" stdset="0">
+       <string>compactContract</string>
+      </property>
+      <property name="text">
+       <string>Observed: full 6-DOF R,t · requires at least four READY accumulated Frozen target pairs</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="method_information_labels_Drone_Multi_view">
+      <property name="componentBindings" stdset="0">
+       <string>[["methods", "method_information_labels", "Drone Multi-view"]]</string>
+      </property>
+      <property name="styleObjectName" stdset="0">
+       <string>statusStrip</string>
+      </property>
+      <property name="text">
+       <string>Solve readiness · accumulated READY/total=0/0 (≥4 READY required) · captured evidence=0 · candidate=--</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="method_detail_labels_Drone_Multi_view">
+      <property name="componentBindings" stdset="0">
+       <string>[["methods", "method_detail_labels", "Drone Multi-view"]]</string>
+      </property>
+      <property name="styleObjectName" stdset="0">
+       <string>compactContract</string>
+      </property>
+      <property name="text">
+       <string>observations L/R=--/-- · angular RMS=-- / -- · collection=-- · JSON fallback=--</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <layout class="QHBoxLayout" name="QHBoxLayout_6" stretch="0,1">
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+      <property name="spacing">
+       <number>6</number>
+      </property>
+      <item>
+       <widget class="QPushButton" name="QPushButton_7">
+        <property name="toolTip">
+         <string>Use at least four READY Frozen target pairs accumulated since the last Alignment Reset, together with their capture-time Drone RTK positions, to solve full 6-DOF R,t for both cameras.</string>
+        </property>
+        <property name="text">
+         <string>Solve Drone RTK Multi-view R,t</string>
+        </property>
+        <property name="commandId" stdset="0">
+         <string>alignment.pose.solve_drone_rtk_multiview</string>
+        </property>
+        <property name="solverButton" stdset="0">
+         <bool>true</bool>
+        </property>
+        <property name="commandRegistrationOrder" stdset="0">
+         <number>7</number>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <spacer name="spacer_79">
+        <property name="orientation">
+         <enum>Qt::Horizontal</enum>
+        </property>
+        <property name="sizeHint">
+         <size>
+          <width>0</width>
+          <height>0</height>
+         </size>
+        </property>
+       </spacer>
+      </item>
+     </layout>
+    </item>
+    <item>
+     <spacer name="spacer_80">
+      <property name="orientation">
+       <enum>Qt::Vertical</enum>
+      </property>
+      <property name="sizeHint">
+       <size>
+        <width>0</width>
+        <height>0</height>
+       </size>
+      </property>
+     </spacer>
+    </item>
+   </layout>
+   <attribute name="title">
+    <string>Drone Multi-view</string>
+   </attribute>
+   <attribute name="toolTip">
+    <string>Accumulate at least four synchronized Frozen target pairs in Drone Rotation, then solve full six-DOF camera pose without a separate JSON file. Translation is solved from the observations instead of inherited from live GNSS.</string>
+   </attribute>
+  </widget>
+  <widget class="QWidget" name="QWidget_7">
+   <layout class="QVBoxLayout" name="QVBoxLayout_7" stretch="">
+    <property name="leftMargin">
+     <number>0</number>
+    </property>
+    <property name="topMargin">
+     <number>0</number>
+    </property>
+    <property name="rightMargin">
+     <number>0</number>
+    </property>
+    <property name="bottomMargin">
+     <number>0</number>
+    </property>
+    <property name="spacing">
+     <number>6</number>
+    </property>
+   </layout>
+   <attribute name="title">
+    <string>Combine</string>
+   </attribute>
+  </widget>
+ </widget>
+ <customwidgets>
+  <customwidget>
+   <class>_CurrentPageTabWidget</class>
+   <extends>QTabWidget</extends>
+   <header>Workstation.workspace_views.optical_pose_parts.layouts</header>
+   <container>1</container>
+  </customwidget>
+ </customwidgets>
+ <resources />
+ <connections />
+</ui>

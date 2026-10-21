@@ -774,6 +774,9 @@ def validate_freeze_anchor(anchor: Mapping[str, Any]) -> dict[str, Any]:
         ground_truth["reference_rotation_offset_rpy_rad"],
         "ground_truth_provenance:reference_rotation_offset_rpy_rad",
     )
+    # This sealed schema describes historical origin-reference evidence.
+    # Do not relabel it as midpoint data; current source-contract validation
+    # below must reject reuse against the changed runtime reference.
     expected_ground_truth = {
         "semantic_reference_name": "vehicle_reference_link",
         "semantic_reference_definition": "project_defined_vehicle_reference_at_base_link_origin",
@@ -1701,7 +1704,7 @@ def _validate_coordinate_contract_sources(anchor: Mapping[str, Any], repository_
     if frame.attrib.get("attached_to") != ground_truth["parent_link"]:
         raise ValueError("ground_truth_parent_link_mismatch")
     pose_values = tuple(float(value) for value in (frame.findtext("pose") or "").split())
-    if pose_values != (0.0, 0.0, 0.0, 0.0, 0.0, 0.0):
+    if pose_values != (*REFERENCE_OFFSET_PARENT_M, *REFERENCE_OFFSET_PARENT_RPY_RAD):
         raise ValueError("ground_truth_reference_offset_mismatch")
 
     try:

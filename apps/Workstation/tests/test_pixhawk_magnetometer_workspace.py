@@ -633,6 +633,39 @@ def test_pixhawk_workspace_renders_p1_p2_imu_magnetometer_table() -> None:
     assert workspace.mag_priority_apply_buttons["left"].text() == "Apply & Verify"
     assert workspace.mag_priority_apply_buttons["right"].text() == "Apply & Verify"
 
+    # The live 4 Hz view refresh must not replace the operator's staged value
+    # with the older CAL_MAG2_PRIO=100 cached readback.
+    workspace._refresh_mag_priority_group({})
+    assert workspace.mag_priority_payload("right")["CAL_MAG2"] == 75
+    assert "Draft pending Apply" in workspace.mag_priority_draft_labels["right"].text()
+    assert workspace.mag_priority_discard_buttons["right"].isEnabled()
+
+    workspace.mag_priority_discard_buttons["right"].click()
+    assert workspace.mag_priority_payload("right")["CAL_MAG2"] == 100
+    assert workspace._mag_priority_dirty["right"] == set()
+
+    backend.panel._mavlink_open_sides = lambda: {"left", "right"}
+    backend.panel._mavlink_connected_sides = lambda: {"left", "right"}
+    cal_params["CAL_MAG1_PRIO"] = 0
+    workspace._refresh_mag_priority_group({})
+    assert workspace._mag_priority_voter_gap_instances["left"] == (1,)
+    assert "i1/MAG1 off" in workspace.mag_priority_warning_labels["left"].text()
+    assert not workspace.mag_priority_apply_buttons["left"].isEnabled()
+
+    cal_params["CAL_MAG1_PRIO"] = 1
+    workspace._refresh_mag_priority_group({})
+    assert workspace._mag_priority_voter_gap_instances["left"] == ()
+    assert workspace.mag_priority_apply_buttons["left"].isEnabled()
+
+    backend.panel.latest_sensor_mag_instances["left"] = {
+        0: SimpleNamespace(device_id=4395041, topic="px4-shell/sensor_mag/0"),
+        2: SimpleNamespace(device_id=8944899, topic="px4-shell/sensor_mag/2"),
+    }
+    workspace._refresh_mag_priority_group({})
+    assert workspace._mag_priority_voter_gap_unknown_instances["left"] == (1,)
+    assert "Gap check incomplete" in workspace.mag_priority_warning_labels["left"].text()
+    assert workspace.mag_priority_apply_buttons["left"].isEnabled()
+
     workspace.deleteLater()
     app.processEvents()
 

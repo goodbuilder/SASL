@@ -1,0 +1,95 @@
+<ui version="4.0">
+  <class>geometryGroup</class>
+  <widget class="QGroupBox" name="geometryGroup">
+    <property name="title">
+      <string>Drone Pixhawk geometry · F/R/D/Rg</string>
+    </property>
+    <layout class="QVBoxLayout" name="geometryLayout">
+      <property name="leftMargin">
+        <number>8</number>
+      </property>
+      <property name="topMargin">
+        <number>8</number>
+      </property>
+      <property name="rightMargin">
+        <number>8</number>
+      </property>
+      <property name="bottomMargin">
+        <number>8</number>
+      </property>
+      <property name="spacing">
+        <number>6</number>
+      </property>
+      <property name="spacing">
+        <number>5</number>
+      </property>
+      <item>
+        <widget class="QLabel" name="geometryHint">
+          <property name="text">
+            <string>Dr = Drone Pixhawk · Dr from reference means reference→Dr · F/R/D/Rg = Forward/Right/Down/Range (m)</string>
+          </property>
+          <property name="wordWrap">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+      <item>
+        <widget class="QTableView" name="drone_geometry_table" />
+      </item>
+      <item>
+        <widget class="QLabel" name="angleTitle">
+          <property name="text">
+            <string>Horizontal triangle angles (F/R only)</string>
+          </property>
+        </widget>
+      </item>
+      <item>
+        <layout class="QGridLayout" name="angleLayout">
+          <property name="leftMargin">
+            <number>0</number>
+          </property>
+          <property name="topMargin">
+            <number>0</number>
+          </property>
+          <property name="rightMargin">
+            <number>0</number>
+          </property>
+          <property name="bottomMargin">
+            <number>0</number>
+          </property>
+          <property name="spacing">
+            <number>6</number>
+          </property>
+          <property name="horizontalSpacing">
+            <number>12</number>
+          </property>
+          <property name="verticalSpacing">
+            <number>3</number>
+          </property>
+        </layout>
+      </item>
+      <item>
+        <widget class="QLabel" name="drone_geometry_status_label">
+          <property name="text">
+            <string>WAITING · geometry evidence 대기 중</string>
+          </property>
+          <property name="wordWrap">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+      <item>
+        <widget class="QLabel" name="drone_geometry_contract_label">
+          <property name="text">
+            <string>Angles: ∠Dr-P1-P2 / ∠Dr-P2-P1 · horizontal North/East only · unsigned internal angle</string>
+          </property>
+          <property name="wordWrap">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+    </layout>
+  </widget>
+  <resources />
+  <connections />
+</ui>

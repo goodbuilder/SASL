@@ -6,10 +6,11 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Callable
 from PyQt5 import QtCore, QtGui, QtWidgets
-from Workstation.ui.components import WorkspaceHeader
+from Workstation.ui.designer import load_form
 from Workstation.application.status_model import RuntimeStatus, StatusModel
-from .px4_widgets import _build_px4_priority_combo, _px4_priority_combo_value
-from .shared import _append_table_row, _command_button, _compact_text, _evidence, _table_model
+from .px4_widgets import _set_px4_priority_combo_value, _px4_priority_combo_value
+from Workstation.workstation_core.px4_mag_manager import MAG_PRIORITY_LEVELS, mag_priority_display
+from .shared import _append_table_row, _compact_text, _evidence, _table_model
 
 
 class AdvancedWorkspace(QtWidgets.QWidget):
@@ -36,121 +37,67 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         self._media_video_signature: tuple[tuple[str, str], ...] = ()
         self._preview_images: dict[str, QtGui.QImage] = {}
 
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-        layout.addWidget(
-            WorkspaceHeader(
-                "Advanced",
-            )
-        )
-
-        self.tabs = QtWidgets.QTabWidget()
-        self.tabs.addTab(self._build_wiris_tab(), "Camera control")
-        self.tabs.addTab(self._build_px4_and_watch_tab(), "Pixhawk tools")
-        self.tabs.addTab(self._build_preview_tab(), "Preview")
-        self.tabs.addTab(self._build_media_tab(), "Files")
-        layout.addWidget(self.tabs, 1)
+        load_form("advanced.ui", self)
+        for button in self.findChildren(QtWidgets.QPushButton):
+            command = button.property("commandId")
+            if command:
+                self.operation_buttons[command] = button
+                button.setEnabled(invoke_command is not None)
+                if invoke_command is not None:
+                    button.clicked.connect(lambda _checked=False, command=command: invoke_command(command))
+        for combo, values in (
+            (self.wiris_target_combo, ("both", "left", "right")),
+            (self.zoom_target_combo, ("both", "left", "right")),
+            (self.wiris_terminator_combo, ("\n", "\0")),
+            (self.px4_camera_combo, ("left", "right", "drone")),
+        ):
+            for index, value in enumerate(values):
+                combo.setItemData(index, value)
+        self.zoom_buttons = {key: getattr(self, f"zoom_{key}_button") for key in ("in", "out", "stop", "set")}
+        self.wiris_response_clear_button.clicked.connect(self.wiris_response_log.clear)
+        self.wiris_catalog_combo.currentIndexChanged.connect(self._apply_wiris_catalog_item)
+        self._load_wiris_catalog()
+        # Priority values and descriptions follow the PX4 semantic contract.
+        self.px4_priority_spins = {}
+        for role, value in {"BOARD": 0, "CAN1": 100, "CAN2": 90, "GPS1_MAG": 0, "GPS2_MAG": 0}.items():
+            combo = getattr(self, f"priority_{role}")
+            for raw, label in MAG_PRIORITY_LEVELS:
+                combo.addItem(label, raw)
+            _set_px4_priority_combo_value(combo, value)
+            combo.currentIndexChanged.connect(lambda _index, combo=combo: combo.setToolTip(
+                f"PX4 priority: {mag_priority_display(combo.currentData())}"
+            ))
+            self.px4_priority_spins[role] = combo
+        self.manual_eth_button.clicked.connect(self._apply_manual_px4_ethernet_setup)
+        self.browse_button.clicked.connect(self._browse_px4_transfer_file)
+        self.restart_button.clicked.connect(lambda: self._start_px4_transfer(resume=False, firmware=False))
+        self.resume_button.clicked.connect(lambda: self._start_px4_transfer(resume=True, firmware=False))
+        self.download_button.clicked.connect(lambda: self._start_px4_download(resume=False))
+        self.resume_download_button.clicked.connect(lambda: self._start_px4_download(resume=True))
+        self.stage_button.clicked.connect(lambda: self._start_px4_transfer(resume=False, firmware=True))
+        self.cancel_button.clicked.connect(self._cancel_px4_transfer)
+        self.flash_button.clicked.connect(self._start_px4_usb_flash)
+        self.cancel_flash_button.clicked.connect(self._cancel_px4_usb_flash)
+        self.baseline_mavlink_model = _table_model(self, ("Message", "Fields"))
+        self.baseline_mavlink_table.setModel(self.baseline_mavlink_model)
+        self.baseline_mavlink_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.baseline_mavlink_table.verticalHeader().setVisible(False)
+        self.baseline_mavlink_table.horizontalHeader().setStretchLastSection(True)
+        self.preview_labels = {side: getattr(self, f"{side}_preview") for side in ("left", "right")}
+        for index, label in enumerate(self.preview_labels.values()):
+            label.setObjectName("calibrationPreview")
+            self.previewSplitter.setStretchFactor(index, 1)
+        for label in self.findChildren(QtWidgets.QLabel):
+            if label.objectName().endswith("status_label"):
+                label.setObjectName("statusStrip")
 
         self._connect_preview_signal()
         self._connect_wiris_response_signal()
         self._refresh_custom_watch_selector()
         self._refresh_media_video_paths()
 
-    def _button(self, text: str, command_id: str) -> QtWidgets.QPushButton:
-        button = _command_button(text, command_id, self.invoke_command)
-        self.operation_buttons[command_id] = button
-        return button
 
-    @staticmethod
-    def _combo(items: tuple[tuple[str, str], ...]) -> QtWidgets.QComboBox:
-        combo = QtWidgets.QComboBox()
-        for label, value in items:
-            combo.addItem(label, value)
-        return combo
 
-    def _build_wiris_tab(self) -> QtWidgets.QWidget:
-        page = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(page)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(6)
-
-        command_group = QtWidgets.QGroupBox("WIRIS SDK command")
-        command_form = QtWidgets.QGridLayout(command_group)
-        command_form.setColumnStretch(1, 1)
-        command_form.setColumnStretch(2, 1)
-        self.wiris_target_combo = self._combo(
-            (("Both cameras", "both"), ("Left camera", "left"), ("Right camera", "right"))
-        )
-        self.wiris_catalog_combo = QtWidgets.QComboBox()
-        self.wiris_command_edit = QtWidgets.QLineEdit()
-        self.wiris_command_edit.setPlaceholderText("SDK command, e.g. HIWS")
-        self.wiris_terminator_combo = self._combo((("LINE", "\n"), ("NULL", "\0")))
-        self.wiris_send_button = self._button("Send", "advanced.wiris.send")
-        self.wiris_status_label = QtWidgets.QLabel("")
-        self.wiris_status_label.setObjectName("statusStrip")
-        self.wiris_status_label.setWordWrap(True)
-        command_form.addWidget(QtWidgets.QLabel("Target"), 0, 0)
-        command_form.addWidget(self.wiris_target_combo, 0, 1)
-        command_form.addWidget(QtWidgets.QLabel("Catalog"), 1, 0)
-        command_form.addWidget(self.wiris_catalog_combo, 1, 1, 1, 2)
-        command_form.addWidget(QtWidgets.QLabel("Command"), 2, 0)
-        command_form.addWidget(self.wiris_command_edit, 2, 1, 1, 2)
-        command_form.addWidget(QtWidgets.QLabel("Terminator"), 3, 0)
-        command_form.addWidget(self.wiris_terminator_combo, 3, 1)
-        command_form.addWidget(self.wiris_send_button, 3, 2)
-        command_form.addWidget(self.wiris_status_label, 4, 0, 1, 3)
-        layout.addWidget(command_group)
-
-        response_group = QtWidgets.QGroupBox("Command responses")
-        response_layout = QtWidgets.QVBoxLayout(response_group)
-        self.wiris_response_log = QtWidgets.QPlainTextEdit()
-        self.wiris_response_log.setReadOnly(True)
-        self.wiris_response_log.setMaximumBlockCount(400)
-        self.wiris_response_log.setMinimumHeight(150)
-        self.wiris_response_log.setPlaceholderText(
-            "WIRIS SDK responses from the selected camera target appear here."
-        )
-        response_actions = QtWidgets.QHBoxLayout()
-        response_actions.addStretch(1)
-        self.wiris_response_clear_button = QtWidgets.QPushButton("Clear responses")
-        self.wiris_response_clear_button.clicked.connect(self.wiris_response_log.clear)
-        response_actions.addWidget(self.wiris_response_clear_button)
-        response_layout.addWidget(self.wiris_response_log)
-        response_layout.addLayout(response_actions)
-        layout.addWidget(response_group, 1)
-
-        self.wiris_catalog_combo.currentIndexChanged.connect(self._apply_wiris_catalog_item)
-        self._load_wiris_catalog()
-
-        zoom_group = QtWidgets.QGroupBox("Zoom")
-        zoom_layout = QtWidgets.QGridLayout(zoom_group)
-        self.zoom_target_combo = self._combo(
-            (("Both cameras", "both"), ("Left camera", "left"), ("Right camera", "right"))
-        )
-        self.zoom_level_spin = QtWidgets.QSpinBox()
-        self.zoom_level_spin.setRange(0, 100)
-        self.zoom_level_spin.setValue(10)
-        self.zoom_buttons = {
-            "in": self._button("In", "advanced.zoom.in"),
-            "out": self._button("Out", "advanced.zoom.out"),
-            "stop": self._button("Stop", "advanced.zoom.stop"),
-            "set": self._button("Set", "advanced.zoom.set"),
-        }
-        self.zoom_status_label = QtWidgets.QLabel("")
-        self.zoom_status_label.setObjectName("statusStrip")
-        self.zoom_status_label.setWordWrap(True)
-        zoom_layout.addWidget(QtWidgets.QLabel("Target"), 0, 0)
-        zoom_layout.addWidget(self.zoom_target_combo, 0, 1)
-        zoom_layout.addWidget(QtWidgets.QLabel("Level"), 0, 2)
-        zoom_layout.addWidget(self.zoom_level_spin, 0, 3)
-        zoom_layout.addWidget(self.zoom_buttons["set"], 0, 4)
-        zoom_layout.addWidget(self.zoom_buttons["in"], 1, 0, 1, 2)
-        zoom_layout.addWidget(self.zoom_buttons["out"], 1, 2, 1, 2)
-        zoom_layout.addWidget(self.zoom_buttons["stop"], 1, 4)
-        zoom_layout.addWidget(self.zoom_status_label, 2, 0, 1, 5)
-        layout.addWidget(zoom_group)
-        return page
 
     def _connect_wiris_response_signal(self) -> None:
         panel = getattr(self.backend, "panel", None)
@@ -249,166 +196,7 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         self.wiris_status_label.setText(record["description"] or "Custom SDK command")
         self.wiris_status_label.setToolTip(record["description"])
 
-    def _build_px4_and_watch_tab(self) -> QtWidgets.QWidget:
-        page = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(page)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(6)
 
-        px4_group = QtWidgets.QGroupBox("PX4 tools")
-        px4_layout = QtWidgets.QGridLayout(px4_group)
-        self.px4_camera_combo = self._combo(
-            (
-                ("Pixhawk 1 / Left", "left"),
-                ("Pixhawk 2 / Right", "right"),
-                ("Drone Pixhawk / sysid 3", "drone"),
-            )
-        )
-        # Historical attribute name retained for compatibility with the
-        # backend facade; values are now PX4 semantic priority combos.
-        self.px4_priority_spins: dict[str, QtWidgets.QComboBox] = {}
-        for row, role in enumerate(("BOARD", "CAN1", "CAN2", "GPS1_MAG", "GPS2_MAG"), start=1):
-            spin = _build_px4_priority_combo(
-                {"BOARD": 0, "CAN1": 100, "CAN2": 90, "GPS1_MAG": 0, "GPS2_MAG": 0}[role]
-            )
-            self.px4_priority_spins[role] = spin
-            px4_layout.addWidget(QtWidgets.QLabel(role), row, 2)
-            px4_layout.addWidget(spin, row, 3)
-        px4_layout.addWidget(QtWidgets.QLabel("Side"), 0, 0)
-        px4_layout.addWidget(self.px4_camera_combo, 0, 1)
-        px4_layout.addWidget(self._button("Refresh MAG", "advanced.px4.refresh_mag"), 0, 4)
-        px4_layout.addWidget(self._button("Refresh attitude", "advanced.px4.refresh_attitude"), 1, 0, 1, 2)
-        px4_layout.addWidget(self._button("Shell", "advanced.px4.shell"), 1, 4)
-        px4_layout.addWidget(self._button("Apply MAG", "advanced.px4.apply_mag"), 2, 0, 1, 2)
-        px4_layout.addWidget(self._button("Save MAG", "advanced.px4.save_mag"), 3, 0, 1, 2)
-        px4_layout.addWidget(self._button("Reboot", "advanced.px4.reboot"), 4, 0, 1, 2)
-        manual_eth_button = QtWidgets.QPushButton("Apply persistent Ethernet MAV_2")
-        manual_eth_button.clicked.connect(self._apply_manual_px4_ethernet_setup)
-        px4_layout.addWidget(manual_eth_button, 5, 0, 1, 2)
-        self.px4_status_label = QtWidgets.QLabel(
-            "MAG: disarmed + PARAM readback · attitude calibration: QGC Sensor Setup"
-        )
-        self.px4_status_label.setObjectName("statusStrip")
-        self.px4_status_label.setWordWrap(True)
-        px4_layout.addWidget(self.px4_status_label, 6, 0, 1, 5)
-        layout.addWidget(px4_group)
-
-        transfer_group = QtWidgets.QGroupBox("MAVFTP file / log / firmware staging")
-        transfer_layout = QtWidgets.QGridLayout(transfer_group)
-        self.px4_transfer_local_edit = QtWidgets.QLineEdit()
-        self.px4_transfer_remote_edit = QtWidgets.QLineEdit("/fs/microsd/workstation/files/upload.bin")
-        self.px4_flash_usb_edit = QtWidgets.QLineEdit()
-        self.px4_flash_usb_edit.setPlaceholderText("Direct Pixhawk USB, e.g. /dev/ttyACM0")
-        self.px4_transfer_status_label = QtWidgets.QLabel("IDLE")
-        self.px4_transfer_status_label.setObjectName("statusStrip")
-        self.px4_transfer_status_label.setWordWrap(True)
-        browse_button = QtWidgets.QPushButton("Browse")
-        browse_button.clicked.connect(self._browse_px4_transfer_file)
-        restart_button = QtWidgets.QPushButton("Restart upload")
-        restart_button.clicked.connect(lambda: self._start_px4_transfer(resume=False, firmware=False))
-        resume_button = QtWidgets.QPushButton("Resume verified partial")
-        resume_button.clicked.connect(lambda: self._start_px4_transfer(resume=True, firmware=False))
-        download_button = QtWidgets.QPushButton("Restart download")
-        download_button.clicked.connect(lambda: self._start_px4_download(resume=False))
-        resume_download_button = QtWidgets.QPushButton("Resume download")
-        resume_download_button.clicked.connect(lambda: self._start_px4_download(resume=True))
-        stage_button = QtWidgets.QPushButton("Stage firmware")
-        stage_button.clicked.connect(lambda: self._start_px4_transfer(resume=False, firmware=True))
-        cancel_button = QtWidgets.QPushButton("Cancel")
-        cancel_button.clicked.connect(self._cancel_px4_transfer)
-        flash_button = QtWidgets.QPushButton("Flash selected local firmware by USB")
-        flash_button.clicked.connect(self._start_px4_usb_flash)
-        cancel_flash_button = QtWidgets.QPushButton("Cancel USB flash")
-        cancel_flash_button.clicked.connect(self._cancel_px4_usb_flash)
-        transfer_layout.addWidget(QtWidgets.QLabel("Local"), 0, 0)
-        transfer_layout.addWidget(self.px4_transfer_local_edit, 0, 1, 1, 3)
-        transfer_layout.addWidget(browse_button, 0, 4)
-        transfer_layout.addWidget(QtWidgets.QLabel("Remote"), 1, 0)
-        transfer_layout.addWidget(self.px4_transfer_remote_edit, 1, 1, 1, 4)
-        transfer_layout.addWidget(restart_button, 2, 0)
-        transfer_layout.addWidget(resume_button, 2, 1)
-        transfer_layout.addWidget(stage_button, 2, 2)
-        transfer_layout.addWidget(cancel_button, 2, 3)
-        transfer_layout.addWidget(download_button, 2, 4)
-        transfer_layout.addWidget(resume_download_button, 2, 5)
-        transfer_layout.addWidget(QtWidgets.QLabel("Direct USB"), 3, 0)
-        transfer_layout.addWidget(self.px4_flash_usb_edit, 3, 1, 1, 2)
-        transfer_layout.addWidget(flash_button, 3, 3)
-        transfer_layout.addWidget(cancel_flash_button, 3, 4)
-        transfer_layout.addWidget(self.px4_transfer_status_label, 4, 0, 1, 6)
-        layout.addWidget(transfer_group)
-
-        watch_group = QtWidgets.QGroupBox("Field watch")
-        watch_layout = QtWidgets.QGridLayout(watch_group)
-        watch_layout.setColumnStretch(1, 1)
-        self.watch_name_edit = QtWidgets.QLineEdit("local_z")
-        self.watch_message_edit = QtWidgets.QLineEdit("ATTITUDE")
-        self.watch_field_edit = QtWidgets.QLineEdit("z")
-        self.watch_remove_combo = QtWidgets.QComboBox()
-        watch_layout.addWidget(QtWidgets.QLabel("Name"), 0, 0)
-        watch_layout.addWidget(self.watch_name_edit, 0, 1)
-        watch_layout.addWidget(QtWidgets.QLabel("Message"), 1, 0)
-        watch_layout.addWidget(self.watch_message_edit, 1, 1)
-        watch_layout.addWidget(QtWidgets.QLabel("Field"), 2, 0)
-        watch_layout.addWidget(self.watch_field_edit, 2, 1)
-        watch_layout.addWidget(self._button("Add", "advanced.watch.add_mavlink"), 0, 2)
-        watch_layout.addWidget(self._button("Find fields", "advanced.watch.discover_mavlink"), 2, 2)
-        watch_layout.addWidget(QtWidgets.QLabel("Remove"), 3, 0)
-        watch_layout.addWidget(self.watch_remove_combo, 3, 1)
-        watch_layout.addWidget(self._button("Remove", "advanced.watch.remove"), 3, 2)
-        self.watch_status_label = QtWidgets.QLabel("")
-        self.watch_status_label.setObjectName("statusStrip")
-        self.watch_status_label.setWordWrap(True)
-        watch_layout.addWidget(self.watch_status_label, 4, 0, 1, 3)
-        layout.addWidget(watch_group)
-
-        baseline_group = QtWidgets.QGroupBox("Message fields")
-        baseline_layout = QtWidgets.QVBoxLayout(baseline_group)
-        baseline_actions = QtWidgets.QHBoxLayout()
-        baseline_actions.addWidget(self._button("Refresh", "advanced.baseline.scan"))
-        baseline_actions.addStretch(1)
-        baseline_layout.addLayout(baseline_actions)
-        self.baseline_mavlink_model = _table_model(self, ("Message", "Fields"))
-        self.baseline_mavlink_table = QtWidgets.QTableView()
-        self.baseline_mavlink_table.setModel(self.baseline_mavlink_model)
-        self.baseline_mavlink_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.baseline_mavlink_table.verticalHeader().setVisible(False)
-        self.baseline_mavlink_table.setMaximumHeight(100)
-        self.baseline_mavlink_table.horizontalHeader().setStretchLastSection(True)
-        baseline_layout.addWidget(self.baseline_mavlink_table)
-        self.baseline_status_label = QtWidgets.QLabel("")
-        self.baseline_status_label.setObjectName("statusStrip")
-        self.baseline_status_label.setWordWrap(True)
-        baseline_layout.addWidget(self.baseline_status_label)
-        layout.addWidget(baseline_group, 1)
-        return page
-
-    def _build_preview_tab(self) -> QtWidgets.QWidget:
-        page = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(page)
-        layout.setContentsMargins(6, 6, 6, 6)
-        controls = QtWidgets.QHBoxLayout()
-        controls.addWidget(self._button("Refresh", "advanced.preview.refresh"))
-        controls.addStretch(1)
-        layout.addLayout(controls)
-        row = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        self.preview_labels: dict[str, QtWidgets.QLabel] = {}
-        for side in ("left", "right"):
-            label = QtWidgets.QLabel(f"{side.upper()} preview waiting")
-            label.setAlignment(QtCore.Qt.AlignCenter)
-            label.setMinimumSize(320, 180)
-            label.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Expanding)
-            label.setObjectName("calibrationPreview")
-            self.preview_labels[side] = label
-            row.addWidget(label)
-        row.setStretchFactor(0, 1)
-        row.setStretchFactor(1, 1)
-        layout.addWidget(row, 1)
-        self.preview_status_label = QtWidgets.QLabel("Pixels: OpenCV RDF")
-        self.preview_status_label.setObjectName("statusStrip")
-        self.preview_status_label.setWordWrap(True)
-        layout.addWidget(self.preview_status_label)
-        return page
 
     def _connect_preview_signal(self) -> None:
         panel = getattr(self.backend, "panel", self.backend)
@@ -447,37 +235,6 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         self.preview_status_label.setText(_compact_text(preview_detail))
         self.preview_status_label.setToolTip(preview_detail)
 
-    def _build_media_tab(self) -> QtWidgets.QWidget:
-        page = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(page)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(6)
-        tools_group = QtWidgets.QGroupBox("Manual recording and files")
-        tools_layout = QtWidgets.QHBoxLayout(tools_group)
-        tools_layout.setContentsMargins(6, 6, 6, 6)
-        manual_record_button = self._button("Manual record", "recording.toggle")
-        manual_record_button.setToolTip(
-            "Advanced fallback for recording outside an automatic Measurement run."
-        )
-        tools_layout.addWidget(manual_record_button)
-        tools_layout.addStretch(1)
-        layout.addWidget(tools_group)
-
-        video_group = QtWidgets.QGroupBox("Video playback")
-        video_layout = QtWidgets.QHBoxLayout(video_group)
-        video_layout.setContentsMargins(6, 6, 6, 6)
-        self.media_video_combo = QtWidgets.QComboBox()
-        video_layout.addWidget(self.media_video_combo, 1)
-        video_layout.addWidget(self._button("Play", "advanced.media.open_video"))
-        layout.addWidget(video_group)
-        self.media_status_label = QtWidgets.QLabel(
-            "Current data and storage health are available in Data; legacy recordings open in the file manager."
-        )
-        self.media_status_label.setObjectName("statusStrip")
-        self.media_status_label.setWordWrap(True)
-        layout.addWidget(self.media_status_label)
-        layout.addStretch(1)
-        return page
 
     def _refresh_custom_watch_selector(self) -> None:
         panel = getattr(self.backend, "panel", self.backend)

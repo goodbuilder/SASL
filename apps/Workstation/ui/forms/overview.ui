@@ -1,0 +1,707 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>OverviewWorkspace</class>
+ <widget class="QWidget" name="OverviewWorkspace">
+  <layout class="QVBoxLayout" name="QVBoxLayout" stretch="0,0,0,0,0,1">
+   <property name="leftMargin">
+    <number>8</number>
+   </property>
+   <property name="topMargin">
+    <number>8</number>
+   </property>
+   <property name="rightMargin">
+    <number>8</number>
+   </property>
+   <property name="bottomMargin">
+    <number>8</number>
+   </property>
+   <property name="spacing">
+    <number>6</number>
+   </property>
+   <item>
+    <widget class="QFrame" name="workstationHeader">
+     <layout class="QVBoxLayout" name="QVBoxLayout2" stretch="0,0">
+      <property name="leftMargin">
+       <number>8</number>
+      </property>
+      <property name="topMargin">
+       <number>6</number>
+      </property>
+      <property name="rightMargin">
+       <number>8</number>
+      </property>
+      <property name="bottomMargin">
+       <number>6</number>
+      </property>
+      <property name="spacing">
+       <number>1</number>
+      </property>
+      <item>
+       <widget class="QLabel" name="workspaceTitle">
+        <property name="text">
+         <string>Overview</string>
+        </property>
+        <property name="wordWrap">
+         <bool>false</bool>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLabel" name="workspaceSubtitle">
+        <property name="text">
+         <string>Connect → verify → measure → auto-save</string>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QGroupBox" name="QGroupBox">
+     <property name="title">
+      <string>Status</string>
+     </property>
+     <layout class="QGridLayout" name="QGridLayout" columnstretch="0,0" rowstretch="0,0,0,0">
+      <property name="leftMargin">
+       <number>6</number>
+      </property>
+      <property name="topMargin">
+       <number>6</number>
+      </property>
+      <property name="rightMargin">
+       <number>6</number>
+      </property>
+      <property name="bottomMargin">
+       <number>6</number>
+      </property>
+      <property name="spacing">
+       <number>5</number>
+      </property>
+      <item row="0" column="0" rowspan="1" colspan="1">
+       <widget class="QWidget" name="indicators_camera_leftSlot">
+        <property name="toolTip">
+         <string>Runtime StatusIndicator: CAM L</string>
+        </property>
+        <layout class="QVBoxLayout" name="indicators_camera_leftSlotLayout">
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="topMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <property name="bottomMargin">
+          <number>0</number>
+         </property>
+        </layout>
+        <property name="runtimeLabel" stdset="0">
+         <string>CAM L</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1" rowspan="1" colspan="1">
+       <widget class="QWidget" name="indicators_camera_rightSlot">
+        <property name="toolTip">
+         <string>Runtime StatusIndicator: CAM R</string>
+        </property>
+        <layout class="QVBoxLayout" name="indicators_camera_rightSlotLayout">
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="topMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <property name="bottomMargin">
+          <number>0</number>
+         </property>
+        </layout>
+        <property name="runtimeLabel" stdset="0">
+         <string>CAM R</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0" rowspan="1" colspan="1">
+       <widget class="QWidget" name="indicators_pixhawk_leftSlot">
+        <property name="toolTip">
+         <string>Runtime StatusIndicator: P1</string>
+        </property>
+        <layout class="QVBoxLayout" name="indicators_pixhawk_leftSlotLayout">
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="topMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <property name="bottomMargin">
+          <number>0</number>
+         </property>
+        </layout>
+        <property name="runtimeLabel" stdset="0">
+         <string>P1</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1" rowspan="1" colspan="1">
+       <widget class="QWidget" name="indicators_pixhawk_rightSlot">
+        <property name="toolTip">
+         <string>Runtime StatusIndicator: P2</string>
+        </property>
+        <layout class="QVBoxLayout" name="indicators_pixhawk_rightSlotLayout">
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="topMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <property name="bottomMargin">
+          <number>0</number>
+         </property>
+        </layout>
+        <property name="runtimeLabel" stdset="0">
+         <string>P2</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="0" rowspan="1" colspan="1">
+       <widget class="QWidget" name="indicators_gnss_baseSlot">
+        <property name="toolTip">
+         <string>Runtime StatusIndicator: BASE</string>
+        </property>
+        <layout class="QVBoxLayout" name="indicators_gnss_baseSlotLayout">
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="topMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <property name="bottomMargin">
+          <number>0</number>
+         </property>
+        </layout>
+        <property name="runtimeLabel" stdset="0">
+         <string>BASE</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1" rowspan="1" colspan="1">
+       <widget class="QWidget" name="indicators_detectionSlot">
+        <property name="toolTip">
+         <string>Runtime StatusIndicator: DET</string>
+        </property>
+        <layout class="QVBoxLayout" name="indicators_detectionSlotLayout">
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="topMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <property name="bottomMargin">
+          <number>0</number>
+         </property>
+        </layout>
+        <property name="runtimeLabel" stdset="0">
+         <string>DET</string>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="0" rowspan="1" colspan="1">
+       <widget class="QWidget" name="indicators_measurementSlot">
+        <property name="toolTip">
+         <string>Runtime StatusIndicator: MEAS</string>
+        </property>
+        <layout class="QVBoxLayout" name="indicators_measurementSlotLayout">
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="topMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <property name="bottomMargin">
+          <number>0</number>
+         </property>
+        </layout>
+        <property name="runtimeLabel" stdset="0">
+         <string>MEAS</string>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="1" rowspan="1" colspan="1">
+       <widget class="QWidget" name="indicators_recordingSlot">
+        <property name="toolTip">
+         <string>Runtime StatusIndicator: REC</string>
+        </property>
+        <layout class="QVBoxLayout" name="indicators_recordingSlotLayout">
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="topMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <property name="bottomMargin">
+          <number>0</number>
+         </property>
+        </layout>
+        <property name="runtimeLabel" stdset="0">
+         <string>REC</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QGroupBox" name="QGroupBox2">
+     <property name="title">
+      <string>Latest result</string>
+     </property>
+     <layout class="QGridLayout" name="QGridLayout2" columnstretch="1" rowstretch="0,0,0">
+      <property name="leftMargin">
+       <number>8</number>
+      </property>
+      <property name="topMargin">
+       <number>8</number>
+      </property>
+      <property name="rightMargin">
+       <number>8</number>
+      </property>
+      <property name="bottomMargin">
+       <number>8</number>
+      </property>
+      <property name="spacing">
+       <number>6</number>
+      </property>
+      <item row="0" column="0" rowspan="1" colspan="1">
+       <widget class="QWidget" name="session_valueSlot">
+        <property name="toolTip">
+         <string>Runtime EngineeringValue: Storage</string>
+        </property>
+        <layout class="QVBoxLayout" name="session_valueSlotLayout">
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="topMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <property name="bottomMargin">
+          <number>0</number>
+         </property>
+        </layout>
+        <property name="runtimeLabel" stdset="0">
+         <string>Storage</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0" rowspan="1" colspan="1">
+       <widget class="QWidget" name="measurement_valueSlot">
+        <property name="toolTip">
+         <string>Runtime EngineeringValue: Result</string>
+        </property>
+        <layout class="QVBoxLayout" name="measurement_valueSlotLayout">
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="topMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <property name="bottomMargin">
+          <number>0</number>
+         </property>
+        </layout>
+        <property name="runtimeLabel" stdset="0">
+         <string>Result</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="0" rowspan="1" colspan="1">
+       <widget class="QWidget" name="contract_valueSlot">
+        <property name="toolTip">
+         <string>Runtime EngineeringValue: Output</string>
+        </property>
+        <layout class="QVBoxLayout" name="contract_valueSlotLayout">
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="topMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <property name="bottomMargin">
+          <number>0</number>
+         </property>
+        </layout>
+        <property name="runtimeLabel" stdset="0">
+         <string>Output</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QGroupBox" name="QGroupBox3">
+     <property name="title">
+      <string>Measurement methods · read-only</string>
+     </property>
+     <layout class="QGridLayout" name="QGridLayout3" columnstretch="0,0" rowstretch="0,0,0,0,0">
+      <property name="leftMargin">
+       <number>6</number>
+      </property>
+      <property name="topMargin">
+       <number>6</number>
+      </property>
+      <property name="rightMargin">
+       <number>6</number>
+      </property>
+      <property name="bottomMargin">
+       <number>6</number>
+      </property>
+      <property name="spacing">
+       <number>5</number>
+      </property>
+      <item row="0" column="0" rowspan="1" colspan="1">
+       <widget class="QPushButton" name="measurement_method_cards_pixhawk_rtk_live">
+        <property name="styleObjectName" stdset="0">
+         <string>overviewMethodCard_pixhawk_rtk_live</string>
+        </property>
+        <property name="text">
+         <string>Pixhawk attitude + GPS/RTK
+BLOCKED · V0 / B0 / F0</string>
+        </property>
+        <property name="styleSheet">
+         <string>text-align:left; padding:6px;</string>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>54</height>
+         </size>
+        </property>
+        <property name="navigationOnly" stdset="0">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1" rowspan="1" colspan="1">
+       <widget class="QPushButton" name="measurement_method_cards_pixhawk_rp_gps_baseline_yaw">
+        <property name="styleObjectName" stdset="0">
+         <string>overviewMethodCard_pixhawk_rp_gps_baseline_yaw</string>
+        </property>
+        <property name="text">
+         <string>Pixhawk R/P + GPS baseline yaw (90°)
+BLOCKED · V0 / B0 / F0</string>
+        </property>
+        <property name="styleSheet">
+         <string>text-align:left; padding:6px;</string>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>54</height>
+         </size>
+        </property>
+        <property name="navigationOnly" stdset="0">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0" rowspan="1" colspan="1">
+       <widget class="QPushButton" name="measurement_method_cards_checkerboard_stereo">
+        <property name="styleObjectName" stdset="0">
+         <string>overviewMethodCard_checkerboard_stereo</string>
+        </property>
+        <property name="text">
+         <string>Checkerboard stereo R,t
+BLOCKED · V0 / B0 / F0</string>
+        </property>
+        <property name="styleSheet">
+         <string>text-align:left; padding:6px;</string>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>54</height>
+         </size>
+        </property>
+        <property name="navigationOnly" stdset="0">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1" rowspan="1" colspan="1">
+       <widget class="QPushButton" name="measurement_method_cards_horizon_hybrid">
+        <property name="styleObjectName" stdset="0">
+         <string>overviewMethodCard_horizon_hybrid</string>
+        </property>
+        <property name="text">
+         <string>Horizon R/P + live Pixhawk/GNSS
+BLOCKED · V0 / B0 / F0</string>
+        </property>
+        <property name="styleSheet">
+         <string>text-align:left; padding:6px;</string>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>54</height>
+         </size>
+        </property>
+        <property name="navigationOnly" stdset="0">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="0" rowspan="1" colspan="1">
+       <widget class="QPushButton" name="measurement_method_cards_mountain_gnss">
+        <property name="styleObjectName" stdset="0">
+         <string>overviewMethodCard_mountain_gnss</string>
+        </property>
+        <property name="text">
+         <string>Mountain + GNSS
+BLOCKED · V0 / B0 / F0</string>
+        </property>
+        <property name="styleSheet">
+         <string>text-align:left; padding:6px;</string>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>54</height>
+         </size>
+        </property>
+        <property name="navigationOnly" stdset="0">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1" rowspan="1" colspan="1">
+       <widget class="QPushButton" name="measurement_method_cards_drone_rtk_rotation_hybrid">
+        <property name="styleObjectName" stdset="0">
+         <string>overviewMethodCard_drone_rtk_rotation_hybrid</string>
+        </property>
+        <property name="text">
+         <string>Drone RTK Rotation + live GNSS
+BLOCKED · V0 / B0 / F0</string>
+        </property>
+        <property name="styleSheet">
+         <string>text-align:left; padding:6px;</string>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>54</height>
+         </size>
+        </property>
+        <property name="navigationOnly" stdset="0">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="0" rowspan="1" colspan="1">
+       <widget class="QPushButton" name="measurement_method_cards_drone_rtk_multiview">
+        <property name="styleObjectName" stdset="0">
+         <string>overviewMethodCard_drone_rtk_multiview</string>
+        </property>
+        <property name="text">
+         <string>Drone RTK Multi-view R,t
+BLOCKED · V0 / B0 / F0</string>
+        </property>
+        <property name="styleSheet">
+         <string>text-align:left; padding:6px;</string>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>54</height>
+         </size>
+        </property>
+        <property name="navigationOnly" stdset="0">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="1" rowspan="1" colspan="1">
+       <widget class="QPushButton" name="measurement_method_cards_terrain_pnp">
+        <property name="styleObjectName" stdset="0">
+         <string>overviewMethodCard_terrain_pnp</string>
+        </property>
+        <property name="text">
+         <string>Terrain PnP
+BLOCKED · V0 / B0 / F0</string>
+        </property>
+        <property name="styleSheet">
+         <string>text-align:left; padding:6px;</string>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>54</height>
+         </size>
+        </property>
+        <property name="navigationOnly" stdset="0">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="0" rowspan="1" colspan="1">
+       <widget class="QPushButton" name="measurement_method_cards_combined_hybrid">
+        <property name="styleObjectName" stdset="0">
+         <string>overviewMethodCard_combined_hybrid</string>
+        </property>
+        <property name="text">
+         <string>Combined candidate
+BLOCKED · V0 / B0 / F0</string>
+        </property>
+        <property name="styleSheet">
+         <string>text-align:left; padding:6px;</string>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>54</height>
+         </size>
+        </property>
+        <property name="navigationOnly" stdset="0">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="1" rowspan="1" colspan="1">
+       <widget class="QPushButton" name="measurement_method_cards_cloud_gnss">
+        <property name="styleObjectName" stdset="0">
+         <string>overviewMethodCard_cloud_gnss</string>
+        </property>
+        <property name="text">
+         <string>Cloud far-field rotation + live GNSS
+BLOCKED · V0 / B0 / F0</string>
+        </property>
+        <property name="styleSheet">
+         <string>text-align:left; padding:6px;</string>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>54</height>
+         </size>
+        </property>
+        <property name="navigationOnly" stdset="0">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <layout class="QHBoxLayout" name="QHBoxLayout" stretch="0,0,0,1">
+     <property name="leftMargin">
+      <number>0</number>
+     </property>
+     <property name="topMargin">
+      <number>0</number>
+     </property>
+     <property name="rightMargin">
+      <number>0</number>
+     </property>
+     <property name="bottomMargin">
+      <number>0</number>
+     </property>
+     <property name="spacing">
+      <number>6</number>
+     </property>
+     <item>
+      <widget class="QPushButton" name="camera_button">
+       <property name="text">
+        <string>Connect cameras</string>
+       </property>
+       <property name="contextId" stdset="0">
+        <string>devices.cameras</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="measurement_button">
+       <property name="text">
+        <string>Measure</string>
+       </property>
+       <property name="contextId" stdset="0">
+        <string>processing.measurement</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="diagnostics_button">
+       <property name="text">
+        <string>Diagnostics</string>
+       </property>
+       <property name="contextId" stdset="0">
+        <string>diagnostics.system</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <spacer name="overviewSpacer37">
+       <property name="orientation">
+        <enum>Qt::Horizontal</enum>
+       </property>
+       <property name="sizeHint">
+        <size>
+         <width>0</width>
+         <height>0</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <spacer name="overviewSpacer38">
+     <property name="orientation">
+      <enum>Qt::Vertical</enum>
+     </property>
+     <property name="sizeHint">
+      <size>
+       <width>0</width>
+       <height>0</height>
+      </size>
+     </property>
+    </spacer>
+   </item>
+  </layout>
+ </widget>
+ <resources />
+ <connections />
+</ui>

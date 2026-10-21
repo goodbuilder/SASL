@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>MC100 이해하기 | Stereo Calibration v1.2</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg:#f3f6f7; --paper:#fff; --soft:#edf2f3; --ink:#17242b; --muted:#53666e;
+      --line:#d4e0e3; --teal:#087f83; --teal-soft:#dcf1ee; --blue:#3769a7;
+      --blue-soft:#e4edf8; --amber:#875700; --amber-soft:#fff1d6; --rose:#a13c48;
+      --shadow:0 12px 32px rgb(28 55 66 / 8%); --radius:18px;
+      font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+    }
+    @media(prefers-color-scheme:dark){:root{
+      --bg:#10181c;--paper:#182328;--soft:#202e34;--ink:#edf4f5;--muted:#a8b9be;
+      --line:#35484f;--teal:#73d2c9;--teal-soft:#193c3a;--blue:#98baf0;--blue-soft:#202f46;
+      --amber:#ffd27e;--amber-soft:#3c301d;--rose:#ffb7bd;--shadow:0 12px 32px rgb(0 0 0 / 22%);
+    }}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--ink);line-height:1.65}
+    a{color:var(--teal);text-underline-offset:3px} code,.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+    code{color:var(--blue);overflow-wrap:anywhere} .wrap{width:min(1120px,calc(100% - 32px));margin:auto}
+    header{padding:48px 0 22px}.eyebrow{font-size:.78rem;font-weight:850;letter-spacing:.13em;color:var(--teal);text-transform:uppercase}
+    h1{font-size:clamp(2.2rem,5.5vw,4.2rem);line-height:1.08;letter-spacing:-.045em;margin:10px 0 12px}
+    .lead{max-width:840px;color:var(--muted);font-size:clamp(1.05rem,2vw,1.28rem);margin:0}
+    .metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:11px;margin:22px 0}
+    .metric{padding:16px;border:1px solid var(--line);border-radius:14px;background:var(--paper);box-shadow:var(--shadow);min-height:100px}
+    .metric b{display:block;color:var(--teal);font-size:clamp(1.45rem,3vw,2.1rem);line-height:1.15}.metric span{display:block;margin-top:7px;color:var(--muted);font-size:.88rem}
+    .notice{margin:16px 0;padding:14px 17px;border-left:5px solid var(--amber);border-radius:10px;background:var(--amber-soft)}
+    nav{display:flex;flex-wrap:wrap;gap:8px;margin:22px 0 4px}nav a{padding:6px 10px;border:1px solid var(--line);border-radius:999px;background:var(--paper);color:var(--ink);font-size:.84rem;text-decoration:none}
+    nav a:hover{border-color:var(--teal);color:var(--teal)} main{padding-bottom:42px}
+    section{margin:20px 0;padding:clamp(18px,3.5vw,32px);border:1px solid var(--line);border-radius:var(--radius);background:var(--paper);box-shadow:var(--shadow);scroll-margin-top:12px}
+    h2{font-size:clamp(1.45rem,3vw,2rem);line-height:1.2;letter-spacing:-.025em;margin:0 0 12px}h3{font-size:1.16rem;line-height:1.3;margin:0 0 8px}
+    h4{font-size:.85rem;letter-spacing:.06em;text-transform:uppercase;color:var(--teal);margin:15px 0 4px}
+    p{margin:7px 0 11px}.muted{color:var(--muted)}.small{font-size:.88rem}
+    .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;align-items:start}
+    .card{padding:16px;border:1px solid var(--line);border-radius:13px;background:var(--soft)}
+    .concept{margin-top:16px;padding:18px;border:1px solid var(--line);border-radius:16px;background:linear-gradient(135deg,var(--paper),var(--soft))}
+    .concept-title{display:flex;align-items:baseline;gap:10px}.num{color:var(--teal);font:850 1rem ui-monospace,SFMono-Regular,Consolas,monospace}
+    .part p{margin:4px 0 8px} figure{margin:14px 0;padding:11px;border:1px solid var(--line);border-radius:13px;background:var(--soft);color:var(--ink)}
+    figure svg{display:block;width:100%;height:auto;max-height:350px}figcaption{font-size:.87rem;color:var(--muted);margin:8px 4px 2px}
+    .box{fill:var(--paper);stroke:var(--line);stroke-width:2}.box-teal{fill:var(--teal-soft);stroke:var(--teal);stroke-width:2}
+    .box-blue{fill:var(--blue-soft);stroke:var(--blue);stroke-width:2}.box-amber{fill:var(--amber-soft);stroke:var(--amber);stroke-width:2}
+    .arrow{fill:none;stroke:currentColor;stroke-width:3;marker-end:url(#ah)}.text{fill:var(--ink);font:700 15px system-ui,sans-serif}.tiny{fill:var(--muted);font:500 12px system-ui,sans-serif}
+    .eq{padding:13px;margin:12px 0;border-radius:11px;background:var(--soft);font:750 clamp(.95rem,2vw,1.18rem) ui-monospace,SFMono-Regular,Consolas,monospace;overflow-x:auto;white-space:nowrap}
+    .scroll{width:100%;overflow-x:auto;border:1px solid var(--line);border-radius:11px}table{width:100%;border-collapse:collapse;font-size:.92rem}
+    th,td{padding:9px 11px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{background:var(--soft);font-size:.81rem}tr:last-child td{border-bottom:0}
+    .calc{display:grid;grid-template-columns:1.2fr .8fr;gap:14px;align-items:center;padding:15px;margin:14px 0;border:1px solid var(--line);border-radius:14px;background:var(--teal-soft)}
+    .calc label{display:block;font-weight:750;margin-bottom:5px}.calc input{width:100%;accent-color:var(--teal)}.calc-result{text-align:right}.calc-result output{display:block;font-size:1.5rem;font-weight:850;color:var(--teal)}
+    details{margin:8px 0;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--paper)}summary{cursor:pointer;color:var(--teal);font-weight:750}details p{margin:8px 0 2px}
+    .callout{padding:13px 15px;margin:13px 0;border-left:4px solid var(--teal);border-radius:9px;background:var(--teal-soft)}.callout.warn{border-color:var(--amber);background:var(--amber-soft)}
+    ul,ol{padding-left:1.25rem}li{margin:5px 0}.sources{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 18px;list-style:none;padding:0}.sources li{margin:0;overflow-wrap:anywhere}
+    footer{padding:18px 0 45px;color:var(--muted);font-size:.87rem}
+    @media(max-width:760px){.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.grid,.sources{grid-template-columns:1fr}.calc{grid-template-columns:1fr}.calc-result{text-align:left}}
+    @media(max-width:430px){.wrap{width:calc(100% - 22px)}header{padding-top:32px}section{padding:17px 13px}.metric{padding:12px;min-height:90px}th,td{padding:8px}}
+    @media print{body{background:#fff}.metric,section{box-shadow:none;break-inside:avoid}nav{display:none}details>*:not(summary){display:block}a{color:inherit}}
+  </style>
+</head>
+<body>
+  <header class="wrap">
+    <div class="eyebrow">Teach-me · Stereo calibration · v1.2</div>
+    <h1>MC100은 100회 비행이 아니다</h1>
+    <p class="lead">MC100은 기존 39개 실행 기록에 모의 센서오차 표본을 적용해 오프라인으로 다시 계산하는 절차다. 100 trial이 각기 여러 조건을 포함하므로, 실제 분석량은 100보다 훨씬 크다.</p>
+    <div class="metrics" aria-label="MC100 핵심 수치">
+      <div class="metric"><b>100</b><span>MC trial · 번호 000–099</span></div>
+      <div class="metric"><b>39 → 31 + 8</b><span>run 기록 → 교정 + 잠긴 V0 평가</span></div>
+      <div class="metric"><b>424</b><span>primary case ID / trial</span></div>
+      <div class="metric"><b>42,400</b><span>전체 primary case ID</span></div>
+    </div>
+    <div class="notice"><strong>요약:</strong> 한 trial은 25개 G0 교정 슬롯과 6개 G1 교정 슬롯에서 yaw 초기값과 표본 범위를 조합한다. 8개 V0는 교정에서 제외하고 freeze 뒤에 평가한다.</div>
+    <nav aria-label="목차"><a href="#read">읽는 법</a><a href="#scene">예제 조건</a><a href="#concepts">기초 개념</a><a href="#method">분석 순서</a><a href="#worked">끝까지 계산</a><a href="#status">검산과 상태</a><a href="#frames">좌표 계약</a></nav>
+  </header>
+
+  <main class="wrap">
+    <section id="read">
+      <h2>이 페이지에서 다시 계산할 것</h2>
+      <div class="grid">
+        <div class="card"><h3>목표</h3><p>계산기로 한 trial의 case 수를 구하고, 100 trial의 전체 수를 손으로 재현한다. 그 뒤 각 결과가 어떤 방법·입력·표본 범위에 속하는지 구분한다.</p></div>
+        <div class="card"><h3>필요한 도구</h3><p>곱셈과 덧셈이 가능한 계산기면 충분하다. 이 예제의 known answer는 solver의 위치추정치가 아니라 analyzer의 교정 case ID 개수다.</p></div>
+      </div>
+    </section>
+
+    <section id="scene">
+      <h2>예제 장면: 실제 manifest의 분석량</h2>
+      <p>아래 조건은 v1.2 실험 규격과 run manifest에서 읽었다. 39개 실행 슬롯 중 <code>V0</code> 8개는 최종 평가 역할이다. 나머지 31개가 MC 교정 루프에 들어간다. <a href="03_experiment_spec.json">실험 규격</a> · <a href="04_run_manifest.json">run manifest</a></p>
+      <div class="scroll"><table><thead><tr><th>입력</th><th>실제 값</th><th>뜻</th></tr></thead><tbody>
+        <tr><td>전체 실행 슬롯</td><td><code>39</code></td><td>G0/G1의 원본 run ID.</td></tr>
+        <tr><td>교정 슬롯</td><td><code>31 = G0 25 + G1 6</code></td><td>각 MC trial에서 교정에 사용한다.</td></tr>
+        <tr><td>최종평가 슬롯</td><td><code>8 = G0 V0 5 + G1 V0 3</code></td><td>알고리즘·설정·경로를 freeze한 뒤 연다.</td></tr>
+        <tr><td>G0 yaw 경우</td><td><code>8</code></td><td>기존 Y0–Y6 7개와 GPS_YAW90.</td></tr>
+        <tr><td>G1 yaw 경우</td><td><code>2</code></td><td>primary zero와 GPS_YAW90.</td></tr>
+        <tr><td>표본 범위</td><td><code>2</code></td><td><code>all_data</code>와 <code>matched_200</code>.</td></tr>
+        <tr><td>Monte Carlo 반복</td><td><code>100</code></td><td>trial index 000–099.</td></tr>
+      </tbody></table></div>
+      <div class="grid" style="margin-top:13px">
+        <div class="card"><h3>주 오차 설계값</h3><p>카메라 장착 IMU roll/pitch: <code>σ=0.02°</code>. 민감도 조건은 <code>0.05°</code>다.</p><p>카메라와 드론 RTK 위치: <code>σ_ENU=(0.02, 0.02, 0.04) m</code>.</p></div>
+        <div class="card"><h3>실험 해석</h3><p>이 수치는 모의 관측을 만드는 설계값이다. 장비 측정 결과나 현장 성능 보증이 아니다.</p><p>카메라 광학 중심은 측정 RTK 위치에 고정한다. 카메라 위치를 solver가 교정하지 않는다.</p></div>
+      </div>
+    </section>
+
+    <section id="concepts">
+      <h2>0. 기초 개념</h2>
+
+      <article class="concept" id="trial">
+        <div class="concept-title"><span class="num">0.1</span><h3>trial은 비행 한 번이 아니다</h3></div>
+        <div class="part"><h4>무엇인가</h4><p>Monte Carlo trial은 모의 측정오차 한 벌을 뜻한다. 같은 원본 촬영을 두고 trial마다 합성 센서 관측을 만들어 교정 결과의 변동을 본다.</p></div>
+        <div class="part"><h4>왜 필요한가</h4><p>“100회”를 물리 비행 100회로 읽으면 데이터 수집량을 잘못 계산한다. MC 횟수는 오프라인 반복 수다.</p></div>
+        <div class="part"><h4>예제의 숫자로</h4><p>trial index <code>t=0,…,99</code>가 있다. v1.2 규격은 원본 manifest 39개를 정의하며, MC 반복마다 새 Gazebo 비행을 뜻하지 않는다.</p>
+          <figure><svg viewBox="0 0 720 160" role="img" aria-label="39개 기존 실행 기록을 100개의 오프라인 센서오차 trial에서 재사용한다">
+            <defs><marker id="a1" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0 0 L0 6 L9 3z" fill="currentColor"/></marker></defs>
+            <rect class="box-blue" x="18" y="36" width="180" height="76" rx="13"/><text class="text" x="108" y="66" text-anchor="middle">기존 39개 기록</text><text class="tiny" x="108" y="89" text-anchor="middle">영상 · GT · 카메라 pose</text>
+            <path class="arrow" d="M198 74 H270"/>
+            <rect class="box-teal" x="278" y="36" width="185" height="76" rx="13"/><text class="text" x="370" y="66" text-anchor="middle">오차 표본 생성</text><text class="tiny" x="370" y="89" text-anchor="middle">trial 000 … 099</text>
+            <path class="arrow" d="M463 74 H535"/>
+            <rect class="box" x="543" y="36" width="158" height="76" rx="13"/><text class="text" x="622" y="66" text-anchor="middle">오프라인 분석</text><text class="tiny" x="622" y="89" text-anchor="middle">새 비행 아님</text>
+            <text class="tiny" x="360" y="145" text-anchor="middle">시험하는 것은 합성 관측오차의 영향이며, 원본 비행 기록은 재사용한다.</text>
+          </svg><figcaption>기존 run을 다시 사용한다. trial 번호가 바뀌어도 Gazebo 실행 수가 늘지 않는다.</figcaption></figure>
+        </div>
+        <div class="part"><h4>직접 확인</h4><details><summary>trial 007은 새 비행인가?</summary><p>아니다. 같은 source run을 trial 007의 합성 오차로 다시 처리한다.</p></details></div>
+        <div class="part"><h4>기호</h4><div class="scroll"><table><thead><tr><th>기호</th><th>뜻</th><th>단위와 위치</th></tr></thead><tbody><tr><td><code>t</code></td><td>trial index</td><td>정수 0–99 · config와 경로</td></tr><tr><td><code>T</code></td><td>MC trial 수</td><td>회 · spec의 <code>mc_repeats=100</code></td></tr><tr><td><code>run_id</code></td><td>원본 실행 슬롯</td><td>문자열 · run manifest</td></tr></tbody></table></div></div>
+      </article>
+
+      <article class="concept" id="case">
+        <div class="concept-title"><span class="num">0.2</span><h3>case ID는 run·trial·yaw·범위를 묶는다</h3></div>
+        <div class="part"><h4>무엇인가</h4><p>한 교정 case identity는 <code>(run_id, trial_index, yaw_case, data_scope)</code> 조합이다. A/B/C와 자세 variant의 각 solver 결과는 case 안에 들어간다.</p></div>
+        <div class="part"><h4>왜 필요한가</h4><p>42,400은 비행 수나 solver 결과 행 수가 아니다. 서로 다른 조건을 구별하는 case ID 수다.</p></div>
+        <div class="part"><h4>예제의 숫자로</h4><div class="eq">G0: 25 × 8 yaw × 2 scope = 400 cases/trial</div><div class="eq">G1: 6 × 2 yaw × 2 scope = 24 cases/trial</div><div class="eq">400 + 24 = 424 cases/trial; 424 × 100 = 42,400 case ID</div>
+          <figure><svg viewBox="0 0 760 160" role="img" aria-label="G0 400개와 G1 24개 case를 더해 trial당 424개, 100회에서 42400개가 된다">
+            <defs><marker id="a2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0 0 L0 6 L9 3z" fill="currentColor"/></marker></defs>
+            <rect class="box-blue" x="14" y="30" width="145" height="66" rx="12"/><text class="text" x="86" y="58" text-anchor="middle">G0 · 400</text><text class="tiny" x="86" y="80" text-anchor="middle">25×8×2</text>
+            <text class="text" x="182" y="70" text-anchor="middle">+</text>
+            <rect class="box" x="207" y="30" width="145" height="66" rx="12"/><text class="text" x="279" y="58" text-anchor="middle">G1 · 24</text><text class="tiny" x="279" y="80" text-anchor="middle">6×2×2</text>
+            <path class="arrow" d="M352 63 H405"/>
+            <rect class="box-teal" x="413" y="30" width="120" height="66" rx="12"/><text class="text" x="473" y="58" text-anchor="middle">424</text><text class="tiny" x="473" y="80" text-anchor="middle">per trial</text>
+            <path class="arrow" d="M533 63 H586"/>
+            <rect class="box-amber" x="594" y="30" width="150" height="66" rx="12"/><text class="text" x="669" y="58" text-anchor="middle">42,400</text><text class="tiny" x="669" y="80" text-anchor="middle">100 trials</text>
+            <text class="tiny" x="380" y="132" text-anchor="middle">각 case는 6개 main method×attitude fit을 포함한다: 3 methods × 2 variants.</text>
+          </svg><figcaption>primary case bundle 수와 main fit 수는 다른 단위다. 42,400 bundles × 6 main fits = 254,400 main fits.</figcaption></figure>
+        </div>
+        <div class="part"><h4>직접 확인</h4><details><summary>G1 한 슬롯은 한 trial에서 몇 case인가?</summary><p>G1에는 primary zero와 GPS_YAW90 두 yaw 경우, 두 scope가 있다. <code>1×2×2=4</code> case다.</p></details></div>
+        <div class="part"><h4>기호</h4><div class="scroll"><table><thead><tr><th>항목</th><th>값</th><th>의미</th></tr></thead><tbody><tr><td><code>n_G0</code></td><td>25</td><td>G0 calibration slots</td></tr><tr><td><code>y_G0</code></td><td>8</td><td>Y0–Y6와 GPS_YAW90</td></tr><tr><td><code>n_G1, y_G1</code></td><td>6, 2</td><td>G1 slots와 primary-zero/GPS_YAW90</td></tr><tr><td><code>s</code></td><td>2</td><td>all_data와 matched_200</td></tr><tr><td><code>K</code></td><td>42,400</td><td>case ID 전체 수</td></tr></tbody></table></div></div>
+      </article>
+
+      <article class="concept" id="pairing">
+        <div class="concept-title"><span class="num">0.3</span><h3>같은 trial 입력으로 방법을 짝비교한다</h3></div>
+        <div class="part"><h4>무엇인가</h4><p>짝비교는 두 보정 방법에 같은 trial의 영상·카메라 RTK·카메라 IMU와 초기 자세를 주는 방식이다. A/B에는 같은 드론 RTK 관측을 쓴다.</p></div>
+        <div class="part"><h4>왜 필요한가</h4><p>입력이 달라지면 결과 차이가 보정법 때문인지 오차 표본 때문인지 분리하기 어렵다. 동일 표본 비교는 그 혼동을 줄인다.</p></div>
+        <div class="part"><h4>예제의 방법으로</h4><p><code>RPY_IMU</code>는 카메라 roll/pitch/yaw를 추정한다. <code>YAW_ONLY</code>는 같은 카메라 IMU roll/pitch 측정값을 고정하고 yaw만 추정한다. C는 드론 RTK가 없다.</p>
+          <figure><svg viewBox="0 0 740 194" role="img" aria-label="같은 camera RTK, camera IMU, image pair 입력을 A, B, C 방식에 공급하고 RPY IMU와 YAW ONLY를 비교한다. Drone RTK는 A/B에만 사용한다.">
+            <defs><marker id="a3" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0 0 L0 6 L9 3z" fill="currentColor"/></marker></defs>
+            <rect class="box-teal" x="15" y="47" width="200" height="94" rx="13"/><text class="text" x="115" y="74" text-anchor="middle">공유 입력</text><text class="tiny" x="115" y="96" text-anchor="middle">camera IMU + RTK + image pairs</text><text class="tiny" x="115" y="117" text-anchor="middle">same trial draw</text>
+            <path d="M215 94 H267 M267 37 V155 M267 37 H307 M267 94 H307 M267 155 H307" fill="none" stroke="currentColor" stroke-width="2.5" marker-end="url(#a3)"/>
+            <rect class="box-blue" x="315" y="15" width="152" height="44" rx="10"/><text class="text" x="391" y="43" text-anchor="middle">A · 독립 RTK</text>
+            <rect class="box-blue" x="315" y="72" width="152" height="44" rx="10"/><text class="text" x="391" y="100" text-anchor="middle">B · 공동 RTK</text>
+            <rect class="box" x="315" y="133" width="152" height="44" rx="10"/><text class="text" x="391" y="161" text-anchor="middle">C · 드론 RTK 없음</text>
+            <path d="M467 37 H510 M467 94 H510 M467 155 H510" fill="none" stroke="currentColor" stroke-width="2.5" marker-end="url(#a3)"/>
+            <rect class="box" x="518" y="22" width="205" height="34" rx="9"/><text class="tiny" x="620" y="44" text-anchor="middle">RPY_IMU · YAW_ONLY</text>
+            <rect class="box" x="518" y="79" width="205" height="34" rx="9"/><text class="tiny" x="620" y="101" text-anchor="middle">RPY_IMU · YAW_ONLY</text>
+            <rect class="box" x="518" y="140" width="205" height="34" rx="9"/><text class="tiny" x="620" y="162" text-anchor="middle">RPY_IMU · YAW_ONLY</text>
+            <text class="tiny" x="392" y="190" text-anchor="middle">드론 RTK는 A/B에만 제공한다. 카메라 center는 어느 방법에서도 최적화하지 않는다.</text>
+          </svg><figcaption>GPS_YAW90은 camera-RTK 기준선에서 만든 초기값이다. 참 yaw 제약이나 yaw 벌점이 아니다.</figcaption></figure>
+        </div>
+        <div class="part"><h4>직접 확인</h4><details><summary>C에도 드론 RTK가 들어가나?</summary><p>아니다. <code>C_no_drone_rtk_joint</code>는 drone RTK를 solver에 주지 않는다. camera RTK는 유지한다.</p></details></div>
+        <div class="part"><h4>기호</h4><div class="scroll"><table><thead><tr><th>방법</th><th>역할</th><th>IMU/RTK 사용</th></tr></thead><tbody><tr><td><code>RPY_IMU</code></td><td>주 자세 방법</td><td>camera IMU prior로 R/P/Y 추정</td></tr><tr><td><code>YAW_ONLY</code></td><td>기준 자세 방법</td><td>같은 IMU R/P 측정값 고정, yaw 추정</td></tr><tr><td><code>A</code>, <code>B</code></td><td>drone RTK 포함</td><td>같은 drone RTK 표본</td></tr><tr><td><code>C</code></td><td>drone RTK 제외</td><td>drone RTK 입력 없음</td></tr></tbody></table></div></div>
+      </article>
+
+      <article class="concept" id="frames">
+        <div class="concept-title"><span class="num">0.4</span><h3>위치 frame과 카메라 자세 frame을 분리한다</h3></div>
+        <div class="part"><h4>무엇인가</h4><p>frame은 벡터의 축 순서·방향·원점을 정한다. 이름 없는 세 숫자를 다른 frame의 세 숫자와 바꿔 읽을 수 없다.</p></div>
+        <div class="part"><h4>왜 필요한가</h4><p>MC100은 RTK 위치오차와 optical 자세오차를 함께 분석한다. frame을 바꾸어 읽으면 같은 오차값도 다른 방향과 위치를 뜻한다.</p></div>
+        <div class="part"><h4>예제의 frame으로</h4><p>세계 위치는 ENU <code>[east,north,up]</code>이며 project spec에서 <code>[x,y,z]=[E,N,U]</code>라고 선언한다. 따라서 RTK 표준편차 <code>σ_ENU=(0.02,0.02,0.04) m</code>의 두 번째 성분은 north다.</p>
+          <figure><svg viewBox="0 0 760 215" role="img" aria-label="world ENU 위치, PX4 local NED, camera-link FLU, PX4 body FRD, optical RDF는 서로 다른 계약이며 R_WC는 optical RDF를 world ENU로 보낸다">
+            <defs><marker id="a4" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0 0 L0 6 L9 3z" fill="currentColor"/></marker></defs>
+            <rect class="box-blue" x="18" y="20" width="330" height="155" rx="13"/><text class="text" x="183" y="47" text-anchor="middle">Position · world ENU</text>
+            <path d="M82 135 H151 M82 135 V78 M82 135 L51 104" fill="none" stroke="currentColor" stroke-width="3" marker-end="url(#a4)"/><text class="tiny" x="158" y="139">E east</text><text class="tiny" x="89" y="75">N north</text><text class="tiny" x="30" y="99">U up</text><text class="tiny" x="197" y="158" text-anchor="middle">σ order [E,N,U]</text>
+            <rect class="box-teal" x="412" y="20" width="330" height="155" rx="13"/><text class="text" x="577" y="47" text-anchor="middle">Image vector · optical RDF</text>
+            <path d="M477 135 H546 M477 135 V78 M477 135 L508 166" fill="none" stroke="currentColor" stroke-width="3" marker-end="url(#a4)"/><text class="tiny" x="553" y="139">R right</text><text class="tiny" x="484" y="75">F forward</text><text class="tiny" x="512" y="178">D down</text>
+            <path d="M348 99 H407" fill="none" stroke="currentColor" stroke-width="2.5" stroke-dasharray="6 5" marker-end="url(#a4)"/><text class="tiny" x="378" y="88" text-anchor="middle">R_WC</text>
+            <text class="tiny" x="380" y="204" text-anchor="middle">camera-link FLU, PX4 body FRD, PX4 local NED는 별도 frame이다.</text>
+          </svg><figcaption>화면상의 축 배치는 이름 구분용이다. 그림은 실제 frame 정렬이나 카메라 방향을 그린 것이 아니다.</figcaption></figure>
+          <div class="callout warn"><strong>변환 계약:</strong> world ENU <code>(x,y,z)=(E,N,U)</code>에서 원점을 확인하고 축 정렬한 경우 PX4 local NED 위치는 <code>[N−N0, E−E0, U0−U]</code>다. public baseline frame은 <code>[F,R,D]=[y,x,0.1−z]</code>다. 각 변환은 해당 origin과 rig 계약을 함께 기록한다.</div>
+        </div>
+        <div class="part"><h4>직접 확인</h4><details><summary><code>σ_ENU</code>의 세 번째 값은 optical z인가?</summary><p>아니다. 여기서는 world ENU의 up 축이다. Optical RDF의 세 번째 축은 forward다.</p></details></div>
+        <div class="part"><h4>기호</h4><div class="scroll"><table><thead><tr><th>frame</th><th>축 순서</th><th>용도</th></tr></thead><tbody><tr><td>world ENU</td><td><code>[E,N,U]</code></td><td>세계 위치, camera RTK, GT</td></tr><tr><td>PX4 local NED</td><td><code>[N,E,D]</code></td><td>PX4 local position·velocity</td></tr><tr><td>camera-link FLU</td><td><code>[F,L,U]</code></td><td>카메라 link pose</td></tr><tr><td>PX4 body FRD</td><td><code>[F,R,D]</code></td><td>PX4 body attitude와 public baseline center</td></tr><tr><td>optical RDF</td><td><code>[R,D,F]</code></td><td>카메라 광선·optical 자세</td></tr><tr><td><code>R_WC</code></td><td>RDF column vector → world ENU</td><td>카메라 회전행렬</td></tr></tbody></table></div></div>
+      </article>
+    </section>
+
+    <section id="method">
+      <h2>1. 분석은 어떤 순서로 돌아가나?</h2>
+      <p>입력 QC와 표본 생성을 먼저 하고, 방법 비교를 마친 뒤 경로를 freeze한다. V0 최종평가는 freeze 뒤에만 한다.</p>
+      <figure><svg viewBox="0 0 920 145" role="img" aria-label="39개 run QC, trial별 관측오차 생성, primary 교정, G0 기준 freeze, V0 최종평가, 전체 결과 감사 순서">
+        <defs><marker id="a5" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0 0 L0 6 L9 3z" fill="currentColor"/></marker></defs>
+        <rect class="box-blue" x="10" y="28" width="130" height="62" rx="11"/><text class="text" x="75" y="54" text-anchor="middle">1 · QC</text><text class="tiny" x="75" y="74" text-anchor="middle">39 run</text>
+        <path class="arrow" d="M140 59 H164"/><rect class="box" x="172" y="28" width="142" height="62" rx="11"/><text class="text" x="243" y="54" text-anchor="middle">2 · MC draws</text><text class="tiny" x="243" y="74" text-anchor="middle">100 noise trials</text>
+        <path class="arrow" d="M314 59 H338"/><rect class="box" x="346" y="28" width="148" height="62" rx="11"/><text class="text" x="420" y="54" text-anchor="middle">3 · 교정 비교</text><text class="tiny" x="420" y="74" text-anchor="middle">A/B/C × variants</text>
+        <path class="arrow" d="M494 59 H518"/><rect class="box-amber" x="526" y="28" width="112" height="62" rx="11"/><text class="text" x="582" y="54" text-anchor="middle">4 · freeze</text><text class="tiny" x="582" y="74" text-anchor="middle">G0만 사용</text>
+        <path class="arrow" d="M638 59 H662"/><rect class="box" x="670" y="28" width="106" height="62" rx="11"/><text class="text" x="723" y="54" text-anchor="middle">5 · V0</text><text class="tiny" x="723" y="74" text-anchor="middle">최종 평가</text>
+        <path class="arrow" d="M776 59 H800"/><rect class="box-teal" x="808" y="28" width="102" height="62" rx="11"/><text class="text" x="859" y="54" text-anchor="middle">6 · 감사</text><text class="tiny" x="859" y="74" text-anchor="middle">coverage/hash</text>
+        <text class="tiny" x="582" y="122" text-anchor="middle">경로 선택·설정 동결 전에 V0 위치오차를 열지 않는다.</text>
+      </svg><figcaption>이 순서는 calibration과 final test를 분리하고, V0에 맞춘 과적합을 막는다.</figcaption></figure>
+      <div class="scroll"><table><thead><tr><th>단계</th><th>작업</th><th>완료 증거</th></tr></thead><tbody>
+        <tr><td>1 · 입력 QC</td><td>run/attempt identity, 파일, frame, seed, 원본 checksum을 확인한다.</td><td>기대 39 slots와 원본 manifest가 맞는다.</td></tr>
+        <tr><td>2 · MC draw</td><td>각 trial에서 camera IMU/RTK와 필요한 synthetic observation을 만든다.</td><td>trial 번호와 shared input identity를 기록한다.</td></tr>
+        <tr><td>3 · 교정</td><td>31 calibration slots에 424 cases/trial을 처리하고 A/B/C × RPY_IMU/YAW_ONLY 결과를 저장한다.</td><td>case 누락·중복, 실패·미수렴, frame을 보존한다.</td></tr>
+        <tr><td>4 · freeze</td><td>G0 calibration 근거로 경로와 설정을 고정한다.</td><td>freeze가 V0 위치오차 접근보다 먼저 생성된다.</td></tr>
+        <tr><td>5–6 · V0와 감사</td><td>8개 final-evaluation slots로 평가하고 summary, report, hash를 검증한다.</td><td>평가 입력, truth 경계, 결과 범위와 provenance를 독립 확인한다.</td></tr>
+      </tbody></table></div>
+    </section>
+
+    <section id="worked">
+      <h2>2. 끝까지 손으로 계산하기</h2>
+      <p>이 계산은 교정 workload의 case identity 수다. 결과 행 수와 실제 optimizer 실행 수는 별도 단위다.</p>
+      <div class="scroll"><table><thead><tr><th>순서</th><th>손계산</th><th>결과</th><th>해석</th></tr></thead><tbody>
+        <tr><td>1</td><td><code>39 − 8 V0</code></td><td><code>31 calibration slots</code></td><td>V0는 교정 루프에서 잠근다.</td></tr>
+        <tr><td>2</td><td><code>25 G0 × 8 yaw × 2 scope</code></td><td><code>400</code></td><td>G0 한 trial.</td></tr>
+        <tr><td>3</td><td><code>6 G1 × 2 yaw × 2 scope</code></td><td><code>24</code></td><td>G1 한 trial.</td></tr>
+        <tr><td>4</td><td><code>400 + 24</code></td><td><code>424 case/trial</code></td><td>한 trial의 run/yaw/scope 조합 수.</td></tr>
+        <tr><td>5</td><td><code>424 × 100</code></td><td><strong><code>42,400 case ID</code></strong></td><td>전체 primary case 수.</td></tr>
+        <tr><td>6</td><td><code>42,400 × 3 methods × 2 variants</code></td><td><code>254,400 main fits</code></td><td>case별 6개 primary method/variant fit의 총량.</td></tr>
+      </tbody></table></div>
+      <div class="eq">G0: 25×(7 existing yaw + 1 GPS_YAW90)×2 = 400<br>G1: 6×(1 primary zero + 1 GPS_YAW90)×2 = 24<br>100×(400+24)=42,400 cases</div>
+      <div class="calc"><div><label for="trials">Trial 수 T를 바꿔 계산해 보기 (1–1000)</label><input id="trials" type="range" min="1" max="1000" step="1" value="100"><span class="small muted">primary case 수 = 424×T · CLI 허용 상한 1000</span></div><div class="calc-result"><span id="tlabel" class="mono">T=100</span><output id="count" for="trials" aria-live="polite">42,400 case ID</output></div></div>
+      <div class="callout"><strong>별도 민감도 분석:</strong> OFAT는 primary 42,400 cases에 포함되지 않는다. 최신 범위 감사는 선택 경로에 따라 최대 50,000 sensitivity cases를 계획했다. <code>full_factorial=false</code>는 모든 요인값 조합을 전부 교차하지 않는다는 뜻이며, MC 100회나 두 표본 범위를 생략하는 조건이 아니다.</div>
+    </section>
+
+    <section id="status">
+      <h2>3. 손계산과 코드·저장 기록 대조</h2>
+      <div class="scroll"><table><thead><tr><th>검산</th><th>결과</th><th>무엇을 확인하나</th></tr></thead><tbody>
+        <tr><td>손계산</td><td><code>25×8×2 + 6×2×2 = 424</code>; <code>424×100 = 42,400</code></td><td>실제 manifest 그룹 수, yaw 경우 수, scope 수.</td></tr>
+        <tr><td>analyzer case enumeration</td><td>trial마다 424, 100회에서 42,400개의 고유 case key</td><td><code>_calibrate_run_trial</code>를 실제 v1.2 manifest/spec로 호출. Fit/I/O용 <code>_calibrate_scope</code>와 checksum 함수만 stub 처리.</td></tr>
+        <tr><td>저장된 진행 census</td><td>trial 000–002 각 424/424; trial 003–004는 당시 진행 중; 총 1,688 case identities 관측</td><td>중간 파일 identity 확인. 전체 byte audit, 수치 fit 검증, V0 최종 보고 완료 증거는 아니다.</td></tr>
+      </tbody></table></div>
+      <p><strong>손계산과 analyzer enumeration은 0 case 차이다.</strong> 이 코드 확인은 case 생성 순서와 조합 수만 검산했다. optimizer, 실제 output hash, V0 평가를 재실행하지 않았다. system Python에서 SciPy/NumPy 호환 경고가 출력돼 수치 solver 검증으로 확대 해석할 수 없다.</p>
+      <div class="callout warn"><strong>역사적 진행 상태 · 2026-10-18:</strong> 저장된 verification 기록은 full MC가 진행 중이던 snapshot이다. 당시 PID와 진행 census는 그 시점의 상태를 보여주며 이후 완료 상태를 나타내지 않는다.</div>
+      <div class="callout"><strong>현재 동결 결과:</strong> <code>analysis_9cfd7c6cd10b</code>의 primary 42,400 case IDs는 기존 v1.2 yaw 36,200건과 GPS_YAW90 확장 6,200건으로 나뉜다. 민감도 50,000건은 별도 범위다. V0별 MC 결과와 QC·실행별 해석 보완은 <a href="../../recordings/stereo_v1_1/paper1_v1_2_001/outputs/20261021-postfreeze-summary-review/stereo_v1_2_summary_report_ready_v3.xlsx">보고용 보완 workbook</a>에서 확인한다.</div>
+      <div class="grid">
+        <div class="card"><h3>이전 v1.1 결과</h3><p>당시 실제 자료 분석은 6,822 calibration results, 6,732 V0 rows, 50 sensitivity cases, 36,071 checksums를 기록했다.</p><p class="small muted">뒤이은 범위 감사가 전체 MC scope의 미포함을 확인했다. 이 수치는 과거 실행 기록이지 v1.2 전체 매트릭스 완료 증거가 아니다.</p></div>
+        <div class="card"><h3>완료 판정</h3><p>RMSE 숫자 하나가 합격 기준은 아니다. 예상 case coverage, shared inputs, 좌표 변환, truth 차단, freeze 시각, 실패·누락 보존, checksums와 최종 보고를 확인한다.</p><p class="small muted">유효 stereo pair가 200개보다 적으면 <code>MATCHED_200_UNMET</code>로 남긴다. 프레임을 복제하지 않는다.</p></div>
+      </div>
+    </section>
+
+    <section id="mistakes">
+      <h2>4. 흔한 오해와 셀프체크</h2>
+      <ul>
+        <li><strong>“MC100은 비행 100회”</strong> — 아니다. 기존 run 기록을 100 trial에서 다시 분석한다.</li>
+        <li><strong>“42,400은 solver 행 수”</strong> — 아니다. case identity 수다. main fit은 case당 6개, 총 254,400으로 별도 기록된다.</li>
+        <li><strong>“GPS_YAW90이 참 yaw를 제공”</strong> — 아니다. camera RTK baseline으로 만든 초기값이며 참 자세 제약이 아니다.</li>
+        <li><strong>“카메라 IMU는 기체 IMU”</strong> — 아니다. 카메라 장착 IMU의 optical roll/pitch 관측이다.</li>
+        <li><strong>“world ENU의 U와 optical RDF의 F가 같은 축”</strong> — 아니다. U는 world up, F는 optical forward다.</li>
+        <li><strong>“200 pair가 모자라면 프레임 복제”</strong> — 아니다. 미달 상태와 실제 pair 수를 기록한다.</li>
+        <li><strong>“합성 sigma는 장비 정확도 보증”</strong> — 아니다. simulation experiment design value다.</li>
+        <li><strong>“V0로 최적 경로를 고름”</strong> — 아니다. V0는 freeze 뒤 final evaluation에만 쓴다.</li>
+      </ul>
+      <details><summary>스스로 답하기: 한 trial에서 G0는 몇 case인가?</summary><p><code>25 slots × 8 yaw cases × 2 scopes = 400 case IDs</code>.</p></details>
+    </section>
+
+    <section id="sources">
+      <h2>근거 파일</h2>
+      <ul class="sources">
+        <li><a href="03_experiment_spec.json">v1.2 실험 규격</a></li>
+        <li><a href="04_run_manifest.json">39-run manifest</a></li>
+        <li><a href="README.txt">v1.2 패키지 안내</a></li>
+        <li><a href="06_소프트웨어_분석과_연결규격.txt">소프트웨어·frame 연결 규격</a></li>
+        <li><a href="../../campaigns/stereo_v1_1/analyze_campaign.py">analyzer 구현</a></li>
+        <li><a href="../../campaigns/stereo_v1_1/GPS_YAW90_ANALYSIS.md">GPS_YAW90 비교 규격</a></li>
+        <li><a href="../../campaigns/stereo_v1_1/verification.md">이전 v1.1 결과 요약</a></li>
+        <li><a href="../../docs/changes/20261011-manifest-sweep/verification.md">현행 전체 매트릭스·진행 감사</a></li>
+      </ul>
+      <p class="small"><strong>Coordinate contract checked:</strong> world ENU <code>[E,N,U]=[x,y,z]</code>; PX4 local NED <code>[N,E,D]</code>; public baseline FRD <code>[F,R,D]</code>; camera-link FLU <code>[F,L,U]</code>; PX4 body quaternion FRD→NED; optical RDF <code>[R,D,F]</code> with optical-to-world <code>R_WC</code>. Position and orientation frames remain distinct.</p>
+    </section>
+  </main>
+  <script>
+    (() => {
+      const slider=document.getElementById("trials"), label=document.getElementById("tlabel"), out=document.getElementById("count");
+      const fmt=new Intl.NumberFormat("ko-KR");
+      const update=()=>{const t=Number(slider.value);label.textContent=`T=${fmt.format(t)}`;out.textContent=`${fmt.format(424*t)} case ID`;};
+      slider.addEventListener("input",update);update();
+    })();
+  </script>
+  <footer class="wrap">v1.2 MC100 학습 페이지 · 작성 2026-10-21 · standalone HTML · 분석 완료 상태는 저장된 감사 근거로만 판단</footer>
+</body>
+</html>

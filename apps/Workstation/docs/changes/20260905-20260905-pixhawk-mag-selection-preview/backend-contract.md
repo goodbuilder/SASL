@@ -25,4 +25,15 @@ snapshots only.
 Missing topology produces an empty/waiting preview rather than a failed PARAM operation. Existing
 worker timeouts, busy state, and late-result handling remain unchanged.
 
+Follow-up: integer `PARAM_SET` is resent up to three total attempts only when the matching
+`PARAM_VALUE` response times out. A received value mismatch is returned immediately without retry.
+The worker checks final readback against every requested configured slot. If a write or final
+readback fails after earlier slots changed, it reports the partial outcome, invalidates cached
+MAG readback, and lets the normal visible/explicit refresh path reconcile it. The disarm gate,
+exclusive per-camera command owner, and Shell active-device verification remain.
+
+The worker also validates requested priorities against the captured live instance-to-device
+snapshot. Explicit priority-0 lower instances preceding an enabled higher candidate produce a
+v1.17 voter-gap error before any write. Empty/incomplete topology does not invent a firmware gap.
+
 ## Persistence, restart, and shutdown

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from PyQt5 import QtCore, QtWidgets
+from Workstation.ui.designer import load_form
 from ..shared import _display_number, _live_inspection, _sync_table_rows, _table_model
 
 
@@ -14,13 +15,12 @@ class AttitudeView(QtCore.QObject):
         if not callable(read_attitude):
             raise TypeError("Attitude view requires its evidence reader")
         self._read_attitude = read_attitude
-        attitude_group = QtWidgets.QGroupBox("Attitude (R/P/Y)")
-        attitude_layout = QtWidgets.QVBoxLayout(attitude_group)
+        attitude_group = load_form("pixhawk_attitude.ui", QtWidgets.QGroupBox())
         self.attitude_model = _table_model(
             self,
             ("Pixhawk", "State", "Roll°", "Pitch°", "Yaw°", "Age", "PX4 time", "Endpoint"),
         )
-        self.attitude_table = QtWidgets.QTableView()
+        self.attitude_table = attitude_group.attitude_table
         self.attitude_table.setModel(self.attitude_model)
         self.attitude_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.attitude_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
@@ -28,7 +28,6 @@ class AttitudeView(QtCore.QObject):
         self.attitude_table.setMaximumHeight(112)
         self.attitude_table.horizontalHeader().setStretchLastSection(True)
         self.attitude_table.clicked.connect(self._inspect_attitude_row)
-        attitude_layout.addWidget(self.attitude_table)
         self.group = attitude_group
         if isinstance(parent, QtWidgets.QWidget):
             self.group.setParent(parent)

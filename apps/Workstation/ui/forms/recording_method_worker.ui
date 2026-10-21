@@ -1,0 +1,80 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>methodWorkerRecovery</class>
+ <widget class="QGroupBox" name="methodWorkerRecovery">
+  <property name="title">
+   <string>Method 계산 상태</string>
+  </property>
+  <layout class="QGridLayout" name="methodWorkerRecoveryLayout" columnstretch="0,1,0">
+   <item row="0" column="0">
+    <widget class="QComboBox" name="method_combo">
+     <property name="accessibleName">
+      <string>상태를 확인할 측정 방법</string>
+     </property>
+     <property name="minimumContentsLength">
+      <number>18</number>
+     </property>
+     <property name="sizeAdjustPolicy">
+      <enum>QComboBox::AdjustToMinimumContentsLengthWithIcon</enum>
+     </property>
+    </widget>
+   </item>
+   <item row="0" column="1">
+    <widget class="QLabel" name="status_label">
+     <property name="text">
+      <string>--</string>
+     </property>
+     <property name="sizePolicy">
+      <sizepolicy hsizetype="Ignored" vsizetype="Fixed">
+       <horstretch>0</horstretch>
+       <verstretch>0</verstretch>
+      </sizepolicy>
+     </property>
+    </widget>
+   </item>
+   <item row="0" column="2">
+    <widget class="QPushButton" name="restart_button">
+     <property name="text">
+      <string>선택 계산 중단·재시작</string>
+     </property>
+     <property name="accessibleName">
+      <string>선택 방법의 현재 계산을 중단하고 재시작</string>
+     </property>
+     <property name="toolTip">
+      <string>표시된 방법의 현재 계산을 FAILED로 기록하고 대기 중인 계산을 계속합니다. 다른 방법의 계산과 관측은 계속됩니다.</string>
+     </property>
+     <property name="enabled">
+      <bool>false</bool>
+     </property>
+    </widget>
+   </item>
+   <item row="1" column="0" rowspan="1" colspan="3">
+    <widget class="QLabel" name="feedback_label">
+     <property name="text">
+      <string>경과 시간만으로 계산 실패를 판정하지 않습니다.</string>
+     </property>
+     <property name="sizePolicy">
+      <sizepolicy hsizetype="Ignored" vsizetype="Fixed">
+       <horstretch>0</horstretch>
+       <verstretch>0</verstretch>
+      </sizepolicy>
+     </property>
+    </widget>
+   </item>
+   <property name="leftMargin">
+    <number>6</number>
+   </property>
+   <property name="topMargin">
+    <number>6</number>
+   </property>
+   <property name="rightMargin">
+    <number>6</number>
+   </property>
+   <property name="bottomMargin">
+    <number>6</number>
+   </property>
+  </layout>
+ </widget>
+ <resources />
+ <connections />
+</ui>

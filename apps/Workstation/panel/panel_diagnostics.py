@@ -1212,6 +1212,50 @@ class DiagnosticsFeature(PanelFeature):
             tooltip="먼저 새로고침으로 CAL_MAG PARAM readback을 완료하세요.",
         )
 
+    def _invalidate_px4_mag_readback_after_apply_failure(self, camera: str, error: str) -> None:
+        """Mark old MAG values uncertain after an apply can have partially succeeded."""
+
+        cache = getattr(self, "_px4_mag_status_cache", None)
+        if isinstance(cache, dict):
+            cache.pop(camera, None)
+        incomplete = getattr(self, "_px4_mag_status_incomplete", None)
+        if isinstance(incomplete, dict):
+            incomplete.pop(camera, None)
+        message = (
+            f"{self._px4_mag_camera_label(camera)} | Priority Apply 실패; 일부 PARAM이 바뀌었을 수 있습니다.\n"
+            f"{error} · Refresh MAG로 실제 값을 다시 읽으세요."
+        )
+        for table in self._px4_mag_registry_values(getattr(self, "px4_mag_tables", {}), camera):
+            table.setRowCount(0)
+        for status_label in self._px4_mag_registry_values(getattr(self, "px4_mag_status_labels", {}), camera):
+            status_label.setText(message)
+        button_state = getattr(self, "_set_px4_mag_manager_button_state", None)
+        if callable(button_state):
+            button_state(
+                camera,
+                refresh_enabled=True,
+                actions_enabled=False,
+                tooltip="Apply 실패 후 실제 CAL_MAG PARAM readback이 필요합니다.",
+            )
+
+    def _show_px4_mag_priority_blocked(self, camera: str, error: str) -> None:
+        """Show a pre-write v1.17 guard rejection without discarding fresh readback."""
+
+        message = (
+            f"{self._px4_mag_camera_label(camera)} | PX4 1.17 voter gap: Apply 차단(쓰기 전)\n"
+            f"{error}"
+        )
+        for status_label in self._px4_mag_registry_values(getattr(self, "px4_mag_status_labels", {}), camera):
+            status_label.setText(message)
+        button_state = getattr(self, "_set_px4_mag_manager_button_state", None)
+        if callable(button_state):
+            button_state(
+                camera,
+                refresh_enabled=True,
+                actions_enabled=True,
+                tooltip="lower MAG filler를 Min (1) 이상으로 설정한 뒤 적용하세요.",
+            )
+
     def refresh_px4_mag_manager(self, camera: str | None = None, *, read_params: bool = False) -> None:
         if not hasattr(self, "px4_mag_managers"):
             return

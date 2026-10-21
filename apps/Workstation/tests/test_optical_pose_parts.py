@@ -217,11 +217,11 @@ def test_optical_parts_have_one_way_dependencies_and_reject_workspace_back_impor
         "__init__": set(),
         "layouts": set(),
         "annotations": {"layouts"},
-        "suggestions": {"annotations"},
-        "candidates": set(),
+        "suggestions": {"annotations", "layouts"},
+        "candidates": {"layouts"},
         "methods": {"layouts"},
-        "observations": set(),
-        "live_reference": set(),
+        "observations": {"layouts"},
+        "live_reference": {"layouts"},
     }
     with pytest.raises(AssertionError):
         _assert_part_boundary("from Workstation.workspace_views.optical_pose import OpticalPosePane")

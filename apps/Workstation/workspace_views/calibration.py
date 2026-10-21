@@ -6,7 +6,8 @@ from typing import Callable
 from PyQt5 import QtCore, QtGui, QtWidgets
 from Workstation.workstation_core.coordinate_contract import CAMERA_FRAME, MEASUREMENT_AXIS_CONTRACT, MEASUREMENT_FRAME
 from Workstation.workstation_core.settings import DEFAULT_CALIBRATION_ROOT
-from Workstation.ui.components import EngineeringValue, WorkspaceHeader
+from Workstation.ui.components import EngineeringValue
+from Workstation.ui.designer import load_form
 from Workstation.application.status_model import RuntimeStatus
 from .shared import _command_button, _display_number, _evidence, _sync_table_rows, _table_model
 from .calibration_parts.widgets import _ContentSizedOperationTabs, _ElidedStatusLabel, CalibrationErrorPlot
@@ -193,34 +194,27 @@ class CalibrationWorkspace(QtWidgets.QWidget):
             parent=self,
         )
 
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-        layout.addWidget(WorkspaceHeader("Calibration"))
+        load_form("calibration.ui", self)
 
-        advanced_content = QtWidgets.QWidget()
-        advanced_layout = QtWidgets.QVBoxLayout(advanced_content)
-        advanced_layout.setContentsMargins(6, 6, 6, 6)
-        advanced_layout.setSpacing(6)
-
-        advanced_layout.addWidget(self._capture.zoom_group)
-
-        camera_group = QtWidgets.QGroupBox("Shared calibration inputs")
-        camera_layout = QtWidgets.QVBoxLayout(camera_group)
-        camera_layout.setContentsMargins(6, 6, 6, 6)
-        camera_layout.setSpacing(5)
-        camera_layout.setAlignment(QtCore.Qt.AlignTop)
+        advanced_content = self.advanced_calibration_content
+        self.zoomHostLayout.addWidget(self._capture.zoom_group)
 
         calibration_session_group = self._inputs._build_calibration_session_group()
         calibration_file_group = self._inputs._build_calibration_file_selection_group()
         self.operation_tabs = self._build_operation_tabs()
         self.capture_surface = self._capture._build_shared_capture_surface()
         self.setup_widgets.update(self._capture.setup_widgets)
-        camera_layout.addWidget(self.operation_tabs)
-        camera_layout.addWidget(self._preview.camera_mode_tabs)
-        camera_layout.addWidget(self.capture_surface)
-        camera_layout.addWidget(calibration_session_group)
-        camera_layout.addWidget(calibration_file_group)
+        # Replace Designer slots at the common container boundary: these
+        # surfaces share one parent, preserving preview/capture adjacency.
+        for placeholder, surface in (
+            (self.operationHost, self.operation_tabs),
+            (self.cameraModeHost, self._preview.camera_mode_tabs),
+            (self.captureHost, self.capture_surface),
+            (self.sessionHost, calibration_session_group),
+            (self.filesHost, calibration_file_group),
+        ):
+            self.cameraHostLayout.replaceWidget(placeholder, surface)
+            placeholder.deleteLater()
         self._calibration_workflow_syncing = False
         self._calibration_workflow_index = 0
         self.operation_tabs.currentChanged.connect(
@@ -234,15 +228,12 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         )
         self._sync_calibration_capture_surface()
         self._quality.refresh_calibration_quality()
-        advanced_layout.addWidget(camera_group)
 
         self._capture._connect_calibration_capture_event_signal()
         self._quality._connect_calibration_diagnostics_signal()
         self._preview._connect_camera_panes()
         self._preview._connect_calibration_preview_signal()
 
-        profile_group = QtWidgets.QGroupBox("Active calibration bundle")
-        profile_layout = QtWidgets.QGridLayout(profile_group)
         self.profile_values: dict[str, EngineeringValue] = {}
         for index, (key, label) in enumerate(
             (
@@ -261,11 +252,10 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         ):
             value = EngineeringValue(label)
             self.profile_values[key] = value
-            profile_layout.addWidget(value, index // 2, index % 2)
-        advanced_layout.addWidget(profile_group)
+            placeholder = getattr(self, f"profile_{key}")
+            self.profileGrid.replaceWidget(placeholder, value)
+            placeholder.deleteLater()
 
-        intrinsic_group = QtWidgets.QGroupBox("Intrinsics result")
-        intrinsic_layout = QtWidgets.QVBoxLayout(intrinsic_group)
         self.intrinsic_model = _table_model(
             self,
             (
@@ -280,7 +270,6 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                 "Frame",
             ),
         )
-        self.intrinsic_table = QtWidgets.QTableView()
         self.intrinsic_table.setModel(self.intrinsic_model)
         self.intrinsic_table.setEditTriggers(
             QtWidgets.QAbstractItemView.NoEditTriggers
@@ -289,214 +278,62 @@ class CalibrationWorkspace(QtWidgets.QWidget):
             QtWidgets.QAbstractItemView.SelectRows
         )
         self.intrinsic_table.verticalHeader().setVisible(False)
-        self.intrinsic_table.setMaximumHeight(108)
         self.intrinsic_table.horizontalHeader().setStretchLastSection(True)
-        intrinsic_layout.addWidget(self.intrinsic_table)
-        self.intrinsics_result_group = intrinsic_group
-        self.intrinsics_page_layout.addWidget(intrinsic_group)
 
         self.extrinsic_value = EngineeringValue("Stereo R/T")
-        metrics_group = QtWidgets.QGroupBox("Extrinsics result")
-        metrics_layout = QtWidgets.QVBoxLayout(metrics_group)
-        metrics_layout.addWidget(self.extrinsic_value)
-        self.calibration_contract = QtWidgets.QLabel()
-        self.calibration_contract.setObjectName("compactContract")
-        self.calibration_contract.setWordWrap(True)
-        self.calibration_contract.setTextInteractionFlags(
-            QtCore.Qt.TextSelectableByMouse
-        )
-        metrics_layout.addWidget(self.calibration_contract)
-        self.extrinsics_result_group = metrics_group
-        self.extrinsics_page_layout.addWidget(metrics_group)
-
-        setup_group = QtWidgets.QGroupBox("Shared checkerboard setup")
-        setup_layout = QtWidgets.QVBoxLayout(setup_group)
-        setup_layout.setContentsMargins(6, 6, 6, 6)
-        setup_layout.setSpacing(5)
+        self.operation_tabs.extrinsicValueLayout.addWidget(self.extrinsic_value)
         setup = _evidence(self.backend).calibration_setup()
         self._initial_calibration_setup = dict(setup)
-
-        def setup_spin(
-            key: str,
-            minimum: int,
-            maximum: int,
-            suffix: str = "",
-        ) -> QtWidgets.QSpinBox:
-            widget = QtWidgets.QSpinBox()
-            widget.setRange(minimum, maximum)
+        for key in ("inner_cols", "inner_rows", "square_size_mm", "min_images", "calculation_pair_count"):
+            control = getattr(self, f"setup_{key}")
+            self.setup_widgets[key] = control
             value = setup.get(key)
-            default_value = 20 if key == "calculation_pair_count" else minimum
-            widget.setValue(int(value if value is not None else default_value))
-            widget.setSuffix(suffix)
-            if key == "calculation_pair_count":
-                widget.setSpecialValueText("all pairs")
-            self.setup_widgets[key] = widget
-            return widget
+            if value is not None:
+                control.setValue(float(value) if isinstance(control, QtWidgets.QDoubleSpinBox) else int(value))
+        self.setup_calibration_root.setText(str(setup.get("calibration_root") or ""))
+        self.setup_calibration_root.setPlaceholderText(DEFAULT_CALIBRATION_ROOT)
+        self.setup_widgets["calibration_root"] = self.setup_calibration_root
+        self.setup_widgets["validation_mode"] = self.setup_validation_mode
+        for index, value in enumerate(("pixhawk", "checkerboard")):
+            self.setup_validation_mode.setItemData(index, value)
+        self.setup_validation_mode.setCurrentIndex(max(0, self.setup_validation_mode.findData(str(setup.get("validation_mode") or "pixhawk"))))
+        self.setupContract.setObjectName("compactContract")
+        for button in (self.applySetupButton, self.saveSetupButton):
+            command = button.property("commandId")
+            self._commands.primary[command] = button
+            button.setEnabled(invoke_command is not None)
+            if invoke_command is not None:
+                button.clicked.connect(lambda _checked=False, command=command: invoke_command(command))
 
-        def setup_double(
-            key: str,
-            minimum: float,
-            maximum: float,
-            suffix: str = "",
-        ) -> QtWidgets.QDoubleSpinBox:
-            widget = QtWidgets.QDoubleSpinBox()
-            widget.setRange(minimum, maximum)
-            widget.setDecimals(3)
-            value = setup.get(key)
-            widget.setValue(float(value if value is not None else minimum))
-            widget.setSuffix(suffix)
-            self.setup_widgets[key] = widget
-            return widget
-
-        def setup_text(
-            key: str,
-            placeholder: str = "",
-        ) -> QtWidgets.QLineEdit:
-            widget = QtWidgets.QLineEdit(str(setup.get(key) or ""))
-            if placeholder:
-                widget.setPlaceholderText(placeholder)
-            self.setup_widgets[key] = widget
-            return widget
-
-        def setup_combo(key: str) -> QtWidgets.QComboBox:
-            widget = QtWidgets.QComboBox()
-            widget.addItem(
-                "Pixhawk attitude + GPS/RTK baseline", "pixhawk"
-            )
-            widget.addItem("Checkerboard stereo R/T", "checkerboard")
-            current = str(setup.get(key) or "pixhawk")
-            widget.setCurrentIndex(max(0, widget.findData(current)))
-            self.setup_widgets[key] = widget
-            return widget
-
-        setup_form = QtWidgets.QGridLayout()
-        setup_form.setHorizontalSpacing(8)
-        setup_form.setVerticalSpacing(5)
-        setup_form.setColumnStretch(1, 1)
-        setup_form.setColumnStretch(3, 1)
-        for index, (label, widget) in enumerate(
-            (
-                ("Inner columns", setup_spin("inner_cols", 2, 30)),
-                ("Inner rows", setup_spin("inner_rows", 2, 30)),
-                (
-                    "Square size",
-                    setup_double("square_size_mm", 1.0, 500.0, " mm"),
-                ),
-                ("Minimum images", setup_spin("min_images", 3, 100)),
-                (
-                    "Calculation pairs",
-                    setup_spin(
-                        "calculation_pair_count", 0, 10000, " pair"
-                    ),
-                ),
-            )
-        ):
-            row = index // 2
-            column = (index % 2) * 2
-            setup_form.addWidget(QtWidgets.QLabel(label), row, column)
-            setup_form.addWidget(widget, row, column + 1)
-        setup_layout.addLayout(setup_form)
-
-        path_form = QtWidgets.QGridLayout()
-        path_form.setHorizontalSpacing(8)
-        path_form.setVerticalSpacing(5)
-        path_form.setColumnStretch(1, 1)
-        path_form.setColumnStretch(3, 1)
-        path_form.addWidget(QtWidgets.QLabel("Calibration root"), 0, 0)
-        path_form.addWidget(
-            setup_text("calibration_root", DEFAULT_CALIBRATION_ROOT),
-            0,
-            1,
-            1,
-            3,
-        )
-        path_form.addWidget(QtWidgets.QLabel("Calculation mode"), 1, 0)
-        path_form.addWidget(setup_combo("validation_mode"), 1, 1)
-        setup_layout.addLayout(path_form)
-        setup_contract = QtWidgets.QLabel(
-            "Square: mm · pixels/intrinsics: OpenCV optical RDF · "
-            "X_right = R_left_to_right X_left + T_left_to_right_m · "
-            "save zoom comes from the captured camera readback"
-        )
-        setup_contract.setObjectName("compactContract")
-        setup_contract.setWordWrap(True)
-        setup_layout.addWidget(setup_contract)
-        setup_actions = QtWidgets.QHBoxLayout()
-        for command_id, label in (
-            ("calibration.apply_setup", "Apply setup"),
-            ("calibration.save_setup", "Save setup"),
-        ):
-            button = _command_button(label, command_id, invoke_command)
-            self._commands.primary[command_id] = button
-            setup_actions.addWidget(button)
-        setup_actions.addStretch(1)
-        setup_layout.addLayout(setup_actions)
-        advanced_layout.addWidget(setup_group)
-
-        validation_group = QtWidgets.QGroupBox(
-            "Advanced intrinsics validation (optional)"
-        )
-        self.checkerboard_validation_outer_group = validation_group
-        validation_group.setCheckable(True)
-        validation_group.setChecked(False)
-        validation_layout = QtWidgets.QVBoxLayout(validation_group)
+        validation_group = self.checkerboard_validation_outer_group
         validation_content = self._validation._build_checkerboard_validation_group()
-        validation_layout.addWidget(validation_content)
+        self.operation_tabs.validationLayout.addWidget(validation_content)
         validation_content.setVisible(False)
         validation_group.toggled.connect(validation_content.setVisible)
-        validation_group.toggled.connect(
-            lambda _checked: self._quality._apply_calibration_quality_gate()
-        )
-        self.intrinsics_page_layout.addWidget(validation_group)
-        self.intrinsics_page_layout.addStretch(1)
-        self.extrinsics_page_layout.addStretch(1)
+        validation_group.toggled.connect(lambda _checked: self._quality._apply_calibration_quality_gate())
         self._sync_calibration_capture_surface()
 
-        handoff_button = QtWidgets.QPushButton("Advanced Zoom")
-        handoff_button.setToolTip(
-            "Open Advanced camera controls for physical zoom commands."
-        )
-        handoff_button.clicked.connect(open_advanced)
-        advanced_layout.addStretch(1)
-        advanced_layout.addWidget(handoff_button, alignment=QtCore.Qt.AlignRight)
+        self.handoffButton.clicked.connect(open_advanced)
 
         self.simple_calibration_tabs = self._capture._build_simple_calibration_tabs(
             self._quality.calibration_quality_gate_label.text(),
             self.profile_values["state"].value.text(),
         )
-        layout.addWidget(self.simple_calibration_tabs)
+        self.simpleLayout.addWidget(self.simple_calibration_tabs)
         self._capture.apply_calibration_capture_snapshot(
             self._capture.calibration_capture_snapshot()
         )
 
-        advanced_group = QtWidgets.QGroupBox()
-        advanced_group.setObjectName("advancedCalibrationGroup")
-        advanced_group.setToolTip(
-            "파일별 선택, subset 품질, K/D·R/t 상세, 세션 경로를 검토합니다."
-        )
-        advanced_group_layout = QtWidgets.QVBoxLayout(advanced_group)
-        advanced_group_layout.setContentsMargins(6, 6, 6, 6)
-        advanced_toggle = QtWidgets.QToolButton()
-        advanced_toggle.setObjectName("advancedCalibrationToggle")
-        advanced_toggle.setText("고급 캘리브레이션")
-        advanced_toggle.setCheckable(True)
-        advanced_toggle.setChecked(False)
-        advanced_toggle.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
-        advanced_toggle.setArrowType(QtCore.Qt.RightArrow)
+        advanced_toggle = self.advancedCalibrationToggle
         advanced_toggle.toggled.connect(
             lambda checked: advanced_toggle.setArrowType(
                 QtCore.Qt.DownArrow if checked else QtCore.Qt.RightArrow
             )
         )
-        advanced_group_layout.addWidget(advanced_toggle)
-        advanced_group_layout.addWidget(advanced_content)
         advanced_content.setVisible(False)
         advanced_toggle.toggled.connect(advanced_content.setVisible)
-        self.advanced_calibration_group = advanced_group
+        self.advanced_calibration_group = self.advancedCalibrationGroup
         self.advanced_calibration_toggle = advanced_toggle
-        self.advanced_calibration_content = advanced_content
-        layout.addWidget(advanced_group)
-        layout.addStretch(1)
 
 
     def _sync_simple_calibration_labels(self) -> None:
@@ -517,229 +354,30 @@ class CalibrationWorkspace(QtWidgets.QWidget):
 
 
     def _build_operation_tabs(self) -> QtWidgets.QTabWidget:
-        kind_tabs = _ContentSizedOperationTabs()
-        kind_tabs.setObjectName("calibrationKindTabs")
-        kind_tabs.setSizePolicy(
-            QtWidgets.QSizePolicy.Expanding,
-            QtWidgets.QSizePolicy.Maximum,
-        )
-        # Command instances are owned by the registry shared with the components.
-
-        def command_button(
-            command_id: str,
-            label: str,
-        ) -> QtWidgets.QPushButton:
-            button = _command_button(
-                label, command_id, self.invoke_command
-            )
-            button.setMinimumWidth(0)
-            button.setSizePolicy(
-                QtWidgets.QSizePolicy.Expanding,
-                QtWidgets.QSizePolicy.Fixed,
-            )
-            self._commands.primary.setdefault(command_id, button)
-            self._commands.instances.setdefault(
-                command_id, []
-            ).append(button)
-            return button
-
-        def workflow_tabs(
-            *,
-            kind: str,
-            capture_actions: tuple[tuple[str, str], ...],
-            compute_actions: tuple[tuple[str, str], ...],
-            profile_actions: tuple[tuple[str, str], ...],
-            capture_hint: str,
-            include_auto_capture: bool,
-            include_intrinsic_quality: bool,
-        ) -> QtWidgets.QTabWidget:
-            tabs = _ContentSizedOperationTabs()
-            tabs.setObjectName(f"calibration{kind}WorkflowTabs")
-            tabs.setSizePolicy(
-                QtWidgets.QSizePolicy.Expanding,
-                QtWidgets.QSizePolicy.Maximum,
-            )
-            sections = (
-                ("Capture", capture_actions),
-                ("Compute", compute_actions),
-                ("Profiles", profile_actions),
-            )
-            for tab_label, actions in sections:
-                page = QtWidgets.QWidget()
-                page_layout = QtWidgets.QVBoxLayout(page)
-                page_layout.setContentsMargins(6, 6, 6, 6)
-                page_layout.setSpacing(6)
-                actions_layout = QtWidgets.QGridLayout()
-                columns = 4 if tab_label == "Capture" else 3
-                for index, (command_id, label) in enumerate(actions):
-                    actions_layout.addWidget(
-                        command_button(command_id, label),
-                        index // columns,
-                        index % columns,
-                    )
-                page_layout.addLayout(actions_layout)
-                if tab_label == "Capture":
-                    hint = QtWidgets.QLabel(capture_hint)
-                    hint.setObjectName("compactContract")
-                    hint.setWordWrap(True)
-                    hint.setFixedHeight(hint.fontMetrics().lineSpacing() * 2 + 6)
-                    page_layout.addWidget(hint)
-                if tab_label == "Capture" and include_auto_capture:
-                    auto_group = QtWidgets.QGroupBox(
-                        "Automatic capture"
-                    )
-                    auto_layout = QtWidgets.QGridLayout(auto_group)
-                    auto_layout.setHorizontalSpacing(8)
-                    auto_layout.setVerticalSpacing(5)
-                    auto_layout.setColumnStretch(1, 1)
-                    auto_interval = QtWidgets.QDoubleSpinBox()
-                    auto_interval.setRange(0.1, 10.0)
-                    auto_interval.setSingleStep(0.1)
-                    auto_interval.setDecimals(1)
-                    auto_interval.setSuffix(" s")
-                    auto_interval.setValue(
-                        float(
-                            self._initial_calibration_setup.get(
-                                "auto_interval_s"
-                            )
-                            or 1.0
-                        )
-                    )
-                    self.setup_widgets["auto_interval_s"] = (
-                        auto_interval
-                    )
-                    auto_button = command_button(
-                        "calibration.auto_capture",
-                        "Start auto capture",
-                    )
-                    auto_button.setToolTip(
-                        "Capture only new left/right checkerboard "
-                        "detections whose decoded-frame app-receive timestamps differ "
-                        "by no more than the configured Max Live pair Δt."
-                    )
-                    auto_layout.addWidget(
-                        QtWidgets.QLabel("Interval"), 0, 0
-                    )
-                    auto_layout.addWidget(auto_interval, 0, 1)
-                    auto_layout.addWidget(
-                        auto_button, 1, 0, 1, 2
-                    )
-                    page_layout.addWidget(auto_group)
-                    page_layout.addWidget(
-                        self._capture._build_calibration_capture_response_group()
-                    )
-                if (
-                    tab_label == "Compute"
-                    and include_intrinsic_quality
-                ):
-                    page_layout.addWidget(
-                        self._quality._build_calibration_quality_group()
-                    )
-                    page_layout.addWidget(
-                        self._quality._build_calibration_outlier_group()
-                    )
-                page_layout.addStretch(1)
-                tabs.addTab(page, tab_label)
-            return tabs
-
-        intrinsics_page = QtWidgets.QWidget()
-        self.intrinsics_page_layout = QtWidgets.QVBoxLayout(
-            intrinsics_page
-        )
-        self.intrinsics_page_layout.setContentsMargins(6, 6, 6, 6)
-        self.intrinsics_page_layout.setAlignment(QtCore.Qt.AlignTop)
-        intrinsics_contract = QtWidgets.QLabel(
-            "Per-camera image pixels → K,D in OpenCV optical RDF. "
-            "Profiles are camera-, native-raster-, focus-, and "
-            "zoom-specific."
-        )
-        intrinsics_contract.setObjectName("compactContract")
-        intrinsics_contract.setWordWrap(True)
-        self.intrinsics_contract_label = intrinsics_contract
-        self.intrinsics_page_layout.addWidget(intrinsics_contract)
-        self.intrinsics_operation_tabs = workflow_tabs(
-            kind="Intrinsics",
-            capture_actions=(),
-            compute_actions=(
-                (
-                    "calibration.run_intrinsic",
-                    "Run calibration (K,D)",
-                ),
-                (
-                    "calibration.save_intrinsics",
-                    "Save Intrinsics",
-                ),
-            ),
-            profile_actions=(
-                (
-                    "calibration.load_intrinsics",
-                    "Load Intrinsics",
-                ),
-            ),
-            capture_hint=(
-                "Each camera contributes its own checkerboard image "
-                "set. Left/right files remain separate inputs to the "
-                "two K,D solves."
-            ),
-            include_auto_capture=False,
-            include_intrinsic_quality=True,
-        )
-        self.intrinsics_page_layout.addWidget(
-            self.intrinsics_operation_tabs
-        )
-        kind_tabs.addTab(intrinsics_page, "Intrinsics")
-
-        extrinsics_page = QtWidgets.QWidget()
-        self.extrinsics_page_layout = QtWidgets.QVBoxLayout(
-            extrinsics_page
-        )
-        self.extrinsics_page_layout.setContentsMargins(6, 6, 6, 6)
-        self.extrinsics_page_layout.setAlignment(QtCore.Qt.AlignTop)
-        self.extrinsics_bundle_contract_label = QtWidgets.QLabel(
-            "Input bundle: Left K,D + Right K,D + synchronized "
-            "stereo pairs. Output: "
-            "X_right = R_left_to_right X_left + "
-            "T_left_to_right_m in OpenCV optical RDF."
-        )
-        self.extrinsics_bundle_contract_label.setObjectName(
-            "compactContract"
-        )
-        self.extrinsics_bundle_contract_label.setWordWrap(True)
-        self.extrinsics_bundle_contract_label.setTextInteractionFlags(
-            QtCore.Qt.TextSelectableByMouse
-        )
-        self.extrinsics_page_layout.addWidget(
-            self.extrinsics_bundle_contract_label
-        )
-        self.extrinsics_operation_tabs = workflow_tabs(
-            kind="Extrinsics",
-            capture_actions=(),
-            compute_actions=(
-                ("calibration.run_extrinsics", "Calculate R,t"),
-                ("calibration.save_extrinsics", "Save R,t"),
-            ),
-            profile_actions=(
-                ("calibration.load_extrinsics", "Load R,t"),
-                (
-                    "calibration.apply_bundle",
-                    "Apply verified K,D + R,t bundle",
-                ),
-            ),
-            capture_hint=(
-                "Extrinsics consumes synchronized left/right rows "
-                "from the shared photo selection. Applied Left/Right "
-                "K,D must match the native raster. Camera, focus, and zoom "
-                "provenance is operator-reviewed and does not gate readiness."
-            ),
-            include_auto_capture=False,
-            include_intrinsic_quality=False,
-        )
-        self.extrinsics_page_layout.addWidget(
-            self.extrinsics_operation_tabs
-        )
-        kind_tabs.addTab(extrinsics_page, "Extrinsics")
+        tabs = load_form("calibration_operations.ui", _ContentSizedOperationTabs())
+        for name in ("intrinsics_page_layout", "extrinsics_page_layout", "intrinsics_contract_label", "extrinsics_bundle_contract_label", "intrinsics_operation_tabs", "extrinsics_operation_tabs", "intrinsics_result_group", "extrinsics_result_group", "checkerboard_validation_outer_group", "intrinsic_table", "calibration_contract"):
+            setattr(self, name, getattr(tabs, name))
+        for label in (self.intrinsics_contract_label, self.extrinsics_bundle_contract_label, self.calibration_contract, tabs.intrinsicsCaptureHint, tabs.extrinsicsCaptureHint):
+            label.setObjectName("compactContract")
+        self.extrinsics_bundle_contract_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.calibration_contract.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        for label in (tabs.intrinsicsCaptureHint, tabs.extrinsicsCaptureHint):
+            label.setFixedHeight(label.fontMetrics().lineSpacing() * 2 + 6)
+        self.intrinsics_operation_tabs.setObjectName("calibrationIntrinsicsWorkflowTabs")
+        self.extrinsics_operation_tabs.setObjectName("calibrationExtrinsicsWorkflowTabs")
+        for button in tabs.findChildren(QtWidgets.QPushButton):
+            command = button.property("commandId")
+            if not command:
+                continue
+            button.setEnabled(self.invoke_command is not None)
+            if self.invoke_command is not None:
+                button.clicked.connect(lambda _checked=False, command=command: self.invoke_command(command))
+            self._commands.primary.setdefault(command, button)
+            self._commands.instances.setdefault(command, []).append(button)
+        tabs.qualityLayout.addWidget(self._quality._build_calibration_quality_group())
+        tabs.outlierLayout.addWidget(self._quality._build_calibration_outlier_group())
         self._inputs._update_calibration_compute_selection_state()
-        return kind_tabs
+        return tabs
 
 
     def _on_calibration_workflow_changed(self, index: int) -> None:
