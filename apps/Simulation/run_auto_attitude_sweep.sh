@@ -72,7 +72,7 @@ Options:
                            yaw simultaneously in one case.
   --values-deg LIST        Comma-separated degrees. Default: -1.0..1.0 in 0.1 steps.
   --repetitions N          Repeat every non-zero attitude case. Default: 1.
-  --trajectories LIST      Comma-separated paths: center,zigzag. Default: center,zigzag.
+  --trajectories LIST      Comma-separated paths: Path1,Path2 (legacy aliases: center,zigzag). Default: Path1,Path2.
   --waypoint-count N       Waypoints per path, including both range endpoints. Default: 8.
   --zigzag-amplitude-m N   Zigzag lateral amplitude. Default: 2.0 m.
   --waypoints-rfu-m LIST   Explicit baseline-center world RFU waypoints.
@@ -131,7 +131,7 @@ normalize_bool() {
 axes_csv="${SWEEP_AXES:-roll,pitch,yaw,combined}"
 values_csv="${SWEEP_VALUES_DEG:--1.0,-0.9,-0.8,-0.7,-0.6,-0.5,-0.4,-0.3,-0.2,-0.1,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0}"
 repetitions="${SWEEP_REPETITIONS:-1}"
-trajectories_csv="${SWEEP_TRAJECTORIES:-center,zigzag}"
+trajectories_csv="${SWEEP_TRAJECTORIES:-Path1,Path2}"
 waypoint_count="${SWEEP_WAYPOINT_COUNT:-${AUTO_WAYPOINT_COUNT:-8}}"
 waypoint_hold_s="${SWEEP_WAYPOINT_HOLD_S:-${WAYPOINT_HOLD_S:-5.0}}"
 final_hover_s="${SWEEP_FINAL_HOVER_S:-0.0}"
@@ -303,13 +303,22 @@ if ((${#trajectories[@]} == 0)); then
   printf '%s\n' 'error: --trajectories must not be empty' >&2
   exit 2
 fi
-for trajectory in "${trajectories[@]}"; do
-  trajectory="${trajectory//[[:space:]]/}"
-  case "$trajectory" in
-    center|zigzag) ;;
-    *) printf 'error: unsupported trajectory %s; use center,zigzag\n' "$trajectory" >&2; exit 2 ;;
+# Preserve stable trajectory IDs for old manifests, CSVs, and replay.
+# Operator-facing Path1/Path2 are aliases for the existing physical paths.
+for trajectory_index in "${!trajectories[@]}"; do
+  trajectory="${trajectories[$trajectory_index]//[[:space:]]/}"
+  case "${trajectory,,}" in
+    path1|center) trajectories[$trajectory_index]="center" ;;
+    path2|zigzag|zig-zag) trajectories[$trajectory_index]="zigzag" ;;
+    *) printf 'error: unsupported trajectory %s; use Path1,Path2\n' "$trajectory" >&2; exit 2 ;;
   esac
 done
+trajectory_display_name() {
+  case "$1" in
+    center) printf 'Path1' ;;
+    zigzag) printf 'Path2' ;;
+  esac
+}
 IFS=',' read -r -a values <<< "$values_csv"
 if ((${#values[@]} == 0)); then
   printf '%s\n' 'error: --values-deg must not be empty' >&2
@@ -370,7 +379,7 @@ for trajectory in "${trajectories[@]}"; do
   trajectory="${trajectory//[[:space:]]/}"
   trajectory_dir="$shared_waypoints_dir/$trajectory"
   shared_path_files["$trajectory"]="$trajectory_dir/validation_mission.csv"
-  printf '%s\n' "Generating $trajectory waypoint path (${waypoint_count} points, hold ${waypoint_hold_s} s) from baseline attitude" \
+  printf '%s\n' "Generating $(trajectory_display_name "$trajectory") waypoint path (${waypoint_count} points, hold ${waypoint_hold_s} s) from baseline attitude" \
     "L=(${CAM_L_OPTICAL_ROLL_DEG:-0},${CAM_L_OPTICAL_PITCH_DEG:-0},${CAM_L_OPTICAL_YAW_DEG:-0})" \
     "R=(${CAM_R_OPTICAL_ROLL_DEG:-0},${CAM_R_OPTICAL_PITCH_DEG:-0},${CAM_R_OPTICAL_YAW_DEG:-0}) deg -> $trajectory_dir"
   generator_cmd=(python3 "$ROOT_DIR/scripts/generate_fov_constrained_waypoints.py" \
