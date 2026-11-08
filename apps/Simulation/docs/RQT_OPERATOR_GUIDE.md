@@ -139,7 +139,7 @@ points are baseline-center world-aligned RFU `(Right, Front, Up)`. They are
 converted to World ENU and then PX4 local NED; the measurement output remains
 the distinct pitched `baseline_center_frd` contract.
 
-The center path uses the configured R values. Zigzag alternates sign and uses
+Path1 (centered) uses the configured R values. Path2 (zig-zag) alternates sign and uses
 40% of the nominal horizontal stereo-overlap half-width, so its lateral offset
 tapers at close range. All explicit mission points remain in the path even
 when the 25 m baseline and WIRIS 8x views no longer overlap. rqt/RViz stay
