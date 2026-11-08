@@ -44,7 +44,9 @@ from rqt with `Save CSV` or `Save MP4`.
 
 The current deterministic campaign is launched with
 `./run_auto_attitude_sweep.sh --ordered --keep-going`. It runs two shared
-trajectories (`center`, `zigzag`). Each trajectory has one zero-error baseline
+trajectories (`Path1` = centered, `Path2` = zig-zag). Internally the paths
+retain `center` and `zigzag` IDs for historical CSV/manifest compatibility.
+Each trajectory has one zero-error baseline
 and nine right-camera optical-RDF OFAT cases: roll, pitch, and yaw offsets
 `0.2,0.5,1.0` degrees. The default campaign therefore has exactly 20 cases.
 RViz and `rqt_gui` remain visible; the Gazebo 3D GUI is not opened.
@@ -54,7 +56,7 @@ RViz and `rqt_gui` remain visible; the Gazebo 3D GUI is not opened.
 Mission points use baseline-center world-aligned RFU (Right, Front, Up), not
 the pitched `baseline_center_frd` measurement frame. The eight configured RFU
 points are preserved in input order even after they leave the camera FOV. The
-center path retains their configured Right value. The zigzag path alternates
+Path1 retains their configured Right value. Path2 alternates
 sign and uses 40% of each point's nominal horizontal stereo-overlap half-width,
 so lateral movement tapers to zero when the 25 m baseline has no 8x overlap.
 The generator records the source RFU, World ENU, PX4 local-NED conversion,
@@ -114,7 +116,8 @@ environment variable overrides that file, and a CLI option overrides both.
   such as `-1,0,1`. Zero is the baseline and is not used as a perturbation.
 - `SWEEP_REPETITIONS`: number of repetitions for each non-zero axis/value
   condition.
-- `SWEEP_TRAJECTORIES`: comma-separated `center,zigzag` path set.
+- `SWEEP_TRAJECTORIES`: comma-separated `Path1,Path2` path set (legacy aliases
+  `center,zigzag` remain accepted).
 - `SWEEP_WAYPOINTS_RFU_M`: semicolon-separated world-aligned
   `right,front,up` points relative to the baseline center.
 - `SWEEP_ZIGZAG_OVERLAP_RATIO`: fraction of the nominal horizontal
