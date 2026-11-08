@@ -56,6 +56,17 @@ def test_auto_attitude_sweep_preserves_interactive_auto_recording_contract():
     assert 'auto_args+=(--target-distance-m "${DRONE_TARGET_DISTANCE_M:-500.0}")' not in source
 
 
+def test_sweep_exposes_path1_path2_without_changing_legacy_trajectory_ids():
+    source = RUNNER.read_text(encoding="utf-8")
+    assert 'trajectories_csv="${SWEEP_TRAJECTORIES:-Path1,Path2}"' in source
+    assert 'path1|center) trajectories[$trajectory_index]="center"' in source
+    assert 'path2|zigzag|zig-zag) trajectories[$trajectory_index]="zigzag"' in source
+    assert "trajectory_display_name()" in source
+    assert '--lateral-pattern "$trajectory"' in source
+    # Existing case IDs and archived experiment manifests retain their canonical keys.
+    assert 'case_id="case-${trajectory}-' in source
+
+
 def test_auto_attitude_sweep_flies_one_shared_deterministic_waypoint_path():
     # Every attitude case within one trajectory must fly the identical
     # physical trajectory; center and zigzag are generated once each.
