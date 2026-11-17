@@ -16,6 +16,7 @@ import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.signals import SignalHandlerOptions
 from geometry_msgs.msg import PointStamped
 from sensor_msgs.msg import Image as ImageMsg
 from std_msgs.msg import Float32, Float32MultiArray, String
@@ -2619,7 +2620,11 @@ _signal_stop_requested = False
 def main():
     global _signal_stop_requested
     args = parse_args()
-    rclpy.init()
+    # This process installs its own SIGINT/SIGTERM handlers below and polls
+    # them in the executor loop.  Avoid rclpy's signal hooks so ROS context
+    # startup and recorder shutdown remain independent of Python's threaded
+    # signal delivery behavior.
+    rclpy.init(args=None, signal_handler_options=SignalHandlerOptions.NO)
     recorder = OperatorRecorder(args)
 
     def _stop(signum, frame):

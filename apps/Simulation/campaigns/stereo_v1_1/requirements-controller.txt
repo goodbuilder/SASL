@@ -1,0 +1,3 @@
+# MAVLink control and the PX4 Kconfig utility used by the v1.2 launch path.
+pymavlink==2.4.50
+kconfiglib==13.7.0

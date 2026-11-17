@@ -11,9 +11,9 @@ PX4_MSGS_SOURCE_DIR="$SASL_ROS_WORKSPACE/src/px4_msgs"
 PX4_MSGS_OVERLAY_SETUP="$SASL_ROS_WORKSPACE/install/setup.bash"
 PX4_MSGS_OVERLAY_MANIFEST="$SASL_ROS_WORKSPACE/install/share/sasl_ros_workspace/px4_msgs-overlay.env"
 PX4_MSGS_PACKAGE_SETUP="$SASL_ROS_WORKSPACE/install/px4_msgs/share/px4_msgs/local_setup.bash"
-PX4_MSGS_REF="${PX4_MSGS_REF:-86d8239e962f6939e05c3737784f60c02fa884db}"
 PX4_MAG_FRAME_HELPER="$ROOT_DIR/scripts/prepare_px4_gz_magnetometer_frame.py"
 PX4_CAMERA_AIRFRAME_SOURCE="$ROOT_DIR/stereo_ground_sim/vendor/px4_camera_airframe/4090_camera_px4"
+PX4_TARGET_AIRFRAME_SOURCE="$ROOT_DIR/stereo_ground_sim/vendor/px4_target_airframe/4001_gz_x500"
 cd "$ROOT_DIR"
 export OPERATOR_BAG_DIR="${OPERATOR_BAG_DIR:-$ROOT_DIR/Recordings}"
 
@@ -218,7 +218,8 @@ PX4_PYTHON_EXECUTABLE="${PX4_PYTHON_EXECUTABLE:-}"
 if [[ -z "$PX4_PYTHON_EXECUTABLE" ]]; then
   for px4_python_candidate in \
     "$ROOT_DIR/.venv-px4-local/bin/python" \
-    "$ROOT_DIR/.venv-px4-v1.17.0/bin/python"; do
+    "$ROOT_DIR/.venv-px4-v1.17.0/bin/python" \
+    "$ROOT_DIR/.venv/bin/python"; do
     if [[ -x "$px4_python_candidate" ]] \
       && "$px4_python_candidate" -c 'import kconfiglib' >/dev/null 2>&1; then
       PX4_PYTHON_EXECUTABLE="$px4_python_candidate"
@@ -367,39 +368,37 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 fi
 
 require_canonical_px4_msgs_overlay() {
-  local expected_commit actual_commit overlay_commit
+  local actual_commit overlay_commit rebuild_command
   if [[ ! -d "$PX4_MSGS_SOURCE_DIR/.git" || ! -f "$PX4_MSGS_SOURCE_DIR/package.xml" ]]; then
     printf '%s\n' \
       "error: canonical px4_msgs source is missing: $PX4_MSGS_SOURCE_DIR" \
       "Run: cd $INTEGRATION_ROOT && tools/bootstrap_ros_workspace.sh" >&2
     return 2
   fi
-  expected_commit="$(git -C "$PX4_MSGS_SOURCE_DIR" rev-parse "${PX4_MSGS_REF}^{commit}" 2>/dev/null || true)"
   actual_commit="$(git -C "$PX4_MSGS_SOURCE_DIR" rev-parse HEAD 2>/dev/null || true)"
-  if [[ -z "$expected_commit" || "$actual_commit" != "$expected_commit" ]]; then
+  if [[ -z "$actual_commit" ]]; then
     printf '%s\n' \
-      "error: canonical px4_msgs revision mismatch." \
-      "required: $PX4_MSGS_REF" \
-      "actual: ${actual_commit:-unavailable}" \
-      "Repair with: cd $INTEGRATION_ROOT && tools/bootstrap_ros_workspace.sh" >&2
+      "error: canonical px4_msgs source revision is unavailable: $PX4_MSGS_SOURCE_DIR" >&2
     return 2
   fi
+  printf -v rebuild_command 'PX4_MSGS_REF=%s bash %q' \
+    "$actual_commit" "$INTEGRATION_ROOT/tools/bootstrap_ros_workspace.sh"
   if [[ ! -f "$PX4_MSGS_OVERLAY_SETUP" ]]; then
     printf '%s\n' \
       "error: canonical px4_msgs overlay is not built: $PX4_MSGS_OVERLAY_SETUP" \
-      "Run: cd $INTEGRATION_ROOT && tools/bootstrap_ros_workspace.sh" >&2
+      "Rebuild from this source revision with: $rebuild_command" >&2
     return 2
   fi
   if [[ ! -f "$PX4_MSGS_OVERLAY_MANIFEST" ]]; then
     printf '%s\n' \
       "error: canonical px4_msgs overlay stamp is missing: $PX4_MSGS_OVERLAY_MANIFEST" \
-      "Run: cd $INTEGRATION_ROOT && tools/bootstrap_ros_workspace.sh" >&2
+      "Rebuild from this source revision with: $rebuild_command" >&2
     return 2
   fi
   if [[ ! -f "$PX4_MSGS_PACKAGE_SETUP" ]]; then
     printf '%s\n' \
       "error: px4_msgs Python environment hook is not built: $PX4_MSGS_PACKAGE_SETUP" \
-      "Run: cd $INTEGRATION_ROOT && tools/bootstrap_ros_workspace.sh" >&2
+      "Rebuild from this source revision with: $rebuild_command" >&2
     return 2
   fi
   overlay_commit="$(sed -n 's/^PX4_MSGS_COMMIT=//p' "$PX4_MSGS_OVERLAY_MANIFEST" | head -n 1)"
@@ -408,7 +407,7 @@ require_canonical_px4_msgs_overlay() {
       "error: canonical px4_msgs overlay is stale." \
       "source: $actual_commit" \
       "overlay: ${overlay_commit:-unavailable}" \
-      "Rebuild with: cd $INTEGRATION_ROOT && tools/bootstrap_ros_workspace.sh" >&2
+      "Rebuild from this source revision with: $rebuild_command" >&2
     return 2
   fi
 }
@@ -817,6 +816,10 @@ if [[ ! -f "$PX4_CAMERA_AIRFRAME_SOURCE" ]]; then
   printf '%s\n' "error: camera PX4 airframe source is missing: $PX4_CAMERA_AIRFRAME_SOURCE" >&2
   exit 2
 fi
+if [[ ! -f "$PX4_TARGET_AIRFRAME_SOURCE" ]]; then
+  printf '%s\n' "error: target PX4 airframe source is missing: $PX4_TARGET_AIRFRAME_SOURCE" >&2
+  exit 2
+fi
 
 # Prepare the one pinned PX4/Gazebo boundary before stopping or launching any
 # runtime process. The helper edits only a known v1.17.0 stock/legacy three-line
@@ -830,6 +833,7 @@ if [[ "$skip_px4_build" == true ]]; then
   "$PX4_PYTHON_EXECUTABLE" "$PX4_MAG_FRAME_HELPER" check-build \
     --px4-root "$PX4_DIR" \
     --airframe "$PX4_CAMERA_AIRFRAME_SOURCE" \
+    --target-airframe "$PX4_TARGET_AIRFRAME_SOURCE" \
     --binary "$PX4_BINARY_PATH" \
     --required-version "${PX4_REQUIRED_VERSION:-v1.17.0}"
 fi
@@ -855,6 +859,7 @@ if [[ "$skip_colcon_build" == true ]] && ! require_fresh_installed_simulation_as
 fi
 
 DEFAULT_YOLO_PYTHON="${DEFAULT_YOLO_PYTHON:-${YOLO_PYTHON:-}}"
+YOLO_VENV_DIR="${YOLO_VENV_DIR:-$ROOT_DIR/.venv}"
 YOLO_BOOTSTRAP_PREFERRED_PYTHON="${DEFAULT_YOLO_PYTHON:-python3}"
 if [[ "$yolo_enabled" != true ]]; then
   DEFAULT_YOLO_MODEL=""
@@ -873,14 +878,14 @@ elif [[ -z "$DEFAULT_YOLO_MODEL" ]]; then
 fi
 if [[ "$yolo_enabled" == true && -n "$DEFAULT_YOLO_MODEL" ]]; then
   ensure_yolo_args=(
-    --venv-dir "$ROOT_DIR/.venv"
+    --venv-dir "$YOLO_VENV_DIR"
     --preferred-python "$YOLO_BOOTSTRAP_PREFERRED_PYTHON"
   )
   case "${YOLO_VENV_ISOLATED:-false}" in
     true|TRUE|1|yes|YES) ensure_yolo_args+=(--isolated) ;;
   esac
   if DEFAULT_YOLO_PYTHON="$(bash "$ROOT_DIR/scripts/ensure_yolo_runtime.sh" "${ensure_yolo_args[@]}")"; then
-    local_site_packages="$(find "$ROOT_DIR/.venv" -maxdepth 3 -type d -name site-packages 2>/dev/null | head -n 1 || true)"
+    local_site_packages="$(find "$YOLO_VENV_DIR" -maxdepth 3 -type d -name site-packages 2>/dev/null | head -n 1 || true)"
     if [[ -n "$local_site_packages" && -d "$local_site_packages" ]]; then
       export PYTHONPATH="$local_site_packages${PYTHONPATH:+:$PYTHONPATH}"
     fi
@@ -1102,11 +1107,15 @@ cleanup() {
   # which drains the S2 queue and writes pair_records.csv/run_summary.json.
   # A process-group SIGTERM first would terminate that Python process before
   # this finalization path can run.
-  if [[ -n "${research_output_dir:-}" ]]; then
+  if [[ -n "${research_output_dir:-}" \
+    && -d "$research_output_dir" \
+    && -f "$research_output_dir/RUN_INCOMPLETE" ]]; then
     terminate_matching INT "stereo_ground_sim.stereo_distance_node"
     terminate_matching INT "stereo_ground_sim/stereo_distance_node"
     for _ in {1..180}; do
-      [[ -f "$research_output_dir/RUN_FINALIZED_VALID" ]] && break
+      [[ -f "$research_output_dir/RUN_FINALIZED_VALID" \
+        || -f "$research_output_dir/RUN_FINALIZED_INVALID" \
+        || ! -f "$research_output_dir/RUN_INCOMPLETE" ]] && break
       sleep 1
     done
   fi
@@ -1378,12 +1387,17 @@ else
   # Keep the CMake build space outside the repository: colcon/rosidl can
   # mis-handle the non-ASCII checkout path when its build cache is under
   # apps/Simulation/build. The install space remains repo-local and portable.
+  # Discover packages from their source roots instead of the entire app tree;
+  # the latter also walks recordings/ and can produce enormous debug logs.
   operator_colcon_build_base="${SASL_OPERATOR_COLCON_BUILD_BASE:-}"
   if [[ -z "$operator_colcon_build_base" ]]; then
     operator_colcon_build_base="$(mktemp -d /tmp/sasl-operator-colcon-build.XXXXXX)"
   fi
   colcon build \
-    --base-paths "$ROOT_DIR" "$COMMON_ROS/simulation_interfaces" \
+    --base-paths \
+    "$ROOT_DIR/stereo_ground_sim" \
+    "$ROOT_DIR/stereo_ground_sim_overlay" \
+    "$COMMON_ROS/simulation_interfaces" \
     --build-base "$operator_colcon_build_base" \
     --packages-select simulation_interfaces stereo_ground_sim stereo_ground_sim_overlay
 fi
@@ -1408,6 +1422,90 @@ set -u
 export PYTHONPATH="$ROOT_DIR/stereo_ground_sim:$COMMON_PYTHON:$INTEGRATION_ROOT/apps:$INTEGRATION_ROOT:$ROOT_DIR/build/stereo_ground_sim:$ROOT_DIR/stereo_ground_sim_overlay${PYTHONPATH:+:$PYTHONPATH}"
 RQT_PYTHONPATH="$ROOT_DIR/python_patches:$ROOT_DIR/stereo_ground_sim:$COMMON_PYTHON:$INTEGRATION_ROOT/apps:$INTEGRATION_ROOT:$ROOT_DIR/build/stereo_ground_sim${PYTHONPATH:+:$PYTHONPATH}"
 
+# Create the recorder ROS node before the simulation graph comes online.
+# Adding another DDS participant after PX4, Gazebo, and the operator GUI are
+# active can block Node construction during FHD sweeps, leaving no initial
+# progress or CSV artifact. The recorder can subscribe before its topics exist.
+if [[ -n "$record_mode" ]]; then
+  if [[ -z "$record_dir" ]]; then
+    record_dir="$ROOT_DIR/Recordings/operator_$(date +%Y%m%d_%H%M%S)_$record_mode"
+  fi
+  mkdir -p "$record_dir"
+  recorder_cmd=(
+    "$OPERATOR_RECORDER_PYTHON" -m stereo_ground_sim.operator_recorder
+    --mode "$record_mode"
+    --output-dir "$record_dir"
+  )
+  if [[ "$record_wait_for_bbox" == true ]]; then
+    recorder_cmd+=(--wait-for-bbox)
+  fi
+  overlay_publish_hz_value="$(get_launch_arg_value overlay_publish_hz "${launch_args[@]}" || true)"
+  if [[ -n "$overlay_publish_hz_value" ]] \
+    && awk -v value="$overlay_publish_hz_value" 'BEGIN { exit !(value == value && value > 0) }'; then
+    recorder_cmd+=(--video-fps "$overlay_publish_hz_value")
+  fi
+  setsid "${recorder_cmd[@]}" &
+  recording_pid="$!"
+  children+=("$recording_pid")
+  printf '%s\n' "Recording $record_mode session to: $record_dir"
+fi
+
+perspective_file="$ROOT_DIR/config/operator_rqt.perspective"
+if [[ "$bag_view" == true ]]; then
+  perspective_file="$ROOT_DIR/config/operator_rqt_bag.perspective"
+elif [[ "$preflight_view" == true ]]; then
+  perspective_file="$ROOT_DIR/config/operator_rqt_preflight.perspective"
+fi
+
+if [[ "$show_detection_images" == true ]]; then
+  rqt_image_topic_mode="detection"
+else
+  rqt_image_topic_mode="raw"
+fi
+
+# Start RQT while the ROS graph is still empty. Its window and plugin
+# subscriptions can initialize before PX4/Gazebo add the FHD topic load; the
+# graph view updates automatically when the simulation nodes appear.
+if [[ "$headless" != true ]]; then
+  setsid env PYTHONPATH="$RQT_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" RQT_YOLO_MODEL_PATH="$rqt_yolo_model_path" RQT_MISSION_LABEL="$rqt_mission_label" RQT_COORD_CONTRACT="$rqt_coord_contract" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" ros2 run rqt_gui rqt_gui \
+    --clear-config \
+    --force-discover \
+    --perspective-file "$perspective_file" &
+  children+=("$!")
+else
+  printf '%s\n' "Headless mode: rqt_gui is disabled."
+fi
+
+# Do not add the large simulation graph until the early operator recorder
+# has initialized. RQT is launched before the graph as well, and the startup
+# gate below waits for its visible main window and maximizes it.
+operator_startup_deadline=$((SECONDS + 30))
+recorder_ready=false
+while ((SECONDS < operator_startup_deadline)); do
+  if [[ -z "$record_mode" || ( -f "$record_dir/progress.json" && -s "$record_dir/progress.json" ) ]]; then
+    recorder_ready=true
+  fi
+  if [[ "$recorder_ready" == true ]]; then
+    break
+  fi
+  if [[ -n "$recording_pid" ]] && ! kill -0 "$recording_pid" >/dev/null 2>&1; then
+    printf '%s\n' "error: operator recorder exited before its startup progress file appeared." >&2
+    exit 2
+  fi
+  sleep 0.2
+done
+if [[ "$recorder_ready" != true ]]; then
+  printf '%s\n' "error: operator recorder did not initialize before simulation startup." >&2
+  exit 2
+fi
+if [[ "$headless" != true ]]; then
+  # Each operator run opens a fresh RQT window. Wait for the main window and
+  # maximize it before adding the large simulation graph or starting PX4.
+  if ! python3 "$ROOT_DIR/scripts/maximize_rqt_window.py" --timeout-s 30; then
+    printf '%s\n' "error: RQT main window was not maximized before simulation startup." >&2
+    exit 2
+  fi
+fi
 setsid ros2 launch stereo_ground_sim stereo_ground_sim.launch.py "${launch_args[@]}" &
 ros_launch_pid="$!"
 children+=("$ros_launch_pid")
@@ -1447,18 +1545,18 @@ setsid bash -c '
     ready_file="${20}"
     mag_frame_helper="${21}"
     required_px4_version="${22}"
+    target_airframe_src="${23}"
     cd "$px4_dir"
     export DISPLAY="$display_value"
     if [[ -x "$px4_python" ]]; then
       export PYTHON_EXECUTABLE="$px4_python"
     fi
 
-    # The left/right camera Pixhawks are static mounts that never fly; they
-    # boot on a dedicated airframe (see vendor/px4_camera_airframe/README.md)
-    # instead of the target drone airframe 4001_gz_x500, so EKF2_MAG_TYPE can
-    # be set for them without affecting the target. Copied into
-    # PX4-Autopilot ROMFS (untracked by SASL git) before every build so it
-    # stays in sync.
+    # Use repository-owned airframes for all PX4 instances. The camera
+    # airframe sets camera-specific magnetometer/MAVLink behavior. The target
+    # airframe keeps the stock 4001 vehicle parameters and configures the
+    # lockstep DDS timestamp contract; it is copied into the build output
+    # after make so the PX4 source checkout keeps its tracked stock file intact.
     cp "$camera_airframe_src" \
       "$px4_dir/ROMFS/px4fmu_common/init.d-posix/airframes/4090_camera_px4"
 
@@ -1485,10 +1583,13 @@ setsid bash -c '
     mkdir -p "$px4_dir/build/px4_sitl_default/etc/init.d-posix/airframes"
     cp "$camera_airframe_src" \
       "$px4_dir/build/px4_sitl_default/etc/init.d-posix/airframes/4090_camera_px4"
+    cp "$target_airframe_src" \
+      "$px4_dir/build/px4_sitl_default/etc/init.d-posix/airframes/4001_gz_x500"
     if [[ "$skip_px4_build" != true ]]; then
       "$px4_python" "$mag_frame_helper" record-build \
         --px4-root "$px4_dir" \
         --airframe "$camera_airframe_src" \
+        --target-airframe "$target_airframe_src" \
         --binary "$px4_binary" \
         --required-version "$required_px4_version"
     fi
@@ -1572,7 +1673,8 @@ setsid bash -c '
     "$CAM_R_PX4_UXRCE_DDS_PORT" \
     "$px4_ready_file" \
     "$PX4_MAG_FRAME_HELPER" \
-    "${PX4_REQUIRED_VERSION:-v1.17.0}" &
+    "${PX4_REQUIRED_VERSION:-v1.17.0}" \
+    "$PX4_TARGET_AIRFRAME_SOURCE" &
 px4_supervisor_pid="$!"
 children+=("$px4_supervisor_pid")
 
@@ -1601,26 +1703,7 @@ if [[ "$PX4_CONSOLE_LOG" != "/dev/null" ]]; then
   printf '%s\n' "PX4 console log: $PX4_CONSOLE_LOG"
 fi
 
-perspective_file="$ROOT_DIR/config/operator_rqt.perspective"
-if [[ "$bag_view" == true ]]; then
-  perspective_file="$ROOT_DIR/config/operator_rqt_bag.perspective"
-elif [[ "$preflight_view" == true ]]; then
-  perspective_file="$ROOT_DIR/config/operator_rqt_preflight.perspective"
-fi
-
-if [[ "$show_detection_images" == true ]]; then
-  rqt_image_topic_mode="detection"
-else
-  rqt_image_topic_mode="raw"
-fi
-
 if [[ "$headless" != true ]]; then
-  setsid env PYTHONPATH="$RQT_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" RQT_YOLO_MODEL_PATH="$rqt_yolo_model_path" RQT_MISSION_LABEL="$rqt_mission_label" RQT_COORD_CONTRACT="$rqt_coord_contract" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" ros2 run rqt_gui rqt_gui \
-    --clear-config \
-    --force-discover \
-    --perspective-file "$perspective_file" &
-  children+=("$!")
-
   sleep 3
   rqt_pid="$(pgrep -n -f 'rqt_gui --clear-config' || true)"
   if [[ -n "$rqt_pid" ]]; then
@@ -1636,8 +1719,6 @@ if [[ "$headless" != true ]]; then
       done
     fi
   fi
-else
-  printf '%s\n' "Headless mode: rqt_gui is disabled."
 fi
 
 # Gazebo GUI exits as part of the ROS launch tree, so closing it used to
@@ -1681,38 +1762,6 @@ if [[ "$headless" != true ]]; then
     launch_rviz_value=true
   fi
   start_gui_watchdog "$$" "$launch_rviz_value" true
-fi
-
-if [[ -n "$record_mode" ]]; then
-  if [[ -z "$record_dir" ]]; then
-    record_dir="$ROOT_DIR/Recordings/operator_$(date +%Y%m%d_%H%M%S)_$record_mode"
-  fi
-  mkdir -p "$record_dir"
-  recorder_cmd=(
-    "$OPERATOR_RECORDER_PYTHON" -m stereo_ground_sim.operator_recorder
-    --mode "$record_mode"
-    --output-dir "$record_dir"
-  )
-  if [[ "$record_wait_for_bbox" == true ]]; then
-    recorder_cmd+=(--wait-for-bbox)
-  fi
-  # operator_recorder writes MP4 frames from /left_camera/detection_image and
-  # /right_camera/detection_image, which detection_overlay_node publishes at
-  # overlay_publish_hz -- not at --video-fps's own default (20.0). A mismatch
-  # there makes cv2.VideoWriter encode each real frame as if it arrived
-  # overlay_publish_hz/video_fps times faster than it did, so the MP4 plays
-  # back compressed into a fraction of the real session length. Pass the
-  # actual configured overlay_publish_hz through so playback speed matches
-  # wall-clock time.
-  overlay_publish_hz_value="$(get_launch_arg_value overlay_publish_hz "${launch_args[@]}" || true)"
-  if [[ -n "$overlay_publish_hz_value" ]] \
-    && awk -v value="$overlay_publish_hz_value" 'BEGIN { exit !(value == value && value > 0) }'; then
-    recorder_cmd+=(--video-fps "$overlay_publish_hz_value")
-  fi
-  setsid "${recorder_cmd[@]}" &
-  recording_pid="$!"
-  children+=("$recording_pid")
-  printf '%s\n' "Recording $record_mode session to: $record_dir"
 fi
 
 if [[ "$run_mission" == true ]]; then

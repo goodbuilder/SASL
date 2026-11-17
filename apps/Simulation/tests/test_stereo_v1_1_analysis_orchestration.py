@@ -99,6 +99,7 @@ def test_oracle_evaluation_does_not_require_estimated_euler_angles():
     result = {
         "method": "ORACLE_true_camera_pose",
         "attitude_variant": "ORACLE",
+        "calibration_run_id": "G0-P0-R01",
         "convergence_status": "REFERENCE_ONLY_NOT_A_CALIBRATION_ALGORITHM",
         "fixed_camera_centers_world_m": {
             "left": [-12.5, 0.0, 0.1], "right": [12.5, 0.0, 0.1],
@@ -148,7 +149,8 @@ def _source_qc_fixture(root, *, workbook):
     slots = [{**(row if workbook else {"run_id": row["run_id"]}),
               "status": "VALID", "attempt_count": 1,
               "recording_path": f"raw/{row['run_id']}/a01",
-              "attempts": [{"attempt_id": "a01", "recording_path": f"raw/{row['run_id']}/a01"}]}
+              "attempts": [{"run_id": row["run_id"], "attempt_id": "a01", "status": "VALID",
+                            "recording_path": f"raw/{row['run_id']}/a01"}]}
              for row in sources]
     status = {"planned_run_count": 39, "valid_run_count": 39, "run_slots": slots,
               "schema_version": "stereo_v1_1_run_status_v1", "workbook_sha256": None,
@@ -163,6 +165,35 @@ def _source_qc_fixture(root, *, workbook):
         status.update(workbook_sha256=digest, campaign_plan_sha256=_plan_digest(plan))
     (root / "run_status.json").write_text(json.dumps(status))
     return sources
+
+
+def test_analysis_uses_first_valid_attempt_after_technical_retry(tmp_path):
+    slot = {
+        "run_id": "G0-P0-R01",
+        "status": "VALID_WITH_WARNINGS",
+        "attempts": [
+            {"run_id": "G0-P0-R01", "attempt_id": "a01",
+             "status": "INFRASTRUCTURE_FAILED", "recording_path": "raw/a01"},
+            {"run_id": "G0-P0-R01", "attempt_id": "a02",
+             "status": "VALID_WITH_WARNINGS", "recording_path": "raw/a02"},
+            {"run_id": "G0-P0-R01", "attempt_id": "a03",
+             "status": "INFRASTRUCTURE_FAILED", "recording_path": "raw/a03"},
+        ],
+    }
+
+    assert analyze_campaign._first_valid_attempt(slot)["attempt_id"] == "a02"
+    assert analyze_campaign._attempt_id(slot) == "a02"
+    assert analyze_campaign._attempt_dir(tmp_path, slot) == tmp_path / "raw/a02"
+
+
+def test_analysis_rejects_slot_status_that_differs_from_first_valid_attempt():
+    slot = {
+        "run_id": "G0-P0-R01", "status": "VALID",
+        "attempts": [{"attempt_id": "a01", "status": "VALID_WITH_WARNINGS",
+                      "recording_path": "raw/a01"}],
+    }
+    with pytest.raises(ValueError, match="status differs"):
+        analyze_campaign._first_valid_attempt(slot)
 
 
 @pytest.mark.parametrize("counted", [True, False])
@@ -228,7 +259,9 @@ def test_source_qc_rejects_inconsistent_workbook_before_qc(tmp_path, monkeypatch
 def test_every_mc_trial_covers_full_main_matrix_and_preserves_gps(tmp_path, monkeypatch):
     spec = json.loads((SIM_ROOT / 'campaigns/stereo_v1_1/protocol/03_experiment_spec.json').read_text())
     slots = [{'run_id': f'{group}-{path}-R{rep:02}', 'rig_group': group,
-              'path_id': path, 'repetition': rep, 'attempts': [{'attempt_id': 'a01'}]}
+              'path_id': path, 'repetition': rep,
+              'attempts': [{'attempt_id': 'a01', 'status': 'VALID',
+                            'recording_path': f'raw/{group}-{path}-R{rep:02}/a01'}]}
              for group, paths, repetitions in (
                  ('G0', ('P0', 'P1', 'P2', 'P3', 'P4', 'V0'), 5),
                  ('G1', ('P0', 'P4', 'V0'), 3))
@@ -306,7 +339,9 @@ def test_sensitivity_executes_every_source_repetition_and_mc_trial(tmp_path, mon
     scenario = analyze_campaign._sensitivity_scenarios(spec)[0]
     monkeypatch.setattr(analyze_campaign, '_sensitivity_scenarios', lambda spec: [scenario])
     slots = [{'run_id': f'G0-{path}-R{rep:02d}', 'rig_group': 'G0',
-              'path_id': path, 'repetition': rep, 'attempts': [{'attempt_id': 'a01'}]}
+              'path_id': path, 'repetition': rep,
+              'attempts': [{'attempt_id': 'a01', 'status': 'VALID',
+                            'recording_path': f'raw/G0-{path}-R{rep:02d}/a01'}]}
              for rep in (1, 2) for path in ('P0', 'P3', 'V0')]
     calls = []
     def sensor(root, run_id, trial, scenario_id, **kwargs):
@@ -378,7 +413,8 @@ def test_analysis_summary_separates_mc_cases_from_physical_runs_and_fit_failures
                'data_scope': 'all_data', 'calibration_run_id': f'G0-P0-R{run:02d}',
                'evaluation_run_id': f'G0-V0-R{run:02d}', 'mc_seed': trial,
                'metrics': None if rmse is None else {'position_3d_rmse_m': rmse}}
-        payloads.append({'results': [row], 'calibration_results': [
+        payloads.append({'calibration_run_id': f'G0-P0-R{run:02d}',
+                         'results': [row], 'calibration_results': [
             {'method': row['method'], 'attitude_variant': row['attitude_variant'],
              'convergence_status': status}]})
     summary = analyze_campaign._summarize_evaluations(payloads)
@@ -387,10 +423,26 @@ def test_analysis_summary_separates_mc_cases_from_physical_runs_and_fit_failures
     assert row['source_calibration_run_count'] == row['source_evaluation_run_count'] == 2
     assert row['offline_mc_trial_count'] == row['metric_available_case_count'] == 2
     assert row['position_3d_rmse_mean_m'] == 2.
-    rates = summary['calibration_convergence_rates']['A_rtk_independent__RPY_IMU']
+    rates = summary['calibration_convergence_rates']['G0__A_rtk_independent__RPY_IMU']
     assert rates['attempted_fit_count'] == 2 and rates['not_run_or_other_status_count'] == 1
     assert rates['nonconvergence_fraction_among_attempted_fits'] == .5
     assert rates['failure_or_not_run_fraction_all_cases'] == 2/3
+
+
+def test_calibration_convergence_summary_keeps_rig_groups_separate():
+    payloads = [
+        {"calibration_run_id": "G0-P0-R01", "calibration_results": [{
+            "method": "A_rtk_independent", "attitude_variant": "RPY_IMU",
+            "convergence_status": "CONVERGED"}], "results": []},
+        {"calibration_run_id": "G1-P0-R01", "calibration_results": [{
+            "method": "A_rtk_independent", "attitude_variant": "RPY_IMU",
+            "convergence_status": "RANK_DEFICIENT"}], "results": []},
+    ]
+
+    rates = analyze_campaign._summarize_evaluations(payloads)["calibration_convergence_rates"]
+
+    assert rates["G0__A_rtk_independent__RPY_IMU"]["nonconverged_fit_count"] == 0
+    assert rates["G1__A_rtk_independent__RPY_IMU"]["nonconverged_fit_count"] == 1
 
 
 def test_evaluation_preserves_valid_estimates_when_another_pair_is_invalid(monkeypatch):
@@ -427,7 +479,8 @@ def test_evaluation_inputs_reuse_only_current_static_attempt(tmp_path, monkeypat
     monkeypatch.setattr(analyze_campaign, '_read_json', lambda p: {'path': str(p)})
     monkeypatch.setattr(analyze_campaign, '_camera_truth', lambda p: {})
     monkeypatch.setattr(analyze_campaign, '_select_time_stratified', lambda rows, n: rows[:n])
-    slot = {'run_id': 'G0-V0-R01', 'attempts': [{'attempt_id': 'a01', 'recording_path': 'raw/a01'}]}
+    slot = {'run_id': 'G0-V0-R01', 'attempts': [{'attempt_id': 'a01', 'status': 'VALID',
+                                                 'recording_path': 'raw/a01'}]}
     cache = {}
     first = None
     for trial in range(3):
@@ -439,7 +492,7 @@ def test_evaluation_inputs_reuse_only_current_static_attempt(tmp_path, monkeypat
             assert len(result['pairs']) == (200 if scope == 'matched_200' else 250)
     assert calls == {'pairs': 1, 'gt': 1}
     assert 'sensor' not in cache and len(cache) == 6
-    slot['attempts'] = [{'attempt_id': 'a02', 'recording_path': 'raw/a02'}]
+    slot['attempts'] = [{'attempt_id': 'a02', 'status': 'VALID', 'recording_path': 'raw/a02'}]
     assert analyze_campaign._v0_evaluation_inputs(tmp_path, slot, 0, 'all_data', cache)['gt_series'] is not first
     assert calls == {'pairs': 2, 'gt': 2}
     assert len(cache) == 5
@@ -527,7 +580,7 @@ def test_analyze_handoff_streams_fixture_cases_after_freeze(tmp_path, monkeypatc
     """Exercise real export/coordinator/freeze without fits or real V0 data."""
     spec = json.loads((SIM_ROOT/'campaigns/stereo_v1_1/protocol/03_experiment_spec.json').read_text())
     slot = {'run_id':'G0-P0-R01','rig_group':'G0','path_id':'P0','repetition':1,
-            'attempts':[{'attempt_id':'a01','recording_path':'raw/a01'}]}
+            'attempts':[{'attempt_id':'a01','status':'VALID','recording_path':'raw/a01'}]}
     (tmp_path/'environment_report.json').write_text('{"status":"PREFLIGHT_PASS"}')
     monkeypatch.setattr(analyze_campaign,'_status_slots',lambda root: ({'valid_run_count':39},[slot]))
     monkeypatch.setattr(analyze_campaign,'_load_analysis_protocol',lambda root,status:(spec,{'sha256':'fixture'}))
@@ -693,7 +746,8 @@ def test_calibration_and_evaluation_selection_share_cached_feasible_200(tmp_path
     monkeypatch.setattr(analyze_campaign,'GroundTruthSeries',lambda *args:None)
     monkeypatch.setattr(analyze_campaign,'_camera_truth',lambda *args:{})
     monkeypatch.setattr(analyze_campaign,'_read_json',lambda *args:{})
-    slot={'run_id':'G0-V0-R01','attempts':[{'attempt_id':'a01','recording_path':'fixture/a01'}]}
+    slot={'run_id':'G0-V0-R01','attempts':[{'attempt_id':'a01','status':'VALID',
+                                           'recording_path':'fixture/a01'}]}
     cache={}
     for trial in range(3):
         evaluated=analyze_campaign._v0_evaluation_inputs(tmp_path,slot,trial,'matched_200',cache)

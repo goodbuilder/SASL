@@ -66,9 +66,15 @@ assert(wb.worksheets.items.length===17,"Expected 17 v2 sheets");
 const sourceChartCount=wb.worksheets.getItem("05_그래프").charts.items.length;
 assert(sourceChartCount===22,"Expected 22 v2 charts");
 const sourceMcCount=wb.worksheets.getItem("08_V0_MC분포").getRange("A3").values;
+const latest=JSON.parse(await fs.readFile(path.join(campaign,"analysis_latest.json"),"utf8"));
+assert(latest.analysis_id==="analysis_9cfd7c6cd10b","Report v3 is pinned to frozen analysis_9cfd7c6cd10b");
+assert(latest.analysis_summary===`${path.relative(campaign,analysis)}/analysis_summary.json`,"Latest analysis pointer does not select the frozen v3 source");
+assert(latest.analysis_freeze_sha256===await sha256(path.join(analysis,"analysis_freeze.json")),"Latest analysis freeze hash differs from the frozen v3 source");
 const pathSelection=JSON.parse(await fs.readFile(path.join(analysis,"path_selection.json"),"utf8"));
 const predictions=pathSelection.per_calibration_prediction;
 assert(predictions.length===75 && pathSelection.selected_path_id==="P2","Unexpected frozen selection");
+assert(pathSelection.target_geometry?.frame==="world_enu:east,north,up_m","Unexpected V0 target frame");
+assert(JSON.stringify(pathSelection.target_geometry.distances_m)===JSON.stringify([600,550,500,450,400]),"V0 targets must span world ENU north 600 to 400 m");
 
 console.log("STAGE selection sensitivity");
 const loo=wb.worksheets.add("15_선정민감도");loo.showGridLines=false;
@@ -120,6 +126,11 @@ const trackMap=new Map(wb.worksheets.getItem("02_경로추종").getRange("A6:E44
 const run=wb.worksheets.add("16_실행별V0");run.showGridLines=false;
 run.getRange("A1:N1").merge();run.getRange("A1").values=[["V0 위치오차 · 경로별 5개 실행"]];styleTitle(run,"A1:N1");
 run.getRange("A2:N2").merge();note(run,"A2","G0 existing-yaw Y0–Y6 × MC 100을 각 교정 run·대응 V0 run쌍 안에서 평균한 기술값입니다. 700 case는 독립 비행 700회가 아닙니다. 비행 반복 독립성은 검증되지 않았습니다.");
+run.getRange("A3:N3").merge();
+const v0StartUpM=(600*Math.tan(20*Math.PI/180)).toFixed(3);
+const v0EndUpM=(400*Math.tan(20*Math.PI/180)).toFixed(3);
+note(run,"A3",`계획된 V0 science 참조: world ENU [E,N,U]=[0,600,${v0StartUpM}]m에서 [0,400,${v0EndUpM}]m까지. N=600m가 science 구간 시작점이며 이륙·진입·5초 안정화는 구간 바깥입니다. 이 표기는 각 실행이 시작점에 실제 도달했다는 뜻이 아닙니다.`);
+run.getRange("A3:N3").format.rowHeight=54;
 run.getRange("A4:E4").values=[["대응 반복","A P0 RMSE (m)","A P2 RMSE (m)","B P0 RMSE (m)","B P2 RMSE (m)"]];styleHeader(run,"A4:E4");
 run.getRange("A5:A9").values=Array.from({length:5},(_,i)=>[`R0${i+1}`]);styleBody(run,"A5:E9");
 run.getRange("A21:I21").values=[["반복","방법","범위","P0 RMSE (m)","P2 RMSE (m)","P2−P0 (m)","P0 실제시간 (s)","P2 실제시간 (s)","P2−P0 시간 (s)"]];styleHeader(run,"A21:I21");
@@ -211,12 +222,13 @@ const map=wb.worksheets.getItem("10_계산추적");
 map.getRange("A2").values=[[`경로 기준: 01_실행현황!I, 07_사후QC!P, 09_GT제외프레임!M, 17_추종P95출처!L의 원본_실행별/·파생_재처리/와 98_출처 목록은 캠페인 루트(${campaignRel}/) 기준입니다. 10_계산추적 D열과 13_QC시간간격!K의 apps/Simulation/...는 Git 루트 기준입니다. XLSX만으로 외부 원자료를 다시 열 수는 없습니다.`]];
 map.getRange("A2:G2").format.rowHeight=58;
 map.getRange("E5").values=[["02_경로추종 M: flight_state의 저장 GT−참조 거리, science 행, GT 시각차 ≤40ms, type-7 P95. 재정렬 P95는 17_추종P95출처에서 별도 비교."]];
-map.getRange("A19:G21").values=[
+map.getRange("A19:G22").values=[
   ["16_실행별V0!A48:K147","G0 5개 경로×5 run×A/B×2 scope의 run 내 평균","Y0–Y6 × MC100 = 각 행 700 case",`${analysisRel}/evaluation_metrics.csv`,"world ENU estimate−truth 3D RMSE/P95; 동일 V0 반복 대응","CSV에서 case mean 고정값; 상단·P0/P2 차이는 셀 수식","물리 반복 독립성은 미검증; 700 case는 700 비행 아님"],
   ["15_선정민감도!B5:I9","반복 1개 제외 P0–P4 사전 점수와 1위","G0 trial-0 75개 예측값; 12개 남김",`${analysisRel}/path_selection.json`,"원 규칙의 중앙값을 5개 제외 조건에 적용한 사후 진단","점수는 고정 Python/JS 동등 집계; winner/delta는 Excel 수식","원래 동결 선택을 변경하지 않음; 다른 MC trial은 미평가"],
   ["17_추종P95출처!A9:N47","기록 GT P95와 재정렬 GT P95 · world ENU m","원본 run 39개; 재정렬 tracking 31개",`${campaignRel}/원본_실행별/<run>/<attempt>/gt_alignment_summary.json; 02_경로추종!M`,"기록 flight_state 저장 GT+40ms 조건 vs science stamp GT 재보간; 둘 다 type-7 P95","E=02 M; I=E−G; J/K는 각각 1m 초과 판정","원본 QC 미수정; V0 재정렬 tracking은 pre-freeze 기록에서 미제공"],
+  ["16_실행별V0!A3:N3","V0 계획 참조 시작·종료점","world ENU [E,N,U]=[0,600,218.382]→[0,400,145.588]m","03_experiment_spec.json: V0 600→400m; path_selection.json: target_geometry","N=600m는 science 시작 목표점; 실제 도달 여부와 구분","20° 고도 관계 U=N×tan(20°)","이륙·진입·안정화는 science 구간 밖"],
 ];
-map.getRange("A19:G21").format={font:{name:font,size:9,color:ink},wrapText:true,verticalAlignment:"top",rowHeight:55};
+map.getRange("A19:G22").format={font:{name:font,size:9,color:ink},wrapText:true,verticalAlignment:"top",rowHeight:55};
 wb.worksheets.getItem("99_정의").getRange("B10").values=[["02_경로추종 M/07_사후QC F는 flight_state science 행의 저장 GT−참조 거리(40ms 시각차 제한) P95. 17_추종P95출처의 재정렬값은 같은 science 시각에 원시 GT를 보간해 별도 계산하며 표본·GT 위치가 다를 수 있음. 둘 다 world ENU 3D 거리 m."]];
 const summary=wb.worksheets.getItem("00_요약");
 const auditRel=`${campaignRel}/source_evidence/post_analysis_verification_001/analysis_results_audit.json`;
@@ -239,7 +251,14 @@ assert(graph.charts.items.length===sourceChartCount,"Existing chart count change
 assert(run.charts.items.length===1,"Run-level chart missing");
 assert(JSON.stringify(sourceMcCount)===JSON.stringify(wb.worksheets.getItem("08_V0_MC분포").getRange("A3").values),"MC source cell changed");
 await fs.mkdir(path.dirname(outputPath),{recursive:true});
-const file=await SpreadsheetFile.exportXlsx(wb);await file.save(outputPath);
+const temporaryOutputPath=`${outputPath}.tmp-${process.pid}`;
+try{
+  const file=await SpreadsheetFile.exportXlsx(wb);
+  await file.save(temporaryOutputPath);
+  await fs.rename(temporaryOutputPath,outputPath);
+}finally{
+  await fs.rm(temporaryOutputPath,{force:true});
+}
 console.log("OUTPUT="+path.relative(repo,outputPath));
 console.log("SHA256="+await sha256(outputPath));
 console.log("RUN_GROUPS="+runGroups.size+" SELECTED_CASES="+selectedMetricRows);

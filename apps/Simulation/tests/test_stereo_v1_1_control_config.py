@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import json
 
 import pytest
 
@@ -51,6 +52,14 @@ def test_xlsx_action_ignores_offline_trial_setting_but_uses_workbook_world(tmp_p
     assert runtime["PX4_GZ_WORLD"] == "stereo_ground_drone"
 
 
+@pytest.mark.parametrize("action", ["xlsx_all", "xlsx_resume"])
+def test_v12_sweep_actions_require_full_mc_analysis_for_v3(tmp_path, action):
+    config = load_control_config(_config(tmp_path, f"STEREO_V1_1_ACTION={action}\n"))
+    assert config.mc_trials == 100
+    with pytest.raises(ValueError, match="requires STEREO_V1_1_MC_TRIALS=100"):
+        load_control_config(_config(tmp_path, f"STEREO_V1_1_ACTION={action}\nSTEREO_V1_1_MC_TRIALS=99\n"))
+
+
 def test_resume_preflight_uses_environment_from_the_frozen_workbook(tmp_path, monkeypatch):
     frozen_workbook = tmp_path / "frozen_input.xlsx"
     captured = {}
@@ -86,6 +95,107 @@ def test_workbook_plan_action_validates_xlsx_and_routes_without_flight(tmp_path,
     assert command[2] == "plan"
     assert Path(command[4]) == config.workbook_path
     assert options["label"] == "workbook-plan"
+
+
+def test_complete_xlsx_sweep_runs_analysis_and_v3_report_after_capture(tmp_path, monkeypatch):
+    output_root = tmp_path / "campaign"
+    output_root.mkdir()
+    calls = []
+    monkeypatch.setattr(control_cli, "_run_preflight", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(control_cli, "_campaign_runtime_env", lambda _config: {})
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        if kwargs.get("label") == "workbook:run":
+            (output_root / "run_status.json").write_text(json.dumps({
+                "planned_run_count": 39, "valid_run_count": 39,
+            }))
+        return 0
+    monkeypatch.setattr(control_cli, "_run", fake_run)
+    monkeypatch.setattr(control_cli, "_run_campaign_analysis_and_report", lambda _config: calls.append(("analysis+report", {})) or 0)
+    config = SimpleNamespace(
+        action="xlsx_all", output_root=output_root, workbook_sha256="workbook-hash",
+        workbook_path=tmp_path / "input.xlsx", mc_trials=100,
+    )
+
+    assert control_cli._run_workbook_campaign(config, "xlsx_all") == 0
+
+    assert calls[0][1]["label"] == "workbook:run"
+    assert calls[1][0] == "analysis+report"
+
+
+def test_fresh_campaign_analysis_audit_and_v3_export_run_in_order(tmp_path, monkeypatch):
+    config = SimpleNamespace(mc_trials=100, output_root=tmp_path / "campaign")
+    audit_path = config.output_root / "source_evidence" / "audit.json"
+    analysis_ids = iter((None, "analysis_fresh"))
+    calls = []
+    monkeypatch.setattr(control_cli, "_current_analysis_id", lambda _config: next(analysis_ids))
+    monkeypatch.setattr(control_cli, "_run_analysis", lambda _config, *, input_root:
+                        calls.append(("analysis", input_root)) or 0)
+    monkeypatch.setattr(control_cli, "_ensure_analysis_audit", lambda _config, analysis_id:
+                        calls.append(("audit", analysis_id)) or (0, audit_path))
+    monkeypatch.setattr(control_cli, "_analysis_python", lambda _config: Path("/app/.venv/bin/python"))
+    monkeypatch.setattr(control_cli, "_campaign_runtime_env", lambda _config: {})
+    monkeypatch.setattr(control_cli, "_run", lambda command, *, env, label:
+                        calls.append(("report", command, label)) or 0)
+
+    assert control_cli._run_campaign_analysis_and_report(config) == 0
+
+    assert calls[0] == ("analysis", config.output_root)
+    assert calls[1] == ("audit", "analysis_fresh")
+    assert calls[2][0] == "report"
+    assert calls[2][1][1] == str(control_cli.CAMPAIGN_V3_BUILDER)
+    assert calls[2][1][-1] == str(audit_path)
+    assert calls[2][2] == "report-v3-fresh"
+
+
+def test_incomplete_xlsx_resume_defers_analysis_and_report(tmp_path, monkeypatch):
+    output_root = tmp_path / "campaign"
+    frozen = output_root / "frozen_protocol" / "input_parameters.xlsx"
+    frozen.parent.mkdir(parents=True)
+    frozen.write_bytes(b"frozen")
+    (output_root / "run_status.json").write_text(json.dumps({
+        "planned_run_count": 39, "valid_run_count": 38,
+    }))
+    calls = []
+    monkeypatch.setattr(control_cli, "_run_preflight", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(control_cli, "_campaign_runtime_env", lambda _config: {})
+    monkeypatch.setattr(control_cli, "_run", lambda command, **kwargs: calls.append((command, kwargs)) or 0)
+    monkeypatch.setattr(control_cli, "_run_campaign_analysis_and_report", lambda _config: pytest.fail("must wait for 39 valid runs"))
+    config = SimpleNamespace(
+        action="xlsx_resume", output_root=output_root, workbook_sha256="workbook-hash",
+        workbook_path=tmp_path / "input.xlsx", mc_trials=100,
+    )
+
+    assert control_cli._run_workbook_campaign(config, "xlsx_resume") == 0
+    assert len(calls) == 1
+    assert calls[0][1]["label"] == "workbook:resume"
+
+
+def test_report_v3_is_pinned_to_archived_campaign_and_routes_to_report_builder(tmp_path, monkeypatch):
+    path = _config(tmp_path, "\n".join([
+        "STEREO_V1_1_ACTION=report_v3",
+        "STEREO_V1_1_OUTPUT_ID=paper1_v1_2_001",
+    ]))
+    builder = tmp_path / "build_report_workbook_v3.sh"
+    captured = {}
+    monkeypatch.setattr(control_cli, "REPORT_V3_BUILDER", builder)
+    monkeypatch.setattr(control_cli, "_run", lambda command, *, env, label:
+                        captured.update(command=command, env=env, label=label) or 0)
+
+    config = load_control_config(path)
+    assert control_cli._run_report_v3(config) == 0
+    assert captured["command"] == ["bash", str(builder)]
+    assert captured["label"] == "report-v3"
+
+
+@pytest.mark.parametrize("output", [
+    "STEREO_V1_1_OUTPUT_ID=another_campaign",
+    "STEREO_V1_1_OUTPUT_BASE=data_root",
+])
+def test_report_v3_rejects_non_archived_output(tmp_path, output):
+    path = _config(tmp_path, f"STEREO_V1_1_ACTION=report_v3\n{output}\n")
+    with pytest.raises(ValueError, match="pinned to repo-local paper1_v1_2_001"):
+        load_control_config(path)
 
 
 def test_workbook_action_does_not_require_the_static_run_manifest(tmp_path, monkeypatch):

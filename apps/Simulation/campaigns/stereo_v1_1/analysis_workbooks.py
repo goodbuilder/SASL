@@ -103,7 +103,7 @@ def export_analysis_workbooks(analysis_root: Path, evaluation_payloads):
                 os.close(fd)
                 temporary_files[family] = Path(temporary_name)
                 book = stack.enter_context(xlsxwriter.Workbook(temporary_name, {"constant_memory": True,
-                    "strings_to_formulas": False, "strings_to_urls": False}))
+                    "strings_to_formulas": False, "strings_to_urls": False, "use_zip64": True}))
                 books[family] = book
                 book.set_properties({"title": f"Stereo calibration: {family}", "created": datetime(1980, 1, 1)})
                 header = book.add_format({"bold": True, "bg_color": "#DCE6F1"})

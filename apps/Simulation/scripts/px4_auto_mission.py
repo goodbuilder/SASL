@@ -260,10 +260,29 @@ class ActualDistanceMonitor:
         self._ready = False
         self._phase_publish_warning_logged = False
         self._stop = threading.Event()
+        self._startup_thread = None
 
     def start(self):
+        if self._startup_thread is not None:
+            return
+        self._startup_thread = threading.Thread(
+            target=self._start_ros_monitor,
+            name="px4-actual-distance-monitor-startup",
+            daemon=True,
+        )
+        self._startup_thread.start()
+        self._startup_thread.join(timeout=0.5)
+        if self._startup_thread.is_alive():
+            print(
+                "Actual-distance ROS monitor startup is taking longer than 0.5 s; "
+                "continuing the PX4 mission while it initializes.",
+                flush=True,
+            )
+
+    def _start_ros_monitor(self):
         try:
             import rclpy
+            from rclpy.signals import SignalHandlerOptions
             from std_msgs.msg import Float32, String
         except Exception as exc:
             print(f"Actual-distance ROS monitor unavailable: {exc}", flush=True)
@@ -272,7 +291,10 @@ class ActualDistanceMonitor:
         self._rclpy = rclpy
         try:
             if not rclpy.ok():
-                rclpy.init(args=None)
+                rclpy.init(
+                    args=None,
+                    signal_handler_options=SignalHandlerOptions.NO,
+                )
                 self._owns_rclpy = True
             self._node = rclpy.create_node("px4_auto_mission_distance_monitor")
             self._node.create_subscription(Float32, self.topic, self._callback, 10)
@@ -321,6 +343,8 @@ class ActualDistanceMonitor:
 
     def stop(self):
         self._stop.set()
+        if self._startup_thread is not None:
+            self._startup_thread.join(timeout=1.0)
         if self._thread is not None:
             self._thread.join(timeout=1.0)
         if self._node is not None:
@@ -532,13 +556,69 @@ def wait_heartbeat(master, timeout_s):
 
 
 def wait_local_position(master, timeout_s=10.0):
+    # Request PX4's local-position stream explicitly. Some Onboard MAVLink
+    # links emit heartbeats continuously but do not stream LOCAL_POSITION_NED
+    # until the companion requests it. The message contract is PX4 local NED:
+    # x=north, y=east, z=down; this function returns it unchanged.
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+        0,
+        mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED,
+        100_000,
+        0,
+        0,
+        0,
+        0,
+        0,
+    )
     deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        raise_if_interrupted()
-        msg = master.recv_match(type="LOCAL_POSITION_NED", blocking=True, timeout=1.0)
-        if msg is not None:
-            return msg
+    # PyMAVLink's ``blocking=False`` does not make the UDP socket itself
+    # nonblocking. Set the underlying socket nonblocking so unrelated
+    # telemetry cannot trap recv_msg() inside recvfrom() past our deadline.
+    socket = getattr(master, "port", None)
+    if socket is None or not hasattr(socket, "setblocking"):
+        raise RuntimeError("PX4 MAVLink connection does not expose a readable socket.")
+    was_blocking = socket.getblocking()
+    socket.setblocking(False)
+    try:
+        while time.monotonic() < deadline:
+            raise_if_interrupted()
+            msg = master.recv_msg()
+            if msg is not None and msg.get_type() == "LOCAL_POSITION_NED":
+                return msg
+            time.sleep(0.02)
+    finally:
+        socket.setblocking(was_blocking)
     raise RuntimeError("LOCAL_POSITION_NED was not received from PX4.")
+
+
+def recv_match_nonblocking(master, message_type):
+    """Read a matching MAVLink message without blocking on a UDP socket.
+
+    PyMAVLink's ``blocking=False`` only controls its empty-read loop; a UDP
+    socket that remains in blocking mode can still wait in ``recvfrom`` while
+    unrelated telemetry is arriving. Temporarily make the underlying socket
+    nonblocking and drain a bounded number of packets until the requested
+    message appears or the socket is empty. Message values and frame contracts
+    are returned unchanged.
+    """
+    socket = getattr(master, "port", None)
+    if socket is None or not hasattr(socket, "setblocking"):
+        raise RuntimeError("PX4 MAVLink connection does not expose a readable socket.")
+    was_blocking = socket.getblocking()
+    socket.setblocking(False)
+    try:
+        for _ in range(64):
+            message = master.recv_msg()
+            if message is None:
+                return None
+            if message.get_type() == message_type:
+                return message
+        return None
+    finally:
+        socket.setblocking(was_blocking)
 
 
 def set_mode(master, mode_name):
@@ -580,8 +660,9 @@ def request_land(master):
 def wait_command_ack(master, command, timeout_s=5.0):
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        ack = master.recv_match(type="COMMAND_ACK", blocking=True, timeout=0.5)
+        ack = recv_match_nonblocking(master, "COMMAND_ACK")
         if ack is None:
+            time.sleep(0.02)
             continue
         if int(ack.command) == int(command):
             return ack
@@ -603,8 +684,9 @@ def set_param_float(master, name, value, attempts=4, retry_sleep_s=0.5, timeout_
         )
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            msg = master.recv_match(type="PARAM_VALUE", blocking=True, timeout=0.5)
+            msg = recv_match_nonblocking(master, "PARAM_VALUE")
             if msg is None:
+                time.sleep(0.02)
                 continue
             if msg.param_id.rstrip("\x00") != name:
                 continue
@@ -795,7 +877,7 @@ def approach_until_target(master, boot_time, args, x0, y0, fov_monitor=None, dis
     try:
         while time.monotonic() < deadline:
             raise_if_interrupted()
-            msg = master.recv_match(type="LOCAL_POSITION_NED", blocking=False)
+            msg = recv_match_nonblocking(master, "LOCAL_POSITION_NED")
             traveled = None
             lateral_error = 0.0
             lateral_reference = args.lateral_bias_m + triangle_wave(
@@ -918,7 +1000,7 @@ def follow_waypoints_to_final_position(
             )
             while time.monotonic() < deadline:
                 raise_if_interrupted()
-                msg = master.recv_match(type="LOCAL_POSITION_NED", blocking=False)
+                msg = recv_match_nonblocking(master, "LOCAL_POSITION_NED")
                 if msg is not None:
                     last_pos = msg
 
@@ -987,7 +1069,7 @@ def wait_takeoff(master, boot_time, hz, x, y, target_z, timeout_s):
     while time.monotonic() < deadline:
         raise_if_interrupted()
         send_position_setpoint(master, boot_time, x, y, target_z)
-        msg = master.recv_match(type="LOCAL_POSITION_NED", blocking=False)
+        msg = recv_match_nonblocking(master, "LOCAL_POSITION_NED")
         if msg is not None:
             altitude = -float(msg.z)
             if time.monotonic() - last_report > 2.0:
@@ -1005,8 +1087,9 @@ def wait_landed(master, timeout_s):
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         raise_if_interrupted()
-        msg = master.recv_match(type="EXTENDED_SYS_STATE", blocking=True, timeout=1.0)
+        msg = recv_match_nonblocking(master, "EXTENDED_SYS_STATE")
         if msg is None:
+            time.sleep(0.02)
             continue
         if msg.landed_state == mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND:
             print("Landed.", flush=True)
@@ -1021,6 +1104,19 @@ def run(args):
     distance_monitor = None
     try:
         wait_heartbeat(master, args.heartbeat_timeout_s)
+        # Check the PX4 local-NED stream before initializing optional ROS
+        # monitors. This keeps --check-connection a bounded MAVLink probe and
+        # avoids making readiness depend on DDS discovery.
+        pos = wait_local_position(master)
+        if args.check_connection:
+            print(
+                "PX4 local position: "
+                f"x={float(pos.x):.2f}, y={float(pos.y):.2f}, z={float(pos.z):.2f}",
+                flush=True,
+            )
+            print("Connection check complete. No mission command was sent.", flush=True)
+            return
+
         heartbeat = GcsHeartbeat(master)
         heartbeat.start()
         distance_monitor = ActualDistanceMonitor()
@@ -1037,15 +1133,6 @@ def run(args):
             fov_monitor.start()
             if fov_monitor.error:
                 raise RuntimeError(fov_monitor.error)
-        pos = wait_local_position(master)
-        if args.check_connection:
-            print(
-                "PX4 local position: "
-                f"x={float(pos.x):.2f}, y={float(pos.y):.2f}, z={float(pos.z):.2f}",
-                flush=True,
-            )
-            print("Connection check complete. No mission command was sent.", flush=True)
-            return
         if args.mpc_z_vel_max_up_mps is not None:
             set_param_float(master, "MPC_Z_VEL_MAX_UP", args.mpc_z_vel_max_up_mps)
         if args.mpc_z_vel_max_dn_mps is not None:

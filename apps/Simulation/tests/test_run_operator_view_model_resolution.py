@@ -91,10 +91,24 @@ def test_operator_recorder_is_not_coupled_to_the_isolated_yolo_python() -> None:
     source = (Path(__file__).resolve().parents[1] / "run_operator_view.sh").read_text(
         encoding="utf-8"
     )
+    recorder_candidates = source.split(
+        'if ! OPERATOR_RECORDER_PYTHON="$(resolve_operator_recorder_python \\\n', 1
+    )[1].split(')"; then', 1)[0]
 
     assert "resolve_operator_recorder_python" in source
     assert "'import cv2, xlsxwriter'" in source
-    assert source.index("/usr/bin/python3") < source.index('"$ROOT_DIR/.venv/bin/python"', source.index("resolve_operator_recorder_python"))
+    assert recorder_candidates.index("/usr/bin/python3") < recorder_candidates.index(
+        '"$ROOT_DIR/.venv/bin/python"'
+    )
+
+
+def test_px4_launch_can_reuse_the_app_runtime_for_kconfiglib() -> None:
+    source = (Path(__file__).resolve().parents[1] / "run_operator_view.sh").read_text(
+        encoding="utf-8"
+    )
+    candidate_block = source.split("for px4_python_candidate in", 1)[1].split("; do", 1)[0]
+
+    assert '"$ROOT_DIR/.venv/bin/python"' in candidate_block
 
 
 def test_cleanup_kills_rqt_process_group_even_after_its_wrapper_exits() -> None:

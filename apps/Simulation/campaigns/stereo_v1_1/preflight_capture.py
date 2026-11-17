@@ -13,11 +13,13 @@ import time
 from pathlib import Path
 
 from campaigns.stereo_v1_1.camera_frame_contract import optical_rwc_from_entity_quaternion_xyzw
+from campaigns.stereo_v1_1.runtime_paths import root_python_path
 
 
 SIM_ROOT = Path(__file__).resolve().parents[2]
 REPO_ROOT = SIM_ROOT.parents[1]
 CAMPAIGN_ROOT = Path(__file__).resolve().parent
+SHORT_CAPTURE_DURATION_S = 10.0
 
 
 def _run_step_probe(python: Path, attempt_dir: Path, source: dict, env: dict) -> dict:
@@ -123,6 +125,39 @@ def _expected_rwc(spec: dict, group: str, side: str) -> list[list[float]]:
             for i in range(3)]
 
 
+def _write_preflight_scenario(attempt_dir: Path, workbook_source: dict) -> dict:
+    """Park the no-flight probe vehicle on the workbook path's first ENU point."""
+    from campaigns.stereo_v1_1.workbook_campaign import (
+        _path_point, write_scenario_environment,
+    )
+
+    parameters = workbook_source["parameters"]
+    path = parameters["Path"]
+    angle_rad = math.radians(float(path["glide_angle_deg"]))
+    # The workbook path contract returns world ENU [east, north, up]. Keep the
+    # source Vehicle spawn untouched; this fixture only places the static
+    # no-flight preflight image target where the protocol camera is aimed.
+    position_world_enu_m = [float(value) for value in _path_point(0.0, path, angle_rad)]
+    probe_parameters = dict(parameters)
+    probe_parameters["Vehicle"] = {
+        **parameters["Vehicle"],
+        "spawn_east_m": position_world_enu_m[0],
+        "spawn_north_m": position_world_enu_m[1],
+        "spawn_up_m": position_world_enu_m[2],
+    }
+    probe_path = attempt_dir / "preflight_scenario.env"
+    write_scenario_environment(
+        probe_path, probe_parameters, int(workbook_source["sequence"])
+    )
+    return {
+        "source": "first_point_of_workbook_reference_path",
+        "world_frame": "gazebo_world_enu",
+        "axis_order": ["east", "north", "up"],
+        "position_m": position_world_enu_m,
+        "vehicle_motion": "static; no arming or flight command",
+    }
+
+
 def _write_probe_report(attempt_dir: Path, payload: dict) -> None:
     report_path = attempt_dir / "preflight_report.json"
     with report_path.open("x", encoding="utf-8") as handle:
@@ -144,6 +179,18 @@ def _ros_command(python: Path, script: Path, *args: str) -> list[str]:
     return ["bash", "-c", 'source "${SASL_ROS_WORKSPACE:-workspace/main}/install/setup.bash"\nexec "$@"', "_", *command]
 
 
+def _operator_command(vehicle_model_id: str) -> list[str]:
+    """Start the no-flight probe with its target held at the measured pose."""
+    return [
+        str(SIM_ROOT / "run_operator_view.sh"), "--headless", "--no-yolo",
+        "--raw-view", "--skip-px4-build", "--px4-model-name", vehicle_model_id,
+        "observation_mode:=ideal_reference_point", "launch_rviz:=false", "gz_gui:=false",
+        # This probe never arms or flies. Holding the target at the workbook
+        # path start prevents it falling out of the camera before capture.
+        "target_static_for_research:=true",
+    ]
+
+
 def run_group(output_root: Path, group: str, spec: dict | None = None,
               workbook_source: dict | None = None) -> dict:
     attempt_dir = _next_attempt(output_root, group)
@@ -151,12 +198,14 @@ def run_group(output_root: Path, group: str, spec: dict | None = None,
     env["SIM_CONFIG"] = os.environ.get("SIM_CONFIG", str(SIM_ROOT / "config" / "simulation.env"))
     workbook_environment = {}
     vehicle_model_id = "x500_2m"
+    preflight_vehicle_fixture = None
     if workbook_source is not None:
         from campaigns.stereo_v1_1.workbook_campaign import scenario_environment, write_scenario_environment
         workbook_environment = scenario_environment(workbook_source["parameters"], workbook_source["sequence"])
         vehicle_model_id = workbook_source["parameters"]["Vehicle"].get("model_id", "x500_2m")
         scenario_path = attempt_dir / "effective_scenario.env"
         write_scenario_environment(scenario_path, workbook_source["parameters"], workbook_source["sequence"])
+        preflight_vehicle_fixture = _write_preflight_scenario(attempt_dir, workbook_source)
     for name in tuple(env):
         if name.startswith(("CAMERA_", "CAM_L_", "CAM_R_", "COMMON_OPTICAL_",
                             "RELATIVE_OPTICAL_", "DRONE_", "WAYPOINT_", "YOLO_",
@@ -168,22 +217,20 @@ def run_group(output_root: Path, group: str, spec: dict | None = None,
             env.pop(name, None)
     env["SIM_CONFIG"] = os.environ.get("SIM_CONFIG", str(SIM_ROOT / "config" / "simulation.env"))
     if workbook_source is not None:
-        env["SIM_SCENARIO_CONFIG"] = str(scenario_path)
+        env["SIM_SCENARIO_CONFIG"] = str(attempt_dir / "preflight_scenario.env")
         env.pop("SIM_GAZEBO_SEED", None)
     else:
         env["SIM_SCENARIO_CONFIG"] = f"config/campaign/v1_1/{group}.env"
         env["SIM_GAZEBO_SEED"] = "0"
     if workbook_source is not None and workbook_source.get("protocol_version") == "1.2":
         env["PX4_CONSOLE_LOG"] = str(attempt_dir / "px4_console")
-    python = Path(os.environ.get("STEREO_V1_1_ROOT_PYTHON", sys.executable)).expanduser()
+    python = root_python_path(SIM_ROOT)
     operator = state = capture = None
     handles = []
     failure = None
     step_probe = None
     try:
-        operator_command = [str(SIM_ROOT / "run_operator_view.sh"), "--headless", "--no-yolo",
-                            "--raw-view", "--skip-px4-build", "--px4-model-name", vehicle_model_id,
-                            "observation_mode:=ideal_reference_point", "launch_rviz:=false", "gz_gui:=false"]
+        operator_command = _operator_command(vehicle_model_id)
         operator, handle = _spawn(operator_command, attempt_dir / "runtime.log", env)
         handles.append(handle)
         _wait_token(operator, attempt_dir / "runtime.log", "Operator view started.", 240)
@@ -191,19 +238,6 @@ def run_group(output_root: Path, group: str, spec: dict | None = None,
         state_command = _ros_command(python, CAMPAIGN_ROOT / "state_recorder.py",
                                      "--attempt-dir", str(attempt_dir), "--duration-s", "12")
         v12_capture = workbook_source is not None and workbook_source.get("protocol_version") == "1.2"
-        if not v12_capture:
-            state, handle = _spawn(state_command, attempt_dir / "state_recorder.log", env)
-            handles.append(handle)
-            _wait_token(state, attempt_dir / "state_recorder.log", "STATE_READY", 60)
-
-        capture_command = _ros_command(python, CAMPAIGN_ROOT / "capture_streams.py",
-                                       "--attempt-dir", str(attempt_dir), "--duration-s", "5",
-                                       "--compression", "zstd")
-        if workbook_source is not None and workbook_source.get("protocol_version") == "1.2":
-            capture_command.extend(("--protocol-version", "1.2"))
-        capture, handle = _spawn(capture_command, attempt_dir / "capture_runner.log", env)
-        handles.append(handle)
-        _wait_token(capture, attempt_dir / "capture_runner.log", "CAPTURE_READY", 60)
         if v12_capture:
             settings = workbook_source["parameters"]["Capture"]
             readiness_command = _ros_command(python, CAMPAIGN_ROOT / "capture_readiness.py",
@@ -214,11 +248,31 @@ def run_group(output_root: Path, group: str, spec: dict | None = None,
                 subprocess.run(readiness_command, cwd=REPO_ROOT, env=env,
                                stdout=readiness_log, stderr=subprocess.STDOUT,
                                timeout=70, check=True)
+            # Exercise pause/step/resume before opening the measured image
+            # window. The probe intentionally pauses Gazebo; including it in
+            # the raw-capture interval undercounts live camera frames and
+            # biases the storage-rate sample.
+            step_probe = _run_step_probe(python, attempt_dir, workbook_source, env)
+        else:
             state, handle = _spawn(state_command, attempt_dir / "state_recorder.log", env)
             handles.append(handle)
             _wait_token(state, attempt_dir / "state_recorder.log", "STATE_READY", 60)
-            step_probe = _run_step_probe(python, attempt_dir, workbook_source, env)
-        capture_code = capture.wait(timeout=90)
+
+        if v12_capture:
+            state, handle = _spawn(state_command, attempt_dir / "state_recorder.log", env)
+            handles.append(handle)
+            _wait_token(state, attempt_dir / "state_recorder.log", "STATE_READY", 60)
+
+        capture_command = _ros_command(python, CAMPAIGN_ROOT / "capture_streams.py",
+                                       "--attempt-dir", str(attempt_dir), "--duration-s",
+                                       str(int(SHORT_CAPTURE_DURATION_S)),
+                                       "--compression", "zstd")
+        if workbook_source is not None and workbook_source.get("protocol_version") == "1.2":
+            capture_command.extend(("--protocol-version", "1.2"))
+        capture, handle = _spawn(capture_command, attempt_dir / "capture_runner.log", env)
+        handles.append(handle)
+        _wait_token(capture, attempt_dir / "capture_runner.log", "CAPTURE_READY", 60)
+        capture_code = capture.wait(timeout=SHORT_CAPTURE_DURATION_S + 90)
         state_code = state.wait(timeout=30)
         if capture_code != 0 or state_code != 0:
             raise RuntimeError(f"short capture process exits: images={capture_code}, state={state_code}")
@@ -306,14 +360,15 @@ def run_group(output_root: Path, group: str, spec: dict | None = None,
     result = {
         "status": "PASS", "group": group,
         "attempt_dir_relative": str(attempt_dir.relative_to(output_root)),
-        "duration_s": 5.0, "raw_bytes": raw_bytes,
-        "compressed_raw_bytes_per_second": raw_bytes / 5.0,
+        "duration_s": SHORT_CAPTURE_DURATION_S, "raw_bytes": raw_bytes,
+        "compressed_raw_bytes_per_second": raw_bytes / SHORT_CAPTURE_DURATION_S,
         "camera_image_message_counts": counts,
         "gt_observed_hz": state_summary["gt_observed_hz"],
         "gt_gap_ge_40ms_count": state_summary["gt_gap_ge_40ms_count"],
         "camera_position_error_m": position_errors,
         "camera_orientation_error_deg": orientation_errors,
         "camera_truth_sha256": hashlib.sha256(camera_truth_path.read_bytes()).hexdigest(),
+        "preflight_vehicle_fixture": preflight_vehicle_fixture,
         "operator_exit_code": operator_code,
         "simulation_step_probe": step_probe,
     }

@@ -37,18 +37,17 @@ from campaigns.stereo_v1_1.workbook_campaign import (
     scenario_environment,
     write_scenario_environment,
 )
+from campaigns.stereo_v1_1.runtime_paths import root_python_path
 
 
 PILOT_IDS = ("G0-P0-R01", "G0-P4-R01", "G0-V0-R01", "G1-P4-R01")
-ROOT_PYTHON = Path(os.environ.get(
-    "STEREO_V1_1_ROOT_PYTHON",
-    str(REPO_ROOT / ".venv" / "bin" / "python" if (REPO_ROOT / ".venv" / "bin" / "python").is_file() else sys.executable),
-)).expanduser()
+ROOT_PYTHON = root_python_path(SIM_ROOT)
 YOLO_PYTHON = Path(os.environ.get(
     "STEREO_V1_1_YOLO_PYTHON", str(SIM_ROOT / ".venv" / "bin" / "python")
 )).expanduser()
 FROZEN_FILES = (
-    "campaign_run.py", "campaign_status.py", "capture_streams.py", "state_recorder.py",
+    "campaign_run.py", "runtime_paths.py", "requirements-controller.txt",
+    "campaign_status.py", "capture_streams.py", "state_recorder.py",
     "flight_controller.py", "trajectory_contract.py", "flight_gates.py",
     "campaign_setpoints.py", "runtime_observation.py", "ros_observation_bridge.py",
     "bag_index.py", "postprocess_detections.py", "gt_alignment.py", "align_gt.py",

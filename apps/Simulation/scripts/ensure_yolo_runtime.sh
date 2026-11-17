@@ -68,7 +68,9 @@ configure_system_site_packages() {
 
 create_virtualenv() {
   local builder_python="$1"
-  local venv_args=()
+  # Install pip after venv creation in bootstrap_pip(). This also supports
+  # Debian/Ubuntu Python images that omit ensurepip/python3-venv.
+  local venv_args=(--without-pip)
   local virtualenv_args=(--clear)
   if [[ "$YOLO_VENV_ISOLATED" != true ]]; then
     venv_args+=(--system-site-packages)
@@ -92,10 +94,21 @@ python_has_campaign_analysis_runtime() {
   "$python_bin" -c "import numpy, scipy, zstandard, xlsxwriter" >/dev/null 2>&1
 }
 
+python_has_campaign_controller_runtime() {
+  local python_bin="$1"
+  "$python_bin" -c "import kconfiglib, pymavlink" >/dev/null 2>&1
+}
+
 install_campaign_analysis_runtime() {
   local python_bin="$1"
   "$python_bin" -m pip install --requirement \
     "$ROOT_DIR/campaigns/stereo_v1_1/requirements-postprocess.txt" >&2
+}
+
+install_campaign_controller_runtime() {
+  local python_bin="$1"
+  "$python_bin" -m pip install --requirement \
+    "$ROOT_DIR/campaigns/stereo_v1_1/requirements-controller.txt" >&2
 }
 
 python_matches_torch_distribution() {
@@ -224,7 +237,9 @@ install_yolo_runtime() {
   local venv_python="$1"
   local torch_index_url
   local torch_packages=(torch torchvision)
-  "$venv_python" -m pip install --upgrade pip setuptools wheel >&2
+  # ROS Humble's colcon-core requires setuptools < 80, while recent PyTorch
+  # wheels require >= 77. Keep the shared-site venv inside that overlap.
+  "$venv_python" -m pip install --upgrade pip 'setuptools<80' wheel >&2
   if [[ "$YOLO_TORCH_BACKEND" == "cpu" ]]; then
     torch_index_url="$YOLO_TORCH_CPU_INDEX_URL"
   else
@@ -256,6 +271,13 @@ if [[ -x "${VENV_DIR}/bin/python" ]]; then
     fi
     if ! python_has_campaign_analysis_runtime "${VENV_DIR}/bin/python"; then
       printf '%s\n' "campaign postprocessing/analysis dependencies are unavailable in ${VENV_DIR}" >&2
+      exit 1
+    fi
+    if ! python_has_campaign_controller_runtime "${VENV_DIR}/bin/python"; then
+      install_campaign_controller_runtime "${VENV_DIR}/bin/python"
+    fi
+    if ! python_has_campaign_controller_runtime "${VENV_DIR}/bin/python"; then
+      printf '%s\n' "campaign controller dependencies are unavailable in ${VENV_DIR}" >&2
       exit 1
     fi
     if python_matches_torch_backend "${VENV_DIR}/bin/python"; then
@@ -304,11 +326,15 @@ fi
 if ! python_has_campaign_analysis_runtime "$VENV_PYTHON"; then
   install_campaign_analysis_runtime "$VENV_PYTHON"
 fi
+if ! python_has_campaign_controller_runtime "$VENV_PYTHON"; then
+  install_campaign_controller_runtime "$VENV_PYTHON"
+fi
 
 if python_has_yolo_runtime "$VENV_PYTHON" \
   && python_matches_torch_distribution "$VENV_PYTHON"; then
-  if ! python_has_campaign_analysis_runtime "$VENV_PYTHON"; then
-    printf '%s\n' "campaign postprocessing/analysis dependencies are unavailable in ${VENV_DIR}" >&2
+  if ! python_has_campaign_analysis_runtime "$VENV_PYTHON" \
+    || ! python_has_campaign_controller_runtime "$VENV_PYTHON"; then
+    printf '%s\n' "campaign runtime dependencies are unavailable in ${VENV_DIR}" >&2
     exit 1
   fi
   if python_matches_torch_backend "$VENV_PYTHON"; then

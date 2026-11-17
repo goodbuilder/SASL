@@ -38,7 +38,7 @@ DEFAULTS = {
 ALLOWED_ACTIONS = frozenset({
     "plan", "preflight", "development", "run", "all", "resume",
     "reprocess", "all_results", "qc", "legacy_sweep",
-    "xlsx_plan", "xlsx_all", "xlsx_resume",
+    "xlsx_plan", "xlsx_all", "xlsx_resume", "report_v3",
 })
 _KEYS = frozenset(DEFAULTS)
 _LITERAL = re.compile(r"^[A-Za-z0-9_.:-]+$")
@@ -142,6 +142,8 @@ def load_control_config(path: Path | str = DEFAULT_CONFIG) -> CampaignControlCon
     output_base = values["STEREO_V1_1_OUTPUT_BASE"]
     if output_base not in {"repo", "data_root"}:
         raise ValueError("STEREO_V1_1_OUTPUT_BASE must be repo or data_root")
+    if action == "report_v3" and (output_base != "repo" or output_id != "paper1_v1_2_001"):
+        raise ValueError("report_v3 is pinned to repo-local paper1_v1_2_001")
     input_root_setting = values["STEREO_V1_1_INPUT_ROOT"]
     if (not input_root_setting or Path(input_root_setting).is_absolute()
             or any(character in input_root_setting for character in "\x00\r\n=$`\\;|&<>")):
@@ -164,13 +166,15 @@ def load_control_config(path: Path | str = DEFAULT_CONFIG) -> CampaignControlCon
         if world_rows:
             workbook_world_name = world_rows[0]
     mc_trials = None
-    if action in {"resume", "all_results", "reprocess"}:
+    if action in {"resume", "all_results", "reprocess", "xlsx_all", "xlsx_resume"}:
         try:
             mc_trials = int(values["STEREO_V1_1_MC_TRIALS"])
         except ValueError:
             raise ValueError("STEREO_V1_1_MC_TRIALS must be an integer") from None
         if not 1 <= mc_trials <= 1000:
             raise ValueError("STEREO_V1_1_MC_TRIALS must be between 1 and 1000")
+        if action in {"xlsx_all", "xlsx_resume"} and mc_trials != 100:
+            raise ValueError("v1.2 SWEEP-to-V3 requires STEREO_V1_1_MC_TRIALS=100")
     px4_relative = values["STEREO_V1_1_PX4_DIR"]
     if not _REPO_RELATIVE_PATH.fullmatch(px4_relative) or Path(px4_relative).is_absolute():
         raise ValueError("STEREO_V1_1_PX4_DIR must be a repo-relative path without shell expansion")

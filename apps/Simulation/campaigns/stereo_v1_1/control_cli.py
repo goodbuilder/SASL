@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -16,6 +17,12 @@ from campaigns.stereo_v1_1.control_config import REPO_ROOT, SIM_ROOT, load_contr
 
 
 CAMPAIGN_ROOT = Path(__file__).resolve().parent
+REPORT_V3_BUILDER = (
+    SIM_ROOT / "docs" / "changes" / "20261021-report-workbook-supplement"
+    / "build_report_workbook_v3.sh"
+)
+CAMPAIGN_V3_BUILDER = CAMPAIGN_ROOT / "campaign_report_v3.py"
+V12_ANALYSIS_AUDITOR = CAMPAIGN_ROOT / "audit_v12_analysis_results.py"
 
 
 def _effective_px4_dir(config) -> str:
@@ -122,6 +129,133 @@ def _run_analysis(config, *, input_root: Path) -> int:
     return _run(arguments, env=env, label="reprocess")
 
 
+def _run_report_v3(config) -> int:
+    if config.output_base != "repo" or config.output_id != "paper1_v1_2_001":
+        raise ValueError("report_v3 only rebuilds the frozen repo-local paper1_v1_2_001 report")
+    return _run(["bash", str(REPORT_V3_BUILDER)], env=os.environ.copy(), label="report-v3")
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _current_analysis_id(config) -> str | None:
+    """Return the latest analysis only when it still matches this 39-run source."""
+    root = config.output_root
+    pointer_path = root / "analysis_latest.json"
+    status_path = root / "run_status.json"
+    if not pointer_path.is_file() or not status_path.is_file():
+        return None
+    try:
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        summary_path = (root / pointer["analysis_summary"]).resolve()
+        if (not summary_path.is_relative_to(root.resolve())
+                or summary_path.name != "analysis_summary.json"
+                or summary_path.parent.name != pointer.get("analysis_id")):
+            return None
+        analysis_root = summary_path.parent
+        manifest_path = analysis_root / "analysis_run_manifest.json"
+        freeze_path = analysis_root / "analysis_freeze.json"
+        if not manifest_path.is_file() or not freeze_path.is_file():
+            return None
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        run_slots = status.get("run_slots", [])
+        if (manifest.get("analysis_id") != pointer.get("analysis_id")
+                or manifest.get("mc_trial_count") != config.mc_trials
+                or manifest.get("source_valid_run_count") != 39
+                or summary.get("analysis_id") != pointer.get("analysis_id")
+                or summary.get("source_valid_run_count") != 39
+                or freeze.get("mc_trial_count") != config.mc_trials
+                or pointer.get("analysis_freeze_sha256") != _sha256(freeze_path)
+                or summary.get("analysis_freeze_sha256") != pointer.get("analysis_freeze_sha256")
+                or status.get("planned_run_count") != 39
+                or status.get("valid_run_count") != 39
+                or not isinstance(run_slots, list) or len(run_slots) != 39
+                or any(not isinstance(slot, dict)
+                       or slot.get("status") not in ("VALID", "VALID_WITH_WARNINGS")
+                       or not isinstance(slot.get("attempts"), list) or not slot["attempts"]
+                       or not isinstance(slot["attempts"][-1], dict)
+                       or slot["attempts"][-1].get("status") not in ("VALID", "VALID_WITH_WARNINGS")
+                       for slot in run_slots)):
+            return None
+        for relative, expected in manifest.get("source_campaign_manifest_sha256", {}).items():
+            path = (root / relative).resolve()
+            if not path.is_relative_to(root.resolve()) or not path.is_file() or _sha256(path) != expected:
+                return None
+        attempts = {}
+        for slot in status.get("run_slots", []):
+            if not isinstance(slot, dict) or not slot.get("attempts"):
+                return None
+            attempt = slot["attempts"][-1]
+            relative = Path(slot["recording_path"]) / "checksums.sha256"
+            checksums = (root / relative).resolve()
+            if not checksums.is_relative_to(root.resolve()) or not checksums.is_file():
+                return None
+            attempts[f"{slot['run_id']}/{attempt['attempt_id']}"] = _sha256(checksums)
+        if attempts != manifest.get("source_attempt_checksums_sha256"):
+            return None
+        for name, expected in manifest.get("algorithm_sha256", {}).items():
+            source = (CAMPAIGN_ROOT / name).resolve()
+            if not source.is_relative_to(CAMPAIGN_ROOT.resolve()) or not source.is_file() or _sha256(source) != expected:
+                return None
+        return pointer["analysis_id"]
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _ensure_analysis_audit(config, analysis_id: str) -> tuple[int, Path]:
+    audit_dir = config.output_root / "source_evidence" / f"post_analysis_verification_{analysis_id}"
+    audit_path = audit_dir / "analysis_results_audit.json"
+    if audit_path.is_file():
+        result = json.loads(audit_path.read_text(encoding="utf-8"))
+        if result.get("status") != "PASS" or result.get("analysis_id") != analysis_id:
+            raise RuntimeError(f"existing analysis audit is not a matching PASS: {audit_path}")
+        return 0, audit_path
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    code = _run([
+        sys.executable, str(V12_ANALYSIS_AUDITOR),
+        "--output-root", str(config.output_root),
+        "--source-root", str(config.output_root),
+        "--report", str(audit_path),
+    ], env=os.environ.copy(), label="analysis-audit")
+    if code:
+        return code, audit_path
+    result = json.loads(audit_path.read_text(encoding="utf-8"))
+    if result.get("status") != "PASS" or result.get("analysis_id") != analysis_id:
+        return 2, audit_path
+    return 0, audit_path
+
+
+def _run_campaign_analysis_and_report(config) -> int:
+    if config.mc_trials != 100:
+        raise ValueError("the v1.2 SWEEP report requires 100 Monte Carlo trials")
+    analysis_id = _current_analysis_id(config)
+    if analysis_id is None:
+        code = _run_analysis(config, input_root=config.output_root)
+        if code:
+            return code
+        analysis_id = _current_analysis_id(config)
+    if analysis_id is None:
+        print("Analysis did not publish a current, source-matched analysis_latest.json.", file=sys.stderr, flush=True)
+        return 2
+    audit_code, audit_path = _ensure_analysis_audit(config, analysis_id)
+    if audit_code:
+        return audit_code
+    command = [
+        str(_analysis_python(config)), str(CAMPAIGN_V3_BUILDER),
+        "--output-root", str(config.output_root),
+        "--audit-report", str(audit_path),
+    ]
+    return _run(command, env=_campaign_runtime_env(config), label="report-v3-fresh")
+
+
 def _legacy_sweep_env(config) -> dict[str, str]:
     env = os.environ.copy()
     env["SIM_CONFIG"] = str(config.config_path)
@@ -187,10 +321,20 @@ def _run_workbook_campaign(config, action: str) -> int:
         print("Workbook flight action stopped because preflight is not clear.", flush=True)
         return preflight_code
     runner_action = "run" if action == "xlsx_all" else "resume"
-    return _run([sys.executable, str(CAMPAIGN_ROOT / "workbook_campaign.py"),
+    code = _run([sys.executable, str(CAMPAIGN_ROOT / "workbook_campaign.py"),
                  runner_action, "--workbook", str(config.workbook_path),
                  "--output-root", str(config.output_root)],
                 env=_campaign_runtime_env(config), label=f"workbook:{runner_action}")
+    if code:
+        return code
+    status_path = config.output_root / "run_status.json"
+    if not status_path.is_file():
+        raise RuntimeError("workbook campaign completed without run_status.json")
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    if status.get("valid_run_count") != 39 or status.get("planned_run_count") != 39:
+        print("Campaign is incomplete; analysis and V3 report are deferred until all 39 runs pass source QC.", flush=True)
+        return 0
+    return _run_campaign_analysis_and_report(config)
 
 
 def execute(config_path: Path | str) -> int:
@@ -228,6 +372,8 @@ def execute(config_path: Path | str) -> int:
                     env=_legacy_sweep_env(config), label="legacy-sweep")
     if config.action in {"xlsx_plan", "xlsx_all", "xlsx_resume"}:
         return _run_workbook_campaign(config, config.action)
+    if config.action == "report_v3":
+        return _run_report_v3(config)
     if config.action == "plan":
         output_root.mkdir(parents=True, exist_ok=True)
         return _run_campaign_command(config, "plan")

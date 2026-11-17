@@ -68,6 +68,24 @@ void GZBridge::magnetometerCallback(const gz::msgs::Magnetometer &msg)
 """
 
 
+def _corrected_vector_rotation_source(quaternion: str = "0, 1, 0, 0") -> str:
+    return f"""
+void GZBridge::magnetometerCallback(const gz::msgs::Magnetometer &msg)
+{{
+\tstatic const auto q_FLU_to_FRD = gz::math::Quaterniond({quaternion});
+\tconst gz::math::Vector3d field_b = q_FLU_to_FRD.RotateVector(gz::math::Vector3d(
+\t\t\t\t\t\tmsg.field_tesla().x(),
+\t\t\t\t\t\tmsg.field_tesla().y(),
+\t\t\t\t\t\tmsg.field_tesla().z()));
+\treport.x = field_b.X();
+\treport.y = field_b.Y();
+\treport.z = field_b.Z();
+
+\t_sensor_mag_pub.publish(report);
+}}
+"""
+
+
 @pytest.mark.parametrize(
     ("source", "variant"),
     (
@@ -95,6 +113,23 @@ def test_correct_bridge_mapping_is_idempotent() -> None:
     assert updated == source
     assert before == "sensor_flu_to_body_frd"
     assert changed is False
+
+
+def test_correct_quaternion_vector_rotation_is_idempotent() -> None:
+    source = _corrected_vector_rotation_source()
+
+    updated, before, changed = HELPER.prepare_bridge_source(source)
+
+    assert updated == source
+    assert before == "sensor_flu_to_body_frd"
+    assert changed is False
+
+
+def test_vector_rotation_with_wrong_quaternion_fails_closed() -> None:
+    source = _corrected_vector_rotation_source("0, 0, 1, 0")
+
+    with pytest.raises(HELPER.PreparationError, match="not a known"):
+        HELPER.prepare_bridge_source(source)
 
 
 def test_unknown_bridge_mapping_fails_closed() -> None:
@@ -232,13 +267,15 @@ def test_world_field_verifier_rejects_ned_plugin_in_enu_world(tmp_path: Path) ->
         FIELD_VERIFIER.parse_world(broken)
 
 
-def _init_checkout(tmp_path: Path, bridge_source: str) -> tuple[Path, Path, Path]:
+def _init_checkout(tmp_path: Path, bridge_source: str) -> tuple[Path, Path, Path, Path]:
     px4_root = tmp_path / "PX4-Autopilot"
     bridge = px4_root / HELPER.BRIDGE_RELATIVE_PATH
     bridge.parent.mkdir(parents=True)
     bridge.write_text(bridge_source, encoding="utf-8")
     airframe = tmp_path / "4090_camera_px4"
     airframe.write_text("param set-default EKF2_MAG_TYPE 1\n", encoding="utf-8")
+    target_airframe = tmp_path / "4001_gz_x500"
+    target_airframe.write_text("param set UXRCE_DDS_SYNCT 0\n", encoding="utf-8")
     binary = px4_root / "build/px4_sitl_default/bin/px4"
     binary.parent.mkdir(parents=True)
     binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -261,21 +298,21 @@ def _init_checkout(tmp_path: Path, bridge_source: str) -> tuple[Path, Path, Path
         check=True,
     )
     subprocess.run(["git", "-C", str(px4_root), "tag", "v1.17.0"], check=True)
-    return px4_root, airframe, binary
+    return px4_root, airframe, target_airframe, binary
 
 
 def test_checkout_prepare_and_build_stamp_are_idempotent_and_hash_bound(tmp_path: Path) -> None:
-    px4_root, airframe, binary = _init_checkout(
+    px4_root, airframe, target_airframe, binary = _init_checkout(
         tmp_path, _bridge_source("-msg.field_tesla().x()")
     )
 
     applied = HELPER.prepare_checkout(px4_root, apply=True)
     second = HELPER.prepare_checkout(px4_root, apply=True)
     recorded = HELPER.write_build_stamp(
-        px4_root, airframe=airframe, binary=binary
+        px4_root, airframe=airframe, target_airframe=target_airframe, binary=binary
     )
     verified = HELPER.check_build_stamp(
-        px4_root, airframe=airframe, binary=binary
+        px4_root, airframe=airframe, target_airframe=target_airframe, binary=binary
     )
 
     assert applied["status"] == "applied"
@@ -286,12 +323,21 @@ def test_checkout_prepare_and_build_stamp_are_idempotent_and_hash_bound(tmp_path
 
     airframe.write_text("param set-default EKF2_MAG_TYPE 0\n", encoding="utf-8")
     with pytest.raises(HELPER.PreparationError, match="stamp is stale"):
-        HELPER.check_build_stamp(px4_root, airframe=airframe, binary=binary)
+        HELPER.check_build_stamp(
+            px4_root, airframe=airframe, target_airframe=target_airframe, binary=binary
+        )
+
+    airframe.write_text("param set-default EKF2_MAG_TYPE 1\n", encoding="utf-8")
+    target_airframe.write_text("param set UXRCE_DDS_SYNCT 1\n", encoding="utf-8")
+    with pytest.raises(HELPER.PreparationError, match="stamp is stale"):
+        HELPER.check_build_stamp(
+            px4_root, airframe=airframe, target_airframe=target_airframe, binary=binary
+        )
 
 
 def test_checkout_unknown_mapping_is_not_modified(tmp_path: Path) -> None:
     source = _bridge_source("msg.field_tesla().z()")
-    px4_root, _airframe, _binary = _init_checkout(tmp_path, source)
+    px4_root, _airframe, _target_airframe, _binary = _init_checkout(tmp_path, source)
     bridge = px4_root / HELPER.BRIDGE_RELATIVE_PATH
 
     with pytest.raises(HELPER.PreparationError, match="not a known"):
@@ -301,12 +347,15 @@ def test_checkout_unknown_mapping_is_not_modified(tmp_path: Path) -> None:
 
 
 def test_build_stamp_requires_exact_px4_version(tmp_path: Path) -> None:
-    px4_root, airframe, binary = _init_checkout(tmp_path, _corrected_source())
+    px4_root, airframe, target_airframe, binary = _init_checkout(
+        tmp_path, _corrected_source()
+    )
 
     with pytest.raises(HELPER.PreparationError, match="version mismatch"):
         HELPER.write_build_stamp(
             px4_root,
             airframe=airframe,
+            target_airframe=target_airframe,
             binary=binary,
             required_version="v9.9.9",
         )

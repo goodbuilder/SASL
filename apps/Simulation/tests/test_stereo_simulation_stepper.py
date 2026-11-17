@@ -87,13 +87,20 @@ def test_ground_probe_observes_real_fake_source_progress_not_ack(monkeypatch):
         physics_dt_ns=4_000_000
         source_ns=1_000_000_000
         paused=False
+        stepped_while_paused=False
         def warmup_continuous(self):self.source_ns+=self.physics_dt_ns
         def pause(self):self.paused=True
-        def step(self,n):self.source_ns+=n*self.physics_dt_ns
+        def step(self,n):
+            self.source_ns+=n*self.physics_dt_ns
+            self.stepped_while_paused=True
         def resume(self):self.paused=False;self.source_ns+=self.physics_dt_ns
     physics=Physics()
-    def observe():return SimpleNamespace(simulation_time_ns=physics.source_ns,simulation_epoch=2,
-                                         xy_reset_counter=3,z_reset_counter=1)
+    def observe():
+        # In the paused state, model PX4 continuing to publish while Gazebo GT
+        # has stopped, making their receive pair temporarily incoherent.
+        if physics.paused and not physics.stepped_while_paused:return None
+        return SimpleNamespace(simulation_time_ns=physics.source_ns,simulation_epoch=2,
+                               xy_reset_counter=3,z_reset_counter=1)
     def read_clock():return dict(source_timestamp_ns=physics.source_ns,simulation_epoch=2,
                                  local_reset_counters=(3,1),fresh=True,receive_monotonic_ns=round(wall[0]*1e9))
     result=probe.run_probe(physics,observe,read_clock)

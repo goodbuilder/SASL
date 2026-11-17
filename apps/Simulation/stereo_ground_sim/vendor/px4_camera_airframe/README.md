@@ -1,11 +1,14 @@
 # Camera Pixhawk PX4 airframe (4090_camera_px4)
 
-`4090_camera_px4` is a copy of PX4-Autopilot's stock
+`4090_camera_px4` is based on PX4-Autopilot's stock
 `ROMFS/px4fmu_common/init.d-posix/airframes/4001_gz_x500` (the target drone's
-airframe, `PX4_SYS_AUTOSTART=4001`), with two additions:
+airframe, `PX4_SYS_AUTOSTART=4001`), with additions:
 `param set-default EKF2_MAG_TYPE 1`, and a `mavlink start`/`mavlink stream`
 pair that pushes this camera's ATTITUDE to the operator rqt panel (see
-"Operator MAVLink ATTITUDE diagnostics link" below).
+"Operator MAVLink ATTITUDE diagnostics link" below). It also sets
+`UXRCE_DDS_SYNCT=0`, matching the target's repository-owned airframe. PX4 SITL
+uses Gazebo lockstep time here; run artifacts preserve PX4, simulation, and
+host receive timestamps separately.
 
 ## Why a separate file
 
@@ -52,10 +55,11 @@ message at 50 Hz, instead of a full stream-mode preset.
 
 ## What this does *not* do
 
-The system PX4-Autopilot checkout's `4001_gz_x500` is untouched (reverted
-back to stock). `run_operator_view.sh` copies this file into
+The system PX4-Autopilot checkout is machine-local. `run_operator_view.sh`
+copies this file into
 `PX4-Autopilot/ROMFS/px4fmu_common/init.d-posix/airframes/4090_camera_px4`
-before every `make px4_sitl_default` build (PX4-Autopilot is gitignored, so
-nothing there is committed by SASL git), and passes
+and installs the target airframe documented in
+`../px4_target_airframe/README.md` before every `make px4_sitl_default` build,
+then passes
 `PX4_SYS_AUTOSTART=4090` only for the left/right camera PX4 instances; the
 target instance (0) still gets `4001`.

@@ -31,10 +31,12 @@ def _launch():
 def test_unset_seed_preserves_old_gazebo_command_and_manifest_seed_is_explicit():
     module, context = _launch()
     context.launch_configurations["gz_gui"] = "false"
-    assert module._gazebo_args(context, "/tmp/world.sdf", "/tmp/gui.config") == "-r -s /tmp/world.sdf"
+    assert module._gazebo_args(context, "/tmp/world.sdf", "/tmp/gui.config") == (
+        "-r -s --headless-rendering /tmp/world.sdf"
+    )
     context.launch_configurations["gazebo_seed"] = "2026100501"
     assert module._gazebo_args(context, "/tmp/world.sdf", "/tmp/gui.config") == (
-        "-r -s --seed 2026100501 /tmp/world.sdf"
+        "-r -s --headless-rendering --seed 2026100501 /tmp/world.sdf"
     )
     for invalid in ("NaN", "-1", "4294967296"):
         context.launch_configurations["gazebo_seed"] = invalid

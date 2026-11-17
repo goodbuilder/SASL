@@ -25,6 +25,7 @@ from px4_auto_mission import (
     wait_heartbeat,
     wait_landed,
     wait_local_position,
+    recv_match_nonblocking,
 )
 
 
@@ -559,8 +560,8 @@ def hold_waypoint(
             index, "hold_analysis" if analysis_active else "hold_settle"
         )
         _publish_phase(phase_monitor, phase)
-        pos = master.recv_match(type="LOCAL_POSITION_NED", blocking=False)
-        attitude = master.recv_match(type="ATTITUDE", blocking=False)
+        pos = recv_match_nonblocking(master, "LOCAL_POSITION_NED")
+        attitude = recv_match_nonblocking(master, "ATTITUDE")
         _trace_setpoint(
             guidance_trace,
             guidance_mode=args.guidance_mode,
@@ -715,7 +716,7 @@ def wait_waypoint(
     )
     while time.monotonic() < deadline:
         _publish_phase(phase_monitor, transit_phase)
-        pos = master.recv_match(type="LOCAL_POSITION_NED", blocking=False)
+        pos = recv_match_nonblocking(master, "LOCAL_POSITION_NED")
         if pos is not None:
             remaining = distance_3d(pos, waypoint)
             h_ramp = 1.0
@@ -801,6 +802,22 @@ def wait_waypoint(
 
 def run(args):
     waypoints = collect_waypoints(args)
+    master = mavutil.mavlink_connection(args.connect, autoreconnect=True)
+    wait_heartbeat(master, args.heartbeat_timeout_s)
+
+    # Connection readiness only requires the PX4 heartbeat and local-NED
+    # position stream. Read that position before starting optional ROS
+    # monitors, which can delay a short readiness probe during DDS discovery.
+    pos = wait_local_position(master)
+    if args.check_connection:
+        print(
+            "PX4 local position: "
+            f"x={float(pos.x):.2f}, y={float(pos.y):.2f}, z={float(pos.z):.2f}",
+            flush=True,
+        )
+        print("Connection check complete. No mission command was sent.", flush=True)
+        return
+
     guidance_trace = GuidanceTrace(args.guidance_log)
     if args.event_log is not None:
         _append_event(
@@ -817,26 +834,24 @@ def run(args):
             },
             create=True,
         )
-    master = mavutil.mavlink_connection(args.connect, autoreconnect=True)
-    wait_heartbeat(master, args.heartbeat_timeout_s)
     heartbeat = GcsHeartbeat(master)
     heartbeat.start()
-    phase_monitor = ActualDistanceMonitor()
-    phase_monitor.start()
+    # The waypoint event log is the authoritative phase record for sweep runs.
+    # Do not start a second ROS context in the PX4 command process: even with
+    # asynchronous startup it can interfere with the first setpoint.  Normal
+    # non-sweep missions retain the optional live phase publisher.
+    phase_monitor = None
+    if args.event_log is None:
+        phase_monitor = ActualDistanceMonitor()
+        phase_monitor.start()
+    else:
+        print(
+            "Skipping optional ROS phase monitor; writing waypoint phases to the event log.",
+            flush=True,
+        )
     _publish_phase(phase_monitor, "preflight")
-    pos = wait_local_position(master)
     completed = False
     try:
-        if args.check_connection:
-            print(
-                "PX4 local position: "
-                f"x={float(pos.x):.2f}, y={float(pos.y):.2f}, z={float(pos.z):.2f}",
-                flush=True,
-            )
-            print("Connection check complete. No mission command was sent.", flush=True)
-            completed = True
-            return
-
         if args.mpc_z_vel_max_up_mps is not None:
             set_param_float(master, "MPC_Z_VEL_MAX_UP", args.mpc_z_vel_max_up_mps)
         if args.mpc_z_vel_max_dn_mps is not None:
@@ -940,7 +955,8 @@ def run(args):
     finally:
         if not completed:
             _publish_phase(phase_monitor, "interrupted")
-        phase_monitor.stop()
+        if phase_monitor is not None:
+            phase_monitor.stop()
         heartbeat.stop()
         guidance_trace.close()
 

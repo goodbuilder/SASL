@@ -44,18 +44,23 @@ def run_probe(stepper, get_snapshot, read_clock, *, timeout_s=2.0, records=None)
                                 baseline_ns=initial.simulation_time_ns, quiescent=False,
                                 timeout_s=timeout_s)
     records.append({'action': 'service_warmup_observed', 'clock_evidence': warmed})
+    # Establish a coherent GT/PX4 snapshot while Gazebo is still advancing.
+    # Once paused, PX4 can continue publishing while Gazebo GT reception stops,
+    # so a new pair may correctly fail the receive-skew gate even though the
+    # pause itself is healthy.
+    running = wait_snapshot(
+        lambda snap: guard(snap).simulation_time_ns >= warmed['source_timestamp_ns'],
+        'coherent snapshot before pause',
+    )
     stepper.pause()
     quiet = wait_clock_evidence(read_clock, generation[0], generation[1:],
-                               baseline_ns=warmed['source_timestamp_ns'], quiescent=True,
+                               baseline_ns=running.simulation_time_ns, quiescent=True,
                                timeout_s=timeout_s)
     records.append({'action': 'clock_quiescence_observed', 'clock_evidence': quiet})
-    paused = get_snapshot()
-    if paused is None:
-        raise RuntimeError('simulation step control: probe clock paused but coherent snapshot unavailable')
-    guard(paused)
-    observed_ns = paused.simulation_time_ns
+    observed_ns = int(quiet['source_timestamp_ns'])
     records.append({'action': 'pause_observed', 'source_timestamp_ns': observed_ns,
-                    'host_monotonic_ns': time.monotonic_ns(), 'quiescence_s': .1})
+                    'host_monotonic_ns': time.monotonic_ns(), 'quiescence_s': .1,
+                    'last_coherent_running_snapshot_ns': running.simulation_time_ns})
     for steps in (5, 5, 1):
         target_ns = observed_ns + steps * stepper.physics_dt_ns
         requested_ns = time.monotonic_ns()

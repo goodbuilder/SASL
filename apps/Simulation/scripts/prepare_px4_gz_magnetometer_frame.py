@@ -9,9 +9,9 @@ accepts only those two known predecessors or the final mapping; any other
 source fails closed without being edited.
 
 The helper also owns a build fingerprint used by ``run_operator_view.sh``.
-Skipping the PX4 build is allowed only when the current bridge source,
-camera-airframe source, PX4 revision, and built binary match a stamp written
-after a successful build.
+Skipping the PX4 build is allowed only when the current bridge source, camera
+and target airframe sources, PX4 revision, and built binary match a stamp
+written after a successful build.
 """
 
 from __future__ import annotations
@@ -39,6 +39,14 @@ _ASSIGNMENT_PATTERN = re.compile(
     r"(?P<indent>[ \t]*)report\.x\s*=\s*(?P<x>[^;\n]+);\s*\n"
     r"(?P=indent)report\.y\s*=\s*(?P<y>[^;\n]+);\s*\n"
     r"(?P=indent)report\.z\s*=\s*(?P<z>[^;\n]+);"
+)
+_FLU_TO_FRD_VECTOR_ROTATION_PATTERN = re.compile(
+    r"static\s+const\s+auto\s+q_FLU_to_FRD\s*=\s*"
+    r"gz::math::Quaterniond\s*\(\s*0\s*,\s*1\s*,\s*0\s*,\s*0\s*\)\s*;\s*"
+    r"(?:const\s+)?gz::math::Vector3d\s+field_b\s*=\s*q_FLU_to_FRD\.RotateVector\s*\(\s*"
+    r"gz::math::Vector3d\s*\(\s*msg\.field_tesla\(\)\.x\(\)\s*,\s*"
+    r"msg\.field_tesla\(\)\.y\(\)\s*,\s*msg\.field_tesla\(\)\.z\(\)\s*\)\s*\)\s*;",
+    re.DOTALL,
 )
 
 _VARIANTS = {
@@ -141,6 +149,12 @@ def bridge_variant(source: str) -> tuple[str, re.Match[str]]:
         _normalize(match.group(axis)) for axis in ("x", "y", "z")
     )
     variant = _VARIANTS.get(expressions)
+    if (variant is None
+            and expressions == ("field_b.X()", "field_b.Y()", "field_b.Z()")
+            and _FLU_TO_FRD_VECTOR_ROTATION_PATTERN.search(source[start:end])):
+        # Equivalent to (x, -y, -z): a 180-degree rotation about body X.
+        # Accept only the exact FLU -> FRD quaternion and source vector above.
+        variant = "sensor_flu_to_body_frd"
     if variant is None:
         raise PreparationError(
             "PX4 GZBridge magnetometer mapping is not a known stock, legacy, "
@@ -222,6 +236,7 @@ def build_fingerprint(
     px4_root: Path,
     *,
     airframe: Path,
+    target_airframe: Path,
     binary: Path,
     required_version: str = DEFAULT_REQUIRED_VERSION,
 ) -> dict[str, Any]:
@@ -234,9 +249,12 @@ def build_fingerprint(
     ] == "patch_required":
         raise PreparationError("PX4 GZBridge source is not prepared for FLU to FRD")
     airframe_path = airframe.resolve()
+    target_airframe_path = target_airframe.resolve()
     binary_path = binary.resolve()
     if not airframe_path.is_file():
         raise PreparationError(f"camera airframe source is missing: {airframe_path}")
+    if not target_airframe_path.is_file():
+        raise PreparationError(f"target airframe source is missing: {target_airframe_path}")
     if not binary_path.is_file() or not os.access(binary_path, os.X_OK):
         raise PreparationError(f"PX4 SITL binary is missing or not executable: {binary_path}")
     return {
@@ -247,6 +265,7 @@ def build_fingerprint(
         "bridge_variant": prepared["after_variant"],
         "bridge_source_sha256": prepared["bridge_source_sha256"],
         "camera_airframe_sha256": _sha256(airframe_path),
+        "target_airframe_sha256": _sha256(target_airframe_path),
         "px4_binary_sha256": _sha256(binary_path),
     }
 
@@ -255,6 +274,7 @@ def write_build_stamp(
     px4_root: Path,
     *,
     airframe: Path,
+    target_airframe: Path,
     binary: Path,
     stamp: Path | None = None,
     required_version: str = DEFAULT_REQUIRED_VERSION,
@@ -262,6 +282,7 @@ def write_build_stamp(
     payload = build_fingerprint(
         px4_root,
         airframe=airframe,
+        target_airframe=target_airframe,
         binary=binary,
         required_version=required_version,
     )
@@ -286,6 +307,7 @@ def check_build_stamp(
     px4_root: Path,
     *,
     airframe: Path,
+    target_airframe: Path,
     binary: Path,
     stamp: Path | None = None,
     required_version: str = DEFAULT_REQUIRED_VERSION,
@@ -302,6 +324,7 @@ def check_build_stamp(
     expected = build_fingerprint(
         px4_root,
         airframe=airframe,
+        target_airframe=target_airframe,
         binary=binary,
         required_version=required_version,
     )
@@ -331,6 +354,7 @@ def _parser() -> argparse.ArgumentParser:
         command = subparsers.add_parser(name)
         command.add_argument("--px4-root", required=True, type=Path)
         command.add_argument("--airframe", required=True, type=Path)
+        command.add_argument("--target-airframe", required=True, type=Path)
         command.add_argument("--binary", required=True, type=Path)
         command.add_argument("--stamp", type=Path)
         command.add_argument("--required-version", default=DEFAULT_REQUIRED_VERSION)
@@ -353,6 +377,7 @@ def main(argv: list[str] | None = None) -> int:
             result = write_build_stamp(
                 args.px4_root,
                 airframe=args.airframe,
+                target_airframe=args.target_airframe,
                 binary=args.binary,
                 stamp=args.stamp,
                 required_version=args.required_version,
@@ -361,6 +386,7 @@ def main(argv: list[str] | None = None) -> int:
             result = check_build_stamp(
                 args.px4_root,
                 airframe=args.airframe,
+                target_airframe=args.target_airframe,
                 binary=args.binary,
                 stamp=args.stamp,
                 required_version=args.required_version,

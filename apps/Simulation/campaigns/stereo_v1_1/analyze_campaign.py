@@ -66,6 +66,36 @@ def _read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _first_valid_attempt(slot: dict) -> dict:
+    attempts = slot.get("attempts")
+    if not isinstance(attempts, list):
+        raise ValueError(f"run {slot.get('run_id')} has no attempt list")
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            raise ValueError(f"run {slot.get('run_id')} has a malformed attempt record")
+        if attempt.get("run_id") not in (None, slot.get("run_id")):
+            raise ValueError(f"run {slot.get('run_id')} contains an attempt from another run")
+        if attempt.get("status") in ("VALID", "VALID_WITH_WARNINGS"):
+            if (slot.get("status") in ("VALID", "VALID_WITH_WARNINGS")
+                    and slot["status"] != attempt.get("status")):
+                raise ValueError(f"run {slot.get('run_id')} status differs from its first valid attempt")
+            if not attempt.get("attempt_id") or not attempt.get("recording_path"):
+                raise ValueError(f"run {slot.get('run_id')} has an incomplete valid attempt record")
+            return attempt
+    raise ValueError(f"run {slot.get('run_id')} has no valid attempt")
+
+
+def _rig_group_from_calibration_id(calibration_run_id: object) -> str:
+    if not isinstance(calibration_run_id, str):
+        raise ValueError("evaluation result is missing its calibration run identity")
+    parts = calibration_run_id.split("-")
+    if (len(parts) != 3 or parts[0] not in ("G0", "G1")
+            or parts[1] not in {f"P{index}" for index in range(5)}
+            or not parts[2].startswith("R") or not parts[2][1:].isdigit()):
+        raise ValueError(f"invalid calibration run identity: {calibration_run_id}")
+    return parts[0]
+
+
 def _read_jsonl(path: Path) -> list[dict]:
     with path.open(encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
@@ -207,7 +237,9 @@ def _status_slots(root: Path) -> tuple[dict, list[dict]]:
     for slot in slots:
         if slot["status"] not in ("VALID", "VALID_WITH_WARNINGS"):
             raise ValueError(f"nonvalid source slot: {slot['run_id']}={slot['status']}")
-        record = slot["attempts"][-1]
+        record = _first_valid_attempt(slot)
+        if slot["status"] != record["status"]:
+            raise ValueError(f"source slot status differs from first valid attempt: {slot['run_id']}")
         attempt_dir = root / record["recording_path"]
         source_kwargs = ({"planned_source": workbook_sources[slot["run_id"]]}
                          if workbook_sources is not None else {})
@@ -215,7 +247,7 @@ def _status_slots(root: Path) -> tuple[dict, list[dict]]:
         # Workbook campaigns use the generic campaign census; the legacy
         # counted_in_39 flag is deliberately false for workbook sources.
         count_field = "counted_in_campaign" if workbook_sources is not None else "counted_in_39"
-        if qc["status"] != slot["status"] or not qc.get(count_field, False):
+        if qc["status"] != record["status"] or not qc.get(count_field, False):
             raise ValueError(f"fresh source QC differs from status: {slot['run_id']}")
     return status, slots
 
@@ -228,7 +260,7 @@ def _slot_by_id(slots: list[dict], run_id: str) -> dict:
 
 
 def _attempt_dir(root: Path, slot: dict) -> Path:
-    return root / slot["attempts"][-1]["recording_path"]
+    return root / _first_valid_attempt(slot)["recording_path"]
 
 
 def _science_window(attempt_dir: Path, last_image_stamp: int) -> tuple[int | None, int | None, int | None]:
@@ -463,7 +495,7 @@ def _interpolate_rtk(rows: list[dict], pair: dict) -> dict | None:
 
 def _science_rtk_pairs(root: Path, slot: dict, trial: int, image_pairs: list[dict],
                        output_root: Path | None = None) -> tuple[list[dict], list[dict]]:
-    attempt = slot["attempts"][-1]
+    attempt = _first_valid_attempt(slot)
     target_dir = (Path(output_root).resolve() / slot["run_id"] / attempt["attempt_id"]
                   / "sensors" / f"trial_{trial:03d}") if output_root is not None else None
     rtk_path, _provenance_path = generate_drone_rtk(
@@ -481,13 +513,13 @@ def _science_rtk_pairs(root: Path, slot: dict, trial: int, image_pairs: list[dic
 
 def _camera_sensor_path(root: Path, slot: dict, trial: int,
                         output_root: Path | None = None) -> Path:
-    attempt = slot["attempts"][-1]
+    attempt = _first_valid_attempt(slot)
     parent = Path(output_root).resolve() if output_root is not None else root / "파생_재처리"
     return parent / slot["run_id"] / attempt["attempt_id"] / "sensors" / f"trial_{trial:03d}" / "sensor_observations.json"
 
 
 def _attempt_id(slot: dict) -> str:
-    return str(slot["attempts"][-1]["attempt_id"])
+    return str(_first_valid_attempt(slot)["attempt_id"])
 
 
 def _evaluation_run_id(slots: list[dict], group: str, repetition: int) -> str:
@@ -631,7 +663,7 @@ def _calibrate_scope(root: Path, slot: dict, trial: int, yaw_case: str,
     ideal_rtk_path = None
     ideal_rtk_rows = []
     if selected_pairs:
-        attempt = slot["attempts"][-1]
+        attempt = _first_valid_attempt(slot)
         ideal_rtk_path, _ideal_rtk_provenance = generate_drone_rtk(
             root, slot["run_id"], attempt["attempt_id"], trial,
             sigma_xyz_m=[0.0, 0.0, 0.0],
@@ -1077,7 +1109,7 @@ def _sensitivity_pairs(root: Path, slot: dict, scenario: dict,
 def _sensitivity_rtk_inputs(root: Path, slot: dict, pairs: list[dict],
                             scenario: dict, trial: int,
                             output_dir: Path) -> tuple[list[dict], list[dict], dict]:
-    attempt = slot["attempts"][-1]
+    attempt = _first_valid_attempt(slot)
     path, provenance_path = generate_drone_rtk(
         root, slot["run_id"], attempt["attempt_id"], trial,
         shared_bias=bool(scenario["drone_rtk_shared_bias"]),
@@ -1817,7 +1849,7 @@ def _admit_frozen_evaluation(root: Path, analysis_root: Path, run_manifest: dict
         raise RuntimeError("source protocol identity changed before V0 evaluation")
     current_attempts = {}
     for slot in current_slots:
-        attempt = slot["attempts"][-1]
+        attempt = _first_valid_attempt(slot)
         checksum = root / attempt["recording_path"] / "checksums.sha256"
         if checksum.is_file():
             current_attempts[f"{slot['run_id']}/{attempt['attempt_id']}"] = _sha256(checksum)
@@ -1990,14 +2022,19 @@ def _initial_pose(sensor: dict, trial_config: dict) -> tuple[dict, dict]:
 def _evaluation_record(result: dict, eval_run_id: str, scope: str,
                        pair_summary: dict, pairs: list[dict], true_camera: dict,
                        truth_series: GroundTruthSeries, spec: dict) -> dict:
+    calibration_run_id = result.get("calibration_run_id")
+    rig_group = result.get("rig_group") or _rig_group_from_calibration_id(calibration_run_id)
+    if rig_group != _rig_group_from_calibration_id(calibration_run_id):
+        raise ValueError("evaluation result rig group differs from calibration run identity")
     true_heading = {
-        side: float(spec["camera"]["physical_pose_groups"][result.get("rig_group", "G0")][f"heading_{side}_deg"])
+        side: float(spec["camera"]["physical_pose_groups"][rig_group][f"heading_{side}_deg"])
         for side in ("left", "right")
     }
     output = {
         "method": result["method"],
         "attitude_variant": result["attitude_variant"],
-        "calibration_run_id": result.get("calibration_run_id"),
+        "rig_group": rig_group,
+        "calibration_run_id": calibration_run_id,
         "evaluation_run_id": eval_run_id,
         "mc_seed": result.get("mc_seed"),
         "data_scope": scope,
@@ -2373,14 +2410,21 @@ def _summarize_evaluations(evaluation_payloads: Iterable[dict]) -> dict:
     result_count = main_count = 0
     for payload in evaluation_payloads:
         for result in payload.get("calibration_results", []):
-            key = f"{result.get('method')}__{result.get('attitude_variant')}"
+            calibration_run_id = result.get("calibration_run_id") or payload.get("calibration_run_id")
+            rig_group = _rig_group_from_calibration_id(calibration_run_id)
+            key = f"{rig_group}__{result.get('method')}__{result.get('attitude_variant')}"
             convergence[key][str(result.get("convergence_status"))] += 1
         for row in payload.get("results", []):
             result_count += 1
             if row.get("attitude_variant") not in VARIANTS or row.get("method") not in METHODS:
                 continue
             main_count += 1
-            key = (row.get("data_scope"), row.get("method"), row.get("attitude_variant"))
+            rig_group = row.get("rig_group") or _rig_group_from_calibration_id(
+                row.get("calibration_run_id")
+            )
+            if rig_group != _rig_group_from_calibration_id(row.get("calibration_run_id")):
+                raise ValueError("evaluation summary rig group differs from calibration run identity")
+            key = (rig_group, row.get("data_scope"), row.get("method"), row.get("attitude_variant"))
             group = grouped.setdefault(key, {"count": 0, "calibration_ids": set(),
                 "evaluation_ids": set(), "trials": set(),
                 **{name: _Mean() for name in ("rmse", "p95", "detect", "valid")}})
@@ -2394,9 +2438,10 @@ def _summarize_evaluations(evaluation_payloads: Iterable[dict]) -> dict:
                                   ("detection_rate", "detect"), ("valid_measurement_rate", "valid")):
                 group[target].add(metrics.get(field))
     summary_rows = []
-    for (scope, method, variant), group in sorted(grouped.items()):
+    for (rig_group, scope, method, variant), group in sorted(grouped.items()):
         summary_rows.append({
-            "data_scope": scope, "method": method, "attitude_variant": variant,
+            "rig_group": rig_group, "data_scope": scope, "method": method,
+            "attitude_variant": variant,
             "evaluation_case_count": group["count"],
             "source_calibration_run_count": len(group["calibration_ids"]),
             "source_evaluation_run_count": len(group["evaluation_ids"]),
@@ -2423,13 +2468,13 @@ def _summarize_evaluations(evaluation_payloads: Iterable[dict]) -> dict:
             "unit": "offline method/variant cases; not independent physical flights",
         }
     return {
-        "schema_version": "stereo_v1_1_analysis_summary_v1",
+        "schema_version": "stereo_v1_1_analysis_summary_v2",
         "evaluation_result_count": result_count,
         "main_comparison_result_count": main_count,
         "main_comparison_summary": summary_rows,
         "calibration_convergence_counts": {key: dict(value) for key, value in convergence.items()},
         "calibration_convergence_rates": convergence_rates,
-        "aggregation_scope": "Means over available case metrics; MC cases and raw source-run identities are counted separately. No frame or stochastic-flight independence claim.",
+        "aggregation_scope": "Main comparison means are grouped by rig_group/data_scope/method/attitude_variant; calibration convergence counts are grouped by rig_group/method/attitude_variant. MC cases and raw source-run identities are counted separately. G0 and G1 are not pooled. No frame or stochastic-flight independence claim.",
         "position_metrics_status": "V0 errors were opened after analysis freeze",
         "methodology": "analysis_methodology.md",
     }
@@ -2442,6 +2487,7 @@ def _iter_metric_rows(evaluation_payloads, kind):
             metrics = result.get("metrics") or {}
             if kind == "calibration":
                 yield {
+                    "rig_group": _rig_group_from_calibration_id(payload["calibration_run_id"]),
                     "calibration_run_id": payload["calibration_run_id"],
                     "evaluation_run_id": payload["evaluation_run_id"],
                     "trial_index": payload["trial_index"], "yaw_case": payload["yaw_case"],
@@ -2453,6 +2499,8 @@ def _iter_metric_rows(evaluation_payloads, kind):
                 }
             else:
                 yield {
+                    "rig_group": (result.get("rig_group")
+                                  or _rig_group_from_calibration_id(result.get("calibration_run_id"))),
                     "calibration_run_id": result.get("calibration_run_id"),
                     "evaluation_run_id": result.get("evaluation_run_id"),
                     "trial_index": result.get("mc_seed"), "yaw_case": payload["yaw_case"],
@@ -2522,11 +2570,11 @@ def _analyze_locked(output_root: Path, mc_trials: int = 100,
         if (root / name).is_file()
     }
     source_attempt_checksums = {
-        f"{slot['run_id']}/{slot['attempts'][-1]['attempt_id']}": _sha256(
-            root / slot["attempts"][-1]["recording_path"] / "checksums.sha256"
+        f"{slot['run_id']}/{_first_valid_attempt(slot)['attempt_id']}": _sha256(
+            root / _first_valid_attempt(slot)["recording_path"] / "checksums.sha256"
         )
         for slot in slots
-        if (root / slot["attempts"][-1]["recording_path"] / "checksums.sha256").is_file()
+        if (root / _first_valid_attempt(slot)["recording_path"] / "checksums.sha256").is_file()
     }
     source_identity = {
         "input_root_identity": _input_root_identity(root, output_root),
@@ -2654,6 +2702,8 @@ def _analyze_locked(output_root: Path, mc_trials: int = 100,
             "A's RTK uncertainty is propagated through a first-order pixel covariance approximation.",
             "C may be rank-deficient; its result is preserved without adding a hidden yaw or trajectory prior.",
             "No numeric pass threshold is defined by the protocol.",
+            protocol["split_policy"]["limitation"],
+            "G0 primary comparisons and G1 nominal-zero results are summarized separately; they are not pooled.",
         ],
     })
     _write_immutable(analysis_root / "analysis_summary.json", summary)
@@ -2663,10 +2713,10 @@ def _analyze_locked(output_root: Path, mc_trials: int = 100,
         "storage_contract": "immutable case JSON owns results; index retains identities, relative paths and verified hashes",
         "batches": [dict(row) for row in batches],
     })
-    calibration_fields = ["calibration_run_id", "evaluation_run_id", "trial_index", "yaw_case",
+    calibration_fields = ["rig_group", "calibration_run_id", "evaluation_run_id", "trial_index", "yaw_case",
                           "data_scope", "method", "attitude_variant", "camera_dof", "latent_dof",
                           "convergence_status", "condition_number"]
-    evaluation_fields = ["calibration_run_id", "evaluation_run_id", "trial_index", "yaw_case",
+    evaluation_fields = ["rig_group", "calibration_run_id", "evaluation_run_id", "trial_index", "yaw_case",
                          "data_scope", "method", "attitude_variant", "evaluation_status",
                          "detection_rate", "valid_measurement_rate", "lateral_east_rmse_m",
                          "forward_north_rmse_m", "vertical_up_rmse_m", "position_3d_rmse_m",

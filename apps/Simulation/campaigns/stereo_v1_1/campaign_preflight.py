@@ -24,6 +24,7 @@ sys.path.insert(0, str(SIM_ROOT))
 from campaigns.stereo_v1_1.plan_campaign import build_plan
 from campaigns.stereo_v1_1.campaign_run import _existing_sitl_processes
 from campaigns.stereo_v1_1.preflight_capture import run_group
+from campaigns.stereo_v1_1.runtime_paths import root_python_path
 
 
 MINIMUM_NEXT_RUN_BYTES = 10_000_000_000
@@ -236,6 +237,24 @@ def _reference_geometry() -> dict:
     return results
 
 
+def _short_probe_blockers(checks: list[dict]) -> list[str]:
+    """Return static failures that prevent no-YOLO short-capture probes.
+
+    CUDA availability still blocks the campaign, but it is independent of the
+    headless camera/state probes and their storage-rate measurement. Permit
+    those probes only when the isolated YOLO runtime itself imports cleanly.
+    """
+    blockers = []
+    for check in checks:
+        if not check["required"] or check["status"] == "PASS":
+            continue
+        if (check["name"] == "isolated_yolo_python_and_device"
+                and check.get("detail", {}).get("required_imports_exit") == 0):
+            continue
+        blockers.append(check["name"])
+    return blockers
+
+
 def collect(output_root: Path, action: str = "preflight",
             workbook_path: Path | None = None) -> dict:
     output_root = output_root.resolve()
@@ -261,7 +280,7 @@ def collect(output_root: Path, action: str = "preflight",
     ros_workspace = Path(os.environ.get("SASL_ROS_WORKSPACE", REPO_ROOT / "workspace" / "main")).expanduser().resolve()
     px4_root = Path(os.environ.get("PX4_DIR", SIM_ROOT / "PX4-Autopilot")).expanduser().resolve()
     px4_binary = px4_root / "build" / "px4_sitl_default" / "bin" / "px4"
-    root_python = Path(os.environ.get("STEREO_V1_1_ROOT_PYTHON", sys.executable)).expanduser()
+    root_python = root_python_path(SIM_ROOT)
     yolo_python = Path(os.environ.get(
         "STEREO_V1_1_YOLO_PYTHON", str(SIM_ROOT / ".venv" / "bin" / "python")
     )).expanduser()
@@ -385,12 +404,11 @@ def collect(output_root: Path, action: str = "preflight",
     record("runtime_commands", all(item.get("available") for item in tools.values()), tools)
     active = _existing_sitl_processes()
     record("no_existing_sitl_stack", not active, {"matching_process_ids": active})
-    static_failures = [check["name"] for check in checks
-                       if check["required"] and check["status"] != "PASS"]
+    probe_blockers = _short_probe_blockers(checks)
     live_results = []
     storage_estimate = None
     full_space_required = action in {"preflight", "all", "all_results", "resume"}
-    if not static_failures:
+    if not probe_blockers:
         if workbook_plan is None:
             spec = json.loads((CAMPAIGN_ROOT / "protocol" / "03_experiment_spec.json").read_text(encoding="utf-8-sig"))
             probes = [(group, lambda group=group: run_group(output_root, group, spec))
@@ -483,7 +501,7 @@ def collect(output_root: Path, action: str = "preflight",
                    required=full_space_required)
     else:
         record("live_short_captures", False,
-               {"status": "SKIPPED", "static_blockers": static_failures}, required=False)
+               {"status": "SKIPPED", "static_blockers": probe_blockers}, required=False)
         record("space_for_full_campaign", False,
                {"status": "NOT_MEASURED_BECAUSE_STATIC_PREFLIGHT_FAILED"},
                required=full_space_required)
@@ -529,7 +547,8 @@ def collect(output_root: Path, action: str = "preflight",
                          "capture_streams.py", "state_recorder.py", "qc_attempt.py",
                          "preflight_capture.py", "calibration_solver.py", "analyze_campaign.py",
                          "workbook_campaign.py", "setpoint_cadence.py", "science_dispatch.py",
-                         "capture_readiness.py", "simulation_stepper.py", "verify_simulation_steps.py", "offboard_arming.py")
+                         "capture_readiness.py", "simulation_stepper.py", "verify_simulation_steps.py",
+                         "offboard_arming.py", "runtime_paths.py", "requirements-controller.txt")
         },
         "software": {
             "python": sys.version.split()[0], "python_executable_role": "preflight process",

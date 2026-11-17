@@ -42,6 +42,14 @@ class RunOperatorViewPx4RequiredTests(unittest.TestCase):
             ROOT_DIR / "stereo_ground_sim" / "vendor" / "px4_camera_airframe" / "4090_camera_px4",
             camera_airframe,
         )
+        target_airframe = (
+            root / "stereo_ground_sim" / "vendor" / "px4_target_airframe" / "4001_gz_x500"
+        )
+        target_airframe.parent.mkdir(parents=True)
+        shutil.copy2(
+            ROOT_DIR / "stereo_ground_sim" / "vendor" / "px4_target_airframe" / "4001_gz_x500",
+            target_airframe,
+        )
 
         marker = root / "side-effects.log"
         scripts_dir = root / "scripts"
@@ -57,6 +65,15 @@ class RunOperatorViewPx4RequiredTests(unittest.TestCase):
             encoding="utf-8",
         )
         ensure_yolo.chmod(0o755)
+        app_python = root / ".venv" / "bin" / "python"
+        app_python.parent.mkdir(parents=True)
+        app_python.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ \"${1:-}\" == \"-c\" && \"${2:-}\" == \"import cv2, xlsxwriter\" ]]; then exit 0; fi\n"
+            "exec /usr/bin/python3 \"$@\"\n",
+            encoding="utf-8",
+        )
+        app_python.chmod(0o755)
         prepare_tensorrt = scripts_dir / "prepare_yolo_tensorrt_engine.py"
         prepare_tensorrt.write_text(
             "#!/usr/bin/env python3\n"

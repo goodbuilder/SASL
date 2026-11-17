@@ -13,9 +13,13 @@ class EnsureYoloRuntimeTests(unittest.TestCase):
         text = SCRIPT.read_text(encoding="utf-8")
 
         self.assertIn("create_virtualenv", text)
+        self.assertIn("venv_args=(--without-pip)", text)
+        self.assertIn("bootstrap_pip", text)
         self.assertIn("venv_args+=(--system-site-packages)", text)
         self.assertIn("-m virtualenv", text)
         self.assertIn("virtualenv_args=(--clear)", text)
+        self.assertIn("requirements-controller.txt", text)
+        self.assertIn("python_has_campaign_controller_runtime", text)
         self.assertIn('if [[ "$YOLO_VENV_ISOLATED" == true ]]', text)
         self.assertIn("configure_system_site_packages", text)
         self.assertIn("include-system-site-packages = %s", text)

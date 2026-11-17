@@ -746,7 +746,6 @@ operator_pid=""
 auto_pid=""
 stop_auto() {
   local pid="$auto_pid"
-  auto_pid=""
   [[ -n "$pid" ]] || return 0
   if kill -0 "$pid" >/dev/null 2>&1; then
     kill -TERM -- "-$pid" >/dev/null 2>&1 || kill -TERM "$pid" >/dev/null 2>&1 || true
@@ -757,10 +756,10 @@ stop_auto() {
     kill -KILL -- "-$pid" >/dev/null 2>&1 || kill -KILL "$pid" >/dev/null 2>&1 || true
   fi
   wait "$pid" >/dev/null 2>&1 || true
+  [[ "$auto_pid" == "$pid" ]] && auto_pid=""
 }
 stop_operator() {
   local pid="$operator_pid"
-  operator_pid=""
   [[ -n "$pid" ]] || return 0
   if kill -0 "$pid" >/dev/null 2>&1; then
     # The operator is launched as a background shell, where SIGINT may be
@@ -771,15 +770,34 @@ stop_operator() {
       kill -0 "$pid" >/dev/null 2>&1 || break
       sleep 1
     done
-    kill -KILL "$pid" >/dev/null 2>&1 || true
   fi
   wait "$pid" >/dev/null 2>&1 || true
+  # run_operator_view may still have descendants if its shell exited while a
+  # foreground child was active. It is started in its own session, so clean
+  # any remaining members of that process group without touching the runner.
+  if kill -0 -- "-$pid" >/dev/null 2>&1; then
+    kill -TERM -- "-$pid" >/dev/null 2>&1 || true
+    for _ in {1..10}; do
+      kill -0 -- "-$pid" >/dev/null 2>&1 || break
+      sleep 1
+    done
+    kill -KILL -- "-$pid" >/dev/null 2>&1 || true
+  fi
+  [[ "$operator_pid" == "$pid" ]] && operator_pid=""
 }
 cleanup_case_processes() {
+  trap '' INT TERM
   stop_auto
   stop_operator
 }
-trap cleanup_case_processes EXIT INT TERM
+handle_sweep_signal() {
+  local exit_status="$1"
+  trap '' INT TERM
+  exit "$exit_status"
+}
+trap cleanup_case_processes EXIT
+trap 'handle_sweep_signal 143' TERM
+trap 'handle_sweep_signal 130' INT
 
 wait_for_px4() {
   local deadline=$((SECONDS + wait_seconds))
@@ -955,7 +973,7 @@ run_case() {
     # required left/right MP4 artifacts at the explicitly qualified rate.
     "enable_detection_overlay:=true"
   )
-  SIM_CONFIG="$SIM_CONFIG" "${operator_cmd[@]}" > "$operator_log" 2>&1 &
+  setsid env SIM_CONFIG="$SIM_CONFIG" "${operator_cmd[@]}" > "$operator_log" 2>&1 &
   operator_pid="$!"
   printf '%s\n' "$operator_pid" > "$case_dir/operator.pid"
   if ! wait_for_px4 "$readiness_log"; then

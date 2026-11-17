@@ -115,6 +115,7 @@ def test_both_sources_refit_all_methods_then_evaluate_and_reopen_two_workbooks(t
         evaluated = []
         for row in [*results, m0]:
             row["rig_group"] = "G0"
+            row["calibration_run_id"] = "G0-P0-R01"
             evaluated.append(analysis._evaluation_record(row, "G0-V0-R01", "all_data",
                 summary, pairs, true_camera, truth, spec))
         relative = f"derived/G0-P0-R01/a01/trial_000/{yaw_case}/all_data"
@@ -165,7 +166,8 @@ def test_failed_batch_is_preserved_and_formula_like_reason_is_plain_text(tmp_pat
 
 def test_campaign_schedules_both_sources_and_keeps_original_path_selection(monkeypatch, tmp_path):
     slots = [dict(run_id=f"{group}-{path}-R01", rig_group=group, path_id=path,
-                  repetition=1, attempts=[dict(attempt_id="a01")])
+                  repetition=1, attempts=[dict(attempt_id="a01", status="VALID",
+                                                recording_path=f"raw/{group}-{path}-R01/a01")])
              for group in ("G0", "G1") for path in ("P0", "P4", "V0")]
     calls = []
     monkeypatch.setattr(analysis, "generate_camera_sensors", lambda *a, **kw: [])

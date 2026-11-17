@@ -88,6 +88,14 @@ Gazebo Python bindings with the pure-Python protobuf backend. Before transit,
 v1.2 first verifies a 10 m vertical rise in local NED and world ENU while limiting
 horizontal drift; this startup procedure does not change the science reference.
 
+The short no-flight camera/storage probe writes a private scenario at the first
+workbook reference-path point in world ENU `[east,north,up]` and holds that probe
+target static. It does not alter the workbook's vehicle spawn, arm PX4, or count
+as a campaign run; the target stays visible while image rates and storage usage
+are measured. `scripts/ensure_yolo_runtime.sh` prepares the app `.venv` and installs
+the pinned campaign controller requirements, including MAVLink control and PX4
+Kconfig support. Its CUDA device check remains required before campaign execution.
+
 Failed checks do not automatically relax the protocol. Preflight storage
 estimation includes configured entry/readiness/landing bounds and a reserve.
 The legacy landing-status receipt is not proof of ground contact. Structured
@@ -96,11 +104,15 @@ science completion and the 5 s final hold are separate from clean owned-process
 shutdown and recorder flush. Earlier `landing_confirmed` events from this legacy
 helper must not be used as landing truth.
 
-This command's completion scope is raw collection, QC and handoff. `OfflinePlan`
-remains downstream-analysis metadata: `xlsx_all` does not run calibration or open
-V0 positioning errors. Report raw collection, estimator implementation and final
-evaluation separately; see the v1.2 audit and subsequent implementation evidence
-in [the verification ledger](docs/changes/20261011-manifest-sweep/verification.md).
+For `xlsx_all` and `xlsx_resume`, the run action continues after all 39 slots pass
+source QC: it runs the frozen offline analysis with 100 Monte Carlo trials, audits
+the analysis, then writes `reports/stereo_v1_2_summary_report_ready_v3.xlsx` and
+its input-hash manifest under the campaign output. The analysis freezes path
+selection before opening V0 position errors. An incomplete campaign defers all
+three downstream steps until resume reaches 39 valid runs. `xlsx_plan` remains a
+no-flight plan check. Report raw collection, estimator implementation and final
+evaluation separately; see the [v1.2 campaign evidence](docs/changes/20261011-manifest-sweep/verification.md)
+and [fresh V3 implementation record](docs/changes/20261021-report-workbook-supplement/verification.md).
 
 The offline `IMAGE_HUBER_GAUSSIAN_SENSOR_PRIORS` objective estimates camera
 attitudes with fixed measured optical centers. It assumes declared Gaussian
@@ -184,9 +196,12 @@ which validates and displays the configured campaign without starting SITL. Set
 `development` for a non-counted pilot, `all` to collect the
 39 raw slots, or `all_results` to run preflight, collect/QC all 39 slots, and
 produce the offline analysis. `resume` continues valid incomplete work and
-starts analysis when all 39 slots pass source QC. `reprocess` analyzes an
-existing 39-run dataset without starting SITL. `preflight`, `qc`, and the
-separate `legacy_sweep` action are also available.
+starts analysis when all 39 slots pass source QC. The v1.2 workbook actions
+`xlsx_all` and `xlsx_resume` likewise run the 100-trial analysis, analysis audit,
+and fresh V3 workbook export after all 39 slots are valid. `reprocess` analyzes
+an existing 39-run dataset without starting SITL. `preflight`, `qc`, and the
+separate `legacy_sweep` action are also available. `report_v3` remains the
+historical report-only route pinned to the archived analysis inputs.
 
 ### Inputs/Outputs and Interfaces
 
@@ -206,7 +221,9 @@ explicit run list and order; the runner does not create a factor cross-product.
 `xlsx_all` writes under `recordings/stereo_v1_1/<output_id>`: `run_status.json`
 tracks the 39 slots, `manifest_actual.json` records attempts and seeds, raw
 captures live under `원본_실행별/`, and YOLO/GT derivatives live under
-`파생_재처리/`.
+`파생_재처리/`. Once all slots pass QC, the same output also receives the
+versioned analysis, audit evidence, and the V3 XLSX plus `.manifest.json` with
+SHA-256 hashes for the analysis and run artifacts used in the report.
 
 ### Operational Rules
 
@@ -274,9 +291,10 @@ weather and wind declaration. XLSX preflight checks both copies, verifies the
 declared world and no-wind condition, and records the parsed lighting and
 atmosphere snapshot. The current world has an adiabatic atmosphere and no
 explicit wind element or wind plugin. `OfflinePlan.trial_count` is handoff
-metadata; `xlsx_*` actions do not run offline analysis and ignore
-`STEREO_V1_1_MC_TRIALS`. The fixed-protocol `resume`, `all_results` and
-`reprocess` actions use that environment value when they launch analysis.
+metadata. `xlsx_plan` does not run offline analysis; `xlsx_all` and
+`xlsx_resume` require `STEREO_V1_1_MC_TRIALS=100` and analyze only after all 39
+slots pass source QC. The fixed-protocol `resume`, `all_results` and `reprocess`
+actions use that environment value when they launch analysis.
 
 ### Known Limitations and Workarounds
 
@@ -344,12 +362,27 @@ checks the source while writing versioned results under the selected output.
 The source root must contain its 39-slot status, attempt files, and campaign
 manifests. Keep output IDs unique for new collections.
 
-The checked-in sweep default is `xlsx_plan`; it does not run offline analysis.
-`STEREO_V1_1_MC_TRIALS=100` applies only when the fixed-protocol `resume`,
-`all_results` or `reprocess` action starts analysis. A shorter trial count is
-only for development verification and must not be reported as the full Monte
-Carlo result. The legacy 20-case attitude sweep remains an independent action
-and is not a substitute for the 39-slot protocol.
+`config/simulation.env` defaults to `xlsx_plan`, which does not run offline
+analysis. The dedicated `config/campaign/paper1_v1_2.env` selects `xlsx_all`;
+after 39 valid runs it launches the 100-trial analysis, audit and V3 export.
+`STEREO_V1_1_MC_TRIALS=100` is also the default for fixed-protocol `resume`,
+`all_results` and `reprocess`. A shorter trial count is only for development
+verification and must not be reported as the full Monte Carlo result. The legacy
+20-case attitude sweep remains an independent action and is not a substitute for
+the 39-slot protocol.
+
+To rebuild the archived report-ready workbook v3 from its historical freeze, set
+`STEREO_V1_1_ACTION=report_v3` in
+`config/campaign/paper1_v1_2.env`, then launch the panel with
+`SIM_CONFIG=config/campaign/paper1_v1_2.env ./run_stereo_campaign_rqt.sh` and
+run the configured action. The action is pinned to `paper1_v1_2_001` and
+`analysis_9cfd7c6cd10b`, checks that the campaign's latest-analysis pointer
+still selects that freeze, and writes
+`recordings/stereo_v1_1/paper1_v1_2_001/outputs/20261021-postfreeze-summary-review/stereo_v1_2_summary_report_ready_v3.xlsx`.
+It preserves the v2 source workbook and exports through a temporary file before
+replacing v3. This report-only route remains pinned to that archived input. A
+fresh `xlsx_all` campaign creates its own current V3 report under that campaign's
+`reports/` directory after analysis and audit pass.
 
 When resuming a campaign, QC may revalidate the same preserved attempt without
 another flight only if its saved protocol errors are exactly

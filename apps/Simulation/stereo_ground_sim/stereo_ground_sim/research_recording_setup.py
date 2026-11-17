@@ -316,6 +316,9 @@ class ResearchRecordingSetup:
 
     def _initialize_research_recording(self):
         if not self.node.enable_research_recording:
+            self.node.get_logger().warning(
+                "Research recorder disabled: enable_research_recording is false"
+            )
             return
         if self.node.camera_image_width_px <= 0 or self.node.camera_image_height_px <= 0:
             raise ValueError("recording camera image dimensions must be positive")
@@ -341,6 +344,7 @@ class ResearchRecordingSetup:
             queue_capacity=self.node.research_record_queue_capacity,
         )
         self.node.research_terminal_coordinator.attach(self.node.research_recorder)
+        self.node.get_logger().info(f"Research recorder initialized: {output_dir}")
 
     def _bool_param(self, name):
         return self.node._coerce_bool(self.node.get_parameter(name).value)

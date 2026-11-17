@@ -6,6 +6,7 @@ cd "$ROOT_DIR"
 
 SIM_CONFIG="${SIM_CONFIG:-$ROOT_DIR/config/simulation.env}"
 OPERATOR_RECORDER_PYTHON="${OPERATOR_RECORDER_PYTHON:-}"
+PX4_MISSION_PYTHON="${PX4_MISSION_PYTHON:-}"
 
 resolve_executable() {
   local candidate resolved
@@ -37,6 +38,7 @@ if ! OPERATOR_RECORDER_PYTHON="$(resolve_executable \
 fi
 
 SIM_EXPLICIT_NAMES=(
+  PX4_MISSION_PYTHON
   DRONE_TAKEOFF_ALTITUDE_M DRONE_FORWARD_SPEED_MPS DRONE_MOVE_DISTANCE_M
   DRONE_TARGET_DISTANCE_M DRONE_APPROACH_TIMEOUT_S DRONE_TAKEOFF_TIMEOUT_S
   DRONE_FIRST_HOVER_S DRONE_FINAL_HOVER_S DRONE_LAND_TIMEOUT_S
@@ -54,6 +56,14 @@ SIM_EXPLICIT_NAMES=(
 # shellcheck disable=SC1091
 source "$ROOT_DIR/scripts/load_sim_config.sh"
 load_sim_config_preserving_env "${SIM_EXPLICIT_NAMES[@]}"
+
+if ! PX4_MISSION_PYTHON="$(resolve_executable \
+  "$PX4_MISSION_PYTHON" \
+  "$ROOT_DIR/.venv/bin/python" \
+  python3
+)"; then
+  PX4_MISSION_PYTHON="python3"
+fi
 
 usage() {
   cat <<'USAGE'
@@ -273,4 +283,20 @@ case "$record_full" in
     ;;
 esac
 
-python3 "$ROOT_DIR/scripts/px4_waypoint_mission.py" "${args[@]}" "${mission_cli[@]}"
+if [[ "$check_connection" == true ]]; then
+  check_output="$(mktemp)"
+  set +e
+  timeout --signal=TERM --kill-after=2s 30s \
+    "$PX4_MISSION_PYTHON" "$ROOT_DIR/scripts/px4_waypoint_mission.py" \
+    "${args[@]}" "${mission_cli[@]}" >"$check_output" 2>&1
+  check_status=$?
+  set -e
+  cat "$check_output"
+  if grep -Fq "Connection check complete. No mission command was sent." "$check_output"; then
+    check_status=0
+  fi
+  rm -f "$check_output"
+  exit "$check_status"
+fi
+
+"$PX4_MISSION_PYTHON" "$ROOT_DIR/scripts/px4_waypoint_mission.py" "${args[@]}" "${mission_cli[@]}"

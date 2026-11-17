@@ -96,7 +96,8 @@ class CampaignPanel(Plugin):
         details.addWidget(self._yolo_backend_label, 9, 1)
         details.addWidget(QLabel("Simulation.env SHA-256"), 10, 0)
         details.addWidget(self._config_hash_label, 10, 1)
-        details.addWidget(QLabel("Run parameters XLSX"), 11, 0)
+        self._workbook_field_label = QLabel("Run parameters XLSX")
+        details.addWidget(self._workbook_field_label, 11, 0)
         details.addWidget(self._workbook_label, 11, 1)
         root.addLayout(details)
 
@@ -165,12 +166,20 @@ class CampaignPanel(Plugin):
         self._output_root = output_root
         self._action_label.setText(config.action)
         workbook_action = config.action in {"xlsx_plan", "xlsx_all", "xlsx_resume"}
-        self._run_field_label.setText("Workbook" if workbook_action else "Run ID")
+        self._run_field_label.setText(
+            "Workbook" if workbook_action else "Report" if config.action == "report_v3" else "Run ID"
+        )
+        self._workbook_field_label.setText(
+            "Frozen report source" if config.action == "report_v3" else "Run parameters XLSX"
+        )
         self._run_label.setText(
             f"{config.workbook_path.name} ({config.workbook_sha256[:12]})"
-            if workbook_action and config.workbook_sha256 else config.run_id
+            if workbook_action and config.workbook_sha256 else
+            "stereo_v1_2_summary_report_ready_v3.xlsx" if config.action == "report_v3" else
+            config.run_id
         )
         self._workbook_label.setText(
+            "analysis_9cfd7c6cd10b (frozen report source)" if config.action == "report_v3" else
             str(config.workbook_path.relative_to(SIM_ROOT))
             + (f"  sha256={config.workbook_sha256}" if config.workbook_sha256 else "")
         )
@@ -178,7 +187,9 @@ class CampaignPanel(Plugin):
             str(output_root.relative_to(SIM_ROOT)) if output_root.is_relative_to(SIM_ROOT)
             else f"SASL_WORKSTATION_DATA_ROOT/{config.output_id}"
         )
-        if workbook_action:
+        if config.action == "report_v3":
+            self._input_label.setText("frozen analysis_9cfd7c6cd10b; report rebuild only, no SITL")
+        elif workbook_action:
             self._input_label.setText("the workbook is the per-run input")
         elif config.action == "reprocess":
             self._input_label.setText(str(config.input_root))
@@ -204,6 +215,7 @@ class CampaignPanel(Plugin):
         if not active:
             self._status.setText(
                 "Workbook plan loaded and validated." if workbook_action else
+                "Frozen report v3 is ready to rebuild; this action does not start SITL." if config.action == "report_v3" else
                 "Config loaded. The scientific protocol remains pinned to the v1.1 manifest."
             )
             self._status.setStyleSheet("font-weight: 600; color: #1b5e20;")
@@ -329,6 +341,14 @@ class CampaignPanel(Plugin):
         if self._config is None:
             return
         if self._output_root is None:
+            return
+        if self._config.action == "report_v3":
+            output = (SIM_ROOT / "recordings" / "stereo_v1_1" / "paper1_v1_2_001"
+                      / "outputs" / "20261021-postfreeze-summary-review"
+                      / "stereo_v1_2_summary_report_ready_v3.xlsx")
+            self._progress.setText(
+                f"Report v3: {'available' if output.is_file() else 'not built'}; {output.relative_to(SIM_ROOT)}"
+            )
             return
         if self._config.action == "xlsx_plan":
             self._progress.setText("Workbook plan: validated; no flight status was initialized.")

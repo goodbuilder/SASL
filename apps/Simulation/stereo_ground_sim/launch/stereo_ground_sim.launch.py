@@ -64,7 +64,10 @@ def _gazebo_args(context, world, gui_config):
         seed_arg = f" --seed {seed}"
     if _bool_config(context, "gz_gui"):
         return f"-r --gui-config {gui_config}{seed_arg} {world}"
-    return f"-r -s{seed_arg} {world}"
+    # Server-only mode disables the Gazebo GUI but does not create the
+    # off-screen render context required by camera sensors. Keep rendering
+    # enabled so headless campaign captures contain real scene pixels.
+    return f"-r -s --headless-rendering{seed_arg} {world}"
 
 
 def _camera_axis_values(context, camera, sensor, field, unit, default):
@@ -769,6 +772,23 @@ def _launch_setup(context, *args, **kwargs):
     gz_args = _gazebo_args(context, world, gui_config)
     gz_version = LaunchConfiguration("gz_version")
     return [
+        # Join the ROS graph before Gazebo, PX4 bridges, and diagnostics add
+        # their DDS participants. At FHD rates, constructing this node after
+        # the graph is populated can stall before its recorder and camera
+        # subscriptions are ready. Its subscriptions become active as their
+        # publishers start below.
+        ExecuteProcess(
+            cmd=[
+                yolo_python,
+                "-m",
+                "stereo_ground_sim.stereo_distance_node",
+                "--ros-args",
+                "--params-file",
+                distance_params_file,
+            ],
+            name="stereo_distance_node",
+            output="screen",
+        ),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 [
@@ -859,18 +879,6 @@ def _launch_setup(context, *args, **kwargs):
                     "output_topic": "/simulation/camera_px4_pose_diagnostics/right",
                 }
             ],
-            output="screen",
-        ),
-        ExecuteProcess(
-            cmd=[
-                yolo_python,
-                "-m",
-                "stereo_ground_sim.stereo_distance_node",
-                "--ros-args",
-                "--params-file",
-                distance_params_file,
-            ],
-            name="stereo_distance_node",
             output="screen",
         ),
         Node(
